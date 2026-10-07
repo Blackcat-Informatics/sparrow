@@ -7,6 +7,7 @@ use crate::sparrow_capnp as wire;
 use purrdf_lex::json::{Object, Value};
 
 mod context;
+mod durability;
 mod error;
 mod ingest;
 mod pin;
@@ -23,7 +24,7 @@ type Result<T> = AgentResult<T>;
 pub(crate) mod tool;
 
 pub(super) const USAGE: &str = concat!(
-    "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE",
+    "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | flush STORE_ID SESSION_ID SEQUENCE",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
@@ -41,6 +42,7 @@ pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<
 }
 
 pub(super) enum Command {
+    Flush(sparrow_client::DurabilityWatermark),
     Status,
     SourceTime(source_time::Input),
     Records(records::Input),
@@ -78,6 +80,16 @@ fn invalid(message: impl Into<String>) -> AgentError {
         message: message.into(),
         retryable: false,
     }
+}
+
+fn decimal_u64(value: &Value) -> std::result::Result<u64, purrdf_lex::json::record::DecodeError> {
+    value
+        .as_str()
+        .filter(|v| !v.is_empty() && v.as_bytes().iter().all(u8::is_ascii_digit))
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| {
+            purrdf_lex::json::record::DecodeError::invalid_value(value, "decimal UInt64 string")
+        })
 }
 
 fn evidence(mut target: wire::evidence::Builder<'_>, store: &str, id: &str) -> Result<()> {
@@ -144,6 +156,17 @@ fn parse_kind(
 
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
+        if args.first().is_some_and(|arg| arg == "flush") {
+            if args.len() != 4 {
+                return Err(invalid("flush requires STORE_ID SESSION_ID SEQUENCE"));
+            }
+            return Ok(Self::Flush(sparrow_client::DurabilityWatermark {
+                store_id: args[1].clone(),
+                session_id: args[2].clone(),
+                sequence: decimal_u64(&Value::from(args[3].clone()))
+                    .map_err(|error| invalid(error.to_string()))?,
+            }));
+        }
         if args == ["status"] {
             return Ok(Self::Status);
         }
@@ -318,6 +341,9 @@ impl Command {
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+        if let Self::Flush(through) = self {
+            return Ok(Some(durability::execute(client, through).await?));
+        }
         if let Self::SourceTime(input) = self {
             return Ok(Some(input.execute(client).await?));
         }

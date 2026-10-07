@@ -12,6 +12,8 @@ use tokio::sync::Semaphore;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerConfig {
+    #[serde(default = "default_flush_interval")]
+    buffered_flush_interval_ms: u32,
     socket_path: PathBuf,
     data_dir: PathBuf,
     disk_budget: u64,
@@ -21,6 +23,10 @@ struct ServerConfig {
     max_pin_members: usize,
     max_concurrent_requests: usize,
     text_lexicon_dir: PathBuf,
+}
+
+fn default_flush_interval() -> u32 {
+    sparrow_core::DEFAULT_FLUSH_INTERVAL_MS
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -39,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(
         &config.data_dir,
         Config {
+            buffered_flush_interval_ms: config.buffered_flush_interval_ms,
             disk_budget: config.disk_budget,
             maintenance_reserve: config.maintenance_reserve,
             max_artifact_bytes: config.max_artifact_bytes,
@@ -69,9 +76,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     local.run_until(async {
         let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(30));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut synchronize = tokio::time::interval(std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)));
+        synchronize.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume interval's immediate first tick; the intended delay starts now.
+        synchronize.tick().await;
         loop {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => { signal?; break; }
+                _ = synchronize.tick() => {
+                    let owner = store.clone();
+                    if let Err(error) = tokio::task::spawn_blocking(move || owner.flush_buffered()).await? {
+                        eprintln!("sparrowd: buffered WAL synchronization failed: {error}");
+                    }
+                }
                 _ = maintenance.tick() => {
                     let owner = store.clone();
                     if let Err(e) = tokio::task::spawn_blocking(move || owner.expire(sparrow_server::now()?)).await? {

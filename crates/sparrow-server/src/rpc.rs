@@ -168,6 +168,14 @@ fn artifact(
     value: Artifact,
     store: &str,
 ) -> capnp::Result<()> {
+    out.set_durability(if value.buffered.is_some() {
+        wire::Durability::Buffered
+    } else {
+        wire::Durability::Durable
+    });
+    if let Some(token) = value.buffered {
+        durability_watermark(out.reborrow().init_buffered_through().init_value(), token)?;
+    }
     out.set_store_id(store);
     out.set_id(&value.id);
     out.set_source(&value.source);
@@ -191,6 +199,26 @@ fn artifact(
         records.set(index as u32, id);
     }
     Ok(())
+}
+
+fn durability_watermark(
+    out: wire::durability_watermark::Builder<'_>,
+    value: sparrow_core::DurabilityWatermark,
+) -> capnp::Result<()> {
+    sparrow_client::DurabilityWatermark {
+        store_id: value.store_id,
+        session_id: value.session_id,
+        sequence: value.sequence,
+    }
+    .encode(out)
+    .map_err(|error| capnp::Error::failed(error.to_string()))
+}
+
+fn durability_mode(value: wire::Durability) -> sparrow_core::Durability {
+    match value {
+        wire::Durability::Buffered => sparrow_core::Durability::Buffered,
+        wire::Durability::Durable => sparrow_core::Durability::Durable,
+    }
 }
 
 fn import_progress(
@@ -531,6 +559,7 @@ impl wire::sparrow::Server for Rpc {
         params: wire::sparrow::EventsIngestParams,
         mut results: wire::sparrow::EventsIngestResults,
     ) -> capnp::Result<()> {
+        let mode = durability_mode(params.get()?.get_durability()?);
         let input = match sparrow_client::EventBatch::decode(params.get()?.get_batch()?) {
             Ok(input) => input,
             Err(error) => {
@@ -563,7 +592,14 @@ impl wire::sparrow::Server for Rpc {
                     "/event_time",
                     sparrow_core::TimeRepresentation::UnixMillis,
                 )?;
-                store.ingest(&input.request_id, &input.source, "jsonl", &bytes, now)
+                store.ingest_with_durability(
+                    &input.request_id,
+                    &input.source,
+                    "jsonl",
+                    &bytes,
+                    now,
+                    mode,
+                )
             })
             .await
         {
@@ -1153,10 +1189,32 @@ impl wire::sparrow::Server for Rpc {
         _: wire::sparrow::StatusParams,
         mut results: wire::sparrow::StatusResults,
     ) -> capnp::Result<()> {
-        match self.work(|store, now| store.status(now)).await {
+        match self
+            .work(|store, now| Ok((store.status(now)?, store.durability_status()?)))
+            .await
+        {
             Err(e) => failure(results.get().init_result(), e),
-            Ok(value) => {
+            Ok((value, durability)) => {
                 let mut out = results.get().init_result().init_ok();
+                {
+                    let mut state = out.reborrow().init_durability_status();
+                    state.set_session_id(&durability.session_id);
+                    state.set_accepted_through(durability.accepted_through);
+                    state.set_durable_through(durability.durable_through);
+                    state.set_pending_writes(durability.pending_writes as u32);
+                    state.set_pending_bytes(durability.pending_bytes as u64);
+                    state.set_oldest_pending_ms(durability.oldest_pending_ms);
+                    state.set_max_pending_writes(sparrow_core::MAX_BUFFERED_WRITES as u32);
+                    state.set_max_pending_bytes(sparrow_core::MAX_BUFFERED_BYTES as u64);
+                    state.set_flush_interval_ms(durability.flush_interval_ms);
+                    state.set_flush_lag_ms(durability.flush_lag_ms);
+                    sparrow_client::encode_optional(
+                        state.init_failure(),
+                        durability.failure,
+                        |mut out, value| out.set_value(&value),
+                        |mut out| out.set_absent(()),
+                    );
+                }
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
@@ -1207,8 +1265,11 @@ impl wire::sparrow::Server for Rpc {
         let request_id = request.get_request_id()?.to_str()?.to_owned();
         let source = request.get_source()?.to_str()?.to_owned();
         let format = format(request.get_format()?);
+        let mode = durability_mode(request.get_durability()?);
         match self
-            .work(move |store, now| store.ingest(&request_id, &source, format, &bytes, now))
+            .work(move |store, now| {
+                store.ingest_with_durability(&request_id, &source, format, &bytes, now, mode)
+            })
             .await
         {
             Ok(value) => artifact(
@@ -1220,6 +1281,28 @@ impl wire::sparrow::Server for Rpc {
                     .map_err(|e| capnp::Error::failed(e.to_string()))?,
             )?,
             Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn flush(
+        self: Rc<Self>,
+        params: wire::sparrow::FlushParams,
+        mut results: wire::sparrow::FlushResults,
+    ) -> capnp::Result<()> {
+        let token = sparrow_client::DurabilityWatermark::decode(params.get()?.get_through()?)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        let required = sparrow_core::DurabilityWatermark {
+            store_id: token.store_id,
+            session_id: token.session_id,
+            sequence: token.sequence,
+        };
+        match self
+            .work(move |store, _| store.flush_through(&required))
+            .await
+        {
+            Ok(value) => durability_watermark(results.get().init_result().init_ok(), value)?,
+            Err(error) => failure(results.get().init_result(), error),
         }
         Ok(())
     }
@@ -1637,6 +1720,7 @@ mod tests {
         let store = Store::open(
             dir.path(),
             sparrow_core::Config {
+                buffered_flush_interval_ms: sparrow_core::DEFAULT_FLUSH_INTERVAL_MS,
                 disk_budget: 32 * 1024 * 1024,
                 maintenance_reserve: 4 * 1024 * 1024,
                 max_artifact_bytes: 1024 * 1024,

@@ -162,6 +162,86 @@ fn relay(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identity() {
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let socket = store_path.join("rpc.sock");
+        let config = write_server_config(dir.path(), &store_path, &socket);
+        let original = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{original}\nbuffered_flush_interval_ms = 60000\n")).unwrap();
+        let daemon = start(&config, &socket).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let client = sparrow_client::Client::connect(&socket).await.unwrap();
+        assert_eq!(client.discovery().flush_interval_ms, 60000);
+        let first = client.ingest_with_durability("buffered-rpc", "buffered-sdk", wire::Format::Json,
+            br#"{"message":"explicit flush evidence"}"#, wire::Durability::Buffered).await.unwrap();
+        assert_eq!(first.durability, wire::Durability::Buffered);
+        let fence = first.buffered_through.clone().unwrap();
+        assert_eq!(client.artifact(&first.id).await.unwrap(), first);
+        assert_eq!(client.ingest_with_durability("buffered-rpc", "buffered-sdk", wire::Format::Json,
+            br#"{"message":"explicit flush evidence"}"#, wire::Durability::Buffered).await.unwrap(), first);
+        let reached = client.flush(&fence).await.unwrap();
+        assert!(reached.sequence >= fence.sequence);
+        let durable = client.artifact(&first.id).await.unwrap();
+        assert_eq!(durable.id, first.id);
+        assert_eq!(durable.record_ids, first.record_ids);
+        assert_eq!(durable.durability, wire::Durability::Durable);
+        assert!(durable.buffered_through.is_none());
+        let mut event = delivery_event("buffered typed event");
+        event.sequence = 1;
+        let batch = sparrow_client::EventBatch { request_id: "buffered-event".into(),
+            source: "buffered-event-sdk".into(), client_instance: [7; 16], events: vec![event] };
+        let buffered_event = client.events_with_durability(&batch, wire::Durability::Buffered).await.unwrap();
+        assert_eq!(buffered_event.durability, wire::Durability::Buffered);
+        assert_eq!(client.events_with_durability(&batch, wire::Durability::Buffered).await.unwrap(), buffered_event);
+        let durable_event = client.events(&batch).await.unwrap();
+        assert_eq!(durable_event.id, buffered_event.id);
+        assert_eq!(durable_event.record_ids, buffered_event.record_ids);
+        assert_eq!(durable_event.durability, wire::Durability::Durable);
+        let second = client.ingest_with_durability("buffered-cli", "buffered-sdk", wire::Format::Log,
+            b"CLI flush evidence\n", wire::Durability::Buffered).await.unwrap();
+        let token = second.buffered_through.unwrap();
+        let cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            .arg(&socket).args(["flush", &token.store_id, &token.session_id, &token.sequence.to_string()])
+            .output().await.unwrap();
+        assert!(cli.status.success(), "{}", String::from_utf8_lossy(&cli.stderr));
+        assert!(String::from_utf8_lossy(&cli.stdout).contains("\"durability\":\"durable\""));
+        assert_eq!(client.artifact(&second.id).await.unwrap().durability, wire::Durability::Durable);
+        let third = client.ingest_with_durability("buffered-mcp", "buffered-sdk", wire::Format::Log,
+            b"MCP flush evidence\n", wire::Durability::Buffered).await.unwrap();
+        let token = third.buffered_through.unwrap();
+        let mut mcp = Mcp::start(&socket);
+        mcp.initialize(1).await;
+        let operation = mcp.tool(2, "flush", purrdf_lex::json::Object::new()
+            .with("store_id", token.store_id).with("session_id", token.session_id)
+            .with("sequence", token.sequence.to_string()).into()).await;
+        assert_eq!(operation["structuredContent"]["durability"].as_str(), Some("durable"));
+        mcp.close(true).await;
+        assert_eq!(client.artifact(&third.id).await.unwrap().durability, wire::Durability::Durable);
+        drop(client);
+        drop(daemon); // owned test process is killed/reaped, not gracefully flushed.
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::write(&config, format!("{original}\nbuffered_flush_interval_ms = 25\n")).unwrap();
+        let restarted = start(&config, &socket).await;
+        let recovered = sparrow_client::Client::connect(&socket).await.unwrap();
+        assert_eq!(recovered.artifact(&first.id).await.unwrap(), durable);
+        assert!(matches!(recovered.flush(&fence).await,
+            Err(sparrow_client::Error::Domain { code, retryable: false, .. }) if code == "STALE_WATERMARK"));
+        let next = recovered.ingest_with_durability("periodic", "buffered-sdk", wire::Format::Log,
+            b"automatic WAL boundary\n", wire::Durability::Buffered).await.unwrap();
+        assert_eq!(next.durability, wire::Durability::Buffered);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if recovered.artifact(&next.id).await.unwrap().durability == wire::Durability::Durable { break; }
+            assert!(Instant::now() < deadline, "periodic synchronization did not cover buffered acceptance");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(recovered); drop(restarted);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting() {
     use sparrow_client::FieldValue;
     use tracing_subscriber::prelude::*;
@@ -541,7 +621,7 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         let client = &connection.client;
         let response = client.status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_schema_version(), 11);
+        assert_eq!(status.get_schema_version(), sparrow_client::SCHEMA_VERSION);
         let store = status.get_store_id().unwrap().to_str().unwrap().to_owned();
         let mut input = vec![b'a'; sparrow_core::IMPORT_CHUNK_BYTES + 16 * 1024 * 1024 + 1];
         input[sparrow_core::IMPORT_CHUNK_BYTES - 1] = b'\n';
@@ -1426,7 +1506,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 18);
+    assert_eq!(definitions.len(), 19);
     assert!(
         !definitions
             .iter()
@@ -2039,7 +2119,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(11)
+        Some(u64::from(sparrow_client::SCHEMA_VERSION))
     );
     let unknown = mcp
         .call(

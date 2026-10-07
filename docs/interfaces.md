@@ -193,6 +193,7 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 | --- | --- | --- |
 | `capabilities` | None | API/store versions, supported formats/profiles, vocabulary and tool descriptions, limits, retention, and durability settings. |
 | `status` | None | Bounded storage/queue/projection/ingestion/pin metrics and pressure state. |
+| `flush` | Store ID, current session ID, decimal sequence | Typed synchronization through that fence; reached sequence, or stale/future/store refusal. |
 | `sources_list` | Filter, cursor, page size | Sources, active stream state, and known gaps. |
 | `artifacts_list` | Scope, cursor, page size | Artifact summaries with byte availability and projection state. |
 | `records_search` | Scope, text and/or filters, cursor, page size | Matching record summaries, text evidence, scores when applicable, and read receipt. |
@@ -318,7 +319,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | --- | --- |
 | `ingest`, `importBegin`/`importAppend`/`importGet`, `importSeal`/`importLayout`/`importPrepare`/`importPublish`/`importCancel` | Original bytes, occurrence identity and explicit durability. A partial stream cannot publish a complete artifact. |
 | `eventsIngest` | Bounded typed fields, independent event occurrences, producer instance/sequence identities, and stable batch retries. |
-| Planned flush and import status operations | Synchronization through a specified watermark; raw, projection, checkpoint and source-deletion state. |
+| `flush` | Synchronization through a specified store/session/sequence watermark; typed stale-session and future-sequence refusal. |
 | `status` and planned capabilities operation | Operational status and supported profiles/limits. |
 | `artifactGet`, `recordGet`, `bytesRead` | Store-scoped metadata and exact bounded ranges. |
 | `pin`, `pinRenew`, `pinRelease` | Durable all-or-nothing protection with stable retry identities; renewal optionally checks the current collection revision. |
@@ -454,7 +455,39 @@ normalized diagnostic RDF relationship view remains unfinished.
 Run `cargo run --release -p sparrow-client --example tracing -- SOCKET SOURCE`
 for application-owned scoped subscriber composition and an explicit durable
 shutdown. The worker and its queue/receipt/retry implementation are shared with
-direct producer events. Server-wide buffered/flush controls remain unfinished.
+direct producer events. Schema 12 adds explicit buffered/durable direct artifact
+and event-batch ingestion plus server WAL fences; the delivery worker retains
+its durable acknowledgment law.
+
+### Server WAL acceptance and synchronization
+
+`Ingest.durability` and `eventsIngest`'s durability argument default to `durable`.
+Buffered mode publishes the same atomic catalog/payload/index batch with WAL
+enabled, without promising synchronization. Its artifact receipt carries
+`bufferedThrough` with persistent store ID, fresh opened-session ID and native
+sequence. Durable receipts carry no buffered fence. Inspection/retry can upgrade
+a buffered acknowledgment to durable without changing occurrence IDs. Durability
+mode is not part of the original payload/request identity.
+
+The SDK exposes `ingest_with_durability`, `events_with_durability` and `flush`;
+CLI `flush STORE_ID SESSION_ID SEQUENCE` and MCP `flush` share the same typed
+client implementation. The MCP tool is a mutation and takes decimal-string
+`sequence`, `store_id` and `session_id`; its result identifies the reached fence.
+Flushing can cover later accepted writes while holding the serialized writer.
+Foreign stores, older sessions and future sequences are refused. After reopening,
+inspect the original artifact or retry the stable request to learn recovered
+state; a numeric sequence from another session cannot prove its survival.
+
+The durability ledger admits at most 256 unsynchronized atomic writes and 64 MiB
+of atomic batch byte charge. At either limit, new buffered acceptance refuses
+with retryable `STORAGE_PRESSURE` before publication. Default intended WAL sync is
+2000 ms, configurable from 1..60000 ms. Status exposes session, accepted/durable
+sequences, pending count/bytes, age, interval, lag and latched storage uncertainty.
+Any synchronized control write covers earlier WAL writes; empty control batches
+use explicit synchronization. Write/WAL-sync failure latches uncertainty and
+refuses further receipt certification until reopening. Opening synchronizes
+recovered data before starting a fresh session. These fences certify storage
+durability, not retention extension, producer drops or power-loss qualification.
 
 ## 8. Errors and compatibility
 

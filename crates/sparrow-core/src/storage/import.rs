@@ -439,7 +439,9 @@ impl Store {
         if let Some(receipt) =
             writer.accepted_ingest(request_id, source, format, byte_length, payload_id, now)?
         {
-            return Ok(ImportStart::Accepted(receipt));
+            return Ok(ImportStart::Accepted(
+                writer.receipt(receipt, super::durability::Durability::Durable)?,
+            ));
         }
         writer
             .begin_import(request_id, source, format, byte_length, payload_id, now)

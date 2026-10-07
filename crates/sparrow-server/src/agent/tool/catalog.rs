@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "flush",
+        "Synchronize through a specified current-session acceptance fence; earlier sessions and future sequences are refused.",
+    ),
+    (
         "source_time_define",
         "Durably bind an immutable source timestamp pointer and representation for future ingestions; identical retries are idempotent and conflicting mappings are refused.",
     ),
@@ -99,6 +103,13 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
+        if *name == "flush" {
+            properties = properties
+                .with("store_id", string())
+                .with("session_id", string())
+                .with("sequence", string());
+            required.extend(["store_id", "session_id", "sequence"]);
+        }
         if [
             "keys_list",
             "values_search",
@@ -322,7 +333,14 @@ pub(crate) fn definitions() -> Value {
                 Object::new()
                     .with(
                         "readOnlyHint",
-                        !["pin", "pin_release", "pin_renew", "source_time_define"].contains(name),
+                        ![
+                            "pin",
+                            "pin_release",
+                            "pin_renew",
+                            "source_time_define",
+                            "flush",
+                        ]
+                        .contains(name),
                     )
                     .with("destructiveHint", *name == "pin_release")
                     .with("idempotentHint", true)

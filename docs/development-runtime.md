@@ -54,8 +54,8 @@ The direct artifact/event-batch client and bounded `Delivery` worker are present
 The worker reconnects with immutable pending requests and returns durable
 admitted-input fences through flush/shutdown. The composable `TracingLayer` now
 captures bounded typed fields and span callbacks through that same worker.
-Explicit buffered server acknowledgments and the shared server WAL flush
-contract remain required work. Full server acceptance remains unmet.
+Schema 12 below adds explicit buffered server acknowledgments and the shared
+WAL flush contract. Full server acceptance remains unmet.
 
 ### Schema 11: typed producer event batches
 
@@ -97,7 +97,7 @@ span context, exact timestamp evidence spans, temporal/text retrieval, unchanged
 receipts after restart, changed NaN-payload conflict, and oversized/invalid input
 refusal. The `Delivery` worker below supplies automatic batching/reconnection,
 drop counters and durable admitted-input fences. Tracing callbacks are implemented
-below; explicit buffered server writes and their WAL flush contract remain unfinished.
+below; schema 12 also provides explicit buffered server writes and WAL fences.
 
 The owned development daemon was replaced with this qualified schema-11 build
 on 2026-10-07. It retained store
@@ -164,7 +164,7 @@ handle cancels the owned worker; it does not promise a flush or producer-process
 survival. Empty shutdown returns no fabricated receipt.
 
 This is durable delivery for this producer's admitted events. It does not expose
-a server-wide flush or claim the unfinished buffered-WAL acknowledgement mode.
+a server-wide flush; schema 12 supplies a separate accepted-storage fence.
 Every current event batch receipt must be `durable` before queue retirement.
 
 Release scenarios use real temporary daemons and a typed forwarding relay that
@@ -237,8 +237,8 @@ the admitted/drop fence. Client scenarios exercise sticky formatting refusal,
 failed-update invalidation, reclamation of the 1024-span admission capacity and
 unique producer identities across independent subscriber registries sharing one
 worker. Direct typed span producers sharing it use `Delivery::next_span_id` too.
-These checks do not establish sustained throughput or process RSS. Server-wide
-buffered/WAL-flush controls and normalized diagnostic RDF relationships remain
+These checks do not establish sustained throughput or process RSS. Schema 12
+adds buffered/WAL-flush controls; normalized diagnostic RDF relationships remain
 unfinished.
 
 The full release-profile `make check` passed: eight client unit tests, 56 core
@@ -255,6 +255,72 @@ interval `[2026-10-07T16:42:42.365Z, 2026-10-07T16:42:42.366Z)` each recovered l
 record `record:d04d979eee5329d44da61b9f138c5ca5`, with original field-byte evidence
 and zero unknown time or failed text coverage. The daemon remained at the same
 store identity and private socket; no sibling producer or service was changed.
+
+### Schema 12: explicit buffered acceptance and WAL fences
+
+Direct SDK artifact/event ingestion can request `Durability::Buffered` through
+`ingest_with_durability` / `events_with_durability`; existing default methods and
+the tracing delivery worker still require durable acknowledgment. Buffered
+acceptance uses the same atomic catalog, payload and native-index publication
+with WAL enabled. Its receipt carries a `buffered_through` store/session/sequence
+fence. `Client::flush(&fence)`, CLI `flush STORE_ID SESSION_ID SEQUENCE` and MCP
+`flush` route through one typed SDK helper. Inspection/retry upgrades durability
+without replacing occurrence IDs; mode changes do not change request identity.
+
+The server ledger refuses a new buffered write before publication at 256 pending
+writes or 64 MiB of atomic batch byte charge. Repeated requests consume no new
+ledger entry. Successful synchronized writes/explicit WAL sync retire earlier
+pending charges. Empty control batches use an explicit sync rather than treating
+an empty write as a boundary. Write/WAL-sync failure latches uncertainty and
+refuses receipt certification until the store is reopened. Native WAL is shared
+across families; see [RocksDB WAL](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-(WAL)).
+
+The default intended periodic sync interval is 2000 ms, configurable through
+`buffered_flush_interval_ms` from 1 to 60000. It is not a disk latency guarantee.
+CLI/MCP status advertises accepted/durable sequences, session, pending writes,
+batch bytes, oldest age, interval, lag and failure. Reopening first synchronizes
+recovered data and starts a fresh session. Older-session and future fences are
+refused; inspect/retry the original artifact to determine recovered state.
+Fences do not extend retention or certify producer-side drops.
+
+Storage scenarios cover buffered retry identity, count and byte pressure without
+prefix publication, foreign/stale/future fence refusal, durable retries and
+completed-file import acknowledgments, empty control batches, queue retirement
+and reopen. Real-daemon acceptance exercises SDK/CLI/stdio MCP flush, buffered
+artifact/event requests, durable mode upgrade, killed-process durable recovery,
+old-session refusal and automatic periodic synchronization. These scenarios
+qualify the ordinary native API paths; injected host power loss and real failed
+disk/WAL synchronization, peak RSS and sustained pressure remain unqualified.
+
+The full `make check` passed with 60 storage scenarios, nine real-daemon/MCP
+scenarios, the other workspace checks, release Clippy with warnings denied and
+the seeded/pinned helper census. All 68 ledger jobs hold with zero distinct
+exceptions or unsanctioned isomorphic groups.
+
+The previous development process was absent and its owned stale socket refused
+connections. After verifying no listener/process remained, that endpoint alone
+was removed; the database was preserved. The qualified schema-12 executable now
+runs under the owned transient user unit `sparrow-development.service`, PID
+1857046 at verification, at the existing `development-v5/rpc.sock` and persistent
+store identity `store:46c88e949ccec658600b66c7becd5bb7`. This unit survives tool
+session closure; it is development supervision, not installed reboot persistence
+or qualified crash-restart automation. Inspect it with:
+
+```sh
+systemctl --user status sparrow-development.service
+target/release/sparrow /home/paudley/.local/state/sparrow/development-v5/rpc.sock status
+```
+
+Live buffered event acceptance under `acceptance-schema12-buffered` returned
+`artifact:adccc56dea73a970301e12bea670da6f`, 375 bytes, one record, fence sequence
+554975 in session `session:273a5f33ffa9525f8e30471fb856779f`. Immediate status
+showed one pending write with 161922 batch bytes and a lower durable sequence.
+CLI flush reached 554978; an identical request in durable mode returned the same
+artifact. Native temporal/full-text retrieval at
+`2023-11-14T22:13:20.004Z` recovered
+`record:4663ac26601dd8b25ccf6cd886b7217b`, with zero unknown time or failed text
+coverage and original source spans. Directory/socket modes remained 0700/0600.
+No producer input or sibling/model service was changed.
 
 ## CLI investigations
 

@@ -12,8 +12,9 @@ persistent native full-text retrieval, bounded
 record context, durable stable-ID pin renewal and paginated pin discovery,
 persistent native JSON/Markdown RDF dictionaries and six-way
 quad indexes, a standalone typed producer client with bounded delivery and a
-composable tracing layer, and helper-census tooling are implemented. Stored-view SPARQL,
-server-wide buffered/flush controls, ingestion watchers/syslog and
+composable tracing layer, bounded buffered/durable ingestion with session-scoped
+WAL flush controls, and helper-census tooling are implemented. Stored-view SPARQL,
+ingestion watchers/syslog and
 full architecture acceptance
 remain unfinished. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.

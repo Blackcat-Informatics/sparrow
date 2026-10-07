@@ -13,7 +13,45 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         result::Error(error) => return Err(failure(error?)),
     };
     sparrow_client::Discovery::decode(value)?;
+    let durability = value.get_durability_status()?;
+    let state = Object::new()
+        .with("session_id", durability.get_session_id()?.to_str()?)
+        .with(
+            "accepted_through",
+            durability.get_accepted_through().to_string(),
+        )
+        .with(
+            "durable_through",
+            durability.get_durable_through().to_string(),
+        )
+        .with("pending_writes", u64::from(durability.get_pending_writes()))
+        .with("pending_bytes", durability.get_pending_bytes().to_string())
+        .with(
+            "oldest_pending_ms",
+            durability.get_oldest_pending_ms().to_string(),
+        )
+        .with("flush_lag_ms", durability.get_flush_lag_ms().to_string())
+        .with(
+            "flush_interval_ms",
+            u64::from(durability.get_flush_interval_ms()),
+        )
+        .with(
+            "max_pending_writes",
+            u64::from(durability.get_max_pending_writes()),
+        )
+        .with(
+            "max_pending_bytes",
+            durability.get_max_pending_bytes().to_string(),
+        )
+        .with(
+            "failure",
+            match durability.get_failure()?.which()? {
+                wire::optional_text::Absent(()) => Value::Null,
+                wire::optional_text::Value(value) => Value::from(value?.to_str()?),
+            },
+        );
     let output = Object::new()
+        .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("store_format", value.get_store_format()?.to_str()?)
         .with("schema_version", u64::from(value.get_schema_version()))

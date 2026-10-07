@@ -44,6 +44,11 @@ pub(super) fn render(artifact: wire::artifact::Reader<'_>) -> Result<Value> {
 }
 
 fn render_receipt(artifact: sparrow_client::ArtifactReceipt) -> Result<Value> {
+    let buffered = artifact
+        .buffered_through
+        .as_ref()
+        .map(super::durability::watermark)
+        .unwrap_or(Value::Null);
     let records = artifact
         .record_ids
         .into_iter()
@@ -67,6 +72,7 @@ fn render_receipt(artifact: sparrow_client::ArtifactReceipt) -> Result<Value> {
         .with("byte_length", artifact.byte_length.to_string())
         .with("payload_id", artifact.payload_id)
         .with("record_ids", Value::array(records))
+        .with("buffered_through", buffered)
         .with(
             "durability",
             match artifact.durability {

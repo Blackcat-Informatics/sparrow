@@ -7,6 +7,279 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 
 const DAY: u64 = 86_400_000;
 
+#[test]
+fn buffered_acceptance_has_a_session_fence_and_flush_covers_all_dependencies() {
+    use sparrow_core::Durability;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let first = store
+        .ingest_with_durability(
+            "buffered",
+            "source",
+            "json",
+            br#"{"message":"buffered evidence"}"#,
+            100,
+            Durability::Buffered,
+        )
+        .unwrap();
+    let fence = first.buffered.clone().unwrap();
+    let retry = store
+        .ingest_with_durability(
+            "buffered",
+            "source",
+            "json",
+            br#"{"message":"buffered evidence"}"#,
+            101,
+            Durability::Buffered,
+        )
+        .unwrap();
+    assert_eq!(retry.id, first.id);
+    assert_eq!(retry.buffered, first.buffered);
+    assert_eq!(store.artifact(&first.id).unwrap().buffered, first.buffered);
+    assert_eq!(
+        store
+            .bytes(&first.id, 0, first.byte_length as usize, 100)
+            .unwrap(),
+        br#"{"message":"buffered evidence"}"#
+    );
+    let second = store
+        .ingest_with_durability(
+            "second",
+            "source",
+            "log",
+            b"second\n",
+            100,
+            Durability::Buffered,
+        )
+        .unwrap();
+    let state = store.durability_status().unwrap();
+    assert_eq!(state.pending_writes, 2);
+    assert!(state.pending_bytes > 0);
+    assert!(state.durable_through < fence.sequence);
+    for (token, code) in [
+        (
+            sparrow_core::DurabilityWatermark {
+                store_id: "store:other".into(),
+                ..fence.clone()
+            },
+            "STORE_MISMATCH",
+        ),
+        (
+            sparrow_core::DurabilityWatermark {
+                session_id: "session:other".into(),
+                ..fence.clone()
+            },
+            "STALE_WATERMARK",
+        ),
+        (
+            sparrow_core::DurabilityWatermark {
+                sequence: state.accepted_through + 1,
+                ..fence.clone()
+            },
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        assert_eq!(store.flush_through(&token).unwrap_err().code, code);
+        assert_eq!(store.durability_status().unwrap().pending_writes, 2);
+    }
+    let reached = store.flush_through(&fence).unwrap();
+    assert!(reached.sequence >= second.buffered.as_ref().unwrap().sequence);
+    assert_eq!(store.durability_status().unwrap().pending_writes, 0);
+    assert_eq!(store.durability_status().unwrap().pending_bytes, 0);
+    assert!(store.artifact(&first.id).unwrap().buffered.is_none());
+    assert!(store.artifact(&second.id).unwrap().buffered.is_none());
+    assert!(
+        store
+            .ingest(
+                "buffered",
+                "source",
+                "json",
+                br#"{"message":"buffered evidence"}"#,
+                102
+            )
+            .unwrap()
+            .buffered
+            .is_none()
+    );
+    drop(store);
+    let reopened = Store::open(dir.path(), config()).unwrap();
+    assert!(reopened.artifact(&first.id).unwrap().buffered.is_none());
+    assert_ne!(
+        reopened.durability_status().unwrap().session_id,
+        reached.session_id
+    );
+    assert_eq!(
+        reopened.flush_through(&fence).unwrap_err().code,
+        "STALE_WATERMARK"
+    );
+}
+
+#[test]
+fn buffered_ledger_refuses_the_next_write_without_publishing_a_prefix() {
+    use sparrow_core::Durability;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut first = None;
+    for number in 0..sparrow_core::MAX_BUFFERED_WRITES {
+        let artifact = store
+            .ingest_with_durability(
+                &format!("queue-{number}"),
+                "queue",
+                "opaque",
+                b"x",
+                0,
+                Durability::Buffered,
+            )
+            .unwrap();
+        first.get_or_insert(artifact);
+    }
+    assert_eq!(
+        store.durability_status().unwrap().pending_writes,
+        sparrow_core::MAX_BUFFERED_WRITES
+    );
+    assert!(store.durability_status().unwrap().pending_bytes <= sparrow_core::MAX_BUFFERED_BYTES);
+    assert_eq!(
+        store
+            .ingest_with_durability("overflow", "queue", "opaque", b"x", 0, Durability::Buffered)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    assert_eq!(
+        store.artifacts(0).unwrap().len(),
+        sparrow_core::MAX_BUFFERED_WRITES
+    );
+    store
+        .flush_through(first.unwrap().buffered.as_ref().unwrap())
+        .unwrap();
+    let accepted = store
+        .ingest_with_durability("overflow", "queue", "opaque", b"x", 0, Durability::Buffered)
+        .unwrap();
+    assert!(accepted.buffered.is_some());
+    store.flush_buffered().unwrap();
+    assert!(store.artifact(&accepted.id).unwrap().buffered.is_none());
+}
+
+#[test]
+fn buffered_batch_byte_charge_refuses_new_unique_payloads_before_the_write_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut input = vec![b'x'; 512 * 1024];
+    let mut accepted = 0;
+    let mut first = None;
+    loop {
+        // Distinct every payload chunk: changing only the first chunk would
+        // correctly deduplicate the remaining bytes and exercise the write cap.
+        for (index, chunk) in input
+            .chunks_mut(sparrow_core::IMPORT_CHUNK_BYTES)
+            .enumerate()
+        {
+            chunk[..8].copy_from_slice(&(accepted as u64).to_le_bytes());
+            chunk[8..16].copy_from_slice(&(index as u64).to_le_bytes());
+        }
+        match store.ingest_with_durability(
+            &format!("bytes-{accepted}"),
+            "byte-queue",
+            "opaque",
+            &input,
+            0,
+            sparrow_core::Durability::Buffered,
+        ) {
+            Ok(artifact) => {
+                first.get_or_insert(artifact);
+                accepted += 1;
+            }
+            Err(error) => {
+                assert_eq!(error.code, "STORAGE_PRESSURE");
+                break;
+            }
+        }
+        assert!(
+            accepted < sparrow_core::MAX_BUFFERED_WRITES,
+            "byte quota did not limit the queue"
+        );
+    }
+    assert!(accepted > 0);
+    assert!(accepted < sparrow_core::MAX_BUFFERED_WRITES);
+    let state = store.durability_status().unwrap();
+    assert_eq!(state.pending_writes, accepted);
+    assert!(state.pending_bytes <= sparrow_core::MAX_BUFFERED_BYTES);
+    assert_eq!(store.artifacts(0).unwrap().len(), accepted);
+    store
+        .flush_through(first.unwrap().buffered.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(store.durability_status().unwrap().pending_bytes, 0);
+    assert!(
+        store
+            .ingest_with_durability(
+                &format!("bytes-{accepted}"),
+                "byte-queue",
+                "opaque",
+                &input,
+                0,
+                sparrow_core::Durability::Buffered
+            )
+            .unwrap()
+            .buffered
+            .is_some()
+    );
+}
+
+#[test]
+fn durable_retries_import_receipts_and_empty_control_batches_cover_buffered_intake() {
+    use sparrow_core::Durability;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let first = store
+        .ingest_with_durability(
+            "retry-durable",
+            "source",
+            "log",
+            b"x",
+            0,
+            Durability::Buffered,
+        )
+        .unwrap();
+    assert!(first.buffered.is_some());
+    assert!(
+        store
+            .ingest("retry-durable", "source", "log", b"x", 1)
+            .unwrap()
+            .buffered
+            .is_none()
+    );
+    let second = store
+        .ingest_with_durability(
+            "import-durable",
+            "source",
+            "log",
+            b"x",
+            0,
+            Durability::Buffered,
+        )
+        .unwrap();
+    let imported = store
+        .import_start("import-durable", "source", "log", 1, &second.payload_id, 0)
+        .unwrap();
+    match imported {
+        sparrow_core::ImportStart::Accepted(artifact) => assert!(artifact.buffered.is_none()),
+        _ => panic!("accepted request became a staged import"),
+    }
+    let third = store
+        .ingest_with_durability(
+            "empty-control",
+            "source",
+            "log",
+            b"x",
+            0,
+            Durability::Buffered,
+        )
+        .unwrap();
+    assert!(third.buffered.is_some());
+    assert_eq!(store.expire(0).unwrap(), 0);
+    assert!(store.artifact(&third.id).unwrap().buffered.is_none());
+}
+
 fn oversized_jsonl_fixture() -> Vec<u8> {
     let mut input = b"{}\n{\"message\":\"".to_vec();
     let start = input.len();
@@ -2934,6 +3207,7 @@ fn standard_text_lexicons_are_required() {
 
 fn config() -> Config {
     Config {
+        buffered_flush_interval_ms: sparrow_core::DEFAULT_FLUSH_INTERVAL_MS,
         disk_budget: 128 * 1024 * 1024,
         maintenance_reserve: 8 * 1024 * 1024,
         max_artifact_bytes: 8 * 1024 * 1024,

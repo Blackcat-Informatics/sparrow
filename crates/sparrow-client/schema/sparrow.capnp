@@ -9,6 +9,15 @@ struct OptionalText { union { absent @0 :Void; value @1 :Text; } }
 struct Evidence { storeId @0 :Text; union { artifact @1 :Text; record @2 :Text; } }
 enum Format { jsonl @0; log @1; json @2; markdown @3; opaque @4; }
 enum Durability { buffered @0; durable @1; }
+struct DurabilityWatermark { storeId @0 :Text; sessionId @1 :Text; sequence @2 :UInt64; }
+struct OptionalDurabilityWatermark { union { absent @0 :Void; value @1 :DurabilityWatermark; } }
+struct DurabilityStatus {
+  sessionId @0 :Text; acceptedThrough @1 :UInt64; durableThrough @2 :UInt64;
+  pendingWrites @3 :UInt32; pendingBytes @4 :UInt64;
+  oldestPendingMs @5 :UInt64; failure @6 :OptionalText;
+  maxPendingWrites @7 :UInt32; maxPendingBytes @8 :UInt64;
+  flushIntervalMs @9 :UInt32; flushLagMs @10 :UInt64;
+}
 enum JsonKind { string @0; number @1; booleanTrue @2; booleanFalse @3; null @4; array @5; object @6; }
 struct OptionalKind { union { absent @0 :Void; value @1 :JsonKind; } }
 struct Artifact {
@@ -16,6 +25,7 @@ struct Artifact {
   receivedAt @4 :Instant; expiresAt @5 :Instant; byteLength @6 :UInt64;
   payloadId @7 :Text; recordIds @8 :List(Text);
   durability @9 :Durability = durable;
+  bufferedThrough @10 :OptionalDurabilityWatermark;
 }
 struct ArtifactRef { storeId @0 :Text; id @1 :Text; }
 struct RecordRef { storeId @0 :Text; id @1 :Text; }
@@ -66,6 +76,7 @@ struct Status {
   pinReadHandles @17 :UInt64; pinReadBytes @18 :UInt64;
   maxPinReadHandles @19 :UInt64; maxPinReadBytes @20 :UInt64; pinReadLeaseMs @21 :UInt64;
   maxEventBatchBytes @22 :UInt32; maxEventBatchEvents @23 :UInt32;
+  durabilityStatus @24 :DurabilityStatus;
 }
 
 struct WideInteger { high @0 :UInt64; low @1 :UInt64; }
@@ -95,6 +106,7 @@ struct EventBatch {
 }
 struct Ingest {
   requestId @0 :Text; source @1 :Text; format @2 :Format; bytes @3 :Data;
+  durability @4 :Durability = durable;
 }
 struct ReadBytes { evidence @0 :Evidence; offset @1 :UInt64; length @2 :UInt32; }
 struct Bytes { storeId @0 :Text; data @1 :Data; }
@@ -277,5 +289,6 @@ interface Sparrow {
   importPrepare @22 (request :ImportPrepare) -> (result :Result(ImportPreparation));
   importPublish @23 (import :ImportRef) -> (result :Result(Artifact));
   importCancel @24 (import :ImportRef) -> (result :Result(ImportCanceled));
-  eventsIngest @25 (batch :EventBatch) -> (result :Result(Artifact));
+  eventsIngest @25 (batch :EventBatch, durability :Durability = durable) -> (result :Result(Artifact));
+  flush @26 (through :DurabilityWatermark) -> (result :Result(DurabilityWatermark));
 }

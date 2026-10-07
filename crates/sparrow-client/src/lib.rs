@@ -30,7 +30,7 @@ pub use transport::{Connection, connect};
 mod error;
 pub use error::Error;
 mod receipt;
-pub use receipt::{ArtifactReceipt, Discovery};
+pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through};
 mod imports;
 pub use imports::import_file;
 mod events;
@@ -48,7 +48,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -111,7 +111,18 @@ impl Client {
     /// Accept an atomic typed event batch using the caller's stable retry identity.
     /// A transport failure requires retrying this same immutable batch.
     pub async fn events(&self, batch: &EventBatch) -> Result<ArtifactReceipt, Error> {
+        self.events_with_durability(batch, Durability::Durable)
+            .await
+    }
+
+    /// Accept a typed batch at an explicit acknowledgment boundary; identity is unchanged by the mode.
+    pub async fn events_with_durability(
+        &self,
+        batch: &EventBatch,
+        durability: Durability,
+    ) -> Result<ArtifactReceipt, Error> {
         let mut request = self.capability().events_ingest_request();
+        request.get().set_durability(durability);
         batch.encode(request.get().init_batch())?;
         let response = request.send().promise.await?;
         match response.get()?.get_result()?.which()? {
@@ -140,13 +151,26 @@ impl Client {
     }
 
     /// Accept one bounded complete artifact with the caller's stable retry identity.
-    /// This server generation returns durable receipts; it has no buffered-write mode.
+    /// Default acceptance is durable; use `ingest_with_durability` for a buffered fence.
     pub async fn ingest(
         &self,
         request_id: &str,
         source: &str,
         format: Format,
         bytes: &[u8],
+    ) -> Result<ArtifactReceipt, Error> {
+        self.ingest_with_durability(request_id, source, format, bytes, Durability::Durable)
+            .await
+    }
+
+    /// Accept a complete artifact with explicit buffered or durable acknowledgment.
+    pub async fn ingest_with_durability(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: Format,
+        bytes: &[u8],
+        durability: Durability,
     ) -> Result<ArtifactReceipt, Error> {
         if request_id.is_empty()
             || request_id.len() > 128
@@ -168,11 +192,23 @@ impl Client {
         input.set_source(source);
         input.set_format(format);
         input.set_bytes(bytes);
+        input.set_durability(durability);
         let response = request.send().promise.await?;
         match response.get()?.get_result()?.which()? {
             sparrow_capnp::result::Ok(value) => ArtifactReceipt::decode(value?),
             sparrow_capnp::result::Error(error) => Err(Error::domain(error?)),
         }
+    }
+
+    /// Synchronize through a current-session acceptance fence. Timeout/transport loss
+    /// leaves synchronization unknown and permits retrying this same fence.
+    pub async fn flush(&self, through: &DurabilityWatermark) -> Result<DurabilityWatermark, Error> {
+        if through.store_id != self.discovery.store_id {
+            return Err(Error::InvalidArgument(
+                "durability fence belongs to another discovered store",
+            ));
+        }
+        flush_through(self.capability(), through).await
     }
 
     /// Stream a completed regular file through the same implementation used by the CLI.

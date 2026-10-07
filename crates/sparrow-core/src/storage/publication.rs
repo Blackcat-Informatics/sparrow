@@ -435,6 +435,7 @@ impl Store {
             ));
         }
         let artifact = Artifact {
+            buffered: None,
             id: progress.artifact_id,
             source: manifest.source.clone(),
             format: manifest.format.clone(),

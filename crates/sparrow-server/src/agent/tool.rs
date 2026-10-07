@@ -54,6 +54,11 @@ impl Operation {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
                 "status" => Self::Status,
+                "flush" => Self::Query(Command::Flush(sparrow_client::DurabilityWatermark {
+                    store_id: fields.required("store_id")?,
+                    session_id: fields.required("session_id")?,
+                    sequence: fields.required_with("sequence", super::decimal_u64)?,
+                })),
                 "source_time_define" | "source_time_get" => {
                     let definition = if name == "source_time_define" {
                         let representation: String = fields.required("representation")?;
@@ -180,17 +185,7 @@ impl Operation {
                 "bytes_read" => Self::Bytes {
                     store: fields.required("store_id")?,
                     id: fields.required("id")?,
-                    offset: fields.required_with("offset", |value| {
-                        value
-                            .as_str()
-                            .filter(|v| {
-                                !v.is_empty() && v.as_bytes().iter().all(u8::is_ascii_digit)
-                            })
-                            .and_then(|v| v.parse().ok())
-                            .ok_or_else(|| {
-                                DecodeError::invalid_value(value, "decimal UInt64 string")
-                            })
-                    })?,
+                    offset: fields.required_with("offset", super::decimal_u64)?,
                     length: fields.required("length")?,
                     encoding: fields
                         .raw("encoding")?

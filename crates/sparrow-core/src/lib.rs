@@ -15,6 +15,10 @@ pub use query::{
     EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, RecordQuery,
 };
 pub use storage::context::{Context, ContextFrontier, ContextSide};
+pub use storage::durability::{
+    DEFAULT_FLUSH_INTERVAL_MS, Durability, DurabilityStatus, DurabilityWatermark,
+    MAX_BUFFERED_BYTES, MAX_BUFFERED_WRITES,
+};
 pub use storage::import::{
     IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,
     ImportRecordSpan, ImportStart,

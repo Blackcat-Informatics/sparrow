@@ -16,6 +16,7 @@ use rocksdb::{
 };
 
 pub(crate) mod context;
+pub(crate) mod durability;
 pub(crate) mod import;
 mod ingest;
 pub(crate) mod pin_read;
@@ -146,6 +147,8 @@ impl From<rocksdb::Error> for Error {
 /// Explicit, bounded storage admission configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Intended WAL synchronization interval, 1..=60000 milliseconds.
+    pub buffered_flush_interval_ms: u32,
     /// Physical database budget including maintenance reserve.
     pub disk_budget: u64,
     /// Capacity withheld for compaction and control mutations.
@@ -162,6 +165,12 @@ pub struct Config {
 
 impl Config {
     fn validate(&self) -> Result<(), Error> {
+        if !(1..=60000).contains(&self.buffered_flush_interval_ms) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "buffered_flush_interval_ms must be 1..60000",
+            ));
+        }
         if self.maintenance_reserve < 1024 * 1024
             || self.disk_budget <= self.maintenance_reserve
             || self.max_artifact_bytes == 0
@@ -180,6 +189,9 @@ impl Config {
 /// A complete artifact occurrence and its source provenance.
 #[derive(Clone, Debug)]
 pub struct Artifact {
+    /// Present only while this current-session acceptance is not synchronized.
+    /// Catalog encoding excludes this ephemeral receipt state.
+    pub buffered: Option<durability::DurabilityWatermark>,
     /// Stable store-local occurrence identity.
     pub id: String,
     /// Logical source label, independent of payload identity.
@@ -286,6 +298,7 @@ struct Writer {
     db: DB,
     id: String,
     config: Config,
+    durability: std::cell::RefCell<durability::State>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -382,6 +395,7 @@ impl Catalog for Artifact {
 
     fn decode(v: &Value) -> Result<Self, Error> {
         Ok(Self {
+            buffered: None,
             id: read_field::<String>(v, "id")?,
             source: read_field::<String>(v, "source")?,
             format: read_field::<String>(v, "format")?,
@@ -511,10 +525,7 @@ impl Writer {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), Error> {
-        let mut options = WriteOptions::default();
-        options.set_sync(true);
-        self.db.write_opt(batch, &options)?;
-        Ok(())
+        self.apply(batch, None)
     }
 
     fn get<T: Catalog>(&self, key: &str) -> Result<T, Error> {
@@ -745,8 +756,19 @@ impl Store {
                 ));
             }
         }
+        // Recovered buffered writes are certified only after a real synchronization.
+        db.flush_wal(true)?;
+        let durability = std::cell::RefCell::new(durability::State::new(
+            random_id("session")?,
+            db.latest_sequence_number(),
+        ));
         Ok(Self {
-            inner: Arc::new(Mutex::new(Writer { db, id, config })),
+            inner: Arc::new(Mutex::new(Writer {
+                db,
+                id,
+                config,
+                durability,
+            })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
         })
     }
@@ -776,6 +798,26 @@ impl Store {
         bytes: &[u8],
         now: u64,
     ) -> Result<Artifact, Error> {
+        self.ingest_with_durability(
+            request_id,
+            source,
+            format,
+            bytes,
+            now,
+            durability::Durability::Durable,
+        )
+    }
+
+    /// Accept a complete atomic artifact at the caller's explicit WAL boundary.
+    pub fn ingest_with_durability(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        bytes: &[u8],
+        now: u64,
+        mode: durability::Durability,
+    ) -> Result<Artifact, Error> {
         validate_ingest_labels(request_id, source, format)?;
         let writer = self.lock()?;
         if bytes.len() > writer.config.max_artifact_bytes {
@@ -793,7 +835,7 @@ impl Store {
             &payload_id,
             now,
         )? {
-            return Ok(receipt);
+            return writer.receipt(receipt, mode);
         }
         if writer.db.get(import::import_id(request_id))?.is_some() {
             return Err(Error::new(
@@ -840,6 +882,7 @@ impl Store {
         }
         let ingest::PreparedRecords { mut batch, chunks } = prepared.finish()?;
         let artifact = Artifact {
+            buffered: None,
             id,
             source: source.to_owned(),
             format: format.to_owned(),
@@ -859,13 +902,20 @@ impl Store {
                 "atomic ingestion batch exceeds 128 MiB; split the import into smaller complete artifacts",
             ));
         }
-        writer.commit(batch)?;
-        Ok(artifact)
+        writer.apply(
+            batch,
+            (mode == durability::Durability::Buffered).then_some(artifact.id.as_str()),
+        )?;
+        writer.receipt(artifact, mode)
     }
 
     /// Read artifact metadata, including known expired or evicted artifacts.
     pub fn artifact(&self, id: &str) -> Result<Artifact, Error> {
-        self.evidence(id, "artifact:")
+        if !id.starts_with("artifact:") {
+            return Err(Error::new("INVALID_ARGUMENT", "wrong evidence kind"));
+        }
+        let writer = self.lock()?;
+        writer.receipt(writer.get(id)?, durability::Durability::Buffered)
     }
 
     /// Read record metadata, including minimal parent provenance.
@@ -880,16 +930,6 @@ impl Store {
         let record = writer.get(id)?;
         writer.validate_event_record(&record)?;
         Ok(record)
-    }
-
-    fn evidence<T: Catalog>(&self, id: &str, prefix: &str) -> Result<T, Error> {
-        if !id.starts_with(prefix) {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                format!("metadata requires an identity with prefix {prefix}"),
-            ));
-        }
-        self.lock()?.get(id)
     }
 
     /// Capture currently eligible record membership at an explicit server instant.
@@ -1092,11 +1132,12 @@ impl Store {
     pub fn artifacts(&self, now: u64) -> Result<Vec<Artifact>, Error> {
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
-        Ok(writer
+        writer
             .list::<Artifact>("artifact:")?
             .into_iter()
             .filter(|artifact| writer.live_artifact(artifact, now, &protected))
-            .collect())
+            .map(|artifact| writer.receipt(artifact, durability::Durability::Buffered))
+            .collect::<Result<Vec<_>, _>>()
     }
 
     /// Read an exact bounded range of complete artifact or retained record bytes.
@@ -1420,7 +1461,7 @@ impl Store {
     /// Synchronize accepted writes and flush both catalog and payload families.
     pub fn flush(&self) -> Result<(), Error> {
         let writer = self.lock()?;
-        writer.db.flush_wal(true)?;
+        writer.synchronize()?;
         writer.db.flush()?;
         writer.db.flush_cf(
             writer

@@ -2,6 +2,132 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "store-wal-write"
+summary = "One WAL-enabled atomic write boundary admits bounded buffered batches or synchronizes durable controls."
+home = "sparrow_core::storage::Writer::apply"
+entry_points = ["sparrow_core::storage::Writer::commit"]
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(commit_buffered_artifact_again|commit_durable_artifact_again)$']
+
+[[job]]
+id = "store-wal-synchronize"
+summary = "Certify a sequence and retire pending ownership only after successful WAL synchronization; latch uncertainty on failure."
+home = "sparrow_core::storage::Writer::synchronize"
+entry_points = ["sparrow_core::storage::Store::flush_buffered"]
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(flush_ingestion_wal_again|flush_control_wal_again)$']
+
+[[job]]
+id = "store-artifact-durability"
+summary = "Attach current buffered fences or force durability on stable request replay without changing occurrence metadata."
+home = "sparrow_core::storage::Writer::receipt"
+entry_points = []
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(buffered_artifact_receipt_again|durable_artifact_retry_again)$']
+
+[[job]]
+id = "store-durability-fence"
+summary = "Validate store/session/native-sequence binding before synchronization; refuse stale and future fences."
+home = "sparrow_core::storage::Store::flush_through"
+entry_points = []
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(flush_foreign_session_again|flush_artifact_sequence_again)$']
+
+[[job]]
+id = "store-durability-telemetry"
+summary = "Report bounded unsynchronized batch count/bytes, age/lag and latched failure from the serialized store owner."
+home = "sparrow_core::storage::Store::durability_status"
+entry_points = []
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(measure_pending_wal_age_again|measure_pending_wal_bytes_again)$']
+
+[[job]]
+id = "typed-durability-fence"
+summary = "One generated typed fence codec for direct client and RPC adaptation, with bounded store/session identities."
+home = "sparrow_client::receipt::DurabilityWatermark::encode"
+entry_points = ["sparrow_client::receipt::DurabilityWatermark::decode"]
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_flush_token_again|decode_flush_token_again)$']
+
+[[job]]
+id = "typed-durability-flush"
+summary = "SDK, CLI and MCP share the typed flush call and validate returned coverage of the same store/session fence."
+home = "sparrow_client::receipt::flush_through"
+entry_points = ["sparrow_client::Client::flush"]
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(flush_cli_rpc_again|flush_mcp_rpc_again)$']
+
+[[job]]
+id = "agent-durability-rendering"
+summary = "Artifact receipts and flush results share one agent-only decimal-string fence renderer."
+home = "sparrow_server::agent::durability::watermark"
+entry_points = []
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_artifact_flush_token_again|render_flush_result_token_again)$']
+
+[[job]]
+id = "agent-decimal-u64"
+summary = "Decode decimal UInt64 strings once for MCP byte offsets and flush fences, and CLI fence arguments."
+home = "sparrow_server::agent::decimal_u64"
+entry_points = []
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_flush_sequence_again|parse_byte_offset_again)$']
+
+[[job]]
 id = "producer-span-identity"
 summary = "Allocate nonzero monotonically increasing span identities within one delivery instance, shared across subscribers and direct typed producers."
 home = "sparrow_client::delivery::Delivery::next_span_id"

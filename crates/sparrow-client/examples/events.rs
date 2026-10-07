@@ -4,15 +4,22 @@
 //! Send one declared typed event; repeating identical arguments reuses its receipt.
 
 use sparrow_client::{
-    Client, EventBatch, EventField, EventKind, EventLevel, FieldValue, ProducerEvent,
+    Client, Durability, EventBatch, EventField, EventKind, EventLevel, FieldValue, ProducerEvent,
 };
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 6 || args[3].len() != 32 {
-        return Err(std::io::Error::other("usage: events SOCKET SOURCE REQUEST_ID INSTANCE_HEX UNIX_MILLIS MESSAGE; instance is 16 bytes in canonical hex; retries keep all arguments identical").into());
+    if !(6..=7).contains(&args.len()) || args[3].len() != 32 {
+        return Err(std::io::Error::other("usage: events SOCKET SOURCE REQUEST_ID INSTANCE_HEX UNIX_MILLIS MESSAGE [buffered|durable]; instance is 16 bytes in canonical hex; retries keep event arguments identical").into());
     }
+    let durability = match args.get(6).map(String::as_str) {
+        None | Some("durable") => Durability::Durable,
+        Some("buffered") => Durability::Buffered,
+        Some(_) => {
+            return Err(std::io::Error::other("durability requires buffered or durable").into());
+        }
+    };
     let instance = purrdf_hash::hex::decode_canonical(&args[3])?;
     let batch = EventBatch {
         request_id: args[2].clone(),
@@ -45,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::task::LocalSet::new()
         .run_until(async {
             let client = Client::connect(std::path::Path::new(&args[0])).await?;
-            let receipt = client.events(&batch).await?;
+            let receipt = client.events_with_durability(&batch, durability).await?;
             println!(
                 "{} {:?} records={} bytes={}",
                 receipt.id,
@@ -53,6 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 receipt.record_ids.len(),
                 receipt.byte_length
             );
+            if let Some(token) = receipt.buffered_through {
+                println!("buffered_through={token:?}");
+            }
             Ok::<_, sparrow_client::Error>(())
         })
         .await?;
