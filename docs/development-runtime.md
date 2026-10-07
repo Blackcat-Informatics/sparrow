@@ -14,12 +14,13 @@ and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
-`bytesRead`, `pin`, `pinRenew`, `pinRelease`, `keysList`, `valuesSearch`, `textSearch`, `recordsContext` and `rdfInspect`. The shared typed
+`bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsContext` and `rdfInspect`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
 result rendering. The CLI supplies status, non-destructive buffered file import,
 exact byte export, key/value and full-text searches. MCP also supplies artifact/
-record metadata and pin/release calls. CLI and MCP both supply stable-ID pin renewal. Remaining CLI commands and query surfaces
+record metadata and pin/release calls. CLI and MCP both supply stable-ID pin renewal
+and paginated pin discovery/member retrieval. Remaining CLI commands and query surfaces
 are required work.
 
 ```sh
@@ -40,6 +41,9 @@ sparrow SOCKET_PATH values --source synthetic --path /message --kind string --de
 sparrow SOCKET_PATH text 'allocation failed' --source synthetic
 sparrow SOCKET_PATH bytes STORE_ID ARTIFACT_ID 0 256 /tmp/evidence.bin
 sparrow SOCKET_PATH pin-renew renewal-001 STORE_ID PIN_ID 10 1
+sparrow SOCKET_PATH pins STORE_ID --page-size 200
+sparrow SOCKET_PATH pin-get STORE_ID --name problem_investigation_1 --page-size 200
+sparrow SOCKET_PATH pin-get STORE_ID --id PIN_ID --page-size 200 --cursor CURSOR
 ```
 
 Use a stable request identity for retrying ingestion of the same source, format
@@ -156,7 +160,7 @@ so an idle MCP session does not retain an expired daemon connection lease.
 
 Discovery advertises these implemented tools only: `capabilities`, `status`,
 `keys_list`, `values_search`, `text_search`, `records_context`, `artifact_get`, `record_get`,
-`bytes_read`, `rdf_inspect`, `pin`, `pin_renew` and `pin_release`. Input schemas reject additional fields;
+`bytes_read`, `rdf_inspect`, `pins_list`, `pin_get`, `pin`, `pin_renew` and `pin_release`. Input schemas reject additional fields;
 query arguments use the CLI's names with underscores. Temporal filters remain
 explicitly server-acceptance times. Offsets are decimal strings; bounded lengths,
 row limits and durations are JSON integers. Byte results use native canonical
@@ -174,7 +178,7 @@ The adapter bounds requests to 128 KiB, responses to 8 MiB, concurrent calls to
 four and each call to 30 seconds. Oversized framing closes the session with an
 explicit protocol error; malformed complete JSON frames receive a parse error
 and subsequent valid frames can proceed. EOF drains pending calls. Discovery
-requires daemon schema version 5, including durable pin renewal receipts, RDF profile identity, record context
+requires daemon schema version 6, including finite pin catalog captures, durable pin renewal receipts, RDF profile identity, record context
 and native text/profile identities;
 older discovery contracts fail explicitly rather than invent those identities.
 
@@ -185,6 +189,53 @@ socket fixture checks pending-call admission, failure during a partial input
 frame, cancellation and oversized framing. Integer request IDs beyond binary64
 exact precision round-trip without rounding. The full release `make check`
 gate passed with these fixtures.
+
+## Pin catalog pages
+
+The typed `pinRead` selector union supplies active collection listing, stable-ID
+lookup and case-sensitive name lookup. CLI `pins STORE_ID` and `pin-get STORE_ID
+(--id PIN_ID | --name NAME)` share MCP `pins_list` and `pin_get` operations and
+one renderer. MCP requires `store_id`; `pin_get` requires exactly one `pin_id` or
+`name`. Both accept optional `cursor`, `page_size` and `scan_budget`. CLI spells
+those flags with hyphens. Defaults are 200 requested items and 10,000 catalog
+entry admissions; allowed ranges are 1..1000 and 1..100000 respectively.
+
+Fresh reads capture eligible pin metadata at one server clock instant. Collection
+rows and member references use stable ID order. Name lookup resolves once to a
+stable ID, revision, actual deadline and direct members. Captured pages preserve
+that result after add/renew/release, expiry or reuse of the name. The receipt
+states `snapshot_id`, `as_of`, `lease_expires_at`, complete/exact execution,
+catalog coverage, total items, page position, effective limits and continuation.
+Pagination does not downgrade a complete capture into incomplete execution.
+A cursor requires its original operation, selector and limits; changed scope is
+`CONFLICT`. A retry of the same cursor returns the same domain page through CLI
+and MCP. Clients must replay opaque cursors without interpreting their encoding.
+
+These captures retain metadata only. They do not renew pins, preserve original
+evidence, keep a RocksDB snapshot open or hold the catalog writer between pages.
+A listed member can become unavailable to a subsequent evidence read. The absolute
+lease is 60 seconds under both server UTC and a monotonic clock. Pages never extend
+it. Expired/unknown/restarted-owner handles refuse with `RESULT_EXPIRED`; fresh
+lookup of inactive IDs/names refuses with `PIN_NOT_ACTIVE`. New reads and periodic
+maintenance reclaim expired handles. Status reports handle count, admitted
+retained capacity, the eight-handle ceiling, 8 MiB capacity ceiling and lease.
+
+One capture admits at most 10,000 items and 2 MiB retained capacity. Catalog entry
+decoding is limited to 2 MiB, depth eight and 10,032 native JSON values; one capture
+inspects at most 32 MiB of original catalog bytes. Scans, native storage failures,
+invalid catalog identities, duplicate membership or conflicting active names
+refuse the entire capture without publishing a successful prefix. Capacity growth
+is admitted before extending the captured vector. Pages conservatively reserve
+2 KiB per item plus 4 KiB envelope space under a 256 KiB structured ceiling, so
+the requested item count is an upper bound. These are host admission capacities,
+not process RSS or physical RocksDB I/O measurements. Broader query pagination
+and concurrent stored-RDF snapshots remain required work.
+
+Blocking storage workers own their concurrency permit until the worker actually
+finishes. Cancelling or disconnecting the awaiting RPC does not free admission
+early and create an unbounded blocking-work queue. A regression test pauses a
+worker, cancels its RPC task, verifies admission remains occupied, then releases
+the worker and verifies the permit returns.
 
 ## Retained record context
 
@@ -471,3 +522,29 @@ checkout under `crates/text/lexicons/artifacts/`. Native `Analyzer::resolve` mus
 verify their physical identities and bind the fingerprint to persistent text
 projections. Do not substitute an empty lexicon or rebuild the retained corpus
 as a resident index on each query.
+
+The pin-catalog build reopened the same development format-5 store on
+2026-10-07 UTC with discovery schema version 6. The previous owned daemon stopped
+cleanly; store identity, five retained records and RDF/text profiles remained
+unchanged. Live MCP discovery listed fifteen tools and marked `pin_get` and
+`pins_list` as reads. Fixture pin `pin:829f88b26f505dfb273587d5551e3a81` captured
+two direct members under snapshot `pin-read:c244c8654217ed0f6daed1506d4cb5a7`,
+as of `2026-10-07T07:03:20.367Z`, with absolute lease deadline
+`2026-10-07T07:04:20.367Z`. It was renewed, released and replaced by
+`pin:f08d7a4d708309955220018177807f00`. The original cursor still returned its
+revision-1 metadata and original deadline while fresh name lookup resolved the
+replacement. The collection snapshot likewise retained its original two IDs.
+CLI/MCP continuation receipts were identical for both operations. All fixture
+pins were released; immediate status reported zero active pins, five records,
+two finite handles and 2,714 admitted bytes. EOF drained with no extra stderr.
+Private directory/socket modes remained 0700/0600. No production inputs or
+sibling services were changed.
+
+The catalog-page gate passed 31 storage scenarios, five core unit tests, the
+server worker-cancellation regression, real-daemon/MCP crash-reopen tests and
+thirteen enforced helper jobs with no duplicate exceptions. Tests distinguish
+pagination from incomplete capture, exercise member/collection stability after
+mutations, exact UTC and monotonic expiry, capacity/scan refusal, smaller pages
+under the output ceiling, catalog identity faults, source-byte retirement while
+metadata pages survive, and cursor invalidation on restart. Full first-version
+server acceptance remains unfinished.

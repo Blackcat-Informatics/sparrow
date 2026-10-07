@@ -5,7 +5,10 @@
 
 use crate::sparrow_capnp as wire;
 use purrdf_lex::json::{Value, record::Record as JsonRecord};
-use sparrow_core::{Artifact, Error, JsonQuery, Pin, QueryScope, Record, Store};
+use sparrow_core::{
+    Artifact, Error, JsonQuery, Pin, PinPageBody, PinRead, PinSelector, PinSummary, QueryScope,
+    Record, Store,
+};
 use std::{
     rc::Rc,
     sync::Arc,
@@ -58,7 +61,7 @@ impl Rpc {
         &self,
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let _permit = self
+        let permit = self
             .requests
             .clone()
             .try_acquire_owned()
@@ -67,12 +70,15 @@ impl Rpc {
                 message: "RPC operation concurrency is at its configured limit".into(),
             })?;
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || operation(store, now()?))
-            .await
-            .map_err(|e| Error {
-                code: "STORAGE_FAILURE",
-                message: format!("storage task failed: {e}"),
-            })?
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation(store, now()?)
+        })
+        .await
+        .map_err(|e| Error {
+            code: "STORAGE_FAILURE",
+            message: format!("storage task failed: {e}"),
+        })?
     }
 
     fn scoped_id(&self, evidence: wire::evidence::Reader<'_>) -> Result<String, Error> {
@@ -94,16 +100,21 @@ impl Rpc {
     }
 
     fn reference(&self, store: &str, id: &str, prefix: &str) -> Result<String, Error> {
+        self.check_store(store)?;
+        if !id.starts_with(prefix) {
+            return Err(invalid("reference has the wrong evidence kind"));
+        }
+        Ok(id.to_owned())
+    }
+
+    fn check_store(&self, store: &str) -> Result<(), Error> {
         if store != self.store.store_id()? {
             return Err(Error {
                 code: "STORE_MISMATCH",
                 message: "reference belongs to a different store".into(),
             });
         }
-        if !id.starts_with(prefix) {
-            return Err(invalid("reference has the wrong evidence kind"));
-        }
-        Ok(id.to_owned())
+        Ok(())
     }
 }
 
@@ -243,6 +254,14 @@ fn pin(
         }
     }
     Ok(())
+}
+
+fn pin_summary(mut out: wire::pin_summary::Builder<'_>, pin: &PinSummary) {
+    out.set_id(&pin.id);
+    out.set_name(&pin.name);
+    out.set_revision(pin.revision);
+    out.set_direct_member_count(pin.direct_member_count as u64);
+    out.init_expires_at().set_unix_millis(pin.expires_at);
 }
 
 fn context_side(
@@ -560,7 +579,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(5);
+                out.set_schema_version(6);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
@@ -575,6 +594,11 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_artifact_bytes(number(&value, "max_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_pin_members(number(&value, "max_pin_members")?);
+                out.set_pin_read_handles(number(&value, "pin_read_handles")?);
+                out.set_pin_read_bytes(number(&value, "pin_read_bytes")?);
+                out.set_max_pin_read_handles(number(&value, "max_pin_read_handles")?);
+                out.set_max_pin_read_bytes(number(&value, "max_pin_read_bytes")?);
+                out.set_pin_read_lease_ms(number(&value, "pin_read_lease_ms")?);
             }
         }
         Ok(())
@@ -753,6 +777,105 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn pin_read(
+        self: Rc<Self>,
+        params: wire::sparrow::PinReadParams,
+        mut results: wire::sparrow::PinReadResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(input.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        let selector = match input.get_selector()?.which()? {
+            wire::pin_selector::Active(()) => PinSelector::Active,
+            wire::pin_selector::Id(text) | wire::pin_selector::Name(text) => {
+                let text = text?.to_str()?;
+                if text.len() > 128 {
+                    failure(
+                        results.get().init_result(),
+                        invalid("pin selector exceeds 128 bytes"),
+                    );
+                    return Ok(());
+                }
+                match input.get_selector()?.which()? {
+                    wire::pin_selector::Id(_) => PinSelector::Id(text.to_owned()),
+                    _ => PinSelector::Name(text.to_owned()),
+                }
+            }
+        };
+        let cursor = match input.get_cursor()?.which()? {
+            wire::optional_text::Absent(()) => None,
+            wire::optional_text::Value(text) => {
+                let text = text?.to_str()?;
+                if text.len() > 160 {
+                    failure(
+                        results.get().init_result(),
+                        invalid("pin cursor exceeds 160 bytes"),
+                    );
+                    return Ok(());
+                }
+                Some(text.to_owned())
+            }
+        };
+        let query = PinRead {
+            selector,
+            cursor,
+            page_size: input.get_page_size() as usize,
+            scan_budget: input.get_scan_budget() as usize,
+        };
+        match self
+            .work(move |store, now| store.pin_read(&query, now))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(page) => {
+                let mut out = results.get().init_result().init_ok();
+                let mut receipt = out.reborrow().init_receipt();
+                receipt.set_store_id(&page.store_id);
+                receipt.set_snapshot_id(&page.snapshot_id);
+                receipt.reborrow().init_as_of().set_unix_millis(page.as_of);
+                receipt
+                    .reborrow()
+                    .init_lease_expires_at()
+                    .set_unix_millis(page.lease_expires_at);
+                receipt.set_total_items(page.total_items as u64);
+                receipt.set_page_start(page.page_start as u64);
+                receipt.set_page_size(page.page_size as u32);
+                receipt.set_scan_budget(page.scan_budget as u32);
+                receipt.set_scanned(page.scanned as u64);
+                let mut cursor = receipt.init_next_cursor();
+                match &page.next_cursor {
+                    Some(value) => cursor.set_value(value),
+                    None => cursor.set_absent(()),
+                }
+                match &page.body {
+                    PinPageBody::Collections(rows) => {
+                        let mut list = out.init_collections(rows.len() as u32);
+                        for (index, row) in rows.iter().enumerate() {
+                            pin_summary(list.reborrow().get(index as u32), row);
+                        }
+                    }
+                    PinPageBody::Members { pin, members } => {
+                        let mut body = out.init_members();
+                        pin_summary(body.reborrow().init_pin(), pin);
+                        let mut list = body.init_members(members.len() as u32);
+                        for (index, id) in members.iter().enumerate() {
+                            let mut item = list.reborrow().get(index as u32);
+                            item.set_store_id(&page.store_id);
+                            if id.starts_with("artifact:") {
+                                item.set_artifact(id);
+                            } else {
+                                item.set_record(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn pin_renew(
         self: Rc<Self>,
         params: wire::sparrow::PinRenewParams,
@@ -919,5 +1042,62 @@ impl wire::sparrow::Server for Rpc {
             Err(e) => failure(results.get().init_result(), e),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_rpc_keeps_worker_admission_until_storage_work_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            sparrow_core::Config {
+                disk_budget: 32 * 1024 * 1024,
+                maintenance_reserve: 4 * 1024 * 1024,
+                max_artifact_bytes: 1024 * 1024,
+                max_records: 100,
+                max_pin_members: 100,
+                text_analyzer: sparrow_core::resolve_text_analyzer(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../../purrdf/crates/text/lexicons/artifacts"
+                ))
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let rpc = Arc::new(Rpc::new(store, admission.clone(), 1024 * 1024, 100));
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            rpc.work(move |_, _| {
+                entered
+                    .send(())
+                    .map_err(|_| invalid("test caller disappeared"))?;
+                paused.recv().map_err(invalid)?;
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(admission.available_permits(), 0);
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admission.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(permit);
+        assert_eq!(admission.available_permits(), 1);
     }
 }

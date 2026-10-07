@@ -3,9 +3,351 @@
 
 //! Persistent lifetime scenarios using temporary stores and injected UTC instants.
 
-use sparrow_core::{Config, Store};
+use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 
 const DAY: u64 = 86_400_000;
+
+#[test]
+fn pin_pages_capture_revision_and_members_without_following_name_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pin-page-input", "source", "log", b"one\ntwo\nthree\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("page-create", "Case", &artifact.record_ids, 40, 0)
+        .unwrap();
+    let mut query = PinRead {
+        selector: PinSelector::Name("Case".into()),
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.pin_read(&query, 10).unwrap();
+    assert_eq!(first.total_items, 3);
+    assert_eq!(first.as_of, 10);
+    assert_eq!(first.lease_expires_at, 60010);
+    let other = store
+        .ingest("pin-page-other", "source", "log", b"four\n", 20)
+        .unwrap();
+    store
+        .pin("page-add", "Case", &other.record_ids, 1, 20)
+        .unwrap();
+    store
+        .renew_pin("page-extend", &pin.id, 50, Some(2), 20)
+        .unwrap();
+    store.release_retry("page-release", &pin.id, 20).unwrap();
+    let replacement = store
+        .pin("page-replacement", "Case", &other.record_ids, 60, 20)
+        .unwrap();
+    let current = store
+        .pin_read(
+            &PinRead {
+                selector: query.selector.clone(),
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+    assert!(
+        matches!(current.body, PinPageBody::Members { pin: ref current, .. } if current.id == replacement.id)
+    );
+    let mut captured = Vec::new();
+    let mut page = first.clone();
+    loop {
+        let PinPageBody::Members {
+            pin: summary,
+            members,
+        } = &page.body
+        else {
+            panic!("member page")
+        };
+        assert_eq!(summary.id, pin.id);
+        assert_eq!(summary.revision, 1);
+        assert_eq!(summary.direct_member_count, 3);
+        assert_eq!(summary.expires_at, 40 * DAY);
+        assert_eq!(page.snapshot_id, first.snapshot_id);
+        assert_eq!(page.as_of, 10);
+        captured.extend(members.clone());
+        let Some(cursor) = page.next_cursor.clone() else {
+            break;
+        };
+        query.cursor = Some(cursor);
+        page = store.pin_read(&query, 30).unwrap();
+        assert_eq!(store.clone().pin_read(&query, 40).unwrap(), page);
+    }
+    let mut expected = artifact.record_ids.clone();
+    expected.sort();
+    assert_eq!(captured, expected);
+    let mut changed = query.clone();
+    changed.selector = PinSelector::Id(pin.id.clone());
+    assert_eq!(store.pin_read(&changed, 40).unwrap_err().code, "CONFLICT");
+    changed = query.clone();
+    changed.page_size = 2;
+    assert_eq!(store.pin_read(&changed, 40).unwrap_err().code, "CONFLICT");
+    changed = query.clone();
+    changed.scan_budget += 1;
+    assert_eq!(store.pin_read(&changed, 40).unwrap_err().code, "CONFLICT");
+    assert_eq!(
+        store
+            .pin_read(&query, first.lease_expires_at)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store.status(first.lease_expires_at).unwrap()["pin_read_handles"].as_str(),
+        Some("0")
+    );
+    // Catalog lookup itself is exact and names are case-sensitive.
+    assert_eq!(
+        store
+            .pin_read(
+                &PinRead {
+                    selector: PinSelector::Name("case".into()),
+                    ..Default::default()
+                },
+                40
+            )
+            .unwrap_err()
+            .code,
+        "PIN_NOT_ACTIVE"
+    );
+    assert_eq!(
+        store
+            .pin_read(
+                &PinRead {
+                    selector: PinSelector::Id(pin.id),
+                    ..Default::default()
+                },
+                40
+            )
+            .unwrap_err()
+            .code,
+        "PIN_NOT_ACTIVE"
+    );
+}
+
+#[test]
+fn collection_pages_are_stable_and_do_not_hold_evidence_or_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("page-no-evidence-lease", "source", "log", b"event\n", 0)
+        .unwrap();
+    let pins = ["left", "middle", "right"]
+        .map(|name| store.pin(name, name, &artifact.record_ids, 40, 0).unwrap());
+    let now = 30 * DAY - 1000;
+    let mut query = PinRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.pin_read(&query, now).unwrap();
+    assert_eq!(first.total_items, 3);
+    for pin in &pins {
+        store.release(&pin.id).unwrap();
+    }
+    store.expire(30 * DAY).unwrap();
+    assert!(
+        store
+            .bytes(&artifact.record_ids[0], 0, 6, 30 * DAY)
+            .is_err()
+    );
+    let mut ids = Vec::new();
+    let mut page = first.clone();
+    loop {
+        let PinPageBody::Collections(rows) = &page.body else {
+            panic!("collection page")
+        };
+        ids.extend(rows.iter().map(|row| row.id.clone()));
+        let Some(cursor) = page.next_cursor.clone() else {
+            break;
+        };
+        query.cursor = Some(cursor);
+        page = store.pin_read(&query, 30 * DAY).unwrap();
+    }
+    let mut expected = pins.iter().map(|pin| pin.id.clone()).collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(ids, expected);
+    assert_eq!(
+        store
+            .pin_read(&PinRead::default(), 30 * DAY)
+            .unwrap()
+            .total_items,
+        0
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.pin_read(&query, 30 * DAY).unwrap_err().code,
+        "RESULT_EXPIRED"
+    );
+}
+
+#[test]
+fn pin_capture_limits_refuse_prefixes_and_expired_handles_release_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.max_pin_members = 200;
+    let store = Store::open(dir.path(), limits).unwrap();
+    let artifact = store
+        .ingest("capture-limit", "source", "log", b"one\ntwo\n", 0)
+        .unwrap();
+    let pins =
+        ["a", "b", "c"].map(|name| store.pin(name, name, &artifact.record_ids, 40, 0).unwrap());
+    assert_eq!(
+        store
+            .pin_read(
+                &PinRead {
+                    scan_budget: 1,
+                    ..Default::default()
+                },
+                0
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(0).unwrap()["pin_read_handles"].as_str(),
+        Some("0")
+    );
+    for (page_size, scan_budget) in [(0, 1), (1001, 1), (1, 0), (1, 100001)] {
+        assert_eq!(
+            store
+                .pin_read(
+                    &PinRead {
+                        page_size,
+                        scan_budget,
+                        ..Default::default()
+                    },
+                    0
+                )
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    let query = PinRead {
+        selector: PinSelector::Id(pins[0].id.clone()),
+        page_size: 1,
+        ..Default::default()
+    };
+    let mut first = None;
+    for _ in 0..8 {
+        first = Some(store.pin_read(&query, 0).unwrap());
+    }
+    assert_eq!(
+        store.pin_read(&query, 0).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(0).unwrap()["pin_read_handles"].as_str(),
+        Some("8")
+    );
+    let fresh = store.pin_read(&query, 60000).unwrap();
+    assert_eq!(
+        store.status(60000).unwrap()["pin_read_handles"].as_str(),
+        Some("1")
+    );
+    let expired = PinRead {
+        cursor: first.unwrap().next_cursor,
+        ..query.clone()
+    };
+    assert_eq!(
+        store.pin_read(&expired, 60000).unwrap_err().code,
+        "RESULT_EXPIRED"
+    );
+    let malformed = PinRead {
+        cursor: Some(format!("{}/+1", fresh.snapshot_id)),
+        ..query
+    };
+    assert_eq!(
+        store.pin_read(&malformed, 60000).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+    let many = store
+        .ingest(
+            "many-pin-members",
+            "source",
+            "log",
+            &b"x\n".repeat(150),
+            60000,
+        )
+        .unwrap();
+    let pin = store
+        .pin("many-pin-create", "many", &many.record_ids, 1, 60000)
+        .unwrap();
+    let query = PinRead {
+        selector: PinSelector::Id(pin.id),
+        page_size: 1000,
+        ..Default::default()
+    };
+    let page = store.pin_read(&query, 60000).unwrap();
+    let PinPageBody::Members { members, .. } = &page.body else {
+        panic!("member page")
+    };
+    assert!(members.len() < 150);
+    assert!(members.len() * 2048 + 4096 <= sparrow_core::PIN_READ_PAGE_BYTES);
+    assert_eq!(page.total_items, 150);
+    let last = store
+        .pin_read(
+            &PinRead {
+                cursor: page.next_cursor,
+                ..query
+            },
+            60001,
+        )
+        .unwrap();
+    let PinPageBody::Members {
+        members: remaining, ..
+    } = &last.body
+    else {
+        panic!("member page")
+    };
+    assert_eq!(members.len() + remaining.len(), 150);
+    assert!(last.next_cursor.is_none());
+}
+
+#[test]
+fn malformed_pin_catalog_refuses_complete_captures() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("corrupt-pin-input", "source", "log", b"event\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("valid-pin", "valid", &artifact.record_ids, 40, 0)
+        .unwrap();
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let bytes = db.get(&pin.id).unwrap().unwrap();
+    let changed = std::str::from_utf8(&bytes)
+        .unwrap()
+        .replace(&pin.id, "pin:different");
+    db.put(&pin.id, changed).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    for selector in [
+        PinSelector::Active,
+        PinSelector::Id(pin.id),
+        PinSelector::Name(pin.name),
+    ] {
+        assert_eq!(
+            store
+                .pin_read(
+                    &PinRead {
+                        selector,
+                        ..Default::default()
+                    },
+                    0
+                )
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+    }
+}
 
 #[test]
 fn pin_renewal_is_durable_idempotent_revision_guarded_and_never_follows_names() {

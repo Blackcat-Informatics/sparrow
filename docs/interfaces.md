@@ -207,8 +207,8 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 | `correlate` | Scope and seed IDs or trace/span/source/time selector | Relationships and their supporting evidence; implemented through prepared queries/retrieval. |
 | `result_next` | Result cursor | Next page from the same leased result; an expired handle refuses continuation. |
 | `ingest_get` | Import/request ID | Raw acceptance/durability, projection states, source checkpoint, and deletion state. |
-| `pins_list` | Cursor, page size | Active named collections and deadlines. |
-| `pin_get` | Exactly one pin name or ID, cursor, page size | Collection identity, deadline, revision, and captured members. |
+| `pins_list` | Store ID, cursor, page size, scan budget | Active named collections and deadlines under one finite captured metadata lease. |
+| `pin_get` | Store ID, exactly one pin name or ID, cursor, page size, scan budget | Collection identity, deadline, revision, and captured members; continuations preserve the captured name resolution. |
 | `pin` | Request ID, name, concrete targets, days | Durably created/extended collection and actual expiry. |
 | `pin_renew` | Request ID, pin ID, days | Durably extended deadline. |
 | `pin_release` | Request ID, pin ID | Durable removal of that collection's protection; ordinary retention still applies. |
@@ -322,6 +322,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `status` and planned capabilities operation | Operational status and supported profiles/limits. |
 | `artifactGet`, `recordGet`, `bytesRead` | Store-scoped metadata and exact bounded ranges. |
 | `pin`, `pinRenew`, `pinRelease` | Durable all-or-nothing protection with stable retry identities; renewal optionally checks the current collection revision. |
+| `pinRead` | Typed active-list/name/ID selector, finite catalog capture and store-scoped continuation pages. |
 | `keysList`, `valuesSearch` and planned text/record/graph operations | Shared native semantics, typed results and query coverage. |
 | Planned watch administration | Create/list/update/remove and completed handoff without deletion authority over replacement paths. |
 

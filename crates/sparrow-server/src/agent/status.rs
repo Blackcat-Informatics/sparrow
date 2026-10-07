@@ -12,12 +12,12 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         result::Ok(value) => value?,
         result::Error(error) => return Err(failure(error?)),
     };
-    if value.get_schema_version() != 5
+    if value.get_schema_version() != 6
         || value.get_text_analyzer()?.is_empty()
         || value.get_text_profile()?.is_empty()
         || value.get_rdf_profile()?.is_empty()
     {
-        return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon discovery contract requires schema version 5 with durable pin renewal receipts; use a matching daemon executable".into(), retryable: false });
+        return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon discovery contract requires schema version 6 with bounded pin catalog captures; use a matching daemon executable".into(), retryable: false });
     }
     let output = Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -54,6 +54,20 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "max_records_per_artifact",
             value.get_max_records_per_artifact().to_string(),
         )
-        .with("max_pin_members", value.get_max_pin_members().to_string());
+        .with("max_pin_members", value.get_max_pin_members().to_string())
+        .with("pin_read_handles", value.get_pin_read_handles().to_string())
+        .with("pin_read_bytes", value.get_pin_read_bytes().to_string())
+        .with(
+            "max_pin_read_handles",
+            value.get_max_pin_read_handles().to_string(),
+        )
+        .with(
+            "max_pin_read_bytes",
+            value.get_max_pin_read_bytes().to_string(),
+        )
+        .with(
+            "pin_read_lease_ms",
+            value.get_pin_read_lease_ms().to_string(),
+        );
     Ok(output.into())
 }

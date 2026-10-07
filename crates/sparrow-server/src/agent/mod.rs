@@ -20,7 +20,15 @@ pub type AgentResult<T> = std::result::Result<T, AgentError>;
 type Result<T> = AgentResult<T>;
 pub(crate) mod tool;
 
-pub(super) const USAGE: &str = "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N]; values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT";
+pub(super) const USAGE: &str = concat!(
+    "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE",
+    " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
+    " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
+    " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
+    " | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
+    " [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
+    " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT"
+);
 
 /// Execute a CLI command through the same typed client and renderer as MCP.
 pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<Value> {
@@ -36,6 +44,7 @@ pub(super) enum Command {
     Bytes(read::Input),
     Context(context::Input),
     Renew(pin::Renewal),
+    PinRead(pin::Read),
     Rdf {
         store: String,
         id: String,
@@ -152,6 +161,12 @@ impl Command {
         if args.first().map(String::as_str) == Some("pin-renew") {
             return Ok(Self::Renew(pin::Renewal::parse(&args[1..])?));
         }
+        if matches!(args.first().map(String::as_str), Some("pins" | "pin-get")) {
+            return Ok(Self::PinRead(pin::Read::parse(
+                &args[1..],
+                args[0] == "pin-get",
+            )?));
+        }
         let values = match args.first().map(String::as_str) {
             Some("keys") => false,
             Some("values") => true,
@@ -261,6 +276,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Renew(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::PinRead(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Rdf { store, id } = self {

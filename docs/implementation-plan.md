@@ -13,8 +13,9 @@ surface remain required; the concrete native gap is recorded in
 The full server acceptance criteria remain unmet. Current executable surfaces
 and verification are recorded in [Development runtime](development-runtime.md).
 Stable-ID pin renewal is implemented through the core, typed daemon, CLI and MCP,
-including durable retry receipts and optional revision guards. Pin discovery and
-the full paginated pin workflow remain required.
+including durable retry receipts and optional revision guards. Pin discovery
+and member retrieval now use finite immutable catalog pages shared by the typed
+daemon, CLI and MCP. Broader live/pin/selection query pagination remains required.
 
 This plan builds on [Architecture](architecture.md) and [Interfaces](interfaces.md).
 It records the initial query priorities and sample discovery supplied on

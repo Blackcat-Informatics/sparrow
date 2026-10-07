@@ -7,6 +7,14 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "pins_list",
+        "List active collection metadata in bounded pages over one immutable 60-second catalog capture; cursors never renew protection.",
+    ),
+    (
+        "pin_get",
+        "Resolve exactly one collection name or stable ID and page its captured direct members/revision; later pages preserve that capture after mutations.",
+    ),
+    (
         "capabilities",
         "Discover running store identity, limits and implemented tools.",
     ),
@@ -116,6 +124,8 @@ pub(crate) fn definitions() -> Value {
             "pin",
             "pin_release",
             "pin_renew",
+            "pin_get",
+            "pins_list",
             "records_context",
             "rdf_inspect",
         ]
@@ -205,17 +215,36 @@ pub(crate) fn definitions() -> Value {
             );
             required.push("days");
         }
+        if ["pin_get", "pins_list"].contains(name) {
+            properties = properties
+                .with(
+                    "cursor",
+                    Object::new().with("type", Value::array(["string", "null"])),
+                )
+                .with("page_size", integer(1000))
+                .with("scan_budget", integer(100000));
+        }
+        if *name == "pin_get" {
+            properties = properties.with("pin_id", string()).with("name", string());
+        }
+        let mut schema = Object::new()
+            .with("type", "object")
+            .with("properties", properties)
+            .with("required", Value::array(required))
+            .with("additionalProperties", false);
+        if *name == "pin_get" {
+            schema = schema.with(
+                "oneOf",
+                Value::array([
+                    Value::from(Object::new().with("required", Value::array(["pin_id"]))),
+                    Value::from(Object::new().with("required", Value::array(["name"]))),
+                ]),
+            );
+        }
         Object::new()
             .with("name", *name)
             .with("description", *description)
-            .with(
-                "inputSchema",
-                Object::new()
-                    .with("type", "object")
-                    .with("properties", properties)
-                    .with("required", Value::array(required))
-                    .with("additionalProperties", false),
-            )
+            .with("inputSchema", schema)
             .with("outputSchema", Object::new().with("type", "object"))
             .with(
                 "annotations",

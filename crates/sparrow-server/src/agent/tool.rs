@@ -45,6 +45,7 @@ pub(crate) enum Operation {
         pin: String,
     },
     Renew(pin::Renewal),
+    PinRead(pin::Read),
 }
 
 impl Operation {
@@ -183,6 +184,39 @@ impl Operation {
                         })
                         .transpose()?,
                 }),
+                "pins_list" | "pin_get" => {
+                    let selector = if name == "pin_get" {
+                        match (
+                            fields.optional::<String>("pin_id")?,
+                            fields.optional::<String>("name")?,
+                        ) {
+                            (Some(id), None) => sparrow_core::PinSelector::Id(id),
+                            (None, Some(name)) => sparrow_core::PinSelector::Name(name),
+                            _ => {
+                                return Err(DecodeError::custom(
+                                    "pin_get requires exactly one pin_id or name",
+                                ));
+                            }
+                        }
+                    } else {
+                        sparrow_core::PinSelector::Active
+                    };
+                    Self::PinRead(pin::Read {
+                        store: fields.required("store_id")?,
+                        selector,
+                        cursor: fields.optional("cursor")?,
+                        page_size: fields
+                            .raw("page_size")?
+                            .map(u32::from_json)
+                            .transpose()?
+                            .unwrap_or(200),
+                        scan_budget: fields
+                            .raw("scan_budget")?
+                            .map(u32::from_json)
+                            .transpose()?
+                            .unwrap_or(10000),
+                    })
+                }
                 _ => return Err(DecodeError::custom(format!("unknown tool: {name}"))),
             };
             fields.deny_unknown()?;
@@ -207,6 +241,7 @@ impl Operation {
                 .await?
                 .ok_or_else(|| invalid("query produced no result")),
             Self::Renew(input) => input.execute(client).await,
+            Self::PinRead(input) => input.execute(client).await,
             Self::Metadata {
                 store,
                 id,

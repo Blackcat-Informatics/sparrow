@@ -35,7 +35,7 @@ async fn start(config: &Path, socket: &Path) -> Daemon {
     daemon
 }
 
-async fn exercise(socket: &Path) -> (String, String) {
+async fn exercise(socket: &Path) -> (String, String, String) {
     let connection = connect(socket).await.unwrap();
     let client = &connection.client;
     let response = client.status_request().send().promise.await.unwrap();
@@ -485,7 +485,7 @@ async fn exercise(socket: &Path) -> (String, String) {
         ),
     }
     mcp_exercise(socket, &store, &id, &first_record, bytes).await;
-    (store, id)
+    (store, id, first_record)
 }
 
 struct Mcp {
@@ -565,6 +565,51 @@ impl Mcp {
             success
         );
     }
+    async fn initialize(&mut self, id: u64) {
+        use purrdf_lex::json::{Object, Value};
+        let response = self
+            .call(
+                id,
+                "initialize",
+                Object::new()
+                    .with("protocolVersion", "2025-11-25")
+                    .with("capabilities", Object::new())
+                    .with(
+                        "clientInfo",
+                        Object::new().with("name", "fixture").with("version", "1"),
+                    )
+                    .into(),
+            )
+            .await;
+        assert_eq!(
+            response["result"]["protocolVersion"].as_str(),
+            Some("2025-11-25")
+        );
+        self.send(Value::from(
+            Object::new()
+                .with("jsonrpc", "2.0")
+                .with("method", "notifications/initialized"),
+        ))
+        .await;
+    }
+    async fn tool(
+        &mut self,
+        id: u64,
+        name: &str,
+        arguments: purrdf_lex::json::Value,
+    ) -> purrdf_lex::json::Value {
+        use purrdf_lex::json::Object;
+        self.call(
+            id,
+            "tools/call",
+            Object::new()
+                .with("name", name)
+                .with("arguments", arguments)
+                .into(),
+        )
+        .await["result"]
+            .clone()
+    }
 }
 
 async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, bytes: &[u8]) {
@@ -580,34 +625,10 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     assert_eq!(mcp.receive().await["error"]["code"].as_i64(), Some(-32700));
     let early = mcp.call(1, "tools/list", Object::new().into()).await;
     assert_eq!(early["error"]["code"].as_i64(), Some(-32000));
-    let initialized = mcp
-        .call(
-            2,
-            "initialize",
-            Object::new()
-                .with("protocolVersion", "2025-11-25")
-                .with("capabilities", Object::new())
-                .with(
-                    "clientInfo",
-                    Object::new().with("name", "fixture").with("version", "1"),
-                )
-                .into(),
-        )
-        .await;
-    assert_eq!(
-        initialized["result"]["protocolVersion"].as_str(),
-        Some("2025-11-25")
-    );
-    mcp.send(
-        Object::new()
-            .with("jsonrpc", "2.0")
-            .with("method", "notifications/initialized")
-            .into(),
-    )
-    .await;
+    mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 13);
+    assert_eq!(definitions.len(), 15);
     assert!(
         !definitions
             .iter()
@@ -1006,7 +1027,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(5)
+        Some(6)
     );
     let unknown = mcp
         .call(
@@ -1149,6 +1170,230 @@ async fn mcp_cancellation_admission_and_partial_frames_do_not_lose_messages() {
     oversized.close(false).await;
 }
 
+async fn mcp_pin_pages(socket: &Path, store: &str, artifact: &str, record: &str) -> String {
+    use purrdf_lex::json::{Object, Value};
+    let mut mcp = Mcp::start(socket);
+    mcp.initialize(1).await;
+    let created = mcp
+        .tool(
+            2,
+            "pin",
+            Object::new()
+                .with("store_id", store)
+                .with("request_id", "page-case-create")
+                .with("name", "page-case")
+                .with("targets", Value::array([artifact, record]))
+                .with("days", 2_u64)
+                .into(),
+        )
+        .await;
+    assert_eq!(created["isError"].as_bool(), Some(false));
+    let old_id = created["structuredContent"]["pin_id"].as_str().unwrap();
+    let input = Object::new()
+        .with("store_id", store)
+        .with("name", "page-case")
+        .with("page_size", 1_u64);
+    let first = mcp.tool(3, "pin_get", input.clone().into()).await;
+    assert_eq!(first["isError"].as_bool(), Some(false));
+    let first = &first["structuredContent"];
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    assert_eq!(first["total_items"].as_str(), Some("2"));
+    assert_eq!(first["has_more"].as_bool(), Some(true));
+    assert_eq!(first["members"].as_array().unwrap().len(), 1);
+    assert_eq!(first["answer_certainty"].as_str(), Some("exact"));
+    let release = mcp
+        .tool(
+            4,
+            "pin_release",
+            Object::new()
+                .with("store_id", store)
+                .with("request_id", "page-case-release")
+                .with("pin_id", old_id)
+                .into(),
+        )
+        .await;
+    assert_eq!(release["isError"].as_bool(), Some(false));
+    let replacement = mcp
+        .tool(
+            5,
+            "pin",
+            Object::new()
+                .with("store_id", store)
+                .with("request_id", "page-case-replace")
+                .with("name", "page-case")
+                .with("targets", Value::array([record]))
+                .with("days", 2_u64)
+                .into(),
+        )
+        .await;
+    let replacement_id = replacement["structuredContent"]["pin_id"].as_str().unwrap();
+    assert_ne!(replacement_id, old_id);
+    let cli_page = cli(
+        socket,
+        &[
+            "pin-get",
+            store,
+            "--name",
+            "page-case",
+            "--page-size",
+            "1",
+            "--cursor",
+            &cursor,
+        ],
+    );
+    let second = mcp
+        .tool(
+            6,
+            "pin_get",
+            input.clone().with("cursor", cursor.clone()).into(),
+        )
+        .await;
+    assert_eq!(second["structuredContent"], cli_page);
+    assert_eq!(cli_page["snapshot_id"], first["snapshot_id"]);
+    assert_eq!(cli_page["as_of"], first["as_of"]);
+    assert_eq!(cli_page["lease_expires_at"], first["lease_expires_at"]);
+    assert_eq!(cli_page["pin"]["pin_id"].as_str(), Some(old_id));
+    assert_eq!(cli_page["members"], Value::array([record]));
+    assert_eq!(cli_page["has_more"].as_bool(), Some(false));
+    assert_eq!(cli_page["execution_status"].as_str(), Some("complete"));
+    let current = mcp.tool(7, "pin_get", input.clone().into()).await;
+    assert_eq!(
+        current["structuredContent"]["pin"]["pin_id"].as_str(),
+        Some(replacement_id)
+    );
+    let other = mcp
+        .tool(
+            8,
+            "pin",
+            Object::new()
+                .with("store_id", store)
+                .with("request_id", "page-other-create")
+                .with("name", "page-other")
+                .with("targets", Value::array([artifact]))
+                .with("days", 2_u64)
+                .into(),
+        )
+        .await;
+    let other_id = other["structuredContent"]["pin_id"].as_str().unwrap();
+    let listed = mcp
+        .tool(
+            9,
+            "pins_list",
+            Object::new()
+                .with("store_id", store)
+                .with("page_size", 1_u64)
+                .into(),
+        )
+        .await;
+    assert_eq!(listed["isError"].as_bool(), Some(false));
+    let listed = &listed["structuredContent"];
+    assert_eq!(listed["total_items"].as_str(), Some("2"));
+    let list_cursor = listed["next_cursor"].as_str().unwrap();
+    let refused = mcp
+        .tool(
+            10,
+            "pins_list",
+            Object::new()
+                .with("store_id", store)
+                .with("scan_budget", 1_u64)
+                .into(),
+        )
+        .await;
+    assert_eq!(
+        refused["structuredContent"]["error"]["code"].as_str(),
+        Some("RESOURCE_LIMIT")
+    );
+    for (id, request, pin) in [
+        (11, "page-replacement-release", replacement_id),
+        (12, "page-other-release", other_id),
+    ] {
+        assert_eq!(
+            mcp.tool(
+                id,
+                "pin_release",
+                Object::new()
+                    .with("store_id", store)
+                    .with("request_id", request)
+                    .with("pin_id", pin)
+                    .into()
+            )
+            .await["isError"]
+                .as_bool(),
+            Some(false)
+        );
+    }
+    let list_page = cli(
+        socket,
+        &["pins", store, "--page-size", "1", "--cursor", list_cursor],
+    );
+    let list_again = mcp
+        .tool(
+            13,
+            "pins_list",
+            Object::new()
+                .with("store_id", store)
+                .with("page_size", 1_u64)
+                .with("cursor", list_cursor)
+                .into(),
+        )
+        .await;
+    assert_eq!(list_again["structuredContent"], list_page);
+    let mut ids = [
+        listed["rows"][0]["pin_id"].as_str().unwrap(),
+        list_page["rows"][0]["pin_id"].as_str().unwrap(),
+    ];
+    ids.sort();
+    let mut expected = [replacement_id, other_id];
+    expected.sort();
+    assert_eq!(ids, expected);
+    for (id, name, arguments, code) in [
+        (
+            14,
+            "pins_list",
+            Object::new()
+                .with("store_id", store)
+                .with("page_size", 1_u64)
+                .with("cursor", cursor.clone()),
+            "CONFLICT",
+        ),
+        (
+            15,
+            "pin_get",
+            Object::new()
+                .with("store_id", store)
+                .with("pin_id", old_id)
+                .with("page_size", 1_u64)
+                .with("cursor", cursor.clone()),
+            "CONFLICT",
+        ),
+        (
+            16,
+            "pin_get",
+            input.clone().with("pin_id", old_id),
+            "INVALID_ARGUMENT",
+        ),
+        (
+            17,
+            "pin_get",
+            input.clone().with("store_id", "wrong-store"),
+            "STORE_MISMATCH",
+        ),
+    ] {
+        let result = mcp.tool(id, name, arguments.into()).await;
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        assert_eq!(
+            result["structuredContent"]["error"]["code"].as_str(),
+            Some(code)
+        );
+    }
+    assert_eq!(
+        cli(socket, &["pins", store])["total_items"].as_str(),
+        Some("0")
+    );
+    mcp.close(true).await;
+    cursor
+}
+
 fn cli(socket: &Path, args: &[&str]) -> purrdf_lex::json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
         .arg(socket)
@@ -1170,9 +1415,15 @@ async fn typed_queries_and_exact_bytes_survive_daemon_crash() {
         std::fs::write(&config, format!("socket_path = {:?}\ndata_dir = {:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", socket, store, concat!(env!("CARGO_MANIFEST_DIR"), "/../../../purrdf/crates/text/lexicons/artifacts"))).unwrap();
         let daemon = start(&config, &socket).await;
         let first = exercise(&socket).await;
+        let cursor = mcp_pin_pages(&socket, &first.0, &first.1, &first.2).await;
         drop(daemon); // Only this test's child is terminated.
         std::fs::remove_file(&socket).unwrap(); // Its dead test endpoint, never a live listener.
         let daemon = start(&config, &socket).await;
+        let expired = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
+            .args(["pin-get", &first.0, "--name", "page-case", "--page-size", "1", "--cursor", &cursor]).output().unwrap();
+        assert!(!expired.status.success());
+        assert!(expired.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&expired.stderr).contains("RESULT_EXPIRED"));
         assert_eq!(exercise(&socket).await, first);
         drop(daemon);
     }).await;

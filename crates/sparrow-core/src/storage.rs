@@ -16,6 +16,7 @@ use rocksdb::{
 };
 
 pub(crate) mod context;
+pub(crate) mod pin_read;
 mod rdf_index;
 pub(crate) mod rdf_view;
 mod text_index;
@@ -201,6 +202,7 @@ fn pin_deadline(days: u64, now: u64) -> Result<u64, Error> {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Mutex<Writer>>,
+    pin_reads: Arc<Mutex<pin_read::Reads>>,
 }
 
 struct Writer {
@@ -630,6 +632,7 @@ impl Store {
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(Writer { db, id, config })),
+            pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
         })
     }
 
@@ -1525,6 +1528,7 @@ impl Store {
 
     /// Reclaim unreachable payload references; record pins survive parent expiry.
     pub fn expire(&self, now: u64) -> Result<u64, Error> {
+        self.pin_read_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         let mut batch = WriteBatch::default();
@@ -1691,6 +1695,7 @@ impl Store {
 
     /// Report measured database bytes and deduplicated live payload references.
     pub fn status(&self, now: u64) -> Result<Value, Error> {
+        let (pin_handles, pin_bytes) = self.pin_read_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         let records = writer.list::<Record>("record:")?;
@@ -1700,6 +1705,11 @@ impl Store {
             .count();
         let unique_chunks = writer.count_prefix("ref:")?;
         Ok(Object::new()
+            .with("pin_read_handles", pin_handles.to_string())
+            .with("pin_read_bytes", pin_bytes.to_string())
+            .with("max_pin_read_handles", pin_read::MAX_HANDLES.to_string())
+            .with("max_pin_read_bytes", pin_read::HANDLE_BYTES.to_string())
+            .with("pin_read_lease_ms", pin_read::LEASE_MS.to_string())
             .with("store_id", writer.id.clone())
             .with(
                 "store_format",

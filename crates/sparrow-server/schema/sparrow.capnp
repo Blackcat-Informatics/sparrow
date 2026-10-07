@@ -38,6 +38,8 @@ struct Status {
   schemaVersion @13 :UInt32 = 1;
   textAnalyzer @14 :Text; textProfile @15 :Text;
   rdfProfile @16 :Text;
+  pinReadHandles @17 :UInt64; pinReadBytes @18 :UInt64;
+  maxPinReadHandles @19 :UInt64; maxPinReadBytes @20 :UInt64; pinReadLeaseMs @21 :UInt64;
 }
 struct Ingest {
   requestId @0 :Text; source @1 :Text; format @2 :Format; bytes @3 :Data;
@@ -120,6 +122,25 @@ struct RdfInspection {
   state @5 :ProjectionState; contentGraph @6 :OptionalText; diagnostic @7 :OptionalText;
   primaryRows @8 :UInt64; reifierRows @9 :UInt64; annotationRows @10 :UInt64;
 }
+struct PinSelector { union { active @0 :Void; id @1 :Text; name @2 :Text; } }
+struct PinReadQuery {
+  storeId @0 :Text; selector @1 :PinSelector; cursor @2 :OptionalText;
+  pageSize @3 :UInt32 = 200; scanBudget @4 :UInt32 = 10000;
+}
+struct PinSummary {
+  id @0 :Text; name @1 :Text; expiresAt @2 :Instant;
+  revision @3 :UInt64; directMemberCount @4 :UInt64;
+}
+struct PinReadReceipt {
+  storeId @0 :Text; snapshotId @1 :Text; asOf @2 :Instant; leaseExpiresAt @3 :Instant;
+  totalItems @4 :UInt64; pageStart @5 :UInt64; nextCursor @6 :OptionalText;
+  pageSize @7 :UInt32; scanBudget @8 :UInt32; scanned @9 :UInt64;
+}
+struct PinMembers { pin @0 :PinSummary; members @1 :List(Evidence); }
+struct PinReadPage {
+  receipt @0 :PinReadReceipt;
+  union { collections @1 :List(PinSummary); members @2 :PinMembers; }
+}
 interface Sparrow {
   status @0 () -> (result :Result(Status));
   ingest @1 (request :Ingest) -> (result :Result(Artifact));
@@ -134,4 +155,5 @@ interface Sparrow {
   recordsContext @10 (query :ContextQuery) -> (result :Result(Context));
   rdfInspect @11 (record :RecordRef) -> (result :Result(RdfInspection));
   pinRenew @12 (request :Renew) -> (result :Result(Pin));
+  pinRead @13 (query :PinReadQuery) -> (result :Result(PinReadPage));
 }

@@ -116,6 +116,21 @@
 
 # --- Sparrow-owned storage admission and pin lifetime -----------------
 [[job]]
+id = "pin-catalog-pages"
+summary = "Capture bounded immutable pin metadata and serve finite store-scoped continuation pages without extending protection."
+home = "sparrow_core::Store::pin_read"
+entry_points = []
+spec = "docs/interfaces.md sections 1, 3 and 4: bounded catalog pages, stable identities and finite leases."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^capture_pin_catalog$']
+
+[[job]]
 id = "pin-lifetime"
 summary = "Durably extend active stable pin identities with shared deadline, revision and atomic retry receipt publication."
 home = "sparrow_core::Store::renew_pin"

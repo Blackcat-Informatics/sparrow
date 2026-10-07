@@ -5,6 +5,8 @@
 
 use super::{Result, failure, instant, invalid, wire};
 use purrdf_lex::json::{Object, Value};
+mod read;
+pub(crate) use read::Read;
 
 pub(crate) struct Renewal {
     pub request: String,
@@ -63,9 +65,10 @@ pub(crate) fn revision(value: &str) -> Result<u64> {
         .map_err(|_| invalid("expected_revision exceeds UInt64"))
 }
 
-pub(crate) fn render(value: wire::pin::Reader<'_>) -> Result<Value> {
-    let members = value
-        .get_members()?
+pub(super) fn member_ids(
+    list: capnp::struct_list::Reader<'_, wire::evidence::Owned>,
+) -> Result<Value> {
+    let members = list
         .iter()
         .map(|member| {
             let id = match member.which()? {
@@ -76,6 +79,12 @@ pub(crate) fn render(value: wire::pin::Reader<'_>) -> Result<Value> {
             Ok(Value::from(id))
         })
         .collect::<Result<Vec<_>>>()?;
+    Ok(Value::array(members))
+}
+
+pub(crate) fn render(value: wire::pin::Reader<'_>) -> Result<Value> {
+    let count = value.get_members()?.len();
+    let members = member_ids(value.get_members()?)?;
     Ok(Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("request_id", value.get_request_id()?.to_str()?)
@@ -83,7 +92,7 @@ pub(crate) fn render(value: wire::pin::Reader<'_>) -> Result<Value> {
         .with("name", value.get_name()?.to_str()?)
         .with("expires_at", instant(value.get_expires_at()?)?)
         .with("revision", value.get_revision().to_string())
-        .with("direct_member_count", members.len().to_string())
+        .with("direct_member_count", count.to_string())
         .with(
             "durability",
             match value.get_durability()? {
@@ -91,6 +100,6 @@ pub(crate) fn render(value: wire::pin::Reader<'_>) -> Result<Value> {
                 wire::Durability::Durable => "durable",
             },
         )
-        .with("members", Value::array(members))
+        .with("members", members)
         .into())
 }
