@@ -13,6 +13,10 @@ full architecture acceptance
 remain unfinished. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
 
+The Rust core also exposes a bounded native stored RDF view. Full SPARQL remains
+unfinished because the pinned native engine does not yet price the required
+algebra on bounded views; see [PurRDF integration gaps](docs/purrdf-integration-gaps.md).
+
 ## Operating model
 
 Sparrow will run as a Rust service on one Linux server with local storage. The

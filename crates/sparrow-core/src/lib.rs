@@ -13,5 +13,8 @@ pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
 pub use query::{JsonQuery, QueryScope};
 pub use storage::context::{Context, ContextFrontier, ContextSide};
+pub use storage::rdf_view::{
+    RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
+};
 pub use storage::{Artifact, Config, Error, Pin, Record, Store};
 pub use text::resolve_text_analyzer;

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_ROWS: usize = 32768;
 const MAX_STAGING: usize = 32 * 1024 * 1024;
 const MAX_BATCH: usize = 64 * 1024 * 1024;
-const ORDERS: [(&str, [usize; 4]); 6] = [
+pub(super) const ORDERS: [(&str, [usize; 4]); 6] = [
     ("SPOG", [0, 1, 2, 3]),
     ("POSG", [1, 2, 0, 3]),
     ("OSPG", [2, 0, 1, 3]),
@@ -37,7 +37,7 @@ pub(crate) fn graph_iri(id: &str) -> String {
 pub(super) fn profile_identity() -> Result<String, Error> {
     let mut bytes = Vec::new();
     for value in [
-        "sparrow-rdf-index-v1;canonical-projection-term-json;three-streams;six-permutations;owner-last;u64be;default-graph-to-owner".to_owned(),
+        "sparrow-rdf-index-v2;graph-declarations;term-count;encoded-term-bound;canonical-projection-term-json;three-streams;six-permutations;owner-last;u64be;default-graph-to-owner".to_owned(),
         crate::projection::json_profile()?.identity().to_hex(),
         crate::projection::markdown_profile()?.contract_id().to_hex(),
         format!("rows={MAX_ROWS};staging={MAX_STAGING};batch={MAX_BATCH};term=65536;depth=16"),
@@ -145,14 +145,14 @@ fn manifest_counts(writer: &Writer, id: &str) -> Result<[u64; 3], Error> {
     Ok(counts)
 }
 
-fn encoded(value: &TermValue) -> Result<Vec<u8>, Error> {
+pub(super) fn encoded(value: &TermValue) -> Result<Vec<u8>, Error> {
     let limits = term_limits()?;
     ProjectionTerm::from_term_value(value, limits)
         .and_then(|t| t.to_canonical_json(limits))
         .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))
 }
 
-fn counter(db: &DB, key: &str) -> Result<u64, Error> {
+pub(super) fn counter(db: &DB, key: &str) -> Result<u64, Error> {
     match db.get(key)? {
         Some(bytes) => bytes
             .as_slice()
@@ -163,14 +163,35 @@ fn counter(db: &DB, key: &str) -> Result<u64, Error> {
     }
 }
 
-fn term_key(id: u64) -> String {
+pub(super) fn required_counter(db: &DB, key: &str) -> Result<u64, Error> {
+    let bytes = db.get(key)?.ok_or_else(|| {
+        Error::new(
+            "STORAGE_FAILURE",
+            format!("required RDF counter {key} missing"),
+        )
+    })?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map(u64::from_be_bytes)
+        .map_err(|_| Error::new("STORAGE_FAILURE", format!("invalid RDF counter {key}")))
+}
+
+pub(super) fn term_key(id: u64) -> String {
     format!("rdf:term:{id:020}")
 }
-fn reverse_key(bytes: &[u8]) -> String {
+pub(super) fn reverse_key(bytes: &[u8]) -> String {
     format!(
         "rdf:reverse:{}",
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
     )
+}
+
+pub(super) fn graph_key(graph: u64, owner: u64) -> Vec<u8> {
+    let mut key = b"rdf:g:".to_vec();
+    key.extend_from_slice(&graph.to_be_bytes());
+    key.extend_from_slice(&owner.to_be_bytes());
+    key
 }
 
 fn index_key(owner: u64, stream: u8, name: &str, order: [usize; 4], row: &[u64; 4]) -> Vec<u8> {
@@ -190,17 +211,19 @@ pub(super) struct RdfWrite<'a> {
     references: BTreeMap<u64, u64>,
     owners: BTreeSet<String>,
     staged_bytes: usize,
+    max_encoded: u64,
 }
 
 impl<'a> RdfWrite<'a> {
     pub(super) fn new(db: &'a DB) -> Result<Self, Error> {
         Ok(Self {
             db,
-            next: counter(db, "rdf:next")?,
+            next: required_counter(db, "rdf:next")?,
             terms: BTreeMap::new(),
             references: BTreeMap::new(),
             owners: BTreeSet::new(),
             staged_bytes: 0,
+            max_encoded: required_counter(db, "rdf:max-encoded")?,
         })
     }
 
@@ -236,6 +259,7 @@ impl<'a> RdfWrite<'a> {
             .next
             .checked_add(1)
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF term identity overflow"))?;
+        self.max_encoded = self.max_encoded.max(bytes.len() as u64);
         self.terms.insert(bytes, self.next);
         Ok(self.next)
     }
@@ -266,11 +290,13 @@ impl<'a> RdfWrite<'a> {
     ) -> Result<(), Error> {
         let checkpoint_next = self.next;
         let checkpoint_bytes = self.staged_bytes;
+        let checkpoint_max = self.max_encoded;
         let result = self.graph_inner(batch, id, dataset);
         if result.is_err() {
             self.terms.retain(|_, ordinal| *ordinal <= checkpoint_next);
             self.next = checkpoint_next;
             self.staged_bytes = checkpoint_bytes;
+            self.max_encoded = checkpoint_max;
         }
         result
     }
@@ -377,6 +403,9 @@ impl<'a> RdfWrite<'a> {
             }
         }
         batch.put(format!("rdf:graph:{id}"), manifest);
+        for graph in graphs {
+            batch.put(graph_key(graph, owner), []);
+        }
         self.owners.insert(id.to_owned());
         Ok(())
     }
@@ -444,12 +473,38 @@ impl<'a> RdfWrite<'a> {
                 false,
             )?;
         }
+        for graph in read_field::<Vec<String>>(&manifest, "graphs")? {
+            let graph = graph
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid named graph ID"))?;
+            batch.delete(graph_key(graph, owner));
+        }
         batch.delete(key);
         Ok(())
     }
 
     pub(super) fn finish(self, batch: &mut WriteBatch) -> Result<(), Error> {
         batch.put("rdf:next", self.next.to_be_bytes());
+        batch.put("rdf:max-encoded", self.max_encoded.to_be_bytes());
+        let count = required_counter(self.db, "rdf:term-count")?
+            .checked_add(self.terms.len() as u64)
+            .and_then(|count| {
+                count.checked_sub(
+                    self.references
+                        .values()
+                        .filter(|count| **count == 0)
+                        .count() as u64,
+                )
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    "RDF dictionary count overflow or underflow",
+                )
+            })?;
+        batch.put("rdf:term-count", count.to_be_bytes());
         for (bytes, id) in self.terms {
             batch.put(term_key(id), &bytes);
             batch.put(reverse_key(&bytes), id.to_be_bytes());
@@ -561,11 +616,18 @@ pub(super) fn metadata(
 mod tests {
     use super::*;
 
+    fn empty_dictionary(db: &DB) {
+        for key in ["rdf:term-count", "rdf:max-encoded", "rdf:next"] {
+            db.put(key, 0_u64.to_be_bytes()).unwrap();
+        }
+    }
+
     #[test]
     fn refused_graphs_leave_dictionary_references_and_batch_unchanged() {
         use purrdf::{RdfDatasetBuilder, RdfLiteral};
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
+        empty_dictionary(&db);
         let mut builder = RdfDatasetBuilder::new();
         let s = builder.intern_iri("urn:fixture:s");
         let p = builder.intern_iri("urn:fixture:p");
@@ -627,6 +689,7 @@ mod tests {
         use purrdf::{BlankScope, RdfDatasetBuilder, RdfLiteral, RdfTextDirection};
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
+        empty_dictionary(&db);
         let mut builder = RdfDatasetBuilder::new();
         let s = builder.intern_iri("urn:fixture:subject");
         let p = builder.intern_iri("urn:fixture:predicate");
@@ -656,6 +719,69 @@ mod tests {
         db.write(batch).unwrap();
         let manifest = parse(&db.get("rdf:graph:rdf12-fixture").unwrap().unwrap()).unwrap();
         assert_eq!(manifest["graphs"].as_array().unwrap().len(), 3);
+        {
+            use purrdf::{DatasetView, TermValue};
+            let view = super::super::rdf_view::StoredRdfView::new(
+                &db,
+                crate::RdfReadLimits::default(),
+                &["rdf12-fixture".into()],
+            )
+            .unwrap();
+            assert_eq!(view.quads().count(), 4);
+            assert_eq!(view.reifier_quads().count(), 2);
+            assert_eq!(view.annotation_quads().count(), 2);
+            assert_eq!(view.named_graphs().count(), 3);
+            assert_eq!(
+                view.quads_for_pattern(None, None, None, purrdf::GraphMatch::Default)
+                    .count(),
+                2
+            );
+            for id in [first_blank, second_blank, literal, inner, nested, empty] {
+                let value = native.as_ref().term_value(id);
+                let stored = view.term_id_by_value(&value).unwrap().unwrap();
+                assert_eq!(view.term_value(stored).unwrap(), value);
+            }
+            let owner = view
+                .term_id_by_value(&TermValue::iri(graph_iri("rdf12-fixture")))
+                .unwrap()
+                .unwrap();
+            let s = view
+                .term_id_by_value(&native.as_ref().term_value(s))
+                .unwrap()
+                .unwrap();
+            let p = view
+                .term_id_by_value(&native.as_ref().term_value(p))
+                .unwrap()
+                .unwrap();
+            let o = view
+                .term_id_by_value(&native.as_ref().term_value(first_blank))
+                .unwrap()
+                .unwrap();
+            for mask in 0..8 {
+                let s = (mask & 1 != 0).then_some(s);
+                let p = (mask & 2 != 0).then_some(p);
+                let o = (mask & 4 != 0).then_some(o);
+                for graph in [purrdf::GraphMatch::Any, purrdf::GraphMatch::Named(owner)] {
+                    let mut expected: Vec<_> = view
+                        .quads()
+                        .filter(|q| {
+                            s.is_none_or(|s| q.s == s)
+                                && p.is_none_or(|p| q.p == p)
+                                && o.is_none_or(|o| q.o == o)
+                                && graph.matches(q.g)
+                        })
+                        .collect();
+                    let plan = view.probe_plan(s.is_some(), p.is_some(), o.is_some(), graph);
+                    let mut found: Vec<_> = view
+                        .quads_for_pattern_with_plan(&plan, s, p, o, graph)
+                        .collect();
+                    expected.sort_by_key(|q| (q.s, q.p, q.o, q.g));
+                    found.sort_by_key(|q| (q.s, q.p, q.o, q.g));
+                    assert_eq!(found, expected);
+                }
+            }
+            assert!(view.read_error().is_none());
+        }
         for (stream, count) in [(0, 2), (1, 1), (2, 1)] {
             for (name, _) in ORDERS {
                 let prefix = format!("rdf:q:{stream}:{name}:");
@@ -675,7 +801,7 @@ mod tests {
             })
             .collect();
         for id in [first_blank, second_blank, literal, inner, nested, empty] {
-            let value = native.term_value(id);
+            let value = native.as_ref().term_value(id);
             let identity = encoded(&value).unwrap();
             assert!(bytes.contains(&identity));
             assert_eq!(
@@ -687,9 +813,73 @@ mod tests {
             );
         }
         assert_ne!(
-            encoded(&native.term_value(first_blank)).unwrap(),
-            encoded(&native.term_value(second_blank)).unwrap()
+            encoded(&native.as_ref().term_value(first_blank)).unwrap(),
+            encoded(&native.as_ref().term_value(second_blank)).unwrap()
         );
+        {
+            use purrdf::{DatasetView, FallibleDatasetView, ViewOperationStatus};
+            let value = native.as_ref().term_value(literal);
+            let identity = encoded(&value).unwrap();
+            let id = counter(&db, &reverse_key(&identity)).unwrap();
+            let key = term_key(id);
+            let saved = db.get(&key).unwrap().unwrap();
+            db.delete(&key).unwrap();
+            let view = super::super::rdf_view::StoredRdfView::new(
+                &db,
+                crate::RdfReadLimits::default(),
+                &["rdf12-fixture".into()],
+            )
+            .unwrap();
+            let id = purrdf::ir::GlobalTermId::checked_from_index(id - 1).unwrap();
+            let error = view.resolve(id).err().unwrap();
+            assert_eq!(error.code, "STORAGE_FAILURE");
+            assert!(std::sync::Arc::ptr_eq(&error, &view.read_error().unwrap()));
+            assert!(view.quads().next().is_none());
+            assert!(matches!(
+                view.operation_status(),
+                ViewOperationStatus::Failed { .. }
+            ));
+            drop(view);
+            db.put(&key, saved).unwrap();
+            let broken = index_key(1, 0, "SPOG", [0, 1, 2, 3], &[0; 4]);
+            db.put(&broken, []).unwrap();
+            let view = super::super::rdf_view::StoredRdfView::new(
+                &db,
+                crate::RdfReadLimits::default(),
+                &["rdf12-fixture".into()],
+            )
+            .unwrap();
+            let failure = purrdf::dataset_view::checkpointed_drain(&view, |view| {
+                view.quads().collect::<Vec<_>>()
+            })
+            .unwrap_err();
+            assert_eq!(
+                failure.checkpoint,
+                purrdf::dataset_view::DrainCheckpoint::After
+            );
+            assert_eq!(failure.error.code, "STORAGE_FAILURE");
+            drop(view);
+            db.delete(broken).unwrap();
+            let broken = graph_key(0, 1);
+            db.put(&broken, []).unwrap();
+            let view = super::super::rdf_view::StoredRdfView::new(
+                &db,
+                crate::RdfReadLimits::default(),
+                &["rdf12-fixture".into()],
+            )
+            .unwrap();
+            assert_eq!(
+                purrdf::dataset_view::checkpointed_drain(&view, |view| view
+                    .named_graphs()
+                    .collect::<Vec<_>>())
+                .unwrap_err()
+                .error
+                .code,
+                "STORAGE_FAILURE"
+            );
+            drop(view);
+            db.delete(broken).unwrap();
+        }
         let mut batch = WriteBatch::default();
         let mut write = RdfWrite::new(&db).unwrap();
         write.remove(&mut batch, "rdf12-fixture").unwrap();
@@ -700,6 +890,7 @@ mod tests {
             "rdf:reverse:",
             "rdf:ref:",
             "rdf:q:",
+            "rdf:g:",
             "rdf:graph:",
         ] {
             assert!(
@@ -707,5 +898,6 @@ mod tests {
                     .any(|e| e.unwrap().0.starts_with(prefix.as_bytes()))
             );
         }
+        assert_eq!(counter(&db, "rdf:term-count").unwrap(), 0);
     }
 }

@@ -17,9 +17,10 @@ use rocksdb::{
 
 pub(crate) mod context;
 mod rdf_index;
+pub(crate) mod rdf_view;
 mod text_index;
 
-const FORMAT: &[u8] = b"sparrow.store/4";
+const FORMAT: &[u8] = b"sparrow.store/5";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -402,10 +403,36 @@ impl Writer {
     }
 
     fn protected(&self, now: u64) -> Result<BTreeSet<String>, Error> {
+        self.protected_matching(now, |_| true, || Ok(()), None)
+    }
+
+    fn protected_matching<R>(
+        &self,
+        now: u64,
+        include: impl Fn(&str) -> bool,
+        mut admit: impl FnMut() -> Result<R, Error>,
+        maximum: Option<usize>,
+    ) -> Result<BTreeSet<String>, Error> {
         let mut protected = BTreeSet::new();
-        for pin in self.list::<Pin>("pin:")? {
+        let mut iterator = self.db.prefix_iterator("pin:");
+        loop {
+            let _admission = admit()?;
+            let Some(entry) = iterator.next() else {
+                break;
+            };
+            let (key, bytes) = entry?;
+            if !key.starts_with(b"pin:") {
+                break;
+            }
+            if maximum.is_some_and(|maximum| bytes.len() > maximum) {
+                return Err(Error::new(
+                    "RESOURCE_LIMIT",
+                    "pin catalog entry exceeds RDF scope admission",
+                ));
+            }
+            let pin = Pin::decode(&parse(&bytes)?)?;
             if pin.expires_at > now {
-                protected.extend(pin.members);
+                protected.extend(pin.members.into_iter().filter(|member| include(member)));
             }
         }
         Ok(protected)
@@ -503,6 +530,9 @@ impl Store {
                 batch.put("store_id", &id);
                 batch.put("text_analyzer", &fingerprint);
                 batch.put("rdf_profile", &rdf_fingerprint);
+                batch.put("rdf:term-count", 0_u64.to_be_bytes());
+                batch.put("rdf:max-encoded", 0_u64.to_be_bytes());
+                batch.put("rdf:next", 0_u64.to_be_bytes());
                 let mut write = WriteOptions::default();
                 write.set_sync(true);
                 db.write_opt(batch, &write)?;
@@ -523,6 +553,15 @@ impl Store {
                     "store text analyzer identity missing; inspect or restore the catalog",
                 ));
             }
+        }
+        let terms = rdf_index::required_counter(&db, "rdf:term-count")?;
+        let maximum = rdf_index::required_counter(&db, "rdf:max-encoded")?;
+        let next = rdf_index::required_counter(&db, "rdf:next")?;
+        if maximum > 65536 || (terms > 0 && maximum == 0) || next < terms {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "RDF read control counters inconsistent",
+            ));
         }
         match db.get("rdf_profile")? {
             Some(stored) if stored == rdf_fingerprint.as_bytes() => {}

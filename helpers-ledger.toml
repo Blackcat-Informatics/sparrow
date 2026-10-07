@@ -114,6 +114,22 @@
 # or recorded below with its reason; `make census` and `make census-cross` write
 # the reports new rows are drawn from.
 
+# --- Stored RDF access: Sparrow owns RocksDB admission -----------------
+[[job]]
+id = "stored-rdf-read"
+summary = "Resolve scoped native RDF guards and lazy physical probes under one sticky RocksDB read budget."
+home = "sparrow_core::StoredRdfView::resolve"
+entry_points = ["sparrow_core::StoredRdfView::term_id_by_value", "sparrow_core::Store::with_rdf_records"]
+spec = "docs/development-runtime.md: bounded stored RDF reads; native DatasetView and FallibleDatasetView contracts."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^resolve_stored_rdf_term$']
+
 # --- PurRDF-owned helpers: prevent new local implementations -------------
 # These are reuse rules, not declarations of compiled runtime dependencies.
 # Runtime callers use the native owners below; there are no sanctioned clones.

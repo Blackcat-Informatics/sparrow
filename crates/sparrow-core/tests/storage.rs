@@ -8,6 +8,253 @@ use sparrow_core::{Config, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
+    use purrdf::{
+        SparqlRequest, SparqlResult,
+        sparql::{NativeSparqlEngine, QueryGovernors, QueryOptions},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest(
+            "native-query-a",
+            "rdf-native",
+            "json",
+            br#"{"message":"failed"}"#,
+            0,
+        )
+        .unwrap();
+    let b = store
+        .ingest(
+            "native-query-b",
+            "rdf-native",
+            "json",
+            br#"{"message":"failed"}"#,
+            1,
+        )
+        .unwrap();
+    let unrelated = store
+        .ingest(
+            "native-query-other",
+            "other",
+            "json",
+            br#"{"message":"failed"}"#,
+            2,
+        )
+        .unwrap();
+    let ids = vec![a.record_ids[0].clone(), b.record_ids[0].clone()];
+    let engine = NativeSparqlEngine::new();
+    let governors = QueryGovernors::METERED
+        .with_fuel(1000000)
+        .with_max_answers(100)
+        .with_max_intermediate_cells(10000)
+        .with_max_scratch_bytes(1024 * 1024)
+        .with_max_remote_requests(0);
+    let select = "SELECT ?a ?b WHERE { ?a <urn:sparrow:vocab:payload> ?payload . ?b <urn:sparrow:vocab:payload> ?payload }";
+    let result = store
+        .with_rdf_records(&ids, 3, sparrow_core::RdfReadLimits::default(), |view| {
+            engine
+                .query_governed_fallible_view(
+                    view,
+                    SparqlRequest {
+                        query: select,
+                        base_iri: None,
+                        substitutions: &[],
+                    },
+                    QueryOptions::default(),
+                    &governors,
+                )
+                .map_err(Box::new)
+        })
+        .unwrap()
+        .unwrap();
+    let SparqlResult::Solutions { rows, .. } = result.result else {
+        panic!("SELECT result required")
+    };
+    assert_eq!(rows.len(), 4);
+    assert!(!format!("{rows:?}").contains(&unrelated.record_ids[0]));
+    let stopped = store
+        .with_rdf_records(&ids, 3, sparrow_core::RdfReadLimits::default(), |view| {
+            engine
+                .query_governed_fallible_view(
+                    view,
+                    SparqlRequest {
+                        query: select,
+                        base_iri: None,
+                        substitutions: &[],
+                    },
+                    QueryOptions::default(),
+                    &governors.clone().with_fuel(0),
+                )
+                .map_err(Box::new)
+        })
+        .unwrap();
+    assert!(matches!(
+        *stopped.unwrap_err(),
+        purrdf::sparql::FallibleSparqlError::BudgetExhausted { .. }
+    ));
+    for query in [
+        "SELECT ?s WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } }",
+        "ASK { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> \"rdf-native\" } }",
+        "CONSTRUCT { ?s <urn:sparrow:vocab:sourceName> ?name } WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } }",
+        "DESCRIBE ?s WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> \"rdf-native\" } }",
+    ] {
+        let result = store
+            .with_rdf_records(&ids, 3, sparrow_core::RdfReadLimits::default(), |view| {
+                engine
+                    .query_governed_fallible_view(
+                        view,
+                        SparqlRequest {
+                            query,
+                            base_iri: None,
+                            substitutions: &[],
+                        },
+                        QueryOptions::default(),
+                        &governors,
+                    )
+                    .map_err(Box::new)
+            })
+            .unwrap();
+        let purrdf::sparql::FallibleSparqlError::Query { diagnostic, .. } = *result.unwrap_err()
+        else {
+            panic!("native admission diagnostic required")
+        };
+        assert_eq!(diagnostic.code, "native-sparql-workspace-unpriced");
+    }
+    store
+        .pin(
+            "native-query-pin",
+            "native-selection",
+            std::slice::from_ref(&ids[0]),
+            40,
+            3,
+        )
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    let pinned = store
+        .with_rdf_records(
+            std::slice::from_ref(&ids[0]),
+            31 * DAY,
+            sparrow_core::RdfReadLimits::default(),
+            |view| purrdf::DatasetView::quads(view).count(),
+        )
+        .unwrap();
+    assert!(pinned > 20);
+    assert_eq!(
+        store
+            .with_rdf_records(
+                &ids,
+                31 * DAY,
+                sparrow_core::RdfReadLimits::default(),
+                |_| ()
+            )
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+}
+
+#[test]
+fn stored_rdf_reads_refuse_exhaustion_and_failed_projection_without_prefixes() {
+    use purrdf::DatasetView;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest(
+            "native-read-budget",
+            "rdf-native",
+            "json",
+            br#"{"message":"failed"}"#,
+            0,
+        )
+        .unwrap();
+    let limits = sparrow_core::RdfReadLimits {
+        row_visits: 1,
+        ..Default::default()
+    };
+    let error = store
+        .with_rdf_records(&artifact.record_ids, 1, limits, |view| {
+            view.quads().collect::<Vec<_>>()
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "RESOURCE_LIMIT");
+    assert_eq!(
+        store
+            .with_rdf_records(&artifact.record_ids, 1, Default::default(), |view| view
+                .term_id_by_value(&purrdf::TermValue::iri(format!(
+                    "urn:fixture:{}",
+                    "x".repeat(70000)
+                ))))
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    let limits = sparrow_core::RdfReadLimits {
+        live_bytes: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        store
+            .with_rdf_records(&artifact.record_ids, 1, limits, |_| ())
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    let malformed = store
+        .ingest("native-read-failed", "rdf-native", "json", b"{broken", 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .with_rdf_records(&malformed.record_ids, 1, Default::default(), |_| ())
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+}
+
+#[test]
+fn rdf_read_controls_and_selected_catalog_identity_are_verified() {
+    for key in ["rdf:term-count", "rdf:max-encoded", "rdf:next"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        drop(store);
+        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        db.delete(key).unwrap();
+        drop(db);
+        assert_eq!(
+            Store::open(dir.path(), config()).err().unwrap().code,
+            "STORAGE_FAILURE"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let first = store
+        .ingest("rdf-identity-a", "a", "log", b"one", 0)
+        .unwrap();
+    let second = store
+        .ingest("rdf-identity-b", "b", "log", b"two", 0)
+        .unwrap();
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let bytes = db.get(&first.record_ids[0]).unwrap().unwrap();
+    let changed = std::str::from_utf8(&bytes)
+        .unwrap()
+        .replace(&first.record_ids[0], &second.record_ids[0]);
+    db.put(&first.record_ids[0], changed).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .with_rdf_records(&first.record_ids, 1, Default::default(), |_| ())
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+}
+
+#[test]
 fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
     use purrdf::projections::{ProjectionLimits, ProjectionTerm};
     let dir = tempfile::tempdir().unwrap();
@@ -233,7 +480,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/4")
+        Some("sparrow.store/5")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]

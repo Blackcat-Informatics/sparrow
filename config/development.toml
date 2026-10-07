@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 # Development store only. Live producer directories are not watched or consumed.
-socket_path = "/home/paudley/.local/state/sparrow/development-v4/rpc.sock"
-data_dir = "/home/paudley/.local/state/sparrow/development-v4"
+socket_path = "/home/paudley/.local/state/sparrow/development-v5/rpc.sock"
+data_dir = "/home/paudley/.local/state/sparrow/development-v5"
 disk_budget = 536870912
 maintenance_reserve = 67108864
 max_artifact_bytes = 16777216

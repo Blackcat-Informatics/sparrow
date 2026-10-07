@@ -25,7 +25,7 @@ are required work.
 ```sh
 CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server
 target/release/sparrowd --config config/development.toml
-target/release/sparrow /home/paudley/.local/state/sparrow/development-v4/rpc.sock status
+target/release/sparrow /home/paudley/.local/state/sparrow/development-v5/rpc.sock status
 ```
 
 ## CLI investigations
@@ -68,7 +68,7 @@ coverage receipt. Transport/domain failures exit unsuccessfully without a
 successful result prefix.
 
 Development configuration selects
-`/home/paudley/.local/state/sparrow/development-v4/rpc.sock` and the database in its
+`/home/paudley/.local/state/sparrow/development-v5/rpc.sock` and the database in its
 parent directory. The directory is mode 0700 and socket mode 0600. The daemon
 refuses an existing endpoint rather than unlinking a listener's socket. An owned
 dead endpoint must be reconciled before restart after an unclean shutdown.
@@ -113,7 +113,7 @@ wildcard selector is inferred.
 Launch the adapter with the existing private daemon socket:
 
 ```sh
-target/release/sparrow /home/paudley/.local/state/sparrow/development-v4/rpc.sock mcp --stdio
+target/release/sparrow /home/paudley/.local/state/sparrow/development-v5/rpc.sock mcp --stdio
 ```
 
 A host configuration can use this command and argument array:
@@ -123,7 +123,7 @@ A host configuration can use this command and argument array:
   "mcpServers": {
     "sparrow": {
       "command": "/home/paudley/Active/sparrow/target/release/sparrow",
-      "args": ["/home/paudley/.local/state/sparrow/development-v4/rpc.sock", "mcp", "--stdio"]
+      "args": ["/home/paudley/.local/state/sparrow/development-v5/rpc.sock", "mcp", "--stdio"]
     }
   }
 }
@@ -217,7 +217,7 @@ qualification remain required later work.
 
 ## Persistent RDF foundation
 
-Store format 4 binds the RDF layout, native JSON profile, native Markdown contract,
+Store format 4 bound the RDF layout, native JSON profile, native Markdown contract,
 and admission limits to a persisted `rdf_profile` identity. Missing identity is a
 storage failure; drift refuses reopening with a migration-required error. Earlier
 format-3 data is preserved separately; this implementation does not migrate it.
@@ -255,6 +255,47 @@ oversized/malformed projection refusal with exact-byte preservation, and verifie
 RDF 1.2 nested terms, distinct blank scopes, directional literals, reifier and
 annotation layers, and declaration-only empty graphs. Profile drift/missing
 identity and shared CLI/MCP inspection are covered by the repository gate.
+
+## Bounded stored RDF reads
+
+Store format 5 adds atomic dictionary cardinality, a conservative encoded-term
+high-water bound, and graph-declaration postings. Opening a native view does not
+scan the dictionary or decode each graph manifest. Missing or inconsistent control
+counters are hard storage failures. Format-4 data remains preserved separately
+and requires explicit migration before reopening with this implementation.
+
+`Store::with_rdf_records` admits one concrete selection of 1..1000 retained
+record IDs. It includes occurrence metadata and complete shared content, validates
+the selection atomically, and refuses failed applicable projections. Pin-aware
+eligibility uses the same retention law as ordinary reads. Scope preparation,
+pin parsing, term access, lazy index scans and native operator scratch share one
+read budget; ordinary-age selections do not scan pins. The callback holds the
+serialized store owner for its bounded lease. Concurrent snapshot qualification
+and the full live/pin/selection query scope interface remain required work.
+
+The default ceilings are 128 MiB live admitted capacity, 100,000 read admissions,
+128 MiB admitted maximum read bytes, 100,000 index-row admissions, and a 30-second
+lease. A lease may be configured up to 60 seconds. These are host admission
+counters, not measurements of engine I/O or process RSS. Native engine caches and
+whole-process qualification remain separate. Terms use their persisted encoded
+high-water bound times 256 plus 4 KiB as conservative decoded/owned capacity;
+lookup inputs are admitted before native conversion can clone them.
+
+Native `DatasetView` and `FallibleDatasetView` read all three physical streams,
+preserve declared empty graphs, and use physical prefix probes. Each stream also
+exposes its virtual default set union while retaining named graph identities.
+Adjacent owner/graph duplicates are suppressed without a resident row set. Typed
+guards retain portable native term carriers and resolve datatype/triple links
+through the same verified forward/reverse dictionary. Compact IDs remain scoped
+to this read; they are not agent evidence references.
+
+All read/lease/admission failures latch the first root cause and stop lazy
+iterators. Native before/after checkpoints discard internal prefixes. Tests cover
+cross-record native SELECT joins, selected-owner isolation, all bound-axis shapes,
+native RDF 1.2 terms/layers, empty graphs, pin survival, exhaustion, missing terms,
+malformed index/declaration identities and dictionary reclamation. The required
+full SPARQL algebra remains unmet; see
+[PurRDF integration gaps](purrdf-integration-gaps.md). No SPARQL tool is advertised.
 
 ## Persistent full text
 
@@ -359,7 +400,26 @@ The full repository gate passed, including refusal rollback, native RDF 1.2
 identity/layers, all six index permutations, pin-aware reclamation, profile drift,
 and daemon/MCP crash-reopen coverage. Stored-view SPARQL remains unimplemented.
 
-Remaining final-server acceptance includes native stored-view qualification,
+The bounded-reader build started a fresh format-5 store on 2026-10-07 UTC at
+`development-v5/rpc.sock`, store ID
+`store:46c88e949ccec658600b66c7becd5bb7`, RDF profile
+`1909d176e2b728f3041d0b2c665600aed5303e4b8525260bc1165850690ad0d5`.
+The owned format-4 daemon stopped cleanly and its database remains intact.
+Live checks imported five synthetic occurrences. Two identical JSONL records
+shared one 80-row content graph while retaining separate 11-row metadata graphs.
+The Markdown record retained 41 content rows. All three fixture artifacts exported
+their exact original bytes. CLI/MCP RDF inspection agreed, MCP listed twelve tools
+and drained EOF without extraneous output, and text/key/context checks passed.
+Private directory/socket modes remained 0700/0600. No production inputs were
+consumed and no sibling services changed.
+
+The required release gate passed 24 storage scenarios, four core unit tests,
+daemon/MCP crash-reopen checks and eleven enforced helper jobs with no duplicate
+exceptions. The Rust core's native SELECT join is qualified on persisted fixtures;
+the daemon does not expose SPARQL. Native workspace admission for the required
+remaining algebra is tracked in [PurRDF integration gaps](purrdf-integration-gaps.md).
+
+Remaining final-server acceptance includes concurrent stored-view qualification,
 governed SPARQL, source/artifact metadata graphs, further
 text qualification, event-time and combined predicates, context and
 correlation, final scope/pagination contracts, streaming imports and recovery
