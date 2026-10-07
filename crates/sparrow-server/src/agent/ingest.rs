@@ -127,6 +127,7 @@ impl Input {
         }
         // Ordinal zero also recovers already committed preparation progress.
         let mut expected = 0;
+        let mut previous = None;
         loop {
             let mut request = client.import_prepare_request();
             let mut input = request.get().init_request();
@@ -138,6 +139,28 @@ impl Input {
                 wire::result::Error(error) => return Err(failure(error?)),
             };
             expected = value.get_prepared_records();
+            let raw_chunks = match value.get_raw()?.which()? {
+                wire::optional_raw_preparation::Absent(()) => None,
+                wire::optional_raw_preparation::Value(raw) => {
+                    let raw = raw?;
+                    if raw.get_record_index() != expected
+                        || raw.get_prepared_chunks() == 0
+                        || raw.get_prepared_chunks() > raw.get_total_chunks()
+                    {
+                        return Err(invalid(
+                            "daemon returned inconsistent raw preparation progress",
+                        ));
+                    }
+                    Some(raw.get_prepared_chunks())
+                }
+            };
+            let progress = (expected, raw_chunks);
+            if previous.is_some_and(|old| progress <= old) || expected > value.get_total_records() {
+                return Err(invalid(
+                    "daemon preparation did not advance its durable checkpoint",
+                ));
+            }
+            previous = Some(progress);
             if expected == value.get_total_records() {
                 break;
             }

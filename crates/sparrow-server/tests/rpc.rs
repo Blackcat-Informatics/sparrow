@@ -61,9 +61,9 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         let client = &connection.client;
         let response = client.status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_schema_version(), 9);
+        assert_eq!(status.get_schema_version(), 10);
         let store = status.get_store_id().unwrap().to_str().unwrap().to_owned();
-        let mut input = vec![b'a'; sparrow_core::IMPORT_CHUNK_BYTES * 2];
+        let mut input = vec![b'a'; sparrow_core::IMPORT_CHUNK_BYTES + 16 * 1024 * 1024 + 1];
         input[sparrow_core::IMPORT_CHUNK_BYTES - 1] = b'\n';
         *input.last_mut().unwrap() = b'\n';
         input.extend_from_slice(b"last\n");
@@ -137,6 +137,20 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         reference.set_store_id(&store); reference.set_id(&reserved);
         let response = request.send().promise.await.unwrap();
         assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(_)));
+        let mut request = client.import_prepare_request();
+        let mut prepare = request.get().init_request();
+        upload_ref(prepare.reborrow().init_import(), &store, &id);
+        prepare.set_expected_record(1);
+        let response = request.send().promise.await.unwrap();
+        let partial = rpc_ok(response.get().unwrap().get_result().unwrap());
+        assert_eq!(partial.get_prepared_records(), 1);
+        let raw = match partial.get_raw().unwrap().which().unwrap() {
+            wire::optional_raw_preparation::Value(value) => value.unwrap(),
+            wire::optional_raw_preparation::Absent(()) => panic!("oversized raw record was not checkpointed"),
+        };
+        assert_eq!(raw.get_prepared_chunks(), 128);
+        assert_eq!(raw.get_total_chunks(), 257);
+        let raw_record = raw.get_reserved_record_id().unwrap().to_str().unwrap().to_owned();
         drop(connection);
         drop(daemon);
         std::fs::remove_file(&socket).unwrap();
@@ -148,6 +162,7 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         assert_eq!(receipt["artifact_id"].as_str(), Some(reserved.as_str()));
         assert_eq!(receipt["payload_id"].as_str(), Some(payload.as_str()));
         assert_eq!(receipt["record_ids"].as_array().unwrap().len(), 3);
+        assert_eq!(receipt["record_ids"].item(1).unwrap().as_str(), Some(raw_record.as_str()));
         assert_eq!(receipt, cli(&socket, &args));
         let connection = connect(&socket).await.unwrap();
         let client = &connection.client;
@@ -1392,7 +1407,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(9)
+        Some(10)
     );
     let unknown = mcp
         .call(

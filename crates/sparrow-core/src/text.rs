@@ -56,23 +56,37 @@ pub fn resolve_text_analyzer(directory: impl AsRef<Path>) -> Result<Analyzer, Er
 
 pub(crate) fn facts(
     analyzer: &Analyzer,
-    bytes: &[u8],
+    bytes: Option<&[u8]>,
+    byte_length: u64,
     json: Option<&Value>,
     opaque: bool,
-) -> Value {
+) -> Result<Value, Error> {
     let mut envelope = Object::new().with("profile", PROFILE).with(
         "analyzer",
         purrdf_hash::hex::encode(&analyzer.fingerprint()),
     );
     if opaque {
-        return envelope
+        return Ok(envelope
             .with("state", "not_applicable")
             .with("length", "0")
             .with("terms", Value::array(Vec::<Value>::new()))
-            .into();
+            .into());
     }
-    let result = analyze(analyzer, bytes, json);
-    match result {
+    let result = if byte_length > 1024 * 1024 {
+        Err(Error::new(
+            "RESOURCE_LIMIT",
+            "aligned text record exceeds 1 MiB profile bound",
+        ))
+    } else {
+        let bytes = bytes.ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "text source missing within its materialization bound",
+            )
+        })?;
+        analyze(analyzer, bytes, json)
+    };
+    Ok(match result {
         Ok((length, terms, incomplete)) => envelope
             .with("state", if incomplete { "incomplete" } else { "complete" })
             .with("length", length.to_string())
@@ -87,7 +101,7 @@ pub(crate) fn facts(
                 .with("terms", Value::array(Vec::<Value>::new()))
                 .into()
         }
-    }
+    })
 }
 
 fn analyze(
@@ -95,12 +109,6 @@ fn analyze(
     bytes: &[u8],
     json: Option<&Value>,
 ) -> Result<(u64, Vec<Value>, bool), Error> {
-    if bytes.len() > 1024 * 1024 {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
-            "aligned text record exceeds 1 MiB profile bound",
-        ));
-    }
     let raw =
         std::str::from_utf8(bytes).map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))?;
     let mut terms = BTreeMap::<String, Vec<Value>>::new();

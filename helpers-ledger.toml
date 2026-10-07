@@ -584,3 +584,78 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(render_staging_progress|encode_upload_progress)$']
+
+[[job]]
+id = "oversized-raw-record-preparation"
+summary = "Checkpoint oversized record bytes and exact chunk ownership in bounded pages, then use shared native record preparation after complete digest verification."
+home = "sparrow_core::storage::publication::raw::advance"
+entry_points = []
+spec = "docs/development-runtime.md: schema-10 oversized record checkpoints and complete raw identity boundary."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(prepare_large_record_payload|prepare_oversized_record_bytes)$']
+
+[[job]]
+id = "payload-ownership-preparation"
+summary = "Prepare native content-addressed payloads and parent/record ownership increments once for buffered ingestion and raw checkpoints."
+home = "sparrow_core::storage::Writer::prepare_payloads"
+entry_points = []
+spec = "docs/development-runtime.md: shared two-owner additions with normalized byte and counter integrity checks."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(write_raw_payload_references|prepare_record_payload_references)$']
+
+[[job]]
+id = "payload-ownership-retirement"
+summary = "Count raw payload ownership removals once for ordinary records and abandoned private raw preparation."
+home = "sparrow_core::storage::retire::Retirement::payloads"
+entry_points = []
+spec = "docs/development-runtime.md: shared content survives cancellation and record-only pin retention."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(retire_raw_chunk_references|release_record_chunk_owners)$']
+
+[[job]]
+id = "private-import-page-encoding"
+summary = "Encode bounded immutable native JSON pages behind their native BLAKE3 checksum for layout and raw chunk identities."
+home = "sparrow_core::storage::import::encode_page"
+entry_points = []
+spec = "docs/development-runtime.md: shared checksum-protected 32 KiB layout and raw identity pages."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_record_layout_page|encode_raw_chunk_page)$']
+
+[[job]]
+id = "private-import-page-decoding"
+summary = "Check immutable page length and native digest before native JSON decoding for layouts and raw chunk identities."
+home = "sparrow_core::storage::import::decode_page"
+entry_points = []
+spec = "docs/development-runtime.md: hard failure on missing or corrupt private pages."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_record_layout_page|decode_raw_chunk_page)$']

@@ -8,13 +8,23 @@ use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 use std::collections::BTreeMap;
 
+pub(super) enum RecordPayload<'a> {
+    Buffered(&'a [u8]),
+    /// Exact normalized chunks already durably owned by this private record and parent.
+    Prepared {
+        byte_length: u64,
+        digest: &'a str,
+        chunks: Vec<String>,
+    },
+}
+
 pub(super) struct RecordInput<'a> {
     pub id: String,
     pub artifact_id: &'a str,
     pub source: &'a str,
     pub format: &'a str,
     pub byte_start: u64,
-    pub bytes: &'a [u8],
+    pub payload: RecordPayload<'a>,
     pub received_at: u64,
     pub expires_at: u64,
     pub source_time_profile: &'a Option<source_time::SourceTimeProfile>,
@@ -65,15 +75,35 @@ impl<'a> RecordBatch<'a> {
         }
         let source = input.source;
         let format = input.format;
-        let bytes = input.bytes;
+        let (raw_bytes, byte_length, digest, prepared_chunks) = match input.payload {
+            RecordPayload::Buffered(bytes) => (
+                Some(bytes),
+                bytes.len() as u64,
+                hex::encode(blake3::hash(bytes).as_bytes()),
+                None,
+            ),
+            RecordPayload::Prepared {
+                byte_length,
+                digest,
+                chunks,
+            } => {
+                if byte_length <= crate::projection::RECORD_BYTES {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "prepared raw record must exceed materialization admission",
+                    ));
+                }
+                (None, byte_length, digest.to_owned(), Some(chunks))
+            }
+        };
+        let bytes = raw_bytes.filter(|_| byte_length <= crate::projection::RECORD_BYTES);
         let start = input.byte_start;
         let end = start
-            .checked_add(bytes.len() as u64)
+            .checked_add(byte_length)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "record byte range overflow"))?;
         let now = input.received_at;
         let expires_at = input.expires_at;
         let source_time_profile = input.source_time_profile;
-        let digest = hex::encode(blake3::hash(bytes).as_bytes());
         let mut native_graph = None;
         let projection_id = if ["json", "jsonl"].contains(&format) {
             let key = format!(
@@ -86,8 +116,12 @@ impl<'a> RecordBatch<'a> {
                 let facts = match self.writer.db.get(&key)? {
                     Some(stored) => parse(&stored)?,
                     None => {
-                        let (facts, graph) =
-                            crate::projection::json_facts(bytes, &digest, &self.profile)?;
+                        let (facts, graph) = crate::projection::json_facts(
+                            bytes,
+                            byte_length,
+                            &digest,
+                            &self.profile,
+                        )?;
                         native_graph = Some(graph);
                         facts
                     }
@@ -117,7 +151,12 @@ impl<'a> RecordBatch<'a> {
                     Some(stored) => parse(&stored)?,
                     None => {
                         let result = if format == "markdown" {
-                            crate::projection::markdown_graph(bytes, &digest, &self.markdown)
+                            crate::projection::markdown_graph(
+                                bytes,
+                                byte_length,
+                                &digest,
+                                &self.markdown,
+                            )
                         } else {
                             native_graph.ok_or_else(|| {
                                 Error::new(
@@ -150,8 +189,8 @@ impl<'a> RecordBatch<'a> {
                     .insert(rdf_projection_id.clone(), (state, 1));
             }
         }
-        let mut record_chunks = Vec::new();
-        for chunk in bytes.chunks(CHUNK) {
+        let mut record_chunks = prepared_chunks.unwrap_or_default();
+        for chunk in raw_bytes.into_iter().flat_map(|bytes| bytes.chunks(CHUNK)) {
             let digest = hex::encode(blake3::hash(chunk).as_bytes());
             self.content
                 .entry(digest.clone())
@@ -185,9 +224,10 @@ impl<'a> RecordBatch<'a> {
         let text = crate::text::facts(
             &self.writer.config.text_analyzer,
             bytes,
+            byte_length,
             json,
             format == "opaque",
-        );
+        )?;
         self.writer.put_text(&mut self.batch, &record.id, &text)?;
         let rdf_state = self
             .rdf_projections
@@ -200,22 +240,13 @@ impl<'a> RecordBatch<'a> {
         )?;
         self.byte_count = self
             .byte_count
-            .checked_add(bytes.len() as u64)
+            .checked_add(raw_bytes.map_or(0, |bytes| bytes.len() as u64))
             .ok_or_else(|| Error::new("RESOURCE_LIMIT", "prepared byte count overflow"))?;
         self.record_count += 1;
         Ok(record)
     }
 
     pub(super) fn finish(mut self) -> Result<PreparedRecords, Error> {
-        let cf = self
-            .writer
-            .db
-            .cf_handle("payload")
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
-        let mut additions = BTreeMap::<String, u64>::new();
-        for digest in &self.chunks {
-            *additions.entry(digest.clone()).or_default() += 2;
-        }
         let mut new_bytes = 0_u64;
         for (id, (state, added)) in self.rdf_projections {
             let key = format!("rdf:projection-ref:{id}");
@@ -274,23 +305,11 @@ impl<'a> RecordBatch<'a> {
                     .to_be_bytes(),
             );
         }
-        for (digest, payload) in self.content {
-            let reference_key = format!("ref:{digest}");
-            let count = match self.writer.db.get(&reference_key)? {
-                Some(v) => u64::from_be_bytes(v.as_slice().try_into().map_err(|_| {
-                    Error::new("STORAGE_FAILURE", "invalid payload reference counter")
-                })?),
-                None => {
-                    new_bytes += payload.len() as u64;
-                    self.batch.put_cf(cf, &digest, &payload);
-                    0
-                }
-            };
-            let count = count.checked_add(additions[&digest]).ok_or_else(|| {
-                Error::new("STORAGE_FAILURE", "payload reference counter overflow")
-            })?;
-            self.batch.put(reference_key, count.to_be_bytes());
-        }
+        new_bytes = new_bytes.saturating_add(self.writer.prepare_payloads(
+            &mut self.batch,
+            self.content,
+            &self.chunks,
+        )?);
         let estimate = self
             .byte_count
             .saturating_add(new_bytes)
@@ -314,6 +333,74 @@ impl<'a> RecordBatch<'a> {
             batch: self.batch,
             chunks: self.chunks,
         })
+    }
+}
+
+impl Writer {
+    /// One payload ownership writer for buffered records and bounded raw checkpoints.
+    pub(super) fn prepare_payloads(
+        &self,
+        batch: &mut WriteBatch,
+        content: BTreeMap<String, Vec<u8>>,
+        chunks: &[String],
+    ) -> Result<u64, Error> {
+        let cf = self
+            .db
+            .cf_handle("payload")
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
+        let mut additions = BTreeMap::<String, u64>::new();
+        for digest in chunks {
+            *additions.entry(digest.clone()).or_default() += 2;
+        }
+        let mut new_bytes = 0_u64;
+        for (digest, payload) in content {
+            if payload.is_empty()
+                || payload.len() > CHUNK
+                || hex::encode(blake3::hash(&payload).as_bytes()) != digest
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "invalid normalized payload preparation",
+                ));
+            }
+            let reference_key = format!("ref:{digest}");
+            let count = match self.db.get(&reference_key)? {
+                Some(v) => {
+                    let count = u64::from_be_bytes(v.as_slice().try_into().map_err(|_| {
+                        Error::new("STORAGE_FAILURE", "invalid payload reference counter")
+                    })?);
+                    if count == 0 || self.payload_chunk(&digest)? != payload {
+                        return Err(Error::new(
+                            "STORAGE_FAILURE",
+                            "existing payload contradicts its ownership",
+                        ));
+                    }
+                    count
+                }
+                None => {
+                    new_bytes += payload.len() as u64;
+                    batch.put_cf(cf, &digest, &payload);
+                    0
+                }
+            };
+            let added = additions.remove(&digest).ok_or_else(|| {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    "prepared payload has no occurrence references",
+                )
+            })?;
+            let count = count.checked_add(added).ok_or_else(|| {
+                Error::new("STORAGE_FAILURE", "payload reference counter overflow")
+            })?;
+            batch.put(reference_key, count.to_be_bytes());
+        }
+        if !additions.is_empty() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "prepared occurrence references have no payload bytes",
+            ));
+        }
+        Ok(new_bytes)
     }
 }
 

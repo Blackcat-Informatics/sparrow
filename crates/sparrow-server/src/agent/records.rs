@@ -141,7 +141,7 @@ impl Input {
         };
         let basis = found.get_time_basis()?;
         if (basis == wire::TimeBasis::EventTime) != self.event_interval.is_some() {
-            return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon did not honor the requested time basis; use the matching schema-9 executable".into(), retryable: false });
+            return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon did not honor the requested time basis; use the matching schema-10 executable".into(), retryable: false });
         }
         let text = match found.get_text()?.which()? {
             wire::optional_text_results::Absent(()) => Value::Null,

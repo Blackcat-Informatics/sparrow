@@ -5,7 +5,8 @@ scattered operational artifacts into retained evidence that agents can discover,
 inspect, correlate, and query as a semantic graph.
 
 **Status: implementation in progress.** A RocksDB daemon, Cap'n Proto RPC,
-CLI with resumable typed file imports, stdio MCP, JSON field discovery, immutable JSON source-time profiles,
+CLI with resumable typed file imports and bounded oversized-record preparation,
+stdio MCP, JSON field discovery, immutable JSON source-time profiles,
 explicit event-time intervals, combined same-record field/text searches,
 persistent native full-text retrieval, bounded
 record context, durable stable-ID pin renewal and paginated pin discovery,

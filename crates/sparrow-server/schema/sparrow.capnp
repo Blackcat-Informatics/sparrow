@@ -215,7 +215,13 @@ struct ImportPreparation {
   storeId @0 :Text; importId @1 :Text; reservedArtifactId @2 :Text;
   preparedRecords @3 :UInt64; totalRecords @4 :UInt64;
   receivedAt @5 :Instant; expiresAt @6 :Instant; sourceTimeProfile @7 :OptionalText;
+  raw @8 :OptionalRawPreparation;
 }
+struct RawPreparation {
+  recordIndex @0 :UInt64; reservedRecordId @1 :Text;
+  preparedChunks @2 :UInt64; totalChunks @3 :UInt64;
+}
+struct OptionalRawPreparation { union { absent @0 :Void; value @1 :RawPreparation; } }
 struct ImportCanceled { import @0 :ImportRef; durability @1 :Durability = durable; }
 
 interface Sparrow {

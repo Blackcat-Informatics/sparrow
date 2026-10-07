@@ -329,15 +329,9 @@ impl Writer {
                     "invalid prepared layout page size or alignment",
                 ));
             }
-            let body = json::write_compact(&Value::array(
+            let encoded = encode_page(&Value::array(
                 spans.iter().map(Catalog::encode).collect::<Vec<_>>(),
-            ));
-            if body.len() + 32 > LAYOUT_BYTES {
-                return Err(Error::new("RESOURCE_LIMIT", "layout page exceeds 32 KiB"));
-            }
-            let mut encoded = Vec::with_capacity(32 + body.len());
-            encoded.extend_from_slice(blake3::hash(body.as_bytes()).as_bytes());
-            encoded.extend_from_slice(body.as_bytes());
+            ))?;
             batch.put(
                 layout_key(
                     &manifest.id,
@@ -369,15 +363,7 @@ impl Writer {
                 index / IMPORT_LAYOUT_PAGE_RECORDS as u64,
             ))?
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "import layout page missing"))?;
-        if !(32..=LAYOUT_BYTES).contains(&bytes.len())
-            || blake3::hash(&bytes[32..]).as_bytes() != &bytes[..32]
-        {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "import layout page size or digest mismatch",
-            ));
-        }
-        let value = parse(&bytes[32..])?;
+        let value = decode_page(&bytes)?;
         let values = value
             .as_array()
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "layout page must contain an array"))?;
@@ -905,4 +891,28 @@ impl Writer {
         writer.commit(batch)?;
         Ok(manifest)
     }
+}
+
+/// Shared immutable JSON page codec for record layouts and prepared raw payloads.
+pub(super) fn encode_page(value: &Value) -> Result<Vec<u8>, Error> {
+    let body = json::write_compact(value);
+    if body.len() + 32 > LAYOUT_BYTES {
+        return Err(Error::new("RESOURCE_LIMIT", "import page exceeds 32 KiB"));
+    }
+    let mut encoded = Vec::with_capacity(32 + body.len());
+    encoded.extend_from_slice(blake3::hash(body.as_bytes()).as_bytes());
+    encoded.extend_from_slice(body.as_bytes());
+    Ok(encoded)
+}
+
+pub(super) fn decode_page(bytes: &[u8]) -> Result<Value, Error> {
+    if !(32..=LAYOUT_BYTES).contains(&bytes.len())
+        || blake3::hash(&bytes[32..]).as_bytes() != &bytes[..32]
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "import page size or digest mismatch",
+        ));
+    }
+    parse(&bytes[32..])
 }

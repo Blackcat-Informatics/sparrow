@@ -13,7 +13,7 @@ The generated typed contract is
 and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
-Present RPC methods include the eight schema-9 import methods documented below,
+Present RPC methods include the eight import methods documented below,
 plus `status`, `ingest`, `artifactGet`, `recordGet`,
 `bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext`, `rdfInspect`, `sourceTimeDefine` and `sourceTimeGet`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
@@ -48,10 +48,10 @@ sparrow SOCKET_PATH pin-get STORE_ID --id PIN_ID --page-size 200 --cursor CURSOR
 ```
 
 Use a stable request identity for retrying ingestion of the same source, format
-and byte sequence. Conflicting reuse is refused. The importer reads at most the
-daemon's artifact limit plus one byte, capped locally at 64 MiB plus one byte,
-and refuses oversized input without sending ingestion. It does not stream large
-files yet, delete inputs or tail active files. Supported explicit formats are
+and byte sequence. Conflicting reuse is refused. The importer hashes and uploads
+completed regular files through a 64 KiB buffer, resumes the committed offset,
+and verifies file stability before publication. It does not delete inputs or tail
+active files. Supported explicit formats are
 `jsonl`, `log`, `json`, `markdown` and `opaque`; raw preservation is independent
 of projection support. Its receipt includes concrete artifact/record IDs and
 the daemon's durability acknowledgement.
@@ -908,11 +908,10 @@ retry after staging cleanup, canceled shared dependencies, and missing prepared
 payload refusal with no published prefix.
 
 This subsection records core publication qualification; typed RPC/CLI and
-daemon crash qualification follow below. Preparation currently
-materializes at most **16 MiB per individual record**; larger record layouts
-remain durable raw staging but are explicitly refused for publication. Publishing
-those larger raw records with bounded failed/pending projection diagnostics is
-still required, as are measured RSS/disk-pressure and whole-sample acceptance.
+daemon crash qualification follow below. This initial core implementation
+materialized at most **16 MiB per individual record** and refused larger records.
+The schema-10 extension below removes that raw-publication refusal. Measured
+RSS/disk-pressure and whole-sample acceptance remain required.
 
 The full `make check` gate passed with 50 storage scenarios, including the five
 new native publication/retirement scenarios and cleanup-budget exhaustion across
@@ -958,8 +957,8 @@ artifact lookup. Another CLI fixture accepts 8,388,609 bytes despite the daemon'
 the buffered and streamed paths, conflicting arguments, and prevention of a
 second occurrence. The client file guard also rejects a same-length rewrite.
 
-These checks do not establish oversized individual record publication beyond
-16 MiB, producer consumption/watchers, whole-sample throughput or RSS limits,
+These schema-9 checks did not establish oversized individual record publication
+beyond 16 MiB. Producer consumption/watchers, whole-sample throughput or RSS limits,
 full governed SPARQL, logging-client delivery, or complete architecture acceptance.
 
 The full `make check` gate passed with 51 storage scenarios, two server unit
@@ -983,3 +982,85 @@ matched every byte; source bytes remained unchanged. Native key discovery for
 this source returned 41 rows. This is one-file live acceptance, not whole-corpus
 or throughput qualification. No producer file was claimed, renamed or deleted,
 and no sibling/model service was managed.
+
+### Schema 10: oversized raw records with bounded preparation
+
+Raw publication no longer requires materializing an entire record. Records above
+the 16 MiB projection admission boundary prepare at most 128 normalized 64 KiB
+chunks per call. Each synced batch commits payload bytes, shared occurrence
+reference increments, one checksum-protected chunk-identity page, and the raw
+checkpoint together. Chunk boundaries are relative to the record; a record
+starting inside an upload chunk is assembled exactly from the checked source
+ranges. The persistent reserved record ID survives reopen and is inaccessible
+through public record lookup before complete publication.
+
+`ImportPreparation.raw` is an explicit typed optional value carrying the record
+ordinal, reserved record ID, prepared chunk count and complete chunk count.
+The CLI advances this durable progress, rejects nonadvancing or inconsistent
+responses, and publishes only after every record is complete. Repeating a current
+record ordinal advances from its saved raw chunk cursor rather than registering
+the previous page twice; an older record ordinal only recovers progress.
+
+After all raw pages are durable, final record preparation streams checked
+normalized payloads through native BLAKE3 and compares the exact complete record
+length and sealed digest. It then uses the existing `RecordBatch` implementation
+for projection state, captured source-time profile, text state and native RDF
+metadata. JSON refusals use the native profile's public typed source-byte limit.
+Markdown materialization is explicitly limited to 16 MiB; text remains limited
+to 1 MiB. Opaque content remains not applicable to those projections. Applicable
+limits produce persisted failed diagnostics, not empty successful projections.
+The source-time reason for an oversized profiled JSON record is
+`projection_failed`; receipt-time retention remains independent.
+
+Buffered records and raw checkpoints share `Writer::prepare_payloads` for
+content deduplication and two-owner reference increments. Existing normalized
+content must agree with its native digest and positive ownership counter.
+Final preparation transfers those references to the private complete record;
+publication transfers them to ordinary record/parent evidence without another
+increment. Abandoned raw checkpoints retire at most one 128-entry page per
+cleanup step through `Retirement::payloads`. Shared content belonging to another
+accepted occurrence survives. Completed private records use the same retirement
+implementation as ordinary expiry. Layout and raw identity pages share one
+bounded native-JSON/checksum codec.
+
+The raw checkpoint is bounded at 8 KiB; identity pages at 32 KiB. A raw chunk
+batch holds at most 8 MiB of distinct source bytes before batch encoding. Final
+record preparation retains ordered chunk identities, not complete source bytes,
+and refuses a manifest exceeding the native catalog string budget. Final
+artifact metadata remains limited to 128 MiB and its native decoder limits;
+disk admission still reserves maintenance capacity. Those resource refusals
+retain private retry/cancellation state and do not publish a prefix. Whole-record
+and whole-artifact digest checks perform work proportional to the declared input;
+latency, peak RSS, physical reclamation and sustained pressure remain unqualified.
+
+Core scenarios verify a valid 17 MiB JSON record starting at byte three,
+128/256/273-chunk checkpoints across reopen, complete artifact/record byte reads,
+failed JSON/RDF/text coverage, strict index refusal, captured unknown source time,
+record-only pin survival and eventual reference reclamation. Separate scenarios
+cover canceled partial preparation sharing content with an existing occurrence,
+missing normalized payload refusal without publication, and oversized JSON,
+Markdown and opaque document behavior. The real-daemon scenario now resumes an
+oversized record after a raw ownership checkpoint and preserves its reserved
+record identity through the production CLI and exact export.
+
+This qualifies oversized raw ingestion, not producer consumption/watchers,
+logging-client delivery, full governed SPARQL, complete query scopes/pagination,
+whole-corpus performance, or full architecture acceptance.
+
+The full `make check` gate passed with 55 storage scenarios, two server unit
+checks, three real-daemon/MCP scenarios, all other workspace tests, release
+Clippy with warnings denied, seeded census self-tests and all 35 ledger jobs.
+There are no distinct exceptions or unsanctioned isomorphic groups.
+
+The owned development daemon now runs the matching schema-10 release executable
+at the same private socket and persistent store identity. A synthetic completed
+JSONL file containing one 17,825,807-byte record was accepted durably as
+`artifact:f462b1c1f32180fb4e77c29194c3677d`, record
+`record:5bcf538161b77b607f723b761c66333c`, payload
+`blake3:9e453ecc3570700ac96f213aa692d46db7a6b2e27d1e6df898075041246ac32f`.
+Stable retry returned the identical receipt; consecutive CLI byte ranges of at
+most 1 MiB matched the complete original record. Native RDF inspection reported
+the explicit failed source-byte projection, and key discovery reported one
+eligible record with one failed JSON projection. This exercises live oversized
+raw acceptance and coverage reporting, not throughput or memory qualification.
+No producer file or sibling/model service was modified.

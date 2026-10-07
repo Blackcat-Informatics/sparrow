@@ -32,6 +32,7 @@ const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
 const BYTE_READ_BYTES: usize = 1024 * 1024;
+const CATALOG_STRING_BYTES: usize = 16 * 1024 * 1024;
 
 fn read_chunk_range(
     chunks: impl IntoIterator<Item = Result<Vec<u8>, Error>>,
@@ -300,7 +301,7 @@ fn parse(bytes: &[u8]) -> Result<Value, Error> {
         json::Limits {
             max_depth: 128,
             max_values: 1048576,
-            max_string_bytes: 16777216,
+            max_string_bytes: CATALOG_STRING_BYTES,
             unique_members: true,
         },
     )
@@ -824,7 +825,7 @@ impl Store {
                 source,
                 format,
                 byte_start: start as u64,
-                bytes: &bytes[start..end],
+                payload: ingest::RecordPayload::Buffered(&bytes[start..end]),
                 received_at: now,
                 expires_at,
                 source_time_profile: &source_time_profile,

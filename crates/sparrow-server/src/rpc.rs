@@ -748,6 +748,16 @@ impl wire::sparrow::Server for Rpc {
                 out.reborrow()
                     .init_expires_at()
                     .set_unix_millis(value.expires_at);
+                match value.raw {
+                    None => out.reborrow().init_raw().set_absent(()),
+                    Some(raw) => {
+                        let mut raw_out = out.reborrow().init_raw().init_value();
+                        raw_out.set_record_index(raw.record_index);
+                        raw_out.set_reserved_record_id(raw.record_id);
+                        raw_out.set_prepared_chunks(raw.prepared_chunks);
+                        raw_out.set_total_chunks(raw.total_chunks);
+                    }
+                }
                 match value.source_time_profile {
                     Some(id) => out.init_source_time_profile().set_value(id),
                     None => out.init_source_time_profile().set_absent(()),
@@ -1125,7 +1135,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(9);
+                out.set_schema_version(10);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);

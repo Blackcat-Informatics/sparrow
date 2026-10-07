@@ -11,7 +11,8 @@ use super::{
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 
-const RECORD_BYTES: usize = 16 * 1024 * 1024;
+mod raw;
+pub use raw::RawPreparation;
 const PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
 
 /// Durable private preparation progress. This is not an evidence receipt.
@@ -31,6 +32,8 @@ pub struct ImportPreparation {
     pub expires_at: u64,
     /// Immutable source-time profile captured before native preparation.
     pub source_time_profile: Option<String>,
+    /// Bounded raw chunk preparation of the current oversized record, if any.
+    pub raw: Option<RawPreparation>,
     reclaimed_records: u64,
 }
 
@@ -44,6 +47,13 @@ impl Catalog for ImportPreparation {
             .with("received_at", self.received_at.to_string())
             .with("expires_at", self.expires_at.to_string())
             .with("source_time_profile", self.source_time_profile.clone())
+            .with(
+                "raw",
+                self.raw
+                    .as_ref()
+                    .map(Catalog::encode)
+                    .unwrap_or(Value::Null),
+            )
             .with("reclaimed_records", self.reclaimed_records.to_string())
             .into()
     }
@@ -56,12 +66,20 @@ impl Catalog for ImportPreparation {
             received_at: integer(value, "received_at")?,
             expires_at: integer(value, "expires_at")?,
             source_time_profile: read_field(value, "source_time_profile")?,
+            raw: match value.get("raw") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(RawPreparation::decode(value)?),
+            },
             reclaimed_records: integer(value, "reclaimed_records")?,
         };
         if !progress.artifact_id.starts_with("artifact:")
             || progress.prepared_records > progress.total_records
             || progress.reclaimed_records > progress.prepared_records
             || progress.received_at.checked_add(30 * DAY) != Some(progress.expires_at)
+            || progress.raw.as_ref().is_some_and(|raw| {
+                raw.record_index != progress.prepared_records
+                    || progress.prepared_records == progress.total_records
+            })
         {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -71,6 +89,28 @@ impl Catalog for ImportPreparation {
         crate::format_instant(progress.expires_at)
             .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
         Ok(progress)
+    }
+}
+
+impl ImportPreparation {
+    fn captured_profile(
+        &self,
+        writer: &Writer,
+        source: &str,
+    ) -> Result<Option<super::source_time::SourceTimeProfile>, Error> {
+        match &self.source_time_profile {
+            None => Ok(None),
+            Some(id) => writer
+                .time_profile(source)?
+                .filter(|profile| profile.id == *id)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::new(
+                        "STORAGE_FAILURE",
+                        "captured source-time profile is missing or changed",
+                    )
+                }),
+        }
     }
 }
 
@@ -192,6 +232,7 @@ impl Store {
                     source_time_profile: writer
                         .time_profile(&manifest.source)?
                         .map(|profile| profile.id),
+                    raw: None,
                     reclaimed_records: 0,
                 };
                 let mut batch = WriteBatch::default();
@@ -222,11 +263,8 @@ impl Store {
                 "record length exceeds addressable native preparation",
             )
         })?;
-        if length > RECORD_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "record exceeds 16 MiB native preparation bound; raw staging remains available",
-            ));
+        if length as u64 > crate::projection::RECORD_BYTES {
+            return raw::advance(&writer, &manifest, progress, span);
         }
         let first = span.byte_start / IMPORT_CHUNK_BYTES as u64;
         let after = span.byte_end.div_ceil(IMPORT_CHUNK_BYTES as u64);
@@ -242,20 +280,7 @@ impl Store {
                 "prepared source record disagrees with its sealed byte identity",
             ));
         }
-        let profile = match &progress.source_time_profile {
-            None => None,
-            Some(id) => Some(
-                writer
-                    .time_profile(&manifest.source)?
-                    .filter(|profile| profile.id == *id)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "STORAGE_FAILURE",
-                            "captured source-time profile is missing or changed",
-                        )
-                    })?,
-            ),
-        };
+        let profile = progress.captured_profile(&writer, &manifest.source)?;
         let mut builder = ingest::RecordBatch::new(&writer)?;
         let record = builder.record(ingest::RecordInput {
             id: random_id("record")?,
@@ -263,7 +288,7 @@ impl Store {
             source: &manifest.source,
             format: &manifest.format,
             byte_start: span.byte_start,
-            bytes: &bytes,
+            payload: ingest::RecordPayload::Buffered(&bytes),
             received_at: progress.received_at,
             expires_at: progress.expires_at,
             source_time_profile: &profile,
@@ -460,6 +485,16 @@ pub(super) fn reclaim_prepared(
     let Some(mut progress) = preparation(writer, manifest)? else {
         return Ok((true, false));
     };
+    if progress.raw.is_some() {
+        if manifest.published_artifact.is_some() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "published import has unfinished raw preparation",
+            ));
+        }
+        raw::reclaim(writer, manifest, &mut progress)?;
+        return Ok((false, true));
+    }
     let mut batch = if progress.reclaimed_records < progress.prepared_records {
         let key = record_key(&manifest.id, progress.reclaimed_records);
         let mut record: Record = writer.get(&key)?;

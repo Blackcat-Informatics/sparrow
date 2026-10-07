@@ -7,6 +7,337 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 
 const DAY: u64 = 86_400_000;
 
+fn oversized_jsonl_fixture() -> Vec<u8> {
+    let mut input = b"{}\n{\"message\":\"".to_vec();
+    let start = input.len();
+    input.resize(start + 17 * 1024 * 1024, b'x');
+    for (index, chunk) in input[start..]
+        .chunks_mut(sparrow_core::IMPORT_CHUNK_BYTES)
+        .enumerate()
+    {
+        let marker = purrdf_hash::hex::encode(&(index as u64).to_le_bytes());
+        chunk[..marker.len()].copy_from_slice(marker.as_bytes());
+    }
+    input.extend_from_slice(b"\"}\n{}\n");
+    input
+}
+
+fn stage_fixture(
+    store: &Store,
+    request: &str,
+    format: &str,
+    input: &[u8],
+) -> sparrow_core::ImportManifest {
+    let payload = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let manifest = store
+        .import_begin(
+            request,
+            "oversized",
+            format,
+            input.len() as u64,
+            &payload,
+            0,
+        )
+        .unwrap();
+    for (index, chunk) in input.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
+        store
+            .import_append(
+                &manifest.id,
+                (index * sparrow_core::IMPORT_CHUNK_BYTES) as u64,
+                chunk,
+                0,
+            )
+            .unwrap();
+    }
+    store.import_seal(&manifest.id, 0).unwrap();
+    store.import_prepare_layout(&manifest.id, 0).unwrap()
+}
+
+#[test]
+fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = oversized_jsonl_fixture();
+    let manifest = stage_fixture(&store, "large-json", "jsonl", &input);
+    store
+        .define_time_profile("oversized", "/t", sparrow_core::TimeRepresentation::Rfc3339)
+        .unwrap();
+    store.import_prepare_record(&manifest.id, 0, 1).unwrap();
+    let first = store.import_prepare_record(&manifest.id, 1, 1).unwrap();
+    let raw = first.raw.as_ref().unwrap();
+    assert_eq!(raw.prepared_chunks, 128);
+    assert_eq!(raw.total_chunks, 273);
+    let record_id = raw.record_id.clone();
+    assert_eq!(store.record(&record_id).unwrap_err().code, "NOT_FOUND");
+    assert!(store.records(1).unwrap().is_empty());
+    assert_eq!(
+        store.import_publish(&manifest.id, 1).unwrap_err().code,
+        "CONFLICT"
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    // An older record ordinal recovers progress without adding raw ownership again.
+    assert_eq!(
+        store.import_prepare_record(&manifest.id, 0, 2).unwrap(),
+        first
+    );
+    let second = store.import_prepare_record(&manifest.id, 1, 2).unwrap();
+    assert_eq!(second.raw.as_ref().unwrap().record_id, record_id);
+    assert_eq!(second.raw.as_ref().unwrap().prepared_chunks, 256);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .import_preparation_get(&manifest.id, 3)
+            .unwrap()
+            .unwrap(),
+        second
+    );
+    let third = store.import_prepare_record(&manifest.id, 1, 3).unwrap();
+    assert_eq!(third.raw.as_ref().unwrap().prepared_chunks, 273);
+    let finished = store.import_prepare_record(&manifest.id, 1, 3).unwrap();
+    assert_eq!(finished.prepared_records, 2);
+    assert!(finished.raw.is_none());
+    store.import_prepare_record(&manifest.id, 2, 3).unwrap();
+    let artifact = store.import_publish(&manifest.id, 3).unwrap();
+    assert_eq!(artifact.record_ids[1], record_id);
+    let record = store.record(&record_id).unwrap();
+    assert_eq!(record.byte_start, 3);
+    assert_eq!(record.byte_end, (input.len() - 3) as u64);
+    assert!(matches!(
+        &record.event_time,
+        sparrow_core::EventTime::Unknown { reason, profile_id: Some(_) } if reason == "projection_failed"
+    ));
+    let rdf = store.rdf_inspect(&record_id, 3).unwrap();
+    assert_eq!(rdf["state"].as_str(), Some("failed"));
+    assert!(rdf["diagnostic"].as_str().unwrap().contains("source bytes"));
+    let scope = sparrow_core::QueryScope {
+        source: Some("oversized".into()),
+        received_from: 0,
+        received_before: 10,
+        limit: 100,
+        scan_budget: 100,
+    };
+    let keys = store
+        .json_query(&scope, &sparrow_core::JsonQuery::Keys, 3)
+        .unwrap();
+    assert_eq!(keys["coverage"]["failed_json_records"].as_str(), Some("1"));
+    let text = store.text_query(&scope, "marker", 3).unwrap();
+    assert_eq!(
+        text["text_coverage"]["failed_or_incomplete"].as_str(),
+        Some("1")
+    );
+    let strict = sparrow_core::RecordQuery {
+        text: Some("marker".into()),
+        require_complete_index: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        store.records_query(&scope, &strict, 3).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    for (index, expected) in input.chunks(1024 * 1024).enumerate() {
+        assert_eq!(
+            store
+                .bytes(
+                    &artifact.id,
+                    (index * 1024 * 1024) as u64,
+                    expected.len(),
+                    3
+                )
+                .unwrap(),
+            expected
+        );
+    }
+    let record_bytes = &input[record.byte_start as usize..record.byte_end as usize];
+    for (index, expected) in record_bytes.chunks(1024 * 1024).enumerate() {
+        assert_eq!(
+            store
+                .bytes(&record_id, (index * 1024 * 1024) as u64, expected.len(), 3)
+                .unwrap(),
+            expected
+        );
+    }
+    let pin = store
+        .pin("large-pin", "Case", std::slice::from_ref(&record_id), 40, 3)
+        .unwrap();
+    while store.import_reclaim(2 * DAY).unwrap() != 0 {}
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store
+            .bytes(&record_id, record_bytes.len() as u64 - 4, 4, 31 * DAY)
+            .unwrap(),
+        b"x\"}\n"
+    );
+    store.release(&pin.id).unwrap();
+    store.expire(41 * DAY).unwrap();
+    assert_eq!(
+        store.status(41 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store.status(41 * DAY).unwrap()["unique_json_projections"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn abandoned_partial_raw_record_releases_only_its_own_shared_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = oversized_jsonl_fixture();
+    let shared_bytes = &input[3..3 + sparrow_core::IMPORT_CHUNK_BYTES];
+    let shared = store
+        .ingest("existing-raw", "shared", "log", shared_bytes, 0)
+        .unwrap();
+    let manifest = stage_fixture(&store, "abandoned-raw", "jsonl", &input);
+    store.import_prepare_record(&manifest.id, 0, 1).unwrap();
+    let first = store.import_prepare_record(&manifest.id, 1, 1).unwrap();
+    assert_eq!(first.raw.unwrap().prepared_chunks, 128);
+    store.import_cancel(&manifest.id, 2).unwrap();
+    assert!(store.import_reclaim(2).unwrap() <= 128);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    while store.import_reclaim(2).unwrap() != 0 {}
+    assert_eq!(
+        store.import_get(&manifest.id, 2).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        store.bytes(&shared.id, 0, shared_bytes.len(), 2).unwrap(),
+        shared_bytes
+    );
+    assert_eq!(store.records(2).unwrap().len(), 1);
+    assert_eq!(
+        store.status(2).unwrap()["unique_payload_chunks"].as_str(),
+        Some("1")
+    );
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn oversized_documents_keep_bytes_with_declared_projection_limits_or_nonapplicability() {
+    let input = oversized_jsonl_fixture();
+    for format in ["json", "markdown", "opaque"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let manifest = stage_fixture(&store, format, format, &input);
+        let mut expected = 0;
+        loop {
+            let progress = store
+                .import_prepare_record(&manifest.id, expected, 1)
+                .unwrap();
+            expected = progress.prepared_records;
+            if expected == progress.total_records {
+                break;
+            }
+        }
+        let artifact = store.import_publish(&manifest.id, 1).unwrap();
+        assert_eq!(artifact.record_ids.len(), 1);
+        let rdf = store.rdf_inspect(&artifact.record_ids[0], 1).unwrap();
+        assert_eq!(
+            rdf["state"].as_str(),
+            Some(if format == "opaque" {
+                "not_applicable"
+            } else {
+                "failed"
+            })
+        );
+        if format == "markdown" {
+            assert!(
+                rdf["diagnostic"]
+                    .as_str()
+                    .unwrap()
+                    .contains("materialization bound")
+            );
+        }
+        let scope = sparrow_core::QueryScope {
+            source: Some("oversized".into()),
+            received_from: 0,
+            received_before: 10,
+            limit: 10,
+            scan_budget: 100,
+        };
+        let text = store.text_query(&scope, "marker", 1).unwrap();
+        assert_eq!(
+            text["text_coverage"][if format == "opaque" {
+                "not_applicable"
+            } else {
+                "failed_or_incomplete"
+            }]
+            .as_str(),
+            Some("1")
+        );
+        for (index, bytes) in input.chunks(1024 * 1024).enumerate() {
+            assert_eq!(
+                store
+                    .bytes(
+                        &artifact.record_ids[0],
+                        (index * 1024 * 1024) as u64,
+                        bytes.len(),
+                        1
+                    )
+                    .unwrap(),
+                bytes
+            );
+        }
+        while store.import_reclaim(2 * DAY).unwrap() != 0 {}
+        store.expire(31 * DAY).unwrap();
+        assert_eq!(
+            store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+            Some("0")
+        );
+    }
+}
+
+#[test]
+fn oversized_raw_record_refuses_missing_normalized_bytes_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = oversized_jsonl_fixture();
+    let manifest = stage_fixture(&store, "missing-raw", "jsonl", &input);
+    store.import_prepare_record(&manifest.id, 0, 1).unwrap();
+    for _ in 0..3 {
+        store.import_prepare_record(&manifest.id, 1, 1).unwrap();
+    }
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let digest = purrdf_hash::hex::encode(
+        purrdf_hash::blake3::hash(&input[3..3 + sparrow_core::IMPORT_CHUNK_BYTES]).as_bytes(),
+    );
+    db.delete_cf(db.cf_handle("payload").unwrap(), digest)
+        .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .import_prepare_record(&manifest.id, 1, 2)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert!(store.artifacts(2).unwrap().is_empty());
+    assert!(store.records(2).unwrap().is_empty());
+    assert_eq!(
+        store.import_bytes(&manifest.id, 0, 100, 2).unwrap(),
+        input[..100]
+    );
+    store.import_cancel(&manifest.id, 2).unwrap();
+    while store.import_reclaim(2).unwrap() != 0 {}
+    assert_eq!(
+        store.status(2).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
 #[test]
 fn buffered_and_streamed_ingestion_share_request_identity() {
     use sparrow_core::ImportStart;

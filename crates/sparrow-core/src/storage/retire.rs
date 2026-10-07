@@ -29,12 +29,7 @@ impl<'a> Retirement<'a> {
     }
 
     pub(super) fn record(&mut self, record: &mut Record, owners: u64) -> Result<bool, Error> {
-        if ![1, 2].contains(&owners) {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "invalid retirement ownership multiplicity",
-            ));
-        }
+        self.payloads(&record.chunks, owners)?;
         self.writer.remove_text(&mut self.batch, &record.id)?;
         if record.chunks.is_empty()
             && record.projection_id.is_empty()
@@ -54,9 +49,7 @@ impl<'a> Retirement<'a> {
                 .entry(std::mem::take(&mut record.rdf_projection_id))
                 .or_default() += 1;
         }
-        for digest in record.chunks.drain(..) {
-            *self.removals.entry(digest).or_default() += owners;
-        }
+        record.chunks.clear();
         if !record.projection_id.is_empty() {
             *self
                 .projection_removals
@@ -65,6 +58,19 @@ impl<'a> Retirement<'a> {
         }
 
         Ok(true)
+    }
+
+    pub(super) fn payloads(&mut self, chunks: &[String], owners: u64) -> Result<(), Error> {
+        if ![1, 2].contains(&owners) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "invalid retirement ownership multiplicity",
+            ));
+        }
+        for digest in chunks {
+            *self.removals.entry(digest.clone()).or_default() += owners;
+        }
+        Ok(())
     }
 
     pub(super) fn finish(mut self) -> Result<WriteBatch, Error> {
