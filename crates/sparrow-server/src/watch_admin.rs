@@ -61,9 +61,15 @@ pub(crate) enum Action {
     },
 }
 
-pub(crate) struct Command {
-    pub action: Action,
-    pub reply: oneshot::Sender<Result<ManagedWatch, sparrow_core::Error>>,
+pub(crate) enum Command {
+    Mutation {
+        action: Action,
+        reply: oneshot::Sender<Result<ManagedWatch, sparrow_core::Error>>,
+    },
+    Handoff {
+        intent: sparrow_core::ConsumptionHandoff,
+        reply: oneshot::Sender<Result<sparrow_core::ConsumptionJournal, sparrow_core::Error>>,
+    },
 }
 
 /// Bounded typed control path to the one worker owning durable watch mutations.
@@ -157,9 +163,25 @@ pub(crate) fn encode_info(
 
 impl WatchController {
     pub(crate) async fn submit(&self, action: Action) -> Result<ManagedWatch, sparrow_core::Error> {
+        self.enqueue(|reply| Command::Mutation { action, reply })
+            .await
+    }
+
+    pub(crate) async fn handoff(
+        &self,
+        intent: sparrow_core::ConsumptionHandoff,
+    ) -> Result<sparrow_core::ConsumptionJournal, sparrow_core::Error> {
+        self.enqueue(|reply| Command::Handoff { intent, reply })
+            .await
+    }
+
+    async fn enqueue<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, sparrow_core::Error>>) -> Command,
+    ) -> Result<T, sparrow_core::Error> {
         let (reply, result) = oneshot::channel();
         self.0
-            .try_send(Command { action, reply })
+            .try_send(command(reply))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => failure(
                     "RESOURCE_LIMIT",

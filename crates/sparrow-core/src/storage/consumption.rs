@@ -291,6 +291,11 @@ pub(super) fn validate_source(
     observed: &ConsumptionGeneration,
 ) -> Result<(), Error> {
     observed.validate()?;
+    validate_consumption_path(watch, path)
+}
+
+/// Validate a bounded registered watch and raw relative source path before probing it.
+pub fn validate_consumption_path(watch: &str, path: &[u8]) -> Result<(), Error> {
     if watch.is_empty()
         || watch.len() > 128
         || path.len() > 2048

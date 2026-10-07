@@ -66,16 +66,46 @@ impl Rpc {
         store: &str,
         action: crate::watch_admin::Action,
     ) -> Result<crate::watch_admin::ManagedWatch, Error> {
-        if store != self.store.store_id()? {
-            return Err(crate::watch_admin::failure(
-                "STORE_MISMATCH",
-                "watch mutation belongs to another persistent store",
-            ));
-        }
-        let controller = self.watch_controller.as_ref().ok_or_else(|| crate::watch_admin::failure("UNSUPPORTED", "watch administration requires an owned worker and at least two configured RPC connections"))?;
+        self.check_store(store)?;
+        let controller = self.controller()?;
         // The finite command channel owns admission. Holding a storage work permit
         // here could deadlock the worker's own typed publication RPC.
         controller.submit(action).await
+    }
+
+    fn controller(&self) -> Result<&crate::WatchController, Error> {
+        self.watch_controller.as_ref().ok_or_else(|| crate::watch_admin::failure("UNSUPPORTED", "watch administration requires an owned worker and at least two configured RPC connections"))
+    }
+
+    async fn handoff_request(
+        &self,
+        value: wire::watch_handoff::Reader<'_>,
+        out: wire::result::Builder<'_, wire::handoff_receipt::Owned>,
+        read_only: bool,
+    ) -> capnp::Result<()> {
+        let request = match sparrow_client::CompletedHandoff::decode(value) {
+            Ok(request) => request,
+            Err(error) => {
+                failure(out, invalid(error));
+                return Ok(());
+            }
+        };
+        let result = async {
+            self.check_store(&request.store_id)?;
+            let intent = crate::handoff::intent(&request)?;
+            if read_only {
+                self.work(move |store, now| {
+                    store.consumption_handoff_get(&intent, now)?.ok_or_else(|| {
+                        Error::new("NOT_FOUND", "handoff request has not been admitted")
+                    })
+                })
+                .await
+            } else {
+                self.controller()?.handoff(intent).await
+            }
+        }
+        .await;
+        crate::handoff::result(out, &request, result)
     }
 
     async fn work<T: Send + 'static>(
@@ -183,7 +213,10 @@ fn optional_kind(value: wire::optional_kind::Reader<'_>) -> capnp::Result<Option
     }
 }
 
-fn failure<T: capnp::traits::Owned + 'static>(output: wire::result::Builder<'_, T>, error: Error) {
+pub(crate) fn failure<T: capnp::traits::Owned + 'static>(
+    output: wire::result::Builder<'_, T>,
+    error: Error,
+) {
     let mut out = output.init_error();
     out.set_code(error.code);
     out.set_message(&error.message);
@@ -635,6 +668,32 @@ fn watch_mutation_result(
 }
 
 impl wire::sparrow::Server for Rpc {
+    async fn watch_handoff(
+        self: Rc<Self>,
+        params: wire::sparrow::WatchHandoffParams,
+        mut results: wire::sparrow::WatchHandoffResults,
+    ) -> capnp::Result<()> {
+        self.handoff_request(
+            params.get()?.get_request()?,
+            results.get().init_result(),
+            false,
+        )
+        .await
+    }
+
+    async fn watch_handoff_get(
+        self: Rc<Self>,
+        params: wire::sparrow::WatchHandoffGetParams,
+        mut results: wire::sparrow::WatchHandoffGetResults,
+    ) -> capnp::Result<()> {
+        self.handoff_request(
+            params.get()?.get_request()?,
+            results.get().init_result(),
+            true,
+        )
+        .await
+    }
+
     async fn watch_list(
         self: Rc<Self>,
         _: wire::sparrow::WatchListParams,

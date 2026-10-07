@@ -33,7 +33,7 @@ pub(super) const USAGE: &str = concat!(
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
-    "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION"
+    "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp"
 );
 
 /// Execute a CLI command through the same typed client and renderer as MCP.

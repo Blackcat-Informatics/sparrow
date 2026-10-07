@@ -125,6 +125,99 @@ fn consumption_configuration_requires_explicit_contract_and_disjoint_bounded_roo
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_and_restart() {
+    tokio::task::LocalSet::new().run_until(async {
+        use sparrow_client::{CompletedHandoff, CompletedFileIdentity, HandoffReceipt};
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("completed"); std::fs::create_dir(&root).unwrap();
+        let data = dir.path().join("store"); let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        append_consume_config(&config, &root, 600_000, 16, 16);
+        let daemon = start(&config, &socket).await;
+        let client = sparrow_client::Client::connect(&socket).await.unwrap();
+        let input = root.join("finished.jsonl"); let original = b"{\"message\":\"explicit handoff\"}\r\n";
+        std::fs::write(&input, original).unwrap();
+        let intent_file = dir.path().join("handoff.capnp");
+        let prepared = cli(&socket, &["watch", "handoff-prepare", "explicit-1", "completed", "1", "finished.jsonl", intent_file.to_str().unwrap()]);
+        assert_eq!(prepared["phase"].as_str(), Some("prepared"));
+        assert!(input.exists());
+        let intent = CompletedHandoff::read(std::fs::File::open(&intent_file).unwrap()).unwrap();
+        let saved_bytes = std::fs::read(&intent_file).unwrap();
+        let duplicate_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
+            .args(["watch", "handoff-prepare", "explicit-1", "completed", "1", "finished.jsonl", intent_file.to_str().unwrap()]).output().unwrap();
+        assert!(!duplicate_prepare.status.success());
+        assert_eq!(std::fs::read(&intent_file).unwrap(), saved_bytes);
+        let unsafe_intent = root.join("must-not-consume.capnp");
+        let unsafe_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
+            .args(["watch", "handoff-prepare", "unsafe-intent", "completed", "1", "finished.jsonl", unsafe_intent.to_str().unwrap()]).output().unwrap();
+        assert!(!unsafe_prepare.status.success()); assert!(!unsafe_intent.exists());
+        assert!(matches!(client.handoff_get(&intent).await, Err(sparrow_client::Error::Domain { code, .. }) if code == "NOT_FOUND"));
+        for variation in 0..4 {
+            let mut invalid = intent.clone(); invalid.request_id = format!("invalid-{variation}");
+            match variation {
+                0 => invalid.watch_revision += 1,
+                1 => invalid.generation.inode += 1,
+                2 => invalid.relative_path = b"../outside".to_vec(),
+                _ => invalid.watch = "unregistered".into(),
+            }
+            assert!(matches!(client.handoff(&invalid).await, Err(sparrow_client::Error::Domain { code, .. }) if matches!(code.as_str(), "CONFLICT" | "INVALID_ARGUMENT" | "NOT_FOUND")));
+            assert!(matches!(client.handoff_get(&invalid).await, Err(sparrow_client::Error::Domain { code, .. }) if matches!(code.as_str(), "INVALID_ARGUMENT" | "NOT_FOUND")));
+        }
+        let mut foreign = client.capability().watch_handoff_request();
+        intent.encode(foreign.get().init_request()).unwrap();
+        foreign.get().get_request().unwrap().set_store_id("store:foreign");
+        let response = foreign.send().promise.await.unwrap();
+        assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(error) if error.as_ref().unwrap().get_code().unwrap().to_str().unwrap() == "STORE_MISMATCH"));
+        let admitted = cli(&socket, &["watch", "handoff", intent_file.to_str().unwrap()]);
+        assert_eq!(admitted["phase"].as_str(), Some("reserved"));
+        assert_eq!(admitted["durability"].as_str(), Some("durable"));
+        // Explicit producer handoff bypasses the configured ten-minute quiet interval.
+        watch_until(client.capability(), |w| w.get_completed_claims() == 1 && w.get_pending_claims() == 0).await;
+        let completed = client.handoff_get(&intent).await.unwrap();
+        assert_eq!(completed.phase, wire::HandoffPhase::Removed);
+        assert_eq!(completed.import_id, admitted["import_id"].as_str().unwrap());
+        assert!(!input.exists());
+        let artifact = completed.artifact_id.as_ref().unwrap();
+        let export = dir.path().join("original-export.jsonl");
+        cli(&socket, &["bytes", &intent.store_id, artifact, "0", &original.len().to_string(), export.to_str().unwrap()]);
+        assert_eq!(std::fs::read(export).unwrap(), original);
+        std::fs::write(&input, b"replacement must remain\n").unwrap();
+        assert_eq!(client.handoff(&intent).await.unwrap(), completed);
+        let mut changed = intent.clone(); changed.generation = CompletedFileIdentity::capture(&input.metadata().unwrap());
+        assert!(matches!(client.handoff(&changed).await, Err(sparrow_client::Error::Domain { code, .. }) if code == "CONFLICT"));
+        // The SDK carries non-UTF8 filenames without a JSON envelope or lossy conversion.
+        let raw_path = b"raw-\xff.jsonl";
+        let raw_file = root.join(std::ffi::OsStr::from_bytes(raw_path));
+        std::fs::write(&raw_file, original).unwrap();
+        let raw_intent = CompletedHandoff { request_id: "explicit-raw".into(), relative_path: raw_path.to_vec(), generation: CompletedFileIdentity::capture(&raw_file.metadata().unwrap()), ..intent.clone() };
+        client.handoff(&raw_intent).await.unwrap();
+        watch_until(client.capability(), |w| w.get_completed_claims() == 2 && w.get_pending_claims() == 0).await;
+        assert!(!raw_file.exists());
+        let raw_completed: HandoffReceipt = client.handoff_get(&raw_intent).await.unwrap();
+        assert_ne!(raw_completed.artifact_id, completed.artifact_id);
+        cli(&socket, &["watch", "remove", "remove-after-handoff", "completed", "1"]);
+        let mut after_remove = intent.clone(); after_remove.request_id = "after-removal".into();
+        assert!(matches!(client.handoff(&after_remove).await, Err(sparrow_client::Error::Domain { code, .. }) if matches!(code.as_str(), "CONFLICT" | "NOT_FOUND")));
+        assert_eq!(client.handoff(&intent).await.unwrap(), completed);
+        assert!(cli(&socket, &["watch", "list"])["watches"].as_array().unwrap().is_empty());
+        drop(client); drop(daemon); std::fs::remove_file(&socket).unwrap();
+        let daemon = start(&config, &socket).await;
+        let client = sparrow_client::Client::connect(&socket).await.unwrap();
+        assert_eq!(client.handoff(&intent).await.unwrap(), completed);
+        assert_eq!(client.handoff(&raw_intent).await.unwrap(), raw_completed);
+        assert_eq!(cli(&socket, &["watch", "handoff-status", intent_file.to_str().unwrap()])["phase"].as_str(), Some("removed"));
+        assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
+        let response = client.capability().status_request().send().promise.await.unwrap();
+        let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/8");
+        assert_eq!(status.get_live_records(), 2);
+        assert!(status.get_consume_watches().unwrap().is_empty());
+        drop(client); drop(daemon);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect_removed_authority()
 {
     tokio::task::LocalSet::new()

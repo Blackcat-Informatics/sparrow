@@ -18,11 +18,44 @@ pub(crate) enum Input {
         id: String,
         expected: u64,
     },
+    Prepare {
+        request: String,
+        id: String,
+        expected: u64,
+        relative: String,
+        output: String,
+    },
+    Handoff {
+        intent: sparrow_client::CompletedHandoff,
+        read_only: bool,
+    },
 }
 
 impl Input {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
         match args {
+            [operation, request, id, expected, relative, output]
+                if operation == "handoff-prepare" =>
+            {
+                sparrow_core::validate_consumption_path(id, relative.as_bytes())
+                    .map_err(|e| invalid(e.to_string()))?;
+                Ok(Self::Prepare {
+                    request: request.clone(),
+                    id: id.clone(),
+                    expected: decimal_u64(&Value::from(expected.clone()))
+                        .map_err(|e| invalid(e.to_string()))?,
+                    relative: relative.clone(),
+                    output: output.clone(),
+                })
+            }
+            [operation, path] if operation == "handoff" || operation == "handoff-status" => {
+                Ok(Self::Handoff {
+                    intent: sparrow_client::CompletedHandoff::read(
+                        sparrow_client::open_completed_file(std::path::Path::new(path))?,
+                    )?,
+                    read_only: operation == "handoff-status",
+                })
+            }
             [operation] if operation == "list" => Ok(Self::List),
             [operation, request, expected, path] if operation == "put" => {
                 let text = std::fs::read_to_string(path).map_err(sparrow_client::Error::Io)?;
@@ -44,7 +77,7 @@ impl Input {
                     .map_err(|error| invalid(error.to_string()))?,
             }),
             _ => Err(invalid(
-                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION; zero revision creates a watch",
+                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp; zero revision creates a watch",
             )),
         }
     }
@@ -52,6 +85,103 @@ impl Input {
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
         let discovery = sparrow_client::Discovery::fetch(client).await?;
         match self {
+            Self::Handoff { intent, read_only } => {
+                let receipt = sparrow_client::completed_handoff(client, intent, *read_only).await?;
+                Ok(Object::new()
+                    .with("store_id", receipt.request.store_id)
+                    .with("request_id", receipt.request.request_id)
+                    .with("import_id", receipt.import_id)
+                    .with(
+                        "phase",
+                        match receipt.phase {
+                            wire::HandoffPhase::Reserved => "reserved",
+                            wire::HandoffPhase::Claimed => "claimed",
+                            wire::HandoffPhase::Published => "published",
+                            wire::HandoffPhase::Removed => "removed",
+                        },
+                    )
+                    .with("artifact_id", receipt.artifact_id)
+                    .with("durability", "durable")
+                    .into())
+            }
+            Self::Prepare {
+                request,
+                id,
+                expected,
+                relative,
+                output,
+            } => {
+                use std::{io::Write, os::unix::fs::OpenOptionsExt};
+                let response = client.watch_list_request().send().promise.await?;
+                let list = match response.get()?.get_result()?.which()? {
+                    wire::result::Ok(value) => value?,
+                    wire::result::Error(error) => return Err(failure(error?)),
+                };
+                if list.get_store_id()?.to_str()? != discovery.store_id {
+                    return Err(invalid("watch list belongs to another persistent store"));
+                }
+                let parent = std::path::Path::new(output)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let output_parent =
+                    std::fs::canonicalize(parent).map_err(sparrow_client::Error::Io)?;
+                let mut root = None;
+                for watch in list.get_watches()? {
+                    let definition = watch.get_definition()?;
+                    if watch.get_enabled() {
+                        let watched_root = std::fs::canonicalize(definition.get_root()?.to_str()?)
+                            .map_err(sparrow_client::Error::Io)?;
+                        if output_parent.starts_with(watched_root) {
+                            return Err(invalid(
+                                "save handoff intents outside enabled consumption roots so the retry identity cannot itself be consumed",
+                            ));
+                        }
+                    }
+                    if definition.get_id()?.to_str()? == id {
+                        if !watch.get_enabled() || watch.get_revision() != *expected {
+                            return Err(invalid(
+                                "handoff preparation requires the current enabled watch revision",
+                            ));
+                        }
+                        root = Some(std::path::PathBuf::from(definition.get_root()?.to_str()?));
+                    }
+                }
+                let root = root.ok_or_else(|| invalid("handoff watch is not registered"))?;
+                let file = sparrow_client::open_completed_file(&root.join(relative))?;
+                let intent = sparrow_client::CompletedHandoff {
+                    store_id: discovery.store_id,
+                    request_id: request.clone(),
+                    watch: id.clone(),
+                    watch_revision: *expected,
+                    relative_path: relative.as_bytes().to_vec(),
+                    generation: sparrow_client::CompletedFileIdentity::capture(
+                        &file.metadata().map_err(sparrow_client::Error::Io)?,
+                    ),
+                };
+                // Encode before creating an output, then refuse overwriting an existing retry identity.
+                let mut bytes = Vec::new();
+                intent.write(&mut bytes)?;
+                let mut saved = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(output)
+                    .map_err(sparrow_client::Error::Io)?;
+                saved.write_all(&bytes).map_err(sparrow_client::Error::Io)?;
+                saved.sync_all().map_err(sparrow_client::Error::Io)?;
+                std::fs::File::open(parent)
+                    .and_then(|file| file.sync_all())
+                    .map_err(sparrow_client::Error::Io)?;
+                Ok(Object::new()
+                    .with("store_id", intent.store_id)
+                    .with("request_id", request.clone())
+                    .with("watch", id.clone())
+                    .with("watch_revision", expected.to_string())
+                    .with("intent_path", output.clone())
+                    .with("phase", "prepared")
+                    .into())
+            }
             Self::List => {
                 let response = client.watch_list_request().send().promise.await?;
                 let list = match response.get()?.get_result()?.which()? {

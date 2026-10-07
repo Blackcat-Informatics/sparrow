@@ -2,6 +2,76 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "typed-handoff-intent"
+summary = "One bounded generated codec preserves immutable store/watch/revision/raw-path/file-clock authority in RPC and strict single-message Cap'n Proto retry files; its unit module owns one dev-only shared intent fixture."
+home = "sparrow_client::handoff::CompletedHandoff::encode"
+entry_points = ["sparrow_client::handoff::CompletedHandoff::decode", "sparrow_client::handoff::CompletedHandoff::read", "sparrow_client::handoff::CompletedHandoff::write", "sparrow_client::handoff::CompletedFileIdentity::encode", "sparrow_client::handoff::CompletedFileIdentity::decode"]
+spec = "docs/development-runtime.md: typed explicit completed handoff."
+vectors = ["crates/sparrow-client/src/handoff.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_cli_handoff_intent|encode_daemon_handoff_intent)$']
+
+[[job]]
+id = "handoff-receipt-certification"
+summary = "Certify the original immutable intent, durable admission phase and publication identity before reporting handoff progress."
+home = "sparrow_client::handoff::HandoffReceipt::certify"
+entry_points = ["sparrow_client::handoff::HandoffReceipt::result"]
+spec = "docs/development-runtime.md: typed explicit completed handoff."
+vectors = ["crates/sparrow-client/src/handoff.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_cli_handoff_receipt|validate_worker_handoff_receipt)$']
+
+[[job]]
+id = "handoff-client-transport"
+summary = "The SDK and CLI share generated handoff admission/progress calls, discovery binding and the one receipt certificate."
+home = "sparrow_client::handoff::completed_handoff"
+entry_points = ["sparrow_client::Client::handoff", "sparrow_client::Client::handoff_get"]
+spec = "docs/development-runtime.md: typed explicit completed handoff."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(send_cli_handoff_rpc|send_sdk_handoff_rpc)$']
+
+[[job]]
+id = "handoff-worker-admission"
+summary = "Recover original retry ownership before probing current watches, then admit only the current enabled revision through existing anchored claims."
+home = "sparrow_server::watches::admit_handoff"
+entry_points = ["sparrow_server::watches::acknowledge", "sparrow_server::watches::storage_admission"]
+spec = "docs/development-runtime.md: typed explicit completed handoff."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(admit_cli_completed_source|admit_rpc_completed_source)$']
+
+[[job]]
+id = "handoff-daemon-adapter"
+summary = "One daemon adapter decodes the SDK-owned intent, binds the store and emits current durable journal progress through both typed RPC operations."
+home = "sparrow_server::rpc::Rpc::handoff_request"
+entry_points = ["sparrow_server::handoff::intent", "sparrow_server::handoff::result"]
+spec = "docs/development-runtime.md: typed explicit completed handoff."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_cli_handoff_generation|decode_worker_handoff_generation)$']
+
+[[job]]
 id = "explicit-handoff-binding"
 summary = "Bind a bounded caller request, watch revision, raw path and exact source generation to the existing consumption reservation in one durable batch."
 home = "sparrow_core::storage::handoff::Writer::bind_handoff"
@@ -47,7 +117,7 @@ names = ['^(expire_watch_handoff_receipt|expire_claim_handoff_receipt)$']
 id = "completed-source-validation"
 summary = "One validator checks observed clocks and bounded watch/raw relative path for both discovery journals and explicit handoff intents."
 home = "sparrow_core::storage::consumption::validate_source"
-entry_points = ["sparrow_core::storage::consumption::ConsumptionJournal::reservation", "sparrow_core::storage::handoff::ConsumptionHandoff::validate"]
+entry_points = ["sparrow_core::storage::consumption::ConsumptionJournal::reservation", "sparrow_core::storage::handoff::ConsumptionHandoff::validate", "sparrow_core::storage::consumption::validate_consumption_path"]
 spec = "docs/development-runtime.md: explicit handoff storage foundation."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -103,7 +173,7 @@ names = ['^(hash_watch_create_request|hash_watch_update_request|hash_watch_remov
 id = "watch-control-channel"
 summary = "One finite command queue transfers complete typed mutations to the worker without holding a publication RPC semaphore permit."
 home = "sparrow_server::watch_admin::channel"
-entry_points = ["sparrow_server::watch_admin::WatchController::submit"]
+entry_points = ["sparrow_server::watch_admin::WatchController::submit", "sparrow_server::watch_admin::WatchController::handoff", "sparrow_server::watch_admin::WatchController::enqueue"]
 spec = "docs/development-runtime.md: durable typed watch administration."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -327,7 +397,7 @@ names = ['^(open_claim_input_path|open_claim_recovery_path)$']
 id = "claim-descriptor-observation"
 summary = "Convert the SDK-owned opened-file metadata observation to the persistent typed generation; no second file-clock observation implementation."
 home = "sparrow_server::consumption::observation"
-entry_points = ["sparrow_server::consumption::require"]
+entry_points = ["sparrow_server::consumption::require", "sparrow_server::consumption::generation", "sparrow_server::consumption::identity"]
 spec = "docs/development-runtime.md: anchored filesystem claim coordination."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -354,8 +424,8 @@ names = ['^(validate_claim_upload_directory|validate_claim_removal_directory)$']
 [[job]]
 id = "claim-source-reservation"
 summary = "Synchronize and validate one scheduler-admitted regular-file generation and original parent before reserving its durable managed import identity."
-home = "sparrow_server::consumption::ClaimRoot::reserve"
-entry_points = []
+home = "sparrow_server::consumption::ClaimRoot::prepare_source"
+entry_points = ["sparrow_server::consumption::ClaimRoot::reserve", "sparrow_server::consumption::ClaimRoot::handoff"]
 spec = "docs/development-runtime.md: anchored filesystem claim coordination."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []

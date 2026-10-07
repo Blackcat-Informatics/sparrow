@@ -356,7 +356,8 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `pin`, `pinRenew`, `pinRelease` | Durable all-or-nothing protection with stable retry identities; renewal optionally checks the current collection revision. |
 | `pinRead` | Typed active-list/name/ID selector, finite catalog capture and store-scoped continuation pages. |
 | `keysList`, `valuesSearch` and planned text/record/graph operations | Shared native semantics, typed results and query coverage. |
-| `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume administration; removal stops new admission while preserving existing claims. Explicit completed handoff and tail administration remain unfinished. |
+| `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume administration; removal stops new admission while preserving existing claims. Tail administration remains unfinished. |
+| `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity
@@ -412,6 +413,27 @@ readiness rather than carry old quiet evidence into new policy. Ordinary status
 also includes durable definitions, revisions and admission state. CLI mutations
 are explicit administrative commands; no destructive watch mutation was added
 to ordinary MCP search tools.
+
+Schema 16 provides `WatchHandoff` requests for explicit finished-file admission
+and read-only progress lookup. They carry the original store, stable request ID,
+watch and exact revision, relative Unix path as `Data`, and a typed device/inode,
+byte-length, modification and change-clock generation. First admission requires
+the current enabled watch revision and matching anchored regular-file identity;
+it bypasses the quiet timer under the watch's explicit producer contract.
+The durable request binding and existing consumption reservation commit together,
+with a monotonic `sparrow.store/8` writer fence. Up to 128 bindings and 16 active
+claims are retained. Active ownership survives ordinary retry expiry; synchronized
+removal starts a 48-hour completed retry window. This ownership is not a pin.
+
+`HandoffReceipt.request` echoes the immutable original intent. The SDK certifies
+that echo, durable acknowledgment and phase/artifact consistency. `reserved`
+means durable admission; `claimed`, `published` and `removed` expose subsequent
+progress through the existing worker. A reserved receipt does not certify source
+deletion. Repeated admission returns original current progress before inspecting
+today's watch definition or source path. Changed arguments conflict, and progress
+lookup never creates a new admission. CLI preparation saves a bounded, strict
+single-message Cap'n Proto intent outside consumption roots and refuses overwrite.
+Retries submit that saved intent rather than recapture the source path.
 
 No upload or tool-supplied path independently authorizes deleting arbitrary files.
 The configured consume watch and its claimed source generation are the deletion
@@ -480,7 +502,11 @@ sparrow SOCKET_PATH watch list
 sparrow SOCKET_PATH watch put REQUEST_ID 0 completed-watch.toml
 sparrow SOCKET_PATH watch put REQUEST_ID CURRENT_REVISION updated-watch.toml
 sparrow SOCKET_PATH watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
-# Tail watches and explicit handoff remain unfinished.
+sparrow SOCKET_PATH watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp
+sparrow SOCKET_PATH watch handoff INTENT.capnp
+sparrow SOCKET_PATH watch handoff-status INTENT.capnp
+# Save intents outside consumption roots; retry the same intent after uncertain delivery.
+# Tail watches remain unfinished.
 
 sparrow records search --service worker --severity ERROR --text timeout
 sparrow record get record:42

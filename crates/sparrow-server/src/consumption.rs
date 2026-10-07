@@ -74,7 +74,10 @@ fn open(dir: impl AsFd, path: &Path, flags: OFlags, resolve: ResolveFlags) -> Re
 }
 
 fn observation(file: &File) -> Result<ConsumptionGeneration, Error> {
-    let identity = CompletedFileIdentity::capture(&file.metadata()?);
+    generation(CompletedFileIdentity::capture(&file.metadata()?))
+}
+
+pub(crate) fn generation(identity: CompletedFileIdentity) -> Result<ConsumptionGeneration, Error> {
     Ok(ConsumptionGeneration {
         device: identity.device,
         inode: identity.inode,
@@ -93,6 +96,11 @@ fn observation(file: &File) -> Result<ConsumptionGeneration, Error> {
 }
 
 fn require(file: &File, generation: &ConsumptionGeneration) -> Result<(), Error> {
+    identity(generation).require(file)?;
+    Ok(())
+}
+
+pub(crate) fn identity(generation: &ConsumptionGeneration) -> CompletedFileIdentity {
     CompletedFileIdentity {
         device: generation.device,
         inode: generation.inode,
@@ -102,8 +110,6 @@ fn require(file: &File, generation: &ConsumptionGeneration) -> Result<(), Error>
         changed_seconds: generation.changed.0,
         changed_nanos: i64::from(generation.changed.1),
     }
-    .require(file)?;
-    Ok(())
 }
 
 /// One exclusively locked, descriptor-anchored configured watch root.
@@ -393,6 +399,41 @@ impl ClaimRoot {
         source: &str,
         format: &str,
     ) -> Result<ConsumptionJournal, Error> {
+        let (_file, directories) = self.prepare_source(relative, expected)?;
+        Ok(self.store.consumption_reserve(
+            &self.watch,
+            relative.as_os_str().as_bytes(),
+            source,
+            format,
+            // Reserve the admitted generation, never a fresh observation that
+            // could silently adopt a write after the final readiness check.
+            generation(expected)?,
+            directories,
+        )?)
+    }
+
+    pub(crate) fn handoff(
+        &self,
+        intent: &sparrow_core::ConsumptionHandoff,
+        source: &str,
+        format: &str,
+        now: u64,
+    ) -> Result<ConsumptionJournal, Error> {
+        if intent.watch != self.watch {
+            return Err(Error::State("handoff belongs to another claim root"));
+        }
+        let relative = Path::new(std::ffi::OsStr::from_bytes(&intent.relative_path));
+        let (_file, directories) = self.prepare_source(relative, identity(&intent.observed))?;
+        Ok(self
+            .store
+            .consumption_handoff_reserve(intent, source, format, directories, now)?)
+    }
+
+    fn prepare_source(
+        &self,
+        relative: &Path,
+        expected: CompletedFileIdentity,
+    ) -> Result<(File, ConsumptionDirectories), Error> {
         self.private_namespace()?;
         let parent = self.parent(relative)?;
         let name = relative
@@ -406,14 +447,7 @@ impl ClaimRoot {
         file.sync_all()?;
         parent.sync_all()?;
         expected.require(&file)?;
-        Ok(self.store.consumption_reserve(
-            &self.watch,
-            relative.as_os_str().as_bytes(),
-            source,
-            format,
-            observation(&file)?,
-            self.directories(&parent)?,
-        )?)
+        Ok((file, self.directories(&parent)?))
     }
 
     /// Reconcile a reserved/claimed source through the same atomic move path.

@@ -565,6 +565,85 @@ enum AdminFailure {
     Terminal(Error),
 }
 
+fn admit_handoff(
+    store: &Store,
+    detectors: &[Detector],
+    intent: &sparrow_core::ConsumptionHandoff,
+) -> Result<sparrow_core::ConsumptionJournal, AdminFailure> {
+    let now = crate::now().map_err(AdminFailure::Refused)?;
+    if let Some(original) = store
+        .consumption_handoff_get(intent, now)
+        .map_err(storage_admission)?
+    {
+        return Ok(original);
+    }
+    let detector = detectors
+        .iter()
+        .find(|watch| watch.config.id == intent.watch)
+        .ok_or_else(|| {
+            AdminFailure::Refused(watch_admin::failure(
+                "NOT_FOUND",
+                "handoff watch is not registered",
+            ))
+        })?;
+    if !detector.enabled || detector.revision != intent.watch_revision {
+        return Err(AdminFailure::Refused(watch_admin::failure(
+            "CONFLICT",
+            "handoff requires the current enabled watch revision",
+        )));
+    }
+    detector
+        .owner
+        .root_binding(&detector.config.root)
+        .map_err(|error| AdminFailure::Refused(watch_admin::failure("CONFLICT", error)))?;
+    detector
+        .owner
+        .handoff(
+            intent,
+            &detector.config.source,
+            &detector.config.format,
+            now,
+        )
+        .map_err(|error| match error {
+            Error::Storage(error) => storage_admission(error),
+            Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                AdminFailure::Refused(watch_admin::failure("NOT_FOUND", error))
+            }
+            error => AdminFailure::Refused(watch_admin::failure("CONFLICT", error)),
+        })
+}
+
+fn storage_admission(error: sparrow_core::Error) -> AdminFailure {
+    if error.code == "STORAGE_FAILURE" {
+        AdminFailure::Terminal(Error::Storage(error))
+    } else {
+        AdminFailure::Refused(error)
+    }
+}
+
+fn acknowledge<T>(
+    reply: tokio::sync::oneshot::Sender<Result<T, sparrow_core::Error>>,
+    result: Result<T, AdminFailure>,
+    store: &Store,
+    registry: &WatchRegistry,
+    detectors: &[Detector],
+) -> Result<(), Error> {
+    match result {
+        Ok(value) => {
+            registry.update(detectors, &store.consumption_pending()?)?;
+            let _ = reply.send(Ok(value));
+        }
+        Err(AdminFailure::Refused(error)) => {
+            let _ = reply.send(Err(error));
+        }
+        Err(AdminFailure::Terminal(error)) => {
+            let _ = reply.send(Err(watch_admin::failure("STORAGE_FAILURE", &error)));
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn administrate(
     store: &Store,
     catalog: &mut Catalog,
@@ -682,25 +761,16 @@ async fn run(
                     ));
                 }
             };
-            match administrate(
-                &store,
-                &mut catalog,
-                &mut detectors,
-                command.action,
-                &pending,
-            ) {
-                Ok(watch) => {
-                    registry.update(&detectors, &pending)?;
-                    let _ = command.reply.send(Ok(watch));
+            match command {
+                watch_admin::Command::Mutation { action, reply } => {
+                    let pending = store.consumption_pending()?;
+                    let result =
+                        administrate(&store, &mut catalog, &mut detectors, action, &pending);
+                    acknowledge(reply, result, &store, &registry, &detectors)?;
                 }
-                Err(AdminFailure::Refused(error)) => {
-                    let _ = command.reply.send(Err(error));
-                }
-                Err(AdminFailure::Terminal(error)) => {
-                    let _ = command
-                        .reply
-                        .send(Err(watch_admin::failure("STORAGE_FAILURE", &error)));
-                    return Err(error);
+                watch_admin::Command::Handoff { intent, reply } => {
+                    let result = admit_handoff(&store, &detectors, &intent);
+                    acknowledge(reply, result, &store, &registry, &detectors)?;
                 }
             }
         }

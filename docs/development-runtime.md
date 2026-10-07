@@ -2,8 +2,61 @@
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 15; the schema sections
+The current source implements schema 16; the schema sections
 below retain their historical qualification evidence.
+
+## Typed explicit completed handoff
+
+Schema 16 adds `watchHandoff` and read-only `watchHandoffGet`. The Rust SDK and
+CLI use the same generated client and receipt certification. The request binds
+the original persistent store, stable request ID, registered watch revision,
+relative Unix path bytes and exact device/inode/length/mtime/ctime generation.
+First admission requires the current enabled finished-file watch and an anchored
+regular-file observation, with file and parent synchronization. Explicit producer
+handoff bypasses the discovery quiet timer; it does not weaken generation checks.
+
+Admission uses the existing bounded worker control queue and atomic storage
+reservation. It does not hold a publication RPC semaphore while awaiting the
+worker. Every queued catalog mutation refreshes pending ownership, including
+handoffs admitted earlier in that same tick. The same worker then performs
+atomic private claim, SDK upload, durable publication and synchronized removal.
+An admission receipt says `reserved`; progress can advance through `claimed`,
+`published` and `removed`. Admission does not certify publication or deletion.
+No separate importer, deletion path, parser or retry transaction is introduced.
+
+The CLI workflow is:
+
+```sh
+sparrow SOCKET watch handoff-prepare REQUEST WATCH REVISION RELATIVE_PATH INTENT.capnp
+sparrow SOCKET watch handoff INTENT.capnp
+sparrow SOCKET watch handoff-status INTENT.capnp
+```
+
+Preparation writes one mode-0600, synchronized, create-new Cap'n Proto intent
+outside enabled consumption roots. It does not reserve, rename or delete the
+source. Intents are bounded to 16 KiB and reject trailing messages, symlinks and
+special files. Retry `handoff` with that saved intent; do not run preparation
+again against a replacement generation. The SDK supports non-UTF8 source paths.
+Stable retries recover their original binding before touching current roots,
+definitions or source paths, including after watch removal and daemon restart.
+The default stdio MCP search surface receives no destructive handoff authority.
+
+The SDK codec unit module owns one dev-only intent fixture shared by its two
+adversarial tests, recorded with the typed-intent ledger job and vectors. The
+existing census excludes `cfg(test)` modules, so that fixture is verified by the
+unit checks rather than asserted as an independently indexed shipping symbol.
+No detector, exception or index rule was relaxed.
+
+The final-source `make check` gate passed with 12 SDK unit tests, 68 storage
+scenarios, 23 real-daemon/filesystem/MCP scenarios, all remaining workspace
+checks, release Clippy with warnings denied, seeded census self-tests and 114
+ledger jobs. The real-daemon handoff scenario covers missing/stale/foreign
+authority, generation/path conflicts without admission, immutable CLI preparation
+and unsafe output refusal, quiet-timer bypass, exact CRLF bytes, raw non-UTF8
+filenames, original retries after replacement/removal/restart, and no duplicate
+records. These checks qualify explicit handoff; full architecture acceptance,
+active tailing, syslog and the other outstanding query/operational work remain
+unfinished.
 
 ## Explicit handoff storage foundation
 
@@ -26,10 +79,11 @@ First handoff admission requires a durable watch catalog and fences older
 writers with `sparrow.store/8`. Subsequent catalog replacements preserve that
 marker. The storage API relies on the server to verify the actual registered
 revision, enabled state, explicit producer authority and descriptor generation
-before first admission. **The typed RPC, worker and CLI handoff integration is
-still unfinished; this foundation is not an exposed daemon handoff operation.**
+before first admission. Schema 16 wires those checks through the worker and typed
+operations described above.
 
-The full `make check` gate passed with 68 storage scenarios, 22 real-daemon,
+The storage foundation commit `fad05de` passed the full `make check` gate with
+68 storage scenarios, 22 real-daemon,
 filesystem and MCP scenarios, all remaining workspace checks, release Clippy
 with warnings denied, seeded census self-tests and 109 ledger jobs. The extended
 consumption lifecycle covers restart, original publication beyond retry and

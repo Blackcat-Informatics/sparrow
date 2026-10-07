@@ -112,6 +112,20 @@ struct WatchRemove { storeId @0 :Text; requestId @1 :Text; id @2 :Text; expected
 struct WatchMutation {
   requestId @0 :Text; watch @1 :WatchInfo; durability @2 :Durability = durable;
 }
+struct FileGeneration {
+  device @0 :UInt64; inode @1 :UInt64; byteLength @2 :UInt64;
+  modifiedSeconds @3 :Int64; modifiedNanos @4 :UInt32;
+  changedSeconds @5 :Int64; changedNanos @6 :UInt32;
+}
+struct WatchHandoff {
+  storeId @0 :Text; requestId @1 :Text; watch @2 :Text; watchRevision @3 :UInt64;
+  relativePath @4 :Data; generation @5 :FileGeneration;
+}
+enum HandoffPhase { reserved @0; claimed @1; published @2; removed @3; }
+struct HandoffReceipt {
+  request @0 :WatchHandoff; importId @1 :Text; phase @2 :HandoffPhase;
+  artifactId @3 :OptionalText; durability @4 :Durability = durable;
+}
 
 struct WideInteger { high @0 :UInt64; low @1 :UInt64; }
 struct EventField {
@@ -331,4 +345,6 @@ interface Sparrow {
   watchList @27 () -> (result :Result(WatchList));
   watchPut @28 (request :WatchPut) -> (result :Result(WatchMutation));
   watchRemove @29 (request :WatchRemove) -> (result :Result(WatchMutation));
+  watchHandoff @30 (request :WatchHandoff) -> (result :Result(HandoffReceipt));
+  watchHandoffGet @31 (request :WatchHandoff) -> (result :Result(HandoffReceipt));
 }
