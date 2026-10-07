@@ -14,7 +14,7 @@ and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
-`bytesRead`, `pin`, `pinRelease`, `keysList`, `valuesSearch` and `textSearch`. The shared typed
+`bytesRead`, `pin`, `pinRelease`, `keysList`, `valuesSearch`, `textSearch`, `recordsContext` and `rdfInspect`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
 result rendering. The CLI supplies status, non-destructive buffered file import,
@@ -25,7 +25,7 @@ are required work.
 ```sh
 CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server
 target/release/sparrowd --config config/development.toml
-target/release/sparrow /home/paudley/.local/state/sparrow/development-v3/rpc.sock status
+target/release/sparrow /home/paudley/.local/state/sparrow/development-v4/rpc.sock status
 ```
 
 ## CLI investigations
@@ -68,7 +68,7 @@ coverage receipt. Transport/domain failures exit unsuccessfully without a
 successful result prefix.
 
 Development configuration selects
-`/home/paudley/.local/state/sparrow/development-v3/rpc.sock` and the database in its
+`/home/paudley/.local/state/sparrow/development-v4/rpc.sock` and the database in its
 parent directory. The directory is mode 0700 and socket mode 0600. The daemon
 refuses an existing endpoint rather than unlinking a listener's socket. An owned
 dead endpoint must be reconciled before restart after an unclean shutdown.
@@ -113,7 +113,7 @@ wildcard selector is inferred.
 Launch the adapter with the existing private daemon socket:
 
 ```sh
-target/release/sparrow /home/paudley/.local/state/sparrow/development-v3/rpc.sock mcp --stdio
+target/release/sparrow /home/paudley/.local/state/sparrow/development-v4/rpc.sock mcp --stdio
 ```
 
 A host configuration can use this command and argument array:
@@ -123,7 +123,7 @@ A host configuration can use this command and argument array:
   "mcpServers": {
     "sparrow": {
       "command": "/home/paudley/Active/sparrow/target/release/sparrow",
-      "args": ["/home/paudley/.local/state/sparrow/development-v3/rpc.sock", "mcp", "--stdio"]
+      "args": ["/home/paudley/.local/state/sparrow/development-v4/rpc.sock", "mcp", "--stdio"]
     }
   }
 }
@@ -138,7 +138,7 @@ so an idle MCP session does not retain an expired daemon connection lease.
 
 Discovery advertises these implemented tools only: `capabilities`, `status`,
 `keys_list`, `values_search`, `text_search`, `records_context`, `artifact_get`, `record_get`,
-`bytes_read`, `pin` and `pin_release`. Input schemas reject additional fields;
+`bytes_read`, `rdf_inspect`, `pin` and `pin_release`. Input schemas reject additional fields;
 query arguments use the CLI's names with underscores. Temporal filters remain
 explicitly server-acceptance times. Offsets are decimal strings; bounded lengths,
 row limits and durations are JSON integers. Byte results use native canonical
@@ -156,7 +156,8 @@ The adapter bounds requests to 128 KiB, responses to 8 MiB, concurrent calls to
 four and each call to 30 seconds. Oversized framing closes the session with an
 explicit protocol error; malformed complete JSON frames receive a parse error
 and subsequent valid frames can proceed. EOF drains pending calls. Discovery
-requires daemon schema version 3, including record context and native text/profile identities;
+requires daemon schema version 4, including RDF profile identity, record context
+and native text/profile identities;
 older discovery contracts fail explicitly rather than invent those identities.
 
 The real-daemon acceptance fixture checks CLI/MCP parity for keys, text and context, JSON
@@ -214,6 +215,47 @@ before and after crash/reopen.
 File/stream order, event-time context, pagination leases and producer continuity
 qualification remain required later work.
 
+## Persistent RDF foundation
+
+Store format 4 binds the RDF layout, native JSON profile, native Markdown contract,
+and admission limits to a persisted `rdf_profile` identity. Missing identity is a
+storage failure; drift refuses reopening with a migration-required error. Earlier
+format-3 data is preserved separately; this implementation does not migrate it.
+
+Native JSON analysis supplies both diagnostic field facts and the full native RDF
+projection. Markdown uses native slicing and parses its emitted Turtle through
+PurRDF. Terms persist as native canonical `ProjectionTerm` JSON with a verified
+forward/reverse dictionary and monotonic nonzero 64-bit IDs. Nested triple terms,
+blank scopes, literal language/direction and datatype identity survive storage.
+Primary, reifier and annotation streams remain separate, each with physical SPOG,
+POSG, OSPG, GSPO, GPOS and GOSP indexes. Declared empty named graphs persist.
+Native default graph rows are lifted to the content owner's named graph; explicit
+native graph names remain intact. Owner IDs distinguish shared graph membership.
+
+Identical content shares its projection graph while each occurrence has its own
+record metadata graph. Metadata describes source, artifact, original byte range,
+payload identity, acceptance/expiry and projection state. Pin-aware expiry removes
+all six indexes and dictionary reference closures only after their final graph
+owner expires. Raw evidence survives projection refusal with a diagnostic.
+
+Graph admission caps rows at 32,768, term encoding at 64 KiB and nested depth at
+16, dictionary staging at 32 MiB and anticipated RDF batch staging at 64 MiB.
+These are admission bounds, not a measured process RSS guarantee. Metadata and
+content publication share the raw-evidence atomic write batch.
+
+`sparrow SOCKET_PATH rdf STORE_ID RECORD_ID` and MCP `rdf_inspect` expose retained
+record metadata/content graph identities, projection state, diagnostic and exact
+counts for each native stream. This inspection does not run SPARQL or reconstruct
+a resident dataset. Native stored-view and governor qualification remain required
+before semantic graph queries can be advertised.
+
+Qualification compares every persisted JSON quad against native projection in
+all six indexes, checks shared content and pinned expiry, exercises Markdown and
+oversized/malformed projection refusal with exact-byte preservation, and verifies
+RDF 1.2 nested terms, distinct blank scopes, directional literals, reifier and
+annotation layers, and declaration-only empty graphs. Profile drift/missing
+identity and shared CLI/MCP inspection are covered by the repository gate.
+
 ## Persistent full text
 
 Store format 3 binds native standard analyzer identity at atomic store creation.
@@ -221,7 +263,8 @@ The configured `text_lexicon_dir` must contain exactly five standard CBOR
 lexicons; native `Analyzer::resolve` verifies their pinned physical identities.
 Missing or changed artifacts refuse startup. A changed analyzer identity refuses
 reopening without explicit migration. Format 2 stores are preserved and require
-migration; development uses a separate `development-v3` directory.
+migration. The subsequent RDF layout uses format 4 and a separate
+`development-v4` directory; format 3 stores also require explicit migration.
 
 Ingestion stores native lexical terms, record token lengths, sparse frequency
 postings and separate source-evidence postings in the same synchronized batch as
@@ -295,8 +338,29 @@ eleven implemented tools. The store identity and analyzer/corpus evidence were
 preserved, and directory/socket modes remained 0700/0600. No producer data was
 consumed or deleted during these runtime checks.
 
-Remaining final-server acceptance includes full native JSON/Markdown RDF
-projection, persistent RDF indexes, governed stored-view SPARQL, further
+The qualified RDF build started a fresh format-4 store on 2026-10-07 UTC at
+`development-v4/rpc.sock`, store ID
+`store:c0c19ff0de784da626470803a3274dbc`. The owned format-3 daemon stopped cleanly
+and its database remains intact. Live JSONL record
+`record:cc036f2592587ba42e4d947bf2c50284` has 80 native primary content rows and
+11 metadata rows; Markdown record `record:5dd10b50225185eb43f38181eca8a579` has
+41 content rows and 11 metadata rows. CLI and MCP inspection agreed; MCP advertised
+twelve tools, drained EOF successfully and produced no diagnostic stdout.
+The persisted RDF profile identity is
+`1ceeeb7b44784d4db19d7696a8978e50c08961ddebceecd9934f61bd2f9f056f`.
+
+The synthetic two-line log retained all 75 bytes exactly, returned the native
+`failed` span [11,17), and exposed its same-source neighbor through context.
+The 70,015-byte oversized-term JSON fixture produced an explicit failed RDF
+state with no content graph; its original bytes were exported and compared exactly.
+Directory mode 0700 and socket mode 0600 were verified. Only synthetic fixtures
+were ingested; no production watches or sibling services were changed.
+The full repository gate passed, including refusal rollback, native RDF 1.2
+identity/layers, all six index permutations, pin-aware reclamation, profile drift,
+and daemon/MCP crash-reopen coverage. Stored-view SPARQL remains unimplemented.
+
+Remaining final-server acceptance includes native stored-view qualification,
+governed SPARQL, source/artifact metadata graphs, further
 text qualification, event-time and combined predicates, context and
 correlation, final scope/pagination contracts, streaming imports and recovery
 journals, durable completed-file consumption, inotify/tailing, remaining MCP/CLI tools,

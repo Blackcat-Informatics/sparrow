@@ -6,7 +6,9 @@ inspect, correlate, and query as a semantic graph.
 
 **Status: implementation in progress.** A RocksDB daemon, Cap'n Proto RPC,
 CLI, stdio MCP, JSON field discovery, persistent native full-text retrieval, bounded
-record context and helper-census tooling are implemented. The logging client and
+record context, persistent native JSON/Markdown RDF dictionaries and six-way
+quad indexes, and helper-census tooling are implemented. Stored-view SPARQL,
+the logging client and
 full architecture acceptance
 remain unfinished. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.

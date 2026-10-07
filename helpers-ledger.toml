@@ -238,3 +238,48 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^scan_context_neighbors$']
+
+[[job]]
+id = "rdf-term-identity"
+summary = "Validate and serialize portable RDF 1.2 term identity, including scope, direction and nested triples."
+home = "purrdf:purrdf_rdf::projections::ProjectionTerm::to_canonical_json"
+entry_points = ["purrdf_rdf::projections::ProjectionTerm::from_canonical_json"]
+spec = "PurRDF canonical ProjectionTerm carrier; Sparrow persists its bytes without a second RDF term codec."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^serialize_rdf_term$']
+
+[[job]]
+id = "json-rdf-projection"
+summary = "Project ordered JSON occurrences and exact lexical/structural spans into native RDF."
+home = "purrdf:purrdf_json::project"
+entry_points = ["purrdf_json::encode"]
+spec = "PurRDF ordered JSON projection under the explicit Sparrow native profile."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^json_to_rdf$']
+
+[[job]]
+id = "markdown-rdf-projection"
+summary = "Project complete Markdown byte cover, content and structure through the native Markdown law."
+home = "purrdf:purrdf_markdown::slice_markdown"
+entry_points = []
+spec = "PurRDF Markdown SPEC with its native contract identity; emitted claims use the native RDF parser."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^markdown_to_rdf$']

@@ -9,6 +9,7 @@ use purrdf_lex::json::{Object, Value};
 mod context;
 mod error;
 mod ingest;
+mod rdf;
 mod read;
 mod search;
 mod status;
@@ -18,7 +19,7 @@ pub type AgentResult<T> = std::result::Result<T, AgentError>;
 type Result<T> = AgentResult<T>;
 pub(crate) mod tool;
 
-pub(super) const USAGE: &str = "usage: sparrow SOCKET_PATH status | ingest REQUEST_ID SOURCE FORMAT FILE | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N]; values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT";
+pub(super) const USAGE: &str = "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N]; values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT";
 
 /// Execute a CLI command through the same typed client and renderer as MCP.
 pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<Value> {
@@ -33,6 +34,10 @@ pub(super) enum Command {
     Ingest(ingest::Input),
     Bytes(read::Input),
     Context(context::Input),
+    Rdf {
+        store: String,
+        id: String,
+    },
     Query {
         values: bool,
         text: Option<String>,
@@ -126,6 +131,15 @@ impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
         if args == ["status"] {
             return Ok(Self::Status);
+        }
+        if args.first().map(String::as_str) == Some("rdf") {
+            if args.len() != 3 {
+                return Err(invalid("rdf requires STORE_ID RECORD_ID"));
+            }
+            return Ok(Self::Rdf {
+                store: args[1].clone(),
+                id: args[2].clone(),
+            });
         }
         if args.first().map(String::as_str) == Some("ingest") {
             return Ok(Self::Ingest(ingest::Input::parse(&args[1..])?));
@@ -240,6 +254,9 @@ impl Command {
         }
         if let Self::Context(input) = self {
             return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::Rdf { store, id } = self {
+            return Ok(Some(rdf::inspect(client, store, id).await?));
         }
         let Self::Query {
             values,

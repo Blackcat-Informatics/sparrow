@@ -52,6 +52,10 @@ impl Operation {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
                 "status" => Self::Status,
+                "rdf_inspect" => Self::Query(Command::Rdf {
+                    store: fields.required("store_id")?,
+                    id: fields.required("id")?,
+                }),
                 "capabilities" => Self::Capabilities,
                 "keys_list" | "values_search" | "text_search" | "records_context" => {
                     let mut options = Options {

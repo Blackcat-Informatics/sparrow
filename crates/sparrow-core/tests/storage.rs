@@ -8,6 +8,260 @@ use sparrow_core::{Config, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
+    use purrdf::projections::{ProjectionLimits, ProjectionTerm};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = br#"{"duplicate":1e0,"duplicate":1.00,"array":[null,"a\u0020b"]}"#;
+    let first = store
+        .ingest("rdf-json-first", "rdf", "json", bytes, 0)
+        .unwrap();
+    let second = store
+        .ingest("rdf-json-second", "rdf", "json", bytes, 1)
+        .unwrap();
+    let inspection = store.rdf_inspect(&first.record_ids[0], 2).unwrap();
+    assert_eq!(inspection["state"].as_str(), Some("complete"));
+    assert_eq!(
+        inspection["content_graph"],
+        store.rdf_inspect(&second.record_ids[0], 2).unwrap()["content_graph"]
+    );
+    assert_ne!(
+        inspection["metadata_graph"],
+        store.rdf_inspect(&second.record_ids[0], 2).unwrap()["metadata_graph"]
+    );
+    let digest = purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes());
+    let source = format!("urn:sparrow:payload:{digest}");
+    let native = purrdf::json::encode(
+        purrdf::json::SourceDocument { id: &source, bytes },
+        &sparrow_core::json_projection_profile().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        inspection["primary_rows"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        native.quad_count() as u64
+    );
+    let projection = store
+        .record(&first.record_ids[0])
+        .unwrap()
+        .rdf_projection_id;
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let manifest = purrdf_lex::json::read(
+        std::str::from_utf8(&db.get(format!("rdf:graph:{projection}")).unwrap().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let owner = manifest["owner"].as_str().unwrap().parse::<u64>().unwrap();
+    let limits = ProjectionLimits::new(1, 65536, 33554432, 33554432, 16).unwrap();
+    let canonical = |value: &purrdf::TermValue| {
+        ProjectionTerm::from_term_value(value, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap()
+    };
+    let graph = canonical(&purrdf::TermValue::iri(
+        inspection["content_graph"].as_str().unwrap(),
+    ));
+    let expected: std::collections::BTreeSet<_> = native
+        .quads()
+        .map(|row| {
+            [
+                canonical(&native.term_value(row.s)),
+                canonical(&native.term_value(row.p)),
+                canonical(&native.term_value(row.o)),
+                graph.clone(),
+            ]
+        })
+        .collect();
+    for (name, axes) in [
+        ("SPOG", [0, 1, 2, 3]),
+        ("POSG", [1, 2, 0, 3]),
+        ("OSPG", [2, 0, 1, 3]),
+        ("GSPO", [3, 0, 1, 2]),
+        ("GPOS", [3, 1, 2, 0]),
+        ("GOSP", [3, 2, 0, 1]),
+    ] {
+        let prefix = format!("rdf:q:0:{name}:");
+        let mut actual = std::collections::BTreeSet::new();
+        for entry in db.prefix_iterator(&prefix) {
+            let (key, value) = entry.unwrap();
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            assert!(value.is_empty());
+            assert_eq!(key.len(), prefix.len() + 40);
+            let ids: Vec<_> = key[prefix.len()..]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| u64::from_be_bytes(*v))
+                .collect();
+            if ids[4] != owner {
+                continue;
+            }
+            let mut row = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+            for (position, axis) in axes.into_iter().enumerate() {
+                let bytes = db
+                    .get(format!("rdf:term:{:020}", ids[position]))
+                    .unwrap()
+                    .unwrap();
+                ProjectionTerm::from_canonical_json(&bytes, limits).unwrap();
+                let reverse = format!(
+                    "rdf:reverse:{}",
+                    purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&bytes).as_bytes())
+                );
+                assert_eq!(
+                    db.get(reverse).unwrap().unwrap(),
+                    ids[position].to_be_bytes()
+                );
+                row[axis] = bytes;
+            }
+            actual.insert(row);
+        }
+        assert_eq!(actual, expected, "{name} must preserve every native row");
+    }
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.rdf_inspect(&first.record_ids[0], 2).unwrap(),
+        inspection
+    );
+    store
+        .pin(
+            "rdf-pin",
+            "rdf",
+            &[first.record_ids[0].clone()],
+            2,
+            29 * DAY,
+        )
+        .unwrap();
+    store.expire(30 * DAY + 1).unwrap();
+    assert_eq!(
+        store
+            .rdf_inspect(&first.record_ids[0], 30 * DAY + 1)
+            .unwrap()["state"]
+            .as_str(),
+        Some("complete")
+    );
+    assert_eq!(
+        store
+            .rdf_inspect(&second.record_ids[0], 30 * DAY + 1)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.expire(32 * DAY).unwrap();
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    for prefix in [
+        "rdf:q:",
+        "rdf:term:",
+        "rdf:reverse:",
+        "rdf:ref:",
+        "rdf:graph:",
+        "rdf:state:",
+        "rdf:projection-ref:",
+    ] {
+        assert!(
+            !db.prefix_iterator(prefix)
+                .any(|entry| entry.unwrap().0.starts_with(prefix.as_bytes())),
+            "unreachable {prefix} must be reclaimed"
+        );
+    }
+}
+
+#[test]
+fn native_markdown_and_refused_rdf_projections_keep_original_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let markdown = b"# Heading\n\nParagraph with exact bytes.\n\n---\n";
+    let artifact = store
+        .ingest("rdf-markdown", "rdf", "markdown", markdown, 0)
+        .unwrap();
+    let summary = store.rdf_inspect(&artifact.record_ids[0], 1).unwrap();
+    assert_eq!(summary["state"].as_str(), Some("complete"));
+    assert!(
+        summary["primary_rows"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 10
+    );
+    assert_eq!(
+        store.bytes(&artifact.id, 0, markdown.len(), 1).unwrap(),
+        markdown
+    );
+    let large = format!("{{\"large\":\"{}\"}}", "x".repeat(70000));
+    let oversized = store
+        .ingest("rdf-large-scalar", "rdf", "json", large.as_bytes(), 2)
+        .unwrap();
+    let refused = store.rdf_inspect(&oversized.record_ids[0], 3).unwrap();
+    assert_eq!(refused["state"].as_str(), Some("failed"));
+    assert!(refused["diagnostic"].as_str().unwrap().contains("limit"));
+    assert_eq!(refused["primary_rows"].as_str(), Some("0"));
+    assert_eq!(
+        store.bytes(&oversized.id, 0, large.len(), 3).unwrap(),
+        large.as_bytes()
+    );
+    let malformed = store
+        .ingest("rdf-invalid-json", "rdf", "json", b"{invalid}", 4)
+        .unwrap();
+    assert_eq!(
+        store.rdf_inspect(&malformed.record_ids[0], 5).unwrap()["state"].as_str(),
+        Some("failed")
+    );
+    let empty = store
+        .ingest("rdf-empty-opaque", "rdf", "opaque", b"", 6)
+        .unwrap();
+    assert_eq!(
+        store.rdf_inspect(&empty.record_ids[0], 7).unwrap()["state"].as_str(),
+        Some("not_applicable")
+    );
+    store.expire(31 * DAY).unwrap();
+    store.expire(31 * DAY).unwrap(); // Empty inputs and failed projections reclaim once.
+}
+
+#[test]
+fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/4")
+    );
+    assert_eq!(
+        store.status(0).unwrap()["rdf_profile"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    drop(store);
+    for (replacement, expected) in [
+        (Some(b"different-profile".as_slice()), "UNSUPPORTED"),
+        (None, "STORAGE_FAILURE"),
+    ] {
+        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        match replacement {
+            Some(value) => db.put("rdf_profile", value).unwrap(),
+            None => db.delete("rdf_profile").unwrap(),
+        }
+        drop(db);
+        match Store::open(dir.path(), config()) {
+            Ok(_) => panic!("invalid RDF profile was admitted"),
+            Err(error) => assert_eq!(error.code, expected),
+        }
+    }
+}
+
+#[test]
 fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers() {
     use sparrow_core::{ContextFrontier, QueryScope};
     let dir = tempfile::tempdir().unwrap();

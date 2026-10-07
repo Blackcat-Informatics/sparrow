@@ -8,7 +8,10 @@ use purrdf_lex::json::{Object, Value};
 
 use crate::Error;
 
-pub(crate) fn json_profile() -> Result<json::Profile, Error> {
+pub(crate) type NativeGraph = Result<std::sync::Arc<purrdf::RdfDataset>, Error>;
+
+/// The exact native ordered-JSON profile used for stored occurrence and RDF facts.
+pub fn json_profile() -> Result<json::Profile, Error> {
     let vocabulary = json::Vocabulary::standard().map_err(|e| Error {
         code: "PROJECTION_FAILURE",
         message: e.to_string(),
@@ -34,20 +37,24 @@ pub(crate) fn json_facts(
     bytes: &[u8],
     content_id: &str,
     profile: &json::Profile,
-) -> Result<Value, Error> {
+) -> Result<(Value, NativeGraph), Error> {
     let source = format!("urn:sparrow:payload:{content_id}");
     let result = json::analyze(SourceDocument { id: &source, bytes }, profile);
     let mut envelope = Object::new()
         .with("profile", profile.identity().to_hex())
         .with("source", source.clone());
+    let graph;
     match result {
         Err(e) => {
+            graph = Err(Error::new("PROJECTION_FAILURE", e.to_string()));
             envelope = envelope
                 .with("state", "failed")
                 .with("diagnostic", e.to_string())
                 .with("values", Value::array(Vec::<Value>::new()));
         }
         Ok(document) => {
+            graph = json::project(&document, profile)
+                .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()));
             let mut values = Vec::with_capacity(document.values().len());
             let mut decoding_failures = 0_u64;
             for (index, value) in document.values().iter().enumerate() {
@@ -88,5 +95,39 @@ pub(crate) fn json_facts(
                 .with("values", Value::array(values));
         }
     }
-    Ok(envelope.into())
+    Ok((envelope.into(), graph))
+}
+
+pub(crate) fn markdown_profile() -> Result<purrdf::markdown::Profile, Error> {
+    Ok(purrdf::markdown::Profile::new(
+        "sparrow-markdown",
+        1,
+        purrdf::markdown::Vocabulary::standard()
+            .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))?,
+    ))
+}
+
+pub(crate) fn markdown_graph(
+    bytes: &[u8],
+    digest: &str,
+    profile: &purrdf::markdown::Profile,
+) -> Result<std::sync::Arc<purrdf::RdfDataset>, Error> {
+    let source = format!("urn:sparrow:payload:{digest}");
+    let claims = purrdf::markdown::slice_markdown(
+        &purrdf::markdown::SourceDocument { id: &source, bytes },
+        profile,
+    )
+    .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))?;
+    let mut text = String::new();
+    for claim in claims {
+        if text.len().saturating_add(claim.turtle.len()) > 16 * 1024 * 1024 {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "native Markdown RDF exceeds 16 MiB",
+            ));
+        }
+        text.push_str(&claim.turtle);
+    }
+    purrdf::dataset_from_bytes(text.as_bytes(), purrdf::NativeRdfFormat::Turtle)
+        .map_err(|e| Error::new("PROJECTION_FAILURE", e))
 }

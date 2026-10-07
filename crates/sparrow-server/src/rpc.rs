@@ -325,6 +325,55 @@ fn rows(value: &Value) -> capnp::Result<&[Value]> {
 }
 
 impl wire::sparrow::Server for Rpc {
+    async fn rdf_inspect(
+        self: Rc<Self>,
+        params: wire::sparrow::RdfInspectParams,
+        mut results: wire::sparrow::RdfInspectResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_record()?;
+        let id = self.reference(
+            input.get_store_id()?.to_str()?,
+            input.get_id()?.to_str()?,
+            "record:",
+        );
+        let result = match id {
+            Ok(id) => {
+                self.work(move |store, now| store.rdf_inspect(&id, now))
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(value) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(field::<String>(&value, "store_id")?);
+                out.set_record_id(field::<String>(&value, "record_id")?);
+                out.reborrow().init_membership_at().set_unix_millis(
+                    sparrow_core::parse_instant(&field::<String>(&value, "membership_at")?)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                );
+                out.set_metadata_graph(field::<String>(&value, "metadata_graph")?);
+                out.set_metadata_primary_rows(number(&value, "metadata_primary_rows")?);
+                out.set_state(match field::<String>(&value, "state")?.as_str() {
+                    "complete" => wire::ProjectionState::Complete,
+                    "failed" => wire::ProjectionState::Failed,
+                    "not_applicable" => wire::ProjectionState::NotApplicable,
+                    _ => return Err(capnp::Error::failed("invalid RDF inspection state".into())),
+                });
+                if let Some(text) = value.get("content_graph").and_then(Value::as_str) {
+                    out.reborrow().init_content_graph().set_value(text);
+                }
+                if let Some(text) = value.get("diagnostic").and_then(Value::as_str) {
+                    out.reborrow().init_diagnostic().set_value(text);
+                }
+                out.set_primary_rows(number(&value, "primary_rows")?);
+                out.set_reifier_rows(number(&value, "reifier_rows")?);
+                out.set_annotation_rows(number(&value, "annotation_rows")?);
+            }
+        }
+        Ok(())
+    }
     async fn records_context(
         self: Rc<Self>,
         params: wire::sparrow::RecordsContextParams,
@@ -504,7 +553,8 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(3);
+                out.set_schema_version(4);
+                out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
                 out.set_physical_bytes(number(&value, "physical_bytes")?);

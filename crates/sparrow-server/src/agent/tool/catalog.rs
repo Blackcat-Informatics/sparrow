@@ -35,6 +35,10 @@ const TOOLS: &[(&str, &str)] = &[
         "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity.",
     ),
     (
+        "rdf_inspect",
+        "Inspect persisted native RDF projection state, graph references and distinct stream row counts for a retained record.",
+    ),
+    (
         "record_get",
         "Read one concrete record's metadata and artifact-relative byte bounds.",
     ),
@@ -108,6 +112,7 @@ pub(crate) fn definitions() -> Value {
             "pin",
             "pin_release",
             "records_context",
+            "rdf_inspect",
         ]
         .contains(name)
         {
@@ -119,6 +124,7 @@ pub(crate) fn definitions() -> Value {
             "record_get",
             "bytes_read",
             "records_context",
+            "rdf_inspect",
         ]
         .contains(name)
         {

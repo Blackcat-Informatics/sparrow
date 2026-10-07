@@ -16,9 +16,10 @@ use rocksdb::{
 };
 
 pub(crate) mod context;
+mod rdf_index;
 mod text_index;
 
-const FORMAT: &[u8] = b"sparrow.store/3";
+const FORMAT: &[u8] = b"sparrow.store/4";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -141,6 +142,8 @@ pub struct Record {
     pub byte_end: u64,
     /// Shared, versioned native JSON search projection, or absent for other formats.
     pub projection_id: String,
+    /// Shared complete native RDF graph/state identity, absent for non-projectable formats.
+    pub rdf_projection_id: String,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -291,6 +294,7 @@ impl Catalog for Record {
             .with("byte_start", self.byte_start.to_string())
             .with("byte_end", self.byte_end.to_string())
             .with("projection_id", self.projection_id.clone())
+            .with("rdf_projection_id", self.rdf_projection_id.clone())
             .with("chunks", self.chunks.clone())
             .with("evicted", self.evicted)
             .into()
@@ -306,6 +310,7 @@ impl Catalog for Record {
             byte_start: integer(v, "byte_start")?,
             byte_end: integer(v, "byte_end")?,
             projection_id: read_field(v, "projection_id")?,
+            rdf_projection_id: read_field(v, "rdf_projection_id")?,
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             evicted: read_field(v, "evicted")?,
         })
@@ -474,6 +479,7 @@ impl Store {
             ],
         )?;
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
+        let rdf_fingerprint = rdf_index::profile_identity()?;
         let id = match db.get("store_format")? {
             Some(format) if format == FORMAT => {
                 let id = db
@@ -496,6 +502,7 @@ impl Store {
                 batch.put("store_format", FORMAT);
                 batch.put("store_id", &id);
                 batch.put("text_analyzer", &fingerprint);
+                batch.put("rdf_profile", &rdf_fingerprint);
                 let mut write = WriteOptions::default();
                 write.set_sync(true);
                 db.write_opt(batch, &write)?;
@@ -514,6 +521,21 @@ impl Store {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
                     "store text analyzer identity missing; inspect or restore the catalog",
+                ));
+            }
+        }
+        match db.get("rdf_profile")? {
+            Some(stored) if stored == rdf_fingerprint.as_bytes() => {}
+            Some(_) => {
+                return Err(Error::new(
+                    "UNSUPPORTED",
+                    "RDF profile changed; explicit projection/index migration required",
+                ));
+            }
+            None => {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "store RDF profile identity missing",
                 ));
             }
         }
@@ -601,7 +623,10 @@ impl Store {
         let mut chunks = Vec::new();
         let mut records = Vec::new();
         let mut projections = BTreeMap::<String, (Value, u64)>::new();
+        let mut rdf_projections = BTreeMap::<String, (Value, u64)>::new();
+        let mut rdf = rdf_index::RdfWrite::new(&writer.db)?;
         let profile = crate::projection::json_profile()?;
+        let markdown = crate::projection::markdown_profile()?;
         let mut start = 0;
         let boundaries = if ["jsonl", "log"].contains(&format) {
             bytes
@@ -621,8 +646,9 @@ impl Store {
             ));
         }
         for end in boundaries {
+            let digest = hex::encode(blake3::hash(&bytes[start..end]).as_bytes());
+            let mut native_graph = None;
             let projection_id = if ["json", "jsonl"].contains(&format) {
-                let digest = hex::encode(blake3::hash(&bytes[start..end]).as_bytes());
                 let key = format!("projection:json:{}:{digest}", profile.identity().to_hex());
                 if let Some((_, count)) = projections.get_mut(&key) {
                     *count += 1;
@@ -630,7 +656,13 @@ impl Store {
                     let facts = match writer.db.get(&key)? {
                         Some(stored) => parse(&stored)?,
                         None => {
-                            crate::projection::json_facts(&bytes[start..end], &digest, &profile)?
+                            let (facts, graph) = crate::projection::json_facts(
+                                &bytes[start..end],
+                                &digest,
+                                &profile,
+                            )?;
+                            native_graph = Some(graph);
+                            facts
                         }
                     };
                     projections.insert(key.clone(), (facts, 1));
@@ -639,6 +671,61 @@ impl Store {
             } else {
                 String::new()
             };
+            let rdf_projection_id = if !projection_id.is_empty() {
+                format!("rdf-{projection_id}")
+            } else if format == "markdown" {
+                format!(
+                    "rdf-projection:markdown:{}:{digest}",
+                    markdown.contract_id().to_hex()
+                )
+            } else {
+                String::new()
+            };
+            if !rdf_projection_id.is_empty() {
+                if let Some((_, count)) = rdf_projections.get_mut(&rdf_projection_id) {
+                    *count += 1;
+                } else {
+                    let key = format!("rdf:state:{rdf_projection_id}");
+                    let state = match writer.db.get(&key)? {
+                        Some(stored) => parse(&stored)?,
+                        None => {
+                            let result = if format == "markdown" {
+                                crate::projection::markdown_graph(
+                                    &bytes[start..end],
+                                    &digest,
+                                    &markdown,
+                                )
+                            } else {
+                                native_graph.ok_or_else(|| {
+                                    Error::new(
+                                        "STORAGE_FAILURE",
+                                        "existing JSON facts have no required RDF projection state",
+                                    )
+                                })?
+                            };
+                            match result
+                                .and_then(|graph| rdf.graph(&mut batch, &rdf_projection_id, &graph))
+                            {
+                                Ok(()) => Object::new()
+                                    .with("state", "complete")
+                                    .with("graph", rdf_index::graph_iri(&rdf_projection_id))
+                                    .into(),
+                                Err(error)
+                                    if ["RESOURCE_LIMIT", "PROJECTION_FAILURE"]
+                                        .contains(&error.code) =>
+                                {
+                                    Object::new()
+                                        .with("state", "failed")
+                                        .with("diagnostic", error.to_string())
+                                        .into()
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    };
+                    rdf_projections.insert(rdf_projection_id.clone(), (state, 1));
+                }
+            }
             let mut record_chunks = Vec::new();
             for chunk in bytes[start..end].chunks(CHUNK) {
                 let digest = hex::encode(blake3::hash(chunk).as_bytes());
@@ -657,6 +744,7 @@ impl Store {
                 byte_start: start as u64,
                 byte_end: end as u64,
                 projection_id,
+                rdf_projection_id,
                 chunks: record_chunks,
                 evicted: false,
             };
@@ -670,6 +758,14 @@ impl Store {
                 format == "opaque",
             );
             writer.put_text(&mut batch, &record.id, &text)?;
+            let rdf_state = rdf_projections
+                .get(&record.rdf_projection_id)
+                .map(|(state, _)| state);
+            rdf.graph(
+                &mut batch,
+                &record.id,
+                rdf_index::metadata(&record, &digest, rdf_state)?.as_ref(),
+            )?;
             put(&mut batch, &record.id, &record);
             batch.put(
                 format!("time:{now:020}:{}", record.id),
@@ -683,6 +779,33 @@ impl Store {
             *additions.entry(digest.clone()).or_default() += 2;
         }
         let mut new_bytes = 0_u64;
+        for (id, (state, added)) in rdf_projections {
+            let key = format!("rdf:projection-ref:{id}");
+            let previous = writer
+                .db
+                .get(&key)?
+                .map(|v| {
+                    v.as_slice()
+                        .try_into()
+                        .map(u64::from_be_bytes)
+                        .map_err(|_| {
+                            Error::new("STORAGE_FAILURE", "invalid RDF projection counter")
+                        })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            batch.put(
+                key,
+                previous
+                    .checked_add(added)
+                    .ok_or_else(|| {
+                        Error::new("STORAGE_FAILURE", "RDF projection reference overflow")
+                    })?
+                    .to_be_bytes(),
+            );
+            batch.put(format!("rdf:state:{id}"), json::write_compact(&state));
+        }
+        rdf.finish(&mut batch)?;
         for (key, (facts, added)) in projections {
             let ref_key = format!("projection-ref:{key}");
             let previous = writer
@@ -1259,6 +1382,8 @@ impl Store {
         let mut batch = WriteBatch::default();
         let mut removals = BTreeMap::<String, u64>::new();
         let mut projection_removals = BTreeMap::<String, u64>::new();
+        let mut rdf_removals = BTreeMap::<String, u64>::new();
+        let mut rdf = rdf_index::RdfWrite::new(&writer.db)?;
         let mut expired = 0;
         for mut artifact in writer.list::<Artifact>("artifact:")? {
             if !writer.live_artifact(&artifact, now, &protected) && !artifact.chunks.is_empty() {
@@ -1274,8 +1399,17 @@ impl Store {
                 writer.remove_text(&mut batch, &record.id)?;
             }
             if !writer.live_record(&record, now, &protected)
-                && (!record.chunks.is_empty() || !record.projection_id.is_empty())
+                && (!record.chunks.is_empty()
+                    || !record.projection_id.is_empty()
+                    || !record.rdf_projection_id.is_empty()
+                    || writer.db.get(format!("rdf:graph:{}", record.id))?.is_some())
             {
+                rdf.remove(&mut batch, &record.id)?;
+                if !record.rdf_projection_id.is_empty() {
+                    *rdf_removals
+                        .entry(std::mem::take(&mut record.rdf_projection_id))
+                        .or_default() += 1;
+                }
                 for digest in record.chunks.drain(..) {
                     *removals.entry(digest).or_default() += 1;
                 }
@@ -1288,6 +1422,34 @@ impl Store {
                 expired += 1;
             }
         }
+        for (id, removed) in rdf_removals {
+            let key = format!("rdf:projection-ref:{id}");
+            let bytes = writer
+                .db
+                .get(&key)?
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF projection reference missing"))?;
+            let count =
+                u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
+                    Error::new("STORAGE_FAILURE", "invalid RDF projection counter")
+                })?);
+            let remaining = count.checked_sub(removed).ok_or_else(|| {
+                Error::new("STORAGE_FAILURE", "RDF projection reference underflow")
+            })?;
+            if remaining == 0 {
+                let state = writer
+                    .db
+                    .get(format!("rdf:state:{id}"))?
+                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF projection state missing"))?;
+                if read_field::<String>(&parse(&state)?, "state")? == "complete" {
+                    rdf.remove(&mut batch, &id)?;
+                }
+                batch.delete(key);
+                batch.delete(format!("rdf:state:{id}"));
+            } else {
+                batch.put(key, remaining.to_be_bytes());
+            }
+        }
+        rdf.finish(&mut batch)?;
         let cf = writer
             .db
             .cf_handle("payload")
@@ -1391,7 +1553,12 @@ impl Store {
         let unique_chunks = writer.count_prefix("ref:")?;
         Ok(Object::new()
             .with("store_id", writer.id.clone())
-            .with("store_format", "sparrow.store/3")
+            .with(
+                "store_format",
+                std::str::from_utf8(FORMAT)
+                    .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?,
+            )
+            .with("rdf_profile", rdf_index::profile_identity()?)
             .with(
                 "text_analyzer",
                 hex::encode(&writer.config.text_analyzer.fingerprint()),

@@ -3,7 +3,10 @@
 Status: implementation in progress. Helper-census tooling, a RocksDB storage
 foundation, the Cap'n Proto daemon, bounded JSON occurrence discovery and persistent
 native full-text retrieval and bounded acceptance-time record context through
-shared CLI and stdio MCP clients are present.
+shared CLI and stdio MCP clients are present. Native JSON/Markdown content and
+record metadata now persist through a canonical RDF dictionary and six physical
+quad permutations; typed inspection exposes projection state and stream counts.
+The native stored view and governed SPARQL are still required.
 The full server acceptance criteria remain unmet. Current executable surfaces
 and verification are recorded in [Development runtime](development-runtime.md).
 
@@ -248,7 +251,7 @@ different contracts. Broad retrieval never requires loading all retained data.
 
 - Finish qualified completed-file consumption and its crash/identity/unlink
   acceptance cases; connect a production consume watch only after that gate.
-- Complete the remaining milestone-3 SPARQL forms, Markdown projection, graph/text
+- Complete the remaining milestone-3 SPARQL forms, stored-view qualification, graph/text
   integration, explanations, and correlation contracts.
 - Implement milestone-4 syslog, live tailing, rotation/completion, and the separate
   bounded Rust logging client. Verify client retries, flush/shutdown, and gaps.

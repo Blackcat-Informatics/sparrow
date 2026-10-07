@@ -36,6 +36,7 @@ struct Status {
   maxArtifactBytes @10 :UInt64; maxRecordsPerArtifact @11 :UInt64; maxPinMembers @12 :UInt64;
   schemaVersion @13 :UInt32 = 1;
   textAnalyzer @14 :Text; textProfile @15 :Text;
+  rdfProfile @16 :Text;
 }
 struct Ingest {
   requestId @0 :Text; source @1 :Text; format @2 :Format; bytes @3 :Data;
@@ -106,6 +107,13 @@ struct Context {
   receipt @0 :Receipt; anchor @1 :Record; before @2 :ContextSide; after @3 :ContextSide;
   ordering @4 :ContextOrder; continuityUnknown @5 :Bool = true;
 }
+enum ProjectionState { complete @0; failed @1; notApplicable @2; }
+struct RdfInspection {
+  storeId @0 :Text; recordId @1 :Text; membershipAt @2 :Instant;
+  metadataGraph @3 :Text; metadataPrimaryRows @4 :UInt64;
+  state @5 :ProjectionState; contentGraph @6 :OptionalText; diagnostic @7 :OptionalText;
+  primaryRows @8 :UInt64; reifierRows @9 :UInt64; annotationRows @10 :UInt64;
+}
 interface Sparrow {
   status @0 () -> (result :Result(Status));
   ingest @1 (request :Ingest) -> (result :Result(Artifact));
@@ -118,4 +126,5 @@ interface Sparrow {
   valuesSearch @8 (query :ValueQuery) -> (result :Result(Values));
   textSearch @9 (query :TextQuery) -> (result :Result(TextResults));
   recordsContext @10 (query :ContextQuery) -> (result :Result(Context));
+  rdfInspect @11 (record :RecordRef) -> (result :Result(RdfInspection));
 }

@@ -10,6 +10,7 @@ mod storage;
 mod text;
 
 pub use instant::{format_instant, parse_instant};
+pub use projection::json_profile as json_projection_profile;
 pub use query::{JsonQuery, QueryScope};
 pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::{Artifact, Config, Error, Pin, Record, Store};

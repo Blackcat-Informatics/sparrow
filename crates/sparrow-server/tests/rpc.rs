@@ -563,7 +563,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     .await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 11);
+    assert_eq!(definitions.len(), 12);
     assert!(
         !definitions
             .iter()
@@ -583,6 +583,45 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
             .with("arguments", arguments)
             .into()
     };
+    let rdf = mcp
+        .call(
+            21,
+            "tools/call",
+            query(
+                "rdf_inspect",
+                Object::new()
+                    .with("store_id", store)
+                    .with("id", record)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(rdf["result"]["isError"].as_bool(), Some(false));
+    let rdf = &rdf["result"]["structuredContent"];
+    let cli_rdf = cli(socket, &["rdf", store, record]);
+    for field in [
+        "store_id",
+        "record_id",
+        "state",
+        "metadata_graph",
+        "content_graph",
+        "primary_rows",
+        "reifier_rows",
+        "annotation_rows",
+        "metadata_primary_rows",
+        "diagnostic",
+    ] {
+        assert_eq!(rdf[field], cli_rdf[field]);
+    }
+    assert_eq!(rdf["state"].as_str(), Some("complete"));
+    assert!(
+        rdf["primary_rows"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 20
+    );
     let context = mcp
         .call(
             17,
@@ -858,7 +897,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(3)
+        Some(4)
     );
     let unknown = mcp
         .call(
