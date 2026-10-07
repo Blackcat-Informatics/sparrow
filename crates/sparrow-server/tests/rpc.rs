@@ -162,6 +162,153 @@ fn relay(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting() {
+    use sparrow_client::FieldValue;
+    use tracing_subscriber::prelude::*;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let daemon = start(&config, &socket).await;
+            let backend = connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("relay.sock");
+            let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+            state.drop_first.set(false);
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "tracing-layer");
+            config.flush_interval = Duration::from_secs(60);
+            let delivery = sparrow_client::Delivery::start(config).unwrap();
+            let subscriber = tracing_subscriber::registry()
+                .with(sparrow_client::TracingLayer::new(delivery.clone()));
+            // Separate callback invocations to exercise capture rather than intentionally
+            // contending the worker queue. The fence still audits every refused offer.
+            let settle = || std::thread::sleep(Duration::from_millis(10));
+            settle();
+            tracing::subscriber::with_default(subscriber, || {
+                let root = tracing::info_span!(parent: None, "root", version = 1_u64);
+                settle();
+                let entered = root.enter();
+                settle();
+                let child = tracing::info_span!("child", work = "before");
+                settle();
+                child.follows_from(&root);
+                settle();
+                let child_entered = child.enter();
+                settle();
+                child.record("work", "after");
+                settle();
+                let error = std::io::Error::other("captured error");
+                let error: &(dyn std::error::Error + 'static) = &error;
+                let binary: &[u8] = &[0, 255];
+                for _ in 0..3 {
+                    tracing::warn!(target: "typed.capture", signed = -4_i64, unsigned = u64::MAX,
+                    wide_signed = i128::MIN, wide_unsigned = u128::MAX, flag = true,
+                    float = f64::from_bits(0x7ff8000000000042), text = "native text",
+                    binary, error, debug = ?vec![1, 2], "typed tracing observation");
+                    settle();
+                }
+                tracing::info!(parent: None, explicit_root = true);
+                settle();
+                drop(child_entered);
+                settle();
+                drop(child);
+                settle();
+                drop(entered);
+                settle();
+                drop(root);
+                settle();
+            });
+            let watermark =
+                reached_delivery(delivery_barrier(&delivery, true, Duration::from_secs(5)).await);
+            let stats = delivery.stats().unwrap();
+            assert_eq!(
+                stats.offered_events,
+                watermark.durable_events + watermark.dropped_before_fence
+            );
+            {
+                let calls = state.calls.borrow();
+                let events: Vec<_> = calls.iter().flat_map(|batch| &batch.events).collect();
+                assert_eq!(events.len() as u64, watermark.durable_events);
+                let typed = events
+                    .iter()
+                    .find(|event| event.target == "typed.capture")
+                    .expect("captured typed event");
+                assert_eq!(typed.kind, wire::EventKind::Log);
+                assert_eq!(typed.level, wire::EventLevel::Warn);
+                assert!(typed.event_time > 0);
+                let value = |name: &str| {
+                    &typed
+                        .fields
+                        .iter()
+                        .find(|field| field.name == name)
+                        .unwrap()
+                        .value
+                };
+                assert_eq!(value("signed"), &FieldValue::Signed(-4));
+                assert_eq!(value("unsigned"), &FieldValue::Unsigned(u64::MAX));
+                assert_eq!(value("wide_signed"), &FieldValue::Signed128(i128::MIN));
+                assert_eq!(value("wide_unsigned"), &FieldValue::Unsigned128(u128::MAX));
+                assert_eq!(value("flag"), &FieldValue::Boolean(true));
+                assert_eq!(value("float"), &FieldValue::Float64Bits(0x7ff8000000000042));
+                assert_eq!(value("text"), &FieldValue::Text("native text".into()));
+                assert_eq!(value("binary"), &FieldValue::Bytes(vec![0, 255]));
+                assert_eq!(value("error"), &FieldValue::Error("captured error".into()));
+                assert_eq!(value("debug"), &FieldValue::Debug("[1, 2]".into()));
+                assert_eq!(typed.context.len(), 2);
+                assert_eq!(typed.context[0].name, "root");
+                assert_eq!(typed.context[1].name, "child");
+                assert_eq!(typed.context[1].parent, Some(typed.context[0].id));
+                assert_eq!(typed.span, Some(typed.context[1].id));
+                assert_eq!(
+                    typed.context[1].fields[0].value,
+                    FieldValue::Text("after".into())
+                );
+                let root_event = events
+                    .iter()
+                    .find(|event| {
+                        event
+                            .fields
+                            .iter()
+                            .any(|field| field.name == "explicit_root")
+                    })
+                    .unwrap();
+                assert!(root_event.context.is_empty());
+                assert!(root_event.span.is_none());
+                for kind in [
+                    wire::EventKind::SpanNew,
+                    wire::EventKind::SpanRecord,
+                    wire::EventKind::SpanEnter,
+                    wire::EventKind::SpanExit,
+                    wire::EventKind::SpanClose,
+                    wire::EventKind::SpanFollowsFrom,
+                ] {
+                    assert!(
+                        events.iter().any(|event| event.kind == kind),
+                        "missing lifecycle {kind:?}"
+                    );
+                }
+            }
+            let response = backend
+                .client
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
+                watermark.durable_events
+            );
+            proxy.abort();
+            assert!(proxy.await.unwrap_err().is_cancelled());
+            drop(backend);
+            drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
     tokio::task::LocalSet::new()
         .run_until(async {

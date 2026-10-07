@@ -11,8 +11,9 @@ explicit event-time intervals, combined same-record field/text searches,
 persistent native full-text retrieval, bounded
 record context, durable stable-ID pin renewal and paginated pin discovery,
 persistent native JSON/Markdown RDF dictionaries and six-way
-quad indexes, and helper-census tooling are implemented. Stored-view SPARQL,
-the logging client and
+quad indexes, a standalone typed producer client with bounded delivery and a
+composable tracing layer, and helper-census tooling are implemented. Stored-view SPARQL,
+server-wide buffered/flush controls, ingestion watchers/syslog and
 full architecture acceptance
 remain unfinished. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.

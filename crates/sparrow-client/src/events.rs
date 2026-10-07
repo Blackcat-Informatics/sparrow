@@ -285,13 +285,27 @@ impl ProducerEvent {
         measure_fields(&self.fields, self.fields.capacity(), &mut budget)?;
         budget.context(self.context.capacity())?;
         for span in &self.context {
-            owned_text(&span.name, &mut budget)?;
-            owned_text(&span.target, &mut budget)?;
-            measure_fields(&span.fields, span.fields.capacity(), &mut budget)?;
+            measure_span(span, &mut budget)?;
         }
         relationships(self)?;
         Ok(budget.used())
     }
+}
+
+impl EventSpan {
+    /// Conservative owned snapshot charge, including one context entry.
+    pub fn admission_bytes(&self) -> Result<usize, Error> {
+        let mut budget = Budget::new(MAX_EVENT_BYTES);
+        budget.context(1)?;
+        measure_span(self, &mut budget)?;
+        Ok(budget.used())
+    }
+}
+
+fn measure_span(span: &EventSpan, budget: &mut Budget) -> Result<(), Error> {
+    owned_text(&span.name, budget)?;
+    owned_text(&span.target, budget)?;
+    measure_fields(&span.fields, span.fields.capacity(), budget)
 }
 
 fn owned_text(value: &String, budget: &mut Budget) -> Result<(), Error> {

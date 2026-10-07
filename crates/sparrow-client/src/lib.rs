@@ -39,9 +39,11 @@ pub use events::{
     MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
 };
 mod delivery;
+mod logging;
 pub use delivery::{
     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
 };
+pub use logging::TracingLayer;
 
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
@@ -49,6 +51,16 @@ pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 pub const SCHEMA_VERSION: u32 = 11;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Read UTC Unix milliseconds without inventing a value for an invalid clock.
+pub fn unix_millis_now() -> Result<u64, Error> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Protocol("system clock precedes Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| Error::Protocol("system clock exceeds Unix millisecond range"))
+}
 
 /// Encode a generated optional-value union through its typed variant setters.
 /// The builder moves to exactly one branch; field types remain statically checked.

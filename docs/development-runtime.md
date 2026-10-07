@@ -52,10 +52,10 @@ the crate documentation is compiled as a doctest.
 
 The direct artifact/event-batch client and bounded `Delivery` worker are present.
 The worker reconnects with immutable pending requests and returns durable
-admitted-input fences through flush/shutdown. `tracing_subscriber::Layer`, its
-span callbacks/field visitor, explicit buffered server acknowledgments and the
-shared server WAL flush contract remain required work. Full server acceptance
-remains unmet.
+admitted-input fences through flush/shutdown. The composable `TracingLayer` now
+captures bounded typed fields and span callbacks through that same worker.
+Explicit buffered server acknowledgments and the shared server WAL flush
+contract remain required work. Full server acceptance remains unmet.
 
 ### Schema 11: typed producer event batches
 
@@ -96,8 +96,8 @@ Release acceptance verifies all field variants, repeated names, escaped text,
 span context, exact timestamp evidence spans, temporal/text retrieval, unchanged
 receipts after restart, changed NaN-payload conflict, and oversized/invalid input
 refusal. The `Delivery` worker below supplies automatic batching/reconnection,
-drop counters and durable admitted-input fences. Tracing callbacks, explicit
-buffered server writes and their WAL flush contract remain unfinished.
+drop counters and durable admitted-input fences. Tracing callbacks are implemented
+below; explicit buffered server writes and their WAL flush contract remain unfinished.
 
 The owned development daemon was replaced with this qualified schema-11 build
 on 2026-10-07. It retained store
@@ -118,7 +118,8 @@ target/release/examples/events /home/paudley/.local/state/sparrow/development-v5
 
 The example takes an explicit instance identity and timestamp so a retry can
 reproduce the same input. A new producer process must choose a fresh instance
-for new observations; the example is not the unfinished tracing logging layer.
+for new observations; this direct event example remains separate from the
+application tracing example below.
 
 ### Bounded producer delivery worker
 
@@ -130,7 +131,7 @@ visible drop counters. A full-queue refusal can leave an explicit sequence gap;
 refusals before sequence assignment remain visible through counters. Event
 admission also charges unused string/vector capacity, preventing a tiny value
 from retaining an oversized allocation. Caller-owned inputs must already be
-constructed; the future tracing visitor still needs bounded capture formatting.
+constructed; the tracing layer below bounds capture before queue admission.
 
 Defaults are 1024 queued/in-flight events, 4 MiB conservative event charge,
 128 events/512 KiB per batch, two-second intended batching, five-second RPC
@@ -199,6 +200,61 @@ CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server
 target/release/sparrowd --config config/development.toml
 target/release/sparrow /home/paudley/.local/state/sparrow/development-v5/rpc.sock status
 ```
+
+### Composable Rust tracing capture
+
+The standalone client now provides `TracingLayer::new(delivery.clone())` for
+application-owned `Registry`/`LookupSpan` subscriber composition. It installs no
+global subscriber. All callbacks feed the existing delivery worker and its
+immutable retry identities; no second transport, queue or worker is introduced.
+Use the production example with a synthetic source:
+
+```sh
+cargo run --locked --release -p sparrow-client --example tracing -- \
+  /home/paudley/.local/state/sparrow/development-v5/rpc.sock acceptance-tracing-layer
+```
+
+Capture preserves all shared primitive field types, including exact float bits,
+binary and 128-bit integers. Debug/error formatting has explicit wire variants.
+Span new/update/enter/exit/close/follows-from observations include bounded
+root-to-subject snapshots, explicit parent bindings and the latest valid fields.
+At most 1024 live snapshots are retained, each conservatively charged at 16 KiB;
+text/binary/debug/error values refuse above 4 KiB, fields above 128 or 16 KiB,
+and context above 32 spans or the shared 64 KiB event admission bound. The layer
+walks ancestry leaf-first and charges before cloning to avoid unbounded scope
+collection. Closed spans release owned snapshots and admission slots.
+
+Capture failure increments the shared Invalid drop counter, including invalid
+clock, unavailable context, formatting/field bounds and span state contention.
+A failed span update invalidates future context capture rather than emitting
+stale fields. Drops remain explicit errors at flush/shutdown. Subscribers that
+remap span IDs are refused visibly. User formatters and the application's own
+subscriber internals are outside the layer's allocation/computation control.
+
+The real-daemon scenario exercises all wire field variants, nested/explicit-root
+context, updated fields, all lifecycle kinds and store occurrence counts against
+the admitted/drop fence. Client scenarios exercise sticky formatting refusal,
+failed-update invalidation, reclamation of the 1024-span admission capacity and
+unique producer identities across independent subscriber registries sharing one
+worker. Direct typed span producers sharing it use `Delivery::next_span_id` too.
+These checks do not establish sustained throughput or process RSS. Server-wide
+buffered/WAL-flush controls and normalized diagnostic RDF relationships remain
+unfinished.
+
+The full release-profile `make check` passed: eight client unit tests, 56 core
+storage scenarios, eight real-daemon/MCP scenarios, the other workspace checks,
+Clippy with warnings denied and the seeded/pinned helper census. All 59 ledger
+jobs hold with zero distinct exceptions or unsanctioned isomorphic groups.
+
+Live application-example acceptance on the existing schema-11 development
+daemon delivered five durable observations with zero drops, producer instance
+`00e9e0542ab8704de7917857bac03658`, artifact
+`artifact:b9131864191c576a5782ef44d7b9cc9e` (2014 bytes). Native text search for
+`structured`, field value `/fields/1/value` of kind `true`, and the producer-time
+interval `[2026-10-07T16:42:42.365Z, 2026-10-07T16:42:42.366Z)` each recovered log
+record `record:d04d979eee5329d44da61b9f138c5ca5`, with original field-byte evidence
+and zero unknown time or failed text coverage. The daemon remained at the same
+store identity and private socket; no sibling producer or service was changed.
 
 ## CLI investigations
 

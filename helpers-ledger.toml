@@ -1,6 +1,90 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 # SPDX-License-Identifier: AGPL-3.0-only
 
+[[job]]
+id = "producer-span-identity"
+summary = "Allocate nonzero monotonically increasing span identities within one delivery instance, shared across subscribers and direct typed producers."
+home = "sparrow_client::delivery::Delivery::next_span_id"
+entry_points = []
+spec = "docs/interfaces.md: producer span identity binding."
+vectors = ["crates/sparrow-client/src/logging.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(allocate_tracing_span_id|allocate_direct_span_id)$']
+
+[[job]]
+id = "producer-tracing-field-admission"
+summary = "One typed visitor owner applies field-count and captured-byte bounds before admitting owned fields."
+home = "sparrow_client::logging::Fields::push"
+entry_points = []
+spec = "docs/interfaces.md: bounded Rust field capture."
+vectors = ["crates/sparrow-client/src/logging.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(record_logger_field|record_direct_logger_field)$']
+
+[[job]]
+id = "producer-tracing-capture"
+summary = "Compose typed event and span callbacks through the existing bounded producer worker, without global subscriber installation."
+home = "sparrow_client::logging::TracingLayer::observation"
+entry_points = []
+spec = "docs/interfaces.md: Rust client and logging integration."
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-client/src/logging.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(capture_direct_tracing_event|capture_alternate_span_context)$']
+
+[[job]]
+id = "producer-span-charge"
+summary = "Price owned span snapshots once for event admission and bounded tracing state."
+home = "sparrow_client::events::measure_span"
+entry_points = ["sparrow_client::events::EventSpan::admission_bytes"]
+spec = "docs/interfaces.md: bounded producer context."
+vectors = ["crates/sparrow-client/src/logging.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(price_tracing_span|price_direct_span)$']
+
+[[job]]
+id = "producer-bounded-field-rendering"
+summary = "Render only debug/error fields through a bounded sticky-refusal formatter; primitive fields retain wire types."
+home = "sparrow_client::logging::render"
+entry_points = []
+spec = "docs/interfaces.md: bounded Rust field capture."
+vectors = ["crates/sparrow-client/src/logging.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(format_tracing_debug_field|format_tracing_error_field)$']
+
+[[job]]
+id = "producer-acceptance-clock"
+summary = "Share checked UTC Unix milliseconds between producer capture and daemon receipt time."
+home = "sparrow_client::unix_millis_now"
+entry_points = ["sparrow_server::rpc::now"]
+spec = "docs/interfaces.md: typed Instant."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(tracing_now_millis|daemon_now_millis)$']
+
 # The helpers ledger: one row per job — a piece of functionality the workspace
 # implements exactly once — naming its single home and the sanctioned second
 # implementations. Read by crates/sparrow-helper-census (`make census`;

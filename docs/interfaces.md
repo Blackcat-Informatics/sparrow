@@ -426,6 +426,36 @@ facade can compose through tracing. A persistent client spool is a later
 extension; the initial layer does not promise survival of producer-process loss.
 The layer follows the public [tracing subscriber layer contract](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/index.html).
 
+`sparrow_client::TracingLayer::new(delivery.clone())` now composes through
+`SubscriberExt::with`; it never sets a global subscriber. One Sparrow layer per
+subscriber uses bounded extension snapshots (1024 live spans, 16 KiB conservative
+charge per snapshot). Text/binary field capture and debug/error rendering each
+refuse values over 4 KiB; ordered field capture refuses over 128 fields or 16 KiB
+of captured field charge. Context traversal stops at 32 spans and checks byte
+admission before cloning each ancestor. Refusal drops the complete observation,
+increments the delivery counters, and makes a later flush return an explicit
+drop watermark. Oversized or contended span updates invalidate the snapshot;
+subsequent context capture refuses rather than emitting stale values.
+
+Primitive visitors preserve signed/unsigned 64/128-bit values, booleans, strings,
+bytes and exact float bits. Debug/error renderings are distinct wire variants.
+Span creation, updates, enter/exit, close and follows-from are typed observations;
+explicit root/parent bindings use the subscriber's declared context. Subscribers
+sharing a worker allocate span identities through `Delivery::next_span_id`, so
+independent registries cannot collide within the producer instance. Direct typed
+span producers sharing that instance must use the same allocator. Subscribers
+that remap cloned span IDs are refused visibly rather than silently rewriting
+identities. The normal Registry preserves IDs. Application formatters and the
+subscriber's own bookkeeping remain application-controlled; the layer bounds its
+own buffers and uses nonblocking access to its snapshot and delivery state.
+The canonical event source currently carries span relationships; a separately
+normalized diagnostic RDF relationship view remains unfinished.
+
+Run `cargo run --release -p sparrow-client --example tracing -- SOCKET SOURCE`
+for application-owned scoped subscriber composition and an explicit durable
+shutdown. The worker and its queue/receipt/retry implementation are shared with
+direct producer events. Server-wide buffered/flush controls remain unfinished.
+
 ## 8. Errors and compatibility
 
 Typed errors carry `code`, a concise `message`, `retryable`, `request_id` when

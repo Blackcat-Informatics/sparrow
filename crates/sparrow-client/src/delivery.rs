@@ -244,6 +244,7 @@ struct Shared {
     abort_wake: tokio::sync::Notify,
     owners: AtomicUsize,
     offered: AtomicU64,
+    spans: AtomicU64,
     drops: [AtomicU64; 6],
     exhausted: AtomicBool,
     aborted: AtomicBool,
@@ -312,6 +313,7 @@ impl Delivery {
             abort_wake: tokio::sync::Notify::new(),
             owners: AtomicUsize::new(1),
             offered: AtomicU64::new(0),
+            spans: AtomicU64::new(0),
             drops: std::array::from_fn(|_| AtomicU64::new(0)),
             exhausted: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
@@ -382,6 +384,33 @@ impl Delivery {
         drop(state);
         shared.wake.notify_one();
         Admission::Queued { sequence }
+    }
+
+    /// Account for an observation refused before an event could be constructed.
+    /// Capture adapters use this same drop accounting and durable fence law.
+    pub(crate) fn capture_failed(&self) {
+        if self.shared.bump(&self.shared.offered) {
+            self.shared.reject(DropReason::Invalid, None);
+        } else {
+            self.shared.reject(DropReason::CounterExhausted, None);
+        }
+    }
+
+    /// Allocate a span identity unique within this producer instance.
+    /// Direct typed span producers and tracing layers sharing a worker use this
+    /// allocator rather than assuming independent subscriber IDs are unique.
+    pub fn next_span_id(&self) -> Result<u64, Error> {
+        self.shared
+            .spans
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(1)
+            })
+            .map(|value| value + 1)
+            .map_err(|_| {
+                self.shared.exhausted.store(true, Ordering::SeqCst);
+                self.shared.wake.notify_one();
+                Error::Protocol("producer span identity counter exhausted")
+            })
     }
 
     /// Capture visible bounded delivery diagnostics.

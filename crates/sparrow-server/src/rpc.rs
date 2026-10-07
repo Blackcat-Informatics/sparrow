@@ -9,11 +9,7 @@ use sparrow_core::{
     Artifact, Error, JsonQuery, Pin, PinPageBody, PinRead, PinSelector, PinSummary, QueryScope,
     Record, Store,
 };
-use std::{
-    rc::Rc,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{rc::Rc, sync::Arc};
 use tokio::sync::Semaphore;
 mod events;
 
@@ -26,12 +22,7 @@ fn invalid(error: impl std::fmt::Display) -> Error {
 
 /// Read the server's millisecond acceptance clock.
 pub fn now() -> Result<u64, Error> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(invalid)?
-        .as_millis()
-        .try_into()
-        .map_err(invalid)
+    sparrow_client::unix_millis_now().map_err(invalid)
 }
 
 /// Shared storage owner exposed through the generated RPC capability.

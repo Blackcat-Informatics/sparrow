@@ -18,6 +18,8 @@ purrdf = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "e58974
 purrdf-hash = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "e58974e504b9681597faea1490002ce8ddaf7448" }
 purrdf-lex = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "e58974e504b9681597faea1490002ce8ddaf7448" }
 getrandom = "0.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 capnp = "0.27"
 capnp-rpc = "0.27"
 capnpc = "0.27"
