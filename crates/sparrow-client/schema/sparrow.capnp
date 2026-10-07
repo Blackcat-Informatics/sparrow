@@ -82,10 +82,11 @@ struct Status {
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; }
-enum EvictionFrontier { exhausted @0; recordLimit @1; scanBudget @2; payloadBudget @3; }
+enum EvictionFrontier { exhausted @0; recordLimit @1; scanBudget @2; payloadBudget @3; catalogBudget @4; }
 struct EvictionPass {
   records @0 :UInt32; artifacts @1 :UInt32; visited @2 :UInt32; protected @3 :UInt32;
   payloadRefs @4 :UInt32; pendingManifestRefs @5 :UInt64; frontier @6 :EvictionFrontier;
+  continuation @7 :Bool;
 }
 struct PressurePass { union { absent @0 :Void; present @1 :EvictionPass; } }
 struct PressureStatus {

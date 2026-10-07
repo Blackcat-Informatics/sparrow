@@ -597,6 +597,14 @@ not assert physical space freed. Writes are retried with their original request
 identity and their own full physical admission check. A batch larger than the
 entire data allowance is a `RESOURCE_LIMIT`, rather than a reclamation request.
 
+Schema 18 extends the last logical pass with `catalogBudget` and `continuation`.
+The session-local traversal resumes after complete scan/catalog prefixes and
+restarts when effective pin protection changes or earlier time-index evidence
+is published. Each pass revalidates active pins. Parent manifest cleanup resumes
+at its unfinished ownership; hard failures leave the position unchanged.
+Exhausted traversal is reused only while protection and publication remain
+unchanged. Continuation and retirement counts do not certify physical recovery.
+
 `Ingest.durability` and `eventsIngest`'s durability argument default to `durable`.
 Buffered mode publishes the same atomic catalog/payload/index batch with WAL
 enabled, without promising synchronization. Its artifact receipt carries

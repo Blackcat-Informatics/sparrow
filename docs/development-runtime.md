@@ -11,16 +11,16 @@ owner. Complete source retry receipts retain their original occurrence identity
 and do not resurrect evicted bytes.
 
 Each pass limits newly evicted records, time and pin visits, payload ownership
-removals, conservative catalog capture and atomic write bytes. Capture or batch
-refusal commits nothing. Records retire completely; parent manifest ownership
+removals, conservative catalog capture and atomic write bytes. Hard capture or batch
+refusal commits nothing; a catalog-budget frontier can commit complete retirement
+units preceding that boundary. Records retire completely; parent manifest ownership
 can be drained over subsequent passes without making a surviving subset
 downloadable as a complete file. Reports expose visited/protected counts,
 remaining touched-parent manifest references and an explicit traversal frontier.
 Logical reference retirement does not certify physical bytes freed or peak RSS.
 
-The daemon now invokes this primitive through the schema 17 pressure worker
-below. Continuation past a protected prefix larger than the scan budget,
-recordless-artifact eviction, bounded expiry, forced native compaction and
+The daemon now invokes this primitive through the pressure worker below.
+Recordless-artifact eviction, bounded expiry, forced native compaction and
 sustained physical reclamation qualification remain unfinished.
 
 Temporary-store scenarios cover native RDF/JSON/text and exact-byte survival for
@@ -32,8 +32,48 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 17; the schema sections
+The current source implements schema 18; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 18 bounded eviction traversal
+
+Eviction retains one session-local position shared by manual core calls and the
+daemon's pressure worker. Scan and catalog budgets advance past a complete safe
+prefix. A partial parent manifest resumes at the same retired record until its
+remaining ownership is drained. Hard storage failures and atomic batch admission
+refusal leave the position unchanged. A single required catalog entry that cannot
+fit still fails explicitly; it is never skipped to retire younger evidence.
+
+Every pass captures current active pin membership through the existing pin
+owner. Changed effective membership, including release and expiry, restarts at
+the oldest entry. Renewal preserving the same protection continues the existing
+position. Successful time-index publication is observed through RocksDB's native
+borrowed write-batch visitor, without decoding a second batch format or copying
+payload bodies. An insertion at or before the current position restarts traversal,
+so a backwards receipt-clock step cannot hide newly accepted older evidence.
+Publication after an exhausted traversal supplies the next candidate directly;
+unchanged exhaustion does not repeatedly scan the same protected corpus.
+
+The cursor holds a bounded time key and at most one admitted pin-membership set.
+Each current capture remains independently admitted; retained and fresh membership
+shapes are each limited by the 32 MiB conservative catalog allowance. This is
+internal shape accounting, not a measured RSS guarantee. Reopening discards this
+position safely and starts a fresh chronological pass.
+
+Schema 18 exposes a `catalogBudget` logical frontier and a `continuation` boolean
+in the typed last-pass report. The pressure worker stays requested when a safe
+scan prefix remains, rather than declaring the corpus blocked at its first page.
+Physical recovery still gates additional destructive passes after retirement.
+The CLI and stdio MCP use the same generated contract and pressure renderer.
+
+Qualification covers pressure progress through a twelve-record protected prefix
+with a two-entry scan budget and renewal between passes; release/expiry exposing
+an older record; earlier publication; publication after exhaustion; bounded
+catalog continuation; native default-family batch observation and invalid-key
+refusal; and typed catalog-frontier rendering. The full gate passed with 79
+storage scenarios, six core units, two server units, 24 RPC/daemon/MCP scenarios,
+all other workspace tests and 123 helper ownership jobs with no distinct
+exceptions or unsanctioned duplicate groups.
 
 ## Schema 17 pressure maintenance
 

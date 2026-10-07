@@ -8,6 +8,200 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn pressure_continues_past_a_protected_prefix_without_restarting_after_renewal() {
+    use sparrow_core::{EvictionFrontier, EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let input = b"pinned\n".repeat(12);
+    let old = store
+        .ingest("prefix-old", "source", "log", &input, 1)
+        .unwrap();
+    let candidate = store
+        .ingest("prefix-candidate", "source", "log", b"eligible\n", 2)
+        .unwrap();
+    let pin = store
+        .pin("prefix-pin", "case", std::slice::from_ref(&old.id), 1, 3)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("test-owned-prefix-ballast"),
+        vec![0_u8; 13 * 1024 * 1024],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .ingest("prefix-refused", "source", "log", b"later\n", 4)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    let limits = EvictionLimits {
+        scan_budget: 2,
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    for page in 0..6 {
+        let state = store.pressure_maintain(5, limits).unwrap();
+        assert_eq!(state.phase, PressurePhase::Requested);
+        let report = state.last_pass.unwrap();
+        assert_eq!(report.frontier, EvictionFrontier::ScanBudget);
+        assert!(report.continuation);
+        assert_eq!(report.protected, 2);
+        assert!(report.records.is_empty());
+        if page == 0 {
+            store
+                .renew_pin("prefix-renew", &pin.id, 40, None, 5)
+                .unwrap();
+        }
+    }
+    let state = store.pressure_maintain(6, limits).unwrap();
+    assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!(state.evicted_records, 1);
+    assert_eq!(state.last_pass.unwrap().records, candidate.record_ids);
+    assert_eq!(store.bytes(&old.id, 0, input.len(), 6).unwrap(), input);
+}
+
+#[test]
+fn eviction_restarts_when_pin_release_or_expiry_exposes_an_older_record() {
+    use sparrow_core::EvictionLimits;
+    for release in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let old = store
+            .ingest("changed-old", "source", "log", b"old\n", 1)
+            .unwrap();
+        let middle = store
+            .ingest("changed-middle", "source", "log", b"middle\n", 2)
+            .unwrap();
+        let later = store
+            .ingest("changed-later", "source", "log", b"later\n", 3)
+            .unwrap();
+        let pin = store
+            .pin("changed-pin", "case", &[old.id.clone(), middle.id], 1, 4)
+            .unwrap();
+        let limits = EvictionLimits {
+            scan_budget: 1,
+            max_records: 1,
+            ..EvictionLimits::default()
+        };
+        let first = store.evict_oldest(5, limits).unwrap();
+        assert!(first.records.is_empty());
+        assert!(first.continuation);
+        let now = if release {
+            store.release(&pin.id).unwrap();
+            6
+        } else {
+            DAY + 4
+        };
+        let resumed = store.evict_oldest(now, limits).unwrap();
+        assert_eq!(resumed.records, old.record_ids);
+        assert_eq!(store.bytes(&later.id, 0, 6, now).unwrap(), b"later\n");
+    }
+}
+
+#[test]
+fn earlier_publication_restarts_eviction_and_exhaustion_accepts_new_candidates() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let old = store
+        .ingest("insert-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    let middle = store
+        .ingest("insert-middle", "source", "log", b"middle\n", 3)
+        .unwrap();
+    let later = store
+        .ingest("insert-later", "source", "log", b"later\n", 4)
+        .unwrap();
+    store
+        .pin("insert-pin", "case", &[old.id.clone(), middle.id], 40, 5)
+        .unwrap();
+    let limits = EvictionLimits {
+        scan_budget: 2,
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    assert_eq!(store.evict_oldest(6, limits).unwrap().protected, 2);
+    // Server receipt clocks may move backwards; a new earlier key cannot be skipped.
+    let inserted = store
+        .ingest("insert-earlier", "source", "log", b"inserted\n", 2)
+        .unwrap();
+    assert_eq!(
+        store.evict_oldest(6, limits).unwrap().records,
+        inserted.record_ids
+    );
+    assert_eq!(store.bytes(&later.id, 0, 6, 6).unwrap(), b"later\n");
+    assert_eq!(
+        store
+            .evict_oldest(6, EvictionLimits::default())
+            .unwrap()
+            .records,
+        later.record_ids
+    );
+    assert_eq!(store.evict_oldest(6, limits).unwrap().visited, 0);
+    let appended = store
+        .ingest("insert-after-exhaustion", "source", "log", b"appended\n", 7)
+        .unwrap();
+    let last = store
+        .evict_oldest(
+            8,
+            EvictionLimits {
+                scan_budget: 1,
+                ..limits
+            },
+        )
+        .unwrap();
+    assert_eq!(last.records, appended.record_ids);
+    assert_eq!(last.visited, 1);
+    assert_eq!(store.bytes(&old.id, 0, 4, 8).unwrap(), b"old\n");
+}
+
+#[test]
+fn catalog_frontiers_resume_a_complete_prefix_without_skipping_admission_failures() {
+    use sparrow_core::{EvictionFrontier, EvictionLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let old = store
+        .ingest(
+            "catalog-prefix",
+            "source",
+            "log",
+            &b"pinned\n".repeat(20),
+            1,
+        )
+        .unwrap();
+    let later = store
+        .ingest("catalog-later", "source", "log", b"later\n", 2)
+        .unwrap();
+    store
+        .pin("catalog-pin", "case", std::slice::from_ref(&old.id), 40, 3)
+        .unwrap();
+    let limits = EvictionLimits {
+        max_catalog_bytes: 128 * 1024,
+        ..EvictionLimits::default()
+    };
+    let first = store.evict_oldest(4, limits).unwrap();
+    assert_eq!(first.frontier, EvictionFrontier::CatalogBudget);
+    assert!(first.continuation);
+    assert!(first.records.is_empty());
+    let mut found = false;
+    for _ in 0..20 {
+        let report = store.evict_oldest(4, limits).unwrap();
+        if report.records == later.record_ids {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "bounded catalog traversal did not reach the eligible occurrence"
+    );
+    assert_eq!(store.bytes(&old.id, 0, 7, 4).unwrap(), b"pinned\n");
+}
+
+#[test]
 fn pressure_admission_drives_bounded_retirement_and_waits_for_physical_capacity() {
     use sparrow_core::{EvictionLimits, PressurePhase};
     let dir = tempfile::tempdir().unwrap();

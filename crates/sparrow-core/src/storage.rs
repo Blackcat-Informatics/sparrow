@@ -307,6 +307,7 @@ struct Writer {
     config: Config,
     durability: std::cell::RefCell<durability::State>,
     pressure: std::cell::RefCell<pressure::State>,
+    eviction: std::cell::RefCell<eviction::Cursor>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -570,6 +571,12 @@ impl Writer {
     ) -> Result<Record, Error> {
         let id = std::str::from_utf8(value)
             .map_err(|e| Error::new("STORAGE_FAILURE", format!("invalid time index: {e}")))?;
+        if !id.starts_with("record:") || id.len() <= "record:".len() || id.len() > 128 {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "time index requires a bounded record identity",
+            ));
+        }
         let record: Record = self.get_limited(id, remaining).map_err(|error| {
             if error.code == "NOT_FOUND" {
                 Error::new("STORAGE_FAILURE", "time index references a missing record")
@@ -862,6 +869,7 @@ impl Store {
                 config,
                 durability,
                 pressure: std::cell::RefCell::new(pressure::State::default()),
+                eviction: std::cell::RefCell::new(eviction::Cursor::default()),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
         })

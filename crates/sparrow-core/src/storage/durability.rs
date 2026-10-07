@@ -150,11 +150,17 @@ impl Writer {
             return Ok(());
         }
         let mut options = WriteOptions::default();
+        let mut publication = super::eviction::Publication::default();
+        batch.iterate_cf(&mut publication);
+        publication.check()?;
         options.disable_wal(false);
         options.set_sync(buffered_id.is_none());
         if let Err(error) = self.db.write_opt(batch, &options) {
             self.durability.borrow_mut().failure = Some(error.to_string());
             return Err(error.into());
+        }
+        if let Some(earliest) = publication.earliest {
+            self.eviction.borrow_mut().published(&earliest);
         }
         let sequence = self.db.latest_sequence_number();
         let mut state = self.durability.borrow_mut();

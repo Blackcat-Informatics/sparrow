@@ -119,6 +119,7 @@ impl Writer {
             state.status.phase = PressurePhase::Ready;
             state.status.failure = None;
             state.awaiting_physical = None;
+            self.eviction.borrow_mut().reset();
             return Ok(state.status.clone());
         }
         state.status.pending_flushes = 0;
@@ -165,6 +166,7 @@ impl Writer {
             .saturating_add(report.payload_refs as u64);
         let changed =
             !report.records.is_empty() || !report.artifacts.is_empty() || report.payload_refs != 0;
+        let continuing = report.continuation;
         state.status.last_pass = Some(report);
         state.status.failure = None;
         if changed {
@@ -183,6 +185,8 @@ impl Writer {
                 .cf_handle("payload")
                 .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
             self.db.flush_cfs_opt(&[&default, &payload], &options)?;
+        } else if continuing {
+            state.status.phase = PressurePhase::Requested;
         } else {
             state.status.phase = PressurePhase::Blocked;
         }

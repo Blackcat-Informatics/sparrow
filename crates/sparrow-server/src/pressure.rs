@@ -32,11 +32,13 @@ pub(crate) fn encode(
         pass.set_protected(report.protected as u32);
         pass.set_payload_refs(report.payload_refs as u32);
         pass.set_pending_manifest_refs(report.pending_manifest_refs as u64);
+        pass.set_continuation(report.continuation);
         pass.set_frontier(match report.frontier {
             EvictionFrontier::Exhausted => wire::EvictionFrontier::Exhausted,
             EvictionFrontier::RecordLimit => wire::EvictionFrontier::RecordLimit,
             EvictionFrontier::ScanBudget => wire::EvictionFrontier::ScanBudget,
             EvictionFrontier::PayloadBudget => wire::EvictionFrontier::PayloadBudget,
+            EvictionFrontier::CatalogBudget => wire::EvictionFrontier::CatalogBudget,
         });
     } else {
         out.reborrow().init_last_pass().set_absent(());
@@ -66,6 +68,7 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
                 wire::EvictionFrontier::RecordLimit => "record_limit",
                 wire::EvictionFrontier::ScanBudget => "scan_budget",
                 wire::EvictionFrontier::PayloadBudget => "payload_budget",
+                wire::EvictionFrontier::CatalogBudget => "catalog_budget",
             };
             Object::new()
                 .with("records", u64::from(pass.get_records()))
@@ -78,6 +81,7 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
                     pass.get_pending_manifest_refs().to_string(),
                 )
                 .with("frontier", frontier)
+                .with("continuation", pass.get_continuation())
                 .into()
         }
     };
@@ -103,4 +107,35 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
         .with("last_pass", pass)
         .with("failure", failure)
         .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_catalog_frontier_preserves_continuation_through_agent_rendering() {
+        let status = PressureStatus {
+            phase: PressurePhase::Requested,
+            requested_bytes: 1024,
+            last_pass: Some(sparrow_core::EvictionReport {
+                visited: 1,
+                protected: 1,
+                frontier: EvictionFrontier::CatalogBudget,
+                continuation: true,
+                ..sparrow_core::EvictionReport::default()
+            }),
+            ..PressureStatus::default()
+        };
+        let mut message = capnp::message::Builder::new_default();
+        encode(message.init_root(), &status).unwrap();
+        let value = decode(message.get_root_as_reader().unwrap()).unwrap();
+        assert_eq!(value["phase"].as_str(), Some("requested"));
+        assert_eq!(
+            value["last_pass"]["frontier"].as_str(),
+            Some("catalog_budget")
+        );
+        assert_eq!(value["last_pass"]["continuation"].as_bool(), Some(true));
+        assert_eq!(value["requested_bytes"].as_str(), Some("1024"));
+    }
 }

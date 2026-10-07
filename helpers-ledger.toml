@@ -1364,6 +1364,20 @@ fingerprints = []
 names = ['^(evict_record_dependencies|evict_artifact_dependencies)$']
 
 [[job]]
+id = "eviction-traversal-invalidation"
+summary = "Observe successful native time publication and restart bounded eviction when earlier evidence arrives."
+home = "sparrow_core::storage::eviction::Cursor::published"
+entry_points = ["sparrow_core::storage::eviction::Publication::put_cf"]
+spec = "docs/development-runtime.md: schema 18 bounded eviction traversal."
+vectors = ["crates/sparrow-core/src/storage/eviction.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(invalidate_import_eviction_cursor|invalidate_direct_eviction_cursor)$']
+
+[[job]]
 id = "artifact-manifest-retirement"
 summary = "Drain bounded complete-parent payload ownership through the same reference law as record retirement."
 home = "sparrow_core::storage::retire::Retirement::artifact"
