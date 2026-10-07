@@ -51,8 +51,7 @@ native discovery for filtered requests so old daemons cannot ignore the new
 field. This currently adds the existing status scan, whose scan time remains
 unbounded; no bounded handshake or query snapshot is claimed. Diagnostic
 normalization/filter dimensions and the remaining architecture requirements are
-still unfinished. The running development daemon remains schema 19 until a
-verified build is committed and explicitly adopted below.
+still unfinished.
 
 Local qualification on 2026-10-07: `make check` passed formatting, release Clippy
 with warnings denied, all workspace release tests (91 storage and 26 RPC/daemon/
@@ -67,6 +66,18 @@ filtered CLI read with `UNSUPPORTED`, exit 1 and zero stdout bytes. Its binary
 SHA-256 is `bf9d90750fea6a1cef4ad787625d84677eaccb7936285f9a11110a0d7765fa62`;
 evidence is under `/tmp/sparrow-source-filter-old.c_j3gbdi`. That owned private
 daemon shut down with SIGINT, exit 0 and socket cleanup.
+
+The owned development unit adopted signed commit `b2d751d` after graceful SIGINT
+shutdown, MainPID 0, successful unit result and socket cleanup. PID 727274 now
+serves schema 20 on the existing private socket and reopened the same format-12
+store with 192 live records. A live scope containing `acceptance-descriptor`, an
+absent source and duplicate `acceptance-descriptor` returned exactly the original
+descriptor occurrence; adding an outer nonmatching source returned no rows. MCP
+returned identical filtered rows to CLI. Descriptor and immutable handoff retries
+kept their original identities; independent `cmp` checks passed for all 82
+descriptor bytes, 87 handoff bytes and the preserved replacement producer file.
+Evidence is under `/tmp/sparrow-source-filter-live.uzLVKl`. This remains transient
+development acceptance, not permanent deployment or full architecture completion.
 
 ## Streaming evidence catalog reads
 
