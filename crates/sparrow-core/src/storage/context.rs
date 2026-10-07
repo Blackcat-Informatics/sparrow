@@ -161,24 +161,8 @@ fn scan_context_neighbors(
             result.frontier = ContextFrontier::ScanBudget;
             break;
         }
-        let id = std::str::from_utf8(&value)
-            .map_err(|e| Error::new("STORAGE_FAILURE", format!("invalid time index: {e}")))?;
-        let record: Record = writer.get(id).map_err(|error| {
-            if error.code == "NOT_FOUND" {
-                Error::new(
-                    "STORAGE_FAILURE",
-                    "context time index references a missing record",
-                )
-            } else {
-                error
-            }
-        })?;
-        if key.as_ref() != format!("time:{:020}:{}", record.received_at, record.id).as_bytes() {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "context time index does not match its record",
-            ));
-        }
+        let mut remaining = usize::MAX;
+        let record = writer.time_record(&key, &value, &mut remaining)?;
         if record.received_at < scope.received_from || record.received_at >= scope.received_before {
             break;
         }

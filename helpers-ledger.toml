@@ -1336,7 +1336,7 @@ names = ['^(assemble_byte_range|read_staging_range)$']
 
 [[job]]
 id = "record-dependency-retirement"
-summary = "Release native record, projection, text and exact-byte ownership once for expiry or abandoned private preparation."
+summary = "Release native record, projection, text and exact-byte ownership once for expiry, pressure eviction or abandoned private preparation."
 home = "sparrow_core::storage::retire::Retirement::record"
 entry_points = []
 spec = "docs/development-runtime.md: checkpointed native preparation and complete publication."
@@ -1348,6 +1348,62 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(drop_prepared_record|remove_ingest_record)$']
+
+[[job]]
+id = "oldest-unpinned-eviction"
+summary = "Serialize bounded chronological evidence retirement against pins through the shared dependency owner."
+home = "sparrow_core::storage::eviction::Store::evict_oldest"
+entry_points = []
+spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(evict_record_dependencies|evict_artifact_dependencies)$']
+
+[[job]]
+id = "artifact-manifest-retirement"
+summary = "Drain bounded complete-parent payload ownership through the same reference law as record retirement."
+home = "sparrow_core::storage::retire::Retirement::artifact"
+entry_points = []
+spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(drop_artifact_chunks|release_manifest_chunks)$']
+
+[[job]]
+id = "time-index-record-certification"
+summary = "Validate chronological index identity and catalog agreement once for context and eviction."
+home = "sparrow_core::storage::Writer::time_record"
+entry_points = []
+spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_context_time_record|decode_eviction_time_record)$']
+
+[[job]]
+id = "bounded-catalog-decode"
+summary = "Read one native pinned catalog value and charge its decoded shape before the shared PurRDF decoder."
+home = "sparrow_core::storage::Writer::get_limited"
+entry_points = ["sparrow_core::storage::Writer::charge_catalog"]
+spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_eviction_catalog|decode_pressure_catalog)$']
 
 [[job]]
 id = "complete-import-publication"

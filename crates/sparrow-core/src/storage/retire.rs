@@ -3,7 +3,7 @@
 
 //! Shared dependency retirement for ordinary expiry and abandoned preparation.
 
-use super::{Error, Record, Writer, parse, rdf_index, read_field};
+use super::{Artifact, Error, Record, Writer, parse, rdf_index, read_field};
 use rocksdb::WriteBatch;
 use std::collections::BTreeMap;
 
@@ -11,7 +11,7 @@ pub(super) struct Retirement<'a> {
     writer: &'a Writer,
     pub batch: WriteBatch,
     rdf: rdf_index::RdfWrite<'a>,
-    pub removals: BTreeMap<String, u64>,
+    removals: BTreeMap<String, u64>,
     rdf_removals: BTreeMap<String, u64>,
     projection_removals: BTreeMap<String, u64>,
 }
@@ -58,6 +58,17 @@ impl<'a> Retirement<'a> {
         }
 
         Ok(true)
+    }
+
+    pub(super) fn artifact(
+        &mut self,
+        artifact: &mut Artifact,
+        maximum: usize,
+    ) -> Result<usize, Error> {
+        let count = artifact.chunks.len().min(maximum);
+        self.payloads(&artifact.chunks[..count], 1)?;
+        artifact.chunks.drain(..count);
+        Ok(count)
     }
 
     pub(super) fn payloads(&mut self, chunks: &[String], owners: u64) -> Result<(), Error> {

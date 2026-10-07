@@ -18,6 +18,7 @@ use rocksdb::{
 pub(crate) mod consumption;
 pub(crate) mod context;
 pub(crate) mod durability;
+pub(crate) mod eviction;
 pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
@@ -534,11 +535,53 @@ impl Writer {
     }
 
     fn get<T: Catalog>(&self, key: &str) -> Result<T, Error> {
+        let mut remaining = usize::MAX;
+        self.get_limited(key, &mut remaining)
+    }
+
+    fn get_limited<T: Catalog>(&self, key: &str, remaining: &mut usize) -> Result<T, Error> {
         let bytes = self
             .db
-            .get(key)?
+            .get_pinned(key)?
             .ok_or_else(|| Error::new("NOT_FOUND", format!("unknown evidence {key}")))?;
+        Self::charge_catalog(remaining, bytes.len())?;
         T::decode(&parse(&bytes)?)
+    }
+
+    fn charge_catalog(remaining: &mut usize, bytes: usize) -> Result<(), Error> {
+        *remaining = remaining
+            .checked_sub(bytes.saturating_mul(64))
+            .ok_or_else(|| {
+                Error::new(
+                    "RESOURCE_LIMIT",
+                    "catalog capture exceeds operation admission",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn time_record(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        remaining: &mut usize,
+    ) -> Result<Record, Error> {
+        let id = std::str::from_utf8(value)
+            .map_err(|e| Error::new("STORAGE_FAILURE", format!("invalid time index: {e}")))?;
+        let record: Record = self.get_limited(id, remaining).map_err(|error| {
+            if error.code == "NOT_FOUND" {
+                Error::new("STORAGE_FAILURE", "time index references a missing record")
+            } else {
+                error
+            }
+        })?;
+        if key != format!("time:{:020}:{}", record.received_at, record.id).as_bytes() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "time index does not match its record",
+            ));
+        }
+        Ok(record)
     }
 
     fn retry(&self, key: &str, now: u64) -> Result<Option<Value>, Error> {
@@ -586,7 +629,7 @@ impl Writer {
     }
 
     fn protected(&self, now: u64) -> Result<BTreeSet<String>, Error> {
-        self.protected_matching(now, |_| true, || Ok(()), None)
+        self.protected_matching(now, |_| true, || Ok(()), None, None)
     }
 
     fn protected_matching<R>(
@@ -595,6 +638,7 @@ impl Writer {
         include: impl Fn(&str) -> bool,
         mut admit: impl FnMut() -> Result<R, Error>,
         maximum: Option<usize>,
+        mut remaining: Option<&mut usize>,
     ) -> Result<BTreeSet<String>, Error> {
         let mut protected = BTreeSet::new();
         let mut iterator = self.db.prefix_iterator("pin:");
@@ -612,6 +656,9 @@ impl Writer {
                     "RESOURCE_LIMIT",
                     "pin catalog entry exceeds RDF scope admission",
                 ));
+            }
+            if let Some(remaining) = remaining.as_deref_mut() {
+                Self::charge_catalog(remaining, bytes.len())?;
             }
             let pin = Pin::decode(&parse(&bytes)?)?;
             if pin.expires_at > now {
@@ -1451,9 +1498,7 @@ impl Store {
         let mut expired = 0;
         for mut artifact in writer.list::<Artifact>("artifact:")? {
             if !writer.live_artifact(&artifact, now, &protected) && !artifact.chunks.is_empty() {
-                for digest in artifact.chunks.drain(..) {
-                    *retirement.removals.entry(digest).or_default() += 1;
-                }
+                retirement.artifact(&mut artifact, usize::MAX)?;
                 put(&mut retirement.batch, &artifact.id, &artifact);
                 expired += 1;
             }

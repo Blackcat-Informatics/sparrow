@@ -1,5 +1,36 @@
 # Development runtime
 
+## Oldest-unpinned logical retirement
+
+`Store::evict_oldest` serializes finite chronological retirement against pin
+mutations. It selects records by `(received_at, record_id)` and preserves active
+record and whole-artifact pins. Retiring one record makes the unpinned complete
+parent unavailable; protected sibling records keep their exact bytes and native
+indexes. Shared payload, JSON, RDF and text cleanup uses the existing retirement
+owner. Complete source retry receipts retain their original occurrence identity
+and do not resurrect evicted bytes.
+
+Each pass limits newly evicted records, time and pin visits, payload ownership
+removals, conservative catalog capture and atomic write bytes. Capture or batch
+refusal commits nothing. Records retire completely; parent manifest ownership
+can be drained over subsequent passes without making a surviving subset
+downloadable as a complete file. Reports expose visited/protected counts,
+remaining touched-parent manifest references and an explicit traversal frontier.
+Logical reference retirement does not certify physical bytes freed or peak RSS.
+
+This is the core retirement primitive. Automatic pressure admission, continuation
+past a protected prefix larger than the scan budget, recordless-artifact eviction,
+bounded expiry and native compaction/blob reclamation remain unfinished. The
+daemon does not yet invoke this primitive automatically. It continues to refuse
+unsafe write admission rather than claim reclaimed physical capacity.
+
+Temporary-store scenarios cover native RDF/JSON/text and exact-byte survival for
+record pins and shared occurrences, stable retries after reopen, whole-artifact
+pin protection and expiry, finite manifest cleanup, scan frontiers, atomic
+capture/write refusals, and released records whose parent catalog has expired.
+The shared corrupted-time-index fixture also checks that a failure after preparing
+an earlier retirement commits no successful prefix.
+
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
 The current source implements schema 16; the schema sections

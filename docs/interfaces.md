@@ -481,7 +481,7 @@ uses the durable claim journal and the SDK descriptor upload path before retirin
 the exact private source. Schema 15 `status.consumeWatches` reports coverage,
 bounded candidates/deferral, pending claims, completion counts and failures;
 the CLI and stdio MCP share its rendering. No live producer roots are configured
-in the development daemon. Explicit completion, tail watches, forced-overflow
+in the development daemon. Tail watches, forced-overflow
 qualification, and whole-process crash injection at every filesystem boundary
 remain unfinished. Ordinary upload continues to preserve every caller source.
 

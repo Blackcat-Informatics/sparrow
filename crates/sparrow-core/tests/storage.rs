@@ -6,6 +6,266 @@
 use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 
 const DAY: u64 = 86_400_000;
+
+#[test]
+fn eviction_preserves_record_pins_shared_projections_and_durable_retry_identity() {
+    use sparrow_core::{EvictionLimits, JsonQuery, QueryScope, QuerySelection};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"{\"message\":\"shared needle\"}\n{\"message\":\"pinned needle\"}\n";
+    let old = store
+        .ingest("eviction-old", "source", "jsonl", input, 1)
+        .unwrap();
+    let new = store
+        .ingest("eviction-new", "source", "jsonl", input, 2)
+        .unwrap();
+    let pin = store
+        .pin(
+            "eviction-pin",
+            "investigation",
+            &[old.record_ids[1].clone()],
+            40,
+            3,
+        )
+        .unwrap();
+    let mut rdf_ids = vec![old.record_ids[1].clone()];
+    rdf_ids.extend(new.record_ids.iter().cloned());
+    let rdf_before = store
+        .with_rdf_records(
+            &rdf_ids,
+            3,
+            sparrow_core::RdfReadLimits::default(),
+            |view| purrdf::DatasetView::quads(view).count(),
+        )
+        .unwrap();
+    assert!(rdf_before > 0);
+    let report = store
+        .evict_oldest(
+            4,
+            EvictionLimits {
+                max_records: 1,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(report.records, vec![old.record_ids[0].clone()]);
+    assert_eq!(report.artifacts, vec![old.id.clone()]);
+    assert_eq!(
+        store.bytes(&old.id, 0, 1, 4).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        store.bytes(&old.record_ids[0], 0, 1, 4).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        store.bytes(&old.record_ids[1], 0, 28, 4).unwrap(),
+        b"{\"message\":\"pinned needle\"}\n"
+    );
+    assert_eq!(store.bytes(&new.id, 0, input.len(), 4).unwrap(), input);
+    assert_eq!(
+        store
+            .with_rdf_records(
+                &rdf_ids,
+                4,
+                sparrow_core::RdfReadLimits::default(),
+                |view| purrdf::DatasetView::quads(view).count()
+            )
+            .unwrap(),
+        rdf_before
+    );
+    let scope = QueryScope {
+        selection: QuerySelection::Evidence(vec![old.record_ids[1].clone(), new.id.clone()]),
+        source: None,
+        received_from: 0,
+        received_before: u64::MAX,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    assert_eq!(
+        store.text_query(&scope, "needle", 4).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        store.json_query(&scope, &JsonQuery::Keys, 4).unwrap()["coverage"]["eligible_records"]
+            .as_str(),
+        Some("3")
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .ingest("eviction-old", "source", "jsonl", input, 5)
+            .unwrap()
+            .id,
+        old.id
+    );
+    assert_eq!(
+        store.bytes(&old.id, 0, 1, 5).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.release(&pin.id).unwrap();
+    let report = store
+        .evict_oldest(
+            6,
+            EvictionLimits {
+                max_records: 1,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(report.records, vec![old.record_ids[1].clone()]);
+    assert_eq!(store.bytes(&new.id, 0, input.len(), 6).unwrap(), input);
+}
+
+#[test]
+fn eviction_manifest_cleanup_is_bounded_resumable_and_never_returns_partial_files() {
+    use sparrow_core::{EvictionFrontier, EvictionLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"one\ntwo\n";
+    let artifact = store
+        .ingest("eviction-manifest", "source", "log", input, 1)
+        .unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        max_payload_refs: 1,
+        ..EvictionLimits::default()
+    };
+    let first = store.evict_oldest(2, limits).unwrap();
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(first.payload_refs, 1);
+    assert!(first.pending_manifest_refs > 0);
+    assert_eq!(first.frontier, EvictionFrontier::RecordLimit);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let cleanup = store.evict_oldest(3, limits).unwrap();
+    assert!(cleanup.records.is_empty());
+    assert_eq!(cleanup.payload_refs, 1);
+    assert_eq!(cleanup.pending_manifest_refs, 1);
+    assert_eq!(cleanup.frontier, EvictionFrontier::PayloadBudget);
+    assert_eq!(
+        store
+            .bytes(&artifact.id, 0, input.len(), 3)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    let cleanup = store.evict_oldest(4, limits).unwrap();
+    assert!(cleanup.records.is_empty());
+    assert_eq!(cleanup.pending_manifest_refs, 0);
+    let last = store.evict_oldest(5, limits).unwrap();
+    assert_eq!(last.records.len(), 1);
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn eviction_parent_pins_and_admission_refusals_are_atomic() {
+    use sparrow_core::{EvictionFrontier, EvictionLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let old = store
+        .ingest("eviction-protected", "source", "log", b"old\n", 1)
+        .unwrap();
+    let new = store
+        .ingest("eviction-eligible", "source", "log", b"new\n", 2)
+        .unwrap();
+    store
+        .pin(
+            "eviction-whole-pin",
+            "whole",
+            std::slice::from_ref(&old.id),
+            1,
+            3,
+        )
+        .unwrap();
+    for limits in [
+        EvictionLimits {
+            max_catalog_bytes: 1,
+            ..EvictionLimits::default()
+        },
+        EvictionLimits {
+            max_batch_bytes: 1,
+            ..EvictionLimits::default()
+        },
+    ] {
+        assert_eq!(
+            store.evict_oldest(4, limits).unwrap_err().code,
+            "RESOURCE_LIMIT"
+        );
+        assert_eq!(store.bytes(&new.id, 0, 4, 4).unwrap(), b"new\n");
+    }
+    let scanned = store
+        .evict_oldest(
+            4,
+            EvictionLimits {
+                scan_budget: 1,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(scanned.frontier, EvictionFrontier::ScanBudget);
+    assert!(scanned.records.is_empty());
+    assert_eq!(scanned.protected, 1);
+    let report = store.evict_oldest(4, EvictionLimits::default()).unwrap();
+    assert_eq!(report.records, new.record_ids);
+    assert_eq!(store.bytes(&old.id, 0, 4, 4).unwrap(), b"old\n");
+    let expired_pin = store
+        .evict_oldest(2 * DAY, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(expired_pin.records, old.record_ids);
+    assert_eq!(
+        store
+            .evict_oldest(
+                2 * DAY,
+                EvictionLimits {
+                    max_records: 0,
+                    ..EvictionLimits::default()
+                }
+            )
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+}
+
+#[test]
+fn eviction_retires_released_record_after_ordinary_parent_catalog_cleanup() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("eviction-released", "source", "log", b"retained\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("eviction-record-only", "case", &artifact.record_ids, 40, 0)
+        .unwrap();
+    store.expire(32 * DAY).unwrap();
+    assert_eq!(store.artifact(&artifact.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(
+        store
+            .bytes(&artifact.record_ids[0], 0, 9, 32 * DAY)
+            .unwrap(),
+        b"retained\n"
+    );
+    store.release(&pin.id).unwrap();
+    let report = store
+        .evict_oldest(32 * DAY, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(report.records, artifact.record_ids);
+    assert!(report.artifacts.is_empty());
+    assert_eq!(
+        store.status(32 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
 const CONSUMPTION_DIRECTORIES: sparrow_core::ConsumptionDirectories =
     sparrow_core::ConsumptionDirectories {
         root_device: 1,
@@ -3899,6 +4159,17 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
     db.put(&neighbor_key, b"record:missing").unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .evict_oldest(3, sparrow_core::EvictionLimits::default())
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store.bytes(&anchor.record_ids[0], 0, 7, 3).unwrap(),
+        b"anchor\n"
+    );
     assert_eq!(
         store
             .records_context(&anchor.record_ids[0], &scope, 0, 1, 3)
