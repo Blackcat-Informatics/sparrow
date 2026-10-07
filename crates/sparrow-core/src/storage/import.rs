@@ -4,8 +4,8 @@
 //! Durable raw staging, separate from accepted evidence and derived indexes.
 
 use super::{
-    CHUNK, Catalog, Error, RETRY_WINDOW, Store, Writer, blake3, hex, integer, json, parse, put,
-    read_field, record_ends, validate_ingest_labels,
+    BYTE_READ_BYTES, CHUNK, Catalog, Error, RETRY_WINDOW, Store, Writer, blake3, hex, integer,
+    json, parse, put, read_chunk_range, read_field, record_ends, validate_ingest_labels,
 };
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
@@ -545,6 +545,42 @@ impl Store {
         let manifest: ImportManifest = writer.get(id)?;
         manifest.require_live(now)?;
         writer.import_chunk(&manifest, offset)
+    }
+
+    /// Materialize an exact bounded raw staging range for projection/recovery.
+    /// The range must be committed, but need not have been sealed or published.
+    pub fn import_bytes(
+        &self,
+        id: &str,
+        offset: u64,
+        length: usize,
+        now: u64,
+    ) -> Result<Vec<u8>, Error> {
+        if length > BYTE_READ_BYTES {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "staging byte reads are bounded to 1 MiB",
+            ));
+        }
+        let writer = self.lock()?;
+        let manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        let end = offset
+            .checked_add(length as u64)
+            .filter(|end| *end <= manifest.received_bytes)
+            .ok_or_else(|| {
+                Error::new(
+                    "INVALID_ARGUMENT",
+                    "byte range is outside committed staging",
+                )
+            })?;
+        let first = offset / CHUNK as u64;
+        let after = end.div_ceil(CHUNK as u64);
+        read_chunk_range(
+            (first..after).map(|chunk| writer.import_chunk(&manifest, chunk * CHUNK as u64)),
+            offset % CHUNK as u64,
+            length,
+        )
     }
 
     /// Verify every committed chunk and the complete digest with native bounded

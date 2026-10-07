@@ -826,3 +826,34 @@ The full `make check` gate passed for the layout change with 44 storage
 scenarios, all other workspace tests, release Clippy with warnings denied,
 seeded census self-tests and all 21 helper-ledger jobs. No distinct exceptions
 or unsanctioned isomorphic groups were added.
+
+### Shared record preparation and staged range reads
+
+Buffered ingestion now calls one internal `RecordBatch` to prepare native
+JSON occurrence facts, JSON/Markdown RDF, metadata RDF, persisted text,
+captured source time and exact raw chunk ownership. Its finalizer writes the
+same shared projection/content reference counters and disk-admission estimate.
+Catalog publication and retry receipts remain the caller's atomic commit.
+Buffered imports retain record-count preflight before native preparation, using
+an allocation-free boundary count rather than an artifact-sized boundary vector.
+The former inline native preparation body was removed rather than retained as
+a second implementation for the future streaming caller.
+
+`import_bytes` materializes exact ranges of committed staging bytes, including
+unsealed inputs, at a maximum of 1 MiB per call. It refuses bytes beyond the
+committed offset, overflow, expired/canceled journals and excessive output.
+It reads only the intersecting checked staging chunks. Staging and ordinary
+evidence byte reads share one exact range assembler; input-specific chunk digest
+and lifetime checks remain at their respective storage boundaries. Binary
+content, cross-chunk ranges and zero-length reads remain exact after reopen.
+
+This is preparation for complete streaming publication. The staging path still
+does not publish evidence, and streaming native preparation and typed daemon
+caller wiring remain required work.
+
+The full `make check` gate passed for shared preparation and staged byte reads:
+45 storage scenarios, all other workspace tests, release Clippy with warnings
+denied, seeded census self-tests and all 23 helper-ledger jobs. Existing native
+projection, ranking, exact-byte, pin/retention and daemon crash/reopen scenarios
+continue to pass through the shared production preparation path. No distinct
+exceptions or unsanctioned isomorphic groups were added.

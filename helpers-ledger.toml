@@ -449,3 +449,33 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(prepare_import_layout|build_record_layout)$']
+
+[[job]]
+id = "native-record-preparation"
+summary = "Prepare original record bytes and native JSON, RDF, text and source-time dependencies once for catalog publication."
+home = "sparrow_core::storage::ingest::RecordBatch::record"
+entry_points = []
+spec = "docs/development-runtime.md: shared record preparation and bounded staged byte reads."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(prepare_native_record|project_ingest_record)$']
+
+[[job]]
+id = "exact-chunk-range"
+summary = "Assemble an exact bounded byte range from checked source chunks without clipping or duplicate range arithmetic."
+home = "sparrow_core::storage::read_chunk_range"
+entry_points = []
+spec = "docs/development-runtime.md: shared exact range assembly for retained evidence and staged input."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(assemble_byte_range|read_staging_range)$']

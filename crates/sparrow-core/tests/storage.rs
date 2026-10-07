@@ -8,6 +8,94 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn bounded_staging_ranges_preserve_exact_binary_bytes_and_committed_frontiers() {
+    use sparrow_core::IMPORT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let input: Vec<u8> = (0..2 * IMPORT_CHUNK_BYTES + 37)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
+    );
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = store
+        .import_begin(
+            "range-copy",
+            "binary-copy",
+            "opaque",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    store
+        .import_append(&journal.id, 0, &input[..IMPORT_CHUNK_BYTES], 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .import_bytes(&journal.id, (IMPORT_CHUNK_BYTES - 7) as u64, 20, 0)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        store.import_bytes(&journal.id, 100, 77, 0).unwrap(),
+        input[100..177]
+    );
+    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate().skip(1) {
+        store
+            .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .import_bytes(&journal.id, (IMPORT_CHUNK_BYTES - 7) as u64, 20, 0)
+            .unwrap(),
+        input[IMPORT_CHUNK_BYTES - 7..IMPORT_CHUNK_BYTES + 13]
+    );
+    assert_eq!(
+        store.import_bytes(&journal.id, 0, input.len(), 0).unwrap(),
+        input
+    );
+    assert_eq!(
+        store
+            .import_bytes(&journal.id, input.len() as u64, 0, 0)
+            .unwrap(),
+        b""
+    );
+    assert_eq!(
+        store
+            .import_bytes(&journal.id, 0, 1024 * 1024 + 1, 0)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store
+            .import_bytes(&journal.id, u64::MAX, 1, 0)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    store.import_seal(&journal.id, 0).unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .import_bytes(&journal.id, (2 * IMPORT_CHUNK_BYTES - 2) as u64, 39, 0)
+            .unwrap(),
+        input[2 * IMPORT_CHUNK_BYTES - 2..]
+    );
+    assert!(store.records(0).unwrap().is_empty());
+    store.import_cancel(&journal.id, 1).unwrap();
+    assert_eq!(
+        store.import_bytes(&journal.id, 0, 1, 1).unwrap_err().code,
+        "IMPORT_EXPIRED"
+    );
+}
+
+#[test]
 fn streaming_layout_preserves_cross_chunk_delimiters_long_records_and_pages() {
     use sparrow_core::{IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS};
     let dir = tempfile::tempdir().unwrap();

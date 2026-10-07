@@ -17,6 +17,7 @@ use rocksdb::{
 
 pub(crate) mod context;
 pub(crate) mod import;
+mod ingest;
 pub(crate) mod pin_read;
 mod rdf_index;
 pub(crate) mod rdf_view;
@@ -28,6 +29,42 @@ const FORMAT: &[u8] = b"sparrow.store/5";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
+const BYTE_READ_BYTES: usize = 1024 * 1024;
+
+fn read_chunk_range(
+    chunks: impl IntoIterator<Item = Result<Vec<u8>, Error>>,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, Error> {
+    let end = offset
+        .checked_add(length as u64)
+        .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range overflow"))?;
+    let mut position = 0_u64;
+    let mut result = Vec::with_capacity(length);
+    for chunk in chunks {
+        let chunk = chunk?;
+        let next = position
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "manifest byte count overflow"))?;
+        if next > offset && position < end {
+            result.extend_from_slice(
+                &chunk
+                    [offset.saturating_sub(position) as usize..(end.min(next) - position) as usize],
+            );
+        }
+        position = next;
+        if position >= end {
+            break;
+        }
+    }
+    if result.len() != length {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "manifest does not cover the requested bytes",
+        ));
+    }
+    Ok(result)
+}
 
 fn validate_ingest_labels(request_id: &str, source: &str, format: &str) -> Result<(), Error> {
     if request_id.is_empty() || request_id.len() > 128 || source.is_empty() || source.len() > 512 {
@@ -749,256 +786,37 @@ impl Store {
                 "acceptance timestamp overflows retention deadline",
             )
         })?;
-        let id = random_id("artifact")?;
-        let mut batch = WriteBatch::default();
-        let cf = writer
-            .db
-            .cf_handle("payload")
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
-        let mut content = BTreeMap::<String, Vec<u8>>::new();
-        let mut chunks = Vec::new();
-        let mut records = Vec::new();
-        let mut projections = BTreeMap::<String, (Value, u64)>::new();
-        let mut rdf_projections = BTreeMap::<String, (Value, u64)>::new();
-        let mut rdf = rdf_index::RdfWrite::new(&writer.db)?;
-        let profile = crate::projection::json_profile()?;
-        let markdown = crate::projection::markdown_profile()?;
-        let mut start = 0;
-        let boundaries = record_ends(format, bytes, true).collect::<Vec<_>>();
-        if boundaries.len() > writer.config.max_records {
+        if record_ends(format, bytes, true).count() > writer.config.max_records {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "artifact exceeds configured record count",
             ));
         }
-        for end in boundaries {
-            let digest = hex::encode(blake3::hash(&bytes[start..end]).as_bytes());
-            let mut native_graph = None;
-            let projection_id = if ["json", "jsonl"].contains(&format) {
-                let key = format!("projection:json:{}:{digest}", profile.identity().to_hex());
-                if let Some((_, count)) = projections.get_mut(&key) {
-                    *count += 1;
-                } else {
-                    let facts = match writer.db.get(&key)? {
-                        Some(stored) => parse(&stored)?,
-                        None => {
-                            let (facts, graph) = crate::projection::json_facts(
-                                &bytes[start..end],
-                                &digest,
-                                &profile,
-                            )?;
-                            native_graph = Some(graph);
-                            facts
-                        }
-                    };
-                    projections.insert(key.clone(), (facts, 1));
-                }
-                key
-            } else {
-                String::new()
-            };
-            let rdf_projection_id = if !projection_id.is_empty() {
-                format!("rdf-{projection_id}")
-            } else if format == "markdown" {
-                format!(
-                    "rdf-projection:markdown:{}:{digest}",
-                    markdown.contract_id().to_hex()
-                )
-            } else {
-                String::new()
-            };
-            if !rdf_projection_id.is_empty() {
-                if let Some((_, count)) = rdf_projections.get_mut(&rdf_projection_id) {
-                    *count += 1;
-                } else {
-                    let key = format!("rdf:state:{rdf_projection_id}");
-                    let state = match writer.db.get(&key)? {
-                        Some(stored) => parse(&stored)?,
-                        None => {
-                            let result = if format == "markdown" {
-                                crate::projection::markdown_graph(
-                                    &bytes[start..end],
-                                    &digest,
-                                    &markdown,
-                                )
-                            } else {
-                                native_graph.ok_or_else(|| {
-                                    Error::new(
-                                        "STORAGE_FAILURE",
-                                        "existing JSON facts have no required RDF projection state",
-                                    )
-                                })?
-                            };
-                            match result
-                                .and_then(|graph| rdf.graph(&mut batch, &rdf_projection_id, &graph))
-                            {
-                                Ok(()) => Object::new()
-                                    .with("state", "complete")
-                                    .with("graph", rdf_index::graph_iri(&rdf_projection_id))
-                                    .into(),
-                                Err(error)
-                                    if ["RESOURCE_LIMIT", "PROJECTION_FAILURE"]
-                                        .contains(&error.code) =>
-                                {
-                                    Object::new()
-                                        .with("state", "failed")
-                                        .with("diagnostic", error.to_string())
-                                        .into()
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                    };
-                    rdf_projections.insert(rdf_projection_id.clone(), (state, 1));
-                }
-            }
-            let mut record_chunks = Vec::new();
-            for chunk in bytes[start..end].chunks(CHUNK) {
-                let digest = hex::encode(blake3::hash(chunk).as_bytes());
-                content
-                    .entry(digest.clone())
-                    .or_insert_with(|| chunk.to_vec());
-                record_chunks.push(digest.clone());
-                chunks.push(digest);
-            }
-            let record = Record {
+        let id = random_id("artifact")?;
+        let mut prepared = ingest::RecordBatch::new(&writer)?;
+        let mut records = Vec::new();
+        let mut start = 0;
+        for end in record_ends(format, bytes, true) {
+            let record = prepared.record(ingest::RecordInput {
                 id: random_id("record")?,
-                artifact_id: id.clone(),
-                source: source.to_owned(),
+                artifact_id: &id,
+                source,
+                format,
+                byte_start: start as u64,
+                bytes: &bytes[start..end],
                 received_at: now,
                 expires_at,
-                byte_start: start as u64,
-                byte_end: end as u64,
-                projection_id: projection_id.clone(),
-                event_time: source_time::capture(
-                    source_time_profile.as_ref(),
-                    projections.get(&projection_id).map(|(facts, _)| facts),
-                    start as u64,
-                    end as u64,
-                )?,
-                rdf_projection_id,
-                chunks: record_chunks,
-                evicted: false,
-            };
-            let json = projections
-                .get(&record.projection_id)
-                .map(|(facts, _)| facts);
-            let text = crate::text::facts(
-                &writer.config.text_analyzer,
-                &bytes[start..end],
-                json,
-                format == "opaque",
-            );
-            writer.put_text(&mut batch, &record.id, &text)?;
-            let rdf_state = rdf_projections
-                .get(&record.rdf_projection_id)
-                .map(|(state, _)| state);
-            rdf.graph(
-                &mut batch,
-                &record.id,
-                rdf_index::metadata(&record, &digest, rdf_state)?.as_ref(),
-            )?;
-            put(&mut batch, &record.id, &record);
-            batch.put(
+                source_time_profile: &source_time_profile,
+            })?;
+            put(&mut prepared.batch, &record.id, &record);
+            prepared.batch.put(
                 format!("time:{now:020}:{}", record.id),
                 record.id.as_bytes(),
             );
             records.push(record.id);
             start = end;
         }
-        let mut additions = BTreeMap::<String, u64>::new();
-        for digest in &chunks {
-            *additions.entry(digest.clone()).or_default() += 2;
-        }
-        let mut new_bytes = 0_u64;
-        for (id, (state, added)) in rdf_projections {
-            let key = format!("rdf:projection-ref:{id}");
-            let previous = writer
-                .db
-                .get(&key)?
-                .map(|v| {
-                    v.as_slice()
-                        .try_into()
-                        .map(u64::from_be_bytes)
-                        .map_err(|_| {
-                            Error::new("STORAGE_FAILURE", "invalid RDF projection counter")
-                        })
-                })
-                .transpose()?
-                .unwrap_or(0);
-            batch.put(
-                key,
-                previous
-                    .checked_add(added)
-                    .ok_or_else(|| {
-                        Error::new("STORAGE_FAILURE", "RDF projection reference overflow")
-                    })?
-                    .to_be_bytes(),
-            );
-            batch.put(format!("rdf:state:{id}"), json::write_compact(&state));
-        }
-        rdf.finish(&mut batch)?;
-        for (key, (facts, added)) in projections {
-            let ref_key = format!("projection-ref:{key}");
-            let previous = writer
-                .db
-                .get(&ref_key)?
-                .map(|bytes| {
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map(u64::from_be_bytes)
-                        .map_err(|_| {
-                            Error::new("STORAGE_FAILURE", "invalid projection reference counter")
-                        })
-                })
-                .transpose()?
-                .unwrap_or(0);
-            let encoded = json::write_compact(&facts);
-            new_bytes = new_bytes.saturating_add(encoded.len() as u64);
-            batch.put(&key, encoded);
-            batch.put(
-                ref_key,
-                previous
-                    .checked_add(added)
-                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "projection reference overflow"))?
-                    .to_be_bytes(),
-            );
-        }
-        for (digest, payload) in content {
-            let reference_key = format!("ref:{digest}");
-            let count = match writer.db.get(&reference_key)? {
-                Some(v) => u64::from_be_bytes(v.as_slice().try_into().map_err(|_| {
-                    Error::new("STORAGE_FAILURE", "invalid payload reference counter")
-                })?),
-                None => {
-                    new_bytes += payload.len() as u64;
-                    batch.put_cf(cf, &digest, &payload);
-                    0
-                }
-            };
-            let count = count.checked_add(additions[&digest]).ok_or_else(|| {
-                Error::new("STORAGE_FAILURE", "payload reference counter overflow")
-            })?;
-            batch.put(reference_key, count.to_be_bytes());
-        }
-        let estimate = (bytes.len() as u64)
-            .saturating_add(new_bytes)
-            .saturating_add((records.len() as u64).saturating_mul(2048))
-            .saturating_add(4096)
-            .max(
-                (batch.size_in_bytes() as u64)
-                    .saturating_mul(2)
-                    .saturating_add(4096),
-            );
-        if writer.physical_bytes()?.saturating_add(estimate)
-            > writer.config.disk_budget - writer.config.maintenance_reserve
-        {
-            return Err(Error::new(
-                "STORAGE_PRESSURE",
-                "insufficient capacity below maintenance reserve; release pins or reclaim storage before retrying",
-            ));
-        }
+        let ingest::PreparedRecords { mut batch, chunks } = prepared.finish()?;
         let artifact = Artifact {
             id,
             source: source.to_owned(),
@@ -1271,7 +1089,7 @@ impl Store {
 
     /// Read an exact bounded range of complete artifact or retained record bytes.
     pub fn bytes(&self, id: &str, offset: u64, length: usize, now: u64) -> Result<Vec<u8>, Error> {
-        if length > 1024 * 1024 {
+        if length > BYTE_READ_BYTES {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "byte reads are bounded to 1 MiB",
@@ -1303,7 +1121,7 @@ impl Store {
                 "bytes target must be an artifact or record",
             ));
         };
-        let end = offset
+        offset
             .checked_add(length as u64)
             .filter(|end| *end <= size)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range is outside evidence"))?;
@@ -1311,9 +1129,7 @@ impl Store {
             .db
             .cf_handle("payload")
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
-        let mut position = 0_u64;
-        let mut result = Vec::with_capacity(length);
-        for digest in chunks {
+        let chunks = chunks.into_iter().map(|digest| {
             let chunk = writer
                 .db
                 .get_cf(cf, &digest)?
@@ -1321,25 +1137,9 @@ impl Store {
             if hex::encode(blake3::hash(&chunk).as_bytes()) != digest {
                 return Err(Error::new("STORAGE_FAILURE", "payload digest mismatch"));
             }
-            let next = position + chunk.len() as u64;
-            if next > offset && position < end {
-                result.extend_from_slice(
-                    &chunk[(offset.saturating_sub(position)) as usize
-                        ..((end.min(next)) - position) as usize],
-                );
-            }
-            position = next;
-            if position >= end {
-                break;
-            }
-        }
-        if result.len() != length {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "manifest does not cover the requested bytes",
-            ));
-        }
-        Ok(result)
+            Ok(chunk)
+        });
+        read_chunk_range(chunks, offset, length)
     }
 
     /// Create or extend a collection atomically; every target must be live.
