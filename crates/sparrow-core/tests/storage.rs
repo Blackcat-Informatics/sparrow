@@ -8,6 +8,321 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn streaming_journal_recovers_after_owned_writer_sigkill() {
+    use sparrow_core::IMPORT_CHUNK_BYTES;
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    let mut input = vec![b'z'; IMPORT_CHUNK_BYTES];
+    input.extend_from_slice(b"final\r\n");
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
+    );
+    if let Some(path) = std::env::var_os("SPARROW_TEST_IMPORT_CRASH_STORE") {
+        let store = Store::open(std::path::PathBuf::from(path), config()).unwrap();
+        let journal = store
+            .import_begin(
+                "crash-copy",
+                "copied-log",
+                "log",
+                input.len() as u64,
+                &digest,
+                0,
+            )
+            .unwrap();
+        store
+            .import_append(&journal.id, 0, &input[..IMPORT_CHUNK_BYTES], 0)
+            .unwrap();
+        writeln!(std::io::stdout(), "SPARROW_IMPORT_READY").unwrap();
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "streaming_journal_recovers_after_owned_writer_sigkill",
+            "--nocapture",
+        ])
+        .env("SPARROW_TEST_IMPORT_CRASH_STORE", dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let ready = std::io::BufReader::new(stdout)
+            .lines()
+            .take(8)
+            .any(|line| line.is_ok_and(|line| line == "SPARROW_IMPORT_READY"));
+        let _ = sender.send(ready);
+    });
+    let ready = receiver.recv_timeout(Duration::from_secs(10));
+    // Always terminate/reap only this owned test child, including readiness
+    // failure, before assertions. No store destructor runs in the killed writer.
+    let killed = child.kill();
+    let exit = child.wait().unwrap();
+    reader.join().unwrap();
+    assert!(ready.unwrap());
+    killed.unwrap();
+    assert!(!exit.success());
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = store
+        .import_begin(
+            "crash-copy",
+            "copied-log",
+            "log",
+            input.len() as u64,
+            &digest,
+            1,
+        )
+        .unwrap();
+    assert_eq!(journal.received_bytes, IMPORT_CHUNK_BYTES as u64);
+    assert_eq!(
+        store.import_read_chunk(&journal.id, 0, 1).unwrap(),
+        input[..IMPORT_CHUNK_BYTES]
+    );
+    store
+        .import_append(
+            &journal.id,
+            IMPORT_CHUNK_BYTES as u64,
+            &input[IMPORT_CHUNK_BYTES..],
+            1,
+        )
+        .unwrap();
+    assert!(store.import_seal(&journal.id, 1).unwrap().sealed);
+    assert_eq!(store.status(1).unwrap()["live_records"].as_str(), Some("0"));
+}
+
+#[test]
+fn streaming_journal_recovers_exact_offsets_and_never_publishes_partial_evidence() {
+    use sparrow_core::IMPORT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let mut input = vec![b'x'; IMPORT_CHUNK_BYTES];
+    input.extend_from_slice(b"\r\n\0\xffunfinished");
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
+    );
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = store
+        .import_begin(
+            "copy",
+            "copied-jsonl",
+            "jsonl",
+            input.len() as u64,
+            &digest,
+            100,
+        )
+        .unwrap();
+    let id = journal.id.clone();
+    assert_eq!(store.import_seal(&id, 100).unwrap_err().code, "CONFLICT");
+    assert_eq!(
+        store
+            .import_append(
+                &id,
+                IMPORT_CHUNK_BYTES as u64,
+                &input[IMPORT_CHUNK_BYTES..],
+                100
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let first = store
+        .import_append(&id, 0, &input[..IMPORT_CHUNK_BYTES], 101)
+        .unwrap();
+    assert_eq!(first.received_bytes, IMPORT_CHUNK_BYTES as u64);
+    assert_eq!(
+        store.status(101).unwrap()["live_records"].as_str(),
+        Some("0")
+    );
+    assert_eq!(store.artifact(&id).unwrap_err().code, "INVALID_ARGUMENT");
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .import_begin(
+                "copy",
+                "copied-jsonl",
+                "jsonl",
+                input.len() as u64,
+                &digest,
+                200
+            )
+            .unwrap(),
+        first
+    );
+    assert_eq!(store.import_get(&id, 200).unwrap(), first);
+    assert_eq!(
+        store
+            .import_append(&id, 0, &input[..IMPORT_CHUNK_BYTES], 200)
+            .unwrap(),
+        first
+    );
+    let mut altered = input[..IMPORT_CHUNK_BYTES].to_vec();
+    altered[0] = b'y';
+    assert_eq!(
+        store.import_append(&id, 0, &altered, 200).unwrap_err().code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store
+            .import_begin(
+                "copy",
+                "other-source",
+                "jsonl",
+                input.len() as u64,
+                &digest,
+                200
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    store
+        .import_append(
+            &id,
+            IMPORT_CHUNK_BYTES as u64,
+            &input[IMPORT_CHUNK_BYTES..],
+            200,
+        )
+        .unwrap();
+    let sealed = store.import_seal(&id, 201).unwrap();
+    assert!(sealed.sealed);
+    assert_eq!(sealed.expires_at, journal.expires_at);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut reconstructed = store.import_read_chunk(&id, 0, 202).unwrap();
+    reconstructed.extend(
+        store
+            .import_read_chunk(&id, IMPORT_CHUNK_BYTES as u64, 202)
+            .unwrap(),
+    );
+    assert_eq!(reconstructed, input);
+    assert_eq!(store.import_seal(&id, 202).unwrap(), sealed);
+    assert_eq!(
+        store.import_get(&id, sealed.expires_at).unwrap_err().code,
+        "IMPORT_EXPIRED"
+    );
+    assert_eq!(store.import_reclaim(sealed.expires_at).unwrap(), 2);
+    assert_eq!(
+        store.import_get(&id, sealed.expires_at).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        store.status(202).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn streaming_journal_bounds_recovery_metadata_and_reclaims_in_resumable_batches() {
+    use sparrow_core::IMPORT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let block = vec![b'a'; IMPORT_CHUNK_BYTES];
+    let mut hash = purrdf_hash::blake3::Hasher::new();
+    for _ in 0..130 {
+        hash.update(&block);
+    }
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(hash.finalize().as_bytes())
+    );
+    let journal = store
+        .import_begin(
+            "large",
+            "copy",
+            "opaque",
+            130 * IMPORT_CHUNK_BYTES as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    for index in 0..130 {
+        store
+            .import_append(&journal.id, index * IMPORT_CHUNK_BYTES as u64, &block, 0)
+            .unwrap();
+    }
+    assert!(store.import_seal(&journal.id, 0).unwrap().sealed);
+    // Raw staging exceeds the original buffered artifact limit without a growing
+    // journal or an artifact-sized allocation.
+    assert!(journal.byte_length > config().max_artifact_bytes as u64);
+    store.import_cancel(&journal.id, 10).unwrap();
+    assert_eq!(
+        store
+            .import_read_chunk(&journal.id, 0, 10)
+            .unwrap_err()
+            .code,
+        "IMPORT_EXPIRED"
+    );
+    assert_eq!(store.import_reclaim(10).unwrap(), 128);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.import_reclaim(10).unwrap(), 2);
+    assert_eq!(store.import_reclaim(10).unwrap(), 0);
+    let empty_digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(b"").as_bytes())
+    );
+    for index in 0..16 {
+        store
+            .import_begin(
+                &format!("empty-{index}"),
+                "copy",
+                "opaque",
+                0,
+                &empty_digest,
+                20,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .import_begin("overflow", "copy", "opaque", 0, &empty_digest, 20)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store
+            .import_begin("invalid", "copy", "opaque", 0, "blake3:123", 20)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    let empty = store
+        .import_begin("empty-0", "copy", "opaque", 0, &empty_digest, 20)
+        .unwrap();
+    assert!(store.import_seal(&empty.id, 20).unwrap().sealed);
+    let wrong = store
+        .import_begin("empty-1", "copy", "opaque", 0, &empty_digest, 20)
+        .unwrap();
+    // A full but incorrect payload cannot be sealed or quietly accepted.
+    store.import_cancel(&wrong.id, 20).unwrap();
+    store.import_reclaim(20).unwrap();
+    let wrong = store
+        .import_begin("wrong", "copy", "opaque", 1, &empty_digest, 20)
+        .unwrap();
+    store.import_append(&wrong.id, 0, b"x", 20).unwrap();
+    assert_eq!(
+        store.import_seal(&wrong.id, 20).unwrap_err().code,
+        "CONFLICT"
+    );
+    assert!(!store.import_get(&wrong.id, 20).unwrap().sealed);
+    store.expire(20 + 2 * DAY).unwrap();
+    assert_eq!(
+        store.import_get(&empty.id, 20 + 2 * DAY).unwrap_err().code,
+        "NOT_FOUND"
+    );
+}
+
+#[test]
 fn pin_pages_capture_revision_and_members_without_following_name_reuse() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();

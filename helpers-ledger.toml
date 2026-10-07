@@ -389,3 +389,33 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(bind_source_time|register_source_time_profile)$']
+
+[[job]]
+id = "durable-import-chunk"
+summary = "Commit an exact staging chunk and its recoverable offset together, rejecting changed retries."
+home = "sparrow_core::Store::import_append"
+entry_points = []
+spec = "docs/development-runtime.md: bounded unpublished streaming journals."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(append_import_chunk|upload_staging_chunk)$']
+
+[[job]]
+id = "ingest-label-validation"
+summary = "Validate the same request identity, source label and explicit format for buffered and staged inputs."
+home = "sparrow_core::storage::validate_ingest_labels"
+entry_points = []
+spec = "docs/development-runtime.md: shared import admission and original buffered ingestion."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^validate_import_labels$']

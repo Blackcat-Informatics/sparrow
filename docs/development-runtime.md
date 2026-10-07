@@ -738,3 +738,50 @@ JSON projections, no active pins and no pin read handles. This qualification
 covers one copied source record; streaming, watcher/producer lifecycle, whole
 corpus coverage, source-clock laws beyond this millisecond profile, pressure/
 performance acceptance, and full governed SPARQL remain unfinished.
+
+## Bounded unpublished streaming journals
+
+The core now provides `import_begin`, `import_get`, `import_append`,
+`import_read_chunk`, `import_seal`, `import_cancel`, and `import_reclaim` as the
+storage foundation for streaming imports. **These operations are not yet wired
+through Cap'n Proto or the CLI. Sealing does not publish an artifact or records,
+and never authorizes source deletion.** The existing daemon import remains
+buffered until complete publication and the typed caller are implemented.
+
+Beginning an import binds a request identity to the explicit source, format,
+complete length and canonical BLAKE3 payload identity. At most 16 journals occupy
+the registry; each catalog row is bounded at 8 KiB, including JSON escaping of
+source/request labels. The journal contains counters rather than a growing
+chunk array. Its fixed 48-hour recovery lease is not extended by activity.
+
+Append accepts one aligned 64 KiB chunk, except for the declared final remainder.
+Each synced WAL batch atomically commits the bytes, a native BLAKE3 chunk digest,
+and the next offset. Matching retries return the committed journal; changed
+bytes, gaps, partial non-final chunks and changed declaration arguments are
+refused. Staging uses private payload keys outside evidence references and
+never adds searchable records. Disk admission includes staging batches and
+preserves the configured maintenance reserve.
+
+Sealing checks every chunk length/digest and computes the declared whole-input
+identity with PurRDF's bounded streaming BLAKE3 engine. It does not buffer the
+whole file. Cancellation ends the lease durably. Maintenance reclaims at most
+128 expired chunks per call and atomically advances each journal's cleanup
+cursor; canceled/expired inputs cannot be read or resumed during cleanup.
+Physical blob/WAL reclamation still depends on native engine maintenance.
+
+Focused qualification reconstructs CRLF, invalid UTF-8, NUL and a final
+unterminated fragment after store reopen; verifies retry/conflict behavior,
+complete digest refusal, empty input and the 16-journal ceiling; and stages a
+130-chunk input larger than the buffered artifact limit. Cleanup resumes after
+reopen from its 128-chunk cursor and removes the remaining two chunks. These
+are core store-reopen scenarios. An additional owned test writer is killed with
+SIGKILL after acknowledging a synced chunk; reopening recovers its exact offset
+and bytes, accepts the final remainder and verifies the whole digest. This is
+not daemon streaming or completed-import publication acceptance. Typed streaming
+operations, complete record/manifest publication, projection/retry receipt
+coordination and daemon streaming crash qualification remain required work.
+
+The full `make check` gate passed with 41 storage scenarios, including all three
+new streaming journal scenarios, release Clippy with warnings denied, all other
+workspace tests, seeded census self-tests and all 19 helper-ledger jobs. No
+distinct exceptions or unsanctioned isomorphic groups were introduced.

@@ -15,6 +15,7 @@ pub use query::{
     EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, RecordQuery,
 };
 pub use storage::context::{Context, ContextFrontier, ContextSide};
+pub use storage::import::{IMPORT_CHUNK_BYTES, ImportManifest};
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};
 pub use storage::rdf_view::{

@@ -16,6 +16,7 @@ use rocksdb::{
 };
 
 pub(crate) mod context;
+pub(crate) mod import;
 pub(crate) mod pin_read;
 mod rdf_index;
 pub(crate) mod rdf_view;
@@ -27,6 +28,22 @@ const FORMAT: &[u8] = b"sparrow.store/5";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
+
+fn validate_ingest_labels(request_id: &str, source: &str, format: &str) -> Result<(), Error> {
+    if request_id.is_empty() || request_id.len() > 128 || source.is_empty() || source.len() > 512 {
+        return Err(Error::new(
+            "INVALID_ARGUMENT",
+            "request_id and source must be bounded nonempty strings",
+        ));
+    }
+    if !["jsonl", "log", "json", "markdown", "opaque"].contains(&format) {
+        return Err(Error::new(
+            "INVALID_ARGUMENT",
+            "format must be jsonl, log, json, markdown, or opaque",
+        ));
+    }
+    Ok(())
+}
 
 /// Typed failures from admission, evidence lifetime, and storage.
 #[derive(Debug)]
@@ -686,22 +703,7 @@ impl Store {
         bytes: &[u8],
         now: u64,
     ) -> Result<Artifact, Error> {
-        if request_id.is_empty()
-            || request_id.len() > 128
-            || source.is_empty()
-            || source.len() > 512
-        {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "request_id and source must be bounded nonempty strings",
-            ));
-        }
-        if !["jsonl", "log", "json", "markdown", "opaque"].contains(&format) {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "format must be jsonl, log, json, markdown, or opaque",
-            ));
-        }
+        validate_ingest_labels(request_id, source, format)?;
         let writer = self.lock()?;
         if bytes.len() > writer.config.max_artifact_bytes {
             return Err(Error::new(
@@ -1553,6 +1555,7 @@ impl Store {
 
     /// Reclaim unreachable payload references; record pins survive parent expiry.
     pub fn expire(&self, now: u64) -> Result<u64, Error> {
+        self.import_reclaim(now)?;
         self.pin_read_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
