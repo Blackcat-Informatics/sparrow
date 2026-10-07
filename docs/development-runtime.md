@@ -5,6 +5,40 @@ Implementation is in progress in `/home/paudley/Active/sparrow`, on
 The current source implements schema 15; the schema sections
 below retain their historical qualification evidence.
 
+## Explicit handoff storage foundation
+
+Core storage now binds a caller-owned `ConsumptionHandoff` request ID, exact
+watch revision, raw relative Unix path and observed device/inode/length/content
+clocks to the existing consumption journal. Reservation and retry binding share
+one durable write batch. Discovery and explicit admission use one reservation
+implementation, path validator and native PurRDF catalog codec. A binding proves
+admission only; publication and deletion still require the existing claim,
+upload, durable publication and synchronized removal path.
+
+There are at most 128 retained handoff bindings and 16 active journals. Retrying
+unchanged arguments recovers original ownership without inspecting a current
+source path; conflicting revisions, paths or generations fail. Active bindings
+survive ordinary receipt expiry. Removal confirmation atomically starts their
+48-hour completed retry window. Missing active ownership is a hard storage
+failure, including during expiry. A journal does not pin retained evidence.
+
+First handoff admission requires a durable watch catalog and fences older
+writers with `sparrow.store/8`. Subsequent catalog replacements preserve that
+marker. The storage API relies on the server to verify the actual registered
+revision, enabled state, explicit producer authority and descriptor generation
+before first admission. **The typed RPC, worker and CLI handoff integration is
+still unfinished; this foundation is not an exposed daemon handoff operation.**
+
+The full `make check` gate passed with 68 storage scenarios, 22 real-daemon,
+filesystem and MCP scenarios, all remaining workspace checks, release Clippy
+with warnings denied, seeded census self-tests and 109 ledger jobs. The extended
+consumption lifecycle covers restart, original publication beyond retry and
+retention, removal-window renewal and completed expiry. The admission scenario
+covers missing catalog and overflow refusal without orphan reservations,
+revision/path/generation conflicts, bounded bindings, reopen and hard failure
+after deliberate active-journal corruption. These are storage and regression
+checks; they do not qualify a live explicit handoff operation.
+
 ## Durable typed watch administration
 
 Schema 15 adds `watchList`, `watchPut`, `watchRemove`, durable definitions/revisions

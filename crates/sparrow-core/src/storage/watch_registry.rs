@@ -49,7 +49,9 @@ impl Store {
         }
         let mut batch = WriteBatch::default();
         batch.put("watch_registry", next);
-        batch.put("store_format", FORMAT);
+        if writer.db.get("store_format")?.as_deref() != Some(super::handoff::FORMAT) {
+            batch.put("store_format", FORMAT);
+        }
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)
     }

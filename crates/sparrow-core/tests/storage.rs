@@ -179,6 +179,35 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
             .unwrap(),
         reserved
     );
+    store
+        .watch_registry_replace(None, b"registered-watch")
+        .unwrap();
+    let handoff = sparrow_core::ConsumptionHandoff {
+        request_id: "finished-file-1".into(),
+        watch: reserved.watch.clone(),
+        watch_revision: 1,
+        relative_path: reserved.relative_path.clone(),
+        observed: observed.clone(),
+    };
+    assert_eq!(store.consumption_handoff_get(&handoff, 0).unwrap(), None);
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(&handoff, "source", "log", CONSUMPTION_DIRECTORIES, 0)
+            .unwrap(),
+        reserved
+    );
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/8")
+    );
+    // Catalog updates must never downgrade the handoff writer fence.
+    store
+        .watch_registry_replace(Some(b"registered-watch"), b"changed-watch")
+        .unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/8")
+    );
     assert_eq!(
         store
             .import_start(&reserved.request_id, "source", "log", 4, &digest, 0)
@@ -246,6 +275,27 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     for _ in 0..4 {
         store.expire(40 * DAY).unwrap();
     }
+    let recovered_handoff = store
+        .consumption_handoff_get(&handoff, 40 * DAY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_handoff.import_id, manifest.id);
+    assert_eq!(
+        recovered_handoff.published_artifact.as_deref(),
+        Some(artifact.id.as_str())
+    );
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(
+                &handoff,
+                "source",
+                "log",
+                CONSUMPTION_DIRECTORIES,
+                40 * DAY
+            )
+            .unwrap(),
+        recovered_handoff
+    );
     assert_eq!(
         store.status(40 * DAY).unwrap()["live_records"].as_str(),
         Some("0")
@@ -287,11 +337,38 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .consumption_removed(&manifest.id, &artifact.id, &claimed, 40 * DAY)
         .unwrap();
     assert!(store.consumption_pending().unwrap().is_empty());
+    store.expire(41 * DAY).unwrap();
+    assert_eq!(
+        store.consumption_handoff_get(&handoff, 41 * DAY).unwrap(),
+        Some(removed.clone())
+    );
     assert_eq!(
         store
             .consumption_removed(&manifest.id, &artifact.id, &claimed, 41 * DAY)
             .unwrap(),
         removed
+    );
+    assert_eq!(
+        store
+            .consumption_handoff_get(&handoff, 43 * DAY)
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+    let mut expired_alias = handoff.clone();
+    expired_alias.request_id = "expired-completion-alias".into();
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(
+                &expired_alias,
+                "source",
+                "log",
+                CONSUMPTION_DIRECTORIES,
+                43 * DAY
+            )
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
     );
     store.expire(43 * DAY).unwrap();
     store.expire(43 * DAY).unwrap();
@@ -307,6 +384,130 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         "CONFLICT"
     );
     assert!(store.records(43 * DAY).unwrap().is_empty());
+    assert_eq!(
+        store.consumption_handoff_get(&handoff, 43 * DAY).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_rebind() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut intent = sparrow_core::ConsumptionHandoff {
+        request_id: "handoff-0".into(),
+        watch: "watch".into(),
+        watch_revision: 1,
+        relative_path: b"nested/\xff.log".to_vec(),
+        observed: sparrow_core::ConsumptionGeneration {
+            device: 1,
+            inode: 2,
+            byte_length: 4,
+            modified: (10, 20),
+            changed: (10, 30),
+        },
+    };
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert!(store.consumption_pending().unwrap().is_empty());
+    assert!(store.consumption_handoff_get(&intent, 0).unwrap().is_none());
+    store.watch_registry_replace(None, b"registered").unwrap();
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(
+                &intent,
+                "source",
+                "log",
+                CONSUMPTION_DIRECTORIES,
+                u64::MAX
+            )
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    assert!(store.consumption_pending().unwrap().is_empty());
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/7")
+    );
+    let reserved = store
+        .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
+        .unwrap();
+    for change in 0..5 {
+        let mut changed = intent.clone();
+        match change {
+            0 => changed.watch_revision += 1,
+            1 => changed.watch = "replacement-watch".into(),
+            2 => changed.relative_path = b"other.log".to_vec(),
+            3 => changed.observed.inode += 1,
+            _ => changed.observed.changed.0 += 1,
+        }
+        assert_eq!(
+            store.consumption_handoff_get(&changed, 0).unwrap_err().code,
+            "CONFLICT"
+        );
+        assert_eq!(
+            store
+                .consumption_handoff_reserve(&changed, "source", "log", CONSUMPTION_DIRECTORIES, 0)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+    }
+    for index in 1..128 {
+        intent.request_id = format!("handoff-{index}");
+        assert_eq!(
+            store
+                .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
+                .unwrap(),
+            reserved
+        );
+    }
+    intent.request_id = "over-capacity".into();
+    intent.observed.inode += 1;
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert!(store.consumption_handoff_get(&intent, 0).unwrap().is_none());
+    assert_eq!(store.consumption_pending().unwrap(), vec![reserved.clone()]);
+    store.expire(3 * DAY).unwrap();
+    intent.request_id = "handoff-0".into();
+    intent.observed.inode -= 1;
+    assert_eq!(
+        store.consumption_handoff_get(&intent, 3 * DAY).unwrap(),
+        Some(reserved.clone())
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.consumption_handoff_get(&intent, 3 * DAY).unwrap(),
+        Some(reserved.clone())
+    );
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    db.delete(format!("consumption:{}", reserved.import_id))
+        .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    // Corruption cannot masquerade as ordinary retry expiry and authorize a new generation.
+    assert_eq!(
+        store
+            .consumption_handoff_get(&intent, 3 * DAY)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(store.expire(3 * DAY).unwrap_err().code, "STORAGE_FAILURE");
 }
 
 #[test]

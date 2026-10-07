@@ -18,6 +18,7 @@ use rocksdb::{
 pub(crate) mod consumption;
 pub(crate) mod context;
 pub(crate) mod durability;
+pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
 pub(crate) mod pin_read;
@@ -719,9 +720,12 @@ impl Store {
             Some(format)
                 if format == FORMAT
                     || format == consumption::FORMAT
-                    || format == watch_registry::FORMAT =>
+                    || format == watch_registry::FORMAT
+                    || format == handoff::FORMAT =>
             {
-                if (format == watch_registry::FORMAT) != db.get("watch_registry")?.is_some() {
+                if (format == watch_registry::FORMAT || format == handoff::FORMAT)
+                    != db.get("watch_registry")?.is_some()
+                {
                     return Err(Error::new(
                         "STORAGE_FAILURE",
                         "store format and durable watch registry disagree; restore the original catalog and its writer fence",
@@ -1471,18 +1475,10 @@ impl Store {
             if !key.starts_with(b"request:") {
                 break;
             }
-            let managed = key
-                .strip_prefix(b"request:import-publication:")
-                .map(|id| {
-                    std::str::from_utf8(id)
-                        .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))
-                })
-                .transpose()?
-                .map(|id| writer.consumption(id))
-                .transpose()?
-                .flatten()
-                .is_some();
-            if !managed && integer(&parse(&bytes)?, "expires_at")? <= now {
+            let value = parse(&bytes)?;
+            if !writer.managed_consumption_request(&key, &value)?
+                && integer(&value, "expires_at")? <= now
+            {
                 batch.delete(key);
             }
         }

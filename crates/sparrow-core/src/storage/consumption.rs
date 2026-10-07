@@ -217,8 +217,35 @@ impl Catalog for ConsumptionJournal {
 }
 
 impl ConsumptionJournal {
+    pub(super) fn reservation(
+        watch: &str,
+        relative_path: &[u8],
+        source: &str,
+        format: &str,
+        observed: ConsumptionGeneration,
+        directories: ConsumptionDirectories,
+    ) -> Result<Self, Error> {
+        let mut journal = Self {
+            import_id: String::new(),
+            request_id: "reservation".into(),
+            watch: watch.into(),
+            relative_path: relative_path.into(),
+            source: source.into(),
+            format: format.into(),
+            observed,
+            directories,
+            claimed: None,
+            published_artifact: None,
+            removed_at: None,
+        };
+        journal.validate()?;
+        journal.request_id = journal.reserved_request();
+        journal.import_id = super::import::import_id(&journal.request_id);
+        Ok(journal)
+    }
+
     fn validate(&self) -> Result<(), Error> {
-        self.observed.validate()?;
+        validate_source(&self.watch, &self.relative_path, &self.observed)?;
         if self.directories.root_device != self.directories.parent_device
             || self.directories.root_device != self.observed.device
         {
@@ -228,19 +255,6 @@ impl ConsumptionJournal {
             ));
         }
         validate_ingest_labels(&self.request_id, &self.source, &self.format)?;
-        if self.watch.is_empty()
-            || self.watch.len() > 128
-            || self.relative_path.len() > 2048
-            || self.relative_path.split(|b| *b == b'/').any(|part| {
-                part.is_empty() || part == b"." || part == b".." || part == b".sparrow-inflight"
-            })
-            || self.relative_path.contains(&0)
-        {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "require a bounded watch and relative source path without traversal or claim-directory components",
-            ));
-        }
         if let Some(claimed) = &self.claimed {
             claimed.validate()?;
             if claimed.device != self.observed.device
@@ -269,6 +283,28 @@ impl ConsumptionJournal {
             hex::encode(blake3::hash(identity.as_bytes()).as_bytes())
         )
     }
+}
+
+pub(super) fn validate_source(
+    watch: &str,
+    path: &[u8],
+    observed: &ConsumptionGeneration,
+) -> Result<(), Error> {
+    observed.validate()?;
+    if watch.is_empty()
+        || watch.len() > 128
+        || path.len() > 2048
+        || path.split(|b| *b == b'/').any(|part| {
+            part.is_empty() || part == b"." || part == b".." || part == b".sparrow-inflight"
+        })
+        || path.contains(&0)
+    {
+        return Err(Error::new(
+            "INVALID_ARGUMENT",
+            "require a bounded watch and relative source path without traversal or claim-directory components",
+        ));
+    }
+    Ok(())
 }
 
 impl Writer {
@@ -378,23 +414,28 @@ impl Store {
         observed: ConsumptionGeneration,
         directories: ConsumptionDirectories,
     ) -> Result<ConsumptionJournal, Error> {
-        let mut journal = ConsumptionJournal {
-            import_id: String::new(),
-            request_id: "reservation".into(),
-            watch: watch.into(),
-            relative_path: relative_path.into(),
-            source: source.into(),
-            format: format.into(),
+        let journal = ConsumptionJournal::reservation(
+            watch,
+            relative_path,
+            source,
+            format,
             observed,
             directories,
-            claimed: None,
-            published_artifact: None,
-            removed_at: None,
-        };
-        journal.validate()?;
-        journal.request_id = journal.reserved_request();
-        journal.import_id = super::import::import_id(&journal.request_id);
+        )?;
+        self.reserve_consumption(journal, None)
+    }
+
+    pub(super) fn reserve_consumption(
+        &self,
+        journal: ConsumptionJournal,
+        handoff: Option<(&super::handoff::ConsumptionHandoff, u64)>,
+    ) -> Result<ConsumptionJournal, Error> {
         let writer = self.lock()?;
+        if let Some((intent, now)) = handoff
+            && let Some(previous) = writer.handoff(intent, now)?
+        {
+            return Ok(previous);
+        }
         if journal.observed.byte_length
             > writer.config.disk_budget - writer.config.maintenance_reserve
         {
@@ -403,26 +444,38 @@ impl Store {
                 "source generation exceeds the available disk budget",
             ));
         }
-        if let Some(previous) = writer.consumption(&journal.import_id)? {
-            if previous.source != source || previous.format != format {
+        let previous = writer.consumption(&journal.import_id)?;
+        if let Some(previous) = &previous {
+            if previous.source != journal.source || previous.format != journal.format {
                 return Err(Error::new(
                     "CONFLICT",
                     "source generation already reserved with different interpretation",
                 ));
             }
-            return Ok(previous);
+            if handoff.is_none() {
+                return Ok(previous.clone());
+            }
         }
-        if writer.count_prefix("consumption:")? >= MAX_CONSUMPTION_JOURNALS as u64 {
+        if previous.is_none()
+            && writer.count_prefix("consumption:")? >= MAX_CONSUMPTION_JOURNALS as u64
+        {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "16 consumption journals occupied; resolve claims before reserving more",
             ));
         }
         let mut batch = WriteBatch::default();
-        put(&mut batch, &key(&journal.import_id), &journal);
+        let is_new = previous.is_none();
+        let journal = previous.unwrap_or(journal);
+        if is_new {
+            put(&mut batch, &key(&journal.import_id), &journal);
+        }
         // Older writers must refuse before they can reclaim source-owned staging.
         if writer.db.get("store_format")?.as_deref() == Some(super::FORMAT) {
             batch.put("store_format", FORMAT);
+        }
+        if let Some((intent, now)) = handoff {
+            writer.bind_handoff(&mut batch, intent, &journal, now)?;
         }
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
@@ -532,6 +585,7 @@ impl Store {
             .into();
         batch.put(completed_key(id), json::write_compact(&saved));
         batch.delete(key(id));
+        writer.finish_handoffs(&mut batch, id, now)?;
         writer.commit(batch)?;
         Ok(journal)
     }

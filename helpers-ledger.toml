@@ -2,6 +2,62 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "explicit-handoff-binding"
+summary = "Bind a bounded caller request, watch revision, raw path and exact source generation to the existing consumption reservation in one durable batch."
+home = "sparrow_core::storage::handoff::Writer::bind_handoff"
+entry_points = ["sparrow_core::storage::handoff::Store::consumption_handoff_reserve", "sparrow_core::storage::consumption::Store::reserve_consumption"]
+spec = "docs/development-runtime.md: explicit handoff storage foundation."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(write_watch_handoff_receipt|write_claim_handoff_receipt)$']
+
+[[job]]
+id = "explicit-handoff-recovery"
+summary = "Recover the original generation without probing a replacement path, with one bounded native binding reader and hard ownership invariant failures."
+home = "sparrow_core::storage::handoff::Writer::handoff"
+entry_points = ["sparrow_core::storage::handoff::Binding::read", "sparrow_core::storage::handoff::Store::consumption_handoff_get"]
+spec = "docs/development-runtime.md: explicit handoff storage foundation."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(lookup_watch_handoff_receipt|lookup_claim_handoff_receipt)$']
+
+[[job]]
+id = "explicit-handoff-retention"
+summary = "Retain active handoff ownership past ordinary retry expiry and start its completed retry lease atomically with removal confirmation."
+home = "sparrow_core::storage::handoff::Writer::finish_handoffs"
+entry_points = ["sparrow_core::storage::handoff::Writer::managed_consumption_request"]
+spec = "docs/development-runtime.md: explicit handoff storage foundation."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(expire_watch_handoff_receipt|expire_claim_handoff_receipt)$']
+
+[[job]]
+id = "completed-source-validation"
+summary = "One validator checks observed clocks and bounded watch/raw relative path for both discovery journals and explicit handoff intents."
+home = "sparrow_core::storage::consumption::validate_source"
+entry_points = ["sparrow_core::storage::consumption::ConsumptionJournal::reservation", "sparrow_core::storage::handoff::ConsumptionHandoff::validate"]
+spec = "docs/development-runtime.md: explicit handoff storage foundation."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_handoff_source_path|validate_discovery_source_path)$']
+
+[[job]]
 id = "durable-watch-registry"
 summary = "Store one bounded opaque administrative catalog with exact capture compare-and-set, durable publication and a monotonic old-writer format fence."
 home = "sparrow_core::storage::watch_registry::Store::watch_registry_replace"
