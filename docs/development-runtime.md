@@ -88,6 +88,25 @@ old descriptor does not disturb the replacement's ownership. The subsequent
 full gate passed. This verifies that lifecycle rule without claiming which
 particular child inherited the descriptor in the earlier parallel failure.
 
+At 2026-10-07 22:38 UTC, implementation commit `5b3005d` was gracefully cut
+over on the owned development unit. Its main PID is 179150 and the reopened
+session is `session:cc93cc2d988d7594ff1a433b132bf3da`. The same private Unix
+socket serves schema 18; persistent store identity and format remain
+`store:46c88e949ccec658600b66c7becd5bb7` and `sparrow.store/8`. Status reported
+192 live records, 193 payload chunks, 188 JSON projections, no pins or pending
+durability, ready pressure state and the covered synthetic watch at revision 1.
+Directory/socket modes remain 0700/0600.
+
+The saved descriptor and completed-handoff retries returned their original
+artifact/import identities. Independent byte comparisons passed for both
+82-byte descriptor and 87-byte CRLF handoff exports, and the replacement source
+pathname remained intact. Live stdio MCP status reported the same store,
+schema 18 and 192 live records. Exports and MCP output are under
+`/tmp/sparrow-expiry-live.yV2yG5`. This proves cutover and retained-evidence
+regressions; the temporary-store and owned-daemon scenarios above establish
+bounded expiry behavior. It does not qualify sustained pressure, arbitrary live
+producer intake, reboot packaging or complete architecture acceptance.
+
 ## Schema 18 bounded eviction traversal
 
 Eviction retains one session-local position shared by manual core calls and the
