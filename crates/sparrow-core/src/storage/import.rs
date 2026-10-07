@@ -45,6 +45,8 @@ pub struct ImportManifest {
     pub layout_records: u64,
     /// All record spans and digests are committed; evidence remains unpublished.
     pub layout_complete: bool,
+    /// Complete published artifact identity, absent during private preparation.
+    pub published_artifact: Option<String>,
     reclaimed_chunks: u64,
     reclaimed_layout_pages: u64,
 }
@@ -63,6 +65,7 @@ impl Catalog for ImportManifest {
             .with("sealed", self.sealed)
             .with("layout_records", self.layout_records.to_string())
             .with("layout_complete", self.layout_complete)
+            .with("published_artifact", self.published_artifact.clone())
             .with("reclaimed_chunks", self.reclaimed_chunks.to_string())
             .with(
                 "reclaimed_layout_pages",
@@ -93,6 +96,11 @@ impl Catalog for ImportManifest {
                 .map(|_| read_field(value, "layout_complete"))
                 .transpose()?
                 .unwrap_or(false),
+            published_artifact: value
+                .get("published_artifact")
+                .map(|_| read_field(value, "published_artifact"))
+                .transpose()?
+                .unwrap_or(None),
             reclaimed_layout_pages: value
                 .get("reclaimed_layout_pages")
                 .map(|_| integer(value, "reclaimed_layout_pages"))
@@ -122,6 +130,7 @@ impl Catalog for ImportManifest {
                 && (manifest.layout_records == 0) != (manifest.byte_length == 0))
             || (!lines && manifest.layout_records > 1)
             || (manifest.layout_complete && !lines && manifest.layout_records != 1)
+            || (manifest.published_artifact.is_some() && !manifest.layout_complete)
         {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -142,7 +151,7 @@ impl ImportManifest {
         self.layout_records
             .div_ceil(IMPORT_LAYOUT_PAGE_RECORDS as u64)
     }
-    fn require_live(&self, now: u64) -> Result<(), Error> {
+    pub(super) fn require_live(&self, now: u64) -> Result<(), Error> {
         if now >= self.expires_at || self.reclaimed_chunks != 0 || self.reclaimed_layout_pages != 0
         {
             return Err(Error::new(
@@ -248,7 +257,11 @@ impl Writer {
         Ok(rows)
     }
 
-    fn import_chunk(&self, manifest: &ImportManifest, offset: u64) -> Result<Vec<u8>, Error> {
+    pub(super) fn import_chunk(
+        &self,
+        manifest: &ImportManifest,
+        offset: u64,
+    ) -> Result<Vec<u8>, Error> {
         if !offset.is_multiple_of(CHUNK as u64) || offset >= manifest.received_bytes {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
@@ -273,7 +286,7 @@ impl Writer {
         Ok(bytes[32..].to_vec())
     }
 
-    fn admit_import_batch(&self, batch: &WriteBatch) -> Result<(), Error> {
+    pub(super) fn admit_import_batch(&self, batch: &WriteBatch) -> Result<(), Error> {
         let estimate = (batch.size_in_bytes() as u64)
             .saturating_mul(4)
             .saturating_add(65536);
@@ -334,7 +347,7 @@ impl Writer {
         self.commit(batch)
     }
 
-    fn import_layout_rows(
+    pub(super) fn import_layout_rows(
         &self,
         manifest: &ImportManifest,
         index: u64,
@@ -414,6 +427,21 @@ impl Store {
         }
         let writer = self.lock()?;
         let id = import_id(request_id);
+        if let Some(previous) = super::publication::published(&writer, &id, now)? {
+            let saved = previous.0;
+            if saved.request_id != request_id
+                || saved.source != source
+                || saved.format != format
+                || saved.byte_length != byte_length
+                || saved.payload_id != payload_id
+            {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "published import request has different declared input",
+                ));
+            }
+            return Ok(saved);
+        }
         if let Some(bytes) = writer.db.get(&id)? {
             let previous = ImportManifest::decode(&parse(&bytes)?)?;
             if previous.request_id != request_id
@@ -460,6 +488,7 @@ impl Store {
             reclaimed_chunks: 0,
             layout_records: 0,
             layout_complete: false,
+            published_artifact: None,
             reclaimed_layout_pages: 0,
         };
         let mut batch = WriteBatch::default();
@@ -477,7 +506,11 @@ impl Store {
                 "require an import staging ID",
             ));
         }
-        let manifest: ImportManifest = self.lock()?.get(id)?;
+        let writer = self.lock()?;
+        if let Some((manifest, _)) = super::publication::published(&writer, id, now)? {
+            return Ok(manifest);
+        }
+        let manifest: ImportManifest = writer.get(id)?;
         manifest.require_live(now)?;
         Ok(manifest)
     }
@@ -616,6 +649,12 @@ impl Store {
     pub fn import_cancel(&self, id: &str, now: u64) -> Result<(), Error> {
         let writer = self.lock()?;
         let mut manifest: ImportManifest = writer.get(id)?;
+        if manifest.published_artifact.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "published evidence cannot be canceled as staging",
+            ));
+        }
         manifest.expires_at = manifest.expires_at.min(now);
         let mut batch = WriteBatch::default();
         put(&mut batch, id, &manifest);
@@ -750,10 +789,12 @@ impl Store {
         })
     }
 
-    /// Reclaim at most 128 expired chunks/layout pages and 16 journals per call.
+    /// Reclaim at most 128 expired chunk/page/preparation units per call,
+    /// including at most one private prepared record, and 16 journals.
     /// Each synced batch atomically advances its persistent cleanup cursor.
     pub fn import_reclaim(&self, now: u64) -> Result<u64, Error> {
         let writer = self.lock()?;
+        let mut prepared_reclaimed = false;
         let cf = writer
             .db
             .cf_handle("payload")
@@ -764,6 +805,14 @@ impl Store {
             if manifest.expires_at > now {
                 continue;
             }
+            let preparation_done = if !prepared_reclaimed && removed < RECLAIM_CHUNKS {
+                let (done, reclaimed) = super::publication::reclaim_prepared(&writer, &manifest)?;
+                prepared_reclaimed |= reclaimed;
+                removed += u64::from(reclaimed);
+                done
+            } else {
+                false
+            };
             let end = manifest
                 .chunk_count()
                 .min(manifest.reclaimed_chunks + RECLAIM_CHUNKS - removed);
@@ -780,7 +829,10 @@ impl Store {
                 removed += 1;
             }
             manifest.reclaimed_layout_pages = layout_end;
-            if end == manifest.chunk_count() && layout_end == manifest.layout_pages() {
+            if end == manifest.chunk_count()
+                && layout_end == manifest.layout_pages()
+                && preparation_done
+            {
                 batch.delete(&manifest.id);
             } else {
                 put(&mut batch, &manifest.id, &manifest);

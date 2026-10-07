@@ -479,3 +479,48 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(assemble_byte_range|read_staging_range)$']
+
+[[job]]
+id = "record-dependency-retirement"
+summary = "Release native record, projection, text and exact-byte ownership once for expiry or abandoned private preparation."
+home = "sparrow_core::storage::retire::Retirement::record"
+entry_points = []
+spec = "docs/development-runtime.md: checkpointed native preparation and complete publication."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(drop_prepared_record|remove_ingest_record)$']
+
+[[job]]
+id = "complete-import-publication"
+summary = "Verify sealed source identity and prepared dependencies, then publish complete evidence and its durable retry receipt atomically."
+home = "sparrow_core::Store::import_publish"
+entry_points = []
+spec = "docs/development-runtime.md: private preparation, final membership boundary and finite publication retry receipts."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(publish_import_artifact|commit_staged_artifact)$']
+
+[[job]]
+id = "checked-payload-chunk"
+summary = "Read normalized exact-byte chunks with native digest and size verification for byte export or final publication."
+home = "sparrow_core::storage::Writer::payload_chunk"
+entry_points = []
+spec = "docs/development-runtime.md: final complete-byte identity verification through the shared normalized payload reader."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(read_normalized_chunk|verify_payload_chunk)$']

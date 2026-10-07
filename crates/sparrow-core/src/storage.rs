@@ -19,9 +19,11 @@ pub(crate) mod context;
 pub(crate) mod import;
 mod ingest;
 pub(crate) mod pin_read;
+pub(crate) mod publication;
 mod rdf_index;
 pub(crate) mod rdf_view;
 mod record_fields;
+mod retire;
 pub(crate) mod source_time;
 mod text_index;
 
@@ -473,6 +475,23 @@ impl Catalog for Pin {
 }
 
 impl Writer {
+    fn payload_chunk(&self, digest: &str) -> Result<Vec<u8>, Error> {
+        let cf = self
+            .db
+            .cf_handle("payload")
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
+        let bytes = self
+            .db
+            .get_cf(cf, digest)?
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "referenced payload missing"))?;
+        if bytes.len() > CHUNK || hex::encode(blake3::hash(&bytes).as_bytes()) != digest {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "payload size or digest mismatch",
+            ));
+        }
+        Ok(bytes)
+    }
     fn commit_pin(&self, key: &str, arguments: Value, pin: &Pin, now: u64) -> Result<(), Error> {
         let receipt: Value = Object::new()
             .with("arguments", arguments)
@@ -1125,20 +1144,9 @@ impl Store {
             .checked_add(length as u64)
             .filter(|end| *end <= size)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range is outside evidence"))?;
-        let cf = writer
-            .db
-            .cf_handle("payload")
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
-        let chunks = chunks.into_iter().map(|digest| {
-            let chunk = writer
-                .db
-                .get_cf(cf, &digest)?
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "referenced payload missing"))?;
-            if hex::encode(blake3::hash(&chunk).as_bytes()) != digest {
-                return Err(Error::new("STORAGE_FAILURE", "payload digest mismatch"));
-            }
-            Ok(chunk)
-        });
+        let chunks = chunks
+            .into_iter()
+            .map(|digest| writer.payload_chunk(&digest));
         read_chunk_range(chunks, offset, length)
     }
 
@@ -1365,121 +1373,24 @@ impl Store {
         self.pin_read_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
-        let mut batch = WriteBatch::default();
-        let mut removals = BTreeMap::<String, u64>::new();
-        let mut projection_removals = BTreeMap::<String, u64>::new();
-        let mut rdf_removals = BTreeMap::<String, u64>::new();
-        let mut rdf = rdf_index::RdfWrite::new(&writer.db)?;
+        let mut retirement = retire::Retirement::new(&writer)?;
         let mut expired = 0;
         for mut artifact in writer.list::<Artifact>("artifact:")? {
             if !writer.live_artifact(&artifact, now, &protected) && !artifact.chunks.is_empty() {
                 for digest in artifact.chunks.drain(..) {
-                    *removals.entry(digest).or_default() += 1;
+                    *retirement.removals.entry(digest).or_default() += 1;
                 }
-                put(&mut batch, &artifact.id, &artifact);
+                put(&mut retirement.batch, &artifact.id, &artifact);
                 expired += 1;
             }
         }
         for mut record in writer.list::<Record>("record:")? {
-            if !writer.live_record(&record, now, &protected) {
-                writer.remove_text(&mut batch, &record.id)?;
-            }
-            if !writer.live_record(&record, now, &protected)
-                && (!record.chunks.is_empty()
-                    || !record.projection_id.is_empty()
-                    || !record.rdf_projection_id.is_empty()
-                    || writer.db.get(format!("rdf:graph:{}", record.id))?.is_some())
-            {
-                rdf.remove(&mut batch, &record.id)?;
-                if !record.rdf_projection_id.is_empty() {
-                    *rdf_removals
-                        .entry(std::mem::take(&mut record.rdf_projection_id))
-                        .or_default() += 1;
-                }
-                for digest in record.chunks.drain(..) {
-                    *removals.entry(digest).or_default() += 1;
-                }
-                if !record.projection_id.is_empty() {
-                    *projection_removals
-                        .entry(std::mem::take(&mut record.projection_id))
-                        .or_default() += 1;
-                }
-                put(&mut batch, &record.id, &record);
+            if !writer.live_record(&record, now, &protected) && retirement.record(&mut record, 1)? {
+                put(&mut retirement.batch, &record.id, &record);
                 expired += 1;
             }
         }
-        for (id, removed) in rdf_removals {
-            let key = format!("rdf:projection-ref:{id}");
-            let bytes = writer
-                .db
-                .get(&key)?
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF projection reference missing"))?;
-            let count =
-                u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
-                    Error::new("STORAGE_FAILURE", "invalid RDF projection counter")
-                })?);
-            let remaining = count.checked_sub(removed).ok_or_else(|| {
-                Error::new("STORAGE_FAILURE", "RDF projection reference underflow")
-            })?;
-            if remaining == 0 {
-                let state = writer
-                    .db
-                    .get(format!("rdf:state:{id}"))?
-                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF projection state missing"))?;
-                if read_field::<String>(&parse(&state)?, "state")? == "complete" {
-                    rdf.remove(&mut batch, &id)?;
-                }
-                batch.delete(key);
-                batch.delete(format!("rdf:state:{id}"));
-            } else {
-                batch.put(key, remaining.to_be_bytes());
-            }
-        }
-        rdf.finish(&mut batch)?;
-        let cf = writer
-            .db
-            .cf_handle("payload")
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
-        for (projection, removed) in projection_removals {
-            let key = format!("projection-ref:{projection}");
-            let bytes = writer
-                .db
-                .get(&key)?
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "projection reference missing"))?;
-            let count = u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
-                Error::new("STORAGE_FAILURE", "invalid projection reference counter")
-            })?);
-            let remaining = count
-                .checked_sub(removed)
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "projection reference underflow"))?;
-            if remaining == 0 {
-                batch.delete(key);
-                batch.delete(projection);
-            } else {
-                batch.put(key, remaining.to_be_bytes());
-            }
-        }
-        for (digest, removed) in removals {
-            let key = format!("ref:{digest}");
-            let bytes = writer.db.get(&key)?.ok_or_else(|| {
-                Error::new("STORAGE_FAILURE", "reference counter missing during expiry")
-            })?;
-            let count = u64::from_be_bytes(
-                bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::new("STORAGE_FAILURE", "invalid reference counter"))?,
-            );
-            let remaining = count
-                .checked_sub(removed)
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "reference counter underflow"))?;
-            if remaining == 0 {
-                batch.delete(&key);
-                batch.delete_cf(cf, digest);
-            } else {
-                batch.put(key, remaining.to_be_bytes());
-            }
-        }
+        let mut batch = retirement.finish()?;
         for pin in writer.list::<Pin>("pin:")? {
             if pin.expires_at <= now {
                 batch.delete(pin.id);

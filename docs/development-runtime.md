@@ -746,7 +746,7 @@ The core now provides `import_begin`, `import_get`, `import_append`,
 storage foundation for streaming imports. **These operations are not yet wired
 through Cap'n Proto or the CLI. Sealing does not publish an artifact or records,
 and never authorizes source deletion.** The existing daemon import remains
-buffered until complete publication and the typed caller are implemented.
+buffered until the typed streaming caller is implemented and qualified.
 
 Beginning an import binds a request identity to the explicit source, format,
 complete length and canonical BLAKE3 payload identity. At most 16 journals occupy
@@ -765,7 +765,7 @@ preserves the configured maintenance reserve.
 Sealing checks every chunk length/digest and computes the declared whole-input
 identity with PurRDF's bounded streaming BLAKE3 engine. It does not buffer the
 whole file. Cancellation ends the lease durably. Maintenance reclaims at most
-128 expired chunks or layout pages per call and atomically advances each journal's cleanup
+128 expired chunk, layout or preparation units per call and atomically advances each journal's cleanup
 cursor; canceled/expired inputs cannot be read or resumed during cleanup.
 Physical blob/WAL reclamation still depends on native engine maintenance.
 
@@ -817,10 +817,9 @@ unterminated record larger than the buffered artifact limit, 130 records across
 two pages, native record-digest identity, empty inputs for every format, partial
 record-limit refusal followed by reopen/retry, and damaged/missing page refusal.
 Cleanup removes both raw and layout pages across a bounded restart boundary.
-These layouts remain unpublished core preparation. Complete artifact/record
-publication, shared native projection integration and Cap'n Proto streaming
-caller wiring are still required; the development daemon still uses buffered
-import.
+These layouts remain unpublished core preparation. Native record preparation
+and final publication are described below. Cap'n Proto streaming caller wiring
+is still required; the development daemon still uses buffered import.
 
 The full `make check` gate passed for the layout change with 44 storage
 scenarios, all other workspace tests, release Clippy with warnings denied,
@@ -847,9 +846,8 @@ evidence byte reads share one exact range assembler; input-specific chunk digest
 and lifetime checks remain at their respective storage boundaries. Binary
 content, cross-chunk ranges and zero-length reads remain exact after reopen.
 
-This is preparation for complete streaming publication. The staging path still
-does not publish evidence, and streaming native preparation and typed daemon
-caller wiring remain required work.
+The shared builder now also serves private native preparation and final
+publication described below. Typed daemon caller wiring remains required work.
 
 The full `make check` gate passed for shared preparation and staged byte reads:
 45 storage scenarios, all other workspace tests, release Clippy with warnings
@@ -857,3 +855,68 @@ denied, seeded census self-tests and all 23 helper-ledger jobs. Existing native
 projection, ranking, exact-byte, pin/retention and daemon crash/reopen scenarios
 continue to pass through the shared production preparation path. No distinct
 exceptions or unsanctioned isomorphic groups were added.
+
+### Checkpointed native preparation and complete publication
+
+The core adds `import_preparation_get`, `import_prepare_record`, and
+`import_publish`. Preparing one expected record ordinal commits its native
+JSON/Markdown, metadata RDF, text and normalized exact-byte dependencies in
+the shared builder's synced batch, together with its private record catalog
+entry and next preparation ordinal. No ordinary record catalog or temporal
+membership is written during preparation. Queries, metadata lookup and pins
+cannot treat a prepared prefix as published evidence. Retrying an older
+ordinal returns existing progress; skipped ordinals are conflicts. Reopen
+preserves progress, reserved artifact identity and all dependency ownership.
+
+The first preparation attempt durably captures one server receipt clock and
+immutable source-time profile identity (including explicit absence). All
+occurrences use that receipt clock and its 30-day ordinary deadline, independently
+of the time spent preparing their dependencies. A newly declared source profile
+does not reinterpret the already captured preparation context. The final
+availability boundary is the atomic publication commit, rather than a claim
+that the captured receipt clock is an exact commit timestamp.
+
+Publication checks every private record's provenance, uniqueness, original
+span, captured source-time evidence and metadata RDF presence. It streams the
+normalized raw chunks through the shared checked payload reader, verifies each
+record's native digest against its sealed layout, and verifies the whole
+artifact digest and full byte cover. It then commits the complete artifact,
+ordered record catalogs, temporal membership, published staging marker and
+retry receipt atomically, after the preceding synced dependency batches.
+Final metadata plus receipt is bounded to 128 MiB, additionally constrained
+by catalog decoding bounds, current record limit and disk admission. A failed
+check/refusal does not publish an artifact or a record prefix.
+
+The final publication receipt lasts 48 hours after publication and can be
+retrieved after raw/private staging cleanup. Repeated beginning or publication
+of the same declared input returns the published identity; conflicting request
+arguments fail. Published evidence cannot be canceled as staging. Its normal
+retention/pin rules apply. Expired staging cleanup deletes private record copies
+without decrementing transferred published references. Abandoned preparation
+releases both reserved artifact and record payload ownership, its projection
+references, metadata RDF and text through the same retirement implementation as
+ordinary expiry. Cleanup admits at most one prepared record within its shared
+128-unit chunk/layout/control budget per call, with durable recovery cursors.
+
+Core qualification publishes a file of **16 MiB plus two bytes**, above the
+8 MiB fixture buffered limit, as one complete artifact with two records.
+Bounded exports reconstruct every byte and native whole-input identity; its
+oversized text projections remain explicit failures without losing raw bytes.
+A record pin survives parent expiry and releasing it reclaims all remaining
+payload references. Further scenarios cover private-prefix invisibility,
+native JSON/RDF/source-time capture, reopen and ordinal retries, publication
+retry after staging cleanup, canceled shared dependencies, and missing prepared
+payload refusal with no published prefix.
+
+This is core publication qualification. Cap'n Proto/CLI streaming operations
+and daemon crash qualification are not implemented yet. Preparation currently
+materializes at most **16 MiB per individual record**; larger record layouts
+remain durable raw staging but are explicitly refused for publication. Publishing
+those larger raw records with bounded failed/pending projection diagnostics is
+still required, as are measured RSS/disk-pressure and whole-sample acceptance.
+
+The full `make check` gate passed with 50 storage scenarios, including the five
+new native publication/retirement scenarios and cleanup-budget exhaustion across
+multiple journals. All other workspace tests, release Clippy with warnings
+denied, seeded census self-tests and all 26 helper-ledger jobs passed. No
+distinct exceptions or unsanctioned isomorphic groups were added.

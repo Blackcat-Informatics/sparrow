@@ -8,6 +8,412 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"{\"timestamp\":\"2026-09-27T00:13:37.406Z\",\"message\":\"alpha\"}\n{\"timestamp\":\"2026-09-27T00:13:37.406Z\",\"message\":\"alpha\"}\n";
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let journal = store
+        .import_begin(
+            "publish-copy",
+            "events",
+            "jsonl",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    store
+        .define_time_profile(
+            "events",
+            "/timestamp",
+            sparrow_core::TimeRepresentation::Rfc3339,
+        )
+        .unwrap();
+    store.import_append(&journal.id, 0, input, 0).unwrap();
+    store.import_seal(&journal.id, 0).unwrap();
+    store.import_prepare_layout(&journal.id, 0).unwrap();
+    assert!(
+        store
+            .import_preparation_get(&journal.id, 0)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.import_publish(&journal.id, 0).unwrap_err().code,
+        "CONFLICT"
+    );
+    let progress = store.import_prepare_record(&journal.id, 0, 10).unwrap();
+    assert_eq!(progress.prepared_records, 1);
+    assert!(store.records(10).unwrap().is_empty());
+    assert_eq!(
+        store.artifact(&progress.artifact_id).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        store.import_publish(&journal.id, 10).unwrap_err().code,
+        "CONFLICT"
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.import_prepare_record(&journal.id, 0, 20).unwrap(),
+        progress
+    );
+    assert_eq!(
+        store
+            .import_prepare_record(&journal.id, 2, 20)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let complete = store.import_prepare_record(&journal.id, 1, 20).unwrap();
+    assert_eq!(complete.prepared_records, 2);
+    assert_eq!(complete.received_at, 10);
+    let artifact = store.import_publish(&journal.id, 30).unwrap();
+    assert_eq!(artifact.record_ids.len(), 2);
+    assert_eq!(
+        store.bytes(&artifact.id, 0, input.len(), 30).unwrap(),
+        input
+    );
+    for id in &artifact.record_ids {
+        let record = store.record(id).unwrap();
+        assert!(matches!(
+            record.event_time,
+            sparrow_core::EventTime::Known { .. }
+        ));
+        assert_eq!(
+            store.rdf_inspect(id, 30).unwrap()["state"].as_str(),
+            Some("complete")
+        );
+    }
+    assert_eq!(store.records(30).unwrap().len(), 2);
+    assert_eq!(
+        store.import_cancel(&journal.id, 30).unwrap_err().code,
+        "CONFLICT"
+    );
+    // Expired private staging copies must never decrement published ownership.
+    while store.import_reclaim(2 * DAY).unwrap() != 0 {}
+    assert_eq!(store.records(2 * DAY).unwrap().len(), 2);
+    assert_eq!(
+        store.bytes(&artifact.id, 0, input.len(), 2 * DAY).unwrap(),
+        input
+    );
+    assert_eq!(
+        store.import_publish(&journal.id, 2 * DAY).unwrap().id,
+        artifact.id
+    );
+    let retry = store
+        .import_begin(
+            "publish-copy",
+            "events",
+            "jsonl",
+            input.len() as u64,
+            &digest,
+            2 * DAY,
+        )
+        .unwrap();
+    assert_eq!(retry.published_artifact.as_ref(), Some(&artifact.id));
+    assert_eq!(
+        store
+            .import_begin(
+                "publish-copy",
+                "changed",
+                "jsonl",
+                input.len() as u64,
+                &digest,
+                2 * DAY
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_json_projections"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn canceled_native_preparation_releases_only_its_own_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"{\"message\":\"retained\"}\n{\"message\":\"retained\"}\n";
+    let original = store
+        .ingest("original", "retained", "jsonl", input, 0)
+        .unwrap();
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let journal = store
+        .import_begin(
+            "cancel-native",
+            "private",
+            "jsonl",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    store.import_append(&journal.id, 0, input, 0).unwrap();
+    store.import_seal(&journal.id, 0).unwrap();
+    store.import_prepare_layout(&journal.id, 0).unwrap();
+    store.import_prepare_record(&journal.id, 0, 1).unwrap();
+    store.import_prepare_record(&journal.id, 1, 1).unwrap();
+    assert_eq!(store.records(1).unwrap().len(), 2);
+    store.import_cancel(&journal.id, 2).unwrap();
+    assert!(store.import_reclaim(2).unwrap() > 0);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    while store.import_reclaim(2).unwrap() != 0 {}
+    assert_eq!(
+        store.import_get(&journal.id, 2).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(store.bytes(&original.id, 0, input.len(), 2).unwrap(), input);
+    for id in &original.record_ids {
+        assert_eq!(
+            store.rdf_inspect(id, 2).unwrap()["state"].as_str(),
+            Some("complete")
+        );
+    }
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_json_projections"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn import_publication_refuses_missing_prepared_payload_without_publishing_a_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = b"one\n";
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = store
+        .import_begin(
+            "broken-prepared",
+            "copy",
+            "log",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    store.import_append(&journal.id, 0, input, 0).unwrap();
+    store.import_seal(&journal.id, 0).unwrap();
+    store.import_prepare_layout(&journal.id, 0).unwrap();
+    let progress = store.import_prepare_record(&journal.id, 0, 0).unwrap();
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    db.delete_cf(
+        db.cf_handle("payload").unwrap(),
+        digest.strip_prefix("blake3:").unwrap(),
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.import_publish(&journal.id, 1).unwrap_err().code,
+        "STORAGE_FAILURE"
+    );
+    assert!(store.artifacts(1).unwrap().is_empty());
+    assert!(store.records(1).unwrap().is_empty());
+    assert_eq!(
+        store.artifact(&progress.artifact_id).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        store.import_bytes(&journal.id, 0, input.len(), 1).unwrap(),
+        input
+    );
+    store.import_cancel(&journal.id, 1).unwrap();
+    while store.import_reclaim(1).unwrap() != 0 {}
+    assert_eq!(
+        store.status(1).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn exhausted_chunk_cleanup_budget_defers_later_native_preparation_retirement() {
+    use sparrow_core::IMPORT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let block = vec![b'x'; IMPORT_CHUNK_BYTES];
+    let mut hash = purrdf_hash::blake3::Hasher::new();
+    for _ in 0..130 {
+        hash.update(&block);
+    }
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(hash.finalize().as_bytes())
+    );
+    let mut journals = Vec::new();
+    for request in ["budget-first", "budget-second"] {
+        let journal = store
+            .import_begin(
+                request,
+                "copy",
+                "log",
+                130 * IMPORT_CHUNK_BYTES as u64,
+                &digest,
+                0,
+            )
+            .unwrap();
+        for index in 0..130 {
+            store
+                .import_append(&journal.id, index * IMPORT_CHUNK_BYTES as u64, &block, 0)
+                .unwrap();
+        }
+        journals.push(journal);
+    }
+    journals.sort_by(|a, b| a.id.cmp(&b.id));
+    let later = &journals[1];
+    store.import_seal(&later.id, 0).unwrap();
+    store.import_prepare_layout(&later.id, 0).unwrap();
+    store.import_prepare_record(&later.id, 0, 0).unwrap();
+    for journal in &journals {
+        store.import_cancel(&journal.id, 0).unwrap();
+    }
+    // The first journal consumes the whole call's quota. The later private
+    // record cannot consume unit 129 or underflow remaining cleanup capacity.
+    assert_eq!(store.import_reclaim(0).unwrap(), 128);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.import_reclaim(0).unwrap(), 128);
+    assert_eq!(store.import_reclaim(0).unwrap(), 6);
+    assert_eq!(store.import_reclaim(0).unwrap(), 0);
+    assert_eq!(
+        store.status(0).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn native_import_publishes_files_above_buffered_limit_without_a_whole_file_batch() {
+    use sparrow_core::IMPORT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut input = vec![b'a'; 8 * 1024 * 1024];
+    input.push(b'\n');
+    input.extend_from_slice(&vec![b'b'; 8 * 1024 * 1024]);
+    input.push(b'\n');
+    assert_eq!(
+        store
+            .ingest("buffered-too-large", "copy", "log", &input, 0)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
+    );
+    let journal = store
+        .import_begin(
+            "large-publish",
+            "copy",
+            "log",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate() {
+        store
+            .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
+            .unwrap();
+    }
+    store.import_seal(&journal.id, 0).unwrap();
+    store.import_prepare_layout(&journal.id, 0).unwrap();
+    store.import_prepare_record(&journal.id, 0, 1).unwrap();
+    assert!(store.records(1).unwrap().is_empty());
+    store.import_prepare_record(&journal.id, 1, 2).unwrap();
+    let artifact = store.import_publish(&journal.id, 3).unwrap();
+    assert_eq!(artifact.byte_length, input.len() as u64);
+    assert_eq!(artifact.payload_id, digest);
+    assert_eq!(artifact.record_ids.len(), 2);
+    let mut reconstructed = purrdf_hash::blake3::Hasher::new();
+    for (index, expected) in input.chunks(1024 * 1024).enumerate() {
+        let bytes = store
+            .bytes(
+                &artifact.id,
+                (index * 1024 * 1024) as u64,
+                expected.len(),
+                3,
+            )
+            .unwrap();
+        assert_eq!(bytes, expected);
+        reconstructed.update(&bytes);
+    }
+    assert_eq!(
+        format!(
+            "blake3:{}",
+            purrdf_hash::hex::encode(reconstructed.finalize().as_bytes())
+        ),
+        digest
+    );
+    let second = store.record(&artifact.record_ids[1]).unwrap();
+    assert_eq!(second.byte_start, 8 * 1024 * 1024 + 1);
+    assert_eq!(
+        store.bytes(&second.id, 8 * 1024 * 1024 - 1, 2, 3).unwrap(),
+        b"b\n"
+    );
+    let scope = sparrow_core::QueryScope {
+        source: Some("copy".into()),
+        received_from: 0,
+        received_before: 10,
+        limit: 10,
+        scan_budget: 100,
+    };
+    let query = store.text_query(&scope, "a", 3).unwrap();
+    assert_eq!(
+        query["text_coverage"]["failed_or_incomplete"].as_str(),
+        Some("2")
+    );
+    let pin = store
+        .pin(
+            "retain-large-record",
+            "Case",
+            std::slice::from_ref(&second.id),
+            40,
+            3,
+        )
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store
+            .bytes(&second.id, 8 * 1024 * 1024 - 1, 2, 31 * DAY)
+            .unwrap(),
+        b"b\n"
+    );
+    store.release(&pin.id).unwrap();
+    store.expire(41 * DAY).unwrap();
+    assert_eq!(
+        store.status(41 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
 fn bounded_staging_ranges_preserve_exact_binary_bytes_and_committed_frontiers() {
     use sparrow_core::IMPORT_CHUNK_BYTES;
     let dir = tempfile::tempdir().unwrap();
