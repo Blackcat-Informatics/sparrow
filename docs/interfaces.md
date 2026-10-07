@@ -308,7 +308,7 @@ days does not shorten a record that would ordinarily remain for another twenty.
 
 ## 5. Cap'n Proto ingestion, queries, and administration
 
-The daemon contract is `crates/sparrow-server/schema/sparrow.capnp`. Generated
+The daemon contract is `crates/sparrow-client/schema/sparrow.capnp`. Generated
 client/server types carry requests, binary payloads, instants, counts,
 result/error unions and store-scoped references. Mutation requests carry stable
 `requestId` values. Uploads, batches, RPC traversal, operation work and concurrency

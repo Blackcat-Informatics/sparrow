@@ -543,7 +543,7 @@ names = ['^(lookup_buffered_ingest_retry|lookup_streamed_ingest_retry)$']
 [[job]]
 id = "typed-evidence-format"
 summary = "Translate original artifact format labels into the generated Cap'n Proto enum in one place."
-home = "sparrow_server::rpc::stored_format"
+home = "sparrow_client::parse_format"
 entry_points = []
 spec = "docs/interfaces.md: typed format contract; artifacts and staging use the same representation."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
@@ -558,10 +558,10 @@ names = ['^(artifact_wire_format|import_wire_format)$']
 [[job]]
 id = "completed-file-identity"
 summary = "Capture the opened client file's device, inode, length and nanosecond modification/change clocks for completed-input stability checks."
-home = "sparrow_server::agent::ingest::file_identity"
+home = "sparrow_client::imports::file_identity"
 entry_points = []
 spec = "docs/development-runtime.md: schema-9 bounded file hashing and publication guards."
-vectors = ["crates/sparrow-server/src/agent/ingest.rs", "crates/sparrow-server/tests/rpc.rs"]
+vectors = ["crates/sparrow-client/src/imports.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true
 
@@ -575,7 +575,7 @@ id = "typed-import-progress"
 summary = "Render private committed staging and layout progress separately from accepted artifact receipts."
 home = "sparrow_server::rpc::import_progress"
 entry_points = []
-spec = "crates/sparrow-server/schema/sparrow.capnp: ImportProgress and ImportStart unions."
+spec = "crates/sparrow-client/schema/sparrow.capnp: ImportProgress and ImportStart unions."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true
@@ -584,6 +584,51 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(render_staging_progress|encode_upload_progress)$']
+
+[[job]]
+id = "typed-producer-discovery"
+summary = "Decode and validate the same typed daemon discovery before CLI and SDK mutations."
+home = "sparrow_client::receipt::Discovery::decode"
+entry_points = []
+spec = "docs/development-runtime.md: standalone typed Rust producer client."
+vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_cli_discovery|validate_producer_discovery)$']
+
+[[job]]
+id = "completed-file-upload"
+summary = "Hash and stream the opened stable regular file through shared typed durable staging and publication."
+home = "sparrow_client::imports::import_file"
+entry_points = []
+spec = "docs/development-runtime.md: standalone typed Rust producer client."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(upload_completed_file|stream_cli_import)$']
+
+[[job]]
+id = "typed-artifact-receipt"
+summary = "Decode the generated immutable artifact acceptance metadata once for SDK callers and CLI rendering."
+home = "sparrow_client::receipt::ArtifactReceipt::decode"
+entry_points = []
+spec = "docs/development-runtime.md: standalone typed Rust producer client."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_cli_artifact|decode_sdk_artifact)$']
 
 [[job]]
 id = "oversized-raw-record-preparation"

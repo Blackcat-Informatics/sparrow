@@ -36,14 +36,7 @@ impl std::fmt::Display for AgentError {
 impl std::error::Error for AgentError {}
 impl From<capnp::Error> for AgentError {
     fn from(error: capnp::Error) -> Self {
-        Self {
-            retryable: matches!(
-                error.kind,
-                capnp::ErrorKind::Disconnected | capnp::ErrorKind::Overloaded
-            ),
-            code: "RPC_FAILURE".into(),
-            message: error.to_string(),
-        }
+        sparrow_client::Error::from(error).into()
     }
 }
 impl From<std::str::Utf8Error> for AgentError {
@@ -54,5 +47,35 @@ impl From<std::str::Utf8Error> for AgentError {
 impl From<capnp::NotInSchema> for AgentError {
     fn from(error: capnp::NotInSchema) -> Self {
         Self::from(capnp::Error::from(error))
+    }
+}
+
+impl From<sparrow_client::Error> for AgentError {
+    fn from(error: sparrow_client::Error) -> Self {
+        use sparrow_client::Error;
+        let retryable = error.retryable();
+        let (code, message) = match error {
+            Error::Transport(error) => ("RPC_FAILURE", error.to_string()),
+            Error::Domain {
+                code,
+                message,
+                retryable,
+            } => {
+                return Self {
+                    code,
+                    message,
+                    retryable,
+                };
+            }
+            Error::Unsupported(message) => ("UNSUPPORTED", message.to_owned()),
+            Error::Protocol(message) => ("PROTOCOL_FAILURE", message.to_owned()),
+            Error::InvalidArgument(message) => ("INVALID_ARGUMENT", message.to_owned()),
+            Error::Io(error) => ("FILE_IO_FAILURE", error.to_string()),
+        };
+        Self {
+            code: code.into(),
+            message,
+            retryable,
+        }
     }
 }

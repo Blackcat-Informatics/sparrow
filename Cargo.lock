@@ -1231,6 +1231,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparrow-client"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "capnpc",
+ "futures",
+ "purrdf-hash",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "sparrow-core"
 version = "0.1.0"
 dependencies = [
@@ -1258,12 +1272,12 @@ version = "0.1.0"
 dependencies = [
  "capnp",
  "capnp-rpc",
- "capnpc",
  "futures",
  "purrdf",
  "purrdf-hash",
  "purrdf-lex",
  "serde",
+ "sparrow-client",
  "sparrow-core",
  "tempfile",
  "tokio",

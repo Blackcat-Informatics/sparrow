@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "sparrow-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+capnp.workspace = true
+capnp-rpc.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+purrdf-hash.workspace = true
+
+[build-dependencies]
+capnpc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

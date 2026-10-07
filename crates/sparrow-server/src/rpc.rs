@@ -169,28 +169,7 @@ fn failure<T: capnp::traits::Owned + 'static>(output: wire::result::Builder<'_, 
     out.set_retryable(matches!(error.code, "STORAGE_PRESSURE" | "RESOURCE_LIMIT"));
 }
 
-pub(crate) fn format(value: wire::Format) -> &'static str {
-    match value {
-        wire::Format::Jsonl => "jsonl",
-        wire::Format::Log => "log",
-        wire::Format::Json => "json",
-        wire::Format::Markdown => "markdown",
-        wire::Format::Opaque => "opaque",
-    }
-}
-
-pub(crate) fn stored_format(value: &str) -> capnp::Result<wire::Format> {
-    match value {
-        "jsonl" => Ok(wire::Format::Jsonl),
-        "log" => Ok(wire::Format::Log),
-        "json" => Ok(wire::Format::Json),
-        "markdown" => Ok(wire::Format::Markdown),
-        "opaque" => Ok(wire::Format::Opaque),
-        _ => Err(capnp::Error::failed(
-            "format requires jsonl, log, json, markdown or opaque".into(),
-        )),
-    }
-}
+pub(crate) use sparrow_client::{format_label as format, parse_format as stored_format};
 
 fn artifact(
     mut out: wire::artifact::Builder<'_>,
@@ -1135,7 +1114,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(10);
+                out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);

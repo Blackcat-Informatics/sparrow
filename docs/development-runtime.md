@@ -9,20 +9,52 @@ The daemon uses **Cap'n Proto RPC over a private Unix-domain socket**. The HTTP
 implementation and its dependency were removed following the transport decision
 on 2026-10-06. No JSON operation envelope is sent between clients and the daemon.
 The generated typed contract is
-[`sparrow.capnp`](../crates/sparrow-server/schema/sparrow.capnp). Domain results
+[`sparrow.capnp`](../crates/sparrow-client/schema/sparrow.capnp). Domain results
 and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods include the eight import methods documented below,
 plus `status`, `ingest`, `artifactGet`, `recordGet`,
 `bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext`, `rdfInspect`, `sourceTimeDefine` and `sourceTimeGet`. The shared typed
-client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
+client transport is `sparrow_client::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
 result rendering. The CLI supplies status, non-destructive resumable file import,
 exact byte export, key/value and full-text searches. MCP also supplies artifact/
 record metadata and pin/release calls. CLI and MCP both supply stable-ID pin renewal
 and paginated pin discovery/member retrieval. Remaining CLI commands and query surfaces
 are required work.
+
+## Standalone typed Rust producer client
+
+`crates/sparrow-client` owns the schema compilation, Unix transport, discovery
+guard, typed artifact receipts and completed-file upload implementation. The
+daemon imports the generated contract from this crate. The CLI uses its public
+`import_file` function; there is one hashing, file-identity and resumable upload
+path. The existing server exports are reexports of these same generated types.
+
+`sparrow_client::Client::connect` checks discovery before producer mutations.
+Within a Tokio `LocalSet`, callers can use `ingest`, `import_file`, `artifact`,
+`discovery`, and the generated query capability. Direct ingestion rejects inputs
+above the discovered buffered-input limit; file imports hash and upload through
+one 64 KiB buffer. Both return owned `ArtifactReceipt` values. Reuse the original
+request ID and immutable bytes after a connection failure. Domain errors retain
+their exact daemon code, message and retryability; incompatible discovery, I/O,
+protocol and transport failures remain explicit.
+
+The producer dependency graph was checked with `cargo tree -p sparrow-client -e
+normal`: it contains the Cap'n Proto/Tokio transport and native PurRDF hashing,
+without RocksDB, `sparrow-core`, or the semantic engine. Release acceptance now
+uses the SDK to recover a partially prepared oversized record after a daemon
+crash, verifies the same receipt through CLI retries and SDK inspection, then
+checks durable direct ingestion and conflicting request refusal. Discovery tests
+refuse old schema versions and missing projection identity. The Rust example in
+the crate documentation is compiled as a doctest.
+
+This is the direct artifact client. Automatic reconnection, logging queues,
+`tracing_subscriber::Layer`, typed structured event/span ingestion, buffered
+acknowledgments and durable flush/shutdown watermarks remain required work. The
+current SDK returns durable artifact receipts; it does not advertise these
+unfinished behaviors. Full server acceptance remains unmet.
 
 ```sh
 CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server

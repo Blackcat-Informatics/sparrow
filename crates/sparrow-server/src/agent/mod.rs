@@ -458,17 +458,7 @@ fn optional_value(field: wire::optional_text::Reader<'_>) -> Result<Value> {
 }
 
 fn failure(error: wire::failure::Reader<'_>) -> AgentError {
-    match (
-        error.get_code().and_then(|t| Ok(t.to_str()?.to_owned())),
-        error.get_message().and_then(|t| Ok(t.to_str()?.to_owned())),
-    ) {
-        (Ok(code), Ok(message)) => AgentError {
-            code,
-            message,
-            retryable: error.get_retryable(),
-        },
-        (Err(error), _) | (_, Err(error)) => error.into(),
-    }
+    sparrow_client::Error::domain(error).into()
 }
 
 fn instant(value: wire::instant::Reader<'_>) -> Result<String> {
