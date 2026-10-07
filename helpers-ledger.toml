@@ -223,3 +223,18 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(encode_)?base64(_encode)?$']
+
+[[job]]
+id = "record-context"
+summary = "Capture bounded same-source retained neighbors in explicit acceptance-time order."
+home = "sparrow_core::Store::records_context"
+entry_points = []
+spec = "docs/development-runtime.md: retained context, scan frontiers and observed retirement gaps."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^scan_context_neighbors$']

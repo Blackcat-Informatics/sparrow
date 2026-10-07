@@ -31,6 +31,10 @@ const TOOLS: &[(&str, &str)] = &[
         "Read a concrete complete artifact's metadata; retained records do not substitute for an expired artifact.",
     ),
     (
+        "records_context",
+        "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity.",
+    ),
+    (
         "record_get",
         "Read one concrete record's metadata and artifact-relative byte bounds.",
     ),
@@ -67,7 +71,14 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
-        if ["keys_list", "values_search", "text_search"].contains(name) {
+        if [
+            "keys_list",
+            "values_search",
+            "text_search",
+            "records_context",
+        ]
+        .contains(name)
+        {
             for field in ["source", "received_from", "received_before"] {
                 properties = properties.with(
                     field,
@@ -96,15 +107,38 @@ pub(crate) fn definitions() -> Value {
             "bytes_read",
             "pin",
             "pin_release",
+            "records_context",
         ]
         .contains(name)
         {
             properties = properties.with("store_id", string());
             required.push("store_id");
         }
-        if ["artifact_get", "record_get", "bytes_read"].contains(name) {
+        if [
+            "artifact_get",
+            "record_get",
+            "bytes_read",
+            "records_context",
+        ]
+        .contains(name)
+        {
             properties = properties.with("id", string());
             required.push("id");
+        }
+        if *name == "records_context" {
+            let count = Object::new()
+                .with("type", "integer")
+                .with("minimum", 0_u64)
+                .with("maximum", 999_u64);
+            properties = properties
+                .with("before", count.clone())
+                .with("after", count)
+                .with(
+                    "ordering",
+                    Object::new()
+                        .with("type", "string")
+                        .with("enum", Value::array(["received_at_record_id"])),
+                );
         }
         if *name == "bytes_read" {
             properties = properties

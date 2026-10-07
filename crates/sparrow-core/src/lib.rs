@@ -11,5 +11,6 @@ mod text;
 
 pub use instant::{format_instant, parse_instant};
 pub use query::{JsonQuery, QueryScope};
+pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::{Artifact, Config, Error, Pin, Record, Store};
 pub use text::resolve_text_analyzer;

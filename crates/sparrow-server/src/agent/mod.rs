@@ -6,6 +6,7 @@
 use crate::sparrow_capnp as wire;
 use purrdf_lex::json::{Object, Value};
 
+mod context;
 mod error;
 mod ingest;
 mod read;
@@ -17,7 +18,7 @@ pub type AgentResult<T> = std::result::Result<T, AgentError>;
 type Result<T> = AgentResult<T>;
 pub(crate) mod tool;
 
-pub(super) const USAGE: &str = "usage: sparrow SOCKET_PATH status | ingest REQUEST_ID SOURCE FORMAT FILE | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | text QUERY | keys | values [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N]; values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT";
+pub(super) const USAGE: &str = "usage: sparrow SOCKET_PATH status | ingest REQUEST_ID SOURCE FORMAT FILE | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N]; values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT";
 
 /// Execute a CLI command through the same typed client and renderer as MCP.
 pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<Value> {
@@ -31,6 +32,7 @@ pub(super) enum Command {
     Status,
     Ingest(ingest::Input),
     Bytes(read::Input),
+    Context(context::Input),
     Query {
         values: bool,
         text: Option<String>,
@@ -135,6 +137,7 @@ impl Command {
             Some("keys") => false,
             Some("values") => true,
             Some("text") => false,
+            Some("context") => false,
             _ => return Err(invalid(USAGE)),
         };
         let text = if args[0] == "text" {
@@ -147,8 +150,21 @@ impl Command {
             None
         };
         let mut options = Options::default();
+        let context = args[0] == "context";
+        if context && args.len() < 3 {
+            return Err(invalid("context requires STORE_ID RECORD_ID"));
+        }
+        let mut before = 10;
+        let mut after = 10;
         let mut seen = std::collections::BTreeSet::new();
-        let mut fields = args[if text.is_some() { 2 } else { 1 }..].iter();
+        let mut fields = args[if context {
+            3
+        } else if text.is_some() {
+            2
+        } else {
+            1
+        }..]
+            .iter();
         while let Some(flag) = fields.next() {
             if !seen.insert(flag) {
                 return Err(invalid(format!("duplicate option: {flag}")));
@@ -182,10 +198,32 @@ impl Command {
                 }
                 "--lexical" if values => options.lexical = Some(value.clone()),
                 "--decoded" if values => options.decoded = Some(value.clone()),
+                "--before" if context => {
+                    before = value
+                        .parse()
+                        .map_err(|_| invalid("--before requires an unsigned integer"))?
+                }
+                "--after" if context => {
+                    after = value
+                        .parse()
+                        .map_err(|_| invalid("--after requires an unsigned integer"))?
+                }
+                "--ordering" if context && value == "received_at_record_id" => {}
                 _ => return Err(invalid(format!("unknown option for {}: {flag}", args[0]))),
             }
         }
         options.validate()?;
+        if context {
+            let input = context::Input {
+                store: args[1].clone(),
+                id: args[2].clone(),
+                options,
+                before,
+                after,
+            };
+            input.validate()?;
+            return Ok(Self::Context(input));
+        }
         Ok(Self::Query {
             values,
             text,
@@ -198,6 +236,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Bytes(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::Context(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         let Self::Query {

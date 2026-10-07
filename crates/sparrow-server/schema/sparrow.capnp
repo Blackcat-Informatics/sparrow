@@ -92,6 +92,20 @@ struct TextRanking {
 struct TextCoverage { failedOrIncomplete @0 :UInt64; notApplicable @1 :UInt64; postingVisits @2 :UInt64; }
 struct TextQuery { scope @0 :Scope; text @1 :Text; }
 struct TextResults { receipt @0 :Receipt; ranking @1 :TextRanking; coverage @2 :TextCoverage; rows @3 :List(TextMatch); }
+enum ContextOrder { receivedAtRecordId @0; }
+enum ContextFrontier { requestedCount @0; scopeBoundary @1; scanBudget @2; }
+struct ContextQuery {
+  anchor @0 :RecordRef; scope @1 :Scope; ordering @2 :ContextOrder;
+  before @3 :UInt32 = 10; after @4 :UInt32 = 10;
+}
+struct ContextSide {
+  rows @0 :List(Record); visited @1 :UInt64; retired @2 :UInt64;
+  frontier @3 :ContextFrontier;
+}
+struct Context {
+  receipt @0 :Receipt; anchor @1 :Record; before @2 :ContextSide; after @3 :ContextSide;
+  ordering @4 :ContextOrder; continuityUnknown @5 :Bool = true;
+}
 interface Sparrow {
   status @0 () -> (result :Result(Status));
   ingest @1 (request :Ingest) -> (result :Result(Artifact));
@@ -103,4 +117,5 @@ interface Sparrow {
   keysList @7 (scope :Scope) -> (result :Result(Keys));
   valuesSearch @8 (query :ValueQuery) -> (result :Result(Values));
   textSearch @9 (query :TextQuery) -> (result :Result(TextResults));
+  recordsContext @10 (query :ContextQuery) -> (result :Result(Context));
 }

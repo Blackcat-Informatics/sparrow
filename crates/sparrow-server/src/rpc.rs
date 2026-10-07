@@ -238,6 +238,24 @@ fn pin(mut out: wire::pin::Builder<'_>, value: Pin, store: &str) -> capnp::Resul
     Ok(())
 }
 
+fn context_side(
+    mut out: wire::context_side::Builder<'_>,
+    value: sparrow_core::ContextSide,
+    store: &str,
+) {
+    out.set_visited(value.visited);
+    out.set_retired(value.retired);
+    out.set_frontier(match value.frontier {
+        sparrow_core::ContextFrontier::RequestedCount => wire::ContextFrontier::RequestedCount,
+        sparrow_core::ContextFrontier::ScopeBoundary => wire::ContextFrontier::ScopeBoundary,
+        sparrow_core::ContextFrontier::ScanBudget => wire::ContextFrontier::ScanBudget,
+    });
+    let mut rows = out.init_rows(value.records.len() as u32);
+    for (index, value) in value.records.into_iter().enumerate() {
+        record(rows.reborrow().get(index as u32), value, store);
+    }
+}
+
 fn optional(value: wire::optional_text::Reader<'_>) -> capnp::Result<Option<String>> {
     match value.which()? {
         wire::optional_text::Absent(()) => Ok(None),
@@ -307,6 +325,65 @@ fn rows(value: &Value) -> capnp::Result<&[Value]> {
 }
 
 impl wire::sparrow::Server for Rpc {
+    async fn records_context(
+        self: Rc<Self>,
+        params: wire::sparrow::RecordsContextParams,
+        mut results: wire::sparrow::RecordsContextResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_query()?;
+        let anchor = input.get_anchor()?;
+        let reference = self.reference(
+            anchor.get_store_id()?.to_str()?,
+            anchor.get_id()?.to_str()?,
+            "record:",
+        );
+        let scope = scope(input.get_scope()?)?;
+        let before = input.get_before() as usize;
+        let after = input.get_after() as usize;
+        let ordering = input.get_ordering().map_err(invalid);
+        let found = match (reference, ordering) {
+            (Ok(id), Ok(wire::ContextOrder::ReceivedAtRecordId)) => {
+                self.work(move |store, now| store.records_context(&id, &scope, before, after, now))
+                    .await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        match found {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(value) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_ordering(wire::ContextOrder::ReceivedAtRecordId);
+                out.set_continuity_unknown(true);
+                let mut receipt = out.reborrow().init_receipt();
+                receipt.set_store_id(&value.store_id);
+                receipt
+                    .reborrow()
+                    .init_membership_at()
+                    .set_unix_millis(value.membership_at);
+                let limited = [value.before.frontier, value.after.frontier]
+                    .contains(&sparrow_core::ContextFrontier::ScanBudget);
+                receipt.set_execution(if limited {
+                    wire::Execution::Limited
+                } else {
+                    wire::Execution::Complete
+                });
+                receipt.set_certainty(if limited {
+                    wire::Certainty::Incomplete
+                } else {
+                    wire::Certainty::Exact
+                });
+                let mut coverage = receipt.init_coverage();
+                coverage.set_visited(1 + value.before.visited + value.after.visited);
+                coverage.set_eligible_records(
+                    (1 + value.before.records.len() + value.after.records.len()) as u64,
+                );
+                record(out.reborrow().init_anchor(), value.anchor, &value.store_id);
+                context_side(out.reborrow().init_before(), value.before, &value.store_id);
+                context_side(out.init_after(), value.after, &value.store_id);
+            }
+        }
+        Ok(())
+    }
     async fn text_search(
         self: Rc<Self>,
         params: wire::sparrow::TextSearchParams,
@@ -427,7 +504,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(2);
+                out.set_schema_version(3);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
                 out.set_physical_bytes(number(&value, "physical_bytes")?);

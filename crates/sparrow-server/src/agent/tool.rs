@@ -5,7 +5,8 @@
 
 use super::Result;
 use super::{
-    Command, Options, evidence, failure, ingest, instant, invalid, parse_kind, read, status, wire,
+    Command, Options, context, evidence, failure, ingest, instant, invalid, parse_kind, read,
+    status, wire,
 };
 use purrdf_lex::json::{
     Object, Value,
@@ -52,7 +53,7 @@ impl Operation {
             let result = match name {
                 "status" => Self::Status,
                 "capabilities" => Self::Capabilities,
-                "keys_list" | "values_search" | "text_search" => {
+                "keys_list" | "values_search" | "text_search" | "records_context" => {
                     let mut options = Options {
                         source: fields.optional("source")?,
                         ..Options::default()
@@ -85,6 +86,36 @@ impl Operation {
                         options.decoded = fields.optional("decoded")?;
                     }
                     options.validate().map_err(DecodeError::custom)?;
+                    if name == "records_context" {
+                        let ordering: Option<String> =
+                            fields.raw("ordering")?.map(String::from_json).transpose()?;
+                        if ordering
+                            .as_deref()
+                            .is_some_and(|s| s != "received_at_record_id")
+                        {
+                            return Err(DecodeError::custom(
+                                "context ordering must be received_at_record_id",
+                            ));
+                        }
+                        let input = context::Input {
+                            store: fields.required("store_id")?,
+                            id: fields.required("id")?,
+                            before: fields
+                                .raw("before")?
+                                .map(u32::from_json)
+                                .transpose()?
+                                .unwrap_or(10),
+                            after: fields
+                                .raw("after")?
+                                .map(u32::from_json)
+                                .transpose()?
+                                .unwrap_or(10),
+                            options,
+                        };
+                        input.validate().map_err(DecodeError::custom)?;
+                        fields.deny_unknown()?;
+                        return Ok(Self::Query(Command::Context(input)));
+                    }
                     let text = if name == "text_search" {
                         Some(fields.required("text")?)
                     } else {
@@ -182,16 +213,7 @@ impl Operation {
                         wire::result::Ok(value) => value?,
                         wire::result::Error(error) => return Err(failure(error?)),
                     };
-                    Ok(Object::new()
-                        .with("store_id", value.get_store_id()?.to_str()?)
-                        .with("record_id", value.get_id()?.to_str()?)
-                        .with("artifact_id", value.get_artifact_id()?.to_str()?)
-                        .with("source", value.get_source()?.to_str()?)
-                        .with("received_at", instant(value.get_received_at()?)?)
-                        .with("expires_at", instant(value.get_expires_at()?)?)
-                        .with("byte_start", value.get_byte_start().to_string())
-                        .with("byte_end", value.get_byte_end().to_string())
-                        .into())
+                    context::render_record(value)
                 }
             }
             Self::Bytes {

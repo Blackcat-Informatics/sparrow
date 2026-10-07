@@ -137,7 +137,7 @@ Only protocol messages go to stdout. Each tool opens its own owned RPC connectio
 so an idle MCP session does not retain an expired daemon connection lease.
 
 Discovery advertises these implemented tools only: `capabilities`, `status`,
-`keys_list`, `values_search`, `text_search`, `artifact_get`, `record_get`,
+`keys_list`, `values_search`, `text_search`, `records_context`, `artifact_get`, `record_get`,
 `bytes_read`, `pin` and `pin_release`. Input schemas reject additional fields;
 query arguments use the CLI's names with underscores. Temporal filters remain
 explicitly server-acceptance times. Offsets are decimal strings; bounded lengths,
@@ -156,16 +156,63 @@ The adapter bounds requests to 128 KiB, responses to 8 MiB, concurrent calls to
 four and each call to 30 seconds. Oversized framing closes the session with an
 explicit protocol error; malformed complete JSON frames receive a parse error
 and subsequent valid frames can proceed. EOF drains pending calls. Discovery
-requires daemon schema version 2, including native text/profile identities;
+requires daemon schema version 3, including record context and native text/profile identities;
 older discovery contracts fail explicitly rather than invent those identities.
 
-The real-daemon acceptance fixture checks CLI/MCP parity for keys and text, JSON
+The real-daemon acceptance fixture checks CLI/MCP parity for keys, text and context, JSON
 value matches, exact base64 bytes, store identity errors, pin/release retry and
 capabilities before and after daemon crash/reopen. An isolated unresponsive
 socket fixture checks pending-call admission, failure during a partial input
 frame, cancellation and oversized framing. Integer request IDs beyond binary64
 exact precision round-trip without rounding. The full release `make check`
 gate passed with these fixtures.
+
+## Retained record context
+
+```bash
+target/release/sparrow "$SOCKET" context "$STORE_ID" "$RECORD_ID" \
+  --before 10 --after 10 --ordering received_at_record_id
+```
+
+The `records_context` MCP tool takes `store_id`, `id`, optional `before`/`after`
+counts (default 10 each), `ordering` (only `received_at_record_id`), and the
+same source/acceptance-interval/limit/scan-budget arguments as searches. Counts
+may be zero. The total including the anchor must fit `limit` (default 100,
+maximum 1,000); invalid combinations are refused rather than silently reduced.
+An explicitly supplied source or interval must include the anchor. Expired or
+evicted anchors fail with `EVIDENCE_UNAVAILABLE`; reclaimed metadata fails with
+`NOT_FOUND`. References from another store fail with `STORE_MISMATCH`.
+
+The operation captures membership under the serialized storage owner and scans
+the persisted time index outward from the anchor. It returns same-source retained
+record summaries, their exact artifact-relative byte bounds and a common receipt.
+Both neighbor lists are ascending by `(received_at, record_id)`. This is acceptance
+order, not file byte order or inferred event time: all records in a completed
+artifact share acceptance time, so their opaque record IDs break ties.
+
+Each direction independently applies `scan_budget` (default 10,000, maximum
+100,000 catalog entries). Its result includes `visited`, `retired` and a frontier:
+`requested_count`, `scope_boundary` or `scan_budget`. Observed expired/evicted
+entries from that source count as retirement gaps; entries from other sources
+consume scan visits without appearing as neighbors. Budget exhaustion gives
+limited/incomplete execution rather than an assertion that no neighbors exist.
+Reaching the requested count is a complete bounded context request.
+
+`continuity_unknown=true` is explicit: tombstones already reclaimed and producer
+capture gaps cannot be inferred from the current catalog. Zero observed retired
+entries does not prove continuous producer history. Context uses record metadata,
+not JSON/text indexes; their projection coverage is not assessed by this operation.
+It creates no pin and does not extend retention. A pinned record remains a valid
+anchor after its unpinned complete parent artifact expires. Use `bytes_read` and
+explicit pins to inspect and preserve the returned evidence.
+
+Core tests compare neighbors against the stored timestamp/ID order and cover
+other sources, interval boundaries, zero counts, budgets, reopen, expired anchors,
+record pins, observed gaps and corrupted time-index refusal. The real-daemon
+fixture checks shared CLI/MCP context results and typed ordering/store errors
+before and after crash/reopen.
+File/stream order, event-time context, pagination leases and producer continuity
+qualification remain required later work.
 
 ## Persistent full text
 
@@ -212,7 +259,7 @@ cross check. The real-daemon Cap'n Proto test passed for ingestion, original byt
 retrieval, temporal key discovery, decoded string search, malformed JSON
 coverage, typed store mismatch, durable occurrence identity after crash/reopen,
 durable pin-release retry and rejection of partially valid pin requests. All
-fifteen core storage/clock/query/text tests passed in the focused release run.
+eighteen core storage/clock/query/text/context tests passed in the release gate.
 
 The same daemon fixture also exercises the CLI before and after crash/reopen:
 stable ingest identity across RPC and CLI, unchanged input bytes, oversized
@@ -239,6 +286,14 @@ live stdio MCP session initialized, listed all ten implemented tools, retrieved
 capabilities and repeated the synthetic `failed` search. It returned the same
 record, corpus digest and original span `[11,17)`, then exited successfully on
 EOF. The private directory/socket modes remained 0700/0600.
+
+The qualified context build then reopened that store with discovery schema
+version 3 on 2026-10-07 UTC. Live CLI and stdio MCP context calls returned the
+same synthetic anchor and one retained same-source neighbor, with explicit
+`received_at_record_id` ordering and unknown producer continuity. MCP listed
+eleven implemented tools. The store identity and analyzer/corpus evidence were
+preserved, and directory/socket modes remained 0700/0600. No producer data was
+consumed or deleted during these runtime checks.
 
 Remaining final-server acceptance includes full native JSON/Markdown RDF
 projection, persistent RDF indexes, governed stored-view SPARQL, further

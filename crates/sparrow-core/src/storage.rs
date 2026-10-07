@@ -15,6 +15,7 @@ use rocksdb::{
     ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions,
 };
 
+pub(crate) mod context;
 mod text_index;
 
 const FORMAT: &[u8] = b"sparrow.store/3";

@@ -563,7 +563,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     .await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 10);
+    assert_eq!(definitions.len(), 11);
     assert!(
         !definitions
             .iter()
@@ -583,6 +583,107 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
             .with("arguments", arguments)
             .into()
     };
+    let context = mcp
+        .call(
+            17,
+            "tools/call",
+            query(
+                "records_context",
+                Object::new()
+                    .with("store_id", store)
+                    .with("id", record)
+                    .with("before", 10_u64)
+                    .with("after", 10_u64)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(context["result"]["isError"].as_bool(), Some(false));
+    let context = &context["result"]["structuredContent"];
+    let cli_context = cli(
+        socket,
+        &["context", store, record, "--before", "10", "--after", "10"],
+    );
+    for key in [
+        "anchor",
+        "before",
+        "after",
+        "ordering",
+        "continuity_unknown",
+    ] {
+        assert_eq!(context[key], cli_context[key]);
+    }
+    assert_eq!(context["anchor"]["record_id"].as_str(), Some(record));
+    assert_eq!(context["ordering"].as_str(), Some("received_at_record_id"));
+    assert_eq!(context["continuity_unknown"].as_bool(), Some(true));
+    let neighbors: Vec<_> = ["before", "after"]
+        .into_iter()
+        .flat_map(|side| context[side]["rows"].as_array().unwrap())
+        .collect();
+    assert_eq!(neighbors.len(), 1);
+    assert!(
+        neighbors
+            .iter()
+            .all(|r| r["artifact_id"].as_str() == Some(artifact))
+    );
+    let mismatch = mcp
+        .call(
+            18,
+            "tools/call",
+            query(
+                "records_context",
+                Object::new()
+                    .with("store_id", "store:another")
+                    .with("id", record)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        mismatch["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("STORE_MISMATCH")
+    );
+    let invalid_context = mcp
+        .call(
+            19,
+            "tools/call",
+            query(
+                "records_context",
+                Object::new()
+                    .with("store_id", store)
+                    .with("id", record)
+                    .with("ordering", "event_time")
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        invalid_context["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("INVALID_ARGUMENT")
+    );
+    let limited_context = mcp
+        .call(
+            20,
+            "tools/call",
+            query(
+                "records_context",
+                Object::new()
+                    .with("store_id", store)
+                    .with("id", record)
+                    .with("scan_budget", 1_u64)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(limited_context["result"]["isError"].as_bool(), Some(false));
+    let anchor_only = cli(
+        socket,
+        &[
+            "context", store, record, "--before", "0", "--after", "0", "--limit", "1",
+        ],
+    );
+    assert!(anchor_only["before"]["rows"].as_array().unwrap().is_empty());
+    assert!(anchor_only["after"]["rows"].as_array().unwrap().is_empty());
     let keys = mcp
         .call(
             4,
@@ -757,7 +858,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(2)
+        Some(3)
     );
     let unknown = mcp
         .call(

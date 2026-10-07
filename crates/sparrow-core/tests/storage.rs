@@ -8,6 +8,225 @@ use sparrow_core::{Config, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers() {
+    use sparrow_core::{ContextFrontier, QueryScope};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = store
+        .ingest(
+            "context-ties",
+            "context",
+            "log",
+            b"first\nsecond\nthird\n",
+            10,
+        )
+        .unwrap();
+    let mut ordered = input.record_ids.clone();
+    ordered.sort(); // The advertised tiebreaker is occurrence ID, not file position.
+    store
+        .ingest("context-other", "another-source", "log", b"noise\n", 11)
+        .unwrap();
+    let latest = store
+        .ingest("context-latest", "context", "log", b"latest\n", 12)
+        .unwrap();
+    let mut scope = QueryScope {
+        source: Some("context".into()),
+        received_from: 10,
+        received_before: 13,
+        limit: 100,
+        scan_budget: 100,
+    };
+    let context = store
+        .records_context(&ordered[1], &scope, 10, 10, 20)
+        .unwrap();
+    assert_eq!(context.anchor.id, ordered[1]);
+    assert_eq!(
+        context
+            .before
+            .records
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![ordered[0].as_str()]
+    );
+    assert_eq!(
+        context
+            .after
+            .records
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![ordered[2].as_str(), latest.record_ids[0].as_str()]
+    );
+    assert_eq!(context.before.frontier, ContextFrontier::ScopeBoundary);
+    assert_eq!(context.after.visited, 3);
+    scope.scan_budget = 1;
+    let limited = store
+        .records_context(&ordered[1], &scope, 1, 2, 20)
+        .unwrap();
+    assert_eq!(limited.before.frontier, ContextFrontier::RequestedCount);
+    assert_eq!(limited.after.frontier, ContextFrontier::ScanBudget);
+    assert_eq!(limited.after.records.len(), 1);
+    scope.received_before = 12;
+    scope.scan_budget = 100;
+    let bounded = store
+        .records_context(&ordered[1], &scope, 0, 10, 20)
+        .unwrap();
+    assert!(bounded.before.records.is_empty());
+    assert_eq!(bounded.after.records.len(), 1);
+    scope.source = Some("another-source".into());
+    assert_eq!(
+        store
+            .records_context(&ordered[1], &scope, 1, 1, 20)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    scope.source = None;
+    assert_eq!(
+        store
+            .records_context(&input.id, &scope, 1, 1, 20)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        store
+            .records_context(&ordered[1], &scope, 100, 0, 20)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .records_context(&ordered[1], &scope, 1, 1, 20)
+            .unwrap()
+            .before
+            .records[0]
+            .id,
+        ordered[0]
+    );
+}
+
+#[test]
+fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let anchor = store
+        .ingest("fault-anchor", "fault", "log", b"anchor\n", 1)
+        .unwrap();
+    let neighbor = store
+        .ingest("fault-neighbor", "fault", "log", b"neighbor\n", 2)
+        .unwrap();
+    let scope = sparrow_core::QueryScope {
+        source: None,
+        received_from: 0,
+        received_before: 3,
+        limit: 100,
+        scan_budget: 100,
+    };
+    let neighbor_key = format!("time:{:020}:{}", 2, neighbor.record_ids[0]);
+    let anchor_key = format!("time:{:020}:{}", 1, anchor.record_ids[0]);
+    drop(store);
+    // Corrupt only this test-owned store, while its production owner is closed.
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    db.put(&neighbor_key, b"record:missing").unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .records_context(&anchor.record_ids[0], &scope, 0, 1, 3)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    db.delete(&anchor_key).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .records_context(&anchor.record_ids[0], &scope, 0, 0, 3)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+}
+
+#[test]
+fn context_keeps_record_pins_and_exposes_observed_retirement_gaps() {
+    use sparrow_core::{ContextFrontier, QueryScope};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let earlier = store
+        .ingest("context-earlier", "context", "log", b"earlier\n", 0)
+        .unwrap();
+    store
+        .ingest("context-gap", "context", "log", b"retired\n", 1)
+        .unwrap();
+    let anchor = store
+        .ingest("context-anchor", "context", "log", b"anchor\n", 2)
+        .unwrap();
+    store
+        .ingest("context-later-gap", "context", "log", b"retired later\n", 3)
+        .unwrap();
+    let pin = store
+        .pin(
+            "context-pin",
+            "context",
+            &[earlier.record_ids[0].clone(), anchor.record_ids[0].clone()],
+            2,
+            29 * DAY,
+        )
+        .unwrap();
+    let now = 30 * DAY + 5;
+    let latest = store
+        .ingest("context-new", "context", "log", b"new\n", now)
+        .unwrap();
+    store.expire(now).unwrap();
+    let scope = QueryScope {
+        source: None,
+        received_from: 0,
+        received_before: now + 1,
+        limit: 100,
+        scan_budget: 100,
+    };
+    let context = store
+        .records_context(&anchor.record_ids[0], &scope, 1, 1, now)
+        .unwrap();
+    assert_eq!(context.before.records[0].id, earlier.record_ids[0]);
+    assert_eq!(context.after.records[0].id, latest.record_ids[0]);
+    assert_eq!(context.before.retired, 1);
+    assert_eq!(context.after.retired, 1);
+    assert_eq!(context.before.frontier, ContextFrontier::RequestedCount);
+    assert_eq!(
+        store.bytes(&anchor.id, 0, 1, now).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.release(&pin.id).unwrap();
+    assert_eq!(
+        store
+            .records_context(&anchor.record_ids[0], &scope, 1, 1, now)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.expire(32 * DAY).unwrap();
+    assert_eq!(
+        store
+            .records_context(&anchor.record_ids[0], &scope, 1, 1, 32 * DAY)
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+}
+
+#[test]
 fn persisted_text_ranking_spans_scope_and_record_pins_survive_reopen() {
     use sparrow_core::QueryScope;
     let dir = tempfile::tempdir().unwrap();
