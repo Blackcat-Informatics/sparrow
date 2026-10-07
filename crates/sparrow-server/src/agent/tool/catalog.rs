@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "records_search",
+        "Intersect field predicates within one record before optional native text ranking; explicit acceptance-time scope and native parent bindings.",
+    ),
+    (
         "pins_list",
         "List active collection metadata in bounded pages over one immutable 60-second catalog capture; cursors never renew protection.",
     ),
@@ -91,6 +95,7 @@ pub(crate) fn definitions() -> Value {
             "keys_list",
             "values_search",
             "text_search",
+            "records_search",
             "records_context",
         ]
         .contains(name)
@@ -112,6 +117,44 @@ pub(crate) fn definitions() -> Value {
                     Object::new().with("type", Value::array(["string", "null"])),
                 );
             }
+        }
+        if *name == "records_search" {
+            let mut field_properties = Object::new();
+            for field in [
+                "path",
+                "kind",
+                "lexical",
+                "decoded",
+                "parent_binding",
+                "parent_path",
+            ] {
+                field_properties = field_properties.with(
+                    field,
+                    Object::new().with("type", Value::array(["string", "null"])),
+                );
+            }
+            properties = properties
+                .with(
+                    "text",
+                    Object::new().with("type", Value::array(["string", "null"])),
+                )
+                .with(
+                    "require_complete_index",
+                    Object::new().with("type", "boolean"),
+                )
+                .with(
+                    "fields",
+                    Object::new()
+                        .with("type", "array")
+                        .with("maxItems", 32_u64)
+                        .with(
+                            "items",
+                            Object::new()
+                                .with("type", "object")
+                                .with("additionalProperties", false)
+                                .with("properties", field_properties),
+                        ),
+                );
         }
         if *name == "text_search" {
             properties = properties.with("text", string());

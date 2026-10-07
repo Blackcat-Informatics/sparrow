@@ -1926,3 +1926,214 @@ fn bounded_admission_refuses_work_without_publishing_and_control_remains_availab
     store.release(&pin.id).unwrap();
     assert!(store.status(0).is_ok());
 }
+
+#[test]
+fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity() {
+    use sparrow_core::{FieldConstraint, JsonPredicate, QueryScope, RecordQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = b"{\"job\":\"target\",\"message\":\"success\"}\n{\"job\":\"other\",\"message\":\"failed\"}\n{\"job\":\"target\",\"message\":\"failed\"}\n";
+    let artifact = store
+        .ingest("combined", "logs", "jsonl", bytes, 10)
+        .unwrap();
+    let scope = QueryScope {
+        source: Some("logs".into()),
+        received_from: 10,
+        received_before: 11,
+        limit: 100,
+        scan_budget: 10000,
+    };
+    let mut query = RecordQuery {
+        text: Some("failed".into()),
+        fields: vec![FieldConstraint {
+            predicate: JsonPredicate {
+                path: Some("/job".into()),
+                decoded: Some("target".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let result = store.records_query(&scope, &query, 10).unwrap();
+    assert_eq!(result["ranking"]["documents"].as_str(), Some("2"));
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["rows"][0]["record_id"].as_str(),
+        Some(artifact.record_ids[2].as_str())
+    );
+    let witness = &result["rows"][0]["fields"][0];
+    let start = witness["source_start"]
+        .as_str()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let end = witness["source_end"]
+        .as_str()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    assert_eq!(&bytes[start..end], b"target");
+    query.text = None;
+    let chronological = store.records_query(&scope, &query, 10).unwrap();
+    assert_eq!(chronological["rows"].as_array().unwrap().len(), 2);
+    assert!(chronological.get("ranking").is_none());
+    assert!(chronological["rows"][0].get("score").is_none());
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.records_query(&scope, &query, 10).unwrap(),
+        chronological
+    );
+
+    // Equal pointers in duplicate object members do not identify the same parent.
+    store
+        .ingest(
+            "parents",
+            "parents",
+            "json",
+            br#"{"row":{"job":"target","status":"ok"},"row":{"job":"other","status":"failed"}}"#,
+            20,
+        )
+        .unwrap();
+    let scope = QueryScope {
+        source: Some("parents".into()),
+        received_from: 20,
+        received_before: 21,
+        ..scope
+    };
+    query.fields = vec![
+        FieldConstraint {
+            predicate: JsonPredicate {
+                path: Some("/row/job".into()),
+                decoded: Some("target".into()),
+                ..Default::default()
+            },
+            parent_binding: Some("row".into()),
+            parent_path: None,
+        },
+        FieldConstraint {
+            predicate: JsonPredicate {
+                path: Some("/row/status".into()),
+                decoded: Some("failed".into()),
+                ..Default::default()
+            },
+            parent_binding: Some("row".into()),
+            parent_path: None,
+        },
+    ];
+    assert!(
+        store.records_query(&scope, &query, 20).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for constraint in &mut query.fields {
+        constraint.parent_binding = None;
+    }
+    assert_eq!(
+        store.records_query(&scope, &query, 20).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    store.ingest("nested-parent", "nested", "json", br#"{"items":[{"job":"target","detail":{"status":"failed"}},{"job":"other","detail":{"status":"ok"}}]}"#, 30).unwrap();
+    let scope = QueryScope {
+        source: Some("nested".into()),
+        received_from: 30,
+        received_before: 31,
+        ..scope
+    };
+    query.fields[0].predicate.path = Some("/items/0/job".into());
+    query.fields[1].predicate.path = Some("/items/0/detail/status".into());
+    for constraint in &mut query.fields {
+        constraint.parent_binding = Some("item".into());
+        constraint.parent_path = Some("/items/0".into());
+    }
+    let result = store.records_query(&scope, &query, 30).unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["rows"][0]["fields"][0]["bound_parent"],
+        result["rows"][0]["fields"][1]["bound_parent"]
+    );
+}
+
+#[test]
+fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
+    use sparrow_core::{FieldConstraint, JsonPredicate, QueryScope, RecordQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest(
+            "spellings",
+            "test",
+            "json",
+            br#"{"n":1e0,"n":1.00,"s":"\u0068i"}"#,
+            1,
+        )
+        .unwrap();
+    store
+        .ingest("failed", "test", "jsonl", b"{invalid}\n", 2)
+        .unwrap();
+    store.ingest("raw", "test", "opaque", b"opaque", 3).unwrap();
+    let mut scope = QueryScope {
+        source: Some("test".into()),
+        received_from: 1,
+        received_before: 4,
+        limit: 100,
+        scan_budget: 10000,
+    };
+    let mut query = RecordQuery {
+        fields: vec![
+            FieldConstraint {
+                predicate: JsonPredicate {
+                    path: Some("/n".into()),
+                    lexical: Some("1e0".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            FieldConstraint {
+                predicate: JsonPredicate {
+                    path: Some("/s".into()),
+                    decoded: Some("hi".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let result = store.records_query(&scope, &query, 3).unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["coverage"]["failed_json_records"].as_str(),
+        Some("1")
+    );
+    assert_eq!(result["coverage"]["non_json_records"].as_str(), Some("1"));
+    assert_eq!(result["certainty"].as_str(), Some("incomplete"));
+    query.require_complete_index = true;
+    assert_eq!(
+        store.records_query(&scope, &query, 3).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    query.require_complete_index = false;
+    scope.scan_budget = 2;
+    assert_eq!(
+        store.records_query(&scope, &query, 3).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    scope.scan_budget = 10000;
+    scope.received_before = 1;
+    assert_eq!(
+        store.records_query(&scope, &query, 3).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+    scope.received_before = 4;
+    query.fields[0].parent_path = Some("".into());
+    assert_eq!(
+        store.records_query(&scope, &query, 3).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+}

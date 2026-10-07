@@ -12,7 +12,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         result::Ok(value) => value?,
         result::Error(error) => return Err(failure(error?)),
     };
-    if value.get_schema_version() != 6
+    if value.get_schema_version() != 7
         || value.get_text_analyzer()?.is_empty()
         || value.get_text_profile()?.is_empty()
         || value.get_rdf_profile()?.is_empty()

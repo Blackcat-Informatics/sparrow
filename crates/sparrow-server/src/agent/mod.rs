@@ -12,6 +12,7 @@ mod ingest;
 mod pin;
 mod rdf;
 mod read;
+mod records;
 mod search;
 mod status;
 pub use error::AgentError;
@@ -25,7 +26,7 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
+    " | records [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
     " [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT"
 );
@@ -40,6 +41,7 @@ pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<
 
 pub(super) enum Command {
     Status,
+    Records(records::Input),
     Ingest(ingest::Input),
     Bytes(read::Input),
     Context(context::Input),
@@ -172,6 +174,7 @@ impl Command {
             Some("values") => true,
             Some("text") => false,
             Some("context") => false,
+            Some("records") => false,
             _ => return Err(invalid(USAGE)),
         };
         let text = if args[0] == "text" {
@@ -183,6 +186,10 @@ impl Command {
         } else {
             None
         };
+        let records = args[0] == "records";
+        let mut records_text = None;
+        let mut record_fields = Vec::new();
+        let mut require_complete = false;
         let mut options = Options::default();
         let context = args[0] == "context";
         if context && args.len() < 3 {
@@ -207,6 +214,13 @@ impl Command {
                 .next()
                 .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
             match flag.as_str() {
+                "--text" if records => records_text = Some(value.clone()),
+                "--where-file" if records => record_fields = records::read_fields(value)?,
+                "--require-complete-index" if records => {
+                    require_complete = value
+                        .parse()
+                        .map_err(|_| invalid("require-complete-index requires true or false"))?
+                }
                 "--source" => options.source = Some(value.clone()),
                 "--received-from" => {
                     options.from =
@@ -247,6 +261,14 @@ impl Command {
             }
         }
         options.validate()?;
+        if records {
+            return Ok(Self::Records(records::Input {
+                options,
+                text: records_text,
+                fields: record_fields,
+                require_complete,
+            }));
+        }
         if context {
             let input = context::Input {
                 store: args[1].clone(),
@@ -266,6 +288,9 @@ impl Command {
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+        if let Self::Records(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
         if let Self::Ingest(input) = self {
             return Ok(Some(input.execute(client).await?));
         }

@@ -628,7 +628,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 15);
+    assert_eq!(definitions.len(), 16);
     assert!(
         !definitions
             .iter()
@@ -823,6 +823,110 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     assert_eq!(
         text["result"]["structuredContent"]["text_coverage"]["failed_or_incomplete"].as_str(),
         Some("1")
+    );
+    let predicates = Value::array([Object::new()
+        .with("path", "/message")
+        .with("decoded", "hello world")
+        .with("parent_binding", "root")
+        .with("parent_path", "")]);
+    let predicate_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        predicate_file.path(),
+        purrdf_lex::json::write_compact(&predicates),
+    )
+    .unwrap();
+    let combined = mcp
+        .call(
+            40,
+            "tools/call",
+            query(
+                "records_search",
+                Object::new()
+                    .with("source", "synthetic-rpc")
+                    .with("text", "hello")
+                    .with("fields", predicates.clone())
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(combined["result"]["isError"].as_bool(), Some(false));
+    let through_cli = cli(
+        socket,
+        &[
+            "records",
+            "--source",
+            "synthetic-rpc",
+            "--text",
+            "hello",
+            "--where-file",
+            predicate_file.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        combined["result"]["structuredContent"]["rows"],
+        through_cli["rows"]
+    );
+    assert_eq!(
+        combined["result"]["structuredContent"]["text"]["rows"],
+        through_cli["text"]["rows"]
+    );
+    assert_eq!(
+        through_cli["rows"][0]["fields"][0]["bound_parent"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        through_cli["text"]["ranking"]["documents"].as_str(),
+        Some("1")
+    );
+    assert_eq!(
+        through_cli["receipt"]["coverage"]["failed_json_records"].as_str(),
+        Some("1")
+    );
+    let field_only = cli(
+        socket,
+        &[
+            "records",
+            "--source",
+            "synthetic-rpc",
+            "--where-file",
+            predicate_file.path().to_str().unwrap(),
+        ],
+    );
+    assert!(field_only["text"].is_null());
+    assert_eq!(field_only["rows"], through_cli["rows"]);
+    let strict = mcp
+        .call(
+            41,
+            "tools/call",
+            query(
+                "records_search",
+                Object::new()
+                    .with("source", "synthetic-rpc")
+                    .with("fields", predicates)
+                    .with("require_complete_index", true)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        strict["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("INDEX_NOT_READY")
+    );
+    let invalid_time = mcp
+        .call(
+            42,
+            "tools/call",
+            query(
+                "records_search",
+                Object::new()
+                    .with("event_from", "2026-10-01T00:00:00Z")
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        invalid_time["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("INVALID_ARGUMENT")
     );
     let values = mcp
         .call(
@@ -1027,7 +1131,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(6)
+        Some(7)
     );
     let unknown = mcp
         .call(

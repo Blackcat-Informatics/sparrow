@@ -141,6 +141,32 @@ struct PinReadPage {
   receipt @0 :PinReadReceipt;
   union { collections @1 :List(PinSummary); members @2 :PinMembers; }
 }
+struct JsonPredicate {
+  path @0 :OptionalText; kind @1 :OptionalKind;
+  lexical @2 :OptionalText; decoded @3 :OptionalText;
+}
+struct FieldConstraint {
+  predicate @0 :JsonPredicate; parentBinding @1 :OptionalText; parentPath @2 :OptionalText;
+}
+struct RecordQuery {
+  scope @0 :Scope; text @1 :OptionalText; fields @2 :List(FieldConstraint);
+  requireCompleteIndex @3 :Bool;
+}
+struct OptionalOccurrence { union { absent @0 :Void; value @1 :UInt64; } }
+struct FieldEvidence {
+  predicateIndex @0 :UInt32; occurrence @1 :UInt64; path @2 :Text; kind @3 :JsonKind;
+  sourceStart @4 :UInt64; sourceEnd @5 :UInt64;
+  parentBinding @6 :OptionalText; boundParent @7 :OptionalOccurrence;
+}
+struct RecordMatch {
+  recordId @0 :Text; artifactId @1 :Text; source @2 :Text; receivedAt @3 :Instant;
+  byteStart @4 :UInt64; byteEnd @5 :UInt64; fields @6 :List(FieldEvidence);
+}
+struct OptionalTextResults { union { absent @0 :Void; value @1 :TextResults; } }
+struct RecordsResults {
+  receipt @0 :Receipt; rows @1 :List(RecordMatch); text @2 :OptionalTextResults;
+  fieldVisits @3 :UInt64; qualifiedRecords @4 :UInt64;
+}
 interface Sparrow {
   status @0 () -> (result :Result(Status));
   ingest @1 (request :Ingest) -> (result :Result(Artifact));
@@ -156,4 +182,5 @@ interface Sparrow {
   rdfInspect @11 (record :RecordRef) -> (result :Result(RdfInspection));
   pinRenew @12 (request :Renew) -> (result :Result(Pin));
   pinRead @13 (query :PinReadQuery) -> (result :Result(PinReadPage));
+  recordsSearch @14 (query :RecordQuery) -> (result :Result(RecordsResults));
 }

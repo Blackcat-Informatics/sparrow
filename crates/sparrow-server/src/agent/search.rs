@@ -19,6 +19,10 @@ pub(super) async fn execute(
         wire::result::Ok(found) => found?,
         wire::result::Error(error) => return Err(failure(error?)),
     };
+    render(found)
+}
+
+pub(super) fn render(found: wire::text_results::Reader<'_>) -> Result<Value> {
     let ranking = found.get_ranking()?;
     let terms = ranking
         .get_terms()?

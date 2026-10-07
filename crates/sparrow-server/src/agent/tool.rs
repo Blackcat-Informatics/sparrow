@@ -59,7 +59,8 @@ impl Operation {
                     id: fields.required("id")?,
                 }),
                 "capabilities" => Self::Capabilities,
-                "keys_list" | "values_search" | "text_search" | "records_context" => {
+                "keys_list" | "values_search" | "text_search" | "records_context"
+                | "records_search" => {
                     let mut options = Options {
                         source: fields.optional("source")?,
                         ..Options::default()
@@ -92,6 +93,24 @@ impl Operation {
                         options.decoded = fields.optional("decoded")?;
                     }
                     options.validate().map_err(DecodeError::custom)?;
+                    if name == "records_search" {
+                        let input = super::records::Input {
+                            text: fields.optional("text")?,
+                            fields: fields
+                                .raw("fields")?
+                                .map(super::records::decode_fields)
+                                .transpose()?
+                                .unwrap_or_default(),
+                            require_complete: fields
+                                .raw("require_complete_index")?
+                                .map(bool::from_json)
+                                .transpose()?
+                                .unwrap_or(false),
+                            options,
+                        };
+                        fields.deny_unknown()?;
+                        return Ok(Self::Query(Command::Records(input)));
+                    }
                     if name == "records_context" {
                         let ordering: Option<String> =
                             fields.raw("ordering")?.map(String::from_json).transpose()?;

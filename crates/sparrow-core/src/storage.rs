@@ -19,6 +19,7 @@ pub(crate) mod context;
 pub(crate) mod pin_read;
 mod rdf_index;
 pub(crate) mod rdf_view;
+mod record_fields;
 mod text_index;
 
 const FORMAT: &[u8] = b"sparrow.store/5";
@@ -1033,15 +1034,9 @@ impl Store {
         now: u64,
     ) -> Result<Value, Error> {
         scope.validate()?;
-        if let crate::JsonQuery::Values {
-            kind: Some(kind), ..
-        } = query
-            && ![
-                "string", "number", "true", "false", "null", "array", "object",
-            ]
-            .contains(&kind.as_str())
-        {
-            return Err(Error::new("INVALID_ARGUMENT", "unknown native JSON kind"));
+        let predicate = query.predicate();
+        if let Some(predicate) = &predicate {
+            predicate.validate()?;
         }
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
@@ -1118,23 +1113,13 @@ impl Store {
                             entry.2.clone_from(&record.id);
                         }
                     }
-                    crate::JsonQuery::Values {
-                        path: wanted_path,
-                        kind: wanted_kind,
-                        lexical,
-                        decoded,
-                    } => {
-                        let mut fields = JsonRecord::new(fact, "native JSON occurrence")?;
-                        let actual_lexical: Option<String> = fields.optional("lexical")?;
-                        let actual_decoded: Option<String> = fields.optional("decoded")?;
-                        if wanted_path.as_ref().is_some_and(|wanted| wanted != &path)
-                            || wanted_kind.as_ref().is_some_and(|wanted| wanted != &kind)
-                            || lexical
-                                .as_ref()
-                                .is_some_and(|wanted| actual_lexical.as_ref() != Some(wanted))
-                            || decoded
-                                .as_ref()
-                                .is_some_and(|wanted| actual_decoded.as_ref() != Some(wanted))
+                    crate::JsonQuery::Values { .. } => {
+                        if !predicate
+                            .as_ref()
+                            .ok_or_else(|| {
+                                Error::new("STORAGE_FAILURE", "value predicate missing")
+                            })?
+                            .matches(fact)?
                         {
                             continue;
                         }

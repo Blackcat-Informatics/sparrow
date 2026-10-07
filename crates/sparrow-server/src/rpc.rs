@@ -350,6 +350,99 @@ fn rows(value: &Value) -> capnp::Result<&[Value]> {
         .ok_or_else(|| capnp::Error::failed("missing stored query rows".into()))
 }
 
+fn text_results(mut out: wire::text_results::Builder<'_>, value: &Value) -> capnp::Result<()> {
+    receipt(out.reborrow().init_receipt(), value)?;
+    let ranking = value
+        .get("ranking")
+        .ok_or_else(|| capnp::Error::failed("missing text ranking".into()))?;
+    let mut target = out.reborrow().init_ranking();
+    target.set_profile(field::<String>(ranking, "profile")?);
+    target.set_corpus_id(field::<String>(ranking, "corpus_id")?);
+    target.set_corpus_profile(field::<String>(ranking, "corpus_profile")?);
+    target.set_analyzer(field::<String>(ranking, "analyzer")?);
+    target.set_documents(number(ranking, "documents")?);
+    target.set_tokens(number(ranking, "tokens")?);
+    target.set_membership_complete(field::<bool>(ranking, "membership_complete")?);
+    let terms = ranking
+        .get("terms")
+        .and_then(Value::as_array)
+        .ok_or_else(|| capnp::Error::failed("missing query terms".into()))?;
+    let mut target_terms = target.init_terms(terms.len() as u32);
+    for (index, term) in terms.iter().enumerate() {
+        target_terms.set(
+            index as u32,
+            term.as_str()
+                .ok_or_else(|| capnp::Error::failed("invalid query term".into()))?,
+        );
+    }
+    let coverage = value
+        .get("text_coverage")
+        .ok_or_else(|| capnp::Error::failed("missing text coverage".into()))?;
+    let mut target = out.reborrow().init_coverage();
+    target.set_failed_or_incomplete(number(coverage, "failed_or_incomplete")?);
+    target.set_not_applicable(number(coverage, "not_applicable")?);
+    target.set_posting_visits(number(coverage, "posting_visits")?);
+    let source = rows(value)?;
+    let mut target = out.init_rows(source.len() as u32);
+    for (index, row) in source.iter().enumerate() {
+        let mut target = target.reborrow().get(index as u32);
+        target.set_record_id(field::<String>(row, "record_id")?);
+        target.set_artifact_id(field::<String>(row, "artifact_id")?);
+        target.set_source(field::<String>(row, "source")?);
+        target.reborrow().init_received_at().set_unix_millis(
+            sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?,
+        );
+        target.set_score(field::<String>(row, "score")?);
+        target.set_evidence_limited(field::<bool>(row, "evidence_limited")?);
+        let evidence = row
+            .get("evidence")
+            .and_then(Value::as_array)
+            .ok_or_else(|| capnp::Error::failed("missing text evidence".into()))?;
+        let mut targets = target.init_evidence(evidence.len() as u32);
+        for (index, evidence) in evidence.iter().enumerate() {
+            let mut target = targets.reborrow().get(index as u32);
+            target.set_term(field::<String>(evidence, "term")?);
+            target.set_source_start(number(evidence, "source_start")?);
+            target.set_source_end(number(evidence, "source_end")?);
+            let span = evidence
+                .get("span")
+                .ok_or_else(|| capnp::Error::failed("missing text span".into()))?;
+            target.set_coarse(field::<bool>(span, "coarse")?);
+            target.set_basis(match field::<String>(span, "basis")?.as_str() {
+                "raw_record" => wire::TextBasis::RawRecord,
+                "decoded_json_scalar" => wire::TextBasis::DecodedJsonScalar,
+                _ => return Err(capnp::Error::failed("invalid text basis".into())),
+            });
+            if let Some(path) = span.get("path").and_then(Value::as_str) {
+                target.reborrow().init_path().set_value(path);
+            }
+            let offset = number(evidence, "source_start")?
+                .checked_sub(number(span, "start")?)
+                .ok_or_else(|| capnp::Error::failed("invalid text offset".into()))?;
+            let contributors = span
+                .get("contributors")
+                .and_then(Value::as_array)
+                .ok_or_else(|| capnp::Error::failed("missing text contributors".into()))?;
+            let mut target = target.init_contributors(contributors.len() as u32);
+            for (index, span) in contributors.iter().enumerate() {
+                let mut target = target.reborrow().get(index as u32);
+                target.set_start(
+                    offset
+                        .checked_add(number(span, "start")?)
+                        .ok_or_else(|| capnp::Error::failed("text span overflow".into()))?,
+                );
+                target.set_end(
+                    offset
+                        .checked_add(number(span, "end")?)
+                        .ok_or_else(|| capnp::Error::failed("text span overflow".into()))?,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 impl wire::sparrow::Server for Rpc {
     async fn rdf_inspect(
         self: Rc<Self>,
@@ -459,6 +552,104 @@ impl wire::sparrow::Server for Rpc {
         }
         Ok(())
     }
+    async fn records_search(
+        self: Rc<Self>,
+        params: wire::sparrow::RecordsSearchParams,
+        mut results: wire::sparrow::RecordsSearchResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_query()?;
+        let scope = scope(input.get_scope()?)?;
+        let fields = input.get_fields()?;
+        if fields.len() > 32 {
+            failure(
+                results.get().init_result(),
+                Error {
+                    code: "RESOURCE_LIMIT",
+                    message: "at most 32 field constraints".into(),
+                },
+            );
+            return Ok(());
+        }
+        let fields = fields
+            .iter()
+            .map(|field| {
+                let predicate = field.get_predicate()?;
+                Ok(sparrow_core::FieldConstraint {
+                    predicate: sparrow_core::JsonPredicate {
+                        path: optional(predicate.get_path()?)?,
+                        kind: optional_kind(predicate.get_kind()?)?,
+                        lexical: optional(predicate.get_lexical()?)?,
+                        decoded: optional(predicate.get_decoded()?)?,
+                    },
+                    parent_binding: optional(field.get_parent_binding()?)?,
+                    parent_path: optional(field.get_parent_path()?)?,
+                })
+            })
+            .collect::<capnp::Result<Vec<_>>>()?;
+        let query = sparrow_core::RecordQuery {
+            text: optional(input.get_text()?)?,
+            fields,
+            require_complete_index: input.get_require_complete_index(),
+        };
+        let has_text = query.text.is_some();
+        match self
+            .work(move |store, now| store.records_query(&scope, &query, now))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(value) => {
+                let mut out = results.get().init_result().init_ok();
+                receipt(out.reborrow().init_receipt(), &value)?;
+                out.set_field_visits(number(&value, "field_visits")?);
+                out.set_qualified_records(number(&value, "qualified_records")?);
+                if has_text {
+                    text_results(out.reborrow().init_text().init_value(), &value)?;
+                }
+                let source = rows(&value)?;
+                let mut targets = out.init_rows(source.len() as u32);
+                for (index, row) in source.iter().enumerate() {
+                    let mut target = targets.reborrow().get(index as u32);
+                    target.set_record_id(field::<String>(row, "record_id")?);
+                    target.set_artifact_id(field::<String>(row, "artifact_id")?);
+                    target.set_source(field::<String>(row, "source")?);
+                    target.reborrow().init_received_at().set_unix_millis(
+                        sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                    );
+                    target.set_byte_start(number(row, "byte_start")?);
+                    target.set_byte_end(number(row, "byte_end")?);
+                    let fields = row.get("fields").and_then(Value::as_array).ok_or_else(|| {
+                        capnp::Error::failed("missing captured field witnesses".into())
+                    })?;
+                    let mut targets = target.init_fields(fields.len() as u32);
+                    for (index, field_value) in fields.iter().enumerate() {
+                        let mut target = targets.reborrow().get(index as u32);
+                        target.set_predicate_index(
+                            u32::try_from(number(field_value, "predicate_index")?)
+                                .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                        );
+                        target.set_occurrence(number(field_value, "occurrence")?);
+                        target.set_path(field::<String>(field_value, "path")?);
+                        target.set_kind(json_kind(&field::<String>(field_value, "kind")?)?);
+                        target.set_source_start(number(field_value, "source_start")?);
+                        target.set_source_end(number(field_value, "source_end")?);
+                        if let Some(label) =
+                            field_value.get("parent_binding").and_then(Value::as_str)
+                        {
+                            target.reborrow().init_parent_binding().set_value(label);
+                        }
+                        if !field_value.get("bound_parent").is_some_and(Value::is_null) {
+                            target
+                                .init_bound_parent()
+                                .set_value(number(field_value, "bound_parent")?);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn text_search(
         self: Rc<Self>,
         params: wire::sparrow::TextSearchParams,
@@ -473,96 +664,8 @@ impl wire::sparrow::Server for Rpc {
         {
             Err(error) => failure(results.get().init_result(), error),
             Ok(value) => {
-                let mut out = results.get().init_result().init_ok();
-                receipt(out.reborrow().init_receipt(), &value)?;
-                let ranking = value
-                    .get("ranking")
-                    .ok_or_else(|| capnp::Error::failed("missing text ranking".into()))?;
-                let mut target = out.reborrow().init_ranking();
-                target.set_profile(field::<String>(ranking, "profile")?);
-                target.set_corpus_id(field::<String>(ranking, "corpus_id")?);
-                target.set_corpus_profile(field::<String>(ranking, "corpus_profile")?);
-                target.set_analyzer(field::<String>(ranking, "analyzer")?);
-                target.set_documents(number(ranking, "documents")?);
-                target.set_tokens(number(ranking, "tokens")?);
-                target.set_membership_complete(field::<bool>(ranking, "membership_complete")?);
-                let terms = ranking
-                    .get("terms")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| capnp::Error::failed("missing query terms".into()))?;
-                let mut target_terms = target.init_terms(terms.len() as u32);
-                for (index, term) in terms.iter().enumerate() {
-                    target_terms.set(
-                        index as u32,
-                        term.as_str()
-                            .ok_or_else(|| capnp::Error::failed("invalid query term".into()))?,
-                    );
-                }
-                let coverage = value
-                    .get("text_coverage")
-                    .ok_or_else(|| capnp::Error::failed("missing text coverage".into()))?;
-                let mut target = out.reborrow().init_coverage();
-                target.set_failed_or_incomplete(number(coverage, "failed_or_incomplete")?);
-                target.set_not_applicable(number(coverage, "not_applicable")?);
-                target.set_posting_visits(number(coverage, "posting_visits")?);
-                let source = rows(&value)?;
-                let mut target = out.init_rows(source.len() as u32);
-                for (index, row) in source.iter().enumerate() {
-                    let mut target = target.reborrow().get(index as u32);
-                    target.set_record_id(field::<String>(row, "record_id")?);
-                    target.set_artifact_id(field::<String>(row, "artifact_id")?);
-                    target.set_source(field::<String>(row, "source")?);
-                    target.reborrow().init_received_at().set_unix_millis(
-                        sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
-                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
-                    );
-                    target.set_score(field::<String>(row, "score")?);
-                    target.set_evidence_limited(field::<bool>(row, "evidence_limited")?);
-                    let evidence = row
-                        .get("evidence")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| capnp::Error::failed("missing text evidence".into()))?;
-                    let mut targets = target.init_evidence(evidence.len() as u32);
-                    for (index, evidence) in evidence.iter().enumerate() {
-                        let mut target = targets.reborrow().get(index as u32);
-                        target.set_term(field::<String>(evidence, "term")?);
-                        target.set_source_start(number(evidence, "source_start")?);
-                        target.set_source_end(number(evidence, "source_end")?);
-                        let span = evidence
-                            .get("span")
-                            .ok_or_else(|| capnp::Error::failed("missing text span".into()))?;
-                        target.set_coarse(field::<bool>(span, "coarse")?);
-                        target.set_basis(match field::<String>(span, "basis")?.as_str() {
-                            "raw_record" => wire::TextBasis::RawRecord,
-                            "decoded_json_scalar" => wire::TextBasis::DecodedJsonScalar,
-                            _ => return Err(capnp::Error::failed("invalid text basis".into())),
-                        });
-                        if let Some(path) = span.get("path").and_then(Value::as_str) {
-                            target.reborrow().init_path().set_value(path);
-                        }
-                        let offset = number(evidence, "source_start")?
-                            .checked_sub(number(span, "start")?)
-                            .ok_or_else(|| capnp::Error::failed("invalid text offset".into()))?;
-                        let contributors = span
-                            .get("contributors")
-                            .and_then(Value::as_array)
-                            .ok_or_else(|| {
-                                capnp::Error::failed("missing text contributors".into())
-                            })?;
-                        let mut target = target.init_contributors(contributors.len() as u32);
-                        for (index, span) in contributors.iter().enumerate() {
-                            let mut target = target.reborrow().get(index as u32);
-                            target.set_start(
-                                offset.checked_add(number(span, "start")?).ok_or_else(|| {
-                                    capnp::Error::failed("text span overflow".into())
-                                })?,
-                            );
-                            target.set_end(offset.checked_add(number(span, "end")?).ok_or_else(
-                                || capnp::Error::failed("text span overflow".into()),
-                            )?);
-                        }
-                    }
-                }
+                let out = results.get().init_result().init_ok();
+                text_results(out, &value)?;
             }
         }
         Ok(())
@@ -579,7 +682,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(6);
+                out.set_schema_version(7);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);

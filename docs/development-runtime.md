@@ -14,7 +14,7 @@ and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
-`bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsContext` and `rdfInspect`. The shared typed
+`bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext` and `rdfInspect`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
 result rendering. The CLI supplies status, non-destructive buffered file import,
@@ -178,7 +178,7 @@ The adapter bounds requests to 128 KiB, responses to 8 MiB, concurrent calls to
 four and each call to 30 seconds. Oversized framing closes the session with an
 explicit protocol error; malformed complete JSON frames receive a parse error
 and subsequent valid frames can proceed. EOF drains pending calls. Discovery
-requires daemon schema version 6, including finite pin catalog captures, durable pin renewal receipts, RDF profile identity, record context
+requires daemon schema version 7, including finite pin catalog captures, durable pin renewal receipts, RDF profile identity, record context
 and native text/profile identities;
 older discovery contracts fail explicitly rather than invent those identities.
 
@@ -548,3 +548,85 @@ mutations, exact UTC and monotonic expiry, capacity/scan refusal, smaller pages
 under the output ceiling, catalog identity faults, source-byte retirement while
 metadata pages survive, and cursor invalidation on restart. Full first-version
 server acceptance remains unfinished.
+
+## Combined record qualification
+
+`recordsSearch` (discovery schema version 7), MCP `records_search`, and CLI
+`records` share one storage operation. Optional native text ranking runs over
+records that satisfy every field constraint, rather than joining matches from
+separate records in the same artifact. Without text, rows are chronological
+acceptance-time summaries and have no fabricated score or ranking corpus.
+The existing `textSearch` uses this same operation with no field constraints.
+
+For example, a client-local JSON file containing
+`[{"path":"/job","decoded":"fixture-7"},{"path":"/level","decoded":"ERROR"}]`
+can be passed to:
+
+```sh
+target/release/sparrow SOCKET records --source diagnostic-jsonl \
+  --text 'allocation failed' --where-file predicates.json \
+  --received-from 2026-10-07T00:00:00Z --received-before 2026-10-08T00:00:00Z
+```
+
+MCP accepts the same array as `fields`, with optional `text`, `source`,
+`received_from`, `received_before`, `limit`, `scan_budget`, and
+`require_complete_index`. The criteria file is read only by the CLI; its path is
+never sent as a server read capability. Unknown fields are refused.
+
+Each constraint intersects native `path`, `kind`, `lexical`, and `decoded`
+conditions on one occurrence. Lexical equality uses the retained native scalar
+span, including JSON escape spelling; native string spans cover the contents
+inside the quotes. All constraints qualify the same record. Constraints sharing
+a `parent_binding` label must have the same native parent occurrence identity.
+An optional `parent_path` chooses an exact ancestor pointer; absent it, the
+immediate parent is used. Equal pointers in duplicate members do not make two
+parents identical. Root binding uses `parent_path:""`. These are exact concrete
+pointers; no additional JSONPath interpreter is introduced.
+
+Rows include one supporting occurrence per predicate, its concrete path/kind,
+original artifact byte bounds, and any bound parent identity. All metadata and
+witnesses are captured while the storage owner is locked. Text rows, native
+scores, ranking corpus identity and evidence are returned separately in the
+optional typed `text` result. Raw payloads are not reread or reanalyzed.
+
+A query admits at most 32 constraints and 256 KiB total field criteria, with
+64 KiB optional text. Field occurrence/predicate/ancestor work has its own
+`scan_budget` ceiling and refuses exhaustion without a result prefix. Membership
+and posting work retain their reported existing limits. Chronological rows have
+a 2 MiB response ceiling; ranked membership has a conservative 64 MiB capture
+ceiling, measured as encoded metadata/witness bytes plus per-record allowance,
+not a process RSS guarantee. Applicable failed JSON/text projections are counted;
+`require_complete_index:true` refuses them. Non-JSON records are counted as
+not applicable when JSON fields are requested. Limits and incomplete coverage
+remain visible in the receipt.
+
+This operation currently selects **acceptance time** only. Event-time source
+profiles, event-time intervals, cursor continuation, pin/selection query scopes,
+and the full native governed SPARQL interface remain required work. Unsupported
+event-time input is refused, never translated to acceptance time.
+
+Combined-query qualification passed `make check`: 33 storage scenarios, five
+core unit tests, the server admission/cancellation unit test, 50 census tooling
+unit tests, both real-daemon/MCP scenarios (including crash/reopen), seeded census
+self-tests, and all 14 pinned helper-ledger jobs with no distinct exceptions or
+unsanctioned isomorphic groups. Real-daemon tests cover CLI/MCP row parity,
+field-only absence of text results, root occurrence `0` as a present binding,
+strict failed-index refusal, and refusal of unsupported event-time arguments.
+
+The owned development daemon was updated on 2026-10-07 at approximately
+07:29 UTC to discovery schema 7, PID **446585**, using the same configuration,
+private socket, and `store:46c88e949ccec658600b66c7becd5bb7`. Its prior process
+exited cleanly on SIGINT. Status retained five records, four payload chunks, one
+JSON projection and no active pins or pin read handles; store format remains
+`sparrow.store/5`. No migration, production import or producer lifecycle action
+was performed.
+
+Live CLI and stdio MCP combined queries for `diagnostic-jsonl`, text
+`allocation failed`, `/job` decoded `fixture-7` and `/level` decoded `ERROR`
+returned the two existing synthetic JSONL occurrences with complete/exact
+receipts. Both predicates bind root occurrence `0`. Original `/job` evidence is
+`[84,93)` and `/level` evidence `[40,45)`. Field-only queries return the same
+metadata/witness rows with `text:null`. Native ranking uses two documents and
+48 tokens, corpus
+`8e28d99ceee6e7073cbef16582bbe985fa97bb420ad62785f5015f5003c2675c`, identical
+through CLI and MCP. The MCP adapter exited cleanly on EOF.

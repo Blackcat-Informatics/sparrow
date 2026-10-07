@@ -75,24 +75,49 @@ impl Store {
         input: &str,
         now: u64,
     ) -> Result<Value, Error> {
+        self.records_query(
+            scope,
+            &crate::RecordQuery {
+                text: Some(input.to_owned()),
+                ..Default::default()
+            },
+            now,
+        )
+    }
+
+    /// Qualify predicates on the same record before native ranking. Without text,
+    /// return chronological summaries and native field witnesses without scores.
+    pub fn records_query(
+        &self,
+        scope: &crate::QueryScope,
+        query: &crate::RecordQuery,
+        now: u64,
+    ) -> Result<Value, Error> {
         scope.validate()?;
-        if input.len() > 65536 {
-            return Err(Error::new("RESOURCE_LIMIT", "text query exceeds 64 KiB"));
-        }
+        query.validate()?;
         let writer = self.lock()?;
-        let mut terms = writer
-            .config
-            .text_analyzer
-            .terms(input)
-            .map_err(|e| Error::new("INVALID_ARGUMENT", e.to_string()))?;
+        let mut terms = match &query.text {
+            Some(input) => writer
+                .config
+                .text_analyzer
+                .terms(input)
+                .map_err(|e| Error::new("INVALID_ARGUMENT", e.to_string()))?,
+            None => Vec::new(),
+        };
         terms.sort();
         terms.dedup();
-        if terms.is_empty() || terms.len() > purrdf::text::QUERY_TERMS_MAX {
+        if query.text.is_some() && (terms.is_empty() || terms.len() > purrdf::text::QUERY_TERMS_MAX)
+        {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "text query requires 1..1024 distinct analyzed terms",
             ));
         }
+        let mut field_coverage = record_fields::FieldCoverage::default();
+        let mut witnesses = BTreeMap::<String, Vec<Value>>::new();
+        let mut chronological = Vec::<Value>::new();
+        let mut qualified = 0_usize;
+        let mut capture_bytes = 0_usize;
         let protected = writer.protected(now)?;
         let mut documents = BTreeMap::<String, (Record, u64)>::new();
         let mut visited = 0_usize;
@@ -113,6 +138,14 @@ impl Store {
             let id = std::str::from_utf8(&id)
                 .map_err(|_| Error::new("STORAGE_FAILURE", "invalid time index identity"))?;
             let record: Record = writer.get(id)?;
+            if record.id != id
+                || key.as_ref() != format!("time:{:020}:{id}", record.received_at).as_bytes()
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "temporal index disagrees with record identity/time",
+                ));
+            }
             if record.received_at >= scope.received_before {
                 break;
             }
@@ -130,6 +163,39 @@ impl Store {
                 continue;
             }
             eligible += 1;
+            let Some(fields) = writer.qualify_fields(
+                &record,
+                &query.fields,
+                &mut field_coverage,
+                scope.scan_budget,
+                query.require_complete_index,
+            )?
+            else {
+                continue;
+            };
+            qualified += 1;
+            if query.text.is_none() {
+                if chronological.len() < scope.limit {
+                    let row: Value = Object::new()
+                        .with("record_id", record.id.clone())
+                        .with("artifact_id", record.artifact_id.clone())
+                        .with("source", record.source.clone())
+                        .with("received_at", crate::format_instant(record.received_at)?)
+                        .with("byte_start", record.byte_start.to_string())
+                        .with("byte_end", record.byte_end.to_string())
+                        .with("fields", Value::array(fields))
+                        .into();
+                    capture_bytes += json::write_compact(&row).len();
+                    if capture_bytes > 2 * 1024 * 1024 {
+                        return Err(Error::new(
+                            "RESOURCE_LIMIT",
+                            "record response exceeds 2 MiB; lower limit",
+                        ));
+                    }
+                    chronological.push(row);
+                }
+                continue;
+            }
             let bytes = writer
                 .db
                 .get(format!("text-record:{id}"))?
@@ -137,7 +203,15 @@ impl Store {
             let facts = parse(&bytes)?;
             let state = read_field::<String>(&facts, "state")?;
             match state.as_str() {
-                "failed" | "incomplete" => failed += 1,
+                "failed" | "incomplete" => {
+                    failed += 1;
+                    if query.require_complete_index {
+                        return Err(Error::new(
+                            "INDEX_NOT_READY",
+                            "selected text projection unavailable",
+                        ));
+                    }
+                }
                 "not_applicable" => not_applicable += 1,
                 "complete" => {}
                 _ => {
@@ -150,8 +224,60 @@ impl Store {
             let length = integer(&facts, "length")?;
             if length > 0 {
                 total += u128::from(length);
+                capture_bytes = capture_bytes
+                    .saturating_add(json::write_compact(&record.encode()).len())
+                    .saturating_add(
+                        fields
+                            .iter()
+                            .map(|field| json::write_compact(field).len())
+                            .sum::<usize>()
+                            + 1024,
+                    );
+                if capture_bytes > 64 * 1024 * 1024 {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "record membership capture exceeds 64 MiB; narrow scope",
+                    ));
+                }
+                witnesses.insert(id.to_owned(), fields);
                 documents.insert(id.to_owned(), (record, length));
             }
+        }
+        if query.text.is_none() {
+            limited |= qualified > scope.limit;
+            return Ok(Object::new()
+                .with("store_id", writer.id.clone())
+                .with("membership_at", crate::format_instant(now)?)
+                .with("time_basis", "received_at")
+                .with("execution", if limited { "limited" } else { "complete" })
+                .with(
+                    "certainty",
+                    if limited || field_coverage.failed > 0 || field_coverage.decoding_failures > 0
+                    {
+                        "incomplete"
+                    } else {
+                        "exact"
+                    },
+                )
+                .with(
+                    "coverage",
+                    Object::new()
+                        .with("visited", visited.to_string())
+                        .with("eligible_records", eligible.to_string())
+                        .with("failed_json_records", field_coverage.failed.to_string())
+                        .with(
+                            "non_json_records",
+                            field_coverage.not_applicable.to_string(),
+                        )
+                        .with(
+                            "decoding_failures",
+                            field_coverage.decoding_failures.to_string(),
+                        ),
+                )
+                .with("field_visits", field_coverage.visits.to_string())
+                .with("qualified_records", qualified.to_string())
+                .with("rows", Value::array(chronological))
+                .into());
         }
         let membership_complete = !limited;
         let mut corpus_identity = Vec::new();
@@ -279,6 +405,14 @@ impl Store {
                 .with("artifact_id", record.artifact_id.clone())
                 .with("source", record.source.clone())
                 .with("received_at", crate::format_instant(record.received_at)?)
+                .with("byte_start", record.byte_start.to_string())
+                .with("byte_end", record.byte_end.to_string())
+                .with(
+                    "fields",
+                    Value::array(witnesses.remove(&id).ok_or_else(|| {
+                        Error::new("STORAGE_FAILURE", "captured field witnesses missing")
+                    })?),
+                )
                 .with("score", score.to_decimal_lexical())
                 .with("evidence", Value::array(evidence))
                 .with("evidence_limited", evidence_limited)
@@ -296,7 +430,12 @@ impl Store {
             .with("execution", if limited { "limited" } else { "complete" })
             .with(
                 "certainty",
-                if limited || failed > 0 || not_applicable > 0 {
+                if limited
+                    || failed > 0
+                    || not_applicable > 0
+                    || field_coverage.failed > 0
+                    || field_coverage.decoding_failures > 0
+                {
                     "incomplete"
                 } else {
                     "exact"
@@ -307,9 +446,15 @@ impl Store {
                 Object::new()
                     .with("visited", visited.to_string())
                     .with("eligible_records", eligible.to_string())
-                    .with("failed_json_records", "0")
-                    .with("non_json_records", "0")
-                    .with("decoding_failures", "0"),
+                    .with("failed_json_records", field_coverage.failed.to_string())
+                    .with(
+                        "non_json_records",
+                        field_coverage.not_applicable.to_string(),
+                    )
+                    .with(
+                        "decoding_failures",
+                        field_coverage.decoding_failures.to_string(),
+                    ),
             )
             .with(
                 "text_coverage",
@@ -333,6 +478,9 @@ impl Store {
                     .with("membership_complete", membership_complete)
                     .with("terms", terms),
             )
+            .with("time_basis", "received_at")
+            .with("field_visits", field_coverage.visits.to_string())
+            .with("qualified_records", qualified.to_string())
             .with("rows", Value::array(rows))
             .into())
     }

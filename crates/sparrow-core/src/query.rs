@@ -50,3 +50,143 @@ pub enum JsonQuery {
         decoded: Option<String>,
     },
 }
+
+/// One exact conjunction over a retained native JSON occurrence.
+#[derive(Clone, Debug, Default)]
+pub struct JsonPredicate {
+    /// Exact native concrete RFC 6901 pointer, or any occurrence.
+    pub path: Option<String>,
+    /// Native JSON kind, or any kind.
+    pub kind: Option<String>,
+    /// Exact authoritative lexical spelling, as retained by the native scalar span.
+    pub lexical: Option<String>,
+    /// Exact native-decoded string, without altering the authoritative graph.
+    pub decoded: Option<String>,
+}
+
+impl JsonPredicate {
+    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        if self.kind.as_deref().is_some_and(|kind| {
+            ![
+                "string", "number", "true", "false", "null", "array", "object",
+            ]
+            .contains(&kind)
+        }) {
+            return Err(crate::Error::new(
+                "INVALID_ARGUMENT",
+                "unknown native JSON kind",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches(&self, fact: &purrdf_lex::json::Value) -> Result<bool, crate::Error> {
+        use purrdf_lex::json::record::{DecodeError, Record};
+        let mut fields = Record::new(fact, "native JSON occurrence")?;
+        fn read(value: &purrdf_lex::json::Value) -> Result<&str, DecodeError> {
+            value
+                .as_str()
+                .ok_or_else(|| DecodeError::invalid_value(value, "string"))
+        }
+        let path = fields.required_with("path", read)?;
+        let kind = fields.required_with("kind", read)?;
+        let lexical = fields.raw("lexical")?.map(read).transpose()?;
+        let decoded = fields.raw("decoded")?.map(read).transpose()?;
+        Ok(!self.path.as_deref().is_some_and(|wanted| wanted != path)
+            && !self.kind.as_deref().is_some_and(|wanted| wanted != kind)
+            && !self
+                .lexical
+                .as_deref()
+                .is_some_and(|wanted| lexical != Some(wanted))
+            && !self
+                .decoded
+                .as_deref()
+                .is_some_and(|wanted| decoded != Some(wanted)))
+    }
+}
+
+impl JsonQuery {
+    pub(crate) fn predicate(&self) -> Option<JsonPredicate> {
+        match self {
+            Self::Keys => None,
+            Self::Values {
+                path,
+                kind,
+                lexical,
+                decoded,
+            } => Some(JsonPredicate {
+                path: path.clone(),
+                kind: kind.clone(),
+                lexical: lexical.clone(),
+                decoded: decoded.clone(),
+            }),
+        }
+    }
+}
+
+/// One record constraint, optionally sharing a native parent occurrence binding.
+#[derive(Clone, Debug, Default)]
+pub struct FieldConstraint {
+    /// Exact native occurrence conditions; all supplied conditions intersect.
+    pub predicate: JsonPredicate,
+    /// Constraints sharing this label must bind the same native parent identity.
+    pub parent_binding: Option<String>,
+    /// Exact ancestor pointer to bind; omitted means the immediate native parent.
+    pub parent_path: Option<String>,
+}
+
+/// Combined record qualification before optional native text ranking.
+#[derive(Clone, Debug, Default)]
+pub struct RecordQuery {
+    /// Native full-text query; absent yields chronological field/metadata results.
+    pub text: Option<String>,
+    /// Conjunction over the same record; empty selects every eligible record.
+    pub fields: Vec<FieldConstraint>,
+    /// Refuse unavailable applicable indexes rather than returning covered matches.
+    pub require_complete_index: bool,
+}
+
+impl RecordQuery {
+    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        if self.fields.len() > 32 || self.text.as_ref().is_some_and(|text| text.len() > 65536) {
+            return Err(crate::Error::new(
+                "RESOURCE_LIMIT",
+                "record query permits at most 32 field constraints and 64 KiB text",
+            ));
+        }
+        let mut bytes = 0_usize;
+        for field in &self.fields {
+            field.predicate.validate()?;
+            if field.parent_path.is_some() && field.parent_binding.is_none()
+                || field.parent_binding.as_ref().is_some_and(|label| {
+                    label.is_empty() || label.len() > 128 || label.chars().any(char::is_control)
+                })
+            {
+                return Err(crate::Error::new(
+                    "INVALID_ARGUMENT",
+                    "parent_path requires a bounded nonempty parent_binding",
+                ));
+            }
+            for value in [
+                &field.predicate.path,
+                &field.predicate.kind,
+                &field.predicate.lexical,
+                &field.predicate.decoded,
+                &field.parent_binding,
+                &field.parent_path,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                bytes = bytes.saturating_add(value.len());
+            }
+        }
+        if bytes > 256 * 1024 {
+            return Err(crate::Error::new(
+                "RESOURCE_LIMIT",
+                "field query exceeds 256 KiB compiled input",
+            ));
+        }
+        Ok(())
+    }
+}

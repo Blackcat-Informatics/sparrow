@@ -11,7 +11,7 @@ mod text;
 
 pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
-pub use query::{JsonQuery, QueryScope};
+pub use query::{FieldConstraint, JsonPredicate, JsonQuery, QueryScope, RecordQuery};
 pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};
