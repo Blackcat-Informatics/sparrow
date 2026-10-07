@@ -2,6 +2,8 @@
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
+The current development executable implements schema 13; the schema sections
+below retain their historical qualification evidence.
 
 ## Transport and present operations
 
@@ -14,7 +16,7 @@ and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods include the eight import methods documented below,
-plus `status`, `ingest`, `eventsIngest`, `artifactGet`, `recordGet`,
+plus `status`, `flush`, `ingest`, `eventsIngest`, `artifactGet`, `recordGet`,
 `bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext`, `rdfInspect`, `sourceTimeDefine` and `sourceTimeGet`. The shared typed
 client transport is `sparrow_client::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
@@ -321,6 +323,60 @@ artifact. Native temporal/full-text retrieval at
 `record:4663ac26601dd8b25ccf6cd886b7217b`, with zero unknown time or failed text
 coverage and original source spans. Directory/socket modes remained 0700/0600.
 No producer input or sibling/model service was changed.
+
+### Schema 13: artifact, record and pin query membership
+
+Key/value discovery, native text retrieval, combined same-record queries and
+context reads now share explicit membership scopes. Generated `Scope.selection`
+defaults to live membership, or selects typed evidence references or a stable
+pin with an optional revision guard. CLI `--scope-file FILE` and the MCP `scope`
+object share one native PurRDF JSON decoder and generated encoder; field and
+scope control files share one bounded reader. No alternate parser, tokenizer,
+scoring law, or operation envelope was added.
+
+Every selected reference is validated before filters. Complete artifacts expand
+their retained records, overlapping references are deduplicated, and missing or
+expired selections fail explicitly. A pinned individual record does not make
+its expired complete artifact selectable. Explicit field/text scopes seek their
+own chronological candidates; context scans apply the same resolved membership
+while retaining their existing directional scan budget. Membership expansion
+limits and remaining receipt/paging/I/O limitations are documented in
+[Interfaces](interfaces.md).
+
+`make check` passed with 62 storage scenarios, ten real-daemon/MCP scenarios,
+eight client unit tests, five core unit tests, one server unit test, all census
+unit/integration tests and doctests, release Clippy with warnings denied,
+seeded census self-tests and the pinned cross-workspace gate. All 72 ledger jobs
+hold, with zero distinct exceptions or unsanctioned isomorphic groups. Storage
+scenarios exercise artifact expansion/overlap, record seeks, source intersection,
+missing references even outside filters, empty selection, pin revision/deadline,
+name reuse, and retained records after parent expiry/reclamation. Real-daemon
+acceptance verifies all five CLI/MCP query surfaces and a direct generated
+foreign-store reference produces a typed `STORE_MISMATCH` result.
+
+On 2026-10-07 at approximately 17:43 UTC, the previous owned development unit
+exited successfully on SIGINT, synchronized storage and removed its socket. The
+qualified schema-13 executable now runs under `sparrow-development.service`, PID
+2250240 at verification, at the unchanged private socket and persistent store
+`store:46c88e949ccec658600b66c7becd5bb7`. Store format remains `sparrow.store/5`,
+directory/socket modes 0700/0600, and live record count 187. Reopen starts session
+`session:b9a51ba13f0bb6147e92fcf41165cf42`. The transient unit still does not claim
+reboot persistence or qualified automatic crash recovery.
+
+Live CLI artifact-plus-record selection recovered the existing buffered event
+`record:4663ac26601dd8b25ccf6cd886b7217b` from
+`artifact:adccc56dea73a970301e12bea670da6f`: key discovery returned 21 key rows,
+`/fields/0/value` returned one scalar row, and native text and combined event-time
+search each returned one matching record. Receipts reported exactly one eligible
+record and no failed projections or decoding failures. The text corpus contained
+one document and 57 tokens. MCP independently recovered the same record through
+temporary pin `pin:8a8376d2dc852289eb7e85fd264b88d3`, refused revision 2 with
+`CONFLICT` and a foreign store with `STORE_MISMATCH`, then durably released only
+that acceptance pin. No producer source or sibling/model service was changed.
+
+Full governed SPARQL, diagnostic normalization/correlation, remaining scope
+filters and query snapshots/paging, watchers/syslog, retention/pressure/RSS and
+corpus performance qualification, and final deployment acceptance remain unmet.
 
 ## CLI investigations
 

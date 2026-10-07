@@ -21,6 +21,7 @@ pub(crate) mod import;
 mod ingest;
 pub(crate) mod pin_read;
 pub(crate) mod publication;
+mod query_membership;
 mod rdf_index;
 pub(crate) mod rdf_view;
 mod record_fields;
@@ -958,7 +959,6 @@ impl Store {
         }
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
-        let start = format!("time:{:020}:", scope.received_from);
         let mut visited = 0_usize;
         let mut eligible = 0_u64;
         let mut failed = 0_u64;
@@ -969,17 +969,8 @@ impl Store {
         let mut keys = BTreeMap::<(String, String), (u64, u64, String)>::new();
         let mut value_visits = 0_usize;
         let mut response_bytes = 0_usize;
-        for entry in writer.db.iterator(rocksdb::IteratorMode::From(
-            start.as_bytes(),
-            rocksdb::Direction::Forward,
-        )) {
-            let (key, id) = entry?;
-            if !key.starts_with(b"time:") {
-                break;
-            }
-            let id = std::str::from_utf8(&id)
-                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid temporal index identity"))?;
-            let record: Record = writer.get(id)?;
+        for record in writer.query_candidates(scope, now, &protected)? {
+            let record = record?;
             if record.received_at >= scope.received_before {
                 break;
             }

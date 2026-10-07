@@ -143,6 +143,37 @@ Missing/expired selections are reported, not omitted without evidence. Pin names
 can be resolved using `pin_get`; subsequent reads use the returned stable
 `pin_id` to avoid accidentally following a reused name.
 
+Schema 13 implements membership scopes for key/value, text, combined record,
+and context reads. The generated `Scope.selection` union defaults to `live`,
+accepts a list of typed `Evidence` references, or a stable `PinScope` with
+store ID and optional positive revision. Foreign-store references produce a
+typed `STORE_MISMATCH` failure. All membership validation precedes source/time
+filtering; an expired complete artifact cannot be substituted by its pinned
+individual records. Reclaimed references return `NOT_FOUND`; expired or evicted
+catalog references return `EVIDENCE_UNAVAILABLE`; expired pin collections return
+`PIN_NOT_ACTIVE`. A supplied stale pin revision returns `CONFLICT`.
+
+CLI queries accept `--scope-file FILE`, a regular native-JSON control file of
+at most 256 KiB. MCP query tools accept the same closed object as `scope`:
+`{"kind":"selection","store_id":"store:...","artifact_ids":["artifact:..."]}`
+or `{"kind":"pin","store_id":"store:...","pin_id":"pin:...","expected_revision":"1"}`.
+Live scope omits `store_id`; supplied arrays must be nonempty. Up to 1,000
+explicit references are accepted, and overlapping artifact/record references
+are deduplicated. Scope filters presently use the existing outer source,
+receipt-time and combined-query event-time fields; the additional diagnostic
+filter dimensions above remain planned.
+
+Membership expansion permits at most 100,000 direct pin members and 100,000
+record visits, including overlaps, and retains only bounded IDs/timestamps.
+Exceeding these bounds fails before any result is published. This resolution
+work is additional to `scan_budget`, which governs the subsequent chronological
+candidate scan; it is not an all-I/O budget. Explicit field/text reads seek only
+resolved candidates, ordered by receipt time and ID. Context reads continue
+bounded directional scans of the source catalog, excluding unselected records
+and reporting a scan frontier when the budget is exhausted. The writer lock
+holds membership stable throughout each operation. Persistent query snapshots,
+query cursors and complete scope receipts remain unfinished.
+
 SPARQL additionally selects graph layers `metadata`, `diagnostic`, and `content`,
 defaulting to all three. The default RDF graph is the set union of visible
 triples; named graphs retain their separate identities. Shared content is not

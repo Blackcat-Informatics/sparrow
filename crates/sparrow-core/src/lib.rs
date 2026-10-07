@@ -12,7 +12,8 @@ mod text;
 pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
 pub use query::{
-    EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, RecordQuery,
+    EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, QuerySelection,
+    RecordQuery,
 };
 pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::durability::{

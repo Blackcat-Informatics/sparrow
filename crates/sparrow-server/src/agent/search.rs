@@ -13,7 +13,7 @@ pub(super) async fn execute(
     let mut request = client.text_search_request();
     let mut input = request.get().init_query();
     input.set_text(text);
-    fill_scope(input.init_scope(), options);
+    fill_scope(input.init_scope(), options)?;
     let response = request.send().promise.await?;
     let found = match response.get()?.get_result()?.which()? {
         wire::result::Ok(found) => found?,

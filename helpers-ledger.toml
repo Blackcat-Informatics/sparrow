@@ -2,6 +2,62 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "query-membership"
+summary = "Resolve retained artifact/record/pin membership once, before filters, with revision guards and bounded expansion."
+home = "sparrow_core::storage::Writer::query_membership"
+entry_points = []
+spec = "docs/interfaces.md: schema 13 membership scopes."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(resolve_json_query_selection|resolve_text_query_selection|resolve_context_selection)$']
+
+[[job]]
+id = "query-candidates"
+summary = "Field and text reads share temporal-index validation and selected-candidate seeks."
+home = "sparrow_core::storage::Writer::query_candidates"
+entry_points = []
+spec = "docs/interfaces.md: schema 13 membership scopes."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(json_time_candidates|text_time_candidates)$']
+
+[[job]]
+id = "agent-query-selection"
+summary = "CLI control files and MCP inputs share one closed native JSON scope codec and generated Capnp encoder."
+home = "sparrow_server::agent::selection::decode"
+entry_points = ["sparrow_server::agent::selection::Input::encode"]
+spec = "docs/interfaces.md: scope-file and MCP scope input."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_cli_query_selection|parse_mcp_query_selection)$']
+
+[[job]]
+id = "query-control-file"
+summary = "Field constraints and membership scopes share bounded regular-file reading and the native PurRDF JSON reader."
+home = "sparrow_server::agent::records::read_control_file"
+entry_points = []
+spec = "docs/interfaces.md: bounded query control files."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(read_scope_file|read_field_constraints_file)$']
+
+[[job]]
 id = "store-wal-write"
 summary = "One WAL-enabled atomic write boundary admits bounded buffered batches or synchronizes durable controls."
 home = "sparrow_core::storage::Writer::apply"

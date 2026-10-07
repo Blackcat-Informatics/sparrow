@@ -82,6 +82,11 @@ impl Operation {
                 "keys_list" | "values_search" | "text_search" | "records_context"
                 | "records_search" => {
                     let mut options = Options {
+                        selection: fields
+                            .raw("scope")?
+                            .map(super::selection::decode)
+                            .transpose()?
+                            .unwrap_or_default(),
                         source: fields.optional("source")?,
                         ..Options::default()
                     };

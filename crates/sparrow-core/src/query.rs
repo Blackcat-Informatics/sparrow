@@ -6,6 +6,8 @@
 /// Explicit scope shared by JSON discovery operations.
 #[derive(Clone, Debug)]
 pub struct QueryScope {
+    /// Membership resolved and validated before applying source/time predicates.
+    pub selection: QuerySelection,
     /// Restrict to this exact logical source label.
     pub source: Option<String>,
     /// Inclusive server acceptance time, in Unix milliseconds.
@@ -18,8 +20,45 @@ pub struct QueryScope {
     pub scan_budget: usize,
 }
 
+/// Store-owned membership; semantic predicates remain native PurRDF operations.
+#[derive(Clone, Debug, Default)]
+pub enum QuerySelection {
+    /// All currently retained evidence, including pin-protected records.
+    #[default]
+    Live,
+    /// Concrete artifact and record IDs. Overlap is deduplicated.
+    Evidence(Vec<String>),
+    /// Stable collection identity, optionally guarded against membership changes.
+    Pin {
+        /// Stable ID, never a reusable name.
+        id: String,
+        /// If supplied, the collection must still have this revision.
+        expected_revision: Option<u64>,
+    },
+}
+
 impl QueryScope {
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        match &self.selection {
+            QuerySelection::Live => {}
+            QuerySelection::Evidence(ids)
+                if !ids.is_empty()
+                    && ids.len() <= 1000
+                    && ids.iter().all(|id| {
+                        id.len() <= 128
+                            && (id.starts_with("artifact:") || id.starts_with("record:"))
+                    }) => {}
+            QuerySelection::Pin {
+                id,
+                expected_revision,
+            } if id.starts_with("pin:") && id.len() <= 128 && *expected_revision != Some(0) => {}
+            _ => {
+                return Err(crate::Error::new(
+                    "INVALID_ARGUMENT",
+                    "selection requires 1..1000 bounded artifact/record IDs or a stable pin ID and positive revision",
+                ));
+            }
+        }
         if !(1..=1000).contains(&self.limit)
             || !(1..=100000).contains(&self.scan_budget)
             || self.received_from >= self.received_before

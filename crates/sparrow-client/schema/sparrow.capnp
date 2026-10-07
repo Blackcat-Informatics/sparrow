@@ -123,7 +123,10 @@ struct Released { storeId @0 :Text; requestId @1 :Text; pinId @2 :Text; released
 struct Scope {
   source @0 :OptionalText; receivedFrom @1 :Instant;
   receivedBefore @2 :Instant; limit @3 :UInt32 = 100; scanBudget @4 :UInt32 = 10000;
+  selection @5 :QuerySelection;
 }
+struct PinScope { storeId @0 :Text; id @1 :Text; expectedRevision @2 :OptionalRevision; }
+struct QuerySelection { union { live @0 :Void; evidence @1 :List(Evidence); pin @2 :PinScope; } }
 struct ValueQuery {
   scope @0 :Scope; path @1 :OptionalText; kind @2 :OptionalKind;
   lexical @3 :OptionalText; decoded @4 :OptionalText;

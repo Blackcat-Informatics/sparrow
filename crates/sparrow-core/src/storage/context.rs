@@ -6,7 +6,7 @@
 use super::{Error, Record, Store, Writer};
 use crate::QueryScope;
 use rocksdb::{Direction, IteratorMode};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Why a directional context scan stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +69,7 @@ impl Store {
         }
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
+        let membership = writer.query_membership(scope, now, &protected)?;
         let anchor: Record = writer.get(id)?;
         writer.validate_event_record(&anchor)?;
         if !writer.live_record(&anchor, now, &protected) {
@@ -77,7 +78,10 @@ impl Store {
                 "context anchor expired or was evicted",
             ));
         }
-        if anchor.received_at < scope.received_from
+        if membership
+            .as_ref()
+            .is_some_and(|members| !members.contains_key(id))
+            || anchor.received_at < scope.received_from
             || anchor.received_at >= scope.received_before
             || scope.source.as_ref().is_some_and(|s| *s != anchor.source)
         {
@@ -97,19 +101,19 @@ impl Store {
             &writer,
             &anchor,
             scope,
-            before,
-            Direction::Reverse,
+            (before, Direction::Reverse),
             now,
             &protected,
+            membership.as_ref(),
         )?;
         let later = scan_context_neighbors(
             &writer,
             &anchor,
             scope,
-            after,
-            Direction::Forward,
+            (after, Direction::Forward),
             now,
             &protected,
+            membership.as_ref(),
         )?;
         Ok(Context {
             store_id: writer.id.clone(),
@@ -125,11 +129,12 @@ fn scan_context_neighbors(
     writer: &Writer,
     anchor: &Record,
     scope: &QueryScope,
-    count: usize,
-    direction: Direction,
+    neighbors: (usize, Direction),
     now: u64,
     protected: &BTreeSet<String>,
+    membership: Option<&BTreeMap<String, u64>>,
 ) -> Result<ContextSide, Error> {
+    let (count, direction) = neighbors;
     let mut result = ContextSide {
         records: Vec::new(),
         visited: 0,
@@ -178,7 +183,9 @@ fn scan_context_neighbors(
             break;
         }
         result.visited += 1;
-        if record.source != anchor.source {
+        if record.source != anchor.source
+            || membership.is_some_and(|members| !members.contains_key(&record.id))
+        {
             continue;
         }
         writer.validate_event_record(&record)?;

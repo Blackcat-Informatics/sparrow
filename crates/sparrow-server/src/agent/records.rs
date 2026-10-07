@@ -73,12 +73,16 @@ pub(super) fn decode_fields(
 }
 
 pub(super) fn read_fields(path: &str) -> Result<Vec<sparrow_core::FieldConstraint>> {
+    decode_fields(&read_control_file(path)?).map_err(|e| invalid(e.to_string()))
+}
+
+pub(super) fn read_control_file(path: &str) -> Result<Value> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| invalid(e.to_string()))?;
     let metadata = file.metadata().map_err(|e| invalid(e.to_string()))?;
     if !metadata.is_file() || metadata.len() > 256 * 1024 {
         return Err(invalid(
-            "where-file must be a regular file of at most 256 KiB",
+            "query control file must be a regular file of at most 256 KiB",
         ));
     }
     let mut bytes = Vec::new();
@@ -86,7 +90,7 @@ pub(super) fn read_fields(path: &str) -> Result<Vec<sparrow_core::FieldConstrain
         .read_to_end(&mut bytes)
         .map_err(|e| invalid(e.to_string()))?;
     if bytes.len() > 256 * 1024 {
-        return Err(invalid("where-file grew beyond 256 KiB"));
+        return Err(invalid("query control file grew beyond 256 KiB"));
     }
     let value = purrdf_lex::json::read_slice(
         &bytes,
@@ -94,18 +98,18 @@ pub(super) fn read_fields(path: &str) -> Result<Vec<sparrow_core::FieldConstrain
             max_string_bytes: 256 * 1024,
             unique_members: true,
             max_depth: 8,
-            max_values: 512,
+            max_values: 4096,
         },
     )
     .map_err(|e| invalid(e.to_string()))?;
-    decode_fields(&value).map_err(|e| invalid(e.to_string()))
+    Ok(value)
 }
 
 impl Input {
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
         let mut call = client.records_search_request();
         let mut input = call.get().init_query();
-        fill_scope(input.reborrow().init_scope(), &self.options);
+        fill_scope(input.reborrow().init_scope(), &self.options)?;
         optional(input.reborrow().init_text(), &self.text);
         input.set_require_complete_index(self.require_complete);
         if let Some(interval) = self.event_interval {

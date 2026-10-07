@@ -399,14 +399,48 @@ fn optional(value: wire::optional_text::Reader<'_>) -> capnp::Result<Option<Stri
     }
 }
 
-fn scope(value: wire::scope::Reader<'_>) -> capnp::Result<QueryScope> {
-    Ok(QueryScope {
-        source: optional(value.get_source()?)?,
-        received_from: value.get_received_from()?.get_unix_millis(),
-        received_before: value.get_received_before()?.get_unix_millis(),
+fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<QueryScope, Error>> {
+    let source = optional(value.get_source()?)?;
+    let received_from = value.get_received_from()?.get_unix_millis();
+    let received_before = value.get_received_before()?.get_unix_millis();
+    let selection = match value.get_selection()?.which()? {
+        wire::query_selection::Live(()) => Ok(sparrow_core::QuerySelection::Live),
+        wire::query_selection::Evidence(ids) => {
+            let ids = ids?;
+            if ids.is_empty() || ids.len() > 1000 {
+                Err(invalid("explicit selection requires 1..1000 references"))
+            } else {
+                ids.iter()
+                    .map(|id| rpc.scoped_id(id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(sparrow_core::QuerySelection::Evidence)
+            }
+        }
+        wire::query_selection::Pin(pin) => {
+            let pin = pin?;
+            let expected_revision = match pin.get_expected_revision()?.which()? {
+                wire::optional_revision::Absent(()) => None,
+                wire::optional_revision::Value(value) => Some(value),
+            };
+            rpc.reference(
+                pin.get_store_id()?.to_str()?,
+                pin.get_id()?.to_str()?,
+                "pin:",
+            )
+            .map(|id| sparrow_core::QuerySelection::Pin {
+                id,
+                expected_revision,
+            })
+        }
+    };
+    Ok(selection.map(|selection| QueryScope {
+        selection,
+        source,
+        received_from,
+        received_before,
         limit: value.get_limit() as usize,
         scan_budget: value.get_scan_budget() as usize,
-    })
+    }))
 }
 
 fn field<T: purrdf_lex::json::record::FromJson>(
@@ -940,13 +974,13 @@ impl wire::sparrow::Server for Rpc {
             anchor.get_id()?.to_str()?,
             "record:",
         );
-        let scope = scope(input.get_scope()?)?;
+        let scope = scope(input.get_scope()?, &self)?;
         let before = input.get_before() as usize;
         let after = input.get_after() as usize;
         let ordering = input.get_ordering().map_err(invalid);
         let found = match (reference, ordering) {
             (Ok(id), Ok(wire::ContextOrder::ReceivedAtRecordId)) => {
-                self.work(move |store, now| store.records_context(&id, &scope, before, after, now))
+                self.work(move |store, now| store.records_context(&id, &scope?, before, after, now))
                     .await
             }
             (Err(error), _) | (_, Err(error)) => Err(error),
@@ -1039,7 +1073,7 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::RecordsSearchResults,
     ) -> capnp::Result<()> {
         let input = params.get()?.get_query()?;
-        let scope = scope(input.get_scope()?)?;
+        let scope = scope(input.get_scope()?, &self)?;
         let fields = input.get_fields()?;
         if fields.len() > 32 {
             failure(
@@ -1084,7 +1118,7 @@ impl wire::sparrow::Server for Rpc {
         };
         let has_text = query.text.is_some();
         match self
-            .work(move |store, now| store.records_query(&scope, &query, now))
+            .work(move |store, now| store.records_query(&scope?, &query, now))
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
@@ -1169,10 +1203,10 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::TextSearchResults,
     ) -> capnp::Result<()> {
         let input = params.get()?.get_query()?;
-        let scope = scope(input.get_scope()?)?;
+        let scope = scope(input.get_scope()?, &self)?;
         let query = input.get_text()?.to_str()?.to_owned();
         match self
-            .work(move |store, now| store.text_query(&scope, &query, now))
+            .work(move |store, now| store.text_query(&scope?, &query, now))
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
@@ -1626,9 +1660,9 @@ impl wire::sparrow::Server for Rpc {
         params: wire::sparrow::KeysListParams,
         mut results: wire::sparrow::KeysListResults,
     ) -> capnp::Result<()> {
-        let scope = scope(params.get()?.get_scope()?)?;
+        let scope = scope(params.get()?.get_scope()?, &self)?;
         match self
-            .work(move |store, now| store.json_query(&scope, &JsonQuery::Keys, now))
+            .work(move |store, now| store.json_query(&scope?, &JsonQuery::Keys, now))
             .await
         {
             Ok(value) => {
@@ -1655,7 +1689,7 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::ValuesSearchResults,
     ) -> capnp::Result<()> {
         let input = params.get()?.get_query()?;
-        let scope = scope(input.get_scope()?)?;
+        let scope = scope(input.get_scope()?, &self)?;
         let query = JsonQuery::Values {
             path: optional(input.get_path()?)?,
             kind: optional_kind(input.get_kind()?)?,
@@ -1663,7 +1697,7 @@ impl wire::sparrow::Server for Rpc {
             decoded: optional(input.get_decoded()?)?,
         };
         match self
-            .work(move |store, now| store.json_query(&scope, &query, now))
+            .work(move |store, now| store.json_query(&scope?, &query, now))
             .await
         {
             Ok(value) => {

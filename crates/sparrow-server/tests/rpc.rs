@@ -11,6 +11,205 @@ use std::{
 };
 
 struct Daemon(Child);
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_selection_is_shared_by_typed_cli_and_mcp_surfaces() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            client
+                .ingest(
+                    "selection-noise",
+                    "selection-source",
+                    wire::Format::Json,
+                    br#"{"message":"needle noise"}"#,
+                )
+                .await
+                .unwrap();
+            let selected = client
+                .ingest(
+                    "selection-target",
+                    "selection-source",
+                    wire::Format::Json,
+                    br#"{"message":"needle target"}"#,
+                )
+                .await
+                .unwrap();
+            let selection: Value = Object::new()
+                .with("kind", "selection")
+                .with("store_id", store.clone())
+                .with("artifact_ids", Value::array([selected.id.clone()]))
+                .with("record_ids", Value::array([selected.record_ids[0].clone()]))
+                .into();
+            let path = dir.path().join("scope.json");
+            std::fs::write(&path, purrdf_lex::json::write_compact(&selection)).unwrap();
+            let path = path.to_str().unwrap();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            for (index, (name, command)) in [
+                ("keys_list", "keys"),
+                ("values_search", "values"),
+                ("records_search", "records"),
+                ("text_search", "text"),
+                ("records_context", "context"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut input = Object::new().with("scope", selection.clone());
+                let mut args = vec![command];
+                if name == "text_search" {
+                    input = input.with("text", "needle");
+                    args.push("needle");
+                }
+                if name == "records_context" {
+                    input = input
+                        .with("store_id", store.clone())
+                        .with("id", selected.record_ids[0].clone());
+                    args.extend([store.as_str(), selected.record_ids[0].as_str()]);
+                }
+                args.extend(["--scope-file", path]);
+                let cli_result = cli(&socket, &args);
+                let result = mcp.tool(2 + index as u64, name, input.into()).await;
+                assert_eq!(
+                    result["isError"].as_bool(),
+                    Some(false),
+                    "{name}: {result:?}"
+                );
+                let result = &result["structuredContent"];
+                if name == "records_context" {
+                    assert!(result["before"]["rows"].as_array().unwrap().is_empty());
+                    assert!(result["after"]["rows"].as_array().unwrap().is_empty());
+                    assert_eq!(result["anchor"], cli_result["anchor"]);
+                } else {
+                    assert_eq!(result["rows"], cli_result["rows"]);
+                    if name != "keys_list" {
+                        assert!(
+                            result["rows"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|row| row["record_id"].as_str()
+                                    == Some(selected.record_ids[0].as_str()))
+                        );
+                        assert!(!result["rows"].as_array().unwrap().is_empty());
+                    }
+                }
+            }
+            let created = mcp
+                .tool(
+                    10,
+                    "pin",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("request_id", "selection-pin")
+                        .with("name", "case")
+                        .with("targets", Value::array([selected.id.clone()]))
+                        .with("days", 2_u64)
+                        .into(),
+                )
+                .await;
+            assert_eq!(created["isError"].as_bool(), Some(false));
+            let id = created["structuredContent"]["pin_id"].as_str().unwrap();
+            let pinned = mcp
+                .tool(
+                    11,
+                    "records_search",
+                    Object::new()
+                        .with(
+                            "scope",
+                            Object::new()
+                                .with("kind", "pin")
+                                .with("store_id", store.clone())
+                                .with("pin_id", id)
+                                .with("expected_revision", "1"),
+                        )
+                        .into(),
+                )
+                .await;
+            assert_eq!(pinned["isError"].as_bool(), Some(false));
+            assert_eq!(
+                pinned["structuredContent"]["rows"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let conflict = mcp
+                .tool(
+                    12,
+                    "records_search",
+                    Object::new()
+                        .with(
+                            "scope",
+                            Object::new()
+                                .with("kind", "pin")
+                                .with("store_id", store.clone())
+                                .with("pin_id", id)
+                                .with("expected_revision", "2"),
+                        )
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                conflict["structuredContent"]["error"]["code"].as_str(),
+                Some("CONFLICT")
+            );
+            // Direct generated requests must preserve typed domain errors, not transport exceptions.
+            let mut request = client.capability().keys_list_request();
+            let mut scope = request.get().init_scope();
+            scope
+                .reborrow()
+                .init_received_before()
+                .set_unix_millis(u64::MAX);
+            let mut target = scope.init_selection().init_evidence(1).get(0);
+            target.set_store_id("store:foreign");
+            target.set_artifact(&selected.id);
+            let reply = request.send().promise.await.unwrap();
+            match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "STORE_MISMATCH"
+                ),
+                wire::result::Ok(_) => panic!("foreign selection accepted"),
+            }
+            for (index, invalid) in [
+                Object::new()
+                    .with("kind", "selection")
+                    .with("store_id", store.clone()),
+                Object::new().with("kind", "live").with("pin_id", id),
+                Object::new()
+                    .with("kind", "selection")
+                    .with("store_id", store.clone())
+                    .with("record_ids", Value::array(Vec::<String>::new())),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let result = mcp
+                    .tool(
+                        20 + index as u64,
+                        "keys_list",
+                        Object::new().with("scope", invalid).into(),
+                    )
+                    .await;
+                assert_eq!(result["isError"].as_bool(), Some(true));
+                assert_eq!(
+                    result["structuredContent"]["error"]["code"].as_str(),
+                    Some("INVALID_ARGUMENT")
+                );
+            }
+            mcp.close(true).await;
+        })
+        .await;
+}
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.0.kill().expect("stop this test's daemon");

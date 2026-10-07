@@ -126,6 +126,7 @@ pub(crate) fn definitions() -> Value {
                 );
             }
             properties = properties
+                .with("scope", super::super::selection::schema())
                 .with("limit", integer(1000))
                 .with("scan_budget", integer(100000));
         }

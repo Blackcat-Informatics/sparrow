@@ -134,26 +134,9 @@ impl Store {
         let mut not_applicable = 0_u64;
         let mut total = 0_u128;
         let mut limited = false;
-        let start = format!("time:{:020}:", scope.received_from);
-        for entry in writer.db.iterator(IteratorMode::From(
-            start.as_bytes(),
-            rocksdb::Direction::Forward,
-        )) {
-            let (key, id) = entry?;
-            if !key.starts_with(b"time:") {
-                break;
-            }
-            let id = std::str::from_utf8(&id)
-                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid time index identity"))?;
-            let record: Record = writer.get(id)?;
-            if record.id != id
-                || key.as_ref() != format!("time:{:020}:{id}", record.received_at).as_bytes()
-            {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "temporal index disagrees with record identity/time",
-                ));
-            }
+        for record in writer.query_candidates(scope, now, &protected)? {
+            let record = record?;
+            let id = &record.id;
             if record.received_at >= scope.received_before {
                 break;
             }

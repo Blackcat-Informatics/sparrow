@@ -34,7 +34,7 @@ impl Input {
         let mut anchor = query.reborrow().init_anchor();
         anchor.set_store_id(&self.store);
         anchor.set_id(&self.id);
-        fill_scope(query.reborrow().init_scope(), &self.options);
+        fill_scope(query.reborrow().init_scope(), &self.options)?;
         query.set_ordering(wire::ContextOrder::ReceivedAtRecordId);
         query.set_before(self.before);
         query.set_after(self.after);

@@ -15,6 +15,7 @@ mod rdf;
 mod read;
 mod records;
 mod search;
+mod selection;
 mod source_time;
 mod status;
 pub use error::AgentError;
@@ -29,7 +30,7 @@ pub(super) const USAGE: &str = concat!(
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
-    " [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
+    " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT"
 );
 
@@ -63,6 +64,7 @@ pub(super) enum Command {
 }
 
 pub(super) struct Options {
+    selection: selection::Input,
     source: Option<String>,
     from: u64,
     before: u64,
@@ -107,6 +109,7 @@ fn evidence(mut target: wire::evidence::Builder<'_>, store: &str, id: &str) -> R
 impl Default for Options {
     fn default() -> Self {
         Self {
+            selection: selection::Input::default(),
             source: None,
             from: 0,
             before: u64::MAX,
@@ -274,6 +277,10 @@ impl Command {
                         .map_err(|_| invalid("require-complete-index requires true or false"))?
                 }
                 "--source" => options.source = Some(value.clone()),
+                "--scope-file" => {
+                    options.selection = selection::decode(&records::read_control_file(value)?)
+                        .map_err(|e| invalid(e.to_string()))?
+                }
                 "--received-from" => {
                     options.from =
                         sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?
@@ -382,7 +389,7 @@ impl Command {
         if *values {
             let mut request = client.values_search_request();
             let mut query = request.get().init_query();
-            fill_scope(query.reborrow().init_scope(), options);
+            fill_scope(query.reborrow().init_scope(), options)?;
             optional(query.reborrow().init_path(), &options.path);
             optional(query.reborrow().init_lexical(), &options.lexical);
             optional(query.reborrow().init_decoded(), &options.decoded);
@@ -425,7 +432,7 @@ impl Command {
             ))
         } else {
             let mut request = client.keys_list_request();
-            fill_scope(request.get().init_scope(), options);
+            fill_scope(request.get().init_scope(), options)?;
             let response = request.send().promise.await?;
             let result = response.get()?.get_result()?;
             let found = match result.which()? {
@@ -455,7 +462,7 @@ impl Command {
     }
 }
 
-fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) {
+fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) -> Result<()> {
     optional(scope.reborrow().init_source(), &options.source);
     scope
         .reborrow()
@@ -467,6 +474,7 @@ fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) {
         .set_unix_millis(options.before);
     scope.set_limit(options.limit);
     scope.set_scan_budget(options.scan_budget);
+    options.selection.encode(scope.init_selection())
 }
 
 fn optional(field: wire::optional_text::Builder<'_>, value: &Option<String>) {
