@@ -67,6 +67,10 @@ pub(super) fn render_record(value: wire::record::Reader<'_>) -> Result<Value> {
         .with("expires_at", instant(value.get_expires_at()?)?)
         .with("byte_start", value.get_byte_start().to_string())
         .with("byte_end", value.get_byte_end().to_string())
+        .with(
+            "event_time",
+            super::source_time::event(value.get_event_time()?)?,
+        )
         .into())
 }
 

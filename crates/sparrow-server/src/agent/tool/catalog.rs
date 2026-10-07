@@ -7,6 +7,14 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "source_time_define",
+        "Durably bind an immutable source timestamp pointer and representation for future ingestions; identical retries are idempotent and conflicting mappings are refused.",
+    ),
+    (
+        "source_time_get",
+        "Read a declared source timestamp mapping or explicit absence.",
+    ),
+    (
         "records_search",
         "Intersect field predicates within one record before optional native text ranking; explicit acceptance-time scope and native parent bindings.",
     ),
@@ -118,7 +126,27 @@ pub(crate) fn definitions() -> Value {
                 );
             }
         }
+        if ["source_time_define", "source_time_get"].contains(name) {
+            properties = properties.with("source", string());
+            required.push("source");
+            if *name == "source_time_define" {
+                properties = properties.with("path", string()).with(
+                    "representation",
+                    Object::new().with("type", "string").with(
+                        "enum",
+                        Value::array(["rfc3339", "unix_millis", "unix_seconds"]),
+                    ),
+                );
+                required.extend(["path", "representation"]);
+            }
+        }
         if *name == "records_search" {
+            for field in ["event_from", "event_before"] {
+                properties = properties.with(
+                    field,
+                    Object::new().with("type", Value::array(["string", "null"])),
+                );
+            }
             let mut field_properties = Object::new();
             for field in [
                 "path",
@@ -294,7 +322,7 @@ pub(crate) fn definitions() -> Value {
                 Object::new()
                     .with(
                         "readOnlyHint",
-                        !["pin", "pin_release", "pin_renew"].contains(name),
+                        !["pin", "pin_release", "pin_renew", "source_time_define"].contains(name),
                     )
                     .with("destructiveHint", *name == "pin_release")
                     .with("idempotentHint", true)

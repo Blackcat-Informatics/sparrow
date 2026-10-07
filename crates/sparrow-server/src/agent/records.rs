@@ -17,6 +17,28 @@ pub(crate) struct Input {
     pub text: Option<String>,
     pub fields: Vec<sparrow_core::FieldConstraint>,
     pub require_complete: bool,
+    pub event_interval: Option<sparrow_core::EventInterval>,
+}
+
+pub(super) fn interval(
+    from: Option<String>,
+    before: Option<String>,
+) -> Result<Option<sparrow_core::EventInterval>> {
+    match (from, before) {
+        (None, None) => Ok(None),
+        (Some(from), Some(before)) => {
+            let from = sparrow_core::parse_instant(&from).map_err(|e| invalid(e.to_string()))?;
+            let before =
+                sparrow_core::parse_instant(&before).map_err(|e| invalid(e.to_string()))?;
+            if from >= before {
+                return Err(invalid("event_from must precede event_before"));
+            }
+            Ok(Some(sparrow_core::EventInterval { from, before }))
+        }
+        _ => Err(invalid(
+            "event_from and event_before must be supplied together",
+        )),
+    }
 }
 
 pub(super) fn decode_fields(
@@ -86,6 +108,14 @@ impl Input {
         fill_scope(input.reborrow().init_scope(), &self.options);
         optional(input.reborrow().init_text(), &self.text);
         input.set_require_complete_index(self.require_complete);
+        if let Some(interval) = self.event_interval {
+            let mut interval_out = input.reborrow().init_event_interval().init_value();
+            interval_out
+                .reborrow()
+                .init_from()
+                .set_unix_millis(interval.from);
+            interval_out.init_before().set_unix_millis(interval.before);
+        }
         let mut fields = input.init_fields(self.fields.len() as u32);
         for (index, field) in self.fields.iter().enumerate() {
             let mut target = fields.reborrow().get(index as u32);
@@ -109,6 +139,10 @@ impl Input {
             wire::result::Ok(value) => value?,
             wire::result::Error(error) => return Err(failure(error?)),
         };
+        let basis = found.get_time_basis()?;
+        if (basis == wire::TimeBasis::EventTime) != self.event_interval.is_some() {
+            return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon did not honor the requested time basis; use the matching schema-8 executable".into(), retryable: false });
+        }
         let text = match found.get_text()?.which()? {
             wire::optional_text_results::Absent(()) => Value::Null,
             wire::optional_text_results::Value(value) => search::render(value?)?,
@@ -149,13 +183,35 @@ impl Input {
                     .with("received_at", instant(row.get_received_at()?)?)
                     .with("byte_start", row.get_byte_start().to_string())
                     .with("byte_end", row.get_byte_end().to_string())
+                    .with(
+                        "event_time",
+                        super::source_time::event(row.get_event_time()?)?,
+                    )
                     .with("fields", Value::array(fields))
                     .into())
             })
             .collect::<Result<Vec<Value>>>()?;
+        let coverage = found.get_event_coverage()?;
         Ok(Object::new()
+            .with(
+                "event_coverage",
+                Object::new()
+                    .with("evaluated", coverage.get_evaluated().to_string())
+                    .with("unknown", coverage.get_unknown().to_string())
+                    .with(
+                        "outside_interval",
+                        coverage.get_outside_interval().to_string(),
+                    )
+                    .with("membership_complete", coverage.get_membership_complete()),
+            )
             .with("receipt", receipt(found.get_receipt()?)?)
-            .with("time_basis", "received_at")
+            .with(
+                "time_basis",
+                match basis {
+                    wire::TimeBasis::ReceivedAt => "received_at",
+                    wire::TimeBasis::EventTime => "event_time",
+                },
+            )
             .with("field_visits", found.get_field_visits().to_string())
             .with(
                 "qualified_records",

@@ -136,8 +136,19 @@ pub struct FieldConstraint {
 }
 
 /// Combined record qualification before optional native text ranking.
+#[derive(Clone, Copy, Debug)]
+pub struct EventInterval {
+    /// Inclusive source instant in UTC Unix milliseconds.
+    pub from: u64,
+    /// Exclusive source instant in UTC Unix milliseconds.
+    pub before: u64,
+}
+
+/// Combined record qualification before optional native text ranking.
 #[derive(Clone, Debug, Default)]
 pub struct RecordQuery {
+    /// Explicit source-time interval; acceptance scope remains an independent filter.
+    pub event_interval: Option<EventInterval>,
     /// Native full-text query; absent yields chronological field/metadata results.
     pub text: Option<String>,
     /// Conjunction over the same record; empty selects every eligible record.
@@ -148,6 +159,15 @@ pub struct RecordQuery {
 
 impl RecordQuery {
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        if self
+            .event_interval
+            .is_some_and(|interval| interval.from >= interval.before)
+        {
+            return Err(crate::Error::new(
+                "INVALID_ARGUMENT",
+                "require an increasing half-open event-time interval",
+            ));
+        }
         if self.fields.len() > 32 || self.text.as_ref().is_some_and(|text| text.len() > 65536) {
             return Err(crate::Error::new(
                 "RESOURCE_LIMIT",

@@ -70,6 +70,7 @@ impl Store {
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         let anchor: Record = writer.get(id)?;
+        writer.validate_event_record(&anchor)?;
         if !writer.live_record(&anchor, now, &protected) {
             return Err(Error::new(
                 "EVIDENCE_UNAVAILABLE",
@@ -180,6 +181,7 @@ fn scan_context_neighbors(
         if record.source != anchor.source {
             continue;
         }
+        writer.validate_event_record(&record)?;
         if !writer.live_record(&record, now, protected) {
             result.retired += 1;
             continue;

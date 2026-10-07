@@ -628,7 +628,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 16);
+    assert_eq!(definitions.len(), 18);
     assert!(
         !definitions
             .iter()
@@ -928,6 +928,116 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
         invalid_time["result"]["structuredContent"]["error"]["code"].as_str(),
         Some("INVALID_ARGUMENT")
     );
+    let defined = mcp
+        .call(
+            50,
+            "tools/call",
+            query(
+                "source_time_define",
+                Object::new()
+                    .with("source", "rpc-events")
+                    .with("path", "/t")
+                    .with("representation", "rfc3339")
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(defined["result"]["isError"].as_bool(), Some(false));
+    let cli_profile = cli(socket, &["source-time", "rpc-events", "/t", "rfc3339"]);
+    assert_eq!(defined["result"]["structuredContent"], cli_profile);
+    assert_eq!(cli_profile["durability"].as_str(), Some("durable"));
+    let gotten = mcp
+        .call(
+            51,
+            "tools/call",
+            query(
+                "source_time_get",
+                Object::new().with("source", "rpc-events").into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        gotten["result"]["structuredContent"],
+        cli(socket, &["source-time-get", "rpc-events"])
+    );
+    assert_eq!(
+        gotten["result"]["structuredContent"]["profile"],
+        cli_profile
+    );
+    let conflict = mcp
+        .call(
+            52,
+            "tools/call",
+            query(
+                "source_time_define",
+                Object::new()
+                    .with("source", "rpc-events")
+                    .with("path", "/t")
+                    .with("representation", "unix_seconds")
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        conflict["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("CONFLICT")
+    );
+    let fixture = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(fixture.path(), b"{\"t\":\"1970-01-01T00:00:02Z\",\"message\":\"failed\"}\n{\"t\":\"1970-01-01T00:00:01Z\",\"message\":\"failed\"}\n{\"t\":\"1970-01-01T00:00:03Z\",\"t\":\"1970-01-01T00:00:03Z\"}\n{\"message\":\"unknown\"}\n").unwrap();
+    cli(
+        socket,
+        &[
+            "ingest",
+            "rpc-events-input",
+            "rpc-events",
+            "jsonl",
+            fixture.path().to_str().unwrap(),
+        ],
+    );
+    let event_args = Object::new()
+        .with("source", "rpc-events")
+        .with("event_from", "1970-01-01T00:00:01Z")
+        .with("event_before", "1970-01-01T00:00:02Z")
+        .with("text", "failed");
+    let events = mcp
+        .call(53, "tools/call", query("records_search", event_args.into()))
+        .await;
+    assert_eq!(events["result"]["isError"].as_bool(), Some(false));
+    let event_cli = cli(
+        socket,
+        &[
+            "records",
+            "--source",
+            "rpc-events",
+            "--text",
+            "failed",
+            "--event-from",
+            "1970-01-01T00:00:01Z",
+            "--event-before",
+            "1970-01-01T00:00:02Z",
+        ],
+    );
+    let event_mcp = &events["result"]["structuredContent"];
+    assert_eq!(event_mcp["rows"], event_cli["rows"]);
+    assert_eq!(event_mcp["text"]["rows"], event_cli["text"]["rows"]);
+    assert_eq!(event_cli["event_coverage"]["unknown"].as_str(), Some("2"));
+    assert_eq!(
+        event_cli["event_coverage"]["outside_interval"].as_str(),
+        Some("1")
+    );
+    assert_eq!(event_cli["time_basis"].as_str(), Some("event_time"));
+    assert_eq!(
+        event_cli["rows"][0]["event_time"]["instant"].as_str(),
+        Some("1970-01-01T00:00:01Z")
+    );
+    assert_eq!(
+        event_cli["text"]["ranking"]["documents"].as_str(),
+        Some("1")
+    );
+    assert_eq!(
+        event_cli["rows"][0]["event_time"]["profile_id"],
+        cli_profile["profile_id"]
+    );
     let values = mcp
         .call(
             6,
@@ -1131,7 +1241,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(7)
+        Some(8)
     );
     let unknown = mcp
         .call(

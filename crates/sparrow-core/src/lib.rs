@@ -11,12 +11,15 @@ mod text;
 
 pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
-pub use query::{FieldConstraint, JsonPredicate, JsonQuery, QueryScope, RecordQuery};
+pub use query::{
+    EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, RecordQuery,
+};
 pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};
 pub use storage::rdf_view::{
     RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
 };
+pub use storage::source_time::{EventTime, SourceTimeProfile, TimeRepresentation};
 pub use storage::{Artifact, Config, Error, Pin, Record, Store};
 pub use text::resolve_text_analyzer;

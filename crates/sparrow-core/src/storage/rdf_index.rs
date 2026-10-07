@@ -59,6 +59,7 @@ impl Store {
         }
         let writer = self.lock()?;
         let record: Record = writer.get(id)?;
+        writer.validate_event_record(&record)?;
         if !writer.live_record(&record, now, &writer.protected(now)?) {
             return Err(Error::new(
                 "EVIDENCE_UNAVAILABLE",
@@ -600,6 +601,20 @@ pub(super) fn metadata(
         ),
     ] {
         let predicate = builder.intern_iri(&predicate);
+        builder.push_quad(subject, predicate, object, None);
+    }
+    if let crate::EventTime::Known {
+        millis, profile_id, ..
+    } = &record.event_time
+    {
+        let predicate = builder.intern_iri(&format!("{NS}eventTime"));
+        let object = builder.intern_literal(RdfLiteral::typed(
+            crate::format_instant(*millis)?,
+            "http://www.w3.org/2001/XMLSchema#dateTime",
+        ));
+        builder.push_quad(subject, predicate, object, None);
+        let predicate = builder.intern_iri(&format!("{NS}sourceTimeProfile"));
+        let object = builder.intern_iri(&format!("urn:sparrow:{profile_id}"));
         builder.push_quad(subject, predicate, object, None);
     }
     if state.and_then(|s| s.get("state")).and_then(Value::as_str) == Some("complete") {

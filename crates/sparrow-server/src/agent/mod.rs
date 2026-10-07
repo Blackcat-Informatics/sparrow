@@ -14,6 +14,7 @@ mod rdf;
 mod read;
 mod records;
 mod search;
+mod source_time;
 mod status;
 pub use error::AgentError;
 /// Shared result type preserving typed failures across CLI and MCP.
@@ -26,7 +27,7 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | records [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
+    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
     " [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT"
 );
@@ -41,6 +42,7 @@ pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<
 
 pub(super) enum Command {
     Status,
+    SourceTime(source_time::Input),
     Records(records::Input),
     Ingest(ingest::Input),
     Bytes(read::Input),
@@ -145,6 +147,29 @@ impl Command {
         if args == ["status"] {
             return Ok(Self::Status);
         }
+        if args
+            .first()
+            .is_some_and(|arg| arg == "source-time" || arg == "source-time-get")
+        {
+            let define = args[0] == "source-time";
+            if args.len() != if define { 4 } else { 2 } {
+                return Err(invalid(
+                    "source-time requires SOURCE POINTER REPRESENTATION; source-time-get requires SOURCE",
+                ));
+            }
+            let definition = if define {
+                Some((
+                    args[2].clone(),
+                    source_time::representation(&args[3]).map_err(|e| invalid(e.to_string()))?,
+                ))
+            } else {
+                None
+            };
+            return Ok(Self::SourceTime(source_time::Input {
+                source: args[1].clone(),
+                definition,
+            }));
+        }
         if args.first().map(String::as_str) == Some("rdf") {
             if args.len() != 3 {
                 return Err(invalid("rdf requires STORE_ID RECORD_ID"));
@@ -188,6 +213,8 @@ impl Command {
         };
         let records = args[0] == "records";
         let mut records_text = None;
+        let mut event_from = None;
+        let mut event_before = None;
         let mut record_fields = Vec::new();
         let mut require_complete = false;
         let mut options = Options::default();
@@ -214,6 +241,8 @@ impl Command {
                 .next()
                 .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
             match flag.as_str() {
+                "--event-from" if records => event_from = Some(value.clone()),
+                "--event-before" if records => event_before = Some(value.clone()),
                 "--text" if records => records_text = Some(value.clone()),
                 "--where-file" if records => record_fields = records::read_fields(value)?,
                 "--require-complete-index" if records => {
@@ -265,6 +294,7 @@ impl Command {
             return Ok(Self::Records(records::Input {
                 options,
                 text: records_text,
+                event_interval: records::interval(event_from, event_before)?,
                 fields: record_fields,
                 require_complete,
             }));
@@ -288,6 +318,9 @@ impl Command {
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+        if let Self::SourceTime(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
         if let Self::Records(input) = self {
             return Ok(Some(input.execute(client).await?));
         }

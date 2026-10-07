@@ -20,6 +20,7 @@ pub(crate) mod pin_read;
 mod rdf_index;
 pub(crate) mod rdf_view;
 mod record_fields;
+pub(crate) mod source_time;
 mod text_index;
 
 const FORMAT: &[u8] = b"sparrow.store/5";
@@ -147,6 +148,8 @@ pub struct Record {
     pub projection_id: String,
     /// Shared complete native RDF graph/state identity, absent for non-projectable formats.
     pub rdf_projection_id: String,
+    /// Declared source instant and evidence, or an explicit unknown diagnostic.
+    pub event_time: source_time::EventTime,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -332,13 +335,14 @@ impl Catalog for Record {
             .with("byte_end", self.byte_end.to_string())
             .with("projection_id", self.projection_id.clone())
             .with("rdf_projection_id", self.rdf_projection_id.clone())
+            .with("event_time", self.event_time.encode())
             .with("chunks", self.chunks.clone())
             .with("evicted", self.evicted)
             .into()
     }
 
     fn decode(v: &Value) -> Result<Self, Error> {
-        Ok(Self {
+        let record = Self {
             id: read_field::<String>(v, "id")?,
             artifact_id: read_field::<String>(v, "artifact_id")?,
             source: read_field::<String>(v, "source")?,
@@ -348,9 +352,29 @@ impl Catalog for Record {
             byte_end: integer(v, "byte_end")?,
             projection_id: read_field(v, "projection_id")?,
             rdf_projection_id: read_field(v, "rdf_projection_id")?,
+            event_time: v
+                .get("event_time")
+                .map(source_time::EventTime::decode)
+                .transpose()?
+                .unwrap_or_else(|| source_time::EventTime::unknown("legacy_unprofiled", None)),
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             evicted: read_field(v, "evicted")?,
-        })
+        };
+        if let source_time::EventTime::Known {
+            source_start,
+            source_end,
+            ..
+        } = &record.event_time
+            && (*source_start < record.byte_start
+                || source_start > source_end
+                || *source_end > record.byte_end)
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "source time evidence outside record",
+            ));
+        }
+        Ok(record)
     }
 }
 
@@ -700,6 +724,7 @@ impl Store {
             }
             return Artifact::decode(field(&previous, "receipt")?);
         }
+        let source_time_profile = writer.time_profile(source)?;
         let expires_at = now.checked_add(30 * DAY).ok_or_else(|| {
             Error::new(
                 "INVALID_ARGUMENT",
@@ -836,7 +861,13 @@ impl Store {
                 expires_at,
                 byte_start: start as u64,
                 byte_end: end as u64,
-                projection_id,
+                projection_id: projection_id.clone(),
+                event_time: source_time::capture(
+                    source_time_profile.as_ref(),
+                    projections.get(&projection_id).map(|(facts, _)| facts),
+                    start as u64,
+                    end as u64,
+                )?,
                 rdf_projection_id,
                 chunks: record_chunks,
                 evicted: false,
@@ -1001,7 +1032,16 @@ impl Store {
 
     /// Read record metadata, including minimal parent provenance.
     pub fn record(&self, id: &str) -> Result<Record, Error> {
-        self.evidence(id, "record:")
+        if !id.starts_with("record:") {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "record metadata requires a record: identity",
+            ));
+        }
+        let writer = self.lock()?;
+        let record = writer.get(id)?;
+        writer.validate_event_record(&record)?;
+        Ok(record)
     }
 
     fn evidence<T: Catalog>(&self, id: &str, prefix: &str) -> Result<T, Error> {

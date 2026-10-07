@@ -54,6 +54,21 @@ impl Operation {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
                 "status" => Self::Status,
+                "source_time_define" | "source_time_get" => {
+                    let definition = if name == "source_time_define" {
+                        let representation: String = fields.required("representation")?;
+                        Some((
+                            fields.required("path")?,
+                            super::source_time::representation(&representation)?,
+                        ))
+                    } else {
+                        None
+                    };
+                    Self::Query(Command::SourceTime(super::source_time::Input {
+                        source: fields.required("source")?,
+                        definition,
+                    }))
+                }
                 "rdf_inspect" => Self::Query(Command::Rdf {
                     store: fields.required("store_id")?,
                     id: fields.required("id")?,
@@ -95,6 +110,11 @@ impl Operation {
                     options.validate().map_err(DecodeError::custom)?;
                     if name == "records_search" {
                         let input = super::records::Input {
+                            event_interval: super::records::interval(
+                                fields.optional("event_from")?,
+                                fields.optional("event_before")?,
+                            )
+                            .map_err(DecodeError::custom)?,
                             text: fields.optional("text")?,
                             fields: fields
                                 .raw("fields")?
@@ -253,6 +273,10 @@ impl Operation {
                 .with("transport", "capnp-unix")
                 .with("retention_days", 30_u64)
                 .with("time_basis", "received_at")
+                .with(
+                    "records_time_bases",
+                    Value::array(["received_at", "event_time"]),
+                )
                 .with("mcp_protocol", "2025-11-25")
                 .into()),
             Self::Query(command) => command

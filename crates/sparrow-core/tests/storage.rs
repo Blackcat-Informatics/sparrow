@@ -2137,3 +2137,383 @@ fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
         "INVALID_ARGUMENT"
     );
 }
+
+#[test]
+fn source_time_profiles_are_durable_immutable_and_do_not_reinterpret_old_records() {
+    use sparrow_core::{EventTime, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = br#"{"timestamp":"2026-10-07T05:00:00.123+02:00","message":"historical failed"}"#;
+    let before = store
+        .ingest("before-profile", "historical", "json", bytes, 100)
+        .unwrap();
+    assert!(
+        matches!(store.record(&before.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, profile_id: None } if reason == "no_profile")
+    );
+    let profile = store
+        .define_time_profile("historical", "/timestamp", TimeRepresentation::Rfc3339)
+        .unwrap();
+    assert_eq!(
+        store
+            .define_time_profile("historical", "/timestamp", TimeRepresentation::Rfc3339)
+            .unwrap(),
+        profile
+    );
+    assert_eq!(
+        store
+            .define_time_profile("historical", "/timestamp", TimeRepresentation::UnixMillis)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store
+            .define_time_profile("bad", "/bad~2", TimeRepresentation::Rfc3339)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    let artifact = store
+        .ingest("after-profile", "historical", "json", bytes, 200)
+        .unwrap();
+    let record = store.record(&artifact.record_ids[0]).unwrap();
+    let expected = sparrow_core::parse_instant("2026-10-07T03:00:00.123Z").unwrap();
+    let EventTime::Known {
+        millis,
+        profile_id,
+        occurrence,
+        source_start,
+        source_end,
+    } = &record.event_time
+    else {
+        panic!("known source time");
+    };
+    assert_eq!(*millis, expected);
+    assert_eq!(*profile_id, profile.id);
+    assert_eq!(*occurrence, 1);
+    assert_eq!(
+        &bytes[*source_start as usize..*source_end as usize],
+        b"2026-10-07T05:00:00.123+02:00"
+    );
+    assert_eq!(record.received_at, 200);
+    assert_eq!(record.expires_at, 30 * DAY + 200);
+    let native = store.with_rdf_records(&[before.record_ids[0].clone(), record.id.clone()], 300,
+        sparrow_core::RdfReadLimits::default(), |view| {
+            purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
+                purrdf::SparqlRequest { query: "SELECT ?record ?time ?profile WHERE { ?record <urn:sparrow:vocab:eventTime> ?time . ?record <urn:sparrow:vocab:sourceTimeProfile> ?profile }", base_iri: None, substitutions: &[] },
+                purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
+                    .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0))
+                    .map_err(Box::new)
+        }).unwrap().unwrap();
+    let purrdf::SparqlResult::Solutions { rows, .. } = native.result else {
+        panic!("native SELECT result");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(format!("{rows:?}").contains("2026-10-07T03:00:00.123Z"));
+    assert!(format!("{rows:?}").contains(&profile.id));
+    assert_eq!(
+        store
+            .ingest("before-profile", "historical", "json", bytes, 300)
+            .unwrap()
+            .id,
+        before.id
+    );
+    assert!(
+        store
+            .record(&before.record_ids[0])
+            .unwrap()
+            .event_time
+            .millis()
+            .is_none()
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.time_profile("historical").unwrap(), Some(profile));
+    assert_eq!(
+        store.record(&record.id).unwrap().event_time,
+        record.event_time
+    );
+    assert!(store.time_profile("missing").unwrap().is_none());
+    assert_eq!(
+        store.bytes(&artifact.id, 0, bytes.len(), 300).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn event_intervals_exclude_unknowns_sort_source_time_and_keep_retention_on_acceptance() {
+    use sparrow_core::{EventInterval, EventTime, QueryScope, RecordQuery, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_time_profile("events", "/t", TimeRepresentation::UnixMillis)
+        .unwrap();
+    let later = store
+        .ingest(
+            "event-later",
+            "events",
+            "json",
+            br#"{"t":2000,"m":"failed"}"#,
+            10,
+        )
+        .unwrap();
+    let early = store
+        .ingest(
+            "event-early",
+            "events",
+            "json",
+            br#"{"t":1000,"m":"failed"}"#,
+            20,
+        )
+        .unwrap();
+    let unknowns: [&[u8]; 7] = [
+        br#"{"t":1000,"t":1000}"#,
+        br#"{"missing":1}"#,
+        br#"{"t":"1000"}"#,
+        br#"{"t":1.1}"#,
+        br#"{"t":-1}"#,
+        br#"{"t":18446744073709551615}"#,
+        b"{invalid}",
+    ];
+    for (index, bytes) in unknowns.iter().enumerate() {
+        let artifact = store
+            .ingest(
+                &format!("event-unknown-{index}"),
+                "events",
+                "json",
+                bytes,
+                30,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.record(&artifact.record_ids[0]).unwrap().event_time,
+            EventTime::Unknown {
+                profile_id: Some(_),
+                ..
+            }
+        ));
+    }
+    let scope = QueryScope {
+        source: Some("events".into()),
+        received_from: 0,
+        received_before: 100,
+        limit: 1,
+        scan_budget: 10000,
+    };
+    let mut query = RecordQuery {
+        event_interval: Some(EventInterval {
+            from: 1000,
+            before: 2001,
+        }),
+        ..Default::default()
+    };
+    let result = store.records_query(&scope, &query, 100).unwrap();
+    assert_eq!(
+        result["rows"][0]["record_id"].as_str(),
+        Some(early.record_ids[0].as_str())
+    );
+    assert_eq!(result["time_basis"].as_str(), Some("event_time"));
+    assert_eq!(result["event_coverage"]["unknown"].as_str(), Some("7"));
+    assert_eq!(
+        result["event_coverage"]["membership_complete"].as_bool(),
+        Some(true)
+    );
+    query.require_complete_index = true;
+    assert_eq!(
+        store.records_query(&scope, &query, 100).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    query.require_complete_index = false;
+    query.event_interval = Some(EventInterval {
+        from: 1000,
+        before: 2000,
+    });
+    query.text = Some("failed".into());
+    let result = store.records_query(&scope, &query, 100).unwrap();
+    assert_eq!(result["ranking"]["documents"].as_str(), Some("1"));
+    assert_eq!(
+        result["rows"][0]["record_id"].as_str(),
+        Some(early.record_ids[0].as_str())
+    );
+    assert_eq!(
+        result["event_coverage"]["outside_interval"].as_str(),
+        Some("1")
+    );
+    let receipt_only = RecordQuery::default();
+    assert_eq!(
+        store.records_query(&scope, &receipt_only, 100).unwrap()["rows"][0]["record_id"].as_str(),
+        Some(later.record_ids[0].as_str())
+    );
+    let pin = store
+        .pin("event-pin", "historical", &early.record_ids, 40, 0)
+        .unwrap();
+    store.expire(30 * DAY + 100).unwrap();
+    assert_eq!(
+        store.records_query(&scope, &query, 30 * DAY + 100).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    store.release(&pin.id).unwrap();
+    assert!(
+        store.records_query(&scope, &query, 30 * DAY + 100).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn declared_epoch_seconds_and_native_rfc3339_refuse_ambiguous_precision() {
+    use sparrow_core::{EventTime, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_time_profile("seconds", "/t", TimeRepresentation::UnixSeconds)
+        .unwrap();
+    let a = store
+        .ingest("seconds", "seconds", "json", br#"{"t":1000}"#, 0)
+        .unwrap();
+    assert_eq!(
+        store.record(&a.record_ids[0]).unwrap().event_time.millis(),
+        Some(1000000)
+    );
+    store
+        .define_time_profile("rfc", "/t", TimeRepresentation::Rfc3339)
+        .unwrap();
+    for (index, timestamp) in [
+        "2026-10-07T05:00:00",
+        "2026-10-07T05:00:00.000001Z",
+        "1960-01-01T00:00:00Z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let bytes = purrdf_lex::json::write_compact(
+            &purrdf_lex::json::Object::new().with("t", *timestamp).into(),
+        );
+        let a = store
+            .ingest(
+                &format!("invalid-clock-{index}"),
+                "rfc",
+                "json",
+                bytes.as_bytes(),
+                0,
+            )
+            .unwrap();
+        assert!(
+            matches!(store.record(&a.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, .. } if reason == "invalid_instant")
+        );
+    }
+}
+
+#[test]
+fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries() {
+    use purrdf_lex::json::{self, Limits};
+    use sparrow_core::{EventInterval, EventTime, QueryScope, RecordQuery, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let legacy = store
+        .ingest("legacy", "legacy", "json", br#"{"t":1000}"#, 0)
+        .unwrap();
+    let profile = store
+        .define_time_profile("known", "/t", TimeRepresentation::UnixMillis)
+        .unwrap();
+    let known = store
+        .ingest("known", "known", "json", br#"{"t":1000}"#, 0)
+        .unwrap();
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let mut raw = json::read_slice(
+        &db.get(&legacy.record_ids[0]).unwrap().unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    raw.as_object_mut().unwrap().remove("event_time");
+    db.put(&legacy.record_ids[0], json::write_compact(&raw))
+        .unwrap();
+    let profile_key = format!(
+        "source-time:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(b"known").as_bytes())
+    );
+    let saved = db.get(&profile_key).unwrap().unwrap();
+    db.delete(&profile_key).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(
+        matches!(store.record(&legacy.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, profile_id: None } if reason == "legacy_unprofiled")
+    );
+    assert_eq!(
+        store.record(&known.record_ids[0]).unwrap_err().code,
+        "STORAGE_FAILURE"
+    );
+    let scope = QueryScope {
+        source: None,
+        received_from: 0,
+        received_before: 1,
+        limit: 100,
+        scan_budget: 10000,
+    };
+    let query = RecordQuery {
+        event_interval: Some(EventInterval {
+            from: 0,
+            before: 2000,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        store.records_query(&scope, &query, 0).unwrap_err().code,
+        "STORAGE_FAILURE"
+    );
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let mut raw = json::read_slice(&saved, Limits::default()).unwrap();
+    raw.as_object_mut().unwrap().insert("path", "/different");
+    db.put(&profile_key, json::write_compact(&raw)).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.time_profile("known").unwrap_err().code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store
+            .define_time_profile("known", "/t", TimeRepresentation::UnixMillis)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(profile.source, "known");
+}
+
+#[test]
+fn source_time_registry_has_an_exact_admission_ceiling() {
+    use sparrow_core::TimeRepresentation;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for index in 0..1024 {
+        store
+            .define_time_profile(
+                &format!("source-{index}"),
+                "/t",
+                TimeRepresentation::UnixMillis,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .define_time_profile("overflow", "/t", TimeRepresentation::UnixMillis)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert!(store.time_profile("overflow").unwrap().is_none());
+    assert!(
+        store
+            .define_time_profile("source-0", "/t", TimeRepresentation::UnixMillis)
+            .is_ok()
+    );
+}

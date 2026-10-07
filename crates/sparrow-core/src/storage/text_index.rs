@@ -115,7 +115,15 @@ impl Store {
         }
         let mut field_coverage = record_fields::FieldCoverage::default();
         let mut witnesses = BTreeMap::<String, Vec<Value>>::new();
-        let mut chronological = Vec::<Value>::new();
+        let mut chronological = Vec::<(u64, String, Value)>::new();
+        let mut event_unknown = 0_u64;
+        let mut event_evaluated = 0_u64;
+        let mut event_outside = 0_u64;
+        let time_basis = if query.event_interval.is_some() {
+            "event_time"
+        } else {
+            "received_at"
+        };
         let mut qualified = 0_usize;
         let mut capture_bytes = 0_usize;
         let protected = writer.protected(now)?;
@@ -162,6 +170,28 @@ impl Store {
             {
                 continue;
             }
+            event_evaluated += 1;
+            writer.validate_event_record(&record)?;
+            if record.event_time.millis().is_none() {
+                event_unknown += 1;
+            }
+            if let Some(interval) = query.event_interval {
+                if query.require_complete_index
+                    && matches!(&record.event_time, crate::EventTime::Unknown { reason, .. } if reason == "projection_failed")
+                {
+                    return Err(Error::new(
+                        "INDEX_NOT_READY",
+                        "selected source-time profile depends on a failed JSON projection",
+                    ));
+                }
+                let Some(millis) = record.event_time.millis() else {
+                    continue;
+                };
+                if millis < interval.from || millis >= interval.before {
+                    event_outside += 1;
+                    continue;
+                }
+            }
             eligible += 1;
             let Some(fields) = writer.qualify_fields(
                 &record,
@@ -175,7 +205,7 @@ impl Store {
             };
             qualified += 1;
             if query.text.is_none() {
-                if chronological.len() < scope.limit {
+                if query.event_interval.is_some() || chronological.len() < scope.limit {
                     let row: Value = Object::new()
                         .with("record_id", record.id.clone())
                         .with("artifact_id", record.artifact_id.clone())
@@ -183,16 +213,33 @@ impl Store {
                         .with("received_at", crate::format_instant(record.received_at)?)
                         .with("byte_start", record.byte_start.to_string())
                         .with("byte_end", record.byte_end.to_string())
+                        .with("event_time", record.event_time.encode())
                         .with("fields", Value::array(fields))
                         .into();
                     capture_bytes += json::write_compact(&row).len();
-                    if capture_bytes > 2 * 1024 * 1024 {
+                    if capture_bytes
+                        > if query.event_interval.is_some() {
+                            64 * 1024 * 1024
+                        } else {
+                            2 * 1024 * 1024
+                        }
+                    {
                         return Err(Error::new(
                             "RESOURCE_LIMIT",
-                            "record response exceeds 2 MiB; lower limit",
+                            "chronological membership capture exceeds its byte ceiling; narrow scope or lower limit",
                         ));
                     }
-                    chronological.push(row);
+                    chronological.push((
+                        if query.event_interval.is_some() {
+                            record.event_time.millis().ok_or_else(|| {
+                                Error::new("STORAGE_FAILURE", "qualified event time disappeared")
+                            })?
+                        } else {
+                            record.received_at
+                        },
+                        record.id.clone(),
+                        row,
+                    ));
                 }
                 continue;
             }
@@ -243,12 +290,28 @@ impl Store {
                 documents.insert(id.to_owned(), (record, length));
             }
         }
+        let event_coverage = Object::new()
+            .with("evaluated", event_evaluated.to_string())
+            .with("unknown", event_unknown.to_string())
+            .with("outside_interval", event_outside.to_string())
+            .with("membership_complete", !limited);
         if query.text.is_none() {
             limited |= qualified > scope.limit;
+            chronological.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let mut response_bytes = 0_usize;
+            let mut selected_rows = Vec::new();
+            for (_, _, row) in chronological.into_iter().take(scope.limit) {
+                response_bytes += json::write_compact(&row).len();
+                if response_bytes > 2 * 1024 * 1024 {
+                    limited = true;
+                    break;
+                }
+                selected_rows.push(row);
+            }
             return Ok(Object::new()
                 .with("store_id", writer.id.clone())
                 .with("membership_at", crate::format_instant(now)?)
-                .with("time_basis", "received_at")
+                .with("time_basis", time_basis)
                 .with("execution", if limited { "limited" } else { "complete" })
                 .with(
                     "certainty",
@@ -276,7 +339,8 @@ impl Store {
                 )
                 .with("field_visits", field_coverage.visits.to_string())
                 .with("qualified_records", qualified.to_string())
-                .with("rows", Value::array(chronological))
+                .with("event_coverage", event_coverage)
+                .with("rows", Value::array(selected_rows))
                 .into());
         }
         let membership_complete = !limited;
@@ -413,6 +477,7 @@ impl Store {
                         Error::new("STORAGE_FAILURE", "captured field witnesses missing")
                     })?),
                 )
+                .with("event_time", record.event_time.encode())
                 .with("score", score.to_decimal_lexical())
                 .with("evidence", Value::array(evidence))
                 .with("evidence_limited", evidence_limited)
@@ -478,9 +543,10 @@ impl Store {
                     .with("membership_complete", membership_complete)
                     .with("terms", terms),
             )
-            .with("time_basis", "received_at")
+            .with("time_basis", time_basis)
             .with("field_visits", field_coverage.visits.to_string())
             .with("qualified_records", qualified.to_string())
+            .with("event_coverage", event_coverage)
             .with("rows", Value::array(rows))
             .into())
     }

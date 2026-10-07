@@ -207,7 +207,7 @@ fn artifact(
     Ok(())
 }
 
-fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) {
+fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> capnp::Result<()> {
     out.set_store_id(store);
     out.set_id(&value.id);
     out.set_artifact_id(&value.artifact_id);
@@ -220,6 +220,75 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) {
         .set_unix_millis(value.expires_at);
     out.set_byte_start(value.byte_start);
     out.set_byte_end(value.byte_end);
+    event_time(out.init_event_time(), &value.event_time)
+}
+
+fn time_representation(value: wire::TimeRepresentation) -> sparrow_core::TimeRepresentation {
+    match value {
+        wire::TimeRepresentation::Rfc3339 => sparrow_core::TimeRepresentation::Rfc3339,
+        wire::TimeRepresentation::UnixMillis => sparrow_core::TimeRepresentation::UnixMillis,
+        wire::TimeRepresentation::UnixSeconds => sparrow_core::TimeRepresentation::UnixSeconds,
+    }
+}
+
+fn source_time_profile(
+    mut out: wire::source_time_profile::Builder<'_>,
+    profile: &sparrow_core::SourceTimeProfile,
+    store: &str,
+) {
+    out.set_store_id(store);
+    out.set_id(&profile.id);
+    out.set_source(&profile.source);
+    out.set_path(&profile.path);
+    out.set_representation(match profile.representation {
+        sparrow_core::TimeRepresentation::Rfc3339 => wire::TimeRepresentation::Rfc3339,
+        sparrow_core::TimeRepresentation::UnixMillis => wire::TimeRepresentation::UnixMillis,
+        sparrow_core::TimeRepresentation::UnixSeconds => wire::TimeRepresentation::UnixSeconds,
+    });
+}
+
+fn event_time(
+    out: wire::event_time::Builder<'_>,
+    value: &sparrow_core::EventTime,
+) -> capnp::Result<()> {
+    match value {
+        sparrow_core::EventTime::Known {
+            millis,
+            profile_id,
+            occurrence,
+            source_start,
+            source_end,
+        } => {
+            let mut out = out.init_known();
+            out.reborrow().init_instant().set_unix_millis(*millis);
+            out.set_profile_id(profile_id);
+            out.set_occurrence(*occurrence);
+            out.set_source_start(*source_start);
+            out.set_source_end(*source_end);
+        }
+        sparrow_core::EventTime::Unknown { reason, profile_id } => {
+            let mut out = out.init_unknown();
+            out.set_reason(match reason.as_str() {
+                "no_profile" => wire::UnknownTimeReason::NoProfile,
+                "not_json" => wire::UnknownTimeReason::NotJson,
+                "projection_failed" => wire::UnknownTimeReason::ProjectionFailed,
+                "missing_field" => wire::UnknownTimeReason::MissingField,
+                "ambiguous_field" => wire::UnknownTimeReason::AmbiguousField,
+                "wrong_kind" => wire::UnknownTimeReason::WrongKind,
+                "invalid_instant" => wire::UnknownTimeReason::InvalidInstant,
+                "legacy_unprofiled" => wire::UnknownTimeReason::LegacyUnprofiled,
+                _ => {
+                    return Err(capnp::Error::failed(
+                        "invalid stored source time diagnostic".into(),
+                    ));
+                }
+            });
+            if let Some(profile) = profile_id {
+                out.init_profile_id().set_value(profile);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn pin(
@@ -268,7 +337,7 @@ fn context_side(
     mut out: wire::context_side::Builder<'_>,
     value: sparrow_core::ContextSide,
     store: &str,
-) {
+) -> capnp::Result<()> {
     out.set_visited(value.visited);
     out.set_retired(value.retired);
     out.set_frontier(match value.frontier {
@@ -278,8 +347,9 @@ fn context_side(
     });
     let mut rows = out.init_rows(value.records.len() as u32);
     for (index, value) in value.records.into_iter().enumerate() {
-        record(rows.reborrow().get(index as u32), value, store);
+        record(rows.reborrow().get(index as u32), value, store)?;
     }
+    Ok(())
 }
 
 fn optional(value: wire::optional_text::Reader<'_>) -> capnp::Result<Option<String>> {
@@ -545,13 +615,59 @@ impl wire::sparrow::Server for Rpc {
                 coverage.set_eligible_records(
                     (1 + value.before.records.len() + value.after.records.len()) as u64,
                 );
-                record(out.reborrow().init_anchor(), value.anchor, &value.store_id);
-                context_side(out.reborrow().init_before(), value.before, &value.store_id);
-                context_side(out.init_after(), value.after, &value.store_id);
+                record(out.reborrow().init_anchor(), value.anchor, &value.store_id)?;
+                context_side(out.reborrow().init_before(), value.before, &value.store_id)?;
+                context_side(out.init_after(), value.after, &value.store_id)?;
             }
         }
         Ok(())
     }
+    async fn source_time_define(
+        self: Rc<Self>,
+        params: wire::sparrow::SourceTimeDefineParams,
+        mut results: wire::sparrow::SourceTimeDefineResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_definition()?;
+        let source = input.get_source()?.to_str()?.to_owned();
+        let path = input.get_path()?.to_str()?.to_owned();
+        let representation = time_representation(input.get_representation()?);
+        match self
+            .work(move |store, _| {
+                Ok((
+                    store.define_time_profile(&source, &path, representation)?,
+                    store.store_id()?,
+                ))
+            })
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok((profile, store)) => {
+                source_time_profile(results.get().init_result().init_ok(), &profile, &store)
+            }
+        }
+        Ok(())
+    }
+    async fn source_time_get(
+        self: Rc<Self>,
+        params: wire::sparrow::SourceTimeGetParams,
+        mut results: wire::sparrow::SourceTimeGetResults,
+    ) -> capnp::Result<()> {
+        let source = params.get()?.get_source()?.to_str()?.to_owned();
+        match self
+            .work(move |store, _| Ok((store.time_profile(&source)?, store.store_id()?)))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok((Some(profile), store)) => source_time_profile(
+                results.get().init_result().init_ok().init_value(),
+                &profile,
+                &store,
+            ),
+            Ok((None, _)) => results.get().init_result().init_ok().set_absent(()),
+        }
+        Ok(())
+    }
+
     async fn records_search(
         self: Rc<Self>,
         params: wire::sparrow::RecordsSearchParams,
@@ -587,6 +703,16 @@ impl wire::sparrow::Server for Rpc {
             })
             .collect::<capnp::Result<Vec<_>>>()?;
         let query = sparrow_core::RecordQuery {
+            event_interval: match input.get_event_interval()?.which()? {
+                wire::optional_event_interval::Absent(()) => None,
+                wire::optional_event_interval::Value(value) => {
+                    let value = value?;
+                    Some(sparrow_core::EventInterval {
+                        from: value.get_from()?.get_unix_millis(),
+                        before: value.get_before()?.get_unix_millis(),
+                    })
+                }
+            },
             text: optional(input.get_text()?)?,
             fields,
             require_complete_index: input.get_require_complete_index(),
@@ -602,6 +728,19 @@ impl wire::sparrow::Server for Rpc {
                 receipt(out.reborrow().init_receipt(), &value)?;
                 out.set_field_visits(number(&value, "field_visits")?);
                 out.set_qualified_records(number(&value, "qualified_records")?);
+                out.set_time_basis(match field::<String>(&value, "time_basis")?.as_str() {
+                    "received_at" => wire::TimeBasis::ReceivedAt,
+                    "event_time" => wire::TimeBasis::EventTime,
+                    _ => return Err(capnp::Error::failed("invalid captured time basis".into())),
+                });
+                let coverage = value
+                    .get("event_coverage")
+                    .ok_or_else(|| capnp::Error::failed("missing event coverage".into()))?;
+                let mut target = out.reborrow().init_event_coverage();
+                target.set_evaluated(number(coverage, "evaluated")?);
+                target.set_unknown(number(coverage, "unknown")?);
+                target.set_outside_interval(number(coverage, "outside_interval")?);
+                target.set_membership_complete(field::<bool>(coverage, "membership_complete")?);
                 if has_text {
                     text_results(out.reborrow().init_text().init_value(), &value)?;
                 }
@@ -618,6 +757,15 @@ impl wire::sparrow::Server for Rpc {
                     );
                     target.set_byte_start(number(row, "byte_start")?);
                     target.set_byte_end(number(row, "byte_end")?);
+                    let event = row.get("event_time").ok_or_else(|| {
+                        capnp::Error::failed("missing captured event time".into())
+                    })?;
+                    let event =
+                        <sparrow_core::EventTime as purrdf_lex::json::record::FromJson>::from_json(
+                            event,
+                        )
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                    event_time(target.reborrow().init_event_time(), &event)?;
                     let fields = row.get("fields").and_then(Value::as_array).ok_or_else(|| {
                         capnp::Error::failed("missing captured field witnesses".into())
                     })?;
@@ -682,7 +830,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(7);
+                out.set_schema_version(8);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
@@ -795,7 +943,7 @@ impl wire::sparrow::Server for Rpc {
                     .store
                     .store_id()
                     .map_err(|e| capnp::Error::failed(e.to_string()))?,
-            ),
+            )?,
             Err(e) => failure(results.get().init_result(), e),
         }
         Ok(())

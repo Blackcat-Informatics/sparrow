@@ -344,3 +344,48 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^matches_json_occurrence$']
+
+[[job]]
+id = "source-event-time"
+summary = "Capture explicit source timestamp representation from unique native occurrences with original byte evidence."
+home = "sparrow_core::storage::source_time::capture"
+entry_points = []
+spec = "docs/development-runtime.md: immutable source profiles, unknown diagnostics and explicit event-time intervals."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(extract_event_time|parse_event_time)$']
+
+[[job]]
+id = "native-integer-lexical"
+summary = "Interpret integer lexical values through the native XSD codec without a second numeric parser."
+home = "purrdf:purrdf_xsd::numeric::parse_integer"
+entry_points = []
+spec = "PurRDF native XSD integer lexical codec; Sparrow declares integer epoch units explicitly."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^parse_epoch_integer$']
+
+[[job]]
+id = "source-time-profile"
+summary = "Durably bind one immutable source timestamp profile with content identity, capacity and conflicting-definition refusal."
+home = "sparrow_core::Store::define_time_profile"
+entry_points = []
+spec = "docs/development-runtime.md: explicit immutable source-time registry and admission ceiling."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(bind_source_time|register_source_time_profile)$']

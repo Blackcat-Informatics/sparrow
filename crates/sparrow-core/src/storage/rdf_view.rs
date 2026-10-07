@@ -781,6 +781,9 @@ impl Store {
         };
         let mut graphs = BTreeSet::new();
         for record in records {
+            writer
+                .validate_event_record(&record)
+                .map_err(|error| view.budget.fail(error))?;
             if !writer.live_record(&record, now, &protected) {
                 return Err(view.budget.fail(Error::new(
                     "EVIDENCE_UNAVAILABLE",

@@ -14,7 +14,7 @@ and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
-`bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext` and `rdfInspect`. The shared typed
+`bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext`, `rdfInspect`, `sourceTimeDefine` and `sourceTimeGet`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
 result rendering. The CLI supplies status, non-destructive buffered file import,
@@ -178,7 +178,7 @@ The adapter bounds requests to 128 KiB, responses to 8 MiB, concurrent calls to
 four and each call to 30 seconds. Oversized framing closes the session with an
 explicit protocol error; malformed complete JSON frames receive a parse error
 and subsequent valid frames can proceed. EOF drains pending calls. Discovery
-requires daemon schema version 7, including finite pin catalog captures, durable pin renewal receipts, RDF profile identity, record context
+requires daemon schema version 8, including finite pin catalog captures, durable pin renewal receipts, RDF profile identity, record context
 and native text/profile identities;
 older discovery contracts fail explicitly rather than invent those identities.
 
@@ -600,10 +600,10 @@ not a process RSS guarantee. Applicable failed JSON/text projections are counted
 not applicable when JSON fields are requested. Limits and incomplete coverage
 remain visible in the receipt.
 
-This operation currently selects **acceptance time** only. Event-time source
-profiles, event-time intervals, cursor continuation, pin/selection query scopes,
-and the full native governed SPARQL interface remain required work. Unsupported
-event-time input is refused, never translated to acceptance time.
+The schema-7 operation selected acceptance time only. The explicit source-time
+extension below adds event intervals in schema 8. Cursor continuation,
+pin/selection query scopes, higher-precision/pre-epoch clock representations,
+and the full native governed SPARQL interface remain required work.
 
 Combined-query qualification passed `make check`: 33 storage scenarios, five
 core unit tests, the server admission/cancellation unit test, 50 census tooling
@@ -630,3 +630,111 @@ metadata/witness rows with `text:null`. Native ranking uses two documents and
 48 tokens, corpus
 `8e28d99ceee6e7073cbef16582bbe985fa97bb420ad62785f5015f5003c2675c`, identical
 through CLI and MCP. The MCP adapter exited cleanly on EOF.
+
+## Explicit source-time profiles and event intervals
+
+Discovery schema 8 adds typed `sourceTimeDefine` and `sourceTimeGet` RPCs,
+MCP `source_time_define` and `source_time_get`, and CLI
+`source-time SOURCE POINTER REPRESENTATION` / `source-time-get SOURCE`.
+A definition durably binds one exact source name to a concrete native JSON
+pointer and one declared representation. Identical retries return the same
+content-addressed profile; conflicting definitions return `CONFLICT` and require
+a new logical source name. Define the profile before importing that source.
+A later definition never reinterprets older records or changes an ingestion
+retry receipt. Profile lookups return explicit absence for undefined sources.
+The registry admits at most 1,024 mappings, bounds source names at 512 bytes and
+pointers at 4,096 bytes, validates native pointer escapes and catalog identity,
+and refuses physical control-admission pressure.
+
+Representations are `rfc3339`, `unix_millis`, and `unix_seconds`. RFC 3339 values
+must be native decoded strings with an explicit offset, at or after the Unix
+epoch, exact to the existing millisecond clock. Integer epoch representations use
+PurRDF's native XSD integer lexical reader and checked unit conversion. Fractional
+or exponent-form numeric values are not silently rounded or guessed as another
+unit. Out-of-range, pre-epoch, ambiguous-zone and unsupported precision values
+remain unknown with `invalid_instant`. Higher-resolution and other producer
+clock laws remain required work; these profiles do not claim to cover them.
+
+Every new record durably captures either a known source instant, immutable
+profile identity, native occurrence ID and original artifact byte span, or an
+explicit unknown reason: `no_profile`, `not_json`, `projection_failed`,
+`missing_field`, `ambiguous_field`, `wrong_kind`, or `invalid_instant`. Duplicate
+matching timestamp pointers are ambiguous even if their lexical values agree.
+Older records without this additive catalog field report `legacy_unprofiled`.
+They are never reparsed using a newly registered profile. Missing/broken declared
+profile references or source-time evidence outside the record are storage failures.
+Known instants additionally appear as typed `eventTime` metadata RDF literals
+and link their `sourceTimeProfile`; they do not replace `receivedAt` or `expiresAt`.
+
+For example:
+
+```sh
+target/release/sparrow SOCKET source-time copied-events /timestamp rfc3339
+target/release/sparrow SOCKET records --source copied-events \
+  --event-from 2026-09-27T00:00:00Z --event-before 2026-09-28T00:00:00Z
+```
+
+`records_search` accepts paired `event_from` and `event_before` bounds, plus its
+existing text/field and acceptance-time filters. CLI uses paired `--event-from`
+and `--event-before`. Bounds are UTC half-open intervals. Unknown source times
+are excluded, with `event_coverage.unknown` counted among live source/acceptance
+scope records. `outside_interval` counts known source times outside the interval;
+`evaluated` is their shared population. `membership_complete:false` identifies
+an incomplete bounded catalog scan, so these counts must not be treated as exact
+store-wide totals. Chronological event queries sort by source instant and stable
+record ID before applying the row limit. Optional text ranking runs only over
+qualified event-time members, with the existing native corpus receipts.
+
+The response explicitly reports `time_basis:event_time`, each row's known time
+and supporting spans, and event coverage. With no event bounds it reports
+`received_at` and preserves acceptance ordering. Record metadata and context
+also expose the captured event-time state. Expiry and pins remain based on
+acceptance/retention deadlines, independently of old, future or skewed source
+clocks. Cursor pagination and event-ordered context are not yet implemented.
+
+Source-time qualification passed the full `make check` gate: 38 storage
+scenarios, five core unit tests, the server admission/cancellation unit test,
+50 census tooling unit tests and five tooling gate scenarios, both real-daemon/
+MCP scenarios including crash/reopen, seeded census self-tests, and all 17
+helper-ledger jobs. No distinct exceptions or unsanctioned isomorphic groups
+were added. Native governed stored-view SELECT verified the new `eventTime`
+RDF literal and immutable profile link. Strict event-time index requests also
+refuse source-clock capture that depended on a failed applicable JSON projection.
+
+Before cutover, the rebuilt client refused an event-time request against the
+still-running schema-7 daemon with `UNSUPPORTED` and no stdout result rows,
+because that daemon did not honor the requested time basis. The adapter checks
+the returned typed time basis rather than accepting a silently ignored filter.
+
+The owned development daemon was updated at approximately **2026-10-07
+08:06 UTC**, PID **595446**, discovery schema **8**, using the same private
+socket, configuration and `store:46c88e949ccec658600b66c7becd5bb7`. The previous
+owned process exited cleanly on SIGINT. Store format and native RDF/text profile
+identities remain unchanged. Directory/socket permissions remain 0700/0600.
+
+Live acceptance used only a copied, complete **962-byte first record** from
+`~/Active/lillith_soul/inner-core/corrections/2026-09-27.jsonl`, rather than
+claiming the entire producer file. Its device, inode, size and modification time
+were unchanged around reading and qualification. CLI export matched every copied
+byte, SHA-256
+`46aa5ddbc5c4f04e9c4bf96533aa0931628ca41b22222891d36ff502ca378ed1`.
+No producer file was renamed, deleted or consumed.
+
+The declared source `copied-correction-source-time-v1` uses `/timestamp` and
+`rfc3339`, immutable profile
+`time-profile:961b463f0ed6a30f7031df16ba0348e82f61c0848196e8ee0046574f8df4ef2e`.
+The copied artifact is `artifact:476f80ab8f332b28801d5383902a9c4f`, record
+`record:08a1adcc30816e2f98f4c0db4ebc7da1`. Its source instant is
+**2026-09-27T00:13:37.406Z**, native occurrence **5**, exact span **[171,195)**;
+its independent acceptance time is **2026-10-07T08:06:59.738Z**. CLI and MCP
+event-interval queries returned identical rows and complete coverage with one
+evaluated record, zero unknowns and zero outside the interval. Adding an
+acceptance-before bound of September 28 excluded the record, demonstrating
+that event and acceptance filters intersect independently. MCP record metadata
+reported the same native event evidence, and the adapter exited cleanly on EOF.
+
+The development store now retains six records, five payload chunks, two shared
+JSON projections, no active pins and no pin read handles. This qualification
+covers one copied source record; streaming, watcher/producer lifecycle, whole
+corpus coverage, source-clock laws beyond this millisecond profile, pressure/
+performance acceptance, and full governed SPARQL remain unfinished.

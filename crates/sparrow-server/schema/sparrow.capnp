@@ -23,6 +23,31 @@ struct Record {
   storeId @0 :Text; id @1 :Text; artifactId @2 :Text; source @3 :Text;
   receivedAt @4 :Instant; expiresAt @5 :Instant;
   byteStart @6 :UInt64; byteEnd @7 :UInt64;
+  eventTime @8 :EventTime;
+}
+enum TimeRepresentation { rfc3339 @0; unixMillis @1; unixSeconds @2; }
+enum UnknownTimeReason {
+  legacyUnprofiled @0; noProfile @1; notJson @2; projectionFailed @3;
+  missingField @4; ambiguousField @5; wrongKind @6; invalidInstant @7;
+}
+struct KnownEventTime {
+  instant @0 :Instant; profileId @1 :Text; occurrence @2 :UInt64;
+  sourceStart @3 :UInt64; sourceEnd @4 :UInt64;
+}
+struct UnknownEventTime { reason @0 :UnknownTimeReason; profileId @1 :OptionalText; }
+struct EventTime { union { unknown @0 :UnknownEventTime; known @1 :KnownEventTime; } }
+struct SourceTimeProfile {
+  storeId @0 :Text; id @1 :Text; source @2 :Text; path @3 :Text;
+  representation @4 :TimeRepresentation; durability @5 :Durability = durable;
+}
+struct OptionalSourceTimeProfile { union { absent @0 :Void; value @1 :SourceTimeProfile; } }
+struct SourceTimeDefinition { source @0 :Text; path @1 :Text; representation @2 :TimeRepresentation; }
+struct EventInterval { from @0 :Instant; before @1 :Instant; }
+struct OptionalEventInterval { union { absent @0 :Void; value @1 :EventInterval; } }
+enum TimeBasis { receivedAt @0; eventTime @1; }
+struct EventCoverage {
+  evaluated @0 :UInt64; unknown @1 :UInt64; outsideInterval @2 :UInt64;
+  membershipComplete @3 :Bool;
 }
 struct Pin {
   storeId @0 :Text; id @1 :Text; name @2 :Text; expiresAt @3 :Instant;
@@ -151,6 +176,7 @@ struct FieldConstraint {
 struct RecordQuery {
   scope @0 :Scope; text @1 :OptionalText; fields @2 :List(FieldConstraint);
   requireCompleteIndex @3 :Bool;
+  eventInterval @4 :OptionalEventInterval;
 }
 struct OptionalOccurrence { union { absent @0 :Void; value @1 :UInt64; } }
 struct FieldEvidence {
@@ -161,11 +187,13 @@ struct FieldEvidence {
 struct RecordMatch {
   recordId @0 :Text; artifactId @1 :Text; source @2 :Text; receivedAt @3 :Instant;
   byteStart @4 :UInt64; byteEnd @5 :UInt64; fields @6 :List(FieldEvidence);
+  eventTime @7 :EventTime;
 }
 struct OptionalTextResults { union { absent @0 :Void; value @1 :TextResults; } }
 struct RecordsResults {
   receipt @0 :Receipt; rows @1 :List(RecordMatch); text @2 :OptionalTextResults;
   fieldVisits @3 :UInt64; qualifiedRecords @4 :UInt64;
+  timeBasis @5 :TimeBasis; eventCoverage @6 :EventCoverage;
 }
 interface Sparrow {
   status @0 () -> (result :Result(Status));
@@ -183,4 +211,6 @@ interface Sparrow {
   pinRenew @12 (request :Renew) -> (result :Result(Pin));
   pinRead @13 (query :PinReadQuery) -> (result :Result(PinReadPage));
   recordsSearch @14 (query :RecordQuery) -> (result :Result(RecordsResults));
+  sourceTimeDefine @15 (definition :SourceTimeDefinition) -> (result :Result(SourceTimeProfile));
+  sourceTimeGet @16 (source :Text) -> (result :Result(OptionalSourceTimeProfile));
 }
