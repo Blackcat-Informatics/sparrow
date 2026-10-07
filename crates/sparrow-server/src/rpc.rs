@@ -107,6 +107,19 @@ impl Rpc {
         Ok(id.to_owned())
     }
 
+    fn import_reference(&self, value: wire::import_ref::Reader<'_>) -> Result<String, Error> {
+        let store = value
+            .get_store_id()
+            .map_err(invalid)?
+            .to_str()
+            .map_err(invalid)?;
+        let id = value.get_id().map_err(invalid)?.to_str().map_err(invalid)?;
+        if store.len() > 128 || id.len() != 71 {
+            return Err(invalid("require a bounded store-scoped import identity"));
+        }
+        self.reference(store, id, "import:")
+    }
+
     fn check_store(&self, store: &str) -> Result<(), Error> {
         if store != self.store.store_id()? {
             return Err(Error {
@@ -156,13 +169,26 @@ fn failure<T: capnp::traits::Owned + 'static>(output: wire::result::Builder<'_, 
     out.set_retryable(matches!(error.code, "STORAGE_PRESSURE" | "RESOURCE_LIMIT"));
 }
 
-fn format(value: wire::Format) -> &'static str {
+pub(crate) fn format(value: wire::Format) -> &'static str {
     match value {
         wire::Format::Jsonl => "jsonl",
         wire::Format::Log => "log",
         wire::Format::Json => "json",
         wire::Format::Markdown => "markdown",
         wire::Format::Opaque => "opaque",
+    }
+}
+
+pub(crate) fn stored_format(value: &str) -> capnp::Result<wire::Format> {
+    match value {
+        "jsonl" => Ok(wire::Format::Jsonl),
+        "log" => Ok(wire::Format::Log),
+        "json" => Ok(wire::Format::Json),
+        "markdown" => Ok(wire::Format::Markdown),
+        "opaque" => Ok(wire::Format::Opaque),
+        _ => Err(capnp::Error::failed(
+            "format requires jsonl, log, json, markdown or opaque".into(),
+        )),
     }
 }
 
@@ -174,18 +200,7 @@ fn artifact(
     out.set_store_id(store);
     out.set_id(&value.id);
     out.set_source(&value.source);
-    out.set_format(match value.format.as_str() {
-        "jsonl" => wire::Format::Jsonl,
-        "log" => wire::Format::Log,
-        "json" => wire::Format::Json,
-        "markdown" => wire::Format::Markdown,
-        "opaque" => wire::Format::Opaque,
-        _ => {
-            return Err(capnp::Error::failed(
-                "invalid stored artifact format".into(),
-            ));
-        }
-    });
+    out.set_format(stored_format(&value.format)?);
     out.reborrow()
         .init_received_at()
         .set_unix_millis(value.received_at);
@@ -203,6 +218,32 @@ fn artifact(
     );
     for (index, id) in value.record_ids.iter().enumerate() {
         records.set(index as u32, id);
+    }
+    Ok(())
+}
+
+fn import_progress(
+    mut out: wire::import_progress::Builder<'_>,
+    value: sparrow_core::ImportManifest,
+    store: &str,
+) -> capnp::Result<()> {
+    out.set_store_id(store);
+    out.set_id(&value.id);
+    out.set_request_id(&value.request_id);
+    out.set_source(&value.source);
+    out.set_format(stored_format(&value.format)?);
+    out.set_byte_length(value.byte_length);
+    out.set_payload_id(&value.payload_id);
+    out.set_received_bytes(value.received_bytes);
+    out.reborrow()
+        .init_expires_at()
+        .set_unix_millis(value.expires_at);
+    out.set_sealed(value.sealed);
+    out.set_layout_complete(value.layout_complete);
+    out.set_layout_records(value.layout_records);
+    match value.published_artifact {
+        Some(id) => out.init_published_artifact().set_value(id),
+        None => out.init_published_artifact().set_absent(()),
     }
     Ok(())
 }
@@ -514,6 +555,260 @@ fn text_results(mut out: wire::text_results::Builder<'_>, value: &Value) -> capn
 }
 
 impl wire::sparrow::Server for Rpc {
+    async fn import_begin(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportBeginParams,
+        mut results: wire::sparrow::ImportBeginResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_request()?;
+        let request = input.get_request_id()?.to_str()?;
+        let source = input.get_source()?.to_str()?;
+        let payload = input.get_payload_id()?.to_str()?;
+        if request.len() > 128 || source.len() > 512 || payload.len() != 71 {
+            failure(
+                results.get().init_result(),
+                invalid("import labels or digest exceed admitted bounds"),
+            );
+            return Ok(());
+        }
+        let request = request.to_owned();
+        let source = source.to_owned();
+        let payload = payload.to_owned();
+        let kind = format(input.get_format()?);
+        let length = input.get_byte_length();
+        match self
+            .work(move |store, now| {
+                Ok((
+                    store.import_start(&request, &source, kind, length, &payload, now)?,
+                    store.store_id()?,
+                ))
+            })
+            .await
+        {
+            Ok((sparrow_core::ImportStart::Staging(value), store)) => import_progress(
+                results.get().init_result().init_ok().init_staging(),
+                value,
+                &store,
+            )?,
+            Ok((sparrow_core::ImportStart::Accepted(value), store)) => artifact(
+                results.get().init_result().init_ok().init_accepted(),
+                value,
+                &store,
+            )?,
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn import_append(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportAppendParams,
+        mut results: wire::sparrow::ImportAppendResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_request()?;
+        let bytes = input.get_bytes()?;
+        if bytes.len() > sparrow_core::IMPORT_CHUNK_BYTES {
+            failure(
+                results.get().init_result(),
+                invalid("import chunk exceeds 64 KiB"),
+            );
+            return Ok(());
+        }
+        let id = match self.import_reference(input.get_import()?) {
+            Ok(id) => id,
+            Err(e) => {
+                failure(results.get().init_result(), e);
+                return Ok(());
+            }
+        };
+        let bytes = bytes.to_vec();
+        let offset = input.get_offset();
+        match self
+            .work(move |store, now| {
+                Ok((
+                    store.import_append(&id, offset, &bytes, now)?,
+                    store.store_id()?,
+                ))
+            })
+            .await
+        {
+            Ok((value, store)) => {
+                import_progress(results.get().init_result().init_ok(), value, &store)?
+            }
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn import_get(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportGetParams,
+        mut results: wire::sparrow::ImportGetResults,
+    ) -> capnp::Result<()> {
+        let id = match self.import_reference(params.get()?.get_import()?) {
+            Ok(id) => id,
+            Err(e) => {
+                failure(results.get().init_result(), e);
+                return Ok(());
+            }
+        };
+        match self
+            .work(move |store, now| Ok((store.import_get(&id, now)?, store.store_id()?)))
+            .await
+        {
+            Ok((value, store)) => {
+                import_progress(results.get().init_result().init_ok(), value, &store)?
+            }
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn import_seal(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportSealParams,
+        mut results: wire::sparrow::ImportSealResults,
+    ) -> capnp::Result<()> {
+        let id = match self.import_reference(params.get()?.get_import()?) {
+            Ok(id) => id,
+            Err(e) => {
+                failure(results.get().init_result(), e);
+                return Ok(());
+            }
+        };
+        match self
+            .work(move |store, now| Ok((store.import_seal(&id, now)?, store.store_id()?)))
+            .await
+        {
+            Ok((value, store)) => {
+                import_progress(results.get().init_result().init_ok(), value, &store)?
+            }
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn import_layout(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportLayoutParams,
+        mut results: wire::sparrow::ImportLayoutResults,
+    ) -> capnp::Result<()> {
+        let id = match self.import_reference(params.get()?.get_import()?) {
+            Ok(id) => id,
+            Err(e) => {
+                failure(results.get().init_result(), e);
+                return Ok(());
+            }
+        };
+        match self
+            .work(move |store, now| Ok((store.import_prepare_layout(&id, now)?, store.store_id()?)))
+            .await
+        {
+            Ok((value, store)) => {
+                import_progress(results.get().init_result().init_ok(), value, &store)?
+            }
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn import_prepare(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportPrepareParams,
+        mut results: wire::sparrow::ImportPrepareResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_request()?;
+        let id = match self.import_reference(input.get_import()?) {
+            Ok(id) => id,
+            Err(e) => {
+                failure(results.get().init_result(), e);
+                return Ok(());
+            }
+        };
+        let expected = input.get_expected_record();
+        match self
+            .work(move |store, now| {
+                Ok((
+                    store.import_prepare_record(&id, expected, now)?,
+                    store.store_id()?,
+                ))
+            })
+            .await
+        {
+            Ok((value, store)) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(store);
+                out.set_import_id(&value.import_id);
+                out.set_reserved_artifact_id(&value.artifact_id);
+                out.set_prepared_records(value.prepared_records);
+                out.set_total_records(value.total_records);
+                out.reborrow()
+                    .init_received_at()
+                    .set_unix_millis(value.received_at);
+                out.reborrow()
+                    .init_expires_at()
+                    .set_unix_millis(value.expires_at);
+                match value.source_time_profile {
+                    Some(id) => out.init_source_time_profile().set_value(id),
+                    None => out.init_source_time_profile().set_absent(()),
+                }
+            }
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn import_publish(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportPublishParams,
+        mut results: wire::sparrow::ImportPublishResults,
+    ) -> capnp::Result<()> {
+        let id = match self.import_reference(params.get()?.get_import()?) {
+            Ok(id) => id,
+            Err(e) => {
+                failure(results.get().init_result(), e);
+                return Ok(());
+            }
+        };
+        match self
+            .work(move |store, now| Ok((store.import_publish(&id, now)?, store.store_id()?)))
+            .await
+        {
+            Ok((value, store)) => artifact(results.get().init_result().init_ok(), value, &store)?,
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn import_cancel(
+        self: Rc<Self>,
+        params: wire::sparrow::ImportCancelParams,
+        mut results: wire::sparrow::ImportCancelResults,
+    ) -> capnp::Result<()> {
+        let id = match self.import_reference(params.get()?.get_import()?) {
+            Ok(id) => id,
+            Err(e) => {
+                failure(results.get().init_result(), e);
+                return Ok(());
+            }
+        };
+        match self
+            .work(move |store, now| {
+                store.import_cancel(&id, now)?;
+                Ok((id, store.store_id()?))
+            })
+            .await
+        {
+            Ok((id, store)) => {
+                let mut out = results.get().init_result().init_ok().init_import();
+                out.set_store_id(store);
+                out.set_id(id);
+            }
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
     async fn rdf_inspect(
         self: Rc<Self>,
         params: wire::sparrow::RdfInspectParams,
@@ -830,7 +1125,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(8);
+                out.set_schema_version(9);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);

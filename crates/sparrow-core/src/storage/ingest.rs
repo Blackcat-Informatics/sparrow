@@ -316,3 +316,65 @@ impl<'a> RecordBatch<'a> {
         })
     }
 }
+
+impl Writer {
+    /// Both upload paths compare the original source/format and exact payload identity.
+    /// Legacy receipts already contain these fields in their artifact catalog.
+    pub(super) fn accepted_ingest(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        byte_length: u64,
+        payload_id: &str,
+        now: u64,
+    ) -> Result<Option<super::Artifact>, Error> {
+        let artifact = match self.retry(&format!("request:ingest:{request_id}"), now)? {
+            Some(saved) => {
+                <super::Artifact as super::Catalog>::decode(super::field(&saved, "receipt")?)?
+            }
+            None => match super::publication::published(
+                self,
+                &super::import::import_id(request_id),
+                now,
+            )? {
+                Some((_, artifact)) => artifact,
+                None => return Ok(None),
+            },
+        };
+        if artifact.source != source
+            || artifact.format != format
+            || artifact.byte_length != byte_length
+            || artifact.payload_id != payload_id
+        {
+            return Err(Error::new(
+                "CONFLICT",
+                "request_id was committed with different input",
+            ));
+        }
+        Ok(Some(artifact))
+    }
+
+    pub(super) fn ingest_receipt(
+        &self,
+        batch: &mut WriteBatch,
+        request_id: &str,
+        artifact: &super::Artifact,
+        now: u64,
+    ) -> Result<(), Error> {
+        let receipt: Value = Object::new()
+            .with(
+                "expires_at",
+                now.checked_add(super::RETRY_WINDOW)
+                    .ok_or_else(|| Error::new("INVALID_ARGUMENT", "retry deadline overflow"))?
+                    .to_string(),
+            )
+            .with("receipt", super::Catalog::encode(artifact))
+            .into();
+        batch.put(
+            format!("request:ingest:{request_id}"),
+            json::write_compact(&receipt),
+        );
+        Ok(())
+    }
+}

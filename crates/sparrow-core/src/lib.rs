@@ -17,7 +17,7 @@ pub use query::{
 pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::import::{
     IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,
-    ImportRecordSpan,
+    ImportRecordSpan, ImportStart,
 };
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};

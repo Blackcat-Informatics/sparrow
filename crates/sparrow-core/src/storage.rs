@@ -783,20 +783,22 @@ impl Store {
                 "artifact exceeds the configured bounded ingestion size",
             ));
         }
-        let retry_key = format!("request:ingest:{request_id}");
-        let mut preimage = Vec::new();
-        for component in [source.as_bytes(), format.as_bytes(), bytes] {
-            purrdf_hash::frame::frame_le(&mut preimage, component);
+        let payload_id = format!("blake3:{}", hex::encode(blake3::hash(bytes).as_bytes()));
+        if let Some(receipt) = writer.accepted_ingest(
+            request_id,
+            source,
+            format,
+            bytes.len() as u64,
+            &payload_id,
+            now,
+        )? {
+            return Ok(receipt);
         }
-        let signature = hex::encode(blake3::hash(&preimage).as_bytes());
-        if let Some(previous) = writer.retry(&retry_key, now)? {
-            if read_field::<String>(&previous, "signature")? != signature {
-                return Err(Error::new(
-                    "CONFLICT",
-                    "request_id was committed with different input",
-                ));
-            }
-            return Artifact::decode(field(&previous, "receipt")?);
+        if writer.db.get(import::import_id(request_id))?.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "request has a staged import; resume it through import_start",
+            ));
         }
         let source_time_profile = writer.time_profile(source)?;
         let expires_at = now.checked_add(30 * DAY).ok_or_else(|| {
@@ -843,23 +845,13 @@ impl Store {
             received_at: now,
             expires_at,
             byte_length: bytes.len() as u64,
-            payload_id: format!("blake3:{}", hex::encode(blake3::hash(bytes).as_bytes())),
+            payload_id,
             record_ids: records,
             chunks,
             evicted: false,
         };
         put(&mut batch, &artifact.id, &artifact);
-        let receipt: Value = Object::new()
-            .with("signature", signature)
-            .with(
-                "expires_at",
-                now.checked_add(RETRY_WINDOW)
-                    .ok_or_else(|| Error::new("INVALID_ARGUMENT", "retry deadline overflow"))?
-                    .to_string(),
-            )
-            .with("receipt", artifact.encode())
-            .into();
-        batch.put(retry_key, json::write_compact(&receipt));
+        writer.ingest_receipt(&mut batch, request_id, &artifact, now)?;
         if batch.size_in_bytes() > 128 * 1024 * 1024 {
             return Err(Error::new(
                 "RESOURCE_LIMIT",

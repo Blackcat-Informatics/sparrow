@@ -524,3 +524,63 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(read_normalized_chunk|verify_payload_chunk)$']
+
+[[job]]
+id = "shared-ingestion-retry"
+summary = "Buffered and streamed imports resolve one accepted request identity by exact original source, format, length and native payload digest."
+home = "sparrow_core::storage::Writer::accepted_ingest"
+entry_points = []
+spec = "docs/development-runtime.md: schema-9 shared accepted receipts and prevention of duplicate occurrences."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(lookup_buffered_ingest_retry|lookup_streamed_ingest_retry)$']
+
+[[job]]
+id = "typed-evidence-format"
+summary = "Translate original artifact format labels into the generated Cap'n Proto enum in one place."
+home = "sparrow_server::rpc::stored_format"
+entry_points = []
+spec = "docs/interfaces.md: typed format contract; artifacts and staging use the same representation."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(artifact_wire_format|import_wire_format)$']
+
+[[job]]
+id = "completed-file-identity"
+summary = "Capture the opened client file's device, inode, length and nanosecond modification/change clocks for completed-input stability checks."
+home = "sparrow_server::agent::ingest::file_identity"
+entry_points = []
+spec = "docs/development-runtime.md: schema-9 bounded file hashing and publication guards."
+vectors = ["crates/sparrow-server/src/agent/ingest.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(upload_file_identity|completed_input_identity)$']
+
+[[job]]
+id = "typed-import-progress"
+summary = "Render private committed staging and layout progress separately from accepted artifact receipts."
+home = "sparrow_server::rpc::import_progress"
+entry_points = []
+spec = "crates/sparrow-server/schema/sparrow.capnp: ImportProgress and ImportStart unions."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_staging_progress|encode_upload_progress)$']

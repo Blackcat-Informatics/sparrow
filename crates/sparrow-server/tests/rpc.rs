@@ -35,6 +35,147 @@ async fn start(config: &Path, socket: &Path) -> Daemon {
     daemon
 }
 
+fn rpc_ok<'a, T: capnp::traits::Owned + 'static>(
+    result: wire::result::Reader<'a, T>,
+) -> T::Reader<'a> {
+    match result.which().unwrap() {
+        wire::result::Ok(value) => value.unwrap(),
+        wire::result::Error(error) => panic!("RPC failure: {:?}", error.unwrap().get_message()),
+    }
+}
+
+fn upload_ref(mut out: wire::import_ref::Builder<'_>, store: &str, id: &str) {
+    out.set_store_id(store);
+    out.set_id(id);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes() {
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let socket = store_path.join("rpc.sock");
+        let config = write_server_config(dir.path(), &store_path, &socket);
+        let daemon = start(&config, &socket).await;
+        let connection = connect(&socket).await.unwrap();
+        let client = &connection.client;
+        let response = client.status_request().send().promise.await.unwrap();
+        let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+        assert_eq!(status.get_schema_version(), 9);
+        let store = status.get_store_id().unwrap().to_str().unwrap().to_owned();
+        let mut input = vec![b'a'; sparrow_core::IMPORT_CHUNK_BYTES * 2];
+        input[sparrow_core::IMPORT_CHUNK_BYTES - 1] = b'\n';
+        *input.last_mut().unwrap() = b'\n';
+        input.extend_from_slice(b"last\n");
+        let payload = format!("blake3:{}", purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes()));
+        let mut request = client.import_begin_request();
+        let mut begin = request.get().init_request();
+        begin.set_request_id("crash-upload"); begin.set_source("streamed"); begin.set_format(wire::Format::Log);
+        begin.set_byte_length(input.len() as u64); begin.set_payload_id(&payload);
+        let response = request.send().promise.await.unwrap();
+        let upload = rpc_ok(response.get().unwrap().get_result().unwrap());
+        let progress = match upload.which().unwrap() {
+            wire::import_start::Staging(value) => value.unwrap(),
+            wire::import_start::Accepted(_) => panic!("new input already accepted"),
+        };
+        let id = progress.get_id().unwrap().to_str().unwrap().to_owned();
+        assert_eq!(progress.get_received_bytes(), 0);
+        let mut request = client.import_append_request();
+        let mut chunk = request.get().init_request();
+        upload_ref(chunk.reborrow().init_import(), &store, &id);
+        chunk.set_bytes(&input[..sparrow_core::IMPORT_CHUNK_BYTES]);
+        let response = request.send().promise.await.unwrap();
+        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_received_bytes(), sparrow_core::IMPORT_CHUNK_BYTES as u64);
+        drop(connection);
+        drop(daemon);
+        std::fs::remove_file(&socket).unwrap();
+        let daemon = start(&config, &socket).await;
+        let connection = connect(&socket).await.unwrap();
+        let client = &connection.client;
+        let mut request = client.import_get_request();
+        upload_ref(request.get().init_import(), &store, &id);
+        let response = request.send().promise.await.unwrap();
+        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_received_bytes(), sparrow_core::IMPORT_CHUNK_BYTES as u64);
+        // Wrong-store and oversized payloads fail before private mutation.
+        let mut request = client.import_append_request();
+        let mut chunk = request.get().init_request();
+        upload_ref(chunk.reborrow().init_import(), "store:other", &id);
+        chunk.set_bytes(b"wrong");
+        let response = request.send().promise.await.unwrap();
+        assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(_)));
+        let mut request = client.import_append_request();
+        let mut chunk = request.get().init_request();
+        upload_ref(chunk.reborrow().init_import(), &store, &id);
+        chunk.set_bytes(&input[..sparrow_core::IMPORT_CHUNK_BYTES + 1]);
+        let response = request.send().promise.await.unwrap();
+        assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(_)));
+        for offset in (sparrow_core::IMPORT_CHUNK_BYTES..input.len()).step_by(sparrow_core::IMPORT_CHUNK_BYTES) {
+            let mut request = client.import_append_request();
+            let mut chunk = request.get().init_request();
+            upload_ref(chunk.reborrow().init_import(), &store, &id);
+            chunk.set_offset(offset as u64);
+            chunk.set_bytes(&input[offset..(offset + sparrow_core::IMPORT_CHUNK_BYTES).min(input.len())]);
+            let response = request.send().promise.await.unwrap();
+            rpc_ok(response.get().unwrap().get_result().unwrap());
+        }
+        let mut request = client.import_seal_request();
+        upload_ref(request.get().init_import(), &store, &id);
+        let response = request.send().promise.await.unwrap();
+        assert!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_sealed());
+        let mut request = client.import_layout_request();
+        upload_ref(request.get().init_import(), &store, &id);
+        let response = request.send().promise.await.unwrap();
+        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_layout_records(), 3);
+        let mut request = client.import_prepare_request();
+        upload_ref(request.get().init_request().init_import(), &store, &id);
+        let response = request.send().promise.await.unwrap();
+        let preparation = rpc_ok(response.get().unwrap().get_result().unwrap());
+        assert_eq!(preparation.get_prepared_records(), 1);
+        let reserved = preparation.get_reserved_artifact_id().unwrap().to_str().unwrap().to_owned();
+        let mut request = client.artifact_get_request();
+        let mut reference = request.get().init_artifact();
+        reference.set_store_id(&store); reference.set_id(&reserved);
+        let response = request.send().promise.await.unwrap();
+        assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(_)));
+        drop(connection);
+        drop(daemon);
+        std::fs::remove_file(&socket).unwrap();
+        let daemon = start(&config, &socket).await;
+        let copied = dir.path().join("completed.log");
+        std::fs::write(&copied, &input).unwrap();
+        let args = ["ingest", "crash-upload", "streamed", "log", copied.to_str().unwrap()];
+        let receipt = cli(&socket, &args);
+        assert_eq!(receipt["artifact_id"].as_str(), Some(reserved.as_str()));
+        assert_eq!(receipt["payload_id"].as_str(), Some(payload.as_str()));
+        assert_eq!(receipt["record_ids"].as_array().unwrap().len(), 3);
+        assert_eq!(receipt, cli(&socket, &args));
+        let connection = connect(&socket).await.unwrap();
+        let client = &connection.client;
+        let mut reconstructed = Vec::new();
+        for offset in (0..input.len()).step_by(sparrow_core::IMPORT_CHUNK_BYTES) {
+            let mut request = client.bytes_read_request();
+            let mut read = request.get().init_request();
+            let mut evidence = read.reborrow().init_evidence();
+            evidence.set_store_id(&store); evidence.set_artifact(&reserved);
+            read.set_offset(offset as u64); read.set_length((input.len() - offset).min(sparrow_core::IMPORT_CHUNK_BYTES) as u32);
+            let response = request.send().promise.await.unwrap();
+            reconstructed.extend_from_slice(rpc_ok(response.get().unwrap().get_result().unwrap()).get_data().unwrap());
+        }
+        assert_eq!(reconstructed, input);
+        assert_eq!(std::fs::read(copied).unwrap(), input);
+        let response = client.status_request().send().promise.await.unwrap();
+        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 3);
+        drop(connection);
+        drop(daemon);
+    }).await;
+}
+
+fn write_server_config(dir: &Path, store: &Path, socket: &Path) -> std::path::PathBuf {
+    let config = dir.join("server.toml");
+    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", concat!(env!("CARGO_MANIFEST_DIR"), "/../../../purrdf/crates/text/lexicons/artifacts"))).unwrap();
+    config
+}
+
 async fn exercise(socket: &Path) -> (String, String, String) {
     let connection = connect(socket).await.unwrap();
     let client = &connection.client;
@@ -108,21 +249,31 @@ async fn exercise(socket: &Path) -> (String, String, String) {
         Some("durable")
     );
     assert_eq!(std::fs::read(copied.path()).unwrap(), bytes);
+    copied.as_file().set_len(0).unwrap();
     copied.as_file().set_len(8388609).unwrap();
-    let rejected = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-        .arg(socket)
-        .args([
+    let streamed = cli(
+        socket,
+        &[
             "ingest",
             "oversized-cli-v1",
-            "synthetic-rpc",
+            "streamed-cli",
             "jsonl",
             copied.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("RESULT_TOO_LARGE"));
-    assert!(rejected.stdout.is_empty());
+        ],
+    );
+    assert_eq!(streamed["byte_length"].as_str(), Some("8388609"));
+    assert_eq!(streamed["durability"].as_str(), Some("durable"));
+    let retried = cli(
+        socket,
+        &[
+            "ingest",
+            "oversized-cli-v1",
+            "streamed-cli",
+            "jsonl",
+            copied.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(streamed["artifact_id"], retried["artifact_id"]);
     let exported_dir = tempfile::tempdir().unwrap();
     let exported = exported_dir.path().join("evidence.bin");
     let length = bytes.len().to_string();
@@ -1241,7 +1392,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(8)
+        Some(9)
     );
     let unknown = mcp
         .call(
@@ -1624,21 +1775,37 @@ fn cli(socket: &Path, args: &[&str]) -> purrdf_lex::json::Value {
 
 #[tokio::test(flavor = "current_thread")]
 async fn typed_queries_and_exact_bytes_survive_daemon_crash() {
-    tokio::task::LocalSet::new().run_until(async {
-        let dir = tempfile::tempdir().unwrap(); let store = dir.path().join("store"); let socket = store.join("rpc.sock"); let config = dir.path().join("server.toml");
-        std::fs::write(&config, format!("socket_path = {:?}\ndata_dir = {:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", socket, store, concat!(env!("CARGO_MANIFEST_DIR"), "/../../../purrdf/crates/text/lexicons/artifacts"))).unwrap();
-        let daemon = start(&config, &socket).await;
-        let first = exercise(&socket).await;
-        let cursor = mcp_pin_pages(&socket, &first.0, &first.1, &first.2).await;
-        drop(daemon); // Only this test's child is terminated.
-        std::fs::remove_file(&socket).unwrap(); // Its dead test endpoint, never a live listener.
-        let daemon = start(&config, &socket).await;
-        let expired = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
-            .args(["pin-get", &first.0, "--name", "page-case", "--page-size", "1", "--cursor", &cursor]).output().unwrap();
-        assert!(!expired.status.success());
-        assert!(expired.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&expired.stderr).contains("RESULT_EXPIRED"));
-        assert_eq!(exercise(&socket).await, first);
-        drop(daemon);
-    }).await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = dir.path().join("store");
+            let socket = store.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store, &socket);
+            let daemon = start(&config, &socket).await;
+            let first = exercise(&socket).await;
+            let cursor = mcp_pin_pages(&socket, &first.0, &first.1, &first.2).await;
+            drop(daemon); // Only this test's child is terminated.
+            std::fs::remove_file(&socket).unwrap(); // Its dead test endpoint, never a live listener.
+            let daemon = start(&config, &socket).await;
+            let expired = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
+                    "pin-get",
+                    &first.0,
+                    "--name",
+                    "page-case",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    &cursor,
+                ])
+                .output()
+                .unwrap();
+            assert!(!expired.status.success());
+            assert!(expired.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&expired.stderr).contains("RESULT_EXPIRED"));
+            assert_eq!(exercise(&socket).await, first);
+            drop(daemon);
+        })
+        .await;
 }

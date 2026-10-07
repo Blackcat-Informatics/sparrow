@@ -195,6 +195,29 @@ struct RecordsResults {
   fieldVisits @3 :UInt64; qualifiedRecords @4 :UInt64;
   timeBasis @5 :TimeBasis; eventCoverage @6 :EventCoverage;
 }
+# Private upload progress is distinct from accepted evidence.
+struct ImportRef { storeId @0 :Text; id @1 :Text; }
+struct ImportBegin {
+  requestId @0 :Text; source @1 :Text; format @2 :Format;
+  byteLength @3 :UInt64; payloadId @4 :Text;
+}
+struct ImportProgress {
+  storeId @0 :Text; id @1 :Text; requestId @2 :Text; source @3 :Text;
+  format @4 :Format; byteLength @5 :UInt64; payloadId @6 :Text;
+  receivedBytes @7 :UInt64; expiresAt @8 :Instant; sealed @9 :Bool;
+  layoutComplete @10 :Bool; layoutRecords @11 :UInt64;
+  publishedArtifact @12 :OptionalText;
+}
+struct ImportStart { union { staging @0 :ImportProgress; accepted @1 :Artifact; } }
+struct ImportChunk { import @0 :ImportRef; offset @1 :UInt64; bytes @2 :Data; }
+struct ImportPrepare { import @0 :ImportRef; expectedRecord @1 :UInt64; }
+struct ImportPreparation {
+  storeId @0 :Text; importId @1 :Text; reservedArtifactId @2 :Text;
+  preparedRecords @3 :UInt64; totalRecords @4 :UInt64;
+  receivedAt @5 :Instant; expiresAt @6 :Instant; sourceTimeProfile @7 :OptionalText;
+}
+struct ImportCanceled { import @0 :ImportRef; durability @1 :Durability = durable; }
+
 interface Sparrow {
   status @0 () -> (result :Result(Status));
   ingest @1 (request :Ingest) -> (result :Result(Artifact));
@@ -213,4 +236,12 @@ interface Sparrow {
   recordsSearch @14 (query :RecordQuery) -> (result :Result(RecordsResults));
   sourceTimeDefine @15 (definition :SourceTimeDefinition) -> (result :Result(SourceTimeProfile));
   sourceTimeGet @16 (source :Text) -> (result :Result(OptionalSourceTimeProfile));
+  importBegin @17 (request :ImportBegin) -> (result :Result(ImportStart));
+  importAppend @18 (request :ImportChunk) -> (result :Result(ImportProgress));
+  importGet @19 (import :ImportRef) -> (result :Result(ImportProgress));
+  importSeal @20 (import :ImportRef) -> (result :Result(ImportProgress));
+  importLayout @21 (import :ImportRef) -> (result :Result(ImportProgress));
+  importPrepare @22 (request :ImportPrepare) -> (result :Result(ImportPreparation));
+  importPublish @23 (import :ImportRef) -> (result :Result(Artifact));
+  importCancel @24 (import :ImportRef) -> (result :Result(ImportCanceled));
 }

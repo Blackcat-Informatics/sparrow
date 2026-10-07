@@ -21,6 +21,7 @@ path = "src/bin/sparrow.rs"
 [dependencies]
 sparrow-core = { path = "../sparrow-core" }
 purrdf-lex.workspace = true
+purrdf-hash.workspace = true
 purrdf.workspace = true
 capnp.workspace = true
 capnp-rpc.workspace = true

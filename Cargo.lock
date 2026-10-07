@@ -1261,6 +1261,7 @@ dependencies = [
  "capnpc",
  "futures",
  "purrdf",
+ "purrdf-hash",
  "purrdf-lex",
  "serde",
  "sparrow-core",

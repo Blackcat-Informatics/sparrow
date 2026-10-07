@@ -8,6 +8,122 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn buffered_and_streamed_ingestion_share_request_identity() {
+    use sparrow_core::ImportStart;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"one\ntwo\n";
+    let payload = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let buffered = store
+        .ingest("buffered-first", "copy", "log", input, 0)
+        .unwrap();
+    match store
+        .import_start(
+            "buffered-first",
+            "copy",
+            "log",
+            input.len() as u64,
+            &payload,
+            1,
+        )
+        .unwrap()
+    {
+        ImportStart::Accepted(receipt) => assert_eq!(receipt.id, buffered.id),
+        ImportStart::Staging(_) => panic!("accepted request allocated duplicate staging"),
+    }
+    assert_eq!(
+        store
+            .import_start(
+                "buffered-first",
+                "changed",
+                "log",
+                input.len() as u64,
+                &payload,
+                1
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store
+            .import_start(
+                "buffered-first",
+                "copy",
+                "opaque",
+                input.len() as u64,
+                &payload,
+                1
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let stage = match store
+        .import_start(
+            "streamed-first",
+            "copy",
+            "log",
+            input.len() as u64,
+            &payload,
+            1,
+        )
+        .unwrap()
+    {
+        ImportStart::Staging(value) => value,
+        ImportStart::Accepted(_) => panic!("new request reused independent occurrence"),
+    };
+    assert_eq!(
+        store
+            .ingest("streamed-first", "copy", "log", input, 1)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    store.import_append(&stage.id, 0, input, 1).unwrap();
+    store.import_seal(&stage.id, 1).unwrap();
+    store.import_prepare_layout(&stage.id, 1).unwrap();
+    store.import_prepare_record(&stage.id, 0, 1).unwrap();
+    store.import_prepare_record(&stage.id, 1, 1).unwrap();
+    let streamed = store.import_publish(&stage.id, 2).unwrap();
+    assert_ne!(streamed.id, buffered.id);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .ingest("streamed-first", "copy", "log", input, 3)
+            .unwrap()
+            .id,
+        streamed.id
+    );
+    match store
+        .import_start(
+            "streamed-first",
+            "copy",
+            "log",
+            input.len() as u64,
+            &payload,
+            3,
+        )
+        .unwrap()
+    {
+        ImportStart::Accepted(receipt) => assert_eq!(receipt.id, streamed.id),
+        ImportStart::Staging(_) => panic!("published request recreated staging"),
+    }
+    assert_eq!(
+        store
+            .ingest("streamed-first", "copy", "log", b"changed", 3)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(store.records(3).unwrap().len(), 4);
+}
+
+#[test]
 fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();

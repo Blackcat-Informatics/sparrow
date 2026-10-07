@@ -438,6 +438,7 @@ impl Store {
             )
             .into();
         batch.put(receipt_key(id), json::write_compact(&saved));
+        writer.ingest_receipt(&mut batch, &manifest.request_id, &artifact, now)?;
         if batch.size_in_bytes() > PUBLICATION_BYTES {
             return Err(Error::new(
                 "RESOURCE_LIMIT",

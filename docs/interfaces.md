@@ -316,7 +316,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 
 | Typed operation | Contract |
 | --- | --- |
-| `ingest` and planned streaming import capability | Original bytes, occurrence identity and explicit durability. A partial stream cannot publish a complete artifact. |
+| `ingest`, `importBegin`/`importAppend`/`importGet`, `importSeal`/`importLayout`/`importPrepare`/`importPublish`/`importCancel` | Original bytes, occurrence identity and explicit durability. A partial stream cannot publish a complete artifact. |
 | Planned event batch operation | Preserve independent occurrences and client sequence/retry identities. |
 | Planned flush and import status operations | Synchronization through a specified watermark; raw, projection, checkpoint and source-deletion state. |
 | `status` and planned capabilities operation | Operational status and supported profiles/limits. |

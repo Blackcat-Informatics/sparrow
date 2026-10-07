@@ -19,6 +19,16 @@ const RECLAIM_CHUNKS: u64 = 128;
 pub const IMPORT_LAYOUT_PAGE_RECORDS: usize = 128;
 const LAYOUT_BYTES: usize = 32 * 1024;
 
+/// Starting an upload either resumes private staging or returns accepted evidence.
+/// An accepted retry never allocates another staging journal or occurrence.
+#[derive(Clone, Debug)]
+pub enum ImportStart {
+    /// Private, resumable input; this is not an evidence receipt.
+    Staging(ImportManifest),
+    /// Original durable receipt from buffered or streamed ingestion.
+    Accepted(super::Artifact),
+}
+
 /// A recoverable unpublished input. Sealing verifies bytes, but does not accept
 /// evidence or authorize producer deletion.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,7 +179,7 @@ fn valid_payload_id(id: &str) -> bool {
         .is_some()
 }
 
-fn import_id(request: &str) -> String {
+pub(super) fn import_id(request: &str) -> String {
     format!(
         "import:{}",
         hex::encode(blake3::hash(request.as_bytes()).as_bytes())
@@ -418,6 +428,20 @@ impl Store {
         payload_id: &str,
         now: u64,
     ) -> Result<ImportManifest, Error> {
+        self.lock()?
+            .begin_import(request_id, source, format, byte_length, payload_id, now)
+    }
+
+    /// Atomically recover a shared ingestion receipt or create/resume private staging.
+    pub fn import_start(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        byte_length: u64,
+        payload_id: &str,
+        now: u64,
+    ) -> Result<ImportStart, Error> {
         validate_ingest_labels(request_id, source, format)?;
         if !valid_payload_id(payload_id) {
             return Err(Error::new(
@@ -426,76 +450,14 @@ impl Store {
             ));
         }
         let writer = self.lock()?;
-        let id = import_id(request_id);
-        if let Some(previous) = super::publication::published(&writer, &id, now)? {
-            let saved = previous.0;
-            if saved.request_id != request_id
-                || saved.source != source
-                || saved.format != format
-                || saved.byte_length != byte_length
-                || saved.payload_id != payload_id
-            {
-                return Err(Error::new(
-                    "CONFLICT",
-                    "published import request has different declared input",
-                ));
-            }
-            return Ok(saved);
+        if let Some(receipt) =
+            writer.accepted_ingest(request_id, source, format, byte_length, payload_id, now)?
+        {
+            return Ok(ImportStart::Accepted(receipt));
         }
-        if let Some(bytes) = writer.db.get(&id)? {
-            let previous = ImportManifest::decode(&parse(&bytes)?)?;
-            if previous.request_id != request_id
-                || previous.source != source
-                || previous.format != format
-                || previous.byte_length != byte_length
-                || previous.payload_id != payload_id
-            {
-                return Err(Error::new(
-                    "CONFLICT",
-                    "import request identity has different declared input",
-                ));
-            }
-            previous.require_live(now)?;
-            return Ok(previous);
-        }
-        if byte_length > writer.config.disk_budget - writer.config.maintenance_reserve {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "declared input exceeds the entire available disk budget",
-            ));
-        }
-        if writer.imports()?.len() >= MAX_IMPORTS {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "16 import journals are occupied; resume, cancel, or reclaim them",
-            ));
-        }
-        let expires_at = now
-            .checked_add(RETRY_WINDOW)
-            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "import lease overflow"))?;
-        crate::format_instant(expires_at)
-            .map_err(|e| Error::new("INVALID_ARGUMENT", e.to_string()))?;
-        let manifest = ImportManifest {
-            id,
-            request_id: request_id.into(),
-            source: source.into(),
-            format: format.into(),
-            byte_length,
-            payload_id: payload_id.into(),
-            received_bytes: 0,
-            expires_at,
-            sealed: false,
-            reclaimed_chunks: 0,
-            layout_records: 0,
-            layout_complete: false,
-            published_artifact: None,
-            reclaimed_layout_pages: 0,
-        };
-        let mut batch = WriteBatch::default();
-        put(&mut batch, &manifest.id, &manifest);
-        writer.admit_import_batch(&batch)?;
-        writer.commit(batch)?;
-        Ok(manifest)
+        writer
+            .begin_import(request_id, source, format, byte_length, payload_id, now)
+            .map(ImportStart::Staging)
     }
 
     /// Recover the committed offset and fixed lease after a client/daemon restart.
@@ -842,5 +804,105 @@ impl Store {
             writer.commit(batch)?;
         }
         Ok(removed)
+    }
+}
+
+impl Writer {
+    fn begin_import(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        byte_length: u64,
+        payload_id: &str,
+        now: u64,
+    ) -> Result<ImportManifest, Error> {
+        validate_ingest_labels(request_id, source, format)?;
+        if !valid_payload_id(payload_id) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "require canonical complete blake3 payload identity",
+            ));
+        }
+        let writer = self;
+        let id = import_id(request_id);
+        if let Some(previous) = super::publication::published(writer, &id, now)? {
+            let saved = previous.0;
+            if saved.request_id != request_id
+                || saved.source != source
+                || saved.format != format
+                || saved.byte_length != byte_length
+                || saved.payload_id != payload_id
+            {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "published import request has different declared input",
+                ));
+            }
+            return Ok(saved);
+        }
+        if writer
+            .accepted_ingest(request_id, source, format, byte_length, payload_id, now)?
+            .is_some()
+        {
+            return Err(Error::new(
+                "CONFLICT",
+                "request already accepted; use import_start to retrieve its receipt",
+            ));
+        }
+        if let Some(bytes) = writer.db.get(&id)? {
+            let previous = ImportManifest::decode(&parse(&bytes)?)?;
+            if previous.request_id != request_id
+                || previous.source != source
+                || previous.format != format
+                || previous.byte_length != byte_length
+                || previous.payload_id != payload_id
+            {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "import request identity has different declared input",
+                ));
+            }
+            previous.require_live(now)?;
+            return Ok(previous);
+        }
+        if byte_length > writer.config.disk_budget - writer.config.maintenance_reserve {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "declared input exceeds the entire available disk budget",
+            ));
+        }
+        if writer.imports()?.len() >= MAX_IMPORTS {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "16 import journals are occupied; resume, cancel, or reclaim them",
+            ));
+        }
+        let expires_at = now
+            .checked_add(RETRY_WINDOW)
+            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "import lease overflow"))?;
+        crate::format_instant(expires_at)
+            .map_err(|e| Error::new("INVALID_ARGUMENT", e.to_string()))?;
+        let manifest = ImportManifest {
+            id,
+            request_id: request_id.into(),
+            source: source.into(),
+            format: format.into(),
+            byte_length,
+            payload_id: payload_id.into(),
+            received_bytes: 0,
+            expires_at,
+            sealed: false,
+            reclaimed_chunks: 0,
+            layout_records: 0,
+            layout_complete: false,
+            published_artifact: None,
+            reclaimed_layout_pages: 0,
+        };
+        let mut batch = WriteBatch::default();
+        put(&mut batch, &manifest.id, &manifest);
+        writer.admit_import_batch(&batch)?;
+        writer.commit(batch)?;
+        Ok(manifest)
     }
 }

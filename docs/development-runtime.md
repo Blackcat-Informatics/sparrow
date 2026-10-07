@@ -13,11 +13,12 @@ The generated typed contract is
 and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
-Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
+Present RPC methods include the eight schema-9 import methods documented below,
+plus `status`, `ingest`, `artifactGet`, `recordGet`,
 `bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext`, `rdfInspect`, `sourceTimeDefine` and `sourceTimeGet`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
-result rendering. The CLI supplies status, non-destructive buffered file import,
+result rendering. The CLI supplies status, non-destructive resumable file import,
 exact byte export, key/value and full-text searches. MCP also supplies artifact/
 record metadata and pin/release calls. CLI and MCP both supply stable-ID pin renewal
 and paginated pin discovery/member retrieval. Remaining CLI commands and query surfaces
@@ -491,7 +492,7 @@ remaining algebra is tracked in [PurRDF integration gaps](purrdf-integration-gap
 Remaining final-server acceptance includes concurrent stored-view qualification,
 governed SPARQL, source/artifact metadata graphs, further
 text qualification, event-time and combined predicates, context and
-correlation, final scope/pagination contracts, streaming imports and recovery
+correlation, final scope/pagination contracts, producer import recovery
 journals, durable completed-file consumption, inotify/tailing, remaining MCP/CLI tools,
 syslog, the Rust logging client, pressure eviction/reclamation, codec
 verification, bounded buffered durability, fault/performance qualification,
@@ -743,10 +744,9 @@ performance acceptance, and full governed SPARQL remain unfinished.
 
 The core now provides `import_begin`, `import_get`, `import_append`,
 `import_read_chunk`, `import_seal`, `import_cancel`, and `import_reclaim` as the
-storage foundation for streaming imports. **These operations are not yet wired
-through Cap'n Proto or the CLI. Sealing does not publish an artifact or records,
-and never authorizes source deletion.** The existing daemon import remains
-buffered until the typed streaming caller is implemented and qualified.
+storage foundation for streaming imports. The schema-9 daemon and CLI now expose
+this path, as qualified below. **Sealing does not publish an artifact or records,
+and never authorizes source deletion.**
 
 Beginning an import binds a request identity to the explicit source, format,
 complete length and canonical BLAKE3 payload identity. At most 16 journals occupy
@@ -777,9 +777,8 @@ reopen from its 128-chunk cursor and removes the remaining two chunks. These
 are core store-reopen scenarios. An additional owned test writer is killed with
 SIGKILL after acknowledging a synced chunk; reopening recovers its exact offset
 and bytes, accepts the final remainder and verifies the whole digest. This is
-not daemon streaming or completed-import publication acceptance. Typed streaming
-operations, complete record/manifest publication, projection/retry receipt
-coordination and daemon streaming crash qualification remain required work.
+not daemon streaming or completed-import publication acceptance. The subsequent
+publication and schema-9 sections qualify those additional boundaries.
 
 The full `make check` gate passed with 41 storage scenarios, including all three
 new streaming journal scenarios, release Clippy with warnings denied, all other
@@ -819,7 +818,7 @@ record-limit refusal followed by reopen/retry, and damaged/missing page refusal.
 Cleanup removes both raw and layout pages across a bounded restart boundary.
 These layouts remain unpublished core preparation. Native record preparation
 and final publication are described below. Cap'n Proto streaming caller wiring
-is still required; the development daemon still uses buffered import.
+is qualified in the schema-9 section below.
 
 The full `make check` gate passed for the layout change with 44 storage
 scenarios, all other workspace tests, release Clippy with warnings denied,
@@ -847,7 +846,7 @@ and lifetime checks remain at their respective storage boundaries. Binary
 content, cross-chunk ranges and zero-length reads remain exact after reopen.
 
 The shared builder now also serves private native preparation and final
-publication described below. Typed daemon caller wiring remains required work.
+publication described below. Typed daemon caller wiring is qualified below.
 
 The full `make check` gate passed for shared preparation and staged byte reads:
 45 storage scenarios, all other workspace tests, release Clippy with warnings
@@ -908,8 +907,8 @@ native JSON/RDF/source-time capture, reopen and ordinal retries, publication
 retry after staging cleanup, canceled shared dependencies, and missing prepared
 payload refusal with no published prefix.
 
-This is core publication qualification. Cap'n Proto/CLI streaming operations
-and daemon crash qualification are not implemented yet. Preparation currently
+This subsection records core publication qualification; typed RPC/CLI and
+daemon crash qualification follow below. Preparation currently
 materializes at most **16 MiB per individual record**; larger record layouts
 remain durable raw staging but are explicitly refused for publication. Publishing
 those larger raw records with bounded failed/pending projection diagnostics is
@@ -920,3 +919,67 @@ new native publication/retirement scenarios and cleanup-budget exhaustion across
 multiple journals. All other workspace tests, release Clippy with warnings
 denied, seeded census self-tests and all 26 helper-ledger jobs passed. No
 distinct exceptions or unsanctioned isomorphic groups were added.
+
+### Schema 9: typed resumable file imports
+
+`importBegin`, `importAppend`, `importGet`, `importSeal`, `importLayout`,
+`importPrepare`, `importPublish`, and `importCancel` are generated Cap'n Proto
+RPC methods over the same private Unix socket. References carry persistent
+store identity; wrong-store imports fail before storage mutation. Source/request
+labels are checked before copying, and append payloads are limited to 64 KiB
+before copying into a storage worker. Every storage operation uses the existing worker admission
+permit, including its cancellation ownership law.
+
+Beginning returns an explicit union: unpublished staging progress, or the
+original accepted artifact. Buffered and streamed ingestion share the same
+request receipt and compare source, format, complete length and native BLAKE3
+identity. Existing buffered receipts and earlier publication receipts remain
+readable through their recorded artifact fields. A buffered request cannot
+create another occurrence while its journal exists. Conflicting request reuse
+fails; separate requests with equal bytes remain separate occurrences.
+
+The CLI `ingest REQUEST_ID SOURCE FORMAT FILE` now hashes and uploads through a
+single 64 KiB buffer, seeks to the daemon's durable offset on retry, seals,
+prepares native records by expected ordinal, and requests final publication.
+There is no whole-file `read_to_end` path. It verifies the opened regular file's
+device, inode, length, mtime and ctime before upload and before publication,
+including nanoseconds. A detected change fails without returning an acceptance
+receipt; transport failure preserves staging for the stable request retry.
+Files are never renamed or deleted by this command. Schema-8 daemons are refused
+before staging; use matching executables.
+
+The real-daemon test kills only its owned children after a committed chunk and
+a native record checkpoint. Reopened stores preserve the exact offset and
+reserved artifact identity. The production CLI resumes preparation and publishes
+one complete artifact; retry returns the identical receipt. Bounded byte reads
+reconstruct every source byte. Private preparation is inaccessible through
+artifact lookup. Another CLI fixture accepts 8,388,609 bytes despite the daemon's
+8 MiB buffered-artifact limit. Core tests cover both directions of retry across
+the buffered and streamed paths, conflicting arguments, and prevention of a
+second occurrence. The client file guard also rejects a same-length rewrite.
+
+These checks do not establish oversized individual record publication beyond
+16 MiB, producer consumption/watchers, whole-sample throughput or RSS limits,
+full governed SPARQL, logging-client delivery, or complete architecture acceptance.
+
+The full `make check` gate passed with 51 storage scenarios, two server unit
+checks, three real-daemon/MCP scenarios, the remaining workspace tests, release
+Clippy with warnings denied, seeded census self-tests and all 30 ledger jobs.
+No distinct exceptions or unsanctioned isomorphic groups were added.
+
+On 2026-10-07 the owned development daemon was replaced with the matching
+schema-9 release executable. Its endpoint remains
+`/home/paudley/.local/state/sparrow/development-v5/rpc.sock`, mode 0600, inside
+the mode-0700 store directory. Persistent store identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`.
+
+A temporary, completed copy of
+`lillith_soul/inner-core/corrections/2026-09-26.jsonl` was imported through the
+production CLI: 167,222 bytes, 171 records, artifact
+`artifact:022887776d4345646bdc2ffc5d4dd406`, payload
+`blake3:bfb073b4e6367b07412200888a631546ea24512643a517e64b4df490feae9214`.
+The repeated request returned the identical durable receipt; full bounded export
+matched every byte; source bytes remained unchanged. Native key discovery for
+this source returned 41 rows. This is one-file live acceptance, not whole-corpus
+or throughput qualification. No producer file was claimed, renamed or deleted,
+and no sibling/model service was managed.
