@@ -96,6 +96,26 @@ old writer contract. The new daemon then reopened with the same store identity
 and original empty-artifact receipt. Config, native store and rejection output
 are under `/tmp/sparrow-recordless-writer-fence.gabyjuhl`.
 
+At 2026-10-07 23:08 UTC, the owned development unit was gracefully cut over
+to implementation commit `179f386`, main PID 615744. The existing format 8
+store upgraded to format 12 and served schema 19 on the same private
+`development-v5/rpc.sock`. Its persistent identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`; the reopened session is
+`session:f0edf1fe3556a7d16580670e6e0eb8f5`. Status retained 192 live records,
+193 payload chunks and 188 JSON projections, with no pins or pending durability.
+Pressure remained ready with zero retirement counters. The synthetic watch
+remains covered at revision 1, with no pending claims; directory/socket modes
+remain 0700/0600.
+
+Descriptor and completed-handoff retries returned their original artifact/import
+identities. Independent comparisons passed for the 82-byte descriptor and
+87-byte CRLF handoff exports; the replacement producer pathname remained intact.
+Live stdio MCP reported schema 19, format 12, the same store and 192 live
+records. Exports and MCP output are under `/tmp/sparrow-recordless-live.Pua8sL`.
+This verifies actual legacy-store cutover and retained-evidence regressions,
+without claiming sustained pressure, live producer intake, reboot packaging or
+complete architecture acceptance.
+
 ## Bounded catalog expiry
 
 Ordinary expiry no longer collects the artifact, record and pin corpus or
