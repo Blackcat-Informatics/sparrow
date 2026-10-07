@@ -32,8 +32,41 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 19; the schema sections
+The current source implements schema 20; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 20 source alternatives
+
+All five query surfaces use one store-owned source predicate: OR across bounded
+scope `filter.source_ids`, AND with the outer exact source, receipt interval and
+live/selection/pin membership. Key/value discovery and combined/native-text
+queries filter before qualification or ranking; context refuses an excluded
+anchor and keeps same-source neighbors. Source spelling and occurrence identity
+remain unchanged. Present empty or oversized arrays fail rather than widening
+scope. The immutable `SourceFilter` type owns admission; native PurRDF remains
+the JSON decoder and text/field semantic owner.
+
+This changes the wire contract, not format-12 storage. CLI and MCP require current
+native discovery for filtered requests so old daemons cannot ignore the new
+field. This currently adds the existing status scan, whose scan time remains
+unbounded; no bounded handshake or query snapshot is claimed. Diagnostic
+normalization/filter dimensions and the remaining architecture requirements are
+still unfinished. The running development daemon remains schema 19 until a
+verified build is committed and explicitly adopted below.
+
+Local qualification on 2026-10-07: `make check` passed formatting, release Clippy
+with warnings denied, all workspace release tests (91 storage and 26 RPC/daemon/
+MCP scenarios), seeded census self-tests and the pinned cross-workspace gate.
+All 131 ledger jobs hold with no distinct exceptions. Source tests exercise OR,
+duplicate alternatives, exact-source AND, half-open receipt times, pin-retained
+old evidence, unavailable membership before filtering and source-local context.
+The daemon integration scenario covers all five surfaces through both CLI and
+MCP for live/selection/pin scopes, plus direct generated requests and invalid
+array admission. A private archived schema-19 daemon independently refused a
+filtered CLI read with `UNSUPPORTED`, exit 1 and zero stdout bytes. Its binary
+SHA-256 is `bf9d90750fea6a1cef4ad787625d84677eaccb7936285f9a11110a0d7765fa62`;
+evidence is under `/tmp/sparrow-source-filter-old.c_j3gbdi`. That owned private
+daemon shut down with SIGINT, exit 0 and socket cleanup.
 
 ## Streaming evidence catalog reads
 

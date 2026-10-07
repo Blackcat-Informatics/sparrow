@@ -1991,3 +1991,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(collect_status_records|decode_status_record_catalog|decode_status_pin_catalog)$']
+
+[[job]]
+id = "query-source-filter-admission"
+summary = "Admit bounded exact logical source alternatives once for core and agent inputs."
+home = "sparrow_core::query::SourceFilter::new"
+entry_points = ["sparrow_server::agent::selection::decode"]
+spec = "docs/interfaces.md: schema 20 source alternatives."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_cli_source_ids|validate_mcp_source_ids)$']
+
+[[job]]
+id = "query-source-filter"
+summary = "One source predicate intersects outer exact source with scope alternatives in JSON, text and context reads."
+home = "sparrow_core::query::QueryScope::matches_source"
+entry_points = []
+spec = "docs/interfaces.md: schema 20 source alternatives."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(match_json_sources|match_text_sources|match_context_sources)$']

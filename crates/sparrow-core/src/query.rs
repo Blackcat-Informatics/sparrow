@@ -10,6 +10,8 @@ pub struct QueryScope {
     pub selection: QuerySelection,
     /// Restrict to this exact logical source label.
     pub source: Option<String>,
+    /// Exact logical source IDs, combined with OR and intersected with `source`.
+    pub sources: Option<SourceFilter>,
     /// Inclusive server acceptance time, in Unix milliseconds.
     pub received_from: u64,
     /// Exclusive server acceptance time, in Unix milliseconds.
@@ -37,7 +39,41 @@ pub enum QuerySelection {
     },
 }
 
+/// Admitted exact source-ID alternatives; vocabulary ownership stays with Sparrow.
+#[derive(Clone, Debug)]
+pub struct SourceFilter {
+    ids: Vec<String>,
+}
+
+impl SourceFilter {
+    /// Admit 1..128 source IDs, each using the ingestion bound of 1..512 bytes.
+    /// Duplicates are harmless alternatives and never duplicate result occurrences.
+    pub fn new(ids: Vec<String>) -> Result<Self, crate::Error> {
+        if ids.is_empty() || ids.len() > 128 || ids.iter().any(|id| id.is_empty() || id.len() > 512)
+        {
+            return Err(crate::Error::new(
+                "INVALID_ARGUMENT",
+                "source_ids requires 1..128 nonempty source IDs of at most 512 bytes each",
+            ));
+        }
+        Ok(Self { ids })
+    }
+
+    /// Exact alternatives, preserving caller spelling and order.
+    pub fn ids(&self) -> &[String] {
+        &self.ids
+    }
+}
+
 impl QueryScope {
+    pub(crate) fn matches_source(&self, source: &str) -> bool {
+        self.source.as_deref().is_none_or(|id| id == source)
+            && self
+                .sources
+                .as_ref()
+                .is_none_or(|filter| filter.ids.iter().any(|id| id == source))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
         match &self.selection {
             QuerySelection::Live => {}

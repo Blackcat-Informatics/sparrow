@@ -13,7 +13,7 @@ pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
 pub use query::{
     EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, QuerySelection,
-    RecordQuery,
+    RecordQuery, SourceFilter,
 };
 pub use storage::consumption::{
     ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, MAX_CONSUMPTION_JOURNALS,

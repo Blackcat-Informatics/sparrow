@@ -83,7 +83,7 @@ impl Store {
             .is_some_and(|members| !members.contains_key(id))
             || anchor.received_at < scope.received_from
             || anchor.received_at >= scope.received_before
-            || scope.source.as_ref().is_some_and(|s| *s != anchor.source)
+            || !scope.matches_source(&anchor.source)
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",

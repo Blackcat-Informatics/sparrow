@@ -13,6 +13,216 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn source_arrays_are_shared_by_generated_cli_and_mcp_queries() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = &client.discovery().store_id;
+            let mut artifacts = Vec::new();
+            for source in ["alpha", "beta", "gamma"] {
+                artifacts.push(
+                    client
+                        .ingest(
+                            source,
+                            source,
+                            wire::Format::Json,
+                            format!(r#"{{"message":"needle","{source}":true}}"#).as_bytes(),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let created = mcp
+                .tool(
+                    2,
+                    "pin",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("request_id", "source-array-pin")
+                        .with("name", "case")
+                        .with(
+                            "targets",
+                            Value::array(artifacts.iter().map(|a| a.id.clone())),
+                        )
+                        .with("days", 2_u64)
+                        .into(),
+                )
+                .await;
+            assert_eq!(created["isError"].as_bool(), Some(false));
+            let pin = created["structuredContent"]["pin_id"].as_str().unwrap();
+            let filter = Object::new().with("source_ids", vec!["alpha", "beta", "alpha"]);
+            let path = dir.path().join("scope.json");
+            let mut request_id = 3;
+            for scope in [
+                Object::new().with("kind", "live"),
+                Object::new()
+                    .with("kind", "selection")
+                    .with("store_id", store.clone())
+                    .with(
+                        "artifact_ids",
+                        Value::array(artifacts.iter().map(|a| a.id.clone())),
+                    ),
+                Object::new()
+                    .with("kind", "pin")
+                    .with("store_id", store.clone())
+                    .with("pin_id", pin),
+            ] {
+                let scope: Value = scope.with("filter", filter.clone()).into();
+                std::fs::write(&path, purrdf_lex::json::write_compact(&scope)).unwrap();
+                for (tool, command) in [
+                    ("keys_list", "keys"),
+                    ("values_search", "values"),
+                    ("records_search", "records"),
+                    ("text_search", "text"),
+                    ("records_context", "context"),
+                ] {
+                    let mut input = Object::new().with("scope", scope.clone());
+                    let mut args = vec![command];
+                    if tool == "text_search" {
+                        input = input.with("text", "needle");
+                        args.push("needle");
+                    }
+                    if tool == "values_search" {
+                        input = input.with("path", "/message");
+                        args.extend(["--path", "/message"]);
+                    }
+                    if tool == "records_context" {
+                        input = input
+                            .with("store_id", store.clone())
+                            .with("id", artifacts[0].record_ids[0].clone());
+                        args.extend([store.as_str(), artifacts[0].record_ids[0].as_str()]);
+                    }
+                    args.extend(["--scope-file", path.to_str().unwrap()]);
+                    let cli_result = cli(&socket, &args);
+                    let result = mcp.tool(request_id, tool, input.into()).await;
+                    request_id += 1;
+                    assert_eq!(
+                        result["isError"].as_bool(),
+                        Some(false),
+                        "{tool}: {result:?}"
+                    );
+                    let found = &result["structuredContent"];
+                    if tool == "records_context" {
+                        assert_eq!(found["anchor"], cli_result["anchor"]);
+                        assert!(found["after"]["rows"].as_array().unwrap().is_empty());
+                    } else {
+                        assert_eq!(found["rows"], cli_result["rows"]);
+                        if tool == "keys_list" {
+                            assert!(
+                                found["rows"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .all(|r| r["path"].as_str() != Some("/gamma"))
+                            );
+                        } else {
+                            assert_eq!(found["rows"].as_array().unwrap().len(), 2);
+                        }
+                    }
+                }
+            }
+            // Direct generated requests have the same OR semantics and typed refusal.
+            for names in [vec!["alpha", "beta"], vec![], vec![""]] {
+                let mut call = client.capability().keys_list_request();
+                let mut scope = call.get().init_scope();
+                scope
+                    .reborrow()
+                    .init_received_before()
+                    .set_unix_millis(u64::MAX);
+                let mut ids = scope.init_source_ids().init_value(names.len() as u32);
+                for (index, name) in names.iter().enumerate() {
+                    ids.set(index as u32, name);
+                }
+                let response = call.send().promise.await.unwrap();
+                match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
+                    wire::result::Ok(value) => {
+                        assert!(!names.is_empty());
+                        assert_eq!(
+                            value
+                                .unwrap()
+                                .get_receipt()
+                                .unwrap()
+                                .get_coverage()
+                                .unwrap()
+                                .get_eligible_records(),
+                            2
+                        );
+                    }
+                    wire::result::Error(error) => {
+                        assert!(names.is_empty() || names == [""]);
+                        assert_eq!(
+                            error.unwrap().get_code().unwrap().to_str().unwrap(),
+                            "INVALID_ARGUMENT"
+                        );
+                    }
+                }
+            }
+            for ids in [
+                Value::array(Vec::<String>::new()),
+                Value::array([""]),
+                Value::array(["é".repeat(257)]),
+                Value::array(vec!["alpha"; 129]),
+                Value::Null,
+            ] {
+                let result = mcp
+                    .tool(
+                        request_id,
+                        "records_search",
+                        Object::new()
+                            .with(
+                                "scope",
+                                Object::new()
+                                    .with("kind", "live")
+                                    .with("filter", Object::new().with("source_ids", ids)),
+                            )
+                            .into(),
+                    )
+                    .await;
+                request_id += 1;
+                assert_eq!(
+                    result["structuredContent"]["error"]["code"].as_str(),
+                    Some("INVALID_ARGUMENT")
+                );
+            }
+            let excluded = mcp
+                .tool(
+                    request_id,
+                    "records_context",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("id", artifacts[2].record_ids[0].clone())
+                        .with(
+                            "scope",
+                            Object::new().with("kind", "live").with("filter", filter),
+                        )
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                excluded["structuredContent"]["error"]["code"].as_str(),
+                Some("INVALID_ARGUMENT")
+            );
+            mcp.close(true).await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn daemon_expiry_resumes_multiple_passes_and_keeps_pinned_evidence() {
     tokio::task::LocalSet::new()
         .run_until(async {

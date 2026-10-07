@@ -160,8 +160,24 @@ or `{"kind":"pin","store_id":"store:...","pin_id":"pin:...","expected_revision":
 Live scope omits `store_id`; supplied arrays must be nonempty. Up to 1,000
 explicit references are accepted, and overlapping artifact/record references
 are deduplicated. Scope filters presently use the existing outer source,
-receipt-time and combined-query event-time fields; the additional diagnostic
-filter dimensions above remain planned.
+receipt-time and combined-query event-time fields. Schema 20 adds a closed
+`filter` object to every scope kind, currently requiring `source_ids`:
+`{"kind":"live","filter":{"source_ids":["worker","scheduler"]}}`.
+These exact logical source IDs use the original ingestion spelling; there is no
+case folding or source-name inference. Accept 1..128 alternatives, each 1..512
+UTF-8 bytes. An absent filter admits all sources; an empty array, empty ID or
+unsupported dimension fails with `INVALID_ARGUMENT`. Alternatives combine with
+OR, and intersect the outer exact `source`, receipt interval and resolved
+membership. Duplicate alternatives never duplicate records or counts. Context
+remains source-local and refuses an anchor excluded by the filter. Diagnostic
+service/host/severity/trace/span dimensions remain planned.
+
+The generated contract uses `Scope.sourceIds :OptionalSourceIds`, with distinct
+absent and present-list states. CLI scope files and MCP use the same native JSON
+decoder and typed encoder. Before sending a filtered read, these adapters require
+current discovery through the native client; an older daemon is refused with
+`UNSUPPORTED` rather than silently ignoring the added wire field. This discovery
+check uses the existing status scan; it is not a bounded metadata-only handshake.
 
 Membership expansion permits at most 100,000 direct pin members and 100,000
 record visits, including overlaps, and retains only bounded IDs/timestamps.

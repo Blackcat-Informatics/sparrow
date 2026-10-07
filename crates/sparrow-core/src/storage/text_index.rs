@@ -146,10 +146,7 @@ impl Store {
             }
             visited += 1;
             if !writer.live_record(&record, now, &protected)
-                || scope
-                    .source
-                    .as_ref()
-                    .is_some_and(|source| *source != record.source)
+                || !scope.matches_source(&record.source)
             {
                 continue;
             }

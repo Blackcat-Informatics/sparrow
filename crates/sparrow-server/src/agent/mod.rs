@@ -354,6 +354,15 @@ impl Command {
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+        let options = match self {
+            Self::Query { options, .. } => Some(options),
+            Self::Records(input) => Some(&input.options),
+            Self::Context(input) => Some(&input.options),
+            _ => None,
+        };
+        if let Some(options) = options {
+            options.selection.require_supported(client).await?;
+        }
         if let Self::Watch(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
@@ -483,7 +492,7 @@ fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) -> Result<
         .set_unix_millis(options.before);
     scope.set_limit(options.limit);
     scope.set_scan_budget(options.scan_budget);
-    options.selection.encode(scope.init_selection())
+    options.selection.encode(scope)
 }
 
 fn optional(field: wire::optional_text::Builder<'_>, value: &Option<String>) {

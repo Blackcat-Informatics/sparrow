@@ -8,6 +8,186 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn source_alternatives_intersect_membership_time_and_context_without_duplicates() {
+    use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery, SourceFilter};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut artifacts = Vec::new();
+    for (index, source) in ["alpha", "alpha", "beta", "gamma"].into_iter().enumerate() {
+        artifacts.push(
+            store
+                .ingest(
+                    &format!("source-array-{index}"),
+                    source,
+                    "json",
+                    format!(r#"{{"message":"needle","{source}":true}}"#).as_bytes(),
+                    (index as u64 + 1) * 10,
+                )
+                .unwrap(),
+        );
+    }
+    let pin = store
+        .pin(
+            "source-array-pin",
+            "case",
+            &artifacts.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+            40,
+            40,
+        )
+        .unwrap();
+    let mut scope = QueryScope {
+        selection: QuerySelection::Live,
+        source: None,
+        sources: Some(
+            SourceFilter::new(vec!["alpha".into(), "beta".into(), "alpha".into()]).unwrap(),
+        ),
+        received_from: 0,
+        received_before: 100,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    for selection in [
+        QuerySelection::Live,
+        QuerySelection::Evidence(artifacts.iter().map(|a| a.id.clone()).collect()),
+        QuerySelection::Pin {
+            id: pin.id.clone(),
+            expected_revision: Some(pin.revision),
+        },
+    ] {
+        scope.selection = selection;
+        let records = store
+            .records_query(&scope, &RecordQuery::default(), 50)
+            .unwrap();
+        assert_eq!(records["rows"].as_array().unwrap().len(), 3);
+        assert!(
+            records["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["source"].as_str() != Some("gamma"))
+        );
+        assert_eq!(
+            store.text_query(&scope, "needle", 50).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let keys = store.json_query(&scope, &JsonQuery::Keys, 50).unwrap();
+        assert_eq!(keys["coverage"]["eligible_records"].as_str(), Some("3"));
+        assert!(
+            keys["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["path"].as_str() != Some("/gamma"))
+        );
+        assert_eq!(
+            store
+                .json_query(
+                    &scope,
+                    &JsonQuery::Values {
+                        path: Some("/message".into()),
+                        kind: None,
+                        lexical: None,
+                        decoded: None
+                    },
+                    50
+                )
+                .unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let context = store
+            .records_context(&artifacts[0].record_ids[0], &scope, 0, 10, 50)
+            .unwrap();
+        assert_eq!(context.after.records.len(), 1);
+        assert_eq!(context.after.records[0].id, artifacts[1].record_ids[0]);
+        assert_eq!(
+            store
+                .records_context(&artifacts[3].record_ids[0], &scope, 0, 0, 50)
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    scope.source = Some("beta".into());
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 50)
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    scope.source = Some("gamma".into());
+    assert!(
+        store.text_query(&scope, "needle", 50).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    scope.source = None;
+    scope.received_from = 20;
+    scope.received_before = 30;
+    let records = store
+        .records_query(&scope, &RecordQuery::default(), 50)
+        .unwrap();
+    assert_eq!(records["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        records["rows"][0]["record_id"].as_str(),
+        Some(artifacts[1].record_ids[0].as_str())
+    );
+    scope.received_from = 0;
+    scope.received_before = 100;
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 31 * DAY)
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    store.release(&pin.id).unwrap();
+    scope.sources = Some(SourceFilter::new(vec!["absent".into()]).unwrap());
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 31 * DAY)
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+    scope.selection = QuerySelection::Evidence(vec![artifacts[3].id.clone()]);
+    assert_eq!(
+        store
+            .json_query(&scope, &JsonQuery::Keys, 31 * DAY)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+}
+
+#[test]
+fn source_filter_admission_uses_ingestion_byte_bounds() {
+    use sparrow_core::SourceFilter;
+    for ids in [
+        vec![],
+        vec![String::new()],
+        vec!["x".repeat(513)],
+        vec!["é".repeat(257)],
+        vec!["source".into(); 129],
+    ] {
+        assert_eq!(SourceFilter::new(ids).unwrap_err().code, "INVALID_ARGUMENT");
+    }
+    let filter = SourceFilter::new(vec!["é".repeat(256); 128]).unwrap();
+    assert_eq!(filter.ids().len(), 128);
+}
+
+#[test]
 fn streaming_status_counts_follow_receipt_retention_pin_release_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -1014,6 +1194,7 @@ fn eviction_preserves_record_pins_shared_projections_and_durable_retry_identity(
     let scope = QueryScope {
         selection: QuerySelection::Evidence(vec![old.record_ids[1].clone(), new.id.clone()]),
         source: None,
+        sources: None,
         received_from: 0,
         received_before: u64::MAX,
         limit: 100,
@@ -1951,6 +2132,7 @@ fn query_selection_intersects_filters_deduplicates_and_seeks_selected_evidence()
             selected.id.clone(),
         ]),
         source: Some("source".into()),
+        sources: None,
         received_from: 0,
         received_before: 100,
         limit: 10,
@@ -2046,6 +2228,7 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
             expected_revision: Some(pin.revision),
         },
         source: None,
+        sources: None,
         received_from: 0,
         received_before: now + 1,
         limit: 10,
@@ -2501,6 +2684,7 @@ fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_by
     let scope = sparrow_core::QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("oversized".into()),
+        sources: None,
         received_from: 0,
         received_before: 10,
         limit: 100,
@@ -2646,6 +2830,7 @@ fn oversized_documents_keep_bytes_with_declared_projection_limits_or_nonapplicab
         let scope = sparrow_core::QueryScope {
             selection: sparrow_core::QuerySelection::Live,
             source: Some("oversized".into()),
+            sources: None,
             received_from: 0,
             received_before: 10,
             limit: 10,
@@ -3213,6 +3398,7 @@ fn native_import_publishes_files_above_buffered_limit_without_a_whole_file_batch
     let scope = sparrow_core::QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("copy".into()),
+        sources: None,
         received_from: 0,
         received_before: 10,
         limit: 10,
@@ -4994,6 +5180,7 @@ fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers()
     let mut scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("context".into()),
+        sources: None,
         received_from: 10,
         received_before: 13,
         limit: 100,
@@ -5086,6 +5273,7 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
     let scope = sparrow_core::QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
+        sources: None,
         received_from: 0,
         received_before: 3,
         limit: 100,
@@ -5167,6 +5355,7 @@ fn context_keeps_record_pins_and_exposes_observed_retirement_gaps() {
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
+        sources: None,
         received_from: 0,
         received_before: now + 1,
         limit: 100,
@@ -5216,6 +5405,7 @@ fn persisted_text_ranking_spans_scope_and_record_pins_survive_reopen() {
     let mut scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("logs".into()),
+        sources: None,
         received_from: 0,
         received_before: 2,
         limit: 100,
@@ -5291,6 +5481,7 @@ fn decoded_text_uses_scalar_evidence_and_failed_coverage_is_visible() {
     let scope = sparrow_core::QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
+        sources: None,
         received_from: 0,
         received_before: 1,
         limit: 100,
@@ -5427,6 +5618,7 @@ fn native_json_discovery_preserves_duplicates_lexical_values_and_time_scope() {
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("alpha".into()),
+        sources: None,
         received_from: 100,
         received_before: 200,
         limit: 100,
@@ -5491,6 +5683,7 @@ fn projection_failure_is_visible_without_discarding_raw_evidence() {
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
+        sources: None,
         received_from: 0,
         received_before: 200,
         limit: 100,
@@ -5551,6 +5744,7 @@ fn query_budget_and_row_limit_do_not_claim_complete_coverage() {
     let mut scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
+        sources: None,
         received_from: 0,
         received_before: 200,
         limit: 1,
@@ -5829,6 +6023,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("logs".into()),
+        sources: None,
         received_from: 10,
         received_before: 11,
         limit: 100,
@@ -5890,6 +6085,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("parents".into()),
+        sources: None,
         received_from: 20,
         received_before: 21,
         ..scope
@@ -5934,6 +6130,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("nested".into()),
+        sources: None,
         received_from: 30,
         received_before: 31,
         ..scope
@@ -5973,6 +6170,7 @@ fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
     let mut scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("test".into()),
+        sources: None,
         received_from: 1,
         received_before: 4,
         limit: 100,
@@ -6190,6 +6388,7 @@ fn event_intervals_exclude_unknowns_sort_source_time_and_keep_retention_on_accep
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("events".into()),
+        sources: None,
         received_from: 0,
         received_before: 100,
         limit: 1,
@@ -6347,6 +6546,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
     let scope = QueryScope {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
+        sources: None,
         received_from: 0,
         received_before: 1,
         limit: 100,

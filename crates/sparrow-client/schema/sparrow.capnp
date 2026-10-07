@@ -189,7 +189,9 @@ struct Scope {
   source @0 :OptionalText; receivedFrom @1 :Instant;
   receivedBefore @2 :Instant; limit @3 :UInt32 = 100; scanBudget @4 :UInt32 = 10000;
   selection @5 :QuerySelection;
+  sourceIds @6 :OptionalSourceIds;
 }
+struct OptionalSourceIds { union { absent @0 :Void; value @1 :List(Text); } }
 struct PinScope { storeId @0 :Text; id @1 :Text; expectedRevision @2 :OptionalRevision; }
 struct QuerySelection { union { live @0 :Void; evidence @1 :List(Evidence); pin @2 :PinScope; } }
 struct ValueQuery {

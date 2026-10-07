@@ -463,6 +463,27 @@ fn optional(value: wire::optional_text::Reader<'_>) -> capnp::Result<Option<Stri
 
 fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<QueryScope, Error>> {
     let source = optional(value.get_source()?)?;
+    let sources = match value.get_source_ids()?.which()? {
+        wire::optional_source_ids::Absent(()) => None,
+        wire::optional_source_ids::Value(ids) => {
+            let ids = ids?;
+            if ids.is_empty() || ids.len() > 128 {
+                return Ok(Err(invalid("source_ids requires 1..128 source IDs")));
+            }
+            let mut names = Vec::with_capacity(ids.len() as usize);
+            for id in ids.iter() {
+                let id = id?;
+                if id.len() > 512 {
+                    return Ok(Err(invalid("source ID exceeds 512 bytes")));
+                }
+                names.push(id.to_str()?.to_owned());
+            }
+            match sparrow_core::SourceFilter::new(names) {
+                Ok(filter) => Some(filter),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    };
     let received_from = value.get_received_from()?.get_unix_millis();
     let received_before = value.get_received_before()?.get_unix_millis();
     let selection = match value.get_selection()?.which()? {
@@ -498,6 +519,7 @@ fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<Quer
     Ok(selection.map(|selection| QueryScope {
         selection,
         source,
+        sources,
         received_from,
         received_before,
         limit: value.get_limit() as usize,
