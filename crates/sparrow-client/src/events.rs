@@ -177,19 +177,7 @@ impl EventBatch {
                 ));
             }
             previous = event.sequence;
-            let mut budget = Budget::new(MAX_EVENT_BYTES);
-            budget.charge(1024)?;
-            budget.text(&event.name)?;
-            budget.text(&event.target)?;
-            measure_fields(&event.fields, &mut budget)?;
-            budget.context(event.context.len())?;
-            for span in &event.context {
-                budget.text(&span.name)?;
-                budget.text(&span.target)?;
-                measure_fields(&span.fields, &mut budget)?;
-            }
-            relationships(event)?;
-            batch.charge(budget.used())?;
+            batch.charge(event.admission_bytes()?)?;
         }
         Ok(())
     }
@@ -286,6 +274,31 @@ impl EventBatch {
     }
 }
 
+impl ProducerEvent {
+    /// Conservative source expansion and owned allocation charge, independent of sequence assignment.
+    /// Unused container/string capacity is admitted too, so a tiny value cannot retain an oversized allocation.
+    pub fn admission_bytes(&self) -> Result<usize, Error> {
+        let mut budget = Budget::new(MAX_EVENT_BYTES);
+        budget.charge(1024)?;
+        owned_text(&self.name, &mut budget)?;
+        owned_text(&self.target, &mut budget)?;
+        measure_fields(&self.fields, self.fields.capacity(), &mut budget)?;
+        budget.context(self.context.capacity())?;
+        for span in &self.context {
+            owned_text(&span.name, &mut budget)?;
+            owned_text(&span.target, &mut budget)?;
+            measure_fields(&span.fields, span.fields.capacity(), &mut budget)?;
+        }
+        relationships(self)?;
+        Ok(budget.used())
+    }
+}
+
+fn owned_text(value: &String, budget: &mut Budget) -> Result<(), Error> {
+    budget.text(value)?;
+    budget.charge(value.capacity().saturating_sub(value.len() * 6))
+}
+
 fn check_count(count: usize) -> Result<(), Error> {
     if count == 0 || count > MAX_EVENT_BATCH_EVENTS {
         return Err(Error::InvalidArgument(
@@ -324,15 +337,22 @@ fn relationships(event: &ProducerEvent) -> Result<(), Error> {
     Ok(())
 }
 
-fn measure_fields(fields: &[EventField], budget: &mut Budget) -> Result<(), Error> {
-    budget.fields(fields.len())?;
+fn measure_fields(
+    fields: &[EventField],
+    capacity: usize,
+    budget: &mut Budget,
+) -> Result<(), Error> {
+    budget.fields(capacity)?;
     for field in fields {
-        budget.text(&field.name)?;
+        owned_text(&field.name, budget)?;
         match &field.value {
             FieldValue::Text(value) | FieldValue::Debug(value) | FieldValue::Error(value) => {
-                budget.text(value)?
+                owned_text(value, budget)?
             }
-            FieldValue::Bytes(value) => budget.binary(value.len())?,
+            FieldValue::Bytes(value) => {
+                budget.binary(value.len())?;
+                budget.charge(value.capacity().saturating_sub(value.len() * 2))?;
+            }
             _ => {}
         }
     }

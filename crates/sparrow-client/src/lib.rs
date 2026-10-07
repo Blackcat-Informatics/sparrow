@@ -38,6 +38,10 @@ pub use events::{
     EventBatch, EventField, EventSpan, FieldValue, MAX_EVENT_BATCH_BYTES, MAX_EVENT_BATCH_EVENTS,
     MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
 };
+mod delivery;
+pub use delivery::{
+    Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
+};
 
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
@@ -105,7 +109,7 @@ impl Client {
     }
     /// Connect and verify discovery before allowing producer mutations.
     pub async fn connect(socket: &std::path::Path) -> Result<Self, Error> {
-        let connection = connect(socket).await?;
+        let connection = transport::connect_typed(socket).await?;
         let discovery = Discovery::fetch(&connection.client).await?;
         Ok(Self {
             connection,

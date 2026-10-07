@@ -24,6 +24,14 @@ impl Drop for Connection {
 
 /// Connect to the daemon's private Unix socket within a Tokio `LocalSet`.
 pub async fn connect(socket: &Path) -> capnp::Result<Connection> {
+    connect_typed(socket).await.map_err(|error| match error {
+        crate::Error::Io(error) => error.into(),
+        crate::Error::Transport(error) => error,
+        error => capnp::Error::failed(error.to_string()),
+    })
+}
+
+pub(crate) async fn connect_typed(socket: &Path) -> Result<Connection, crate::Error> {
     let stream = tokio::net::UnixStream::connect(socket).await?;
     let (reader, writer) = stream.compat().split();
     let network = twoparty::VatNetwork::new(

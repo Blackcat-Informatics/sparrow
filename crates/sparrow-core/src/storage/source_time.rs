@@ -350,7 +350,7 @@ impl Store {
             > writer.config.disk_budget
         {
             return Err(Error::new(
-                "DISK_PRESSURE",
+                "STORAGE_PRESSURE",
                 "source time mapping exceeds physical control admission budget",
             ));
         }

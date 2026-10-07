@@ -50,11 +50,12 @@ checks durable direct ingestion and conflicting request refusal. Discovery tests
 refuse old schema versions and missing projection identity. The Rust example in
 the crate documentation is compiled as a doctest.
 
-This is the direct artifact/event-batch client. Automatic reconnection, logging queues,
-`tracing_subscriber::Layer`, typed structured event/span ingestion, buffered
-acknowledgments and durable flush/shutdown watermarks remain required work. The
-current SDK returns durable artifact receipts; it does not advertise these
-unfinished behaviors. Full server acceptance remains unmet.
+The direct artifact/event-batch client and bounded `Delivery` worker are present.
+The worker reconnects with immutable pending requests and returns durable
+admitted-input fences through flush/shutdown. `tracing_subscriber::Layer`, its
+span callbacks/field visitor, explicit buffered server acknowledgments and the
+shared server WAL flush contract remain required work. Full server acceptance
+remains unmet.
 
 ### Schema 11: typed producer event batches
 
@@ -94,8 +95,9 @@ published on that failure. Acceptance/expiry clocks remain server clocks.
 Release acceptance verifies all field variants, repeated names, escaped text,
 span context, exact timestamp evidence spans, temporal/text retrieval, unchanged
 receipts after restart, changed NaN-payload conflict, and oversized/invalid input
-refusal. Automatic two-second batching/reconnection, drop counters, tracing
-callbacks, buffered writes and flush/shutdown watermarks remain unfinished.
+refusal. The `Delivery` worker below supplies automatic batching/reconnection,
+drop counters and durable admitted-input fences. Tracing callbacks, explicit
+buffered server writes and their WAL flush contract remain unfinished.
 
 The owned development daemon was replaced with this qualified schema-11 build
 on 2026-10-07. It retained store
@@ -117,6 +119,80 @@ target/release/examples/events /home/paudley/.local/state/sparrow/development-v5
 The example takes an explicit instance identity and timestamp so a retry can
 reproduce the same input. A new producer process must choose a fresh instance
 for new observations; the example is not the unfinished tracing logging layer.
+
+### Bounded producer delivery worker
+
+`sparrow_client::Delivery` owns one producer thread, a Tokio LocalSet and the
+shared typed client. Producers call `try_send(ProducerEvent)` without waiting for
+socket I/O or a queue lock. The worker assigns increasing sequences under queue
+serialization. Full, contended, invalid, closed and failed admission each have
+visible drop counters. A full-queue refusal can leave an explicit sequence gap;
+refusals before sequence assignment remain visible through counters. Event
+admission also charges unused string/vector capacity, preventing a tiny value
+from retaining an oversized allocation. Caller-owned inputs must already be
+constructed; the future tracing visitor still needs bounded capture formatting.
+
+Defaults are 1024 queued/in-flight events, 4 MiB conservative event charge,
+128 events/512 KiB per batch, two-second intended batching, five-second RPC
+deadlines and 250 ms retry delay. Setup validates finite upper/lower bounds;
+these are configurable. Queue and immutable pending-batch ownership stay charged
+until a matching durable receipt. Retryable Unix-socket/transport/daemon errors
+preserve exactly the same request ID, instance, sequences, timestamps and values.
+RPC timeout means delivery unknown. The first discovered persistent store binds
+the worker; reconnecting to another store fails explicitly with pending input
+retained. Permanent failures remain inspectable through `stats` and
+`pending_batch`, with no manufactured acknowledgement. Source-time registration
+pressure now uses the same retryable `STORAGE_PRESSURE` code as ingestion.
+
+`stats` exposes offered/admitted/durable counts, drops by reason, pending count/
+charge, in-flight count, retry count, terminal/transient failures, oldest pending
+age and flush lag. Charges bound retained work; they do not measure process RSS,
+native transport arenas or allocator overhead. The queue's reserved container
+capacity remains bounded by setup limits even after it drains.
+
+`flush(timeout)` forces an admitted-sequence fence. `shutdown(timeout)` also
+closes admission and waits for the worker/socket to finish. One try-acquired
+control slot rejects simultaneous barriers as `Busy`; there is no unbounded
+control-message queue. Watermarks carry instance, required/durable sequence,
+durable event count, pre-fence drops and the last store-scoped receipt. If any
+offer was dropped before the captured fence, the barrier returns `Dropped` with
+the admitted-input watermark instead of certifying all offers. A timeout retains
+pending work and may be retried. A timed-out shutdown remains closed. Offers
+that finish after fence capture belong to a later fence. Dropping the last
+handle cancels the owned worker; it does not promise a flush or producer-process
+survival. Empty shutdown returns no fabricated receipt.
+
+This is durable delivery for this producer's admitted events. It does not expose
+a server-wide flush or claim the unfinished buffered-WAL acknowledgement mode.
+Every current event batch receipt must be `durable` before queue retirement.
+
+Release scenarios use real temporary daemons and a typed forwarding relay that
+withholds a real durable reply. They verify identical retry bodies/receipt and
+one occurrence, count/byte bounds during daemon absence, unchanged pending work
+after timeout, explicit drops after recovery, timer-driven delivery without a
+flush, fresh process instances, store replacement refusal, reserved-allocation
+admission, and cancellation of an unresponsive owned socket before its 60-second
+RPC deadline. Production and test relay connections now share the same bounded
+server transport constructor. No model/Brainstem service lifecycle is involved.
+
+```sh
+CARGO_BUILD_JOBS=4 cargo build --locked --release --workspace --bins --examples
+target/release/examples/delivery /home/paudley/.local/state/sparrow/development-v5/rpc.sock delivery-example 1700000000002 'bounded delivery example'
+```
+
+Live verification on 2026-10-07 replaced only the owned development daemon with
+the qualified build, preserving store identity and schema 11. PID at verification
+was `1642510`. Two separate runs of the public delivery example with identical
+message/source/time produced fresh client instances
+`56799eb3eeea574d8eac6d652e27270b` and `eba3448b332f3ff224a74dfc00386e37`, with
+durable sequence-1 receipts for independent artifacts
+`artifact:36d39d40186e4eba4efaf62aebff8500` and
+`artifact:fb90b17321830cad8aa9527545ba6fa3`. Native temporal/full-text retrieval
+returned both 341-byte occurrences at producer time
+`2023-11-14T22:13:20.003Z`, with zero unknown time or failed text coverage. Lost-
+reply retry qualification remains the deterministic real-daemon relay scenario,
+where an unchanged instance/request returned the same occurrence. These synthetic
+events do not establish production throughput, RSS or complete tracing acceptance.
 
 ```sh
 CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server

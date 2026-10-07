@@ -18,6 +18,339 @@ impl Drop for Daemon {
     }
 }
 
+fn delivery_event(text: &str) -> sparrow_client::ProducerEvent {
+    sparrow_client::ProducerEvent {
+        sequence: 0,
+        event_time: 1000,
+        kind: wire::EventKind::Log,
+        level: wire::EventLevel::Info,
+        name: "delivery".into(),
+        target: "application".into(),
+        fields: vec![sparrow_client::EventField {
+            name: "message".into(),
+            value: sparrow_client::FieldValue::Text(text.into()),
+        }],
+        context: vec![],
+        span: None,
+        follows_from: None,
+    }
+}
+
+async fn admit(delivery: &sparrow_client::Delivery, event: sparrow_client::ProducerEvent) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match delivery.try_send(event.clone()) {
+            sparrow_client::Admission::Queued { sequence } => return sequence,
+            sparrow_client::Admission::Dropped {
+                reason: sparrow_client::DropReason::Contended,
+                ..
+            } => {
+                assert!(
+                    Instant::now() < deadline,
+                    "producer admission remained contended"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            admission => panic!("unexpected admission: {admission:?}"),
+        }
+    }
+}
+
+async fn delivery_barrier(
+    delivery: &sparrow_client::Delivery,
+    shutdown: bool,
+    timeout: Duration,
+) -> Result<sparrow_client::DeliveryWatermark, sparrow_client::FlushError> {
+    let handle = delivery.clone();
+    tokio::task::spawn_blocking(move || {
+        if shutdown {
+            handle.shutdown(timeout)
+        } else {
+            handle.flush(timeout)
+        }
+    })
+    .await
+    .unwrap()
+}
+
+fn reached_delivery(
+    result: Result<sparrow_client::DeliveryWatermark, sparrow_client::FlushError>,
+) -> sparrow_client::DeliveryWatermark {
+    match result {
+        Ok(value) => {
+            assert_eq!(value.dropped_before_fence, 0);
+            value
+        }
+        Err(sparrow_client::FlushError::Dropped(value)) => {
+            assert!(value.dropped_before_fence > 0);
+            *value
+        }
+        Err(error) => panic!("admitted events did not reach durability: {error}"),
+    }
+}
+
+struct EventRelayState {
+    backend: std::cell::RefCell<wire::sparrow::Client>,
+    calls: std::cell::RefCell<Vec<sparrow_client::EventBatch>>,
+    accepted: std::cell::RefCell<Option<sparrow_client::ArtifactReceipt>>,
+    drop_first: std::cell::Cell<bool>,
+    first_accepted: tokio::sync::Notify,
+}
+struct EventRelay(std::rc::Rc<EventRelayState>);
+impl wire::sparrow::Server for EventRelay {
+    async fn status(
+        self: std::rc::Rc<Self>,
+        _: wire::sparrow::StatusParams,
+        mut results: wire::sparrow::StatusResults,
+    ) -> capnp::Result<()> {
+        let backend = self.0.backend.borrow().clone();
+        let response = backend.status_request().send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)
+    }
+    async fn events_ingest(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::EventsIngestParams,
+        mut results: wire::sparrow::EventsIngestResults,
+    ) -> capnp::Result<()> {
+        let input = sparrow_client::EventBatch::decode(params.get()?.get_batch()?)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        assert!(
+            self.0.calls.borrow().len() < 8,
+            "retry fixture exceeded its request bound"
+        );
+        self.0.calls.borrow_mut().push(input.clone());
+        let backend = self.0.backend.borrow().clone();
+        let mut request = backend.events_ingest_request();
+        input
+            .encode(request.get().init_batch())
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        let response = request.send().promise.await?;
+        if let wire::result::Ok(value) = response.get()?.get_result()?.which()? {
+            let receipt = sparrow_client::ArtifactReceipt::decode(value?)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            if self.0.drop_first.replace(false) {
+                *self.0.accepted.borrow_mut() = Some(receipt);
+                self.0.first_accepted.notify_one();
+                // The real daemon committed. Withhold its reply until the worker's finite deadline closes this connection.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+        results.get().set_result(response.get()?.get_result()?)
+    }
+}
+
+fn relay(
+    socket: &Path,
+    backend: wire::sparrow::Client,
+) -> (std::rc::Rc<EventRelayState>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::UnixListener::bind(socket).unwrap();
+    let state = std::rc::Rc::new(EventRelayState {
+        backend: std::cell::RefCell::new(backend),
+        calls: std::cell::RefCell::new(Vec::new()),
+        accepted: std::cell::RefCell::new(None),
+        drop_first: std::cell::Cell::new(true),
+        first_accepted: tokio::sync::Notify::new(),
+    });
+    let capability: wire::sparrow::Client = capnp_rpc::new_client(EventRelay(state.clone()));
+    let task = tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::task::spawn_local(sparrow_server::serve_connection(stream, capability.clone()));
+        }
+    });
+    (state, task)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let daemon = start(&config, &socket).await;
+            let backend = connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("relay.sock");
+            let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+            let mut config =
+                sparrow_client::DeliveryConfig::new(&proxy_socket, "delivery-lost-reply");
+            config.batch_events = 1;
+            config.rpc_timeout = Duration::from_millis(150);
+            config.retry_interval = Duration::from_millis(20);
+            let delivery = sparrow_client::Delivery::start(config).unwrap();
+            let sequence = admit(&delivery, delivery_event("lost reply recovery")).await;
+            let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
+            let watermark = reached_delivery(result);
+            assert_eq!(watermark.required_sequence, sequence);
+            assert_eq!(watermark.durable_sequence, sequence);
+            assert_eq!(watermark.durable_events, 1);
+            assert_eq!(
+                watermark.last_receipt.as_ref(),
+                state.accepted.borrow().as_ref()
+            );
+            let stats = delivery.stats().unwrap();
+            assert_eq!(stats.pending_events, 0);
+            assert_eq!(stats.pending_bytes, 0);
+            assert!(!stats.running);
+            assert!(stats.retries >= 1);
+            assert!(stats.last_transient_failure.is_none());
+            {
+                let calls = state.calls.borrow();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0], calls[1]);
+                assert_eq!(calls[0].client_instance, watermark.client_instance);
+            }
+            let response = backend
+                .client
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
+                1
+            );
+            let mut timed_config =
+                sparrow_client::DeliveryConfig::new(&socket, "delivery-lost-reply");
+            assert_eq!(timed_config.flush_interval, Duration::from_secs(2));
+            timed_config.flush_interval = Duration::from_millis(50);
+            let timed = sparrow_client::Delivery::start(timed_config).unwrap();
+            admit(&timed, delivery_event("lost reply recovery")).await;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while timed.stats().unwrap().durable_events != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "automatic batching did not deliver without a flush"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let new_process =
+                reached_delivery(delivery_barrier(&timed, true, Duration::from_secs(2)).await);
+            assert_ne!(new_process.client_instance, watermark.client_instance);
+            assert_ne!(
+                new_process.last_receipt.unwrap().id,
+                watermark.last_receipt.unwrap().id
+            );
+            proxy.abort();
+            assert!(proxy.await.unwrap_err().is_cancelled());
+            drop(timed);
+            drop(delivery);
+            drop(backend);
+            drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recovery() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let mut delivery_config =
+                sparrow_client::DeliveryConfig::new(&socket, "delivery-outage");
+            delivery_config.max_queued_events = 2;
+            delivery_config.batch_events = 1;
+            delivery_config.retry_interval = Duration::from_millis(25);
+            let delivery = sparrow_client::Delivery::start(delivery_config).unwrap();
+            admit(&delivery, delivery_event("before service start one")).await;
+            admit(&delivery, delivery_event("before service start two")).await;
+            assert!(matches!(
+                delivery.try_send(delivery_event("overflow")),
+                sparrow_client::Admission::Dropped { .. }
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while delivery.pending_batch().unwrap().is_none() {
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let pending = delivery.pending_batch().unwrap().unwrap();
+            let stats = delivery.stats().unwrap();
+            assert_eq!(stats.pending_events, 2);
+            assert_eq!(stats.in_flight_events, 1);
+            assert!(stats.pending_bytes <= 4 * 1024 * 1024);
+            assert!(matches!(
+                delivery_barrier(&delivery, false, Duration::from_millis(40)).await,
+                Err(sparrow_client::FlushError::TimedOut(_))
+            ));
+            assert_eq!(delivery.pending_batch().unwrap().unwrap(), pending);
+            let daemon = start(&config, &socket).await;
+            let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
+            let watermark = match result {
+                Err(sparrow_client::FlushError::Dropped(value)) => *value,
+                result => panic!("outage drops must remain explicit: {result:?}"),
+            };
+            assert_eq!(watermark.durable_events, 2);
+            assert!(watermark.dropped_before_fence >= 1);
+            assert!(!delivery.stats().unwrap().running);
+            let backend = sparrow_client::Client::connect(&socket).await.unwrap();
+            let recovered = backend.events(&pending).await.unwrap();
+            assert_eq!(recovered.record_ids.len(), 1);
+            let response = backend
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
+                2
+            );
+            assert!(matches!(
+                delivery.try_send(delivery_event("after shutdown")),
+                sparrow_client::Admission::Dropped {
+                    reason: sparrow_client::DropReason::Closed,
+                    ..
+                }
+            ));
+            drop(backend);
+            drop(delivery);
+            drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending_input() {
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first"); let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap(); std::fs::create_dir(&second).unwrap();
+        let first_store = first.join("store"); let first_socket = first_store.join("rpc.sock");
+        let second_store = second.join("store"); let second_socket = second_store.join("rpc.sock");
+        let first_config = write_server_config(&first, &first_store, &first_socket);
+        let second_config = write_server_config(&second, &second_store, &second_socket);
+        let first_daemon = start(&first_config, &first_socket).await; let second_daemon = start(&second_config, &second_socket).await;
+        let first_backend = connect(&first_socket).await.unwrap(); let second_backend = connect(&second_socket).await.unwrap();
+        let proxy_socket = dir.path().join("relay.sock");
+        let (state, proxy) = relay(&proxy_socket, first_backend.client.clone());
+        let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery");
+        config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150); config.retry_interval = Duration::from_millis(100);
+        let delivery = sparrow_client::Delivery::start(config).unwrap();
+        admit(&delivery, delivery_event("unknown accepted delivery")).await;
+        tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified()).await.unwrap();
+        *state.backend.borrow_mut() = second_backend.client.clone();
+        let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
+        match result { Err(sparrow_client::FlushError::Delivery(error)) => assert!(matches!(error.as_ref(), sparrow_client::Error::Domain { code, retryable: false, .. } if code == "STORE_MISMATCH")),
+            result => panic!("replacement store must refuse pending delivery: {result:?}") };
+        let pending = delivery.pending_batch().unwrap().unwrap(); assert_eq!(pending.as_ref(), &state.calls.borrow()[0]);
+        assert_eq!(delivery.stats().unwrap().durable_events, 0);
+        let response = second_backend.client.status_request().send().promise.await.unwrap();
+        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 0);
+        let original = state.accepted.borrow().clone().unwrap();
+        let first_client = sparrow_client::Client::connect(&first_socket).await.unwrap();
+        assert_eq!(first_client.events(&pending).await.unwrap(), original);
+        assert!(matches!(delivery.try_send(delivery_event("after terminal failure")), sparrow_client::Admission::Dropped { reason: sparrow_client::DropReason::Failed, .. }));
+        proxy.abort(); assert!(proxy.await.unwrap_err().is_cancelled());
+        drop(delivery); drop(first_client); drop(first_backend); drop(second_backend); drop(first_daemon); drop(second_daemon);
+    }).await;
+}
+
 async fn start(config: &Path, socket: &Path) -> Daemon {
     let daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_sparrowd"))

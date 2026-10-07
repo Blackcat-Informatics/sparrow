@@ -21,7 +21,7 @@ pub enum Error {
     Protocol(&'static str),
     /// A caller supplied inadmissible input.
     InvalidArgument(&'static str),
-    /// Reading the producer's completed file failed.
+    /// Local file, Unix socket, or producer worker setup failed.
     Io(std::io::Error),
 }
 
@@ -65,7 +65,7 @@ impl std::fmt::Display for Error {
             Self::Unsupported(message) => write!(f, "unsupported discovery: {message}"),
             Self::Protocol(message) => write!(f, "invalid daemon response: {message}"),
             Self::InvalidArgument(message) => write!(f, "invalid input: {message}"),
-            Self::Io(error) => write!(f, "completed-file I/O: {error}"),
+            Self::Io(error) => write!(f, "local I/O: {error}"),
         }
     }
 }

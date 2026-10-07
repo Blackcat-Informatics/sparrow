@@ -809,3 +809,115 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(encode_optional_text_again|encode_optional_span_again)$']
+
+[[job]]
+id = "producer-event-owned-admission"
+summary = "Charge native source expansion and retained allocation capacities before an event can enter a delivery queue."
+home = "sparrow_client::events::ProducerEvent::admission_bytes"
+entry_points = []
+spec = "docs/development-runtime.md: bounded producer delivery worker."
+vectors = ["crates/sparrow-client/src/delivery.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(measure_logger_event_charge|measure_queue_event_charge)$']
+
+[[job]]
+id = "producer-queue-admission"
+summary = "Nonblocking sequence assignment, count/byte ownership and explicit reasoned drops share one admission path."
+home = "sparrow_client::delivery::Delivery::try_send"
+entry_points = []
+spec = "docs/development-runtime.md: bounded producer delivery worker."
+vectors = ["crates/sparrow-client/src/delivery.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(enqueue_tracing_event|enqueue_direct_event)$']
+
+[[job]]
+id = "producer-pending-batch"
+summary = "Build one immutable bounded request and keep its identity/bodies/quota charged through retries."
+home = "sparrow_client::delivery::Shared::next"
+entry_points = []
+spec = "docs/development-runtime.md: stable producer request identity through unknown delivery."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(rebuild_pending_retry_batch|build_logger_retry_batch)$']
+
+[[job]]
+id = "producer-durable-ownership-retirement"
+summary = "Retire queue/in-flight byte and event ownership atomically only after a matching durable store-scoped receipt."
+home = "sparrow_client::delivery::Shared::accepted"
+entry_points = []
+spec = "docs/development-runtime.md: producer durable receipts and quota retirement."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(release_delivered_queue_charge|release_inflight_queue_charge)$']
+
+[[job]]
+id = "producer-delivery-barrier"
+summary = "Flush and shutdown share a single finite control slot, admitted-sequence fence and explicit timeout/failure/drop outcomes."
+home = "sparrow_client::delivery::Delivery::barrier"
+entry_points = []
+spec = "docs/development-runtime.md: producer delivery fences."
+vectors = ["crates/sparrow-client/src/delivery.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(wait_for_logger_flush|wait_for_logger_shutdown)$']
+
+[[job]]
+id = "producer-delivery-worker"
+summary = "The one owned worker drives typed discovery, finite RPC deadlines, immutable retries and automatic batching."
+home = "sparrow_client::delivery::run"
+entry_points = []
+spec = "docs/development-runtime.md: owned producer transport worker."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(run_tracing_delivery_worker|run_direct_delivery_worker)$']
+
+[[job]]
+id = "producer-store-binding"
+summary = "Bind producer retries to their first discovered persistent store and refuse socket replacement across store identities."
+home = "sparrow_client::delivery::Shared::bind_store"
+entry_points = []
+spec = "docs/development-runtime.md: store replacement cannot consume unknown pending requests."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(bind_reconnected_logger_store|bind_reconnected_client_store)$']
+
+[[job]]
+id = "typed-server-connection"
+summary = "Construct the bounded generated server connection once for the production daemon and adversarial real-daemon relay fixtures."
+home = "sparrow_server::transport::serve_connection"
+entry_points = []
+spec = "docs/development-runtime.md: shared typed connection and deterministic lost-reply qualification."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(serve_test_rpc_connection|serve_daemon_rpc_connection)$']

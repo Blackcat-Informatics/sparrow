@@ -4000,3 +4000,33 @@ fn source_time_registry_has_an_exact_admission_ceiling() {
             .is_ok()
     );
 }
+
+#[test]
+fn source_time_registry_pressure_is_retryable_without_publishing_a_mapping() {
+    use purrdf_lex::json::record::ToJson;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = config();
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let ballast_path = dir.path().join("synthetic-admission-ballast");
+    let ballast = std::fs::File::create(&ballast_path).unwrap();
+    ballast.set_len(settings.disk_budget).unwrap();
+    let error = store
+        .define_time_profile(
+            "pressure",
+            "/event_time",
+            sparrow_core::TimeRepresentation::UnixMillis,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "STORAGE_PRESSURE");
+    assert_eq!(error.to_json()["retryable"].as_bool(), Some(true));
+    assert!(store.time_profile("pressure").unwrap().is_none());
+    drop(ballast);
+    std::fs::remove_file(ballast_path).unwrap();
+    store
+        .define_time_profile(
+            "pressure",
+            "/event_time",
+            sparrow_core::TimeRepresentation::UnixMillis,
+        )
+        .unwrap();
+}

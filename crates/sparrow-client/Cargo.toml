@@ -17,6 +17,7 @@ futures.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
 purrdf-hash.workspace = true
+getrandom.workspace = true
 
 [build-dependencies]
 capnpc.workspace = true

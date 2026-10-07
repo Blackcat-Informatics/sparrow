@@ -3,14 +3,11 @@
 
 //! One database owner, serving typed Cap'n Proto RPC over a private Unix socket.
 
-use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use futures::AsyncReadExt;
 use serde::Deserialize;
 use sparrow_core::{Config, Store};
 use sparrow_server::{Rpc, sparrow_capnp::sparrow};
 use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 use tokio::sync::Semaphore;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,10 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
                     let Ok(permit) = connections.clone().try_acquire_owned() else { drop(stream); continue; };
-                    let (reader, writer) = stream.compat().split();
-                    let network = twoparty::VatNetwork::new(reader, writer, rpc_twoparty_capnp::Side::Server,
-                        capnp::message::ReaderOptions { traversal_limit_in_words: Some(8 * 1024 * 1024), nesting_limit: 64 });
-                    let system = RpcSystem::new(Box::new(network), Some(client.clone().client));
+                    let system = sparrow_server::serve_connection(stream, client.clone());
                     tokio::task::spawn_local(async move {
                         let _permit = permit;
                         match tokio::time::timeout(std::time::Duration::from_secs(60), system).await {

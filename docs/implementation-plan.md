@@ -18,7 +18,9 @@ and member retrieval now use finite immutable catalog pages shared by the typed
 daemon, CLI and MCP. Broader live/pin/selection query pagination remains required.
 The standalone producer client and schema-11 typed event batch operation are
 present. Native event JSONL enters the same occurrence/field/text/time indexes;
-the bounded logging queue, tracing layer and flush/shutdown contracts remain
+the bounded producer queue now reconnects with immutable pending batches and
+provides durable admitted-input flush/shutdown fences. The tracing layer, span
+capture and explicit server buffered-WAL acknowledgement/flush contracts remain
 milestone-4 work.
 
 This plan builds on [Architecture](architecture.md) and [Interfaces](interfaces.md).
