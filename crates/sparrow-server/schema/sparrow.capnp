@@ -27,6 +27,7 @@ struct Record {
 struct Pin {
   storeId @0 :Text; id @1 :Text; name @2 :Text; expiresAt @3 :Instant;
   revision @4 :UInt64; members @5 :List(Evidence);
+  requestId @6 :Text; durability @7 :Durability = durable;
 }
 struct Status {
   storeId @0 :Text; storeFormat @1 :Text; physicalBytes @2 :UInt64;
@@ -45,6 +46,11 @@ struct ReadBytes { evidence @0 :Evidence; offset @1 :UInt64; length @2 :UInt32; 
 struct Bytes { storeId @0 :Text; data @1 :Data; }
 struct PinRequest {
   requestId @0 :Text; name @1 :Text; targets @2 :List(Evidence); days @3 :UInt32;
+}
+struct OptionalRevision { union { absent @0 :Void; value @1 :UInt64; } }
+struct Renew {
+  requestId @0 :Text; storeId @1 :Text; pinId @2 :Text; days @3 :UInt32;
+  expectedRevision @4 :OptionalRevision;
 }
 struct Release { requestId @0 :Text; storeId @1 :Text; pinId @2 :Text; }
 struct Released { storeId @0 :Text; requestId @1 :Text; pinId @2 :Text; releasedAt @3 :Instant; }
@@ -127,4 +133,5 @@ interface Sparrow {
   textSearch @9 (query :TextQuery) -> (result :Result(TextResults));
   recordsContext @10 (query :ContextQuery) -> (result :Result(Context));
   rdfInspect @11 (record :RecordRef) -> (result :Result(RdfInspection));
+  pinRenew @12 (request :Renew) -> (result :Result(Pin));
 }

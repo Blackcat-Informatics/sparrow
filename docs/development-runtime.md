@@ -14,12 +14,12 @@ and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
-`bytesRead`, `pin`, `pinRelease`, `keysList`, `valuesSearch`, `textSearch`, `recordsContext` and `rdfInspect`. The shared typed
+`bytesRead`, `pin`, `pinRenew`, `pinRelease`, `keysList`, `valuesSearch`, `textSearch`, `recordsContext` and `rdfInspect`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
 result rendering. The CLI supplies status, non-destructive buffered file import,
 exact byte export, key/value and full-text searches. MCP also supplies artifact/
-record metadata and pin/release calls. Remaining CLI commands and query surfaces
+record metadata and pin/release calls. CLI and MCP both supply stable-ID pin renewal. Remaining CLI commands and query surfaces
 are required work.
 
 ```sh
@@ -39,6 +39,7 @@ sparrow SOCKET_PATH keys --source synthetic --received-from 2026-10-06T00:00:00Z
 sparrow SOCKET_PATH values --source synthetic --path /message --kind string --decoded 'hello world'
 sparrow SOCKET_PATH text 'allocation failed' --source synthetic
 sparrow SOCKET_PATH bytes STORE_ID ARTIFACT_ID 0 256 /tmp/evidence.bin
+sparrow SOCKET_PATH pin-renew renewal-001 STORE_ID PIN_ID 10 1
 ```
 
 Use a stable request identity for retrying ingestion of the same source, format
@@ -54,6 +55,23 @@ the daemon's durability acknowledgement.
 length (at most 1 MiB) and a new output filename. It writes raw bytes and syncs
 the output file; it refuses to overwrite existing files. Its stdout is a JSON
 receipt. A local write failure reports that the new output may be incomplete.
+
+`pin-renew` takes an explicit stable request ID, store ID, `pin:` ID, positive
+integer days and an optional decimal UInt64 expected revision. MCP's `pin_renew`
+uses `request_id`, `store_id`, `pin_id`, integer `days` and optional string
+`expected_revision`. Both return the same durable receipt, including direct
+members, actual deadline, revision, request identity and durability. Renewal
+keeps membership unchanged and uses `max(current_expiry, now + days)`.
+Revision mismatches refuse the entire mutation. An identical retry within the
+48-hour receipt window returns its original result, including after expiry or
+release; that historical receipt does not make the collection active again.
+Fresh renewal of an expired/released/unknown ID reports `PIN_NOT_ACTIVE`, and
+never follows a replacement that reused its name. Creation/addition and renewal
+share one deadline rule, revision increment and synchronized atomic pin/receipt
+publication path.
+Durations must also remain within the native RFC 3339 clock's representable year
+range. UInt64 arithmetic success alone does not authorize an unrenderable
+deadline; creation/addition and renewal refuse it before storage publication.
 
 Key/value scope defaults to every retained source and acceptance time, 100 rows
 and a 10,000-entry scan budget. `--received-from` and `--received-before` accept
@@ -77,7 +95,7 @@ running server; verify startup and a typed `status` call.
 
 Ingestion acknowledges only after the atomic RocksDB write is synchronized. A
 connection failure before acknowledgement leaves delivery unknown; retry with
-the same request identity. Ingestion and pin/release receipts last 48 hours.
+the same request identity. Ingestion and pin/create/renew/release receipts last 48 hours.
 Expired evidence metadata has a one-day tombstone window, except live pinned
 records. Retention maintenance runs every 30 seconds.
 
@@ -138,7 +156,7 @@ so an idle MCP session does not retain an expired daemon connection lease.
 
 Discovery advertises these implemented tools only: `capabilities`, `status`,
 `keys_list`, `values_search`, `text_search`, `records_context`, `artifact_get`, `record_get`,
-`bytes_read`, `rdf_inspect`, `pin` and `pin_release`. Input schemas reject additional fields;
+`bytes_read`, `rdf_inspect`, `pin`, `pin_renew` and `pin_release`. Input schemas reject additional fields;
 query arguments use the CLI's names with underscores. Temporal filters remain
 explicitly server-acceptance times. Offsets are decimal strings; bounded lengths,
 row limits and durations are JSON integers. Byte results use native canonical
@@ -156,12 +174,12 @@ The adapter bounds requests to 128 KiB, responses to 8 MiB, concurrent calls to
 four and each call to 30 seconds. Oversized framing closes the session with an
 explicit protocol error; malformed complete JSON frames receive a parse error
 and subsequent valid frames can proceed. EOF drains pending calls. Discovery
-requires daemon schema version 4, including RDF profile identity, record context
+requires daemon schema version 5, including durable pin renewal receipts, RDF profile identity, record context
 and native text/profile identities;
 older discovery contracts fail explicitly rather than invent those identities.
 
 The real-daemon acceptance fixture checks CLI/MCP parity for keys, text and context, JSON
-value matches, exact base64 bytes, store identity errors, pin/release retry and
+value matches, exact base64 bytes, store identity errors, pin/create/renew/release retry and
 capabilities before and after daemon crash/reopen. An isolated unresponsive
 socket fixture checks pending-call admission, failure during a partial input
 frame, cancellation and oversized framing. Integer request IDs beyond binary64
@@ -427,6 +445,26 @@ journals, durable completed-file consumption, inotify/tailing, remaining MCP/CLI
 syslog, the Rust logging client, pressure eviction/reclamation, codec
 verification, bounded buffered durability, fault/performance qualification,
 packaging and a verified running-server handoff.
+
+The pin-renewal build reopened the same format-5 store on 2026-10-07 UTC with
+discovery schema version 5. The previous owned daemon stopped cleanly; the five
+synthetic records, store identity and RDF/text profiles remained unchanged.
+Live MCP discovery listed thirteen tools and marked renewal as a mutation.
+Fixture pin `pin:6487733f54effd194871768af71c3247` was created over
+`record:6b962236ac743284a0598093966dd49a`, renewed with an expected revision,
+and released. CLI and MCP returned identical revision-2 durable receipts with
+deadline `2026-10-09T06:35:39.756Z`. Retrying renewal after release returned that
+same historical receipt while status still reported zero active pins. The MCP
+session drained EOF successfully without extraneous stderr. Only this synthetic
+pin and the owned development daemon were changed.
+
+The finalized renewal release gate passed 27 storage scenarios, four core unit
+tests, the real-daemon/MCP crash-reopen and protocol tests, and twelve helper
+jobs with no duplicate exceptions. Renewal coverage includes unchanged members,
+non-shortening deadlines, simultaneous revision guards, changed-argument retry
+conflicts, post-release/expiry retries, name reuse, the exact expiry/retry
+boundaries, reduced membership limits after reopen and native RFC 3339 deadline
+refusal before commit. Full server acceptance remains unfinished.
 
 The five standard text lexicon artifacts are available in the sibling PurRDF
 checkout under `crates/text/lexicons/artifacts/`. Native `Analyzer::resolve` must

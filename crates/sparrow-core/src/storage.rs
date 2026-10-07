@@ -164,6 +164,39 @@ pub struct Pin {
     pub members: BTreeSet<String>,
 }
 
+impl Pin {
+    fn extend(&mut self, deadline: u64) -> Result<(), Error> {
+        let expires_at = self.expires_at.max(deadline);
+        crate::format_instant(expires_at).map_err(|error| {
+            Error::new(
+                "STORAGE_FAILURE",
+                format!("stored pin deadline cannot be rendered: {error}"),
+            )
+        })?;
+        self.expires_at = expires_at;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "pin revision overflow"))?;
+        Ok(())
+    }
+}
+
+fn pin_deadline(days: u64, now: u64) -> Result<u64, Error> {
+    if days == 0 {
+        return Err(Error::new(
+            "INVALID_ARGUMENT",
+            "pin duration must be positive integer days",
+        ));
+    }
+    let deadline = days
+        .checked_mul(DAY)
+        .and_then(|duration| now.checked_add(duration))
+        .ok_or_else(|| Error::new("INVALID_ARGUMENT", "pin deadline overflow"))?;
+    crate::format_instant(deadline)?;
+    Ok(deadline)
+}
+
 /// One database owner. Clones share a serialized catalog writer.
 #[derive(Clone)]
 pub struct Store {
@@ -343,6 +376,23 @@ impl Catalog for Pin {
 }
 
 impl Writer {
+    fn commit_pin(&self, key: &str, arguments: Value, pin: &Pin, now: u64) -> Result<(), Error> {
+        let receipt: Value = Object::new()
+            .with("arguments", arguments)
+            .with(
+                "expires_at",
+                now.checked_add(RETRY_WINDOW)
+                    .ok_or_else(|| Error::new("INVALID_ARGUMENT", "retry deadline overflow"))?
+                    .to_string(),
+            )
+            .with("receipt", pin.encode())
+            .into();
+        let mut batch = WriteBatch::default();
+        put(&mut batch, &pin.id, pin);
+        batch.put(key, json::write_compact(&receipt));
+        self.commit(batch)
+    }
+
     fn commit(&self, batch: WriteBatch) -> Result<(), Error> {
         let mut options = WriteOptions::default();
         options.set_sync(true);
@@ -1278,10 +1328,7 @@ impl Store {
                 "pin requires bounded request/name, concrete targets, and positive integer days",
             ));
         }
-        let deadline = days
-            .checked_mul(DAY)
-            .and_then(|days| now.checked_add(days))
-            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "pin deadline overflow"))?;
+        let deadline = pin_deadline(days, now)?;
         let writer = self.lock()?;
         let retry_key = format!("request:pin:{request_id}");
         let targets: BTreeSet<_> = targets.iter().cloned().collect();
@@ -1342,25 +1389,87 @@ impl Store {
                 "pin exceeds direct membership limit",
             ));
         }
-        pin.expires_at = pin.expires_at.max(deadline);
-        pin.revision = pin
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "pin revision overflow"))?;
-        let mut batch = WriteBatch::default();
-        put(&mut batch, &pin.id, &pin);
-        let receipt: Value = Object::new()
-            .with("arguments", arguments)
+        pin.extend(deadline)?;
+        writer.commit_pin(&retry_key, arguments, &pin, now)?;
+        Ok(pin)
+    }
+
+    /// Durably extend a stable active collection without changing its members.
+    /// An identical retry returns its original receipt even after release/expiry.
+    pub fn renew_pin(
+        &self,
+        request_id: &str,
+        id: &str,
+        days: u64,
+        expected_revision: Option<u64>,
+        now: u64,
+    ) -> Result<Pin, Error> {
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || !id.starts_with("pin:")
+            || id.len() <= 4
+            || id.len() > 128
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "renewal requires bounded request_id and stable pin ID",
+            ));
+        }
+        let deadline = pin_deadline(days, now)?;
+        let writer = self.lock()?;
+        let key = format!("request:renew:{request_id}");
+        let arguments: Value = Object::new()
+            .with("pin_id", id)
+            .with("days", days.to_string())
             .with(
-                "expires_at",
-                now.checked_add(RETRY_WINDOW)
-                    .ok_or_else(|| Error::new("INVALID_ARGUMENT", "retry deadline overflow"))?
-                    .to_string(),
+                "expected_revision",
+                expected_revision
+                    .map(|value| Value::from(value.to_string()))
+                    .unwrap_or(Value::Null),
             )
-            .with("receipt", pin.encode())
             .into();
-        batch.put(retry_key, json::write_compact(&receipt));
-        writer.commit(batch)?;
+        if let Some(previous) = writer.retry(&key, now)? {
+            if field(&previous, "arguments")? != &arguments {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "renewal request_id reused with different arguments",
+                ));
+            }
+            return Pin::decode(field(&previous, "receipt")?);
+        }
+        let mut pin = writer.get::<Pin>(id).map_err(|error| {
+            if error.code == "NOT_FOUND" {
+                Error::new("PIN_NOT_ACTIVE", "pin is unknown, released, or reclaimed")
+            } else {
+                error
+            }
+        })?;
+        if pin.id != id {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "pin catalog identity does not match its key",
+            ));
+        }
+        if pin.expires_at <= now {
+            return Err(Error::new(
+                "PIN_NOT_ACTIVE",
+                "expired collection cannot be renewed",
+            ));
+        }
+        if expected_revision.is_some_and(|revision| revision != pin.revision) {
+            return Err(Error::new(
+                "CONFLICT",
+                "pin revision does not match expected_revision",
+            ));
+        }
+        if pin.members.len() > writer.config.max_pin_members {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "pin exceeds current direct membership limit",
+            ));
+        }
+        pin.extend(deadline)?;
+        writer.commit_pin(&key, arguments, &pin, now)?;
         Ok(pin)
     }
 

@@ -51,6 +51,10 @@ const TOOLS: &[(&str, &str)] = &[
         "Durably protect concrete artifact/record IDs for a finite duration, using a stable retry identity.",
     ),
     (
+        "pin_renew",
+        "Durably extend a stable active pin without changing members; optional decimal revision guards concurrent changes and retries preserve the original receipt.",
+    ),
+    (
         "pin_release",
         "Durably release only the named stable pin identity; other protection remains active.",
     ),
@@ -111,6 +115,7 @@ pub(crate) fn definitions() -> Value {
             "bytes_read",
             "pin",
             "pin_release",
+            "pin_renew",
             "records_context",
             "rdf_inspect",
         ]
@@ -169,7 +174,7 @@ pub(crate) fn definitions() -> Value {
                 );
             required.extend(["offset", "length"]);
         }
-        if ["pin", "pin_release"].contains(name) {
+        if ["pin", "pin_release", "pin_renew"].contains(name) {
             properties = properties.with("request_id", string());
             required.push("request_id");
         }
@@ -187,9 +192,18 @@ pub(crate) fn definitions() -> Value {
                 );
             required.extend(["name", "days", "targets"]);
         }
-        if *name == "pin_release" {
+        if ["pin_release", "pin_renew"].contains(name) {
             properties = properties.with("pin_id", string());
             required.push("pin_id");
+        }
+        if *name == "pin_renew" {
+            properties = properties.with("days", integer(u64::from(u32::MAX))).with(
+                "expected_revision",
+                Object::new()
+                    .with("type", "string")
+                    .with("pattern", "^[0-9]+$"),
+            );
+            required.push("days");
         }
         Object::new()
             .with("name", *name)
@@ -206,7 +220,10 @@ pub(crate) fn definitions() -> Value {
             .with(
                 "annotations",
                 Object::new()
-                    .with("readOnlyHint", !["pin", "pin_release"].contains(name))
+                    .with(
+                        "readOnlyHint",
+                        !["pin", "pin_release", "pin_renew"].contains(name),
+                    )
                     .with("destructiveHint", *name == "pin_release")
                     .with("idempotentHint", true)
                     .with("openWorldHint", false),

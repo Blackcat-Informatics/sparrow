@@ -211,10 +211,17 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) {
     out.set_byte_end(value.byte_end);
 }
 
-fn pin(mut out: wire::pin::Builder<'_>, value: Pin, store: &str) -> capnp::Result<()> {
+fn pin(
+    mut out: wire::pin::Builder<'_>,
+    value: Pin,
+    store: &str,
+    request_id: &str,
+) -> capnp::Result<()> {
     out.set_store_id(store);
     out.set_id(&value.id);
     out.set_name(&value.name);
+    out.set_request_id(request_id);
+    out.set_durability(wire::Durability::Durable);
     out.set_revision(value.revision);
     out.reborrow()
         .init_expires_at()
@@ -553,7 +560,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
-                out.set_schema_version(4);
+                out.set_schema_version(5);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
@@ -723,8 +730,11 @@ impl wire::sparrow::Server for Rpc {
             .collect();
         let result = match targets {
             Ok(targets) => {
-                self.work(move |store, now| store.pin(&request_id, &name, &targets, days, now))
-                    .await
+                self.work({
+                    let request_id = request_id.clone();
+                    move |store, now| store.pin(&request_id, &name, &targets, days, now)
+                })
+                .await
             }
             Err(e) => Err(e),
         };
@@ -736,8 +746,50 @@ impl wire::sparrow::Server for Rpc {
                     .store
                     .store_id()
                     .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                &request_id,
             )?,
             Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn pin_renew(
+        self: Rc<Self>,
+        params: wire::sparrow::PinRenewParams,
+        mut results: wire::sparrow::PinRenewResults,
+    ) -> capnp::Result<()> {
+        let request = params.get()?.get_request()?;
+        let request_id = request.get_request_id()?.to_str()?.to_owned();
+        let days = u64::from(request.get_days());
+        let revision = match request.get_expected_revision()?.which()? {
+            wire::optional_revision::Absent(()) => None,
+            wire::optional_revision::Value(value) => Some(value),
+        };
+        let result = match self.reference(
+            request.get_store_id()?.to_str()?,
+            request.get_pin_id()?.to_str()?,
+            "pin:",
+        ) {
+            Ok(id) => {
+                self.work({
+                    let request_id = request_id.clone();
+                    move |store, now| store.renew_pin(&request_id, &id, days, revision, now)
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(value) => pin(
+                results.get().init_result().init_ok(),
+                value,
+                &self
+                    .store
+                    .store_id()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                &request_id,
+            )?,
+            Err(error) => failure(results.get().init_result(), error),
         }
         Ok(())
     }

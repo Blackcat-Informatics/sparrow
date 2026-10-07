@@ -5,7 +5,7 @@
 
 use super::Result;
 use super::{
-    Command, Options, context, evidence, failure, ingest, instant, invalid, parse_kind, read,
+    Command, Options, context, evidence, failure, ingest, instant, invalid, parse_kind, pin, read,
     status, wire,
 };
 use purrdf_lex::json::{
@@ -44,6 +44,7 @@ pub(crate) enum Operation {
         store: String,
         pin: String,
     },
+    Renew(pin::Renewal),
 }
 
 impl Operation {
@@ -169,6 +170,19 @@ impl Operation {
                     store: fields.required("store_id")?,
                     pin: fields.required("pin_id")?,
                 },
+                "pin_renew" => Self::Renew(pin::Renewal {
+                    request: fields.required("request_id")?,
+                    store: fields.required("store_id")?,
+                    id: fields.required("pin_id")?,
+                    days: fields.required("days")?,
+                    expected_revision: fields
+                        .raw("expected_revision")?
+                        .map(|value| {
+                            let text = String::from_json(value)?;
+                            pin::revision(&text).map_err(DecodeError::custom)
+                        })
+                        .transpose()?,
+                }),
                 _ => return Err(DecodeError::custom(format!("unknown tool: {name}"))),
             };
             fields.deny_unknown()?;
@@ -192,6 +206,7 @@ impl Operation {
                 .execute(client)
                 .await?
                 .ok_or_else(|| invalid("query produced no result")),
+            Self::Renew(input) => input.execute(client).await,
             Self::Metadata {
                 store,
                 id,
@@ -277,26 +292,7 @@ impl Operation {
                     wire::result::Ok(value) => value?,
                     wire::result::Error(error) => return Err(failure(error?)),
                 };
-                let members = value
-                    .get_members()?
-                    .iter()
-                    .map(|member| {
-                        let id = match member.which()? {
-                            wire::evidence::Artifact(id) | wire::evidence::Record(id) => {
-                                id?.to_str()?.to_owned()
-                            }
-                        };
-                        Ok(Value::from(id))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(Object::new()
-                    .with("store_id", value.get_store_id()?.to_str()?)
-                    .with("pin_id", value.get_id()?.to_str()?)
-                    .with("name", value.get_name()?.to_str()?)
-                    .with("expires_at", instant(value.get_expires_at()?)?)
-                    .with("revision", value.get_revision().to_string())
-                    .with("members", Value::array(members))
-                    .into())
+                pin::render(value)
             }
             Self::Release {
                 request,

@@ -12,12 +12,12 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         result::Ok(value) => value?,
         result::Error(error) => return Err(failure(error?)),
     };
-    if value.get_schema_version() != 4
+    if value.get_schema_version() != 5
         || value.get_text_analyzer()?.is_empty()
         || value.get_text_profile()?.is_empty()
         || value.get_rdf_profile()?.is_empty()
     {
-        return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon discovery contract requires schema version 4 with persistent RDF inspection; use a matching daemon executable".into(), retryable: false });
+        return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon discovery contract requires schema version 5 with durable pin renewal receipts; use a matching daemon executable".into(), retryable: false });
     }
     let output = Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)

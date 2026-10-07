@@ -114,7 +114,22 @@
 # or recorded below with its reason; `make census` and `make census-cross` write
 # the reports new rows are drawn from.
 
-# --- Stored RDF access: Sparrow owns RocksDB admission -----------------
+# --- Sparrow-owned storage admission and pin lifetime -----------------
+[[job]]
+id = "pin-lifetime"
+summary = "Durably extend active stable pin identities with shared deadline, revision and atomic retry receipt publication."
+home = "sparrow_core::Store::renew_pin"
+entry_points = ["sparrow_core::Store::pin"]
+spec = "docs/interfaces.md section 4: finite named pin union, renewal, revision and idempotent receipt rules."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^renew_pin$']
+
 [[job]]
 id = "stored-rdf-read"
 summary = "Resolve scoped native RDF guards and lazy physical probes under one sticky RocksDB read budget."

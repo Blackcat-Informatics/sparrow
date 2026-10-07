@@ -321,7 +321,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | Planned flush and import status operations | Synchronization through a specified watermark; raw, projection, checkpoint and source-deletion state. |
 | `status` and planned capabilities operation | Operational status and supported profiles/limits. |
 | `artifactGet`, `recordGet`, `bytesRead` | Store-scoped metadata and exact bounded ranges. |
-| `pin`, `pinRelease` and planned renew operation | Durable all-or-nothing protection with stable retry identities. |
+| `pin`, `pinRenew`, `pinRelease` | Durable all-or-nothing protection with stable retry identities; renewal optionally checks the current collection revision. |
 | `keysList`, `valuesSearch` and planned text/record/graph operations | Shared native semantics, typed results and query coverage. |
 | Planned watch administration | Create/list/update/remove and completed handoff without deletion authority over replacement paths. |
 
@@ -429,17 +429,17 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 
 | Code | Meaning |
 | --- | --- |
-| `INVALID_ARGUMENT` | Invalid IDs, ranges, scopes, durations, or names; 400. |
-| `NOT_FOUND` | Unknown or reclaimed evidence/handle; 404. |
-| `EVIDENCE_UNAVAILABLE` | Known expired, evicted, or incomplete complete-file representation; 410 for expired/evicted, 409 for incomplete. |
-| `PIN_NOT_ACTIVE` | Expired/released collection cannot be renewed or used as an active scope; 410. |
-| `CONFLICT` | Retry identity reuse, revision mismatch, or conflicting source generation; 409. |
-| `INDEX_NOT_READY` | Required projection coverage is unavailable; 409 with pending/failed diagnostics. |
-| `RESULT_EXPIRED` | Bounded snapshot/result lease ended; 410. |
-| `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal; 429 or 413 respectively. Native certified governor outcomes retain their read receipts. |
-| `STORAGE_PRESSURE` | Insufficient safe write capacity; 503 with retry state. |
-| `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; 503; retryability follows the actual cause. |
-| `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface; 400. Raw artifact preservation can still succeed independently of projection support. |
+| `INVALID_ARGUMENT` | Invalid IDs, ranges, scopes, durations, or names. |
+| `NOT_FOUND` | Unknown or reclaimed evidence/handle. |
+| `EVIDENCE_UNAVAILABLE` | Known expired, evicted, or incomplete complete-file representation. |
+| `PIN_NOT_ACTIVE` | Expired/released collection cannot be renewed or used as an active scope. |
+| `CONFLICT` | Retry identity reuse, revision mismatch, or conflicting source generation. |
+| `INDEX_NOT_READY` | Required projection coverage is unavailable, with pending/failed diagnostics. |
+| `RESULT_EXPIRED` | Bounded snapshot/result lease ended. |
+| `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. Native certified governor outcomes retain their read receipts. |
+| `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
+| `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
+| `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface. Raw artifact preservation can still succeed independently of projection support. |
 
 Expose API, store-format, codec/profile, and governor identities in discovery.
 Changes to filtering, certainty, retention, identity, or pin semantics require

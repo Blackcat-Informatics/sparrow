@@ -372,6 +372,50 @@ async fn exercise(socket: &Path) -> (String, String) {
     };
     let pin_id = pin.get_id().unwrap().to_str().unwrap().to_owned();
     assert_eq!(pin.get_members().unwrap().len(), 1);
+    let mut request = client.pin_renew_request();
+    let mut input = request.get().init_request();
+    input.set_store_id(&store);
+    input.set_request_id("rpc-renew-v1");
+    input.set_pin_id(&pin_id);
+    input.set_days(2);
+    input.init_expected_revision().set_value(1);
+    let response = request.send().promise.await.unwrap();
+    let renewed = match response
+        .get()
+        .unwrap()
+        .get_result()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
+        wire::result::Ok(value) => value.unwrap(),
+        wire::result::Error(error) => panic!("renewal: {:?}", error.unwrap().get_message()),
+    };
+    assert_eq!(renewed.get_revision(), 2);
+    assert_eq!(renewed.get_id().unwrap().to_str().unwrap(), pin_id);
+    assert_eq!(
+        renewed.get_request_id().unwrap().to_str().unwrap(),
+        "rpc-renew-v1"
+    );
+    assert_eq!(renewed.get_durability().unwrap(), wire::Durability::Durable);
+    assert!(
+        renewed.get_expires_at().unwrap().get_unix_millis()
+            >= pin.get_expires_at().unwrap().get_unix_millis()
+    );
+    assert_eq!(renewed.get_members().unwrap().len(), 1);
+    let cli_receipt = cli(
+        socket,
+        &["pin-renew", "rpc-renew-v1", &store, &pin_id, "2", "1"],
+    );
+    assert_eq!(cli_receipt["revision"].as_str(), Some("2"));
+    assert_eq!(
+        cli_receipt["expires_at"].as_str(),
+        Some(
+            sparrow_core::format_instant(renewed.get_expires_at().unwrap().get_unix_millis())
+                .unwrap()
+                .as_str()
+        )
+    );
     let mut previous = None;
     for _ in 0..2 {
         let mut request = client.pin_release_request();
@@ -563,7 +607,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     .await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 12);
+    assert_eq!(definitions.len(), 13);
     assert!(
         !definitions
             .iter()
@@ -851,6 +895,71 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     let pin_id = pin["result"]["structuredContent"]["pin_id"]
         .as_str()
         .unwrap();
+    let cli_renewal = cli(
+        socket,
+        &["pin-renew", "mcp-renew-v1", store, pin_id, "2", "1"],
+    );
+    let renewed = mcp
+        .call(
+            30,
+            "tools/call",
+            query(
+                "pin_renew",
+                Object::new()
+                    .with("store_id", store)
+                    .with("request_id", "mcp-renew-v1")
+                    .with("pin_id", pin_id)
+                    .with("days", 2_u64)
+                    .with("expected_revision", "1")
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(renewed["result"]["isError"].as_bool(), Some(false));
+    assert_eq!(renewed["result"]["structuredContent"], cli_renewal);
+    assert_eq!(cli_renewal["revision"].as_str(), Some("2"));
+    assert_eq!(cli_renewal["direct_member_count"].as_str(), Some("1"));
+    assert_eq!(cli_renewal["durability"].as_str(), Some("durable"));
+    for (call_id, arguments, code) in [
+        (
+            31,
+            Object::new()
+                .with("store_id", store)
+                .with("request_id", "mcp-renew-v1")
+                .with("pin_id", pin_id)
+                .with("days", 3_u64)
+                .with("expected_revision", "1"),
+            "CONFLICT",
+        ),
+        (
+            32,
+            Object::new()
+                .with("store_id", "wrong-store")
+                .with("request_id", "mcp-renew-other")
+                .with("pin_id", pin_id)
+                .with("days", 2_u64),
+            "STORE_MISMATCH",
+        ),
+        (
+            33,
+            Object::new()
+                .with("store_id", store)
+                .with("request_id", "mcp-renew-other")
+                .with("pin_id", pin_id)
+                .with("days", 2_u64)
+                .with("expected_revision", 1_u64),
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        let response = mcp
+            .call(call_id, "tools/call", query("pin_renew", arguments.into()))
+            .await;
+        assert_eq!(response["result"]["isError"].as_bool(), Some(true));
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"].as_str(),
+            Some(code)
+        );
+    }
     let release = mcp
         .call(
             11,
@@ -897,7 +1006,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(4)
+        Some(5)
     );
     let unknown = mcp
         .call(

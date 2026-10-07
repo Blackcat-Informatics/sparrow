@@ -8,6 +8,255 @@ use sparrow_core::{Config, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn pin_renewal_is_durable_idempotent_revision_guarded_and_never_follows_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("renew-input", "source", "log", b"one\ntwo\n", 0)
+        .unwrap();
+    let targets = vec![artifact.record_ids[0].clone()];
+    let initial = store.pin("renew-create", "case", &targets, 40, 0).unwrap();
+    let shorter = store
+        .renew_pin("renew-short", &initial.id, 1, Some(1), 1)
+        .unwrap();
+    assert_eq!(shorter.expires_at, 40 * DAY);
+    assert_eq!(shorter.revision, 2);
+    assert_eq!(shorter.members, initial.members);
+    assert_eq!(
+        store
+            .renew_pin("renew-stale", &initial.id, 50, Some(1), 2)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let extended = store
+        .renew_pin("renew-extend", &initial.id, 50, Some(2), 2)
+        .unwrap();
+    assert_eq!(extended.expires_at, 50 * DAY + 2);
+    assert_eq!(extended.revision, 3);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let replay = store
+        .renew_pin("renew-extend", &initial.id, 50, Some(2), DAY)
+        .unwrap();
+    assert_eq!(replay.expires_at, extended.expires_at);
+    assert_eq!(replay.revision, extended.revision);
+    for (days, revision) in [(51, Some(2)), (50, None), (50, Some(3))] {
+        assert_eq!(
+            store
+                .renew_pin("renew-extend", &initial.id, days, revision, DAY)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+    }
+    store
+        .release_retry("renew-release", &initial.id, DAY)
+        .unwrap();
+    let replacement = store
+        .pin("renew-replacement", "case", &targets, 60, DAY)
+        .unwrap();
+    let replay = store
+        .renew_pin("renew-extend", &initial.id, 50, Some(2), DAY + 1)
+        .unwrap();
+    assert_eq!(replay.id, initial.id);
+    assert_eq!(replay.revision, 3);
+    assert_eq!(
+        store
+            .renew_pin("renew-old", &initial.id, 90, None, DAY + 1)
+            .unwrap_err()
+            .code,
+        "PIN_NOT_ACTIVE"
+    );
+    assert_eq!(
+        store
+            .renew_pin("renew-extend", &replacement.id, 50, Some(2), DAY + 1)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let active = store.pins(DAY + 1).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, replacement.id);
+    assert_eq!(active[0].revision, 1);
+
+    // A released receipt must not resurrect its ID after its retry window closes.
+    assert_eq!(
+        store
+            .renew_pin("renew-extend", &initial.id, 50, Some(2), 2 * DAY + 2)
+            .unwrap_err()
+            .code,
+        "PIN_NOT_ACTIVE"
+    );
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store
+            .bytes(&artifact.record_ids[0], 0, 4, 31 * DAY)
+            .unwrap(),
+        b"one\n"
+    );
+    assert!(
+        store
+            .bytes(&artifact.record_ids[1], 0, 4, 31 * DAY)
+            .is_err()
+    );
+}
+
+#[test]
+fn pin_renewal_refuses_deadlines_limits_and_inactive_collections_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("renew-validation", "source", "log", b"event\n", 0)
+        .unwrap();
+    let pin = store
+        .pin(
+            "short-pin",
+            "short",
+            std::slice::from_ref(&artifact.id),
+            1,
+            0,
+        )
+        .unwrap();
+    for (request, id, days, now) in [
+        ("", pin.id.as_str(), 1, 0),
+        ("invalid-kind", "record:wrong", 1, 0),
+        ("empty-id", "pin:", 1, 0),
+        ("zero", pin.id.as_str(), 0, 0),
+        ("overflow-duration", pin.id.as_str(), u64::MAX, 0),
+        (
+            "unrenderable-duration",
+            pin.id.as_str(),
+            u64::from(u32::MAX),
+            0,
+        ),
+        (
+            "unrenderable-year",
+            pin.id.as_str(),
+            1,
+            sparrow_core::parse_instant("9999-12-31T00:00:00Z").unwrap(),
+        ),
+        ("overflow-now", pin.id.as_str(), 1, u64::MAX),
+    ] {
+        assert_eq!(
+            store
+                .renew_pin(request, id, days, None, now)
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    assert_eq!(store.pins(0).unwrap()[0].revision, 1);
+    assert_eq!(
+        store
+            .pin(
+                "unrenderable-create",
+                "invalid-deadline",
+                std::slice::from_ref(&pin.members.iter().next().unwrap().clone()),
+                u64::from(u32::MAX),
+                0
+            )
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    let expiring = store
+        .renew_pin("expiry-replay", &pin.id, 1, None, 0)
+        .unwrap();
+    assert_eq!(expiring.expires_at, DAY);
+    let replay = store
+        .renew_pin("expiry-replay", &pin.id, 1, None, DAY)
+        .unwrap();
+    assert_eq!(replay.expires_at, DAY);
+    assert_eq!(replay.revision, 2);
+    assert!(store.pins(DAY).unwrap().is_empty());
+    assert_eq!(
+        store
+            .renew_pin("expired", &pin.id, 10, None, DAY)
+            .unwrap_err()
+            .code,
+        "PIN_NOT_ACTIVE"
+    );
+    assert_eq!(
+        store
+            .renew_pin("missing", "pin:unknown", 10, None, 0)
+            .unwrap_err()
+            .code,
+        "PIN_NOT_ACTIVE"
+    );
+    store.expire(DAY).unwrap();
+    assert_eq!(
+        store
+            .renew_pin("expiry-replay", &pin.id, 1, None, DAY + 1)
+            .unwrap()
+            .expires_at,
+        DAY
+    );
+    assert_eq!(
+        store
+            .renew_pin("reclaimed", &pin.id, 10, None, DAY)
+            .unwrap_err()
+            .code,
+        "PIN_NOT_ACTIVE"
+    );
+    assert!(store.pins(DAY).unwrap().is_empty());
+    let two_members = store
+        .pin(
+            "limited-pin",
+            "limited",
+            &[artifact.id, artifact.record_ids[0].clone()],
+            3,
+            DAY,
+        )
+        .unwrap();
+    drop(store);
+    let mut limits = config();
+    limits.max_pin_members = 1;
+    let store = Store::open(dir.path(), limits).unwrap();
+    assert_eq!(
+        store
+            .renew_pin("limited-renewal", &two_members.id, 10, None, DAY)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(store.pins(DAY).unwrap()[0].revision, 1);
+}
+
+#[test]
+fn pin_renewal_serializes_competing_revision_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("renew-race", "source", "log", b"event\n", 0)
+        .unwrap();
+    let pin = store.pin("race-pin", "race", &[artifact.id], 1, 0).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let attempts = ["race-left", "race-right"].map(|request| {
+        let store = store.clone();
+        let id = pin.id.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            store.renew_pin(request, &id, 10, Some(1), 1)
+        })
+    });
+    let results = attempts.map(|thread| thread.join().unwrap());
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_ref().is_err_and(|error| error.code == "CONFLICT"))
+            .count(),
+        1
+    );
+    let active = store.pins(1).unwrap();
+    assert_eq!(active[0].revision, 2);
+    assert_eq!(active[0].expires_at, 10 * DAY + 1);
+    assert_eq!(active[0].members, pin.members);
+}
+
+#[test]
 fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
     use purrdf::{
         SparqlRequest, SparqlResult,
