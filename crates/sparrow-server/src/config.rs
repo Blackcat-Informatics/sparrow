@@ -3,12 +3,14 @@
 
 //! One strict configuration and storage-open path for the daemon.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sparrow_core::{Config, Store};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
+
+pub(crate) const MAX_CONSUME_ROOTS: usize = 8;
 
 /// Explicit local daemon configuration; unknown fields are errors.
 #[derive(Deserialize)]
@@ -41,7 +43,7 @@ pub struct ServerConfig {
 }
 
 /// Producer contract required before a watcher can claim or retire source files.
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProducerContract {
     /// Producers hand off finished files and never append after handoff.
@@ -49,7 +51,7 @@ pub enum ProducerContract {
 }
 
 /// Bounded recursive completed-input watch; no default deletion authority.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsumeWatch {
     /// Persistent watch identity, also bound into recovery journals.
@@ -100,7 +102,7 @@ impl ServerConfig {
         if !config.consume.is_empty() && config.max_concurrent_requests < 2 {
             return Err("consume requires at least two RPC connections".into());
         }
-        ConsumeWatch::validate(&config.consume)?;
+        ConsumeWatch::validate_fields(&config.consume)?;
         Ok(config)
     }
 
@@ -125,7 +127,23 @@ impl ServerConfig {
 
 impl ConsumeWatch {
     pub(crate) fn validate(watches: &[Self]) -> Result<(), Box<dyn std::error::Error>> {
-        if watches.len() > 8 {
+        Self::validate_fields(watches)?;
+        let mut roots = Vec::new();
+        for watch in watches {
+            let root = watch.root.canonicalize()?;
+            if roots
+                .iter()
+                .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))
+            {
+                return Err("consume roots must not overlap".into());
+            }
+            roots.push(root);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_fields(watches: &[Self]) -> Result<(), Box<dyn std::error::Error>> {
+        if watches.len() > MAX_CONSUME_ROOTS {
             return Err("consume requires at most eight roots".into());
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -135,6 +153,7 @@ impl ConsumeWatch {
                 || watch.id.len() > 128
                 || !ids.insert(&watch.id)
                 || !watch.root.is_absolute()
+                || watch.root.as_os_str().len() > 2048
                 || watch.source.is_empty()
                 || watch.source.len() > 512
                 || watch.quiet_ms > 600_000
@@ -144,14 +163,12 @@ impl ConsumeWatch {
                 return Err("consume requires unique bounded identities, absolute roots, quiet_ms <= 600000, max_directories 1..4096 and max_candidates 1..16384".into());
             }
             sparrow_client::parse_format(&watch.format)?;
-            let root = watch.root.canonicalize()?;
-            if roots
-                .iter()
-                .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))
-            {
+            if roots.iter().any(|other: &PathBuf| {
+                watch.root.starts_with(other) || other.starts_with(&watch.root)
+            }) {
                 return Err("consume roots must not overlap".into());
             }
-            roots.push(root);
+            roots.push(watch.root.clone());
         }
         Ok(())
     }

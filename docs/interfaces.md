@@ -356,7 +356,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `pin`, `pinRenew`, `pinRelease` | Durable all-or-nothing protection with stable retry identities; renewal optionally checks the current collection revision. |
 | `pinRead` | Typed active-list/name/ID selector, finite catalog capture and store-scoped continuation pages. |
 | `keysList`, `valuesSearch` and planned text/record/graph operations | Shared native semantics, typed results and query coverage. |
-| Planned watch administration | Create/list/update/remove and completed handoff without deletion authority over replacement paths. |
+| `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume administration; removal stops new admission while preserving existing claims. Explicit completed handoff and tail administration remain unfinished. |
 
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity
@@ -391,6 +391,27 @@ explicit completion signal. Reject overlapping roots and Sparrow's own storage
 directories. Updating/removing a watch must preserve outstanding claim journals
 for recovery. Status exposes event coverage, overflow/reconciliation state, and
 watch-limit failures. Close events do not replace the producer handoff contract.
+
+Schema 15 provides store-scoped `WatchPut` and `WatchRemove`, with stable
+`requestId` and exact `expectedRevision`; zero creates an absent definition.
+`WatchDefinition.authority` defaults to `unacknowledged` and must explicitly select
+`finishedFilesDeleteAfterDurablePublish`. Only recursive consume/close-or-idle
+is currently admitted. The daemon owns at most eight active or draining roots,
+a 16-command control queue and 128 mutation receipts with a 48-hour retry window;
+eight receipt slots are reserved for removing watches rather than further puts.
+Changed arguments under an existing request ID and stale revisions are refused.
+Retries return the original mutation receipt, which does not reapply its old
+definition; list/status describe current authority.
+
+The bounded catalog and mutation receipt commit atomically with a `sparrow.store/7`
+writer fence. Startup `[[consume]]` entries seed only a missing catalog; once
+initialized, its durable definitions govern restart. Removing a watch with
+outstanding claims retains its disabled definition and root owner until those
+claims finish. Root rebinding is refused while old claims remain. Updates reset
+readiness rather than carry old quiet evidence into new policy. Ordinary status
+also includes durable definitions, revisions and admission state. CLI mutations
+are explicit administrative commands; no destructive watch mutation was added
+to ordinary MCP search tools.
 
 No upload or tool-supplied path independently authorizes deleting arbitrary files.
 The configured consume watch and its claimed source generation are the deletion
@@ -435,10 +456,10 @@ certifies no producer retirement or deletion, and does not roll back that write.
 The daemon now admits explicit `[[consume]]` configuration, with the required
 `producer_contract = "finished_files"`. The owned recursive inotify worker
 uses the durable claim journal and the SDK descriptor upload path before retiring
-the exact private source. Schema 14 `status.consumeWatches` reports coverage,
+the exact private source. Schema 15 `status.consumeWatches` reports coverage,
 bounded candidates/deferral, pending claims, completion counts and failures;
 the CLI and stdio MCP share its rendering. No live producer roots are configured
-in the development daemon. Dynamic typed watch administration, forced-overflow
+in the development daemon. Explicit completion, tail watches, forced-overflow
 qualification, and whole-process crash injection at every filesystem boundary
 remain unfinished. Ordinary upload continues to preserve every caller source.
 
@@ -455,8 +476,11 @@ sparrow capabilities
 sparrow status
 
 sparrow import /srv/dumps/run.jsonl --durability durable
-sparrow watch add /srv/dumps/completed --mode consume --readiness close-or-idle --idle-for 30s
-sparrow watch add /srv/logs/active --mode tail --completion explicit
+sparrow SOCKET_PATH watch list
+sparrow SOCKET_PATH watch put REQUEST_ID 0 completed-watch.toml
+sparrow SOCKET_PATH watch put REQUEST_ID CURRENT_REVISION updated-watch.toml
+sparrow SOCKET_PATH watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
+# Tail watches and explicit handoff remain unfinished.
 
 sparrow records search --service worker --severity ERROR --text timeout
 sparrow record get record:42

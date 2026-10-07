@@ -87,6 +87,30 @@ struct ConsumeWatchStatus {
   pendingClaims @6 :UInt32; completedClaims @7 :UInt64;
   reconciliations @8 :UInt64; coverageLosses @9 :UInt64;
   failure @10 :OptionalText;
+  definition @11 :WatchDefinition; revision @12 :UInt64; enabled @13 :Bool;
+}
+
+enum WatchMode { consume @0; tail @1; }
+enum WatchReadiness { closeOrIdle @0; }
+struct WatchAuthority {
+  union { unacknowledged @0 :Void; finishedFilesDeleteAfterDurablePublish @1 :Void; }
+}
+struct WatchDefinition {
+  id @0 :Text; root @1 :Text; source @2 :Text; format @3 :Format;
+  quietMs @4 :UInt32 = 30000; maxDirectories @5 :UInt32 = 1024;
+  maxCandidates @6 :UInt32 = 4096; recursive @7 :Bool = true;
+  mode @8 :WatchMode; readiness @9 :WatchReadiness; authority @10 :WatchAuthority;
+}
+struct WatchInfo {
+  storeId @0 :Text; definition @1 :WatchDefinition; revision @2 :UInt64; enabled @3 :Bool;
+}
+struct WatchList { storeId @0 :Text; watches @1 :List(WatchInfo); }
+struct WatchPut {
+  storeId @0 :Text; requestId @1 :Text; expectedRevision @2 :UInt64; definition @3 :WatchDefinition;
+}
+struct WatchRemove { storeId @0 :Text; requestId @1 :Text; id @2 :Text; expectedRevision @3 :UInt64; }
+struct WatchMutation {
+  requestId @0 :Text; watch @1 :WatchInfo; durability @2 :Durability = durable;
 }
 
 struct WideInteger { high @0 :UInt64; low @1 :UInt64; }
@@ -304,4 +328,7 @@ interface Sparrow {
   importCancel @24 (import :ImportRef) -> (result :Result(ImportCanceled));
   eventsIngest @25 (batch :EventBatch, durability :Durability = durable) -> (result :Result(Artifact));
   flush @26 (through :DurabilityWatermark) -> (result :Result(DurabilityWatermark));
+  watchList @27 () -> (result :Result(WatchList));
+  watchPut @28 (request :WatchPut) -> (result :Result(WatchMutation));
+  watchRemove @29 (request :WatchRemove) -> (result :Result(WatchMutation));
 }

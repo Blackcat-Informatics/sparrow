@@ -2,10 +2,87 @@
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 14; the schema sections
+The current source implements schema 15; the schema sections
 below retain their historical qualification evidence.
 
-## Configured recursive completed consumption
+## Durable typed watch administration
+
+Schema 15 adds `watchList`, `watchPut`, `watchRemove`, durable definitions/revisions
+in status, and explicit CLI administrative commands. `watch put REQUEST_ID 0
+DEFINITION.toml` creates a missing definition; the same command with its current
+revision updates it. `watch remove REQUEST_ID WATCH_ID CURRENT_REVISION` disables
+new source admission. The definition file uses the same strict `ConsumeWatch`
+fields as one startup entry, without the `[[consume]]` table wrapper. Its explicit
+finished-file producer contract authorizes private-source retirement after the
+existing durable publication boundary. Ordinary MCP search tools gain no watch
+mutation authority.
+
+The one worker owns mutations through a 16-command typed channel. Administrative
+RPC waiting does not hold the publication semaphore, which would prevent the
+worker from completing its own typed upload. Store-scoped mutations compare the
+current watch revision, carry stable request IDs, and return durable receipts.
+The native framed BLAKE3 identity covers operation, exact arguments and expected
+revision. A retry returns its original immutable receipt even after later
+updates/removal; it does not restore that old authority. Current list/status,
+rather than a historical retry acknowledgment, describes current admission.
+
+The server owns one strict version-1 TOML catalog codec. Core storage treats its
+bytes as opaque, bounds the complete catalog at 512 KiB, and commits its exact
+capture compare-and-set and format marker in one durable write batch. There is
+no second configuration parser or filesystem sidecar transaction. The catalog
+binds to the persistent store and contains at most eight active/draining roots
+and 128 bounded mutation receipts, with eight slots reserved for removal rather
+than further put/update requests. Receipt expiry is 48 hours. Capacity refusal
+preserves the old catalog; an uncertain persistence or invariant failure is
+terminal, so the worker cannot continue with stale source authority.
+
+Initialization atomically fences old writers with `sparrow.store/7`. New writers
+accept prior formats; their first registry publication upgrades it. A later
+consumption reservation cannot downgrade that marker. A format/catalog mismatch
+or malformed stored catalog fails actionably rather than use startup defaults.
+Startup configuration is bootstrap-only once the catalog exists: changing or
+restoring an old `[[consume]]` block does not undo durable administrative removal.
+Structural configuration errors remain errors, while an obsolete bootstrap root
+need not exist after its durable definition has been removed.
+
+Root admission reuses the same strict configuration checks, no-symlink
+`ClaimRoot`, private lock and generation-bound journal machinery. A new root is
+opened before publishing its authority; no claim is admitted before catalog
+commit. Updating the same root starts fresh readiness evidence. A different
+physical root is refused while any old journal remains. Removal clears discovery
+and candidates, retains the disabled definition and held root for recovery, and
+automatically retires that definition after all persistent claims finish. It
+does not cancel staging, delete unexpected bytes or abandon a blocked claim.
+Removed roots with no pending journal stop immediately. The worker rotates root
+admission after a processed claim instead of always prioritizing the first root;
+sustained multi-root fairness/throughput still needs measurement.
+
+Tests exercise real-daemon create/update/list/remove, explicit authority refusal,
+foreign-store and stale-revision refusal, changed retry arguments, ordinary
+ingestion after dynamic registration, immutable retries across restart, and stale
+bootstrap configuration after removal. A removed watch with a mutated private
+claim stays disabled and recoverable across restart, preserves new unclaimed
+files and refuses rebinding before touching the other root. Corrupt durable
+catalog startup is a hard failure. A real-daemon pressure fixture fills all 120
+put receipt slots, verifies refusal, and still disables the watch using reserved
+removal capacity. Core coverage proves exact catalog CAS,
+capacity refusal, persistent identity/reopen and preservation of the format-7
+fence during later source reservation.
+
+The qualification gate includes release Clippy with warnings denied, ten SDK
+units, five core units, 67 storage scenarios, 50 census units, five census gate
+fixtures, one server unit, 22 RPC/filesystem/MCP scenarios, doctests and the seeded
+self-test. The pinned cross gate checks 105 ownership jobs without detector
+relaxation or distinct exceptions. The ordinary signed-commit hook runs `make
+check` on final source. Live development acceptance is recorded separately.
+
+Explicit completed handoff, active tailing, forced kernel overflow and watch
+exhaustion, failure injection at every process/crash boundary, full governed
+SPARQL and the remaining full architecture/pressure/memory/deployment acceptance
+are still unfinished. Administrative catalog publication does not establish
+those results.
+
+## Configured recursive completed consumption (schema 14 qualification)
 
 Schema 14 adds typed `Status.consumeWatches`; the daemon now starts one owned
 Linux consumption worker for explicit `[[consume]]` roots. The development
@@ -89,10 +166,10 @@ doctests and the seeded census self-test. The pinned cross-workspace gate checks
 95 helper ownership jobs with zero distinct exceptions or unsanctioned groups.
 The signed commit's ordinary pre-commit hook runs the same gate on final source.
 
-Dynamic typed watch administration, explicit completion RPC, forced kernel
+At this schema-14 qualification, dynamic typed watch administration, explicit completion RPC, forced kernel
 overflow and watch-exhaustion injection, whole-process crash injection at every
 claim boundary, fairness across continuously busy roots, active-log tailing and
-whole-corpus memory/throughput acceptance remain unfinished. No reboot-persistent
+whole-corpus memory/throughput acceptance remained unfinished. No reboot-persistent
 service or production producer handoff has been qualified by this change.
 
 The signed implementation `5126d8b` passed its ordinary final pre-commit gate on

@@ -29,6 +29,7 @@ mod record_fields;
 mod retire;
 pub(crate) mod source_time;
 mod text_index;
+pub(crate) mod watch_registry;
 
 const FORMAT: &[u8] = b"sparrow.store/5";
 const DAY: u64 = 86_400_000;
@@ -114,7 +115,8 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+    /// Construct one machine-readable domain refusal with an actionable message.
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -714,7 +716,17 @@ impl Store {
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
         let rdf_fingerprint = rdf_index::profile_identity()?;
         let id = match db.get("store_format")? {
-            Some(format) if format == FORMAT || format == consumption::FORMAT => {
+            Some(format)
+                if format == FORMAT
+                    || format == consumption::FORMAT
+                    || format == watch_registry::FORMAT =>
+            {
+                if (format == watch_registry::FORMAT) != db.get("watch_registry")?.is_some() {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "store format and durable watch registry disagree; restore the original catalog and its writer fence",
+                    ));
+                }
                 let id = db
                     .get("store_id")?
                     .ok_or_else(|| Error::new("STORAGE_FAILURE", "store identity missing"))?;

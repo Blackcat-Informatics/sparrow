@@ -12,6 +12,25 @@ use std::{
 
 struct Daemon(Child);
 
+fn watch_definition(
+    root: &Path,
+    id: &str,
+    quiet_ms: u32,
+    directories: usize,
+    candidates: usize,
+) -> sparrow_server::ConsumeWatch {
+    sparrow_server::ConsumeWatch {
+        id: id.into(),
+        root: root.into(),
+        producer_contract: sparrow_server::ProducerContract::FinishedFiles,
+        source: "consume-acceptance".into(),
+        format: "jsonl".into(),
+        quiet_ms,
+        max_directories: directories,
+        max_candidates: candidates,
+    }
+}
+
 fn append_consume_config(
     config: &Path,
     root: &Path,
@@ -24,7 +43,19 @@ fn append_consume_config(
         .append(true)
         .open(config)
         .unwrap();
-    writeln!(file, "\n[[consume]]\nid = \"completed\"\nroot = {root:?}\nproducer_contract = \"finished_files\"\nsource = \"consume-acceptance\"\nformat = \"jsonl\"\nquiet_ms = {quiet_ms}\nmax_directories = {directories}\nmax_candidates = {candidates}").unwrap();
+    writeln!(
+        file,
+        "\n[[consume]]\n{}",
+        toml::to_string(&watch_definition(
+            root,
+            "completed",
+            quiet_ms,
+            directories,
+            candidates
+        ))
+        .unwrap()
+    )
+    .unwrap();
 }
 
 async fn watch_until(
@@ -91,6 +122,456 @@ fn consumption_configuration_requires_explicit_contract_and_disjoint_bounded_roo
             .contains("overlap")
     );
     assert!(!root.join(".sparrow-inflight").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect_removed_authority()
+{
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let definition_file = dir.path().join("definition.toml");
+            let mut definition = watch_definition(&root, "completed", 30_000, 16, 16);
+            std::fs::write(&definition_file, toml::to_string(&definition).unwrap()).unwrap();
+            let daemon = start(&config, &socket).await;
+            assert!(
+                cli(&socket, &["watch", "list"])["watches"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let created = cli(
+                &socket,
+                &[
+                    "watch",
+                    "put",
+                    "watch-create",
+                    "0",
+                    definition_file.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(created["durability"].as_str(), Some("durable"));
+            assert_eq!(created["watch"]["revision"].as_str(), Some("1"));
+            assert_eq!(created["watch"]["enabled"].as_bool(), Some(true));
+            assert_eq!(
+                cli(
+                    &socket,
+                    &[
+                        "watch",
+                        "put",
+                        "watch-create",
+                        "0",
+                        definition_file.to_str().unwrap()
+                    ]
+                ),
+                created
+            );
+            definition.quiet_ms = 300;
+            std::fs::write(&definition_file, toml::to_string(&definition).unwrap()).unwrap();
+            let updated = cli(
+                &socket,
+                &[
+                    "watch",
+                    "put",
+                    "watch-update",
+                    "1",
+                    definition_file.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(updated["watch"]["revision"].as_str(), Some("2"));
+            for (request, expected) in [("watch-create", "0"), ("stale-update", "1")] {
+                let failed = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args([
+                        "watch",
+                        "put",
+                        request,
+                        expected,
+                        definition_file.to_str().unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(!failed.status.success());
+                assert!(String::from_utf8_lossy(&failed.stderr).contains("CONFLICT"));
+            }
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            // A missing explicit source-retirement contract never authorizes a watch.
+            let mut call = producer.capability().watch_put_request();
+            let mut input = call.get().init_request();
+            input.set_store_id(&producer.discovery().store_id);
+            input.set_request_id("no-contract");
+            let mut watch = input.init_definition();
+            watch.set_id("unacknowledged");
+            watch.set_root(root.to_str().unwrap());
+            watch.set_source("source");
+            let response = call.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "INVALID_ARGUMENT"
+                ),
+                wire::result::Ok(_) => panic!("unacknowledged producer contract admitted"),
+            }
+            // Store scoping precedes any registry mutation or filesystem action.
+            let mut call = producer.capability().watch_remove_request();
+            let mut input = call.get().init_request();
+            input.set_store_id("store:foreign");
+            input.set_request_id("foreign-remove");
+            input.set_id("completed");
+            input.set_expected_revision(2);
+            let response = call.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "STORE_MISMATCH"
+                ),
+                wire::result::Ok(_) => panic!("foreign watch mutation admitted"),
+            }
+            // A newly configured watch reaches the actual canonical ingestion caller.
+            std::fs::write(
+                root.join("accepted.jsonl"),
+                b"{\"message\":\"administrative intake\"}\r\n",
+            )
+            .unwrap();
+            watch_until(producer.capability(), |watch| {
+                watch.get_completed_claims() == 1
+            })
+            .await;
+            let result = cli(
+                &socket,
+                &[
+                    "values",
+                    "--source",
+                    "consume-acceptance",
+                    "--path",
+                    "/message",
+                    "--decoded",
+                    "administrative intake",
+                ],
+            );
+            assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+            assert!(!root.join("accepted.jsonl").exists());
+            let removed = cli(
+                &socket,
+                &["watch", "remove", "watch-remove", "completed", "2"],
+            );
+            assert_eq!(removed["watch"]["revision"].as_str(), Some("3"));
+            assert_eq!(removed["watch"]["enabled"].as_bool(), Some(false));
+            assert!(
+                cli(&socket, &["watch", "list"])["watches"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            std::fs::write(
+                root.join("preserved.jsonl"),
+                b"preserved after administrative removal",
+            )
+            .unwrap();
+            drop(producer);
+            drop(daemon);
+            std::fs::remove_file(&socket).unwrap();
+            // Stale startup configuration is bootstrap-only once the catalog exists.
+            append_consume_config(&config, &root, 0, 16, 16);
+            let _daemon = start(&config, &socket).await;
+            assert!(
+                cli(&socket, &["watch", "list"])["watches"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                cli(
+                    &socket,
+                    &["watch", "remove", "watch-remove", "completed", "2"]
+                ),
+                removed
+            );
+            definition.quiet_ms = 30_000;
+            std::fs::write(&definition_file, toml::to_string(&definition).unwrap()).unwrap();
+            assert_eq!(
+                cli(
+                    &socket,
+                    &[
+                        "watch",
+                        "put",
+                        "watch-create",
+                        "0",
+                        definition_file.to_str().unwrap()
+                    ]
+                ),
+                created
+            );
+            assert!(
+                cli(&socket, &["watch", "list"])["watches"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(
+                std::fs::read(root.join("preserved.jsonl")).unwrap(),
+                b"preserved after administrative removal"
+            );
+            assert_eq!(
+                cli(&socket, &["status"])["store_format"].as_str(),
+                Some("sparrow.store/7")
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removed_watch_keeps_durable_claim_recovery_and_refuses_root_rebinding() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::{ServerConfig, consumption::ClaimRoot};
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            let other = dir.path().join("other");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&other).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 30_000, 16, 16);
+            let id = {
+                let store = ServerConfig::read(&config).unwrap().open_store().unwrap();
+                let owner = ClaimRoot::open(store, "completed", &root).unwrap();
+                let path = root.join("unfinished.jsonl");
+                std::fs::write(&path, b"{\"message\":\"original claim\"}\n").unwrap();
+                let identity =
+                    sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap());
+                let journal = owner
+                    .reserve(
+                        Path::new("unfinished.jsonl"),
+                        identity,
+                        "consume-acceptance",
+                        "jsonl",
+                    )
+                    .unwrap();
+                owner
+                    .recover(&journal.import_id, sparrow_server::now().unwrap())
+                    .unwrap();
+                journal.import_id
+            };
+            let private = root.join(".sparrow-inflight").join(&id);
+            std::fs::write(&private, b"late writer must not be retired").unwrap();
+            let daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(producer.capability(), |watch| {
+                watch.get_pending_claims() == 1
+                    && matches!(
+                        watch.get_failure().unwrap().which().unwrap(),
+                        wire::optional_text::Value(_)
+                    )
+            })
+            .await;
+            let removed = cli(
+                &socket,
+                &["watch", "remove", "drain-watch", "completed", "1"],
+            );
+            assert_eq!(removed["watch"]["enabled"].as_bool(), Some(false));
+            watch_until(producer.capability(), |watch| {
+                !watch.get_enabled()
+                    && watch.get_pending_claims() == 1
+                    && watch.get_candidates() == 0
+                    && watch.get_directories() == 0
+            })
+            .await;
+            let definition = dir.path().join("rebind.toml");
+            std::fs::write(
+                &definition,
+                toml::to_string(&watch_definition(&other, "completed", 0, 16, 16)).unwrap(),
+            )
+            .unwrap();
+            let failed = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
+                    "watch",
+                    "put",
+                    "rebind-pending",
+                    "2",
+                    definition.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(!failed.status.success());
+            assert!(String::from_utf8_lossy(&failed.stderr).contains("CONFLICT"));
+            assert!(!other.join(".sparrow-inflight").exists());
+            std::fs::write(
+                root.join("new-input.jsonl"),
+                b"new input remains outside the removed watch",
+            )
+            .unwrap();
+            drop(producer);
+            drop(daemon);
+            std::fs::remove_file(&socket).unwrap();
+            let _daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(producer.capability(), |watch| {
+                !watch.get_enabled()
+                    && watch.get_pending_claims() == 1
+                    && matches!(
+                        watch.get_failure().unwrap().which().unwrap(),
+                        wire::optional_text::Value(_)
+                    )
+            })
+            .await;
+            assert_eq!(
+                cli(
+                    &socket,
+                    &["watch", "remove", "drain-watch", "completed", "1"]
+                ),
+                removed
+            );
+            assert_eq!(
+                std::fs::read(&private).unwrap(),
+                b"late writer must not be retired"
+            );
+            assert_eq!(
+                std::fs::read(root.join("new-input.jsonl")).unwrap(),
+                b"new input remains outside the removed watch"
+            );
+            assert_eq!(
+                cli(&socket, &["status"])["live_records"].as_str(),
+                Some("0")
+            );
+        })
+        .await;
+}
+
+#[test]
+fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    let store = sparrow_server::ServerConfig::read(&config)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    store
+        .watch_registry_replace(None, b"invalid durable authority")
+        .unwrap();
+    drop(store);
+    let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!socket.exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("invalid durable watch catalog"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn watch_receipt_pressure_preserves_reserved_removal_capacity() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 30_000, 16, 16);
+            let _daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            let response = producer
+                .capability()
+                .watch_list_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let list = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let definition = list.get_watches().unwrap().get(0).get_definition().unwrap();
+            let mut revision = 1;
+            for index in 0..120 {
+                let mut call = producer.capability().watch_put_request();
+                let mut input = call.get().init_request();
+                input.set_store_id(&producer.discovery().store_id);
+                input.set_request_id(format!("pressure-update-{index}"));
+                input.set_expected_revision(revision);
+                input.set_definition(definition).unwrap();
+                let response = call.send().promise.await.unwrap();
+                revision = rpc_ok(response.get().unwrap().get_result().unwrap())
+                    .get_watch()
+                    .unwrap()
+                    .get_revision();
+            }
+            let mut call = producer.capability().watch_put_request();
+            let mut input = call.get().init_request();
+            input.set_store_id(&producer.discovery().store_id);
+            input.set_request_id("pressure-over-limit");
+            input.set_expected_revision(revision);
+            input.set_definition(definition).unwrap();
+            let response = call.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "RESOURCE_LIMIT"
+                ),
+                wire::result::Ok(_) => panic!("put consumed reserved watch removal capacity"),
+            }
+            let mut call = producer.capability().watch_remove_request();
+            let mut input = call.get().init_request();
+            input.set_store_id(&producer.discovery().store_id);
+            input.set_request_id("pressure-remove");
+            input.set_id("completed");
+            input.set_expected_revision(revision);
+            let response = call.send().promise.await.unwrap();
+            assert!(
+                !rpc_ok(response.get().unwrap().get_result().unwrap())
+                    .get_watch()
+                    .unwrap()
+                    .get_enabled()
+            );
+            assert!(
+                cli(&socket, &["watch", "list"])["watches"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            std::fs::write(
+                root.join("preserved.jsonl"),
+                b"source after pressure removal",
+            )
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                std::fs::read(root.join("preserved.jsonl")).unwrap(),
+                b"source after pressure removal"
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -216,7 +697,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/6"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/7"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,

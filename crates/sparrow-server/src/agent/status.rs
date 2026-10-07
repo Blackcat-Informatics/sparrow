@@ -55,6 +55,12 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         let status = Object::new()
             .with("id", watch.get_id()?.to_str()?)
             .with("root", watch.get_root()?.to_str()?)
+            .with("revision", watch.get_revision().to_string())
+            .with("enabled", watch.get_enabled())
+            .with(
+                "definition",
+                super::watch::definition(watch.get_definition()?)?,
+            )
             .with(
                 "coverage",
                 match watch.get_coverage()? {

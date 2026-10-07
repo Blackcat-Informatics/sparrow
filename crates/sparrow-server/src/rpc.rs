@@ -13,10 +13,7 @@ use std::{rc::Rc, sync::Arc};
 use tokio::sync::Semaphore;
 
 fn invalid(error: impl std::fmt::Display) -> Error {
-    Error {
-        code: "INVALID_ARGUMENT",
-        message: error.to_string(),
-    }
+    Error::new("INVALID_ARGUMENT", error.to_string())
 }
 
 /// Read the server's millisecond acceptance clock.
@@ -31,6 +28,7 @@ pub struct Rpc {
     max_artifact_bytes: usize,
     max_pin_members: usize,
     watches: crate::watches::WatchRegistry,
+    watch_controller: Option<crate::WatchController>,
 }
 
 impl Rpc {
@@ -47,6 +45,7 @@ impl Rpc {
             max_artifact_bytes,
             max_pin_members,
             watches: crate::watches::WatchRegistry::default(),
+            watch_controller: None,
         }
     }
 
@@ -54,6 +53,29 @@ impl Rpc {
     pub fn with_watches(mut self, watches: crate::watches::WatchRegistry) -> Self {
         self.watches = watches;
         self
+    }
+
+    /// Attach the one bounded administration worker; requires two connection slots.
+    pub fn with_watch_controller(mut self, controller: crate::WatchController) -> Self {
+        self.watch_controller = Some(controller);
+        self
+    }
+
+    async fn mutate_watch(
+        &self,
+        store: &str,
+        action: crate::watch_admin::Action,
+    ) -> Result<crate::watch_admin::ManagedWatch, Error> {
+        if store != self.store.store_id()? {
+            return Err(crate::watch_admin::failure(
+                "STORE_MISMATCH",
+                "watch mutation belongs to another persistent store",
+            ));
+        }
+        let controller = self.watch_controller.as_ref().ok_or_else(|| crate::watch_admin::failure("UNSUPPORTED", "watch administration requires an owned worker and at least two configured RPC connections"))?;
+        // The finite command channel owns admission. Holding a storage work permit
+        // here could deadlock the worker's own typed publication RPC.
+        controller.submit(action).await
     }
 
     async fn work<T: Send + 'static>(
@@ -594,7 +616,119 @@ fn text_results(mut out: wire::text_results::Builder<'_>, value: &Value) -> capn
     Ok(())
 }
 
+fn watch_mutation_result(
+    mut out: wire::result::Builder<'_, wire::watch_mutation::Owned>,
+    store: &str,
+    request: &str,
+    result: Result<crate::watch_admin::ManagedWatch, Error>,
+) -> capnp::Result<()> {
+    match result {
+        Ok(watch) => {
+            let mut receipt = out.reborrow().init_ok();
+            receipt.set_request_id(request);
+            receipt.set_durability(wire::Durability::Durable);
+            crate::watch_admin::encode_info(receipt.init_watch(), store, &watch)?;
+        }
+        Err(error) => failure(out, error),
+    }
+    Ok(())
+}
+
 impl wire::sparrow::Server for Rpc {
+    async fn watch_list(
+        self: Rc<Self>,
+        _: wire::sparrow::WatchListParams,
+        mut results: wire::sparrow::WatchListResults,
+    ) -> capnp::Result<()> {
+        let store = self
+            .store
+            .store_id()
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        let watches = self
+            .watches
+            .snapshot()
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        let mut out = results.get().init_result().init_ok();
+        out.set_store_id(&store);
+        let mut rows = out.init_watches(watches.len() as u32);
+        for (index, watch) in watches.into_iter().enumerate() {
+            crate::watch_admin::encode_info(
+                rows.reborrow().get(index as u32),
+                &store,
+                &crate::watch_admin::ManagedWatch {
+                    definition: watch.definition,
+                    revision: watch.revision,
+                    enabled: watch.enabled,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn watch_put(
+        self: Rc<Self>,
+        params: wire::sparrow::WatchPutParams,
+        mut results: wire::sparrow::WatchPutResults,
+    ) -> capnp::Result<()> {
+        let request = params.get()?.get_request()?;
+        let store = request.get_store_id()?.to_str()?;
+        let request_id = request.get_request_id()?.to_str()?;
+        if request_id.is_empty() || request_id.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("watch request identity requires 1..128 bytes"),
+            );
+            return Ok(());
+        }
+        let definition = match crate::watch_admin::decode_definition(request.get_definition()?) {
+            Ok(definition) => definition,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
+        let result = self
+            .mutate_watch(
+                store,
+                crate::watch_admin::Action::Put {
+                    request_id: request_id.into(),
+                    expected: request.get_expected_revision(),
+                    definition,
+                },
+            )
+            .await;
+        watch_mutation_result(results.get().init_result(), store, request_id, result)
+    }
+
+    async fn watch_remove(
+        self: Rc<Self>,
+        params: wire::sparrow::WatchRemoveParams,
+        mut results: wire::sparrow::WatchRemoveResults,
+    ) -> capnp::Result<()> {
+        let request = params.get()?.get_request()?;
+        let store = request.get_store_id()?.to_str()?;
+        let request_id = request.get_request_id()?.to_str()?;
+        let id = request.get_id()?.to_str()?;
+        if request_id.is_empty() || request_id.len() > 128 || id.is_empty() || id.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("watch and request identities require 1..128 bytes"),
+            );
+            return Ok(());
+        }
+        let result = self
+            .mutate_watch(
+                store,
+                crate::watch_admin::Action::Remove {
+                    request_id: request_id.into(),
+                    expected: request.get_expected_revision(),
+                    id: id.into(),
+                },
+            )
+            .await;
+        watch_mutation_result(results.get().init_result(), store, request_id, result)
+    }
+
     async fn events_ingest(
         self: Rc<Self>,
         params: wire::sparrow::EventsIngestParams,
@@ -1246,6 +1380,12 @@ impl wire::sparrow::Server for Rpc {
                     let mut state = states.reborrow().get(index as u32);
                     state.set_id(&watch.id);
                     state.set_root(&watch.root);
+                    state.set_revision(watch.revision);
+                    state.set_enabled(watch.enabled);
+                    crate::watch_admin::encode_definition(
+                        state.reborrow().init_definition(),
+                        &watch.definition,
+                    )?;
                     state.set_coverage(if watch.covered {
                         wire::WatchCoverage::Covered
                     } else {

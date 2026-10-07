@@ -421,7 +421,9 @@ impl Store {
         let mut batch = WriteBatch::default();
         put(&mut batch, &key(&journal.import_id), &journal);
         // Older writers must refuse before they can reclaim source-owned staging.
-        batch.put("store_format", FORMAT);
+        if writer.db.get("store_format")?.as_deref() == Some(super::FORMAT) {
+            batch.put("store_format", FORMAT);
+        }
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
         Ok(journal)

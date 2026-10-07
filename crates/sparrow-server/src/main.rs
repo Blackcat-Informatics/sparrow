@@ -16,26 +16,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::read(Path::new(&args[1]))?;
     let store = config.open_store()?;
     let watches = sparrow_server::watches::WatchRegistry::default();
-    let mut consumer = sparrow_server::watches::ConsumeWorker::start(
+    let mut consumer = Some(sparrow_server::watches::ConsumeWorker::start(
         store.clone(),
         &config.consume,
         config.socket_path.clone(),
         watches.clone(),
-    )?;
+    )?);
     // Refuse an existing socket rather than unlink another listener's endpoint.
     let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
     std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let connections = Arc::new(Semaphore::new(config.max_concurrent_requests));
-    let client: sparrow::Client = capnp_rpc::new_client(
-        Rpc::new(
-            store.clone(),
-            operations,
-            config.max_artifact_bytes,
-            config.max_pin_members,
-        )
-        .with_watches(watches),
-    );
+    let mut rpc = Rpc::new(
+        store.clone(),
+        operations,
+        config.max_artifact_bytes,
+        config.max_pin_members,
+    )
+    .with_watches(watches);
+    if config.max_concurrent_requests >= 2 {
+        rpc = rpc.with_watch_controller(
+            consumer
+                .as_ref()
+                .expect("worker started above")
+                .controller(),
+        );
+    }
+    let client: sparrow::Client = capnp_rpc::new_client(rpc);
     eprintln!(
         "sparrowd: store={} capnp={} data={}",
         store.store_id()?,

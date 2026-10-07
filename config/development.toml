@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 # Development store and owned synthetic intake only. No live producer directories.
+# Consume entries seed a missing catalog; use typed watch administration afterward.
 socket_path = "/home/paudley/.local/state/sparrow/development-v5/rpc.sock"
 data_dir = "/home/paudley/.local/state/sparrow/development-v5"
 disk_budget = 536870912

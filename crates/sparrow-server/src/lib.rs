@@ -8,8 +8,10 @@ mod config;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod transport;
+mod watch_admin;
 pub mod watches;
 pub use transport::serve_connection;
+pub use watch_admin::WatchController;
 
 mod rpc;
 pub use rpc::{Rpc, now};

@@ -34,5 +34,6 @@ pub use storage::rdf_view::{
     RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
 };
 pub use storage::source_time::{EventTime, SourceTimeProfile, TimeRepresentation};
+pub use storage::watch_registry::MAX_WATCH_REGISTRY_BYTES;
 pub use storage::{Artifact, Config, Error, Pin, Record, Store};
 pub use text::resolve_text_analyzer;

@@ -2,6 +2,146 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "durable-watch-registry"
+summary = "Store one bounded opaque administrative catalog with exact capture compare-and-set, durable publication and a monotonic old-writer format fence."
+home = "sparrow_core::storage::watch_registry::Store::watch_registry_replace"
+entry_points = ["sparrow_core::storage::watch_registry::Store::watch_registry"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(write_cli_watch_catalog|write_worker_watch_catalog)$']
+
+[[job]]
+id = "watch-catalog-codec"
+summary = "One strict versioned TOML owner binds durable administrative state to the store and validates bounded definitions, revisions and receipts."
+home = "sparrow_server::watch_admin::Catalog::load"
+entry_points = ["sparrow_server::watch_admin::Catalog::persist"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_startup_watch_catalog|parse_rpc_watch_catalog)$']
+
+[[job]]
+id = "watch-mutation-identity"
+summary = "Native framed BLAKE3 binds a finite durable mutation receipt to its operation, exact arguments and expected revision; retries never reapply stale authority."
+home = "sparrow_server::watch_admin::Action::identity"
+entry_points = ["sparrow_server::watch_admin::Catalog::prepare"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(hash_watch_create_request|hash_watch_update_request|hash_watch_remove_request)$']
+
+[[job]]
+id = "watch-control-channel"
+summary = "One finite command queue transfers complete typed mutations to the worker without holding a publication RPC semaphore permit."
+home = "sparrow_server::watch_admin::channel"
+entry_points = ["sparrow_server::watch_admin::WatchController::submit"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(enqueue_watch_create|enqueue_watch_update|enqueue_watch_remove)$']
+
+[[job]]
+id = "watch-authority-transition"
+summary = "One worker admits root changes, durably changes authority, drains removed watches and retires definitions only after persistent claims are gone."
+home = "sparrow_server::watches::administrate"
+entry_points = ["sparrow_server::watches::Detector::pause", "sparrow_server::watch_admin::Catalog::retire"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(apply_watch_create|apply_watch_update|apply_watch_remove)$']
+
+[[job]]
+id = "typed-watch-definition-codec"
+summary = "One generated-capability codec carries explicit finished-file retirement authority, recursive consume readiness and shared configuration bounds for administration and status."
+home = "sparrow_server::watch_admin::decode_definition"
+entry_points = ["sparrow_server::watch_admin::encode_definition", "sparrow_server::watch_admin::encode_info", "sparrow_server::config::ConsumeWatch::validate_fields"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_cli_watch|decode_status_watch|encode_status_watch|encode_list_watch)$']
+
+[[job]]
+id = "typed-watch-mutation-adapter"
+summary = "One store-scoped mutation adapter and durable reply codec serve both generated put and remove methods."
+home = "sparrow_server::rpc::Rpc::mutate_watch"
+entry_points = ["sparrow_server::rpc::watch_mutation_result", "sparrow_server::rpc::Rpc::with_watch_controller"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(mutate_watch_from_cli|mutate_watch_from_sdk)$']
+
+[[job]]
+id = "watch-agent-rendering"
+summary = "Explicit CLI administrative parsing and one typed definition renderer share the generated codec and native JSON output with ordinary status."
+home = "sparrow_server::agent::watch::Input::parse"
+entry_points = ["sparrow_server::agent::watch::Input::execute", "sparrow_server::agent::watch::definition", "sparrow_server::agent::watch::info", "sparrow_server::agent::watch::mutation"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_watch_status_definition|render_watch_list_definition)$']
+
+[[job]]
+id = "watch-test-definition"
+summary = "Shared dev-only watch definition scaffolding serves startup, dynamic administration and recovery scenarios without copied configuration serializers."
+home = "sparrow_server::test_crate::rpc::watch_definition"
+entry_points = ["sparrow_server::test_crate::rpc::append_consume_config"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(new_dynamic_watch_fixture|new_startup_watch_fixture)$']
+
+[[job]]
+id = "shared-domain-error-construction"
+summary = "The public core domain-error constructor serves native storage and typed server refusals through one implementation."
+home = "sparrow_core::storage::Error::new"
+entry_points = ["sparrow_server::watch_admin::failure", "sparrow_server::rpc::invalid"]
+spec = "docs/development-runtime.md: durable typed watch administration."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(construct_watch_domain_error|construct_ingest_domain_error)$']
+
+[[job]]
 id = "consume-watch-configuration"
 summary = "Validate explicit finished-file contracts, bounded identities/capacity and disjoint recursive roots through one configuration owner."
 home = "sparrow_server::config::ConsumeWatch::validate"

@@ -18,6 +18,7 @@ mod search;
 mod selection;
 mod source_time;
 mod status;
+mod watch;
 pub use error::AgentError;
 /// Shared result type preserving typed failures across CLI and MCP.
 pub type AgentResult<T> = std::result::Result<T, AgentError>;
@@ -31,7 +32,8 @@ pub(super) const USAGE: &str = concat!(
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
-    " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT"
+    " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
+    "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION"
 );
 
 /// Execute a CLI command through the same typed client and renderer as MCP.
@@ -45,6 +47,7 @@ pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<
 pub(super) enum Command {
     Flush(sparrow_client::DurabilityWatermark),
     Status,
+    Watch(watch::Input),
     SourceTime(source_time::Input),
     Records(records::Input),
     Ingest(ingest::Input),
@@ -159,6 +162,9 @@ fn parse_kind(
 
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
+        if args.first().is_some_and(|arg| arg == "watch") {
+            return Ok(Self::Watch(watch::Input::parse(&args[1..])?));
+        }
         if args.first().is_some_and(|arg| arg == "flush") {
             if args.len() != 4 {
                 return Err(invalid("flush requires STORE_ID SESSION_ID SEQUENCE"));
@@ -348,6 +354,9 @@ impl Command {
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+        if let Self::Watch(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
         if let Self::Flush(through) = self {
             return Ok(Some(durability::execute(client, through).await?));
         }

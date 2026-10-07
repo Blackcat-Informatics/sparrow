@@ -15,6 +15,78 @@ const CONSUMPTION_DIRECTORIES: sparrow_core::ConsumptionDirectories =
     };
 
 #[test]
+fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let identity = store.store_id().unwrap();
+    assert!(store.watch_registry().unwrap().is_none());
+    store.watch_registry_replace(None, b"catalog-one").unwrap();
+    assert_eq!(
+        store
+            .watch_registry_replace(None, b"stale-replacement")
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store.watch_registry().unwrap().as_deref(),
+        Some(b"catalog-one".as_slice())
+    );
+    assert_eq!(
+        store
+            .watch_registry_replace(Some(b"catalog-one"), b"")
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store
+            .watch_registry_replace(
+                Some(b"catalog-one"),
+                &vec![0; sparrow_core::MAX_WATCH_REGISTRY_BYTES + 1]
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    let journal = store
+        .consumption_reserve(
+            "watch",
+            b"input.log",
+            "source",
+            "log",
+            sparrow_core::ConsumptionGeneration {
+                device: 1,
+                inode: 2,
+                byte_length: 4,
+                modified: (10, 20),
+                changed: (10, 30),
+            },
+            CONSUMPTION_DIRECTORIES,
+        )
+        .unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/7")
+    );
+    store
+        .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.store_id().unwrap(), identity);
+    assert_eq!(
+        store.watch_registry().unwrap().as_deref(),
+        Some(b"catalog-two".as_slice())
+    );
+    assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/7")
+    );
+}
+
+#[test]
 fn physical_accounting_handles_directory_churn_with_bounded_measurement_failures() {
     use std::sync::{
         Arc,

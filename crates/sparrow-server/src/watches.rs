@@ -7,6 +7,7 @@
 use crate::{
     ConsumeWatch,
     consumption::{ClaimRoot, Error, Recovery},
+    watch_admin::{self, Action, Catalog, ManagedWatch},
 };
 use rustix::fs::{
     self,
@@ -42,6 +43,12 @@ pub struct WatchStatus {
     pub id: String,
     /// Configured absolute producer root.
     pub root: String,
+    /// Complete durable definition shared with administrative list replies.
+    pub definition: ConsumeWatch,
+    /// Compare-and-set revision of this durable definition.
+    pub revision: u64,
+    /// Whether new source admission is enabled; false means claims are draining.
+    pub enabled: bool,
     /// Whether recursive event coverage is complete in the current epoch.
     pub covered: bool,
     /// Held kernel directory watches.
@@ -85,6 +92,9 @@ impl WatchRegistry {
             .map(|detector| WatchStatus {
                 id: detector.config.id.clone(),
                 root: detector.config.root.to_string_lossy().into_owned(),
+                definition: detector.config.clone(),
+                revision: detector.revision,
+                enabled: detector.enabled,
                 covered: detector.covered,
                 directories: detector.directories.len() as u32,
                 candidates: detector.candidates.len() as u32,
@@ -123,6 +133,8 @@ struct Candidate {
 
 struct Detector {
     config: ConsumeWatch,
+    revision: u64,
+    enabled: bool,
     owner: ClaimRoot,
     events: OwnedFd,
     directories: BTreeMap<i32, Directory>,
@@ -140,11 +152,14 @@ struct Detector {
 }
 
 impl Detector {
-    fn open(store: Store, config: ConsumeWatch) -> Result<Self, Error> {
+    fn open(store: Store, watch: ManagedWatch) -> Result<Self, Error> {
+        let config = watch.definition;
         let owner = ClaimRoot::open(store, &config.id, &config.root)?;
         let events = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
         let mut detector = Self {
             config,
+            revision: watch.revision,
+            enabled: watch.enabled,
             owner,
             events,
             directories: BTreeMap::new(),
@@ -161,7 +176,21 @@ impl Detector {
             failure: None,
         };
         detector.reconcile("startup")?;
+        if !detector.enabled {
+            detector.pause()?;
+        }
         Ok(detector)
+    }
+
+    fn pause(&mut self) -> Result<(), Error> {
+        self.covered = false;
+        self.candidates.clear();
+        self.renames.clear();
+        self.directories.clear();
+        self.todo.clear();
+        self.scan = None;
+        self.events = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
+        Ok(())
     }
 
     fn reconcile(&mut self, reason: &str) -> Result<(), Error> {
@@ -431,6 +460,7 @@ impl Detector {
 pub struct ConsumeWorker {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<(), String>>>,
+    controller: watch_admin::WatchController,
 }
 
 impl ConsumeWorker {
@@ -440,27 +470,35 @@ impl ConsumeWorker {
         configs: &[ConsumeWatch],
         socket: PathBuf,
         registry: WatchRegistry,
-    ) -> Result<Option<Self>, Error> {
-        ConsumeWatch::validate(configs)
+    ) -> Result<Self, Error> {
+        let mut catalog = Catalog::load(&store, configs)?;
+        let definitions = catalog
+            .watches()
+            .iter()
+            .map(|watch| watch.definition.clone())
+            .collect::<Vec<_>>();
+        ConsumeWatch::validate(&definitions)
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         let pending = store.consumption_pending()?;
         if pending
             .iter()
-            .any(|journal| !configs.iter().any(|watch| watch.id == journal.watch))
+            .any(|journal| !definitions.iter().any(|watch| watch.id == journal.watch))
         {
             return Err(Error::State(
                 "configured watches omit an unfinished consumption journal; restore its watch before starting the consumer",
             ));
         }
-        if configs.is_empty() {
-            return Ok(None);
-        }
-        let detectors = configs
+        let detectors = catalog
+            .watches()
             .iter()
             .cloned()
-            .map(|config| Detector::open(store.clone(), config))
+            .map(|watch| Detector::open(store.clone(), watch))
             .collect::<Result<Vec<_>, _>>()?;
         registry.update(&detectors, &pending)?;
+        if catalog.needs_initial_commit() {
+            catalog.persist(&store)?;
+        }
+        let (controller, commands) = watch_admin::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let thread = std::thread::Builder::new()
@@ -471,13 +509,24 @@ impl ConsumeWorker {
                     .build()
                     .map_err(|error| error.to_string())?;
                 tokio::task::LocalSet::new()
-                    .block_on(&runtime, run(store, detectors, socket, stopped, registry))
+                    .block_on(
+                        &runtime,
+                        run(
+                            store, detectors, socket, stopped, registry, catalog, commands,
+                        ),
+                    )
                     .map_err(|error| error.to_string())
             })?;
-        Ok(Some(Self {
+        Ok(Self {
             stop,
             thread: Some(thread),
-        }))
+            controller,
+        })
+    }
+
+    /// Share the bounded command path, never a second watch mutation owner.
+    pub fn controller(&self) -> watch_admin::WatchController {
+        self.controller.clone()
     }
 
     /// A finished worker is terminal; the daemon must inspect its join result.
@@ -511,18 +560,154 @@ async fn stopped(stop: &AtomicBool) {
     }
 }
 
+enum AdminFailure {
+    Refused(sparrow_core::Error),
+    Terminal(Error),
+}
+
+fn administrate(
+    store: &Store,
+    catalog: &mut Catalog,
+    detectors: &mut Vec<Detector>,
+    action: Action,
+    pending: &[sparrow_core::ConsumptionJournal],
+) -> Result<ManagedWatch, AdminFailure> {
+    let (mut next, watch, duplicate) = catalog
+        .prepare(&action, crate::now().map_err(AdminFailure::Refused)?)
+        .map_err(AdminFailure::Refused)?;
+    if duplicate {
+        return Ok(watch);
+    }
+    next.retire(pending);
+    let definitions = next
+        .watches()
+        .iter()
+        .map(|watch| watch.definition.clone())
+        .collect::<Vec<_>>();
+    ConsumeWatch::validate(&definitions)
+        .map_err(|error| AdminFailure::Refused(watch_admin::failure("INVALID_ARGUMENT", error)))?;
+    let old = detectors
+        .iter()
+        .find(|detector| detector.config.id == watch.definition.id);
+    let mut prepared = None;
+    if watch.enabled {
+        let same_root =
+            old.is_some_and(|old| old.owner.root_binding(&watch.definition.root).is_ok());
+        if !same_root {
+            if pending
+                .iter()
+                .any(|journal| journal.watch == watch.definition.id)
+            {
+                return Err(AdminFailure::Refused(watch_admin::failure(
+                    "CONFLICT",
+                    "unfinished claims still bind this watch to its original root; drain or restore that exact root before changing it",
+                )));
+            }
+            prepared = Some(
+                Detector::open(store.clone(), watch.clone()).map_err(|error| {
+                    AdminFailure::Refused(watch_admin::failure(
+                        "INVALID_ARGUMENT",
+                        format!("watch root admission refused: {error}"),
+                    ))
+                })?,
+            );
+        }
+    }
+    // Catalog, stable receipt and old-writer fence share one durable DB batch.
+    // Any uncertain write is terminal: never keep admitting with stale authority.
+    next.persist(store).map_err(|error| match error {
+        Error::Storage(error) if matches!(error.code, "RESOURCE_LIMIT" | "STORAGE_PRESSURE") => {
+            AdminFailure::Refused(error)
+        }
+        error => AdminFailure::Terminal(error),
+    })?;
+    *catalog = next;
+    if let Some(detector) = prepared {
+        detectors.retain(|old| old.config.id != watch.definition.id);
+        detectors.push(detector);
+    } else if let Some(detector) = detectors
+        .iter_mut()
+        .find(|detector| detector.config.id == watch.definition.id)
+    {
+        detector.config = watch.definition.clone();
+        detector.revision = watch.revision;
+        detector.enabled = watch.enabled;
+        if watch.enabled {
+            detector
+                .reconcile("administrative update")
+                .map_err(AdminFailure::Terminal)?;
+        } else {
+            detector.pause().map_err(AdminFailure::Terminal)?;
+        }
+    }
+    detectors.retain(|detector| {
+        catalog
+            .watches()
+            .iter()
+            .any(|watch| watch.definition.id == detector.config.id)
+    });
+    Ok(watch)
+}
+
 async fn run(
     store: Store,
     mut detectors: Vec<Detector>,
     socket: PathBuf,
     stop: Arc<AtomicBool>,
     registry: WatchRegistry,
+    mut catalog: Catalog,
+    mut commands: tokio::sync::mpsc::Receiver<watch_admin::Command>,
 ) -> Result<(), Error> {
     let mut client: Option<Client> = None;
     let mut retry = BTreeMap::<String, Instant>::new();
     let mut connect_after = Instant::now();
     while !stop.load(Ordering::Acquire) {
+        let pending = store.consumption_pending()?;
+        if catalog.retire(&pending) {
+            catalog.persist(&store)?;
+            detectors.retain(|detector| {
+                catalog
+                    .watches()
+                    .iter()
+                    .any(|watch| watch.definition.id == detector.config.id)
+            });
+        }
+        for _ in 0..watch_admin::MAX_WATCH_COMMANDS {
+            let command = match commands.try_recv() {
+                Ok(command) => command,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(Error::State(
+                        "watch administration channel closed unexpectedly",
+                    ));
+                }
+            };
+            match administrate(
+                &store,
+                &mut catalog,
+                &mut detectors,
+                command.action,
+                &pending,
+            ) {
+                Ok(watch) => {
+                    registry.update(&detectors, &pending)?;
+                    let _ = command.reply.send(Ok(watch));
+                }
+                Err(AdminFailure::Refused(error)) => {
+                    let _ = command.reply.send(Err(error));
+                }
+                Err(AdminFailure::Terminal(error)) => {
+                    let _ = command
+                        .reply
+                        .send(Err(watch_admin::failure("STORAGE_FAILURE", &error)));
+                    return Err(error);
+                }
+            }
+        }
         for detector in &mut detectors {
+            if !detector.enabled {
+                continue;
+            }
             detector.drain()?;
             if detector.covered && Instant::now() >= detector.next_reconcile {
                 detector.reconcile("periodic scan")?;
@@ -532,6 +717,10 @@ async fn run(
         }
         let pending = store.consumption_pending()?;
         registry.update(&detectors, &pending)?;
+        if detectors.is_empty() {
+            tokio::time::sleep(TICK).await;
+            continue;
+        }
         retry.retain(|id, _| pending.iter().any(|journal| journal.import_id == *id));
         if client.is_none() && Instant::now() >= connect_after {
             tokio::select! {
@@ -560,6 +749,9 @@ async fn run(
             .map(|journal| (journal.watch.clone(), journal.import_id.clone()));
         if work.is_none() && pending.len() < sparrow_core::MAX_CONSUMPTION_JOURNALS {
             for detector in &mut detectors {
+                if !detector.enabled {
+                    continue;
+                }
                 if let Some((path, identity)) = detector.ready()? {
                     if stop.load(Ordering::Acquire) {
                         break;
@@ -621,6 +813,12 @@ async fn run(
             } else {
                 detector.failure = None;
                 detector.completed = detector.completed.saturating_add(1);
+            }
+            if let Some(index) = detectors
+                .iter()
+                .position(|detector| detector.config.id == watch)
+            {
+                detectors.rotate_left(index + 1);
             }
         }
         tokio::time::sleep(TICK).await;
