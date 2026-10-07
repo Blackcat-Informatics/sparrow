@@ -57,7 +57,21 @@ RPC/daemon/MCP scenarios), seeded census self-tests and the pinned cross gate.
 All 129 helper ownership jobs hold with no distinct exceptions. New storage
 scenarios cover exact counts across retention, pin release and reopen, and hard
 failures for corrupted record/artifact/pin identities. This is local source
-qualification; the running development daemon has not yet adopted this change.
+qualification.
+
+The owned development unit adopted signed commit `bf0260d` after graceful SIGINT
+shutdown and socket cleanup. PID 701553 reopened the same store
+`store:46c88e949ccec658600b66c7becd5bb7`, format 12/schema 19, with 192 live
+records, 193 payload chunks, 188 JSON projections, no pins and no durability
+backlog. The socket remained mode 0600 in its mode-0700 directory. The first
+connection raced socket creation; the same unit then became ready without a
+second start. Descriptor ingestion and immutable handoff retries retained their
+original artifact identities and durable receipts. Independent `cmp` checks
+verified all 82 descriptor bytes, all 87 handoff bytes including CRLF, and the
+preserved replacement producer file. The stdio MCP status adapter also passed
+through the typed socket client. Captured outputs are under
+`/tmp/sparrow-stream-catalog-live.J3qPAA`. This remains a transient development
+unit, not permanent/reboot or corpus-scale qualification.
 
 This removes resident catalog vectors; it does not prove a bounded count-scan
 duration, bounded aggregate pin protection, corpus-scale RSS or latency. Those
