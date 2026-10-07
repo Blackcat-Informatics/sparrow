@@ -65,6 +65,33 @@ struct Status {
   rdfProfile @16 :Text;
   pinReadHandles @17 :UInt64; pinReadBytes @18 :UInt64;
   maxPinReadHandles @19 :UInt64; maxPinReadBytes @20 :UInt64; pinReadLeaseMs @21 :UInt64;
+  maxEventBatchBytes @22 :UInt32; maxEventBatchEvents @23 :UInt32;
+}
+
+struct WideInteger { high @0 :UInt64; low @1 :UInt64; }
+struct EventField {
+  name @0 :Text;
+  union {
+    text @1 :Text; boolean @2 :Bool; signed @3 :Int64; unsigned @4 :UInt64;
+    signed128 @5 :WideInteger; unsigned128 @6 :WideInteger;
+    float64Bits @7 :UInt64; bytes @8 :Data; debug @9 :Text; error @10 :Text;
+  }
+}
+enum EventLevel { error @0; warn @1; info @2; debug @3; trace @4; }
+enum EventKind { log @0; spanNew @1; spanRecord @2; spanEnter @3; spanExit @4; spanClose @5; spanFollowsFrom @6; }
+struct OptionalSpanId { union { absent @0 :Void; value @1 :UInt64; } }
+struct EventSpan {
+  id @0 :UInt64; parent @1 :OptionalSpanId; name @2 :Text; target @3 :Text;
+  fields @4 :List(EventField);
+}
+struct ProducerEvent {
+  sequence @0 :UInt64; eventTime @1 :Instant; kind @2 :EventKind; level @3 :EventLevel;
+  name @4 :Text; target @5 :Text; fields @6 :List(EventField);
+  context @7 :List(EventSpan); span @8 :OptionalSpanId; followsFrom @9 :OptionalSpanId;
+}
+struct EventBatch {
+  requestId @0 :Text; source @1 :Text; clientInstance @2 :Data;
+  events @3 :List(ProducerEvent);
 }
 struct Ingest {
   requestId @0 :Text; source @1 :Text; format @2 :Format; bytes @3 :Data;
@@ -250,4 +277,5 @@ interface Sparrow {
   importPrepare @22 (request :ImportPrepare) -> (result :Result(ImportPreparation));
   importPublish @23 (import :ImportRef) -> (result :Result(Artifact));
   importCancel @24 (import :ImportRef) -> (result :Result(ImportCanceled));
+  eventsIngest @25 (batch :EventBatch) -> (result :Result(Artifact));
 }

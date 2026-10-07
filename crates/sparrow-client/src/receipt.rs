@@ -20,6 +20,10 @@ pub struct Discovery {
     pub text_profile: String,
     /// Persisted native RDF projection profile identity.
     pub rdf_profile: String,
+    /// Maximum admitted event batch expansion in bytes.
+    pub max_event_batch_bytes: u32,
+    /// Maximum independent events in one batch.
+    pub max_event_batch_events: u32,
 }
 
 impl Discovery {
@@ -33,15 +37,19 @@ impl Discovery {
             text_analyzer: value.get_text_analyzer()?.to_str()?.to_owned(),
             text_profile: value.get_text_profile()?.to_str()?.to_owned(),
             rdf_profile: value.get_rdf_profile()?.to_str()?.to_owned(),
+            max_event_batch_bytes: value.get_max_event_batch_bytes(),
+            max_event_batch_events: value.get_max_event_batch_events(),
         };
         if discovery.schema_version != crate::SCHEMA_VERSION
             || discovery.store_id.is_empty()
             || discovery.text_analyzer.is_empty()
             || discovery.text_profile.is_empty()
             || discovery.rdf_profile.is_empty()
+            || discovery.max_event_batch_bytes != crate::MAX_EVENT_BATCH_BYTES as u32
+            || discovery.max_event_batch_events != crate::MAX_EVENT_BATCH_EVENTS as u32
         {
             return Err(Error::Unsupported(
-                "requires schema version 10 and nonempty store, text and RDF identities; use a matching daemon executable",
+                "requires schema version 11, matching event batch limits and nonempty store, text and RDF identities; use a matching daemon executable",
             ));
         }
         Ok(discovery)
@@ -108,7 +116,7 @@ impl ArtifactReceipt {
 mod tests {
     #[test]
     fn discovery_refuses_old_schema_or_missing_profile_identity() {
-        for (version, rdf) in [(9, "rdf"), (crate::SCHEMA_VERSION, "")] {
+        for (version, rdf) in [(10, "rdf"), (crate::SCHEMA_VERSION, "")] {
             let mut message = capnp::message::Builder::new_default();
             let mut status = message.init_root::<super::wire::status::Builder<'_>>();
             status.set_schema_version(version);
@@ -116,6 +124,8 @@ mod tests {
             status.set_text_analyzer("analyzer");
             status.set_text_profile("text");
             status.set_rdf_profile(rdf);
+            status.set_max_event_batch_bytes(crate::MAX_EVENT_BATCH_BYTES as u32);
+            status.set_max_event_batch_events(crate::MAX_EVENT_BATCH_EVENTS as u32);
             assert!(matches!(
                 super::Discovery::decode(status.into_reader()),
                 Err(super::Error::Unsupported(_))

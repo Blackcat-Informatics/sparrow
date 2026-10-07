@@ -704,3 +704,108 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(decode_record_layout_page|decode_raw_chunk_page)$']
+
+[[job]]
+id = "typed-event-admission"
+summary = "Validate immutable producer batches, ordered nonzero sequences, relationships and conservative per-event/batch quotas before mutation."
+home = "sparrow_client::events::EventBatch::validate"
+entry_points = []
+spec = "docs/development-runtime.md: schema-11 typed producer event batches."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_cli_event_batch|validate_server_event_batch)$']
+
+[[job]]
+id = "typed-event-expansion-budget"
+summary = "Apply one checked expansion allowance while inspecting owned inputs and before allocating decoded wire strings, bytes and lists."
+home = "sparrow_client::events::Budget::charge"
+entry_points = []
+spec = "docs/development-runtime.md: schema-11 event memory and source expansion bounds."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(charge_event_decode_budget|charge_event_encode_budget)$']
+
+[[job]]
+id = "typed-event-wire-encoding"
+summary = "Marshal the producer's ordered native Rust values and context through one shared generated contract."
+home = "sparrow_client::events::EventBatch::encode"
+entry_points = []
+spec = "crates/sparrow-client/schema/sparrow.capnp: typed EventBatch and field union."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_logger_event_batch|encode_direct_event_batch)$']
+
+[[job]]
+id = "typed-event-wire-decoding"
+summary = "Decode typed fields, exact float bits, wide integers and span relationships with admission before allocations."
+home = "sparrow_client::events::EventBatch::decode"
+entry_points = []
+spec = "crates/sparrow-client/schema/sparrow.capnp: typed EventBatch and field union."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_rpc_event_batch|decode_mcp_event_batch)$']
+
+[[job]]
+id = "typed-event-source-representation"
+summary = "Normalize typed producer observations once with the native JSON writer into queryable complete JSONL source records."
+home = "sparrow_server::rpc::events::source_bytes"
+entry_points = []
+spec = "docs/development-runtime.md: schema-11 canonical sparrow.events/1 source representation."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(normalize_client_event_source|write_logger_event_json)$']
+
+[[job]]
+id = "typed-event-span-relationships"
+summary = "Require explicit lifecycle subjects, nonzero distinct follows-from endpoints and a unique ordered span parent chain."
+home = "sparrow_client::events::relationships"
+entry_points = []
+spec = "docs/development-runtime.md: schema-11 span/lifecycle source evidence."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_logger_span_relationships|validate_wire_span_relationships)$']
+
+[[job]]
+id = "typed-optional-union-encoding"
+summary = "Move a generated builder through one typed optional union branch shared by CLI text and producer span references."
+home = "sparrow_client::encode_optional"
+entry_points = []
+spec = "docs/development-runtime.md: shared generated producer/agent wire helpers."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_optional_text_again|encode_optional_span_again)$']

@@ -33,13 +33,32 @@ mod receipt;
 pub use receipt::{ArtifactReceipt, Discovery};
 mod imports;
 pub use imports::import_file;
+mod events;
+pub use events::{
+    EventBatch, EventField, EventSpan, FieldValue, MAX_EVENT_BATCH_BYTES, MAX_EVENT_BATCH_EVENTS,
+    MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
+};
 
-pub use sparrow_capnp::{Durability, Format};
+pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Encode a generated optional-value union through its typed variant setters.
+/// The builder moves to exactly one branch; field types remain statically checked.
+pub fn encode_optional<B, T>(
+    out: B,
+    value: Option<T>,
+    present: impl FnOnce(B, T),
+    absent: impl FnOnce(B),
+) {
+    match value {
+        Some(value) => present(out, value),
+        None => absent(out),
+    }
+}
 
 /// Parse an explicit format label using the shared generated enum.
 pub fn parse_format(value: &str) -> capnp::Result<Format> {
@@ -73,6 +92,17 @@ pub struct Client {
 }
 
 impl Client {
+    /// Accept an atomic typed event batch using the caller's stable retry identity.
+    /// A transport failure requires retrying this same immutable batch.
+    pub async fn events(&self, batch: &EventBatch) -> Result<ArtifactReceipt, Error> {
+        let mut request = self.capability().events_ingest_request();
+        batch.encode(request.get().init_batch())?;
+        let response = request.send().promise.await?;
+        match response.get()?.get_result()?.which()? {
+            sparrow_capnp::result::Ok(value) => ArtifactReceipt::decode(value?),
+            sparrow_capnp::result::Error(error) => Err(Error::domain(error?)),
+        }
+    }
     /// Connect and verify discovery before allowing producer mutations.
     pub async fn connect(socket: &std::path::Path) -> Result<Self, Error> {
         let connection = connect(socket).await?;

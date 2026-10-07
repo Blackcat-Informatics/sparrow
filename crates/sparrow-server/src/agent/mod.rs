@@ -443,11 +443,13 @@ fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) {
     scope.set_scan_budget(options.scan_budget);
 }
 
-fn optional(mut field: wire::optional_text::Builder<'_>, value: &Option<String>) {
-    match value {
-        Some(value) => field.set_value(value),
-        None => field.set_absent(()),
-    }
+fn optional(field: wire::optional_text::Builder<'_>, value: &Option<String>) {
+    sparrow_client::encode_optional(
+        field,
+        value.as_deref(),
+        |mut field, value| field.set_value(value),
+        |mut field| field.set_absent(()),
+    );
 }
 
 fn optional_value(field: wire::optional_text::Reader<'_>) -> Result<Value> {

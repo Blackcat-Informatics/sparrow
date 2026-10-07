@@ -17,6 +17,14 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("store_format", value.get_store_format()?.to_str()?)
         .with("schema_version", u64::from(value.get_schema_version()))
+        .with(
+            "max_event_batch_bytes",
+            u64::from(value.get_max_event_batch_bytes()),
+        )
+        .with(
+            "max_event_batch_events",
+            u64::from(value.get_max_event_batch_events()),
+        )
         .with("rdf_profile", value.get_rdf_profile()?.to_str()?)
         .with("text_analyzer", value.get_text_analyzer()?.to_str()?)
         .with("text_profile", value.get_text_profile()?.to_str()?)

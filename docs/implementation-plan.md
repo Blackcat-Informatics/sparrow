@@ -16,6 +16,10 @@ Stable-ID pin renewal is implemented through the core, typed daemon, CLI and MCP
 including durable retry receipts and optional revision guards. Pin discovery
 and member retrieval now use finite immutable catalog pages shared by the typed
 daemon, CLI and MCP. Broader live/pin/selection query pagination remains required.
+The standalone producer client and schema-11 typed event batch operation are
+present. Native event JSONL enters the same occurrence/field/text/time indexes;
+the bounded logging queue, tracing layer and flush/shutdown contracts remain
+milestone-4 work.
 
 This plan builds on [Architecture](architecture.md) and [Interfaces](interfaces.md).
 It records the initial query priorities and sample discovery supplied on

@@ -61,7 +61,7 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         let client = &connection.client;
         let response = client.status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_schema_version(), 10);
+        assert_eq!(status.get_schema_version(), 11);
         let store = status.get_store_id().unwrap().to_str().unwrap().to_owned();
         let mut input = vec![b'a'; sparrow_core::IMPORT_CHUNK_BYTES + 16 * 1024 * 1024 + 1];
         input[sparrow_core::IMPORT_CHUNK_BYTES - 1] = b'\n';
@@ -205,6 +205,142 @@ fn write_server_config(dir: &Path, store: &Path, socket: &Path) -> std::path::Pa
     let config = dir.join("server.toml");
     std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", concat!(env!("CARGO_MANIFEST_DIR"), "/../../../purrdf/crates/text/lexicons/artifacts"))).unwrap();
     config
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() {
+    tokio::task::LocalSet::new().run_until(async {
+        use sparrow_client::{EventBatch, EventField, EventSpan, FieldValue, ProducerEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let socket = store_path.join("rpc.sock");
+        let config = write_server_config(dir.path(), &store_path, &socket);
+        let daemon = start(&config, &socket).await;
+        let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+        assert_eq!(producer.discovery().max_event_batch_events, 256);
+        assert_eq!(producer.discovery().max_event_batch_bytes, 1024 * 1024);
+        let fields = vec![
+            ("message", FieldValue::Text("allocation failed\n\"quoted\" 😺".into())),
+            ("flag", FieldValue::Boolean(true)),
+            ("integer", FieldValue::Signed(i64::MIN)),
+            ("integer", FieldValue::Unsigned(u64::MAX)),
+            ("wide", FieldValue::Signed128(i128::MIN)),
+            ("wide", FieldValue::Unsigned128(u128::MAX)),
+            ("nan", FieldValue::Float64Bits(0x7ff8_0000_0000_0042)),
+            ("zero", FieldValue::Float64Bits((-0.0_f64).to_bits())),
+            ("fraction", FieldValue::Float64Bits(0.125_f64.to_bits())),
+            ("bytes", FieldValue::Bytes(vec![0, 255, 128])),
+            ("debug", FieldValue::Debug("Some(3)".into())),
+            ("error", FieldValue::Error("disk failure".into())),
+        ].into_iter().map(|(name, value)| EventField { name: name.into(), value }).collect::<Vec<_>>();
+        let span = EventSpan { id: 42, parent: None, name: "request".into(), target: "application".into(),
+            fields: vec![EventField { name: "request_number".into(), value: FieldValue::Unsigned(7) }] };
+        let event = ProducerEvent { sequence: 1, event_time: 1_700_000_000_001, kind: wire::EventKind::SpanNew,
+            level: wire::EventLevel::Info, name: "request".into(), target: "application".into(), fields: vec![],
+            context: vec![], span: Some(42), follows_from: None };
+        let mut log = event.clone();
+        log.sequence = 2; log.event_time += 1; log.kind = wire::EventKind::Log;
+        log.name = "allocation".into(); log.fields = fields; log.context.push(span.clone());
+        let mut close = event.clone();
+        close.sequence = 4; close.event_time += 2; close.kind = wire::EventKind::SpanClose; close.context.push(span);
+        let batch = EventBatch { request_id: "typed-events-v1".into(), source: "structured-sdk".into(),
+            client_instance: [9; 16], events: vec![event, log, close] };
+        let mut message = capnp::message::Builder::new_default();
+        batch.encode(message.init_root::<wire::event_batch::Builder<'_>>()).unwrap();
+        assert_eq!(EventBatch::decode(message.get_root_as_reader().unwrap()).unwrap(), batch);
+        let receipt = producer.events(&batch).await.unwrap();
+        assert_eq!(receipt.record_ids.len(), 3);
+        assert_eq!(receipt.durability, wire::Durability::Durable);
+        assert_eq!(producer.events(&batch).await.unwrap(), receipt);
+        let mut read = producer.capability().bytes_read_request();
+        let mut input = read.get().init_request();
+        input.set_length(receipt.byte_length.try_into().unwrap());
+        let mut evidence = input.init_evidence();
+        evidence.set_store_id(&receipt.store_id); evidence.set_artifact(&receipt.id);
+        let response = read.send().promise.await.unwrap();
+        let bytes = rpc_ok(response.get().unwrap().get_result().unwrap()).get_data().unwrap().to_vec();
+        let records = bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty())
+            .map(|line| purrdf_lex::json::read_slice(line, purrdf_lex::json::Limits::default()).unwrap()).collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        let fields = &records[1]["fields"];
+        assert_eq!(fields[0]["value"].as_str(), Some("allocation failed\n\"quoted\" 😺"));
+        assert_eq!(fields[1]["value"].as_bool(), Some(true));
+        assert_eq!(fields[2]["value"].as_number().unwrap().lexeme(), i64::MIN.to_string());
+        assert_eq!(fields[3]["value"].as_number().unwrap().lexeme(), u64::MAX.to_string());
+        assert_eq!(fields[4]["value"].as_number().unwrap().lexeme(), i128::MIN.to_string());
+        assert_eq!(fields[5]["value"].as_number().unwrap().lexeme(), u128::MAX.to_string());
+        assert_eq!(fields[6]["bits"].as_number().unwrap().as_u64(), Some(0x7ff8_0000_0000_0042));
+        assert_eq!(fields[6]["nonfinite"].as_str(), Some("nan"));
+        assert!(fields[6].get("value").is_none());
+        assert_eq!(fields[7]["bits"].as_number().unwrap().as_u64(), Some((-0.0_f64).to_bits()));
+        assert_eq!(fields[8]["value"].as_number().unwrap().as_f64(), 0.125);
+        assert_eq!(fields[9]["value"].as_str(), Some("00ff80"));
+        assert_eq!(fields[10]["kind"].as_str(), Some("debug"));
+        assert_eq!(fields[11]["kind"].as_str(), Some("error"));
+        assert_eq!(records[1]["context"][0]["id"].as_number().unwrap().as_u64(), Some(42));
+        assert_eq!(records[1]["sequence"].as_number().unwrap().as_u64(), Some(2));
+        for (index, id) in receipt.record_ids.iter().enumerate() {
+            let mut request = producer.capability().record_get_request();
+            let mut reference = request.get().init_record(); reference.set_store_id(&receipt.store_id); reference.set_id(id);
+            let response = request.send().promise.await.unwrap();
+            let record = rpc_ok(response.get().unwrap().get_result().unwrap());
+            match record.get_event_time().unwrap().which().unwrap() {
+                wire::event_time::Known(value) => {
+                    let value = value.unwrap();
+                    assert_eq!(value.get_instant().unwrap().get_unix_millis(), batch.events[index].event_time);
+                    let span = &bytes[value.get_source_start() as usize..value.get_source_end() as usize];
+                    assert_eq!(span, batch.events[index].event_time.to_string().as_bytes());
+                },
+                wire::event_time::Unknown(_) => panic!("typed producer time was not indexed"),
+            }
+            assert_eq!(record.get_received_at().unwrap().get_unix_millis(), receipt.received_at);
+        }
+        let query = cli(&socket, &["records", "--source", "structured-sdk", "--text", "allocation",
+            "--event-from", "2023-11-14T22:13:20.002Z", "--event-before", "2023-11-14T22:13:20.003Z"]);
+        assert_eq!(query["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(query["rows"][0]["record_id"].as_str(), Some(receipt.record_ids[1].as_str()));
+        let mut changed = batch.clone(); changed.events[1].fields[6].value = FieldValue::Float64Bits(0x7ff8_0000_0000_0043);
+        assert!(matches!(producer.events(&changed).await.unwrap_err(), sparrow_client::Error::Domain { ref code, .. } if code == "CONFLICT"));
+        // Generated callers cannot bypass SDK cardinality or relationship admission.
+        let mut request = producer.capability().events_ingest_request();
+        let mut invalid = request.get().init_batch(); invalid.set_request_id("too-many-events"); invalid.set_source("invalid");
+        invalid.set_client_instance(&[9; 16]); invalid.init_events(257);
+        let response = request.send().promise.await.unwrap();
+        assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(_)));
+        let mut request = producer.capability().events_ingest_request();
+        let mut invalid = request.get().init_batch();
+        invalid.set_request_id("wire-byte-quota"); invalid.set_source("refused-wire-quota"); invalid.set_client_instance(&[9; 16]);
+        let mut event = invalid.init_events(1).get(0);
+        event.set_sequence(1);
+        event.init_fields(1).get(0).set_bytes(&vec![0; 64 * 1024]);
+        let response = request.send().promise.await.unwrap();
+        assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(_)));
+        let mut request = producer.capability().source_time_get_request();
+        request.get().set_source("refused-wire-quota");
+        let response = request.send().promise.await.unwrap();
+        assert!(matches!(rpc_ok(response.get().unwrap().get_result().unwrap()).which().unwrap(), wire::optional_source_time_profile::Absent(())));
+        let mut request = producer.capability().source_time_define_request();
+        let mut definition = request.get().init_definition();
+        definition.set_source("incompatible-events"); definition.set_path("/timestamp"); definition.set_representation(wire::TimeRepresentation::Rfc3339);
+        let response = request.send().promise.await.unwrap();
+        rpc_ok(response.get().unwrap().get_result().unwrap());
+        let mut incompatible = batch.clone(); incompatible.source = "incompatible-events".into(); incompatible.request_id = "incompatible-event-source".into();
+        assert!(matches!(producer.events(&incompatible).await.unwrap_err(), sparrow_client::Error::Domain { ref code, .. } if code == "CONFLICT"));
+        let mut invalid = batch.clone(); invalid.request_id = "invalid-order".into(); invalid.events[1].sequence = 1;
+        assert!(invalid.validate().is_err());
+        invalid = batch.clone(); invalid.events[1].fields[0].value = FieldValue::Text("x".repeat(16 * 1024 + 1));
+        assert!(invalid.validate().is_err());
+        invalid = batch.clone(); invalid.events[1].context[0].parent = Some(42);
+        assert!(invalid.validate().is_err());
+        drop(producer); drop(daemon); std::fs::remove_file(&socket).unwrap();
+        let daemon = start(&config, &socket).await;
+        let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+        assert_eq!(producer.events(&batch).await.unwrap(), receipt);
+        assert_eq!(producer.artifact(&receipt.id).await.unwrap(), receipt);
+        let response = producer.capability().status_request().send().promise.await.unwrap();
+        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 3);
+        drop(producer); drop(daemon);
+    }).await;
 }
 
 async fn exercise(socket: &Path) -> (String, String, String) {
@@ -1423,7 +1559,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     );
     assert_eq!(
         capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
-        Some(10)
+        Some(11)
     );
     let unknown = mcp
         .call(

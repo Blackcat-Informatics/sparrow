@@ -15,6 +15,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
+mod events;
 
 fn invalid(error: impl std::fmt::Display) -> Error {
     Error {
@@ -534,6 +535,59 @@ fn text_results(mut out: wire::text_results::Builder<'_>, value: &Value) -> capn
 }
 
 impl wire::sparrow::Server for Rpc {
+    async fn events_ingest(
+        self: Rc<Self>,
+        params: wire::sparrow::EventsIngestParams,
+        mut results: wire::sparrow::EventsIngestResults,
+    ) -> capnp::Result<()> {
+        let input = match sparrow_client::EventBatch::decode(params.get()?.get_batch()?) {
+            Ok(input) => input,
+            Err(error) => {
+                failure(results.get().init_result(), invalid(error));
+                return Ok(());
+            }
+        };
+        // Normalization is bounded independently of the configured storage admission.
+        let bytes = match events::source_bytes(&input) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
+        if bytes.len() > self.max_artifact_bytes {
+            failure(
+                results.get().init_result(),
+                Error {
+                    code: "RESOURCE_LIMIT",
+                    message: "event batch exceeds configured artifact admission".into(),
+                },
+            );
+            return Ok(());
+        }
+        match self
+            .work(move |store, now| {
+                store.define_time_profile(
+                    &input.source,
+                    "/event_time",
+                    sparrow_core::TimeRepresentation::UnixMillis,
+                )?;
+                store.ingest(&input.request_id, &input.source, "jsonl", &bytes, now)
+            })
+            .await
+        {
+            Ok(value) => artifact(
+                results.get().init_result().init_ok(),
+                value,
+                &self
+                    .store
+                    .store_id()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?,
+            )?,
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
     async fn import_begin(
         self: Rc<Self>,
         params: wire::sparrow::ImportBeginParams,
@@ -1115,6 +1169,8 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
+                out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);

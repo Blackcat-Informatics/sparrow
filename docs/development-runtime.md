@@ -14,7 +14,7 @@ and failures are explicit unions; counts and clock instants are unsigned integer
 fields, formats and JSON kinds are enums, and references carry a store identity.
 
 Present RPC methods include the eight import methods documented below,
-plus `status`, `ingest`, `artifactGet`, `recordGet`,
+plus `status`, `ingest`, `eventsIngest`, `artifactGet`, `recordGet`,
 `bytesRead`, `pin`, `pinRenew`, `pinRelease`, `pinRead`, `keysList`, `valuesSearch`, `textSearch`, `recordsSearch`, `recordsContext`, `rdfInspect`, `sourceTimeDefine` and `sourceTimeGet`. The shared typed
 client transport is `sparrow_client::connect`, used within a Tokio `LocalSet`.
 The `sparrow` CLI and stdio MCP adapter share generated-client operations and
@@ -33,7 +33,7 @@ daemon imports the generated contract from this crate. The CLI uses its public
 path. The existing server exports are reexports of these same generated types.
 
 `sparrow_client::Client::connect` checks discovery before producer mutations.
-Within a Tokio `LocalSet`, callers can use `ingest`, `import_file`, `artifact`,
+Within a Tokio `LocalSet`, callers can use `ingest`, `events`, `import_file`, `artifact`,
 `discovery`, and the generated query capability. Direct ingestion rejects inputs
 above the discovered buffered-input limit; file imports hash and upload through
 one 64 KiB buffer. Both return owned `ArtifactReceipt` values. Reuse the original
@@ -50,11 +50,73 @@ checks durable direct ingestion and conflicting request refusal. Discovery tests
 refuse old schema versions and missing projection identity. The Rust example in
 the crate documentation is compiled as a doctest.
 
-This is the direct artifact client. Automatic reconnection, logging queues,
+This is the direct artifact/event-batch client. Automatic reconnection, logging queues,
 `tracing_subscriber::Layer`, typed structured event/span ingestion, buffered
 acknowledgments and durable flush/shutdown watermarks remain required work. The
 current SDK returns durable artifact receipts; it does not advertise these
 unfinished behaviors. Full server acceptance remains unmet.
+
+### Schema 11: typed producer event batches
+
+`eventsIngest` accepts at most 256 events, a conservative 1 MiB batch expansion,
+64 KiB per event, 128 fields per event/span, and 32 context spans. Every string
+is at most 16 KiB. Shared SDK admission runs both before encoding and during
+daemon decoding; counts and quotas are checked before list/string allocation.
+Discovery advertises batch limits. The client refuses older schemas or different
+batch bounds before producer mutation.
+
+`ProducerEvent` carries a nonzero increasing client sequence, producer UTC Unix
+milliseconds, severity/kind enums, metadata name/target, ordered typed fields,
+span context, and optional subject/follows-from identities. Sequence gaps are
+allowed and remain visible; this operation does not promise a complete sequence
+history. Producers must use a fresh 16-byte client instance for each process and
+preserve the exact pending batch and request ID across reconnects. Server retry
+identity is the batch request ID, not a global deduplication of span/sequence IDs.
+
+The daemon emits canonical native JSONL using PurRDF's writer and native integer/
+floating codecs, then uses the existing atomic record/dependency builder and
+durable receipt law. The stored source is this explicit structured-event
+representation, not a claim of preserving an unseen textual producer log. Each
+event is one independently retained occurrence. Field wrappers retain Rust kind
+alongside queryable values. Floating fields always retain all 64 bits, including
+negative zero and NaN payloads; nonfinite values have an explicit classification
+and no fabricated JSON numeric value. Binary fields retain exact native hex.
+Debug/error renderings keep their explicit kinds. Span snapshots/lifecycle and
+follows-from references are source evidence; a separate normalized diagnostic
+RDF relationship view is still required.
+
+Typed events declare `/event_time` with Unix-millisecond interpretation through
+the existing immutable source profile operation before artifact ingestion. An
+incompatible existing source profile refuses the batch. A new profile may remain
+if subsequent artifact admission fails; no event prefix or acceptance receipt is
+published on that failure. Acceptance/expiry clocks remain server clocks.
+
+Release acceptance verifies all field variants, repeated names, escaped text,
+span context, exact timestamp evidence spans, temporal/text retrieval, unchanged
+receipts after restart, changed NaN-payload conflict, and oversized/invalid input
+refusal. Automatic two-second batching/reconnection, drop counters, tracing
+callbacks, buffered writes and flush/shutdown watermarks remain unfinished.
+
+The owned development daemon was replaced with this qualified schema-11 build
+on 2026-10-07. It retained store
+`store:46c88e949ccec658600b66c7becd5bb7`, store format `sparrow.store/5`, and the
+existing private socket. PID at verification was `1407618`. A live call through
+the standalone producer example accepted one 380-byte event as
+`artifact:e6c56d2df4de85a31e00c2a01cb4fda9` with record
+`record:be55d651c34cd9c68b389dae6f9b0511`; identical arguments returned the same
+durable receipt. Temporal/text retrieval found exactly that record at producer
+time `2023-11-14T22:13:20.002Z`, boolean value search returned original `true`
+source bytes, and a complete byte export reproduced the declared event source.
+The source was synthetic; production sample files were untouched.
+
+```sh
+CARGO_BUILD_JOBS=4 cargo build --locked --release --workspace --bins --examples
+target/release/examples/events /home/paudley/.local/state/sparrow/development-v5/rpc.sock acceptance-schema11-events schema11-typed-event-v1 00112233445566778899aabbccddeeff 1700000000002 'allocation failed typed acceptance'
+```
+
+The example takes an explicit instance identity and timestamp so a retry can
+reproduce the same input. A new producer process must choose a fresh instance
+for new observations; the example is not the unfinished tracing logging layer.
 
 ```sh
 CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server

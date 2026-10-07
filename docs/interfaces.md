@@ -317,7 +317,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | Typed operation | Contract |
 | --- | --- |
 | `ingest`, `importBegin`/`importAppend`/`importGet`, `importSeal`/`importLayout`/`importPrepare`/`importPublish`/`importCancel` | Original bytes, occurrence identity and explicit durability. A partial stream cannot publish a complete artifact. |
-| Planned event batch operation | Preserve independent occurrences and client sequence/retry identities. |
+| `eventsIngest` | Bounded typed fields, independent event occurrences, producer instance/sequence identities, and stable batch retries. |
 | Planned flush and import status operations | Synchronization through a specified watermark; raw, projection, checkpoint and source-deletion state. |
 | `status` and planned capabilities operation | Operational status and supported profiles/limits. |
 | `artifactGet`, `recordGet`, `bytesRead` | Store-scoped metadata and exact bounded ranges. |
@@ -330,10 +330,15 @@ Artifact upload metadata accepts `source_name`, an optional existing `source_id`
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity
 uses the configured upload source. Format selects the interpretation profile;
 it does not authorize changing original bytes or supplying server receipt time.
-Event batches use `application/json` with a versioned `sparrow.events/1` envelope
-and client instance/sequence identities, or `application/x-ndjson` for a JSONL
-stream. Preserve event subspans through the shared JSON parser rather than
-round-tripping events through a lossy serialization.
+Typed `EventBatch` messages carry a 16-byte producer instance, ordered events,
+integer producer instants, severity/lifecycle enums, typed fields and span
+context. `eventsIngest` uses native JSON serialization to store each event as a
+`sparrow.events/1` JSONL record with independently queryable source evidence.
+String, boolean, signed/unsigned 64/128-bit integer, exact floating-point bits,
+binary, debug and error field variants remain distinguishable. Ordered field
+lists preserve repeated names. JSON/JSONL byte uploads remain available through
+the ordinary upload operations. Preserve event subspans through the shared JSON
+parser rather than round-tripping events through a lossy serialization.
 
 Large upload publication can be asynchronous. An accepted receipt is accompanied by
 an import ID and precise accepted/durability state; it does not imply ready
