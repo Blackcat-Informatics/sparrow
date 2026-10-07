@@ -2,6 +2,90 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "consume-watch-configuration"
+summary = "Validate explicit finished-file contracts, bounded identities/capacity and disjoint recursive roots through one configuration owner."
+home = "sparrow_server::config::ConsumeWatch::validate"
+entry_points = []
+spec = "docs/development-runtime.md: configured recursive completed consumption."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_cli_watch|validate_worker_watch)$']
+
+[[job]]
+id = "consume-discovery-observation"
+summary = "Observe regular files without generating candidate IN_OPEN, using a held no-symlink parent descriptor and the SDK generation capture owner."
+home = "sparrow_server::consumption::ClaimRoot::observe"
+entry_points = ["sparrow_server::consumption::ClaimRoot::directory", "sparrow_server::consumption::ClaimRoot::root_binding"]
+spec = "docs/development-runtime.md: configured recursive completed consumption."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(observe_scanned_file|observe_event_file)$']
+
+[[job]]
+id = "consume-event-coverage"
+summary = "Install bounded anchored directory watches before scans; reconcile uncertain coverage in a fresh descriptor epoch and clear stale readiness."
+home = "sparrow_server::watches::Detector::reconcile"
+entry_points = ["sparrow_server::watches::Detector::add_directory", "sparrow_server::watches::Detector::drain", "sparrow_server::watches::Detector::scan_step"]
+spec = "docs/development-runtime.md: configured recursive completed consumption."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(scan_startup_watch|scan_overflow_watch|scan_periodic_watch)$']
+
+[[job]]
+id = "consume-readiness"
+summary = "One bounded candidate registry resets quiet time on observed activity and revalidates exact generation before reservation."
+home = "sparrow_server::watches::Detector::candidate"
+entry_points = ["sparrow_server::watches::Detector::ready"]
+spec = "docs/development-runtime.md: configured recursive completed consumption."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(ready_scanned_file|ready_closed_file|ready_renamed_file)$']
+
+[[job]]
+id = "consume-worker"
+summary = "One owned worker drives native SDK publication, exact source retirement, finite retries and persistent-journal recovery for production configured watches."
+home = "sparrow_server::watches::run"
+entry_points = ["sparrow_server::watches::ConsumeWorker::start", "sparrow_server::watches::ConsumeWorker::shutdown"]
+spec = "docs/development-runtime.md: configured recursive completed consumption."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(run_new_claim_worker|run_recovery_claim_worker)$']
+
+[[job]]
+id = "consume-status"
+summary = "One bounded snapshot owner exposes coverage, deferral, persistent pending counts and failures through generated RPC and shared CLI/MCP rendering."
+home = "sparrow_server::watches::WatchRegistry::update"
+entry_points = ["sparrow_server::watches::WatchRegistry::snapshot", "sparrow_server::rpc::Rpc::with_watches"]
+spec = "docs/development-runtime.md: configured recursive completed consumption."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(read_cli_watch_status|read_mcp_watch_status)$']
+
+[[job]]
 id = "storage-physical-footprint"
 summary = "Measure all database filesystem bytes through one owner, retry complete observations when compaction removes an entry, and refuse an unstable or broken measurement without a partial sum."
 home = "sparrow_core::storage::Writer::physical_bytes"

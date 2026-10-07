@@ -14,6 +14,9 @@ use std::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Explicit finished-file consumption authority. Empty by default.
+    #[serde(default)]
+    pub consume: Vec<ConsumeWatch>,
     /// Intended buffered WAL synchronization interval.
     #[serde(default = "default_flush_interval")]
     pub buffered_flush_interval_ms: u32,
@@ -37,6 +40,49 @@ pub struct ServerConfig {
     pub text_lexicon_dir: PathBuf,
 }
 
+/// Producer contract required before a watcher can claim or retire source files.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerContract {
+    /// Producers hand off finished files and never append after handoff.
+    FinishedFiles,
+}
+
+/// Bounded recursive completed-input watch; no default deletion authority.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumeWatch {
+    /// Persistent watch identity, also bound into recovery journals.
+    pub id: String,
+    /// Absolute directory whose completed files may be consumed.
+    pub root: PathBuf,
+    /// Required explicit producer handoff promise.
+    pub producer_contract: ProducerContract,
+    /// Source label supplied to the canonical native import path.
+    pub source: String,
+    /// Existing typed SDK format name.
+    pub format: String,
+    /// Fresh observed stability interval after startup or lost event coverage.
+    #[serde(default = "default_quiet")]
+    pub quiet_ms: u32,
+    /// Maximum held recursive directory watches and scan cursors.
+    #[serde(default = "default_directories")]
+    pub max_directories: usize,
+    /// Maximum simultaneously tracked readiness candidates.
+    #[serde(default = "default_candidates")]
+    pub max_candidates: usize,
+}
+
+fn default_quiet() -> u32 {
+    30_000
+}
+fn default_directories() -> usize {
+    1024
+}
+fn default_candidates() -> usize {
+    4096
+}
+
 fn default_flush_interval() -> u32 {
     sparrow_core::DEFAULT_FLUSH_INTERVAL_MS
 }
@@ -51,6 +97,10 @@ impl ServerConfig {
         if config.socket_path.parent() != Some(config.data_dir.as_path()) {
             return Err("socket_path must be directly inside the private data_dir".into());
         }
+        if !config.consume.is_empty() && config.max_concurrent_requests < 2 {
+            return Err("consume requires at least two RPC connections".into());
+        }
+        ConsumeWatch::validate(&config.consume)?;
         Ok(config)
     }
 
@@ -70,5 +120,39 @@ impl ServerConfig {
         )?;
         std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o700))?;
         Ok(store)
+    }
+}
+
+impl ConsumeWatch {
+    pub(crate) fn validate(watches: &[Self]) -> Result<(), Box<dyn std::error::Error>> {
+        if watches.len() > 8 {
+            return Err("consume requires at most eight roots".into());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut roots = Vec::new();
+        for watch in watches {
+            if watch.id.is_empty()
+                || watch.id.len() > 128
+                || !ids.insert(&watch.id)
+                || !watch.root.is_absolute()
+                || watch.source.is_empty()
+                || watch.source.len() > 512
+                || watch.quiet_ms > 600_000
+                || !(1..=4096).contains(&watch.max_directories)
+                || !(1..=16384).contains(&watch.max_candidates)
+            {
+                return Err("consume requires unique bounded identities, absolute roots, quiet_ms <= 600000, max_directories 1..4096 and max_candidates 1..16384".into());
+            }
+            sparrow_client::parse_format(&watch.format)?;
+            let root = watch.root.canonicalize()?;
+            if roots
+                .iter()
+                .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))
+            {
+                return Err("consume roots must not overlap".into());
+            }
+            roots.push(root);
+        }
+        Ok(())
     }
 }

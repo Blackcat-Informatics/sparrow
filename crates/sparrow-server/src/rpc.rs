@@ -30,6 +30,7 @@ pub struct Rpc {
     requests: Arc<Semaphore>,
     max_artifact_bytes: usize,
     max_pin_members: usize,
+    watches: crate::watches::WatchRegistry,
 }
 
 impl Rpc {
@@ -45,7 +46,14 @@ impl Rpc {
             requests,
             max_artifact_bytes,
             max_pin_members,
+            watches: crate::watches::WatchRegistry::default(),
         }
+    }
+
+    /// Attach the daemon's one bounded configured-watch snapshot owner.
+    pub fn with_watches(mut self, watches: crate::watches::WatchRegistry) -> Self {
+        self.watches = watches;
+        self
     }
 
     async fn work<T: Send + 'static>(
@@ -1229,6 +1237,34 @@ impl wire::sparrow::Server for Rpc {
             Err(e) => failure(results.get().init_result(), e),
             Ok((value, durability)) => {
                 let mut out = results.get().init_result().init_ok();
+                let watches = self
+                    .watches
+                    .snapshot()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let mut states = out.reborrow().init_consume_watches(watches.len() as u32);
+                for (index, watch) in watches.into_iter().enumerate() {
+                    let mut state = states.reborrow().get(index as u32);
+                    state.set_id(&watch.id);
+                    state.set_root(&watch.root);
+                    state.set_coverage(if watch.covered {
+                        wire::WatchCoverage::Covered
+                    } else {
+                        wire::WatchCoverage::Reconciling
+                    });
+                    state.set_directories(watch.directories);
+                    state.set_candidates(watch.candidates);
+                    state.set_deferred(watch.deferred);
+                    state.set_pending_claims(watch.pending);
+                    state.set_completed_claims(watch.completed);
+                    state.set_reconciliations(watch.reconciliations);
+                    state.set_coverage_losses(watch.coverage_losses);
+                    sparrow_client::encode_optional(
+                        state.init_failure(),
+                        watch.failure,
+                        |mut out, value| out.set_value(&value),
+                        |mut out| out.set_absent(()),
+                    );
+                }
                 {
                     let mut state = out.reborrow().init_durability_status();
                     state.set_session_id(&durability.session_id);

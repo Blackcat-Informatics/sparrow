@@ -10,7 +10,8 @@ use super::{
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 
-const MAX_JOURNALS: usize = 16;
+/// Maximum simultaneously active source-ownership journals in one store.
+pub const MAX_CONSUMPTION_JOURNALS: usize = 16;
 const JOURNAL_BYTES: usize = 8192;
 pub(super) const FORMAT: &[u8] = b"sparrow.store/6";
 
@@ -411,7 +412,7 @@ impl Store {
             }
             return Ok(previous);
         }
-        if writer.count_prefix("consumption:")? >= MAX_JOURNALS as u64 {
+        if writer.count_prefix("consumption:")? >= MAX_CONSUMPTION_JOURNALS as u64 {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "16 consumption journals occupied; resolve claims before reserving more",
@@ -443,7 +444,7 @@ impl Store {
             let Some(id) = name.strip_prefix(b"consumption:") else {
                 break;
             };
-            if journals.len() >= MAX_JOURNALS {
+            if journals.len() >= MAX_CONSUMPTION_JOURNALS {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
                     "active consumption registry exceeds its admitted bound",

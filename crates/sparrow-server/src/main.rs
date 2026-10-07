@@ -15,17 +15,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = ServerConfig::read(Path::new(&args[1]))?;
     let store = config.open_store()?;
+    let watches = sparrow_server::watches::WatchRegistry::default();
+    let mut consumer = sparrow_server::watches::ConsumeWorker::start(
+        store.clone(),
+        &config.consume,
+        config.socket_path.clone(),
+        watches.clone(),
+    )?;
     // Refuse an existing socket rather than unlink another listener's endpoint.
     let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
     std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let connections = Arc::new(Semaphore::new(config.max_concurrent_requests));
-    let client: sparrow::Client = capnp_rpc::new_client(Rpc::new(
-        store.clone(),
-        operations,
-        config.max_artifact_bytes,
-        config.max_pin_members,
-    ));
+    let client: sparrow::Client = capnp_rpc::new_client(
+        Rpc::new(
+            store.clone(),
+            operations,
+            config.max_artifact_bytes,
+            config.max_pin_members,
+        )
+        .with_watches(watches),
+    );
     eprintln!(
         "sparrowd: store={} capnp={} data={}",
         store.store_id()?,
@@ -33,7 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.data_dir.display()
     );
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
+    let serving = local.run_until(async {
+        let serving = async {
+        let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
         let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(30));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut synchronize = tokio::time::interval(std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)));
@@ -43,6 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => { signal?; break; }
+                _ = consumer_health.tick(), if consumer.is_some() => {
+                    if consumer.as_ref().is_some_and(sparrow_server::watches::ConsumeWorker::is_finished) {
+                        consumer.take().expect("worker checked above").shutdown().await?;
+                        return Err("completed-consumption worker terminated unexpectedly".into());
+                    }
+                }
                 _ = synchronize.tick() => {
                     let owner = store.clone();
                     if let Err(error) = tokio::task::spawn_blocking(move || owner.flush_buffered()).await? {
@@ -71,8 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Ok::<(), Box<dyn std::error::Error>>(())
-    }).await?;
+        }.await;
+        if let Some(worker) = consumer.take() { worker.shutdown().await?; }
+        serving
+    }).await;
     store.flush()?;
     std::fs::remove_file(&config.socket_path)?;
-    Ok(())
+    serving
 }

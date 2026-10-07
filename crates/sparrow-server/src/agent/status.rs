@@ -50,7 +50,36 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
                 wire::optional_text::Value(value) => Value::from(value?.to_str()?),
             },
         );
+    let mut watches = Vec::new();
+    for watch in value.get_consume_watches()? {
+        let status = Object::new()
+            .with("id", watch.get_id()?.to_str()?)
+            .with("root", watch.get_root()?.to_str()?)
+            .with(
+                "coverage",
+                match watch.get_coverage()? {
+                    wire::WatchCoverage::Covered => "covered",
+                    wire::WatchCoverage::Reconciling => "reconciling",
+                },
+            )
+            .with("directories", u64::from(watch.get_directories()))
+            .with("candidates", u64::from(watch.get_candidates()))
+            .with("deferred", watch.get_deferred())
+            .with("pending_claims", u64::from(watch.get_pending_claims()))
+            .with("completed_claims", watch.get_completed_claims().to_string())
+            .with("reconciliations", watch.get_reconciliations().to_string())
+            .with("coverage_losses", watch.get_coverage_losses().to_string())
+            .with(
+                "failure",
+                match watch.get_failure()?.which()? {
+                    wire::optional_text::Absent(()) => Value::Null,
+                    wire::optional_text::Value(value) => Value::from(value?.to_str()?),
+                },
+            );
+        watches.push(Value::from(status));
+    }
     let output = Object::new()
+        .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("store_format", value.get_store_format()?.to_str()?)

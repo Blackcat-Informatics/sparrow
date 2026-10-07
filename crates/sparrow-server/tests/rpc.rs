@@ -12,6 +12,380 @@ use std::{
 
 struct Daemon(Child);
 
+fn append_consume_config(
+    config: &Path,
+    root: &Path,
+    quiet_ms: u32,
+    directories: usize,
+    candidates: usize,
+) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(config)
+        .unwrap();
+    writeln!(file, "\n[[consume]]\nid = \"completed\"\nroot = {root:?}\nproducer_contract = \"finished_files\"\nsource = \"consume-acceptance\"\nformat = \"jsonl\"\nquiet_ms = {quiet_ms}\nmax_directories = {directories}\nmax_candidates = {candidates}").unwrap();
+}
+
+async fn watch_until(
+    client: &wire::sparrow::Client,
+    condition: impl Fn(wire::consume_watch_status::Reader<'_>) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = client.status_request().send().promise.await.unwrap();
+        let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+        let watches = status.get_consume_watches().unwrap();
+        assert_eq!(watches.len(), 1);
+        if condition(watches.get(0)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watch status never met its acceptance condition: {:?}",
+            watches.get(0)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn consumption_configuration_requires_explicit_contract_and_disjoint_bounded_roots() {
+    use sparrow_server::ServerConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("completed");
+    std::fs::create_dir(&root).unwrap();
+    let store = dir.path().join("store");
+    let config = write_server_config(dir.path(), &store, &store.join("rpc.sock"));
+    append_consume_config(&config, &root, 30_000, 1024, 4096);
+    let valid = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(
+        ServerConfig::read(&config).unwrap().consume[0].quiet_ms,
+        30_000
+    );
+    for altered in [
+        valid.replace("producer_contract = \"finished_files\"\n", ""),
+        valid.replace("finished_files", "arbitrary_open_files"),
+        valid.replace("max_candidates = 4096", "max_candidates = 0"),
+        valid.replace("quiet_ms = 30000", "quiet_ms = 600001"),
+        valid.replace("max_concurrent_requests = 4", "max_concurrent_requests = 1"),
+    ] {
+        std::fs::write(&config, altered).unwrap();
+        assert!(ServerConfig::read(&config).is_err());
+    }
+    let child = root.join("nested");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(&config, &valid).unwrap();
+    append_consume_config(&config, &child, 30_000, 1024, 4096);
+    let overlap = std::fs::read_to_string(&config).unwrap().replacen(
+        "id = \"completed\"",
+        "id = \"other\"",
+        1,
+    );
+    std::fs::write(&config, overlap).unwrap();
+    assert!(
+        ServerConfig::read(&config)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("overlap")
+    );
+    assert!(!root.join(".sparrow-inflight").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopened_inputs() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use std::{io::Write, os::unix::fs::symlink};
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir_all(root.join("nested")).unwrap();
+            let store = dir.path().join("store");
+            let socket = store.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store, &socket);
+            append_consume_config(&config, &root, 600, 16, 1);
+            let inputs = [
+                (
+                    "a.jsonl",
+                    "startup-a",
+                    b"{\"message\":\"startup-a\"}\r\n".as_slice(),
+                ),
+                (
+                    "b.jsonl",
+                    "startup-b",
+                    b"{\"message\":\"startup-b\"}\n".as_slice(),
+                ),
+                (
+                    "nested/c.jsonl",
+                    "startup-c",
+                    b"{\"message\":\"startup-c\"}".as_slice(),
+                ),
+            ];
+            for (name, _, bytes) in inputs {
+                std::fs::write(root.join(name), bytes).unwrap();
+            }
+            let outside = dir.path().join("outside.jsonl");
+            std::fs::write(&outside, b"outside evidence").unwrap();
+            symlink(&outside, root.join("symlink.jsonl")).unwrap();
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                root.join("fifo"),
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .unwrap();
+            let mut daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            let client = producer.capability();
+            watch_until(client, |watch| watch.get_deferred()).await;
+            watch_until(client, |watch| {
+                watch.get_completed_claims() == 3 && watch.get_pending_claims() == 0
+            })
+            .await;
+            for (name, message, expected) in inputs {
+                assert!(!root.join(name).exists());
+                let mut request = client.values_search_request();
+                let mut query = request.get().init_query();
+                query.reborrow().init_path().set_value("/message");
+                query.reborrow().init_decoded().set_value(message);
+                let mut scope = query.init_scope();
+                scope
+                    .reborrow()
+                    .init_source()
+                    .set_value("consume-acceptance");
+                scope.init_received_before().set_unix_millis(u64::MAX);
+                let response = request.send().promise.await.unwrap();
+                let values = rpc_ok(response.get().unwrap().get_result().unwrap());
+                assert_eq!(values.get_rows().unwrap().len(), 1);
+                let row = values.get_rows().unwrap().get(0);
+                let mut request = client.bytes_read_request();
+                let mut read = request.get().init_request();
+                read.set_length(expected.len() as u32);
+                let mut evidence = read.init_evidence();
+                evidence.set_store_id(&producer.discovery().store_id);
+                evidence.set_artifact(row.get_artifact_id().unwrap());
+                let response = request.send().promise.await.unwrap();
+                assert_eq!(
+                    rpc_ok(response.get().unwrap().get_result().unwrap())
+                        .get_data()
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(std::fs::read(&outside).unwrap(), b"outside evidence");
+            assert!(
+                root.join("symlink.jsonl")
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(root.join("fifo").exists());
+            // A new recursive directory forces a fresh event-coverage epoch.
+            std::fs::create_dir(root.join("new")).unwrap();
+            let changing = root.join("new/changing.jsonl");
+            std::fs::write(&changing, b"{\"message\":\"reopened\"}").unwrap();
+            watch_until(client, |watch| {
+                watch.get_coverage().unwrap() == wire::WatchCoverage::Covered
+                    && watch.get_directories() == 3
+                    && watch.get_candidates() == 1
+            })
+            .await;
+            // Repeated observed writable reopen/append activity exceeds the quiet
+            // interval overall, but each individual stable interval remains too short.
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&changing)
+                    .unwrap();
+                file.write_all(b" ").unwrap();
+                drop(file);
+                assert!(changing.exists());
+            }
+            watch_until(client, |watch| watch.get_completed_claims() == 4).await;
+            assert!(!changing.exists());
+            // A later generation at a consumed path is its own input occurrence.
+            std::fs::write(root.join("a.jsonl"), inputs[0].2).unwrap();
+            watch_until(client, |watch| watch.get_completed_claims() == 5).await;
+            let status = cli(&socket, &["status"]);
+            assert_eq!(
+                status["consume_watches"][0]["completed_claims"].as_str(),
+                Some("5")
+            );
+            assert_eq!(status["live_records"].as_str(), Some("5"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/6"));
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
+                rustix::process::Signal::INT,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while daemon.0.try_wait().unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "consumer graceful shutdown stalled"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!socket.exists());
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn configured_consumer_recovers_confirmed_journal_and_reports_late_write_without_retirement()
+{
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::{
+                ServerConfig,
+                consumption::{ClaimRoot, Recovery},
+                watches::{ConsumeWorker, WatchRegistry},
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 10_000, 16, 4);
+            let (confirmed, blocked) = {
+                let store = ServerConfig::read(&config).unwrap().open_store().unwrap();
+                let owner = ClaimRoot::open(store.clone(), "completed", &root).unwrap();
+                let mut ids = Vec::new();
+                for name in ["confirmed.jsonl", "blocked.jsonl"] {
+                    let path = root.join(name);
+                    std::fs::write(&path, format!("{{\"message\":\"{name}\"}}\n")).unwrap();
+                    let identity =
+                        sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap());
+                    let journal = owner
+                        .reserve(Path::new(name), identity, "consume-acceptance", "jsonl")
+                        .unwrap();
+                    assert!(matches!(
+                        owner
+                            .recover(&journal.import_id, sparrow_server::now().unwrap())
+                            .unwrap(),
+                        Recovery::Claimed(_)
+                    ));
+                    ids.push(journal.import_id);
+                }
+                assert!(
+                    ConsumeWorker::start(store, &[], socket.clone(), WatchRegistry::default())
+                        .is_err()
+                );
+                (ids.remove(0), ids.remove(0))
+            };
+            std::fs::write(
+                root.join("confirmed.jsonl"),
+                b"replacement source remains independent",
+            )
+            .unwrap();
+            let private = root.join(".sparrow-inflight");
+            std::fs::write(private.join(&blocked), b"unexpected late writer mutation").unwrap();
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_completed_claims() == 1
+                    && watch.get_pending_claims() == 1
+                    && matches!(
+                        watch.get_failure().unwrap().which().unwrap(),
+                        wire::optional_text::Value(_)
+                    )
+            })
+            .await;
+            assert!(!private.join(&confirmed).exists());
+            assert_eq!(
+                std::fs::read(private.join(&blocked)).unwrap(),
+                b"unexpected late writer mutation"
+            );
+            assert_eq!(
+                std::fs::read(root.join("confirmed.jsonl")).unwrap(),
+                b"replacement source remains independent"
+            );
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["live_records"].as_str(), Some("1"));
+            assert!(
+                status["consume_watches"][0]["failure"]
+                    .as_str()
+                    .unwrap()
+                    .contains("changed")
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn consume_coverage_limit_and_root_replacement_fail_without_source_retirement() {
+    for replace_root in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("completed");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/evidence.jsonl"), b"preserved evidence").unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        append_consume_config(
+            &config,
+            &root,
+            10_000,
+            if replace_root { 16 } else { 1 },
+            16,
+        );
+        let mut daemon = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+                .arg("--config")
+                .arg(&config)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let preserved = if replace_root {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !socket.exists() {
+                assert!(daemon.0.try_wait().unwrap().is_none());
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let old = dir.path().join("old-root");
+            std::fs::rename(&root, &old).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("replacement.jsonl"), b"replacement evidence").unwrap();
+            old
+        } else {
+            root.clone()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = daemon.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lost watch coverage was not a terminal visible refusal"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(!status.success());
+        assert!(
+            !socket.exists(),
+            "terminal daemon left its owned socket behind"
+        );
+        assert_eq!(
+            std::fs::read(preserved.join("nested/evidence.jsonl")).unwrap(),
+            b"preserved evidence"
+        );
+        if replace_root {
+            assert_eq!(
+                std::fs::read(root.join("replacement.jsonl")).unwrap(),
+                b"replacement evidence"
+            );
+        }
+    }
+}
+
 #[test]
 fn anchored_claim_open_refuses_fifos_and_replaced_coordination_locks() {
     use sparrow_client::CompletedFileIdentity;

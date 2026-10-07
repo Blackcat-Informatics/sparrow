@@ -2,8 +2,98 @@
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current development executable implements schema 13; the schema sections
+The current source implements schema 14; the schema sections
 below retain their historical qualification evidence.
+
+## Configured recursive completed consumption
+
+Schema 14 adds typed `Status.consumeWatches`; the daemon now starts one owned
+Linux consumption worker for explicit `[[consume]]` roots. The development
+configuration still has no producer roots. An example for a directory that the
+operator explicitly owns and authorizes Sparrow to consume is:
+
+```toml
+[[consume]]
+id = "completed-application-dumps"
+root = "/srv/application/completed"
+producer_contract = "finished_files"
+source = "application-dumps"
+format = "jsonl"
+quiet_ms = 30000
+max_directories = 1024
+max_candidates = 4096
+```
+
+The contract is required: producers hand off finished regular files and never
+write them afterward. Quiet time is an observation within that contract, not
+a writer lock. Ordinary imports remain non-destructive. Configuration rejects
+overlapping roots, unknown fields, missing contracts, unbounded capacities and
+incompatible format names. Root admission rejects symlink components and overlap
+with Sparrow's data directory. At most eight roots are admitted, with at least
+two RPC connections so the owned SDK connection can coexist with callers.
+
+Each recursive directory is opened with the existing anchored `openat2` owner
+and watched before it is scanned. Linux inotify has no dirfd registration API;
+the only followed alias is the kernel-owned `/proc/self/fd/<held-directory>`.
+Candidate metadata also uses that held-parent alias and `symlink_metadata`,
+without opening the candidate or generating a self-induced `IN_OPEN`. The SDK's
+`CompletedFileIdentity::capture` remains the sole generation observation owner.
+Symlinks, FIFOs, devices and sockets are excluded. Native `statat` handles unknown
+directory-entry types without assuming that they are regular files.
+
+Scans advance by 64 entries per 50 ms worker tick. Candidate and rename maps,
+directory descriptors and scan queues have explicit capacities. Candidate
+saturation preserves excess files, exposes `deferred`, and schedules a new scan
+as capacity becomes available. The scanner can finish coverage while candidate
+capacity is full, so a full candidate registry does not prevent draining its
+admitted prefix. Periodic reconciliation begins after complete scan coverage,
+at the larger of 60 seconds or twice the quiet interval plus one second; it
+cannot continually restart an unfinished large scan.
+
+Open/write/attribute/creation/close-write/publication events reset quiet time.
+Read-only closes are not completion signals. Rename cookies reconcile candidate
+movement, with inode identity still checked at the destination. Overflow,
+ignored/unmounted directories, directory moves and recursive namespace changes
+start a new inotify descriptor epoch and clear stale readiness. An event drain
+is bounded at 4096 events; if that limit can discard prefetched Reader bytes,
+the entire coverage epoch is invalidated before further claims. No claim is
+admitted during reconciliation, and completion of coverage starts fresh quiet
+timers. Directory/root/lock coverage failures are actionable terminal daemon
+errors; they do not authorize source retirement. The daemon joins the worker,
+flushes storage and removes its owned endpoint on an orderly terminal path.
+
+The worker resumes the existing bounded persistent journal registry before
+admitting new files. Recovery, SDK upload and private-source unlink share the
+previously qualified `ClaimRoot` implementations. RPC discovery has a finite
+10-second deadline and claim publication a 45-second deadline. Failure retains
+the original journal/request identity and retries after a five-second delay;
+it never substitutes a second source occurrence. Pending journals cannot be
+silently abandoned by deleting their watch from configuration. Shutdown stops
+admission and cancels asynchronous waiting while preserving recoverable claims.
+It joins while the server LocalSet still drives its owned Cap'n Proto connection.
+
+Typed status exposes configured ID/root, reconciliation or complete coverage,
+held directories, tracked candidates, deferred inputs, pending/completed claims,
+coverage epochs/losses and the latest bounded unresolved failure. CLI and stdio
+MCP use the same generated reply and renderer; no HTTP interface was added.
+The four new acceptance fixtures cover strict configuration, actual recursive
+daemon consumption with a one-candidate limit, original-byte queries, writable
+reopen deferral, newly created directories, later source generations, confirmed
+journal recovery, late-write preservation, directory coverage limits, root
+replacement and consumer shutdown. Samples and sibling services remain untouched.
+
+Qualification uses the normal `make check` gate: release Clippy with warnings
+denied, ten SDK units, five core units, 66 storage scenarios, 50 census units,
+five census gate fixtures, one server unit, 18 RPC/filesystem/MCP scenarios,
+doctests and the seeded census self-test. The pinned cross-workspace gate checks
+95 helper ownership jobs with zero distinct exceptions or unsanctioned groups.
+The signed commit's ordinary pre-commit hook runs the same gate on final source.
+
+Dynamic typed watch administration, explicit completion RPC, forced kernel
+overflow and watch-exhaustion injection, whole-process crash injection at every
+claim boundary, fairness across continuously busy roots, active-log tailing and
+whole-corpus memory/throughput acceptance remain unfinished. No reboot-persistent
+service or production producer handoff has been qualified by this change.
 
 ## Transport and present operations
 

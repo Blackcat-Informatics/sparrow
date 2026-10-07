@@ -77,6 +77,16 @@ struct Status {
   maxPinReadHandles @19 :UInt64; maxPinReadBytes @20 :UInt64; pinReadLeaseMs @21 :UInt64;
   maxEventBatchBytes @22 :UInt32; maxEventBatchEvents @23 :UInt32;
   durabilityStatus @24 :DurabilityStatus;
+  consumeWatches @25 :List(ConsumeWatchStatus);
+}
+
+enum WatchCoverage { reconciling @0; covered @1; }
+struct ConsumeWatchStatus {
+  id @0 :Text; root @1 :Text; coverage @2 :WatchCoverage;
+  directories @3 :UInt32; candidates @4 :UInt32; deferred @5 :Bool;
+  pendingClaims @6 :UInt32; completedClaims @7 :UInt64;
+  reconciliations @8 :UInt64; coverageLosses @9 :UInt64;
+  failure @10 :OptionalText;
 }
 
 struct WideInteger { high @0 :UInt64; low @1 :UInt64; }

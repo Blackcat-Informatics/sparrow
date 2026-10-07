@@ -5,9 +5,10 @@
 
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
 mod config;
-pub use config::ServerConfig;
+pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod transport;
+pub mod watches;
 pub use transport::serve_connection;
 
 mod rpc;

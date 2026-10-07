@@ -141,6 +141,66 @@ pub enum Recovery {
 }
 
 impl ClaimRoot {
+    /// Open a discovery directory beneath the held root without following symlinks.
+    pub(crate) fn directory(&self, relative: &Path) -> Result<File, Error> {
+        open(
+            &self.root,
+            if relative.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                relative
+            },
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            BENEATH,
+        )
+    }
+
+    /// Verify the configured root still names this owner, including its parents.
+    pub(crate) fn root_binding(&self, path: &Path) -> Result<(), Error> {
+        self.private_namespace()?;
+        let linked = open(
+            fs::CWD,
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            ResolveFlags::NO_SYMLINKS,
+        )?;
+        let linked = linked.metadata()?;
+        let held = self.root.metadata()?;
+        if linked.dev() != held.dev() || linked.ino() != held.ino() {
+            return Err(Error::State(
+                "configured consume root changed; preserve pending claims and restore its exact binding",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Observe a directory-relative file without opening it or generating IN_OPEN.
+    /// The only followed alias is the kernel-owned procfs descriptor for this held parent.
+    pub(crate) fn observe(&self, relative: &Path) -> Result<Option<CompletedFileIdentity>, Error> {
+        use std::os::fd::AsRawFd;
+        let parent = match self.parent(relative) {
+            Ok(parent) => parent,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let name = relative
+            .file_name()
+            .ok_or(Error::State("discovery requires a relative filename"))?;
+        let path =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name);
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.dev() != self.root.metadata()?.dev() {
+            return Ok(None);
+        }
+        Ok(Some(CompletedFileIdentity::capture(&metadata)))
+    }
+
     /// Open an admitted producer root; never follow symlinks or overlap store data.
     /// Creates only the excluded private claim directory and its ownership lock.
     pub fn open(store: Store, watch: &str, path: &Path) -> Result<Self, Error> {

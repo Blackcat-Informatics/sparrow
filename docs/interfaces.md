@@ -432,9 +432,15 @@ after these checks and keeps its immutable pending body and charge on a
 permanent receipt mismatch. Ingestion may already have committed: the refusal
 certifies no producer retirement or deletion, and does not roll back that write.
 
-The completed-consumption claim journal, watch administration, inotify workers,
-and source-unlink recovery remain required implementation work. Ordinary upload
-continues to preserve every caller source.
+The daemon now admits explicit `[[consume]]` configuration, with the required
+`producer_contract = "finished_files"`. The owned recursive inotify worker
+uses the durable claim journal and the SDK descriptor upload path before retiring
+the exact private source. Schema 14 `status.consumeWatches` reports coverage,
+bounded candidates/deferral, pending claims, completion counts and failures;
+the CLI and stdio MCP share its rendering. No live producer roots are configured
+in the development daemon. Dynamic typed watch administration, forced-overflow
+qualification, and whole-process crash injection at every filesystem boundary
+remain unfinished. Ordinary upload continues to preserve every caller source.
 
 ## 6. CLI
 
