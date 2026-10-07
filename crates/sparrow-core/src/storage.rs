@@ -45,6 +45,22 @@ fn validate_ingest_labels(request_id: &str, source: &str, format: &str) -> Resul
     Ok(())
 }
 
+fn record_ends<'a>(
+    format: &str,
+    bytes: &'a [u8],
+    complete: bool,
+) -> impl Iterator<Item = usize> + 'a {
+    let lines = ["jsonl", "log"].contains(&format);
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, byte)| (lines && *byte == b'\n').then_some(index + 1))
+        .chain(
+            (complete && (!lines || (!bytes.is_empty() && bytes.last() != Some(&b'\n'))))
+                .then_some(bytes.len()),
+        )
+}
+
 /// Typed failures from admission, evidence lifetime, and storage.
 #[derive(Debug)]
 pub struct Error {
@@ -748,17 +764,7 @@ impl Store {
         let profile = crate::projection::json_profile()?;
         let markdown = crate::projection::markdown_profile()?;
         let mut start = 0;
-        let boundaries = if ["jsonl", "log"].contains(&format) {
-            bytes
-                .iter()
-                .enumerate()
-                .filter(|(_, b)| **b == b'\n')
-                .map(|(i, _)| i + 1)
-                .chain((!bytes.is_empty() && bytes.last() != Some(&b'\n')).then_some(bytes.len()))
-                .collect::<Vec<_>>()
-        } else {
-            vec![bytes.len()]
-        };
+        let boundaries = record_ends(format, bytes, true).collect::<Vec<_>>();
         if boundaries.len() > writer.config.max_records {
             return Err(Error::new(
                 "RESOURCE_LIMIT",

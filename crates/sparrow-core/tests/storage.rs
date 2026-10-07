@@ -8,6 +8,233 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn streaming_layout_preserves_cross_chunk_delimiters_long_records_and_pages() {
+    use sparrow_core::{IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut input = vec![b'x'; IMPORT_CHUNK_BYTES - 1];
+    input.extend_from_slice(b"\r\n"); // CR and LF cross a staging chunk boundary.
+    for _ in 0..IMPORT_LAYOUT_PAGE_RECORDS {
+        input.extend_from_slice(b"\n");
+    }
+    input.extend_from_slice(&vec![0xff; 130 * IMPORT_CHUNK_BYTES + 3]);
+    input.extend_from_slice(b"\0unterminated");
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
+    );
+    let journal = store
+        .import_begin(
+            "layout",
+            "copied-bin",
+            "jsonl",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .import_prepare_layout(&journal.id, 0)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate() {
+        store
+            .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
+            .unwrap();
+    }
+    store.import_seal(&journal.id, 0).unwrap();
+    let ready = store.import_prepare_layout(&journal.id, 0).unwrap();
+    assert!(ready.layout_complete);
+    assert_eq!(ready.layout_records, 130);
+    assert_eq!(store.import_prepare_layout(&journal.id, 0).unwrap(), ready);
+    let first = store.import_layout_page(&journal.id, 0, 0).unwrap();
+    assert_eq!(first.records.len(), IMPORT_LAYOUT_PAGE_RECORDS);
+    assert_eq!(first.next_index, Some(128));
+    assert_eq!(first.records[0].byte_end, IMPORT_CHUNK_BYTES as u64 + 1);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let last = store.import_layout_page(&journal.id, 128, 0).unwrap();
+    assert_eq!(last.records.len(), 2);
+    assert_eq!(last.next_index, None);
+    assert_eq!(last.total_records, 130);
+    let mut offset = 0;
+    for row in first.records.iter().chain(&last.records) {
+        assert_eq!(row.byte_start, offset);
+        let bytes = &input[row.byte_start as usize..row.byte_end as usize];
+        assert_eq!(
+            row.payload_id,
+            format!(
+                "blake3:{}",
+                purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+            )
+        );
+        offset = row.byte_end;
+    }
+    assert_eq!(offset, input.len() as u64);
+    assert_eq!(
+        store
+            .import_layout_page(&journal.id, 1, 0)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        store
+            .import_layout_page(&journal.id, 256, 0)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    assert!(store.records(0).unwrap().is_empty());
+    store.import_cancel(&journal.id, 1).unwrap();
+    assert_eq!(store.import_reclaim(1).unwrap(), 128);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.import_reclaim(1).unwrap(),
+        input.len().div_ceil(IMPORT_CHUNK_BYTES) as u64 + 2 - 128
+    );
+    assert_eq!(
+        store.import_get(&journal.id, 1).unwrap_err().code,
+        "NOT_FOUND"
+    );
+}
+
+#[test]
+fn streaming_layout_record_limits_leave_recoverable_private_pages() {
+    use sparrow_core::IMPORT_LAYOUT_PAGE_RECORDS;
+    let dir = tempfile::tempdir().unwrap();
+    let mut limited = config();
+    limited.max_records = IMPORT_LAYOUT_PAGE_RECORDS;
+    let store = Store::open(dir.path(), limited).unwrap();
+    let input = vec![b'\n'; IMPORT_LAYOUT_PAGE_RECORDS + 1];
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
+    );
+    let journal = store
+        .import_begin(
+            "over-limit",
+            "copied-log",
+            "log",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    store.import_append(&journal.id, 0, &input, 0).unwrap();
+    store.import_seal(&journal.id, 0).unwrap();
+    assert_eq!(
+        store
+            .import_prepare_layout(&journal.id, 0)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    let partial = store.import_get(&journal.id, 0).unwrap();
+    assert!(!partial.layout_complete);
+    assert_eq!(partial.layout_records, 128);
+    assert_eq!(
+        store
+            .import_layout_page(&journal.id, 0, 0)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .import_prepare_layout(&journal.id, 1)
+            .unwrap()
+            .layout_records,
+        129
+    );
+    assert_eq!(
+        store
+            .import_layout_page(&journal.id, 128, 1)
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
+    store.import_cancel(&journal.id, 1).unwrap();
+    assert_eq!(store.import_reclaim(1).unwrap(), 3);
+    let empty_digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(b"").as_bytes())
+    );
+    for format in ["log", "jsonl", "json", "markdown", "opaque"] {
+        let journal = store
+            .import_begin(format, "empty", format, 0, &empty_digest, 0)
+            .unwrap();
+        store.import_seal(&journal.id, 0).unwrap();
+        let manifest = store.import_prepare_layout(&journal.id, 0).unwrap();
+        let count = u64::from(!["log", "jsonl"].contains(&format));
+        assert_eq!(manifest.layout_records, count);
+        assert_eq!(
+            store
+                .import_layout_page(&journal.id, 0, 0)
+                .unwrap()
+                .records
+                .len() as u64,
+            count
+        );
+    }
+}
+
+#[test]
+fn broken_staging_layouts_refuse_reads_and_remain_reclaimable() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = b"one\ntwo\n";
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = store
+        .import_begin(
+            "broken-layout",
+            "copy",
+            "log",
+            input.len() as u64,
+            &digest,
+            0,
+        )
+        .unwrap();
+    store.import_append(&journal.id, 0, input, 0).unwrap();
+    store.import_seal(&journal.id, 0).unwrap();
+    store.import_prepare_layout(&journal.id, 0).unwrap();
+    drop(store);
+    let key = format!("import-layout:{}:{:020}", journal.id, 0);
+    for remove in [false, true] {
+        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        if remove {
+            db.delete(&key).unwrap();
+        } else {
+            db.put(&key, b"invalid layout").unwrap();
+        }
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store
+                .import_layout_page(&journal.id, 0, 0)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        assert!(store.records(0).unwrap().is_empty());
+    }
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.import_cancel(&journal.id, 1).unwrap();
+    assert_eq!(store.import_reclaim(1).unwrap(), 2);
+}
+
+#[test]
 fn streaming_journal_recovers_after_owned_writer_sigkill() {
     use sparrow_core::IMPORT_CHUNK_BYTES;
     use std::io::{BufRead, Write};

@@ -765,7 +765,7 @@ preserves the configured maintenance reserve.
 Sealing checks every chunk length/digest and computes the declared whole-input
 identity with PurRDF's bounded streaming BLAKE3 engine. It does not buffer the
 whole file. Cancellation ends the lease durably. Maintenance reclaims at most
-128 expired chunks per call and atomically advances each journal's cleanup
+128 expired chunks or layout pages per call and atomically advances each journal's cleanup
 cursor; canceled/expired inputs cannot be read or resumed during cleanup.
 Physical blob/WAL reclamation still depends on native engine maintenance.
 
@@ -785,3 +785,44 @@ The full `make check` gate passed with 41 storage scenarios, including all three
 new streaming journal scenarios, release Clippy with warnings denied, all other
 workspace tests, seeded census self-tests and all 19 helper-ledger jobs. No
 distinct exceptions or unsanctioned isomorphic groups were introduced.
+
+### Private paged record layouts
+
+`import_prepare_layout` now prepares exact source record spans and canonical
+record-byte BLAKE3 identities after sealing. It streams the checked raw chunks
+through native hashers and retains at most one 64 KiB chunk and one 128-record
+page, including for records larger than the buffered artifact limit. Buffered
+ingestion and layout preparation call the same raw delimiter implementation.
+CRLF remains intact, delimiters belong to their preceding record, and a
+completed final unterminated line becomes a record. Empty JSONL/log inputs
+have zero records; empty JSON, Markdown and opaque artifacts have one record.
+
+Each private page is at most 32 KiB, carries a checked native content digest,
+and commits atomically with the journal's prepared-record counter. The complete
+layout flag is committed only after all byte spans and the complete raw digest
+have been checked. Record-count or disk-pressure refusals retain private partial
+pages and raw staging. A retry rebuilds the deterministic pages without creating
+occurrences and preserves previous cleanup coverage. Old raw-only journals
+decode with an explicitly unprepared layout.
+
+`import_layout_page` requires a complete layout and an aligned record ordinal,
+returns at most 128 spans plus the complete count and next ordinal, validates
+source ranges/ordering and contiguous neighboring pages, and uses the same
+fixed recovery lease. Missing/damaged pages are storage failures rather than
+empty results. Cancellation/expiry cleanup shares its 128-unit budget between
+raw chunks and layout pages and resumes both counters after reopen.
+
+Qualification covers CRLF split across chunks, empty records, a binary final
+unterminated record larger than the buffered artifact limit, 130 records across
+two pages, native record-digest identity, empty inputs for every format, partial
+record-limit refusal followed by reopen/retry, and damaged/missing page refusal.
+Cleanup removes both raw and layout pages across a bounded restart boundary.
+These layouts remain unpublished core preparation. Complete artifact/record
+publication, shared native projection integration and Cap'n Proto streaming
+caller wiring are still required; the development daemon still uses buffered
+import.
+
+The full `make check` gate passed for the layout change with 44 storage
+scenarios, all other workspace tests, release Clippy with warnings denied,
+seeded census self-tests and all 21 helper-ledger jobs. No distinct exceptions
+or unsanctioned isomorphic groups were added.

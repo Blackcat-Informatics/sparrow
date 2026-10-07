@@ -419,3 +419,33 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^validate_import_labels$']
+
+[[job]]
+id = "raw-record-boundaries"
+summary = "Frame exact completed or streaming input record ends without interpreting, normalizing or dropping raw bytes."
+home = "sparrow_core::storage::record_ends"
+entry_points = []
+spec = "docs/development-runtime.md: private paged record layouts and shared buffered/staged framing."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(split_log_records|jsonl_record_ends)$']
+
+[[job]]
+id = "staged-record-layout"
+summary = "Build bounded durable record span pages and native record digests from sealed exact input chunks."
+home = "sparrow_core::Store::import_prepare_layout"
+entry_points = []
+spec = "docs/development-runtime.md: unpublished layout preparation, deterministic retries and recovery."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(prepare_import_layout|build_record_layout)$']

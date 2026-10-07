@@ -4,8 +4,8 @@
 //! Durable raw staging, separate from accepted evidence and derived indexes.
 
 use super::{
-    CHUNK, Catalog, Error, RETRY_WINDOW, Store, Writer, blake3, hex, integer, parse, put,
-    read_field, validate_ingest_labels,
+    CHUNK, Catalog, Error, RETRY_WINDOW, Store, Writer, blake3, hex, integer, json, parse, put,
+    read_field, record_ends, validate_ingest_labels,
 };
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
@@ -15,6 +15,9 @@ pub const IMPORT_CHUNK_BYTES: usize = CHUNK;
 const MAX_IMPORTS: usize = 16;
 const MANIFEST_BYTES: usize = 8192;
 const RECLAIM_CHUNKS: u64 = 128;
+/// Maximum record spans in one immutable layout page.
+pub const IMPORT_LAYOUT_PAGE_RECORDS: usize = 128;
+const LAYOUT_BYTES: usize = 32 * 1024;
 
 /// A recoverable unpublished input. Sealing verifies bytes, but does not accept
 /// evidence or authorize producer deletion.
@@ -38,7 +41,12 @@ pub struct ImportManifest {
     pub expires_at: u64,
     /// Complete bytes have been verified against the declared identity.
     pub sealed: bool,
+    /// Number of record spans durably prepared so far.
+    pub layout_records: u64,
+    /// All record spans and digests are committed; evidence remains unpublished.
+    pub layout_complete: bool,
     reclaimed_chunks: u64,
+    reclaimed_layout_pages: u64,
 }
 
 impl Catalog for ImportManifest {
@@ -53,7 +61,13 @@ impl Catalog for ImportManifest {
             .with("received_bytes", self.received_bytes.to_string())
             .with("expires_at", self.expires_at.to_string())
             .with("sealed", self.sealed)
+            .with("layout_records", self.layout_records.to_string())
+            .with("layout_complete", self.layout_complete)
             .with("reclaimed_chunks", self.reclaimed_chunks.to_string())
+            .with(
+                "reclaimed_layout_pages",
+                self.reclaimed_layout_pages.to_string(),
+            )
             .into()
     }
 
@@ -69,9 +83,25 @@ impl Catalog for ImportManifest {
             expires_at: integer(value, "expires_at")?,
             sealed: read_field(value, "sealed")?,
             reclaimed_chunks: integer(value, "reclaimed_chunks")?,
+            layout_records: value
+                .get("layout_records")
+                .map(|_| integer(value, "layout_records"))
+                .transpose()?
+                .unwrap_or(0),
+            layout_complete: value
+                .get("layout_complete")
+                .map(|_| read_field(value, "layout_complete"))
+                .transpose()?
+                .unwrap_or(false),
+            reclaimed_layout_pages: value
+                .get("reclaimed_layout_pages")
+                .map(|_| integer(value, "reclaimed_layout_pages"))
+                .transpose()?
+                .unwrap_or(0),
         };
         validate_ingest_labels(&manifest.request_id, &manifest.source, &manifest.format)
             .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+        let lines = ["jsonl", "log"].contains(&manifest.format.as_str());
         if manifest.id != import_id(&manifest.request_id)
             || !valid_payload_id(&manifest.payload_id)
             || manifest.received_bytes > manifest.byte_length
@@ -79,6 +109,19 @@ impl Catalog for ImportManifest {
                 && !manifest.received_bytes.is_multiple_of(CHUNK as u64))
             || manifest.reclaimed_chunks > manifest.chunk_count()
             || (manifest.sealed && manifest.received_bytes != manifest.byte_length)
+            || (manifest.layout_complete && !manifest.sealed)
+            || (manifest.layout_records != 0 && !manifest.sealed)
+            || manifest.reclaimed_layout_pages > manifest.layout_pages()
+            || (!manifest.layout_complete
+                && !manifest
+                    .layout_records
+                    .is_multiple_of(IMPORT_LAYOUT_PAGE_RECORDS as u64))
+            || (lines && manifest.layout_records > manifest.byte_length)
+            || (manifest.layout_complete
+                && lines
+                && (manifest.layout_records == 0) != (manifest.byte_length == 0))
+            || (!lines && manifest.layout_records > 1)
+            || (manifest.layout_complete && !lines && manifest.layout_records != 1)
         {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -95,8 +138,13 @@ impl ImportManifest {
     fn chunk_count(&self) -> u64 {
         self.received_bytes.div_ceil(CHUNK as u64)
     }
+    fn layout_pages(&self) -> u64 {
+        self.layout_records
+            .div_ceil(IMPORT_LAYOUT_PAGE_RECORDS as u64)
+    }
     fn require_live(&self, now: u64) -> Result<(), Error> {
-        if now >= self.expires_at || self.reclaimed_chunks != 0 {
+        if now >= self.expires_at || self.reclaimed_chunks != 0 || self.reclaimed_layout_pages != 0
+        {
             return Err(Error::new(
                 "IMPORT_EXPIRED",
                 "staging lease ended; complete bounded reclamation before starting a new import",
@@ -121,6 +169,57 @@ fn import_id(request: &str) -> String {
 
 fn chunk_key(id: &str, offset: u64) -> String {
     format!("import-chunk:{id}:{offset:020}")
+}
+
+fn layout_key(id: &str, page: u64) -> String {
+    format!("import-layout:{id}:{page:020}")
+}
+
+/// Exact staged record boundary and native complete record-byte identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportRecordSpan {
+    /// Zero-based source record ordinal.
+    pub index: u64,
+    /// Inclusive original artifact offset.
+    pub byte_start: u64,
+    /// Exclusive original offset, including any line delimiter.
+    pub byte_end: u64,
+    /// Canonical native BLAKE3 of the complete record bytes.
+    pub payload_id: String,
+}
+
+impl Catalog for ImportRecordSpan {
+    fn encode(&self) -> Value {
+        Object::new()
+            .with("index", self.index.to_string())
+            .with("byte_start", self.byte_start.to_string())
+            .with("byte_end", self.byte_end.to_string())
+            .with("payload_id", self.payload_id.clone())
+            .into()
+    }
+    fn decode(value: &Value) -> Result<Self, Error> {
+        let span = Self {
+            index: integer(value, "index")?,
+            byte_start: integer(value, "byte_start")?,
+            byte_end: integer(value, "byte_end")?,
+            payload_id: read_field(value, "payload_id")?,
+        };
+        if span.byte_start > span.byte_end || !valid_payload_id(&span.payload_id) {
+            return Err(Error::new("STORAGE_FAILURE", "invalid import record span"));
+        }
+        Ok(span)
+    }
+}
+
+/// One bounded immutable layout page under the import's fixed staging lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportLayoutPage {
+    /// Record spans in original order, at most 128 rows.
+    pub records: Vec<ImportRecordSpan>,
+    /// Complete input record count; no evidence has been published.
+    pub total_records: u64,
+    /// Next aligned page start, or absence at the final page.
+    pub next_index: Option<u64>,
 }
 
 impl Writer {
@@ -187,6 +286,110 @@ impl Writer {
             ));
         }
         Ok(())
+    }
+
+    fn commit_layout_page(
+        &self,
+        manifest: &mut ImportManifest,
+        spans: &[ImportRecordSpan],
+        complete: bool,
+    ) -> Result<(), Error> {
+        let mut batch = WriteBatch::default();
+        if let Some(first) = spans.first() {
+            if spans.len() > IMPORT_LAYOUT_PAGE_RECORDS
+                || !first
+                    .index
+                    .is_multiple_of(IMPORT_LAYOUT_PAGE_RECORDS as u64)
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "invalid prepared layout page size or alignment",
+                ));
+            }
+            let body = json::write_compact(&Value::array(
+                spans.iter().map(Catalog::encode).collect::<Vec<_>>(),
+            ));
+            if body.len() + 32 > LAYOUT_BYTES {
+                return Err(Error::new("RESOURCE_LIMIT", "layout page exceeds 32 KiB"));
+            }
+            let mut encoded = Vec::with_capacity(32 + body.len());
+            encoded.extend_from_slice(blake3::hash(body.as_bytes()).as_bytes());
+            encoded.extend_from_slice(body.as_bytes());
+            batch.put(
+                layout_key(
+                    &manifest.id,
+                    first.index / IMPORT_LAYOUT_PAGE_RECORDS as u64,
+                ),
+                encoded,
+            );
+            // Rebuilding after a failed attempt cannot lose the cleanup coverage
+            // of later pages that were already committed on the previous attempt.
+            manifest.layout_records = manifest
+                .layout_records
+                .max(first.index + spans.len() as u64);
+        }
+        manifest.layout_complete = complete;
+        put(&mut batch, &manifest.id, manifest);
+        self.admit_import_batch(&batch)?;
+        self.commit(batch)
+    }
+
+    fn import_layout_rows(
+        &self,
+        manifest: &ImportManifest,
+        index: u64,
+    ) -> Result<Vec<ImportRecordSpan>, Error> {
+        let bytes = self
+            .db
+            .get(layout_key(
+                &manifest.id,
+                index / IMPORT_LAYOUT_PAGE_RECORDS as u64,
+            ))?
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "import layout page missing"))?;
+        if !(32..=LAYOUT_BYTES).contains(&bytes.len())
+            || blake3::hash(&bytes[32..]).as_bytes() != &bytes[..32]
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "import layout page size or digest mismatch",
+            ));
+        }
+        let value = parse(&bytes[32..])?;
+        let values = value
+            .as_array()
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "layout page must contain an array"))?;
+        let count =
+            (manifest.layout_records - index).min(IMPORT_LAYOUT_PAGE_RECORDS as u64) as usize;
+        if values.len() != count {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "import layout page count mismatch",
+            ));
+        }
+        let mut rows = Vec::with_capacity(count);
+        for (offset, value) in values.iter().enumerate() {
+            let row = ImportRecordSpan::decode(value)?;
+            if row.index != index + offset as u64
+                || row.byte_end > manifest.byte_length
+                || (rows
+                    .last()
+                    .is_some_and(|previous: &ImportRecordSpan| previous.byte_end != row.byte_start))
+                || (row.index == 0 && row.byte_start != 0)
+                || (row.index + 1 == manifest.layout_records
+                    && row.byte_end != manifest.byte_length)
+                || (row.byte_start == row.byte_end
+                    && !(manifest.byte_length == 0
+                        && !["log", "jsonl"].contains(&manifest.format.as_str())
+                        && manifest.layout_records == 1))
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "import record layout does not cover exact source ranges",
+                ));
+            }
+            rows.push(row);
+        }
+        Ok(rows)
     }
 }
 
@@ -255,6 +458,9 @@ impl Store {
             expires_at,
             sealed: false,
             reclaimed_chunks: 0,
+            layout_records: 0,
+            layout_complete: false,
+            reclaimed_layout_pages: 0,
         };
         let mut batch = WriteBatch::default();
         put(&mut batch, &manifest.id, &manifest);
@@ -380,7 +586,135 @@ impl Store {
         writer.commit(batch)
     }
 
-    /// Reclaim at most 128 expired chunks and 16 journal entries per call.
+    /// Durably prepare exact record spans with bounded memory. Repeated or
+    /// interrupted attempts rebuild deterministic private pages, never occurrences.
+    /// This is preparation for publication, not an acceptance/deletion receipt.
+    pub fn import_prepare_layout(&self, id: &str, now: u64) -> Result<ImportManifest, Error> {
+        let writer = self.lock()?;
+        let mut manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        if !manifest.sealed {
+            return Err(Error::new(
+                "CONFLICT",
+                "seal all raw bytes before preparing their record layout",
+            ));
+        }
+        if manifest.layout_complete {
+            return Ok(manifest);
+        }
+        let mut rows = Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS);
+        let mut record_hash = blake3::Hasher::new();
+        let mut input_hash = blake3::Hasher::new();
+        let mut record_start = 0;
+        let mut next_index = 0;
+        let count = manifest.chunk_count().max(1);
+        for chunk in 0..count {
+            let bytes = if manifest.byte_length == 0 {
+                Vec::new()
+            } else {
+                writer.import_chunk(&manifest, chunk * CHUNK as u64)?
+            };
+            input_hash.update(&bytes);
+            let mut cursor = 0;
+            for end in record_ends(&manifest.format, &bytes, chunk + 1 == count) {
+                if next_index >= writer.config.max_records as u64 {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "import layout exceeds configured record count; raw staging remains available for cancellation",
+                    ));
+                }
+                record_hash.update(&bytes[cursor..end]);
+                let byte_end = chunk * CHUNK as u64 + end as u64;
+                rows.push(ImportRecordSpan {
+                    index: next_index,
+                    byte_start: record_start,
+                    byte_end,
+                    payload_id: format!(
+                        "blake3:{}",
+                        hex::encode(record_hash.finalize().as_bytes())
+                    ),
+                });
+                record_hash = blake3::Hasher::new();
+                record_start = byte_end;
+                cursor = end;
+                next_index += 1;
+                if rows.len() == IMPORT_LAYOUT_PAGE_RECORDS {
+                    writer.commit_layout_page(&mut manifest, &rows, false)?;
+                    rows.clear();
+                }
+            }
+            record_hash.update(&bytes[cursor..]);
+        }
+        if next_index < manifest.layout_records
+            || record_start != manifest.byte_length
+            || format!("blake3:{}", hex::encode(input_hash.finalize().as_bytes()))
+                != manifest.payload_id
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "prepared record layout does not match the complete sealed input",
+            ));
+        }
+        writer.commit_layout_page(&mut manifest, &rows, true)?;
+        Ok(manifest)
+    }
+
+    /// Retrieve one checked, complete layout page at an aligned record ordinal.
+    pub fn import_layout_page(
+        &self,
+        id: &str,
+        index: u64,
+        now: u64,
+    ) -> Result<ImportLayoutPage, Error> {
+        if !index.is_multiple_of(IMPORT_LAYOUT_PAGE_RECORDS as u64) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "layout page ordinal must be aligned to 128 records",
+            ));
+        }
+        let writer = self.lock()?;
+        let manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        if !manifest.layout_complete {
+            return Err(Error::new(
+                "CONFLICT",
+                "complete record layout has not been committed",
+            ));
+        }
+        if index >= manifest.layout_records {
+            if index == 0 && manifest.layout_records == 0 {
+                return Ok(ImportLayoutPage {
+                    records: Vec::new(),
+                    total_records: 0,
+                    next_index: None,
+                });
+            }
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "layout page ordinal is outside the complete layout",
+            ));
+        }
+        let records = writer.import_layout_rows(&manifest, index)?;
+        if index != 0 {
+            let previous =
+                writer.import_layout_rows(&manifest, index - IMPORT_LAYOUT_PAGE_RECORDS as u64)?;
+            if previous.last().map(|row| row.byte_end) != records.first().map(|row| row.byte_start)
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "neighboring layout pages do not cover contiguous bytes",
+                ));
+            }
+        }
+        let next = index + records.len() as u64;
+        Ok(ImportLayoutPage {
+            records,
+            total_records: manifest.layout_records,
+            next_index: (next < manifest.layout_records).then_some(next),
+        })
+    }
+
+    /// Reclaim at most 128 expired chunks/layout pages and 16 journals per call.
     /// Each synced batch atomically advances its persistent cleanup cursor.
     pub fn import_reclaim(&self, now: u64) -> Result<u64, Error> {
         let writer = self.lock()?;
@@ -402,7 +736,15 @@ impl Store {
                 removed += 1;
             }
             manifest.reclaimed_chunks = end;
-            if end == manifest.chunk_count() {
+            let layout_end = manifest
+                .layout_pages()
+                .min(manifest.reclaimed_layout_pages + RECLAIM_CHUNKS - removed);
+            for page in manifest.reclaimed_layout_pages..layout_end {
+                batch.delete(layout_key(&manifest.id, page));
+                removed += 1;
+            }
+            manifest.reclaimed_layout_pages = layout_end;
+            if end == manifest.chunk_count() && layout_end == manifest.layout_pages() {
                 batch.delete(&manifest.id);
             } else {
                 put(&mut batch, &manifest.id, &manifest);
