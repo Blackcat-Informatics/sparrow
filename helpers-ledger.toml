@@ -1976,3 +1976,18 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(collect_eviction_candidates|sort_recordless_artifacts)$']
+
+[[job]]
+id = "streaming-evidence-catalog"
+summary = "Decode and identity-check one native evidence catalog entry at a time for status, listings, pin mutation and protection capture."
+home = "sparrow_core::storage::Writer::decode_evidence"
+entry_points = ["sparrow_core::storage::Writer::catalog", "sparrow_core::storage::Writer::count_catalog", "sparrow_core::storage::Writer::protected_matching"]
+spec = "docs/development-runtime.md: streaming evidence catalog reads."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(collect_status_records|decode_status_record_catalog|decode_status_pin_catalog)$']

@@ -377,6 +377,28 @@ trait Catalog: Sized {
     fn decode(value: &Value) -> Result<Self, Error>;
 }
 
+trait EvidenceCatalog: Catalog {
+    fn identity(&self) -> &str;
+}
+
+impl EvidenceCatalog for Artifact {
+    fn identity(&self) -> &str {
+        &self.id
+    }
+}
+
+impl EvidenceCatalog for Record {
+    fn identity(&self) -> &str {
+        &self.id
+    }
+}
+
+impl EvidenceCatalog for Pin {
+    fn identity(&self) -> &str {
+        &self.id
+    }
+}
+
 impl purrdf_lex::json::record::ToJson for Artifact {
     fn to_json(&self) -> Value {
         self.encode()
@@ -624,16 +646,43 @@ impl Writer {
         Ok(())
     }
 
-    fn list<T: Catalog>(&self, prefix: &str) -> Result<Vec<T>, Error> {
-        let mut rows = Vec::new();
-        for entry in self.db.prefix_iterator(prefix) {
-            let (key, bytes) = entry?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            rows.push(T::decode(&parse(&bytes)?)?);
+    fn catalog<'a, T: EvidenceCatalog + 'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = Result<T, Error>> + 'a {
+        self.db
+            .prefix_iterator(prefix)
+            .take_while(move |entry| match entry {
+                Ok((key, _)) => key.starts_with(prefix.as_bytes()),
+                Err(_) => true,
+            })
+            .map(|entry| {
+                let (key, bytes) = entry?;
+                Self::decode_evidence(&key, &bytes)
+            })
+    }
+
+    fn decode_evidence<T: EvidenceCatalog>(key: &[u8], bytes: &[u8]) -> Result<T, Error> {
+        let row = T::decode(&parse(bytes)?)?;
+        if row.identity().as_bytes() != key {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "evidence catalog identity disagrees with its key",
+            ));
         }
-        Ok(rows)
+        Ok(row)
+    }
+
+    fn count_catalog<T: EvidenceCatalog>(
+        &self,
+        prefix: &str,
+        include: impl Fn(&T) -> bool,
+    ) -> Result<u64, Error> {
+        self.catalog::<T>(prefix).try_fold(0_u64, |count, row| {
+            count
+                .checked_add(u64::from(include(&row?)))
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "evidence catalog counter overflow"))
+        })
     }
 
     fn count_prefix(&self, prefix: &str) -> Result<u64, Error> {
@@ -680,7 +729,7 @@ impl Writer {
             if let Some(remaining) = remaining.as_deref_mut() {
                 Self::charge_catalog(remaining, bytes.len())?;
             }
-            let pin = Pin::decode(&parse(&bytes)?)?;
+            let pin: Pin = Self::decode_evidence(&key, &bytes)?;
             if pin.expires_at > now {
                 protected.extend(pin.members.into_iter().filter(|member| include(member)));
             }
@@ -1059,11 +1108,13 @@ impl Store {
     pub fn records(&self, now: u64) -> Result<Vec<Record>, Error> {
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
-        Ok(writer
-            .list::<Record>("record:")?
-            .into_iter()
-            .filter(|record| writer.live_record(record, now, &protected))
-            .collect())
+        writer
+            .catalog::<Record>("record:")
+            .filter(|row| match row {
+                Ok(record) => writer.live_record(record, now, &protected),
+                Err(_) => true,
+            })
+            .collect()
     }
 
     /// Query persistent native JSON facts in a bounded temporal catalog scan.
@@ -1233,12 +1284,13 @@ impl Store {
 
     /// Return active pin collections at an explicit UTC instant.
     pub fn pins(&self, now: u64) -> Result<Vec<Pin>, Error> {
-        Ok(self
-            .lock()?
-            .list::<Pin>("pin:")?
-            .into_iter()
-            .filter(|pin| pin.expires_at > now)
-            .collect())
+        self.lock()?
+            .catalog::<Pin>("pin:")
+            .filter(|row| match row {
+                Ok(pin) => pin.expires_at > now,
+                Err(_) => true,
+            })
+            .collect()
     }
 
     /// Return complete artifacts eligible for exact-byte retrieval at this instant.
@@ -1246,10 +1298,12 @@ impl Store {
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         writer
-            .list::<Artifact>("artifact:")?
-            .into_iter()
-            .filter(|artifact| writer.live_artifact(artifact, now, &protected))
-            .map(|artifact| writer.receipt(artifact, durability::Durability::Buffered))
+            .catalog::<Artifact>("artifact:")
+            .filter(|row| match row {
+                Ok(artifact) => writer.live_artifact(artifact, now, &protected),
+                Err(_) => true,
+            })
+            .map(|artifact| writer.receipt(artifact?, durability::Durability::Buffered))
             .collect::<Result<Vec<_>, _>>()
     }
 
@@ -1363,9 +1417,11 @@ impl Store {
             }
         }
         let mut pin = writer
-            .list::<Pin>("pin:")?
-            .into_iter()
-            .find(|pin| pin.name == name && pin.expires_at > now)
+            .catalog::<Pin>("pin:")
+            .try_fold(None, |found, pin| -> Result<_, Error> {
+                let pin = pin?;
+                Ok(found.or_else(|| (pin.name == name && pin.expires_at > now).then_some(pin)))
+            })?
             .unwrap_or(Pin {
                 id: random_id("pin")?,
                 name: name.to_owned(),
@@ -1533,11 +1589,9 @@ impl Store {
         let (pin_handles, pin_bytes) = self.pin_read_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
-        let records = writer.list::<Record>("record:")?;
-        let live = records
-            .iter()
-            .filter(|record| writer.live_record(record, now, &protected))
-            .count();
+        let live = writer.count_catalog::<Record>("record:", |record| {
+            writer.live_record(record, now, &protected)
+        })?;
         let unique_chunks = writer.count_prefix("ref:")?;
         let format = writer
             .db
@@ -1586,10 +1640,7 @@ impl Store {
             .with(
                 "active_pins",
                 writer
-                    .list::<Pin>("pin:")?
-                    .iter()
-                    .filter(|pin| pin.expires_at > now)
-                    .count()
+                    .count_catalog::<Pin>("pin:", |pin| pin.expires_at > now)?
                     .to_string(),
             )
             .into())

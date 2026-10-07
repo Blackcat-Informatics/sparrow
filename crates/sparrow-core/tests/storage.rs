@@ -8,6 +8,128 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn streaming_status_counts_follow_receipt_retention_pin_release_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let old = store
+        .ingest(
+            "status-stream-old",
+            "source",
+            "log",
+            b"same\nsame\nold\n",
+            0,
+        )
+        .unwrap();
+    store
+        .ingest(
+            "status-stream-later",
+            "source",
+            "log",
+            b"same\nlater\n",
+            DAY,
+        )
+        .unwrap();
+    let pin = store
+        .pin("status-stream-pin", "case", &old.record_ids[..1], 40, 1)
+        .unwrap();
+    assert_eq!(store.status(1).unwrap()["live_records"].as_str(), Some("5"));
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["live_records"].as_str(),
+        Some("3")
+    );
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["active_pins"].as_str(),
+        Some("1")
+    );
+    store.expire(30 * DAY).unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["live_records"].as_str(),
+        Some("3")
+    );
+    assert_eq!(store.records(30 * DAY).unwrap().len(), 3);
+    assert_eq!(store.pins(30 * DAY).unwrap().len(), 1);
+    assert_eq!(store.artifacts(30 * DAY).unwrap().len(), 1);
+    store.release(&pin.id).unwrap();
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["live_records"].as_str(),
+        Some("2")
+    );
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["active_pins"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["live_records"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn streaming_catalog_refuses_identity_corruption_and_never_returns_partial_rows() {
+    use purrdf_lex::json;
+    for kind in ["record", "artifact", "pin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let artifact = store
+            .ingest("status-stream-catalog", "source", "log", b"kept\n", 0)
+            .unwrap();
+        let pin = store
+            .pin(
+                "status-stream-catalog-pin",
+                "case",
+                &artifact.record_ids,
+                40,
+                0,
+            )
+            .unwrap();
+        let key = match kind {
+            "record" => artifact.record_ids[0].clone(),
+            "artifact" => artifact.id.clone(),
+            _ => pin.id.clone(),
+        };
+        drop(store);
+        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        let mut value =
+            json::read_slice(&db.get(&key).unwrap().unwrap(), json::Limits::DEFAULT).unwrap();
+        *value.get_mut("id").unwrap() = json::Value::from(format!("{kind}:different"));
+        db.put(&key, json::write_compact(&value)).unwrap();
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        let error = match kind {
+            "record" => store.records(1).unwrap_err(),
+            "artifact" => store.artifacts(1).unwrap_err(),
+            _ => store.pins(1).unwrap_err(),
+        };
+        assert_eq!(error.code, "STORAGE_FAILURE");
+        if kind != "artifact" {
+            assert_eq!(store.status(1).unwrap_err().code, "STORAGE_FAILURE");
+        }
+        if kind == "pin" {
+            assert_eq!(
+                store
+                    .pin(
+                        "status-stream-refused-pin",
+                        "case",
+                        &artifact.record_ids,
+                        40,
+                        1
+                    )
+                    .unwrap_err()
+                    .code,
+                "STORAGE_FAILURE"
+            );
+            assert_eq!(
+                store.record(&artifact.record_ids[0]).unwrap().id,
+                artifact.record_ids[0]
+            );
+        }
+    }
+}
+
+#[test]
 fn recordless_eviction_merges_receipt_order_preserves_pins_and_retries() {
     use sparrow_core::{EvictionFrontier, EvictionLimits};
     let dir = tempfile::tempdir().unwrap();

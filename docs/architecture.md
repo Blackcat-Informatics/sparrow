@@ -199,6 +199,12 @@ Bound all caches, worker queues, parser inputs, open imports, result handles,
 read snapshots, and per-operation output. Independently measure process RSS and
 engine/cache allocations; an internal byte counter is not an RSS measurement.
 
+The current safe RocksDB binding does not supply the error-returning bounded
+file-compaction integration required for forced reclamation. The concrete API
+gaps and production/qualification requirements are recorded in
+[native reclamation integration](native-reclamation.md). Automatic compaction
+and logical retirement do not satisfy that unfinished requirement.
+
 ## 5. Retention and named pins
 
 All deadlines are server UTC instants. One day means 24 hours, independently of

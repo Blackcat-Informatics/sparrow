@@ -35,6 +35,36 @@ Implementation is in progress in `/home/paudley/Active/sparrow`, on
 The current source implements schema 19; the schema sections
 below retain their historical qualification evidence.
 
+## Streaming evidence catalog reads
+
+Status counts now stream the record and pin catalogs through one native cursor
+and one decoded row at a time. They no longer allocate a vector containing all
+resident records or all pin envelopes. Eligible record/artifact/pin listings and
+pin-name lookup share the same iterator; explicit listing APIs still allocate
+their requested result vectors. Pin lookup completes its scan and propagates
+later corruption, even after finding a matching name.
+
+The shared decoder validates catalog key/identity agreement before returning
+evidence. Pin protection capture uses that same identity owner after its existing
+admission checks. Malformed rows and native iterator errors remain hard failures;
+filtered or counted reads never turn them into omitted rows or partial success.
+Counts remain exact for the captured UTC instant under the writer lock. This
+changes no wire schema, storage encoding or lifetime law.
+
+Qualification on 2026-10-07: `make check` passed release Clippy with warnings
+denied, all workspace release tests (including 89 storage scenarios and 25
+RPC/daemon/MCP scenarios), seeded census self-tests and the pinned cross gate.
+All 129 helper ownership jobs hold with no distinct exceptions. New storage
+scenarios cover exact counts across retention, pin release and reopen, and hard
+failures for corrupted record/artifact/pin identities. This is local source
+qualification; the running development daemon has not yet adopted this change.
+
+This removes resident catalog vectors; it does not prove a bounded count-scan
+duration, bounded aggregate pin protection, corpus-scale RSS or latency. Those
+requirements remain unfinished. Forced physical reclamation also remains unmet
+for the concrete safe-binding gaps in
+[native reclamation integration](native-reclamation.md).
+
 ## Schema 19 recordless artifact eviction
 
 Empty JSONL and log artifacts have no addressable records but retain catalog
