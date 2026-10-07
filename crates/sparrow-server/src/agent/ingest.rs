@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use super::Result;
 use super::{failure, instant, invalid, wire};
 use purrdf_lex::json::{Object, Value};
 use std::{fs::File, io::Read, path::PathBuf};
@@ -13,7 +14,7 @@ pub(crate) struct Input {
 }
 
 impl Input {
-    pub(super) fn parse(args: &[String]) -> capnp::Result<Self> {
+    pub(super) fn parse(args: &[String]) -> Result<Self> {
         if args.len() != 4 {
             return Err(invalid("usage: ingest REQUEST_ID SOURCE FORMAT FILE"));
         }
@@ -37,7 +38,7 @@ impl Input {
         })
     }
 
-    pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> capnp::Result<Value> {
+    pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
         let response = client.status_request().send().promise.await?;
         let status = match response.get()?.get_result()?.which()? {
             wire::result::Ok(status) => status?,
@@ -76,37 +77,41 @@ impl Input {
             wire::result::Ok(artifact) => artifact?,
             wire::result::Error(error) => return Err(failure(error?)),
         };
-        let records = artifact
-            .get_record_ids()?
-            .iter()
-            .map(|id| Ok(Value::from(id?.to_str()?)))
-            .collect::<capnp::Result<Vec<_>>>()?;
-        Ok(Object::new()
-            .with("store_id", artifact.get_store_id()?.to_str()?)
-            .with("artifact_id", artifact.get_id()?.to_str()?)
-            .with("source", artifact.get_source()?.to_str()?)
-            .with(
-                "format",
-                match artifact.get_format()? {
-                    wire::Format::Jsonl => "jsonl",
-                    wire::Format::Log => "log",
-                    wire::Format::Json => "json",
-                    wire::Format::Markdown => "markdown",
-                    wire::Format::Opaque => "opaque",
-                },
-            )
-            .with("received_at", instant(artifact.get_received_at()?)?)
-            .with("expires_at", instant(artifact.get_expires_at()?)?)
-            .with("byte_length", artifact.get_byte_length().to_string())
-            .with("payload_id", artifact.get_payload_id()?.to_str()?)
-            .with("record_ids", Value::array(records))
-            .with(
-                "durability",
-                match artifact.get_durability()? {
-                    wire::Durability::Buffered => "buffered",
-                    wire::Durability::Durable => "durable",
-                },
-            )
-            .into())
+        render(artifact)
     }
+}
+
+pub(super) fn render(artifact: wire::artifact::Reader<'_>) -> Result<Value> {
+    let records = artifact
+        .get_record_ids()?
+        .iter()
+        .map(|id| Ok(Value::from(id?.to_str()?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Object::new()
+        .with("store_id", artifact.get_store_id()?.to_str()?)
+        .with("artifact_id", artifact.get_id()?.to_str()?)
+        .with("source", artifact.get_source()?.to_str()?)
+        .with(
+            "format",
+            match artifact.get_format()? {
+                wire::Format::Jsonl => "jsonl",
+                wire::Format::Log => "log",
+                wire::Format::Json => "json",
+                wire::Format::Markdown => "markdown",
+                wire::Format::Opaque => "opaque",
+            },
+        )
+        .with("received_at", instant(artifact.get_received_at()?)?)
+        .with("expires_at", instant(artifact.get_expires_at()?)?)
+        .with("byte_length", artifact.get_byte_length().to_string())
+        .with("payload_id", artifact.get_payload_id()?.to_str()?)
+        .with("record_ids", Value::array(records))
+        .with(
+            "durability",
+            match artifact.get_durability()? {
+                wire::Durability::Buffered => "buffered",
+                wire::Durability::Durable => "durable",
+            },
+        )
+        .into())
 }

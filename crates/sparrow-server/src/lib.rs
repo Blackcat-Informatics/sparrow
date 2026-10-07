@@ -15,3 +15,7 @@ mod rpc;
 pub use rpc::{Rpc, now};
 mod client;
 pub use client::{Connection, connect};
+mod agent;
+pub use agent::{AgentError, AgentResult, run_cli};
+mod mcp;
+pub use mcp::run_mcp;

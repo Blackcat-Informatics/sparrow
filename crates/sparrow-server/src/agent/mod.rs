@@ -1,14 +1,31 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use purrdf_lex::json::{Object, Value};
-use sparrow_server::sparrow_capnp as wire;
+//! Shared agent operations and canonical result rendering for CLI and MCP.
 
+use crate::sparrow_capnp as wire;
+use purrdf_lex::json::{Object, Value};
+
+mod error;
 mod ingest;
 mod read;
 mod search;
+mod status;
+pub use error::AgentError;
+/// Shared result type preserving typed failures across CLI and MCP.
+pub type AgentResult<T> = std::result::Result<T, AgentError>;
+type Result<T> = AgentResult<T>;
+pub(crate) mod tool;
 
-pub(super) const USAGE: &str = "usage: sparrow SOCKET_PATH status | ingest REQUEST_ID SOURCE FORMAT FILE | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | keys | values [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N]; values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT";
+pub(super) const USAGE: &str = "usage: sparrow SOCKET_PATH status | ingest REQUEST_ID SOURCE FORMAT FILE | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | text QUERY | keys | values [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N]; values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT";
+
+/// Execute a CLI command through the same typed client and renderer as MCP.
+pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<Value> {
+    match Command::parse(args)?.execute(client).await? {
+        Some(output) => Ok(output),
+        None => status::execute(client).await,
+    }
+}
 
 pub(super) enum Command {
     Status,
@@ -33,12 +50,78 @@ pub(super) struct Options {
     decoded: Option<String>,
 }
 
-fn invalid(message: impl Into<String>) -> capnp::Error {
-    capnp::Error::failed(message.into())
+fn invalid(message: impl Into<String>) -> AgentError {
+    AgentError {
+        code: "INVALID_ARGUMENT".into(),
+        message: message.into(),
+        retryable: false,
+    }
+}
+
+fn evidence(mut target: wire::evidence::Builder<'_>, store: &str, id: &str) -> Result<()> {
+    target.set_store_id(store);
+    if id.starts_with("artifact:") {
+        target.set_artifact(id);
+    } else if id.starts_with("record:") {
+        target.set_record(id);
+    } else {
+        return Err(invalid("evidence ID requires artifact: or record: prefix"));
+    }
+    Ok(())
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            source: None,
+            from: 0,
+            before: u64::MAX,
+            limit: 100,
+            scan_budget: 10000,
+            path: None,
+            kind: None,
+            lexical: None,
+            decoded: None,
+        }
+    }
+}
+
+impl Options {
+    fn validate(&self) -> Result<()> {
+        if self.from >= self.before
+            || !(1..=1000).contains(&self.limit)
+            || !(1..=100000).contains(&self.scan_budget)
+        {
+            return Err(invalid(
+                "require from < before, limit 1..1000 and scan-budget 1..100000",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_kind(
+    value: &str,
+) -> std::result::Result<wire::JsonKind, purrdf_lex::json::record::DecodeError> {
+    match value {
+        "string" => Ok(wire::JsonKind::String),
+        "number" => Ok(wire::JsonKind::Number),
+        "true" => Ok(wire::JsonKind::BooleanTrue),
+        "false" => Ok(wire::JsonKind::BooleanFalse),
+        "null" => Ok(wire::JsonKind::Null),
+        "array" => Ok(wire::JsonKind::Array),
+        "object" => Ok(wire::JsonKind::Object),
+        _ => Err(purrdf_lex::json::record::DecodeError::unknown_variant(
+            value,
+            &[
+                "string", "number", "true", "false", "null", "array", "object",
+            ],
+        )),
+    }
 }
 
 impl Command {
-    pub(super) fn parse(args: &[String]) -> capnp::Result<Self> {
+    pub(super) fn parse(args: &[String]) -> Result<Self> {
         if args == ["status"] {
             return Ok(Self::Status);
         }
@@ -63,17 +146,7 @@ impl Command {
         } else {
             None
         };
-        let mut options = Options {
-            source: None,
-            from: 0,
-            before: u64::MAX,
-            limit: 100,
-            scan_budget: 10000,
-            path: None,
-            kind: None,
-            lexical: None,
-            decoded: None,
-        };
+        let mut options = Options::default();
         let mut seen = std::collections::BTreeSet::new();
         let mut fields = args[if text.is_some() { 2 } else { 1 }..].iter();
         while let Some(flag) = fields.next() {
@@ -105,34 +178,14 @@ impl Command {
                 }
                 "--path" if values => options.path = Some(value.clone()),
                 "--kind" if values => {
-                    options.kind = Some(match value.as_str() {
-                        "string" => wire::JsonKind::String,
-                        "number" => wire::JsonKind::Number,
-                        "true" => wire::JsonKind::BooleanTrue,
-                        "false" => wire::JsonKind::BooleanFalse,
-                        "null" => wire::JsonKind::Null,
-                        "array" => wire::JsonKind::Array,
-                        "object" => wire::JsonKind::Object,
-                        _ => {
-                            return Err(invalid(
-                                "--kind requires string, number, true, false, null, array or object",
-                            ));
-                        }
-                    })
+                    options.kind = Some(parse_kind(value).map_err(|e| invalid(e.to_string()))?)
                 }
                 "--lexical" if values => options.lexical = Some(value.clone()),
                 "--decoded" if values => options.decoded = Some(value.clone()),
                 _ => return Err(invalid(format!("unknown option for {}: {flag}", args[0]))),
             }
         }
-        if options.from >= options.before
-            || !(1..=1000).contains(&options.limit)
-            || !(1..=100000).contains(&options.scan_budget)
-        {
-            return Err(invalid(
-                "require from < before, limit 1..1000 and scan-budget 1..100000",
-            ));
-        }
+        options.validate()?;
         Ok(Self::Query {
             values,
             text,
@@ -140,10 +193,7 @@ impl Command {
         })
     }
 
-    pub(super) async fn execute(
-        &self,
-        client: &wire::sparrow::Client,
-    ) -> capnp::Result<Option<Value>> {
+    pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
         if let Self::Ingest(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
@@ -198,7 +248,7 @@ impl Command {
                             .with("decoded", optional_value(row.get_decoded()?)?),
                     ))
                 })
-                .collect::<capnp::Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
             Ok(Some(
                 Object::new()
                     .with("receipt", receipt(found.get_receipt()?)?)
@@ -226,7 +276,7 @@ impl Command {
                             .with("records", row.get_records().to_string()),
                     ))
                 })
-                .collect::<capnp::Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
             Ok(Some(
                 Object::new()
                     .with("receipt", receipt(found.get_receipt()?)?)
@@ -258,27 +308,28 @@ fn optional(mut field: wire::optional_text::Builder<'_>, value: &Option<String>)
     }
 }
 
-fn optional_value(field: wire::optional_text::Reader<'_>) -> capnp::Result<Value> {
+fn optional_value(field: wire::optional_text::Reader<'_>) -> Result<Value> {
     match field.which()? {
         wire::optional_text::Absent(()) => Ok(Value::Null),
         wire::optional_text::Value(value) => Ok(value?.to_str()?.into()),
     }
 }
 
-fn failure(error: wire::failure::Reader<'_>) -> capnp::Error {
+fn failure(error: wire::failure::Reader<'_>) -> AgentError {
     match (
         error.get_code().and_then(|t| Ok(t.to_str()?.to_owned())),
         error.get_message().and_then(|t| Ok(t.to_str()?.to_owned())),
     ) {
-        (Ok(code), Ok(message)) => invalid(format!(
-            "{code}: {message}; retryable={}",
-            error.get_retryable()
-        )),
-        (Err(error), _) | (_, Err(error)) => error,
+        (Ok(code), Ok(message)) => AgentError {
+            code,
+            message,
+            retryable: error.get_retryable(),
+        },
+        (Err(error), _) | (_, Err(error)) => error.into(),
     }
 }
 
-fn instant(value: wire::instant::Reader<'_>) -> capnp::Result<String> {
+fn instant(value: wire::instant::Reader<'_>) -> Result<String> {
     sparrow_core::format_instant(value.get_unix_millis()).map_err(|e| invalid(e.to_string()))
 }
 
@@ -294,7 +345,7 @@ fn kind_name(kind: wire::JsonKind) -> &'static str {
     }
 }
 
-fn receipt(value: wire::receipt::Reader<'_>) -> capnp::Result<Value> {
+fn receipt(value: wire::receipt::Reader<'_>) -> Result<Value> {
     let coverage = value.get_coverage()?;
     Ok(Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)

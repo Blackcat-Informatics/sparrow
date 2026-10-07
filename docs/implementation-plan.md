@@ -2,7 +2,7 @@
 
 Status: implementation in progress. Helper-census tooling, a RocksDB storage
 foundation, the Cap'n Proto daemon, bounded JSON occurrence discovery and persistent
-native full-text retrieval through the CLI are present.
+native full-text retrieval through shared CLI and stdio MCP clients are present.
 The full server acceptance criteria remain unmet. Current executable surfaces
 and verification are recorded in [Development runtime](development-runtime.md).
 

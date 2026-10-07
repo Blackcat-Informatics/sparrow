@@ -440,7 +440,464 @@ async fn exercise(socket: &Path) -> (String, String) {
             error.unwrap().get_message()
         ),
     }
+    mcp_exercise(socket, &store, &id, &first_record, bytes).await;
     (store, id)
+}
+
+struct Mcp {
+    child: tokio::process::Child,
+    input: Option<tokio::process::ChildStdin>,
+    output: tokio::io::BufReader<tokio::process::ChildStdout>,
+}
+
+impl Mcp {
+    fn start(socket: &Path) -> Self {
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            .arg(socket)
+            .args(["mcp", "--stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take();
+        let output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            input,
+            output,
+        }
+    }
+    async fn send(&mut self, value: purrdf_lex::json::Value) {
+        use tokio::io::AsyncWriteExt;
+        let message = format!("{}\n", purrdf_lex::json::write_compact(&value));
+        self.input
+            .as_mut()
+            .unwrap()
+            .write_all(message.as_bytes())
+            .await
+            .unwrap();
+    }
+    async fn receive(&mut self) -> purrdf_lex::json::Value {
+        use tokio::io::AsyncBufReadExt;
+        let mut bytes = Vec::new();
+        let length = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.output.read_until(b'\n', &mut bytes),
+        )
+        .await
+        .expect("MCP response timeout")
+        .unwrap();
+        assert!(length > 0, "MCP closed stdout before responding");
+        purrdf_lex::json::read_slice(&bytes, purrdf_lex::json::Limits::default()).unwrap()
+    }
+    async fn call(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: purrdf_lex::json::Value,
+    ) -> purrdf_lex::json::Value {
+        self.send(
+            purrdf_lex::json::Object::new()
+                .with("jsonrpc", "2.0")
+                .with("id", id)
+                .with("method", method)
+                .with("params", params)
+                .into(),
+        )
+        .await;
+        let response = self.receive().await;
+        assert_eq!(response["id"].as_u64(), Some(id));
+        response
+    }
+    async fn close(mut self, success: bool) {
+        drop(self.input.take());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), self.child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success(),
+            success
+        );
+    }
+}
+
+async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, bytes: &[u8]) {
+    use purrdf_lex::json::{Object, Value};
+    let mut mcp = Mcp::start(socket);
+    use tokio::io::AsyncWriteExt;
+    mcp.input
+        .as_mut()
+        .unwrap()
+        .write_all(b"{invalid}\n")
+        .await
+        .unwrap();
+    assert_eq!(mcp.receive().await["error"]["code"].as_i64(), Some(-32700));
+    let early = mcp.call(1, "tools/list", Object::new().into()).await;
+    assert_eq!(early["error"]["code"].as_i64(), Some(-32000));
+    let initialized = mcp
+        .call(
+            2,
+            "initialize",
+            Object::new()
+                .with("protocolVersion", "2025-11-25")
+                .with("capabilities", Object::new())
+                .with(
+                    "clientInfo",
+                    Object::new().with("name", "fixture").with("version", "1"),
+                )
+                .into(),
+        )
+        .await;
+    assert_eq!(
+        initialized["result"]["protocolVersion"].as_str(),
+        Some("2025-11-25")
+    );
+    mcp.send(
+        Object::new()
+            .with("jsonrpc", "2.0")
+            .with("method", "notifications/initialized")
+            .into(),
+    )
+    .await;
+    let tools = mcp.call(3, "tools/list", Object::new().into()).await;
+    let definitions = tools["result"]["tools"].as_array().unwrap();
+    assert_eq!(definitions.len(), 10);
+    assert!(
+        !definitions
+            .iter()
+            .any(|tool| tool["name"].as_str() == Some("sparql_query"))
+    );
+    assert_eq!(
+        definitions
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("pin"))
+            .unwrap()["annotations"]["readOnlyHint"]
+            .as_bool(),
+        Some(false)
+    );
+    let query = |name: &str, arguments: Value| {
+        Object::new()
+            .with("name", name)
+            .with("arguments", arguments)
+            .into()
+    };
+    let keys = mcp
+        .call(
+            4,
+            "tools/call",
+            query(
+                "keys_list",
+                Object::new().with("source", "synthetic-rpc").into(),
+            ),
+        )
+        .await;
+    assert_eq!(keys["result"]["isError"].as_bool(), Some(false));
+    assert_eq!(
+        keys["result"]["structuredContent"]["rows"],
+        cli(socket, &["keys", "--source", "synthetic-rpc"])["rows"]
+    );
+    let text = mcp
+        .call(
+            5,
+            "tools/call",
+            query(
+                "text_search",
+                Object::new()
+                    .with("source", "synthetic-rpc")
+                    .with("text", "hello")
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        text["result"]["structuredContent"]["rows"],
+        cli(socket, &["text", "hello", "--source", "synthetic-rpc"])["rows"]
+    );
+    assert_eq!(
+        text["result"]["structuredContent"]["text_coverage"]["failed_or_incomplete"].as_str(),
+        Some("1")
+    );
+    let values = mcp
+        .call(
+            6,
+            "tools/call",
+            query(
+                "values_search",
+                Object::new()
+                    .with("path", "/message")
+                    .with("decoded", "hello world")
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        values["result"]["structuredContent"]["rows"][0]["record_id"].as_str(),
+        Some(record)
+    );
+    let raw = mcp
+        .call(
+            7,
+            "tools/call",
+            query(
+                "bytes_read",
+                Object::new()
+                    .with("store_id", store)
+                    .with("id", artifact)
+                    .with("offset", "0")
+                    .with("length", bytes.len() as u64)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        raw["result"]["structuredContent"]["data"].as_str(),
+        Some(purrdf::xsd::canonical_base64(bytes).as_str())
+    );
+    let invalid = mcp
+        .call(
+            8,
+            "tools/call",
+            query(
+                "keys_list",
+                Object::new().with("event_time", "guessed").into(),
+            ),
+        )
+        .await;
+    assert_eq!(invalid["result"]["isError"].as_bool(), Some(true));
+    assert_eq!(
+        invalid["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("INVALID_ARGUMENT")
+    );
+    let mismatch = mcp
+        .call(
+            9,
+            "tools/call",
+            query(
+                "record_get",
+                Object::new()
+                    .with("store_id", "wrong-store")
+                    .with("id", record)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        mismatch["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("STORE_MISMATCH")
+    );
+    assert_eq!(
+        mismatch["result"]["structuredContent"]["error"]["retryable"].as_bool(),
+        Some(false)
+    );
+    let pin = mcp
+        .call(
+            10,
+            "tools/call",
+            query(
+                "pin",
+                Object::new()
+                    .with("store_id", store)
+                    .with("request_id", "mcp-pin-v1")
+                    .with("name", "mcp-case")
+                    .with("targets", Value::array([record]))
+                    .with("days", 1_u64)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(pin["result"]["isError"].as_bool(), Some(false));
+    let pin_id = pin["result"]["structuredContent"]["pin_id"]
+        .as_str()
+        .unwrap();
+    let release = mcp
+        .call(
+            11,
+            "tools/call",
+            query(
+                "pin_release",
+                Object::new()
+                    .with("store_id", store)
+                    .with("request_id", "mcp-release-v1")
+                    .with("pin_id", pin_id)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(release["result"]["isError"].as_bool(), Some(false));
+    let retry = mcp
+        .call(
+            12,
+            "tools/call",
+            query(
+                "pin_release",
+                Object::new()
+                    .with("store_id", store)
+                    .with("request_id", "mcp-release-v1")
+                    .with("pin_id", pin_id)
+                    .into(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        release["result"]["structuredContent"],
+        retry["result"]["structuredContent"]
+    );
+    let capabilities = mcp
+        .call(
+            13,
+            "tools/call",
+            query("capabilities", Object::new().into()),
+        )
+        .await;
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["status"]["store_id"].as_str(),
+        Some(store)
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["status"]["schema_version"].as_u64(),
+        Some(2)
+    );
+    let unknown = mcp
+        .call(
+            14,
+            "tools/call",
+            query("sparql_query", Object::new().into()),
+        )
+        .await;
+    assert_eq!(unknown["error"]["code"].as_i64(), Some(-32602));
+    let precision = mcp
+        .call(9007199254740993, "ping", Object::new().into())
+        .await;
+    assert_eq!(precision["id"].as_u64(), Some(9007199254740993));
+    let null_limit = mcp
+        .call(
+            15,
+            "tools/call",
+            query("keys_list", Object::new().with("limit", Value::Null).into()),
+        )
+        .await;
+    assert_eq!(null_limit["result"]["isError"].as_bool(), Some(true));
+    let unknown_list_field = mcp
+        .call(
+            16,
+            "tools/list",
+            Object::new().with("unexpected", true).into(),
+        )
+        .await;
+    assert_eq!(unknown_list_field["error"]["code"].as_i64(), Some(-32602));
+    mcp.close(true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_cancellation_admission_and_partial_frames_do_not_lose_messages() {
+    use purrdf_lex::json::{Object, Value};
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("unresponsive.sock");
+    // An isolated fault endpoint, never the real daemon or a model backend.
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let mut mcp = Mcp::start(&socket);
+    mcp.call(
+        1,
+        "initialize",
+        Object::new()
+            .with("protocolVersion", "2025-11-25")
+            .with("capabilities", Object::new())
+            .with(
+                "clientInfo",
+                Object::new()
+                    .with("name", "fault-fixture")
+                    .with("version", "1"),
+            )
+            .into(),
+    )
+    .await;
+    mcp.send(
+        Object::new()
+            .with("jsonrpc", "2.0")
+            .with("method", "notifications/initialized")
+            .into(),
+    )
+    .await;
+    for id in 11..=14_u64 {
+        mcp.send(
+            Object::new()
+                .with("jsonrpc", "2.0")
+                .with("id", id)
+                .with("method", "tools/call")
+                .with(
+                    "params",
+                    Object::new()
+                        .with("name", "status")
+                        .with("arguments", Object::new()),
+                )
+                .into(),
+        )
+        .await;
+    }
+    let excess = mcp
+        .call(
+            15,
+            "tools/call",
+            Object::new()
+                .with("name", "status")
+                .with("arguments", Object::new())
+                .into(),
+        )
+        .await;
+    assert_eq!(
+        excess["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("RESOURCE_LIMIT")
+    );
+    mcp.input
+        .as_mut()
+        .unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"pi")
+        .await
+        .unwrap();
+    let (peer, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(peer); // Complete one pending call while its next input frame is incomplete.
+    let failed = mcp.receive().await;
+    assert!((11..=14).contains(&failed["id"].as_u64().unwrap()));
+    assert_eq!(
+        failed["result"]["structuredContent"]["error"]["code"].as_str(),
+        Some("RPC_FAILURE")
+    );
+    mcp.input
+        .as_mut()
+        .unwrap()
+        .write_all(b"ng\"}\n")
+        .await
+        .unwrap();
+    assert_eq!(mcp.receive().await["id"].as_u64(), Some(99));
+    for id in 11..=14_u64 {
+        mcp.send(
+            Object::new()
+                .with("jsonrpc", "2.0")
+                .with("method", "notifications/cancelled")
+                .with("params", Object::new().with("requestId", id))
+                .into(),
+        )
+        .await;
+    }
+    let ping = mcp.call(100, "ping", Object::new().into()).await;
+    assert!(ping.get("error").is_none());
+    mcp.close(true).await;
+    let mut oversized = Mcp::start(&socket);
+    let mut bytes = vec![b' '; 128 * 1024 + 1];
+    bytes.push(b'\n');
+    if let Err(error) = oversized.input.as_mut().unwrap().write_all(&bytes).await {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    let refused = oversized.receive().await;
+    assert_eq!(refused["id"], Value::Null);
+    assert_eq!(refused["error"]["code"].as_i64(), Some(-32700));
+    oversized.close(false).await;
 }
 
 fn cli(socket: &Path, args: &[&str]) -> purrdf_lex::json::Value {

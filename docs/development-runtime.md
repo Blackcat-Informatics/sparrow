@@ -16,9 +16,11 @@ fields, formats and JSON kinds are enums, and references carry a store identity.
 Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
 `bytesRead`, `pin`, `pinRelease`, `keysList`, `valuesSearch` and `textSearch`. The shared typed
 client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
-The `sparrow` CLI uses that generated client for status, non-destructive buffered
-file ingestion, exact byte-range export, key listing, value searches and full-text searches. Pin
-commands, other query surfaces and the stdio MCP adapter remain required work.
+The `sparrow` CLI and stdio MCP adapter share generated-client operations and
+result rendering. The CLI supplies status, non-destructive buffered file import,
+exact byte export, key/value and full-text searches. MCP also supplies artifact/
+record metadata and pin/release calls. Remaining CLI commands and query surfaces
+are required work.
 
 ```sh
 CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server
@@ -106,6 +108,65 @@ interpretation remains pending. Value predicates include existence, kind,
 exact lexical equality, decoded string equality and an exact pointer; no
 wildcard selector is inferred.
 
+## Stdio MCP
+
+Launch the adapter with the existing private daemon socket:
+
+```sh
+target/release/sparrow /home/paudley/.local/state/sparrow/development-v3/rpc.sock mcp --stdio
+```
+
+A host configuration can use this command and argument array:
+
+```json
+{
+  "mcpServers": {
+    "sparrow": {
+      "command": "/home/paudley/Active/sparrow/target/release/sparrow",
+      "args": ["/home/paudley/.local/state/sparrow/development-v3/rpc.sock", "mcp", "--stdio"]
+    }
+  }
+}
+```
+
+The adapter implements MCP protocol 2025-11-25 initialization, initialized
+notification, ping, tools/list, tools/call and cancellation over newline-delimited
+stdio. It uses PurRDF's JSON codec and native canonical base64 formatter. The
+daemon transport remains typed Cap'n Proto; the adapter never opens RocksDB.
+Only protocol messages go to stdout. Each tool opens its own owned RPC connection,
+so an idle MCP session does not retain an expired daemon connection lease.
+
+Discovery advertises these implemented tools only: `capabilities`, `status`,
+`keys_list`, `values_search`, `text_search`, `artifact_get`, `record_get`,
+`bytes_read`, `pin` and `pin_release`. Input schemas reject additional fields;
+query arguments use the CLI's names with underscores. Temporal filters remain
+explicitly server-acceptance times. Offsets are decimal strings; bounded lengths,
+row limits and durations are JSON integers. Byte results use native canonical
+base64 by default or explicitly requested UTF-8, which refuses invalid bytes.
+Pin/release calls require stable mutation request identities. Read/mutation
+annotations accompany tool discovery.
+
+Responses include structured content and the same JSON in a text block. Daemon
+domain errors preserve code, message and retryability in structured tool errors;
+transport failures have the distinct `RPC_FAILURE` code. Unsupported tools and
+malformed protocol requests produce JSON-RPC errors. Undelivered or cancelled
+mutation acknowledgement does not prove non-delivery: retry its stable identity.
+
+The adapter bounds requests to 128 KiB, responses to 8 MiB, concurrent calls to
+four and each call to 30 seconds. Oversized framing closes the session with an
+explicit protocol error; malformed complete JSON frames receive a parse error
+and subsequent valid frames can proceed. EOF drains pending calls. Discovery
+requires daemon schema version 2, including native text/profile identities;
+older discovery contracts fail explicitly rather than invent those identities.
+
+The real-daemon acceptance fixture checks CLI/MCP parity for keys and text, JSON
+value matches, exact base64 bytes, store identity errors, pin/release retry and
+capabilities before and after daemon crash/reopen. An isolated unresponsive
+socket fixture checks pending-call admission, failure during a partial input
+frame, cancellation and oversized framing. Integer request IDs beyond binary64
+exact precision round-trip without rounding. The full release `make check`
+gate passed with these fixtures.
+
 ## Persistent full text
 
 Store format 3 binds native standard analyzer identity at atomic store creation.
@@ -171,11 +232,19 @@ development process was cleanly stopped after confirming its identity and empty
 store; its database directory was preserved. These are development runtime
 observations, not final architecture acceptance or a guarantee of later liveness.
 
+The daemon was subsequently replaced with the qualified schema-version-2 build
+on 2026-10-07 UTC, reopening the same format-3 store and preserving its identity.
+Its typed status reported the persisted analyzer identity and text profile. A
+live stdio MCP session initialized, listed all ten implemented tools, retrieved
+capabilities and repeated the synthetic `failed` search. It returned the same
+record, corpus digest and original span `[11,17)`, then exited successfully on
+EOF. The private directory/socket modes remained 0700/0600.
+
 Remaining final-server acceptance includes full native JSON/Markdown RDF
 projection, persistent RDF indexes, governed stored-view SPARQL, further
 text qualification, event-time and combined predicates, context and
 correlation, final scope/pagination contracts, streaming imports and recovery
-journals, durable completed-file consumption, inotify/tailing, stdio MCP, CLI,
+journals, durable completed-file consumption, inotify/tailing, remaining MCP/CLI tools,
 syslog, the Rust logging client, pressure eviction/reclamation, codec
 verification, bounded buffered durability, fault/performance qualification,
 packaging and a verified running-server handoff.

@@ -427,6 +427,9 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
+                out.set_schema_version(2);
+                out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
+                out.set_text_profile(field::<String>(&value, "text_profile")?);
                 out.set_physical_bytes(number(&value, "physical_bytes")?);
                 out.set_disk_budget(number(&value, "disk_budget")?);
                 out.set_maintenance_reserve(number(&value, "maintenance_reserve")?);

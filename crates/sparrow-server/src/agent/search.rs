@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use super::Result;
 use super::{Options, failure, fill_scope, instant, optional_value, receipt, wire};
 use purrdf_lex::json::{Object, Value};
 
@@ -8,7 +9,7 @@ pub(super) async fn execute(
     client: &wire::sparrow::Client,
     options: &Options,
     text: &str,
-) -> capnp::Result<Value> {
+) -> Result<Value> {
     let mut request = client.text_search_request();
     let mut input = request.get().init_query();
     input.set_text(text);
@@ -23,7 +24,7 @@ pub(super) async fn execute(
         .get_terms()?
         .iter()
         .map(|term| Ok(Value::from(term?.to_str()?)))
-        .collect::<capnp::Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let ranking = Object::new()
         .with("profile", ranking.get_profile()?.to_str()?)
         .with("corpus_id", ranking.get_corpus_id()?.to_str()?)
@@ -77,7 +78,7 @@ pub(super) async fn execute(
                             .with("contributors", Value::array(contributors)),
                     ))
                 })
-                .collect::<capnp::Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
             Ok(Value::from(
                 Object::new()
                     .with("record_id", row.get_record_id()?.to_str()?)
@@ -89,7 +90,7 @@ pub(super) async fn execute(
                     .with("evidence", Value::array(evidence)),
             ))
         })
-        .collect::<capnp::Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     Ok(Object::new()
         .with("receipt", receipt(found.get_receipt()?)?)
         .with("ranking", ranking)

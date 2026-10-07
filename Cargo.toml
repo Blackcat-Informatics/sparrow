@@ -23,7 +23,7 @@ capnp-rpc = "0.27"
 capnpc = "0.27"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-std", "io-util", "process"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 

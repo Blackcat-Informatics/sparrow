@@ -208,3 +208,18 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^bm25(f)?$']
+
+[[job]]
+id = "base64"
+summary = "Render exact original bytes in canonical base64 for structured agent responses."
+home = "purrdf:purrdf_xsd::binary::canonical_base64"
+entry_points = ["purrdf_xsd::canonical_base64"]
+spec = "XSD base64Binary canonical lexical form; RFC 4648 section 4."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_)?base64(_encode)?$']

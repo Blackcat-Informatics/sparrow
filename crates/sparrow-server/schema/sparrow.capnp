@@ -35,6 +35,7 @@ struct Status {
   uniqueJsonProjections @8 :UInt64; retryWindowSeconds @9 :UInt64;
   maxArtifactBytes @10 :UInt64; maxRecordsPerArtifact @11 :UInt64; maxPinMembers @12 :UInt64;
   schemaVersion @13 :UInt32 = 1;
+  textAnalyzer @14 :Text; textProfile @15 :Text;
 }
 struct Ingest {
   requestId @0 :Text; source @1 :Text; format @2 :Format; bytes @3 :Data;
