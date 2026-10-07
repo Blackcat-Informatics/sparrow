@@ -4,8 +4,7 @@
 use crate::{ArtifactReceipt, Error, sparrow_capnp as wire};
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{FileExt, MetadataExt},
     path::Path,
 };
 
@@ -18,48 +17,118 @@ pub async fn import_file(
     format: wire::Format,
     path: &Path,
 ) -> Result<ArtifactReceipt, Error> {
+    let mut file = open_completed_file(path)?;
+    import_open_file(client, request_id, source, format, &mut file).await
+}
+
+/// Open a completed input without following any symlink or waiting on a FIFO.
+/// Linux `openat2` is required; unsupported kernels fail rather than weaken resolution.
+pub fn open_completed_file(path: &Path) -> Result<File, Error> {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+    let fd = openat2(CWD, path, OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(), ResolveFlags::NO_SYMLINKS).map_err(|error| {
+        if error == rustix::io::Errno::NOSYS {
+            Error::Unsupported("path imports require Linux openat2; use an already opened completed regular-file descriptor on unsupported kernels")
+        } else { Error::Io(error.into()) }
+    })?;
+    let file = File::from(fd);
+    if !file.metadata()?.is_file() {
+        return Err(Error::InvalidArgument(
+            "completed input must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Upload an already opened completed regular file through the same resumable path.
+/// Reads positionally from byte zero, preserving the caller's cursor and path ownership.
+pub async fn import_open_file(
+    client: &wire::sparrow::Client,
+    request_id: &str,
+    source: &str,
+    format: wire::Format,
+    file: &mut File,
+) -> Result<ArtifactReceipt, Error> {
     // Discovery refuses an older daemon before allocating private staging.
-    crate::Discovery::fetch(client).await?;
-    let mut file = File::open(path)?;
+    let discovery = crate::Discovery::fetch(client).await?;
+    upload(client, &discovery, request_id, source, format, file).await
+}
+
+pub(crate) async fn upload(
+    client: &wire::sparrow::Client,
+    discovery: &crate::Discovery,
+    request_id: &str,
+    source: &str,
+    format: wire::Format,
+    file: &mut File,
+) -> Result<ArtifactReceipt, Error> {
+    if request_id.is_empty() || request_id.len() > 128 || source.is_empty() || source.len() > 512 {
+        return Err(Error::InvalidArgument(
+            "require bounded nonempty request and source labels",
+        ));
+    }
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(Error::InvalidArgument(
             "ingest requires a regular completed file; live tailing is a separate operation",
         ));
     }
-    let identity = file_identity(&metadata);
+    let identity = CompletedFileIdentity::capture(&metadata);
     let length = metadata.len();
     let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
     let mut digest = purrdf_hash::blake3::Hasher::new();
     let mut remaining = length;
     while remaining != 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
-        file.read_exact(&mut buffer[..count])?;
+        file.read_exact_at(&mut buffer[..count], length - remaining)?;
         digest.update(&buffer[..count]);
         remaining -= count as u64;
     }
-    require_file_identity(&file, identity)?;
+    identity.require(file)?;
     let payload = format!(
         "blake3:{}",
         purrdf_hash::hex::encode(digest.finalize().as_bytes())
     );
+    let acceptance = crate::receipt::ExpectedArtifact {
+        discovery,
+        source,
+        format,
+        byte_length: length,
+        payload_id: payload.clone(),
+        durability: wire::Durability::Durable,
+        record_count: None,
+    };
     let mut request = client.import_begin_request();
     let mut input = request.get().init_request();
     input.set_request_id(request_id);
     input.set_source(source);
     input.set_format(format);
     input.set_byte_length(length);
-    input.set_payload_id(payload);
+    input.set_payload_id(&payload);
     let response = request.send().promise.await?;
     let start = match response.get()?.get_result()?.which()? {
         wire::result::Ok(value) => value?,
         wire::result::Error(error) => return Err(Error::domain(error?)),
     };
     let progress = match start.which()? {
-        wire::import_start::Accepted(value) => return ArtifactReceipt::decode(value?),
+        wire::import_start::Accepted(value) => {
+            let receipt = acceptance.certify(ArtifactReceipt::decode(value?)?)?;
+            identity.require(file)?;
+            return Ok(receipt);
+        }
         wire::import_start::Staging(value) => value?,
     };
     let store = progress.get_store_id()?.to_str()?.to_owned();
+    if store != discovery.store_id
+        || progress.get_byte_length() != length
+        || progress.get_payload_id()?.to_str()? != payload
+        || progress.get_source()?.to_str()? != source
+        || progress.get_format()? != format
+    {
+        return Err(Error::Protocol(
+            "import staging contradicts the discovered store or requested input",
+        ));
+    }
     let id = progress.get_id()?.to_str()?.to_owned();
     let mut offset = progress.get_received_bytes();
     if offset > length || (offset != length && !offset.is_multiple_of(buffer.len() as u64)) {
@@ -67,10 +136,9 @@ pub async fn import_file(
             "daemon returned an invalid durable import offset",
         ));
     }
-    file.seek(SeekFrom::Start(offset))?;
     while offset < length {
         let count = (length - offset).min(buffer.len() as u64) as usize;
-        file.read_exact(&mut buffer[..count])?;
+        file.read_exact_at(&mut buffer[..count], offset)?;
         let mut request = client.import_append_request();
         let mut input = request.get().init_request();
         import_reference(input.reborrow().init_import(), &store, &id);
@@ -88,7 +156,7 @@ pub async fn import_file(
             ));
         }
     }
-    require_file_identity(&file, identity)?;
+    identity.require(file)?;
     let mut request = client.import_seal_request();
     import_reference(request.get().init_import(), &store, &id);
     let response = request.send().promise.await?;
@@ -147,12 +215,16 @@ pub async fn import_file(
             break;
         }
     }
-    require_file_identity(&file, identity)?;
+    identity.require(file)?;
     let mut request = client.import_publish_request();
     import_reference(request.get().init_import(), &store, &id);
     let response = request.send().promise.await?;
     match response.get()?.get_result()?.which()? {
-        wire::result::Ok(value) => ArtifactReceipt::decode(value?),
+        wire::result::Ok(value) => {
+            let receipt = acceptance.certify(ArtifactReceipt::decode(value?)?)?;
+            identity.require(file)?;
+            Ok(receipt)
+        }
         wire::result::Error(error) => Err(Error::domain(error?)),
     }
 }
@@ -162,42 +234,99 @@ fn import_reference(mut out: wire::import_ref::Builder<'_>, store: &str, id: &st
     out.set_id(id);
 }
 
-fn file_identity(value: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
-    (
-        value.dev(),
-        value.ino(),
-        value.len(),
-        value.mtime(),
-        value.mtime_nsec(),
-        value.ctime(),
-        value.ctime_nsec(),
-    )
+/// Opened-file generation and observed mutation clocks used by upload and future claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompletedFileIdentity {
+    /// Filesystem device identity.
+    pub device: u64,
+    /// Opened inode identity.
+    pub inode: u64,
+    /// Exact observed byte length.
+    pub length: u64,
+    /// Modification clock in Unix seconds.
+    pub modified_seconds: i64,
+    /// Modification clock fractional nanoseconds.
+    pub modified_nanos: i64,
+    /// Inode change clock in Unix seconds.
+    pub changed_seconds: i64,
+    /// Inode change clock fractional nanoseconds.
+    pub changed_nanos: i64,
 }
 
-fn require_file_identity(
-    file: &File,
-    expected: (u64, u64, u64, i64, i64, i64, i64),
-) -> Result<(), Error> {
-    if file_identity(&file.metadata()?) != expected {
-        return Err(Error::InvalidArgument(
-            "completed file changed during import; no acceptance receipt returned; retry the stable request with its original bytes",
-        ));
+impl CompletedFileIdentity {
+    /// Capture one metadata observation without reopening any source path.
+    pub fn capture(value: &std::fs::Metadata) -> Self {
+        Self {
+            device: value.dev(),
+            inode: value.ino(),
+            length: value.len(),
+            modified_seconds: value.mtime(),
+            modified_nanos: value.mtime_nsec(),
+            changed_seconds: value.ctime(),
+            changed_nanos: value.ctime_nsec(),
+        }
     }
-    Ok(())
+}
+
+impl CompletedFileIdentity {
+    /// Refuse mutation or generation changes against this opened-file observation.
+    pub fn require(self, file: &File) -> Result<(), Error> {
+        if Self::capture(&file.metadata()?) != self {
+            return Err(Error::InvalidArgument(
+                "completed file changed during import; no acceptance receipt returned; retry the stable request with its original bytes",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn completed_path_open_refuses_symlinks_directories_and_fifos_without_waiting() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"source").unwrap();
+        super::open_completed_file(&file).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(super::open_completed_file(&link).is_err());
+        let parent_link = directory.path().join("parent-link");
+        std::os::unix::fs::symlink(directory.path(), &parent_link).unwrap();
+        assert!(super::open_completed_file(&parent_link.join("file")).is_err());
+        assert!(matches!(
+            super::open_completed_file(directory.path()),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        let fifo = directory.path().join("fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let task =
+            std::thread::spawn(move || send.send(super::open_completed_file(&fifo)).unwrap());
+        assert!(matches!(
+            receive
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("FIFO open must not wait for a writer"),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        task.join().unwrap();
+    }
+
+    #[test]
     fn completed_file_guard_rejects_same_length_rewrites() {
         use std::io::{Seek, SeekFrom, Write};
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"original").unwrap();
-        let identity = super::file_identity(&file.metadata().unwrap());
-        super::require_file_identity(&file, identity).unwrap();
+        let identity = super::CompletedFileIdentity::capture(&file.metadata().unwrap());
+        identity.require(&file).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(b"replaced").unwrap();
-        assert!(super::require_file_identity(&file, identity).is_err());
+        assert!(identity.require(&file).is_err());
     }
 }

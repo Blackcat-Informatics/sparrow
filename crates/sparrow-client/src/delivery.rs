@@ -4,8 +4,8 @@
 //! Bounded producer delivery; only the owned worker performs socket I/O.
 
 use crate::{
-    ArtifactReceipt, Client, Durability, Error, EventBatch, Format, MAX_EVENT_BATCH_BYTES,
-    MAX_EVENT_BATCH_EVENTS, MAX_EVENT_BYTES, ProducerEvent,
+    ArtifactReceipt, Client, Error, EventBatch, MAX_EVENT_BATCH_BYTES, MAX_EVENT_BATCH_EVENTS,
+    MAX_EVENT_BYTES, ProducerEvent,
 };
 use std::{
     collections::VecDeque,
@@ -676,20 +676,13 @@ impl Shared {
         Ok(())
     }
     fn accepted(&self, batch: &EventBatch, receipt: ArtifactReceipt) -> Result<(), Error> {
+        // Client::events certifies the exact canonical payload and durable record count.
+        // This queue additionally preserves its binding across reconnects.
+        self.bind_store(&receipt.store_id)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
-        if receipt.durability != Durability::Durable
-            || receipt.format != Format::Jsonl
-            || receipt.source != batch.source
-            || receipt.record_ids.len() != batch.events.len()
-            || state.store.as_deref() != Some(receipt.store_id.as_str())
-        {
-            return Err(Error::Protocol(
-                "producer event receipt does not certify the requested durable batch",
-            ));
-        }
         let pending = state
             .pending
             .as_ref()

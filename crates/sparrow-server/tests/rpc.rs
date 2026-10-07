@@ -293,10 +293,57 @@ struct EventRelayState {
     calls: std::cell::RefCell<Vec<sparrow_client::EventBatch>>,
     accepted: std::cell::RefCell<Option<sparrow_client::ArtifactReceipt>>,
     drop_first: std::cell::Cell<bool>,
+    corrupt_receipt: std::cell::Cell<bool>,
+    corrupt_publication: std::cell::Cell<bool>,
+    mutate_file: std::cell::RefCell<Option<std::path::PathBuf>>,
+    mutate_published_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     first_accepted: tokio::sync::Notify,
 }
 struct EventRelay(std::rc::Rc<EventRelayState>);
+impl EventRelayState {
+    fn corrupt(&self, mut artifact: wire::artifact::Builder<'_>, enabled: bool) {
+        if enabled {
+            artifact.set_payload_id(format!("blake3:{}", purrdf_hash::hex::encode(&[0; 32])));
+        }
+    }
+}
 impl wire::sparrow::Server for EventRelay {
+    async fn ingest(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::IngestParams,
+        mut results: wire::sparrow::IngestResults,
+    ) -> capnp::Result<()> {
+        let mut request = self.0.backend.borrow().ingest_request();
+        request.get().set_request(params.get()?.get_request()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)?;
+        if let wire::result::Ok(value) = results.get().get_result()?.which()? {
+            self.0.corrupt(value?, self.0.corrupt_receipt.get());
+        }
+        Ok(())
+    }
+    async fn import_begin(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportBeginParams,
+        mut results: wire::sparrow::ImportBeginResults,
+    ) -> capnp::Result<()> {
+        let mut request = self.0.backend.borrow().import_begin_request();
+        request.get().set_request(params.get()?.get_request()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)?;
+        if let Some(path) = self.0.mutate_file.borrow().as_ref() {
+            std::fs::write(path, b"changed").unwrap();
+        }
+        if self.0.corrupt_receipt.get()
+            && let wire::result::Ok(value) = results.get().get_result()?.which()?
+        {
+            match value?.which()? {
+                wire::import_start::Accepted(value) => self.0.corrupt(value?, true),
+                wire::import_start::Staging(value) => value?.set_store_id("store:foreign"),
+            }
+        }
+        Ok(())
+    }
     async fn status(
         self: std::rc::Rc<Self>,
         _: wire::sparrow::StatusParams,
@@ -334,7 +381,69 @@ impl wire::sparrow::Server for EventRelay {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
+        results.get().set_result(response.get()?.get_result()?)?;
+        if let wire::result::Ok(value) = results.get().get_result()?.which()? {
+            self.0.corrupt(value?, self.0.corrupt_receipt.get());
+        }
+        Ok(())
+    }
+
+    async fn import_append(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportAppendParams,
+        mut results: wire::sparrow::ImportAppendResults,
+    ) -> capnp::Result<()> {
+        let mut request = self.0.backend.borrow().import_append_request();
+        request.get().set_request(params.get()?.get_request()?)?;
+        let response = request.send().promise.await?;
         results.get().set_result(response.get()?.get_result()?)
+    }
+    async fn import_seal(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportSealParams,
+        mut results: wire::sparrow::ImportSealResults,
+    ) -> capnp::Result<()> {
+        let mut request = self.0.backend.borrow().import_seal_request();
+        request.get().set_import(params.get()?.get_import()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)
+    }
+    async fn import_layout(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportLayoutParams,
+        mut results: wire::sparrow::ImportLayoutResults,
+    ) -> capnp::Result<()> {
+        let mut request = self.0.backend.borrow().import_layout_request();
+        request.get().set_import(params.get()?.get_import()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)
+    }
+    async fn import_prepare(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportPrepareParams,
+        mut results: wire::sparrow::ImportPrepareResults,
+    ) -> capnp::Result<()> {
+        let mut request = self.0.backend.borrow().import_prepare_request();
+        request.get().set_request(params.get()?.get_request()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)
+    }
+    async fn import_publish(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportPublishParams,
+        mut results: wire::sparrow::ImportPublishResults,
+    ) -> capnp::Result<()> {
+        let mut request = self.0.backend.borrow().import_publish_request();
+        request.get().set_import(params.get()?.get_import()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)?;
+        if let Some(path) = self.0.mutate_published_file.borrow().as_ref() {
+            std::fs::write(path, b"changed").unwrap();
+        }
+        if let wire::result::Ok(value) = results.get().get_result()?.which()? {
+            self.0.corrupt(value?, self.0.corrupt_publication.get());
+        }
+        Ok(())
     }
 }
 
@@ -348,6 +457,10 @@ fn relay(
         calls: std::cell::RefCell::new(Vec::new()),
         accepted: std::cell::RefCell::new(None),
         drop_first: std::cell::Cell::new(true),
+        corrupt_receipt: std::cell::Cell::new(false),
+        corrupt_publication: std::cell::Cell::new(false),
+        mutate_file: std::cell::RefCell::new(None),
+        mutate_published_file: std::cell::RefCell::new(None),
         first_accepted: tokio::sync::Notify::new(),
     });
     let capability: wire::sparrow::Client = capnp_rpc::new_client(EventRelay(state.clone()));
@@ -358,6 +471,249 @@ fn relay(
         }
     });
     (state, task)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn opened_completed_file_upload_keeps_claimed_generation_and_replacement_path() {
+    use std::io::{Read, Seek, SeekFrom};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let original = dir.path().join("producer.jsonl");
+            let claimed = dir.path().join("claimed.jsonl");
+            let bytes = b"{\"message\":\"opened source generation\"}\n";
+            std::fs::write(&original, bytes).unwrap();
+            std::fs::rename(&original, &claimed).unwrap();
+            let mut file = sparrow_client::open_completed_file(&claimed).unwrap();
+            let identity =
+                sparrow_client::CompletedFileIdentity::capture(&file.metadata().unwrap());
+            std::fs::write(&original, b"replacement generation\n").unwrap();
+            file.seek(SeekFrom::Start(7)).unwrap(); // Upload must start at byte zero.
+            let receipt = client
+                .import_open_file(
+                    "descriptor-source",
+                    "descriptor",
+                    wire::Format::Jsonl,
+                    &mut file,
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.byte_length, bytes.len() as u64);
+            assert_eq!(receipt.durability, wire::Durability::Durable);
+            assert_eq!(
+                file.stream_position().unwrap(),
+                7,
+                "upload preserves the caller's cursor"
+            );
+            assert_eq!(
+                receipt.payload_id,
+                format!(
+                    "blake3:{}",
+                    purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+                )
+            );
+            identity.require(&file).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut preserved = Vec::new();
+            file.read_to_end(&mut preserved).unwrap();
+            assert_eq!(preserved, bytes);
+            let retry = client
+                .import_open_file(
+                    "descriptor-source",
+                    "descriptor",
+                    wire::Format::Jsonl,
+                    &mut file,
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry, receipt);
+            assert_eq!(file.stream_position().unwrap(), bytes.len() as u64);
+            assert_eq!(std::fs::read(&claimed).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(&original).unwrap(),
+                b"replacement generation\n"
+            );
+            let mut request = client.capability().bytes_read_request();
+            let mut query = request.get().init_request();
+            let mut evidence = query.reborrow().init_evidence();
+            evidence.set_store_id(&receipt.store_id);
+            evidence.set_artifact(&receipt.id);
+            query.set_length(bytes.len() as u32);
+            let response = request.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap())
+                    .get_data()
+                    .unwrap(),
+                bytes
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.drop_first.set(false);
+            state.corrupt_receipt.set(true);
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            assert!(matches!(
+                client
+                    .ingest("bad-direct-reply", "direct", wire::Format::Json, b"{}")
+                    .await,
+                Err(sparrow_client::Error::Protocol(_))
+            ));
+            let mut event = delivery_event("wrong receipt evidence");
+            event.sequence = 1;
+            let batch = sparrow_client::EventBatch {
+                request_id: "bad-events-reply".into(),
+                source: "events".into(),
+                client_instance: [8; 16],
+                events: vec![event],
+            };
+            assert!(matches!(
+                client.events(&batch).await,
+                Err(sparrow_client::Error::Protocol(_))
+            ));
+            let input = dir.path().join("source.json");
+            std::fs::write(&input, b"{}").unwrap();
+            genuine
+                .ingest("bad-file-retry", "file", wire::Format::Json, b"{}")
+                .await
+                .unwrap();
+            assert!(matches!(
+                client
+                    .import_file("bad-file-retry", "file", wire::Format::Json, &input)
+                    .await,
+                Err(sparrow_client::Error::Protocol(_))
+            ));
+            assert!(matches!(
+                client
+                    .import_file("bad-staging-reply", "file", wire::Format::Json, &input)
+                    .await,
+                Err(sparrow_client::Error::Protocol(_))
+            ));
+            assert_eq!(std::fs::read(&input).unwrap(), b"{}");
+            // Mutation after the accepted-retry reply must also refuse source certification.
+            std::fs::write(&input, b"initial").unwrap();
+            genuine
+                .ingest(
+                    "late-source-change",
+                    "changing-file",
+                    wire::Format::Opaque,
+                    b"initial",
+                )
+                .await
+                .unwrap();
+            state.corrupt_receipt.set(false);
+            *state.mutate_file.borrow_mut() = Some(input.clone());
+            assert!(matches!(
+                client
+                    .import_file(
+                        "late-source-change",
+                        "changing-file",
+                        wire::Format::Opaque,
+                        &input
+                    )
+                    .await,
+                Err(sparrow_client::Error::InvalidArgument(_))
+            ));
+            assert_eq!(std::fs::read(&input).unwrap(), b"changed");
+            *state.mutate_file.borrow_mut() = None;
+            std::fs::write(&input, b"initial").unwrap();
+            state.corrupt_publication.set(true);
+            assert!(matches!(
+                client
+                    .import_file(
+                        "bad-publication-reply",
+                        "publication",
+                        wire::Format::Opaque,
+                        &input
+                    )
+                    .await,
+                Err(sparrow_client::Error::Protocol(_))
+            ));
+            assert_eq!(std::fs::read(&input).unwrap(), b"initial");
+            let committed = genuine
+                .ingest(
+                    "bad-publication-reply",
+                    "publication",
+                    wire::Format::Opaque,
+                    b"initial",
+                )
+                .await
+                .unwrap();
+            assert_eq!(committed.durability, wire::Durability::Durable);
+            state.corrupt_publication.set(false);
+            *state.mutate_published_file.borrow_mut() = Some(input.clone());
+            assert!(matches!(
+                client
+                    .import_file(
+                        "late-publication-change",
+                        "publication-change",
+                        wire::Format::Opaque,
+                        &input
+                    )
+                    .await,
+                Err(sparrow_client::Error::InvalidArgument(_))
+            ));
+            assert_eq!(std::fs::read(&input).unwrap(), b"changed");
+            let committed = genuine
+                .ingest(
+                    "late-publication-change",
+                    "publication-change",
+                    wire::Format::Opaque,
+                    b"initial",
+                )
+                .await
+                .unwrap();
+            assert_eq!(committed.durability, wire::Durability::Durable);
+            *state.mutate_published_file.borrow_mut() = None;
+            state.corrupt_receipt.set(true);
+            let delivery = sparrow_client::Delivery::start(sparrow_client::DeliveryConfig {
+                flush_interval: Duration::from_millis(10),
+                ..sparrow_client::DeliveryConfig::new(proxy_socket, "pending-receipt")
+            })
+            .unwrap();
+            admit(&delivery, delivery_event("must retain unknown body")).await;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if delivery.stats().unwrap().terminal_failure.is_some() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "receipt mismatch must be a visible permanent failure"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let statistics = delivery.stats().unwrap();
+            assert_eq!(statistics.durable_events, 0);
+            assert_eq!(statistics.pending_events, 1);
+            assert!(delivery.pending_batch().unwrap().is_some());
+            assert!(matches!(
+                delivery_barrier(&delivery, false, Duration::from_secs(1)).await,
+                Err(sparrow_client::FlushError::Delivery(_))
+            ));
+            proxy.abort();
+            let _ = proxy.await;
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

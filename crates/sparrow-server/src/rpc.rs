@@ -11,7 +11,6 @@ use sparrow_core::{
 };
 use std::{rc::Rc, sync::Arc};
 use tokio::sync::Semaphore;
-mod events;
 
 fn invalid(error: impl std::fmt::Display) -> Error {
     Error {
@@ -602,7 +601,7 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         // Normalization is bounded independently of the configured storage admission.
-        let bytes = match events::source_bytes(&input) {
+        let bytes = match input.source_bytes().map_err(invalid) {
             Ok(bytes) => bytes,
             Err(error) => {
                 failure(results.get().init_result(), error);

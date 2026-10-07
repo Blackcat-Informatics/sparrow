@@ -2,6 +2,48 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "producer-acceptance-certification"
+summary = "All producer mutations certify returned store/session, source, format, exact bytes, membership and acknowledgment durability before retiring input."
+home = "sparrow_client::receipt::ExpectedArtifact::certify"
+entry_points = ["sparrow_client::receipt::ExpectedArtifact::bytes", "sparrow_client::receipt::ArtifactReceipt::require_store"]
+spec = "docs/interfaces.md: completed descriptor upload and producer receipt certification."
+vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(certify_file_upload_receipt|certify_direct_ingest_receipt|certify_event_batch_receipt)$']
+
+[[job]]
+id = "completed-file-open"
+summary = "One safe Linux openat2 boundary refuses symlink resolution and blocking special-file opens for CLI and SDK path imports."
+home = "sparrow_client::imports::open_completed_file"
+entry_points = []
+spec = "docs/interfaces.md: completed descriptor upload and producer receipt certification."
+vectors = ["crates/sparrow-client/src/imports.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(open_cli_upload_file|open_sdk_upload_file)$']
+
+[[job]]
+id = "completed-file-stability"
+summary = "One opened-file generation guard covers hashing, raw upload and both accepted-retry and final publication replies."
+home = "sparrow_client::imports::CompletedFileIdentity::require"
+entry_points = []
+spec = "docs/interfaces.md: completed descriptor upload and producer receipt certification."
+vectors = ["crates/sparrow-client/src/imports.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(check_claim_upload_stability|check_client_file_stability)$']
+
+[[job]]
 id = "query-membership"
 summary = "Resolve retained artifact/record/pin membership once, before filters, with revision guards and bounded expansion."
 home = "sparrow_core::storage::Writer::query_membership"
@@ -824,7 +866,7 @@ names = ['^(artifact_wire_format|import_wire_format)$']
 [[job]]
 id = "completed-file-identity"
 summary = "Capture the opened client file's device, inode, length and nanosecond modification/change clocks for completed-input stability checks."
-home = "sparrow_client::imports::file_identity"
+home = "sparrow_client::imports::CompletedFileIdentity::capture"
 entry_points = []
 spec = "docs/development-runtime.md: schema-9 bounded file hashing and publication guards."
 vectors = ["crates/sparrow-client/src/imports.rs", "crates/sparrow-server/tests/rpc.rs"]
@@ -869,8 +911,8 @@ names = ['^(validate_cli_discovery|validate_producer_discovery)$']
 [[job]]
 id = "completed-file-upload"
 summary = "Hash and stream the opened stable regular file through shared typed durable staging and publication."
-home = "sparrow_client::imports::import_file"
-entry_points = []
+home = "sparrow_client::imports::upload"
+entry_points = ["sparrow_client::imports::import_file", "sparrow_client::imports::import_open_file"]
 spec = "docs/development-runtime.md: standalone typed Rust producer client."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -1034,7 +1076,7 @@ names = ['^(decode_rpc_event_batch|decode_mcp_event_batch)$']
 [[job]]
 id = "typed-event-source-representation"
 summary = "Normalize typed producer observations once with the native JSON writer into queryable complete JSONL source records."
-home = "sparrow_server::rpc::events::source_bytes"
+home = "sparrow_client::events::EventBatch::source_bytes"
 entry_points = []
 spec = "docs/development-runtime.md: schema-11 canonical sparrow.events/1 source representation."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]

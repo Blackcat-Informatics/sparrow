@@ -54,7 +54,11 @@ impl Discovery {
             max_event_batch_events: value.get_max_event_batch_events(),
         };
         if discovery.schema_version != crate::SCHEMA_VERSION
-            || discovery.store_id.is_empty()
+            || !discovery.store_id.starts_with("store:")
+            || discovery.store_id.len() <= 6
+            || discovery.store_id.len() > 128
+            || discovery.max_artifact_bytes == 0
+            || discovery.max_records_per_artifact == 0
             || discovery.text_analyzer.is_empty()
             || discovery.text_profile.is_empty()
             || discovery.rdf_profile.is_empty()
@@ -67,7 +71,7 @@ impl Discovery {
             || discovery.max_event_batch_events != crate::MAX_EVENT_BATCH_EVENTS as u32
         {
             return Err(Error::Unsupported(
-                "requires schema version 12, matching event batch limits, bounded durability discovery and nonempty store, text and RDF identities; use a matching daemon executable",
+                "requires the current schema version, matching event batch limits, bounded durability discovery and nonempty store, text and RDF identities; use a matching daemon executable",
             ));
         }
         Ok(discovery)
@@ -111,6 +115,22 @@ pub struct ArtifactReceipt {
 }
 
 impl ArtifactReceipt {
+    /// Require this inspection/acceptance receipt to belong to the discovered store.
+    pub(crate) fn require_store(&self, discovery: &Discovery) -> Result<(), Error> {
+        if self.store_id != discovery.store_id
+            || self.record_ids.len() as u64 > discovery.max_records_per_artifact
+            || self
+                .buffered_through
+                .as_ref()
+                .is_some_and(|fence| fence.session_id != discovery.durability_session)
+        {
+            return Err(Error::Protocol(
+                "artifact receipt contradicts discovered store, session or record limit",
+            ));
+        }
+        Ok(())
+    }
+
     /// Decode one generated receipt without a JSON operation envelope.
     pub fn decode(value: wire::artifact::Reader<'_>) -> Result<Self, Error> {
         let receipt = Self {
@@ -145,7 +165,93 @@ impl ArtifactReceipt {
                 "artifact durability and synchronization fence disagree",
             ));
         }
+        if !receipt.store_id.starts_with("store:")
+            || receipt.store_id.len() <= 6
+            || receipt.store_id.len() > 128
+            || !receipt.id.starts_with("artifact:")
+            || receipt.id.len() <= 9
+            || receipt.id.len() > 128
+            || receipt.source.is_empty()
+            || receipt.source.len() > 512
+            || receipt.expires_at <= receipt.received_at
+            || receipt
+                .payload_id
+                .strip_prefix("blake3:")
+                .and_then(purrdf_hash::hex::decode_32_canonical)
+                .is_none()
+        {
+            return Err(Error::Protocol(
+                "artifact receipt has invalid identity, source or retention interval",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        if receipt.record_ids.iter().any(|id| {
+            !id.starts_with("record:")
+                || id.len() <= 7
+                || id.len() > 128
+                || !ids.insert(id.as_str())
+        }) {
+            return Err(Error::Protocol(
+                "artifact receipt contains invalid or duplicate record identities",
+            ));
+        }
         Ok(receipt)
+    }
+}
+
+/// The concrete input an acknowledgment must certify before a producer can retire it.
+pub(crate) struct ExpectedArtifact<'a> {
+    pub discovery: &'a Discovery,
+    pub source: &'a str,
+    pub format: wire::Format,
+    pub byte_length: u64,
+    pub payload_id: String,
+    pub durability: wire::Durability,
+    pub record_count: Option<usize>,
+}
+
+impl ExpectedArtifact<'_> {
+    pub(crate) fn certify(&self, receipt: ArtifactReceipt) -> Result<ArtifactReceipt, Error> {
+        receipt.require_store(self.discovery)?;
+        if receipt.source != self.source
+            || receipt.format != self.format
+            || receipt.byte_length != self.byte_length
+            || receipt.payload_id != self.payload_id
+            || self.durability == wire::Durability::Durable
+                && receipt.durability != wire::Durability::Durable
+            || self
+                .record_count
+                .is_some_and(|count| count != receipt.record_ids.len())
+        {
+            return Err(Error::Protocol(
+                "artifact acknowledgment does not certify the requested source, format, exact bytes, record count and durability",
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+impl<'a> ExpectedArtifact<'a> {
+    pub(crate) fn bytes(
+        discovery: &'a Discovery,
+        source: &'a str,
+        format: wire::Format,
+        bytes: &[u8],
+        durability: wire::Durability,
+        record_count: Option<usize>,
+    ) -> Self {
+        Self {
+            discovery,
+            source,
+            format,
+            byte_length: bytes.len() as u64,
+            payload_id: format!(
+                "blake3:{}",
+                purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+            ),
+            durability,
+            record_count,
+        }
     }
 }
 
@@ -218,6 +324,96 @@ pub async fn flush_through(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn acceptance_refuses_unrelated_content_scope_durability_and_membership() {
+        use super::*;
+        let discovery = Discovery {
+            durability_session: "session:test".into(),
+            max_buffered_writes: 256,
+            max_buffered_bytes: 64 * 1024 * 1024,
+            flush_interval_ms: 2000,
+            store_id: "store:test".into(),
+            schema_version: crate::SCHEMA_VERSION,
+            max_artifact_bytes: 1024,
+            max_records_per_artifact: 2,
+            text_analyzer: "native".into(),
+            text_profile: "text".into(),
+            rdf_profile: "rdf".into(),
+            max_event_batch_bytes: crate::MAX_EVENT_BATCH_BYTES as u32,
+            max_event_batch_events: crate::MAX_EVENT_BATCH_EVENTS as u32,
+        };
+        let expected = ExpectedArtifact::bytes(
+            &discovery,
+            "source",
+            wire::Format::Jsonl,
+            b"{}\n",
+            wire::Durability::Durable,
+            Some(1),
+        );
+        let valid = ArtifactReceipt {
+            buffered_through: None,
+            store_id: discovery.store_id.clone(),
+            id: "artifact:test".into(),
+            source: "source".into(),
+            format: wire::Format::Jsonl,
+            received_at: 1,
+            expires_at: 2,
+            byte_length: 3,
+            payload_id: expected.payload_id.clone(),
+            record_ids: vec!["record:test".into()],
+            durability: wire::Durability::Durable,
+        };
+        assert_eq!(expected.certify(valid.clone()).unwrap(), valid);
+        for alteration in 0..8 {
+            let mut receipt = valid.clone();
+            match alteration {
+                0 => receipt.store_id = "store:foreign".into(),
+                1 => receipt.source = "another".into(),
+                2 => receipt.format = wire::Format::Log,
+                3 => receipt.byte_length = 4,
+                4 => receipt.payload_id = "blake3:another".into(),
+                5 => {
+                    receipt.durability = wire::Durability::Buffered;
+                    receipt.buffered_through = Some(DurabilityWatermark {
+                        store_id: discovery.store_id.clone(),
+                        session_id: discovery.durability_session.clone(),
+                        sequence: 1,
+                    });
+                }
+                6 => receipt.record_ids.clear(),
+                7 => {
+                    receipt.record_ids =
+                        vec!["record:1".into(), "record:2".into(), "record:3".into()]
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(expected.certify(receipt), Err(Error::Protocol(_))),
+                "alteration {alteration}"
+            );
+        }
+        let buffered = ExpectedArtifact::bytes(
+            &discovery,
+            "source",
+            wire::Format::Jsonl,
+            b"{}\n",
+            wire::Durability::Buffered,
+            Some(1),
+        );
+        assert!(
+            buffered.certify(valid.clone()).is_ok(),
+            "a stronger durable acknowledgment is valid"
+        );
+        let mut receipt = valid;
+        receipt.durability = wire::Durability::Buffered;
+        receipt.buffered_through = Some(DurabilityWatermark {
+            store_id: discovery.store_id.clone(),
+            session_id: "session:previous".into(),
+            sequence: 1,
+        });
+        assert!(matches!(buffered.certify(receipt), Err(Error::Protocol(_))));
+    }
+
     #[test]
     fn discovery_refuses_old_schema_or_missing_profile_identity() {
         for (version, rdf) in [(11, "rdf"), (crate::SCHEMA_VERSION, "")] {

@@ -397,6 +397,45 @@ The configured consume watch and its claimed source generation are the deletion
 authority. Ordinary file import preserves the caller's file unless it belongs to
 that completed-consumption workflow.
 
+### Completed descriptor upload and producer receipt certification
+
+The SDK supplies `Client::import_open_file` and the generated-capability
+`import_open_file` helper for an already opened completed regular file. The
+caller retains descriptor ownership; upload reads positionally from byte zero and never
+reopens or deletes a path. `CompletedFileIdentity::capture` and `require` share
+the device/inode, length and nanosecond modification/change-clock guard used
+by hashing, uploading, accepted-retry receipts and final publication replies.
+An observed source mutation refuses certification even if the daemon has
+already committed its original bytes. This observation is not a writer lock
+or deletion authority.
+
+CLI and SDK path imports use one `open_completed_file` helper backed by safe
+Rustix `openat2` with `NO_SYMLINKS` and nonblocking open flags. Symlinks in any
+path component and special files are refused. Unsupported kernels return an
+actionable error rather than use weaker resolution; caller-owned regular-file
+descriptors remain supported. The native filesystem wrapper is a concrete
+requirement of path resolution and later claims, not a second semantic helper.
+
+Direct artifact, event-batch and file uploads share one receipt-certification
+owner. Before returning success, they match the discovered store/session,
+requested source and format, exact byte length and native BLAKE3 payload,
+record limit/count when known, and requested durability. A buffered request
+may receive a stronger durable acknowledgment; a durable request cannot receive
+a weaker one. Malformed/duplicate occurrence IDs, invalid retention intervals,
+and noncanonical payload identities are protocol failures. Inspection also
+checks the requested store and artifact identity.
+
+`EventBatch::source_bytes` owns the existing `sparrow.events/1` native JSON
+codec for both producer verification and daemon publication; no second source
+normalizer is maintained. The bounded delivery worker retires a batch only
+after these checks and keeps its immutable pending body and charge on a
+permanent receipt mismatch. Ingestion may already have committed: the refusal
+certifies no producer retirement or deletion, and does not roll back that write.
+
+The completed-consumption claim journal, watch administration, inotify workers,
+and source-unlink recovery remain required implementation work. Ordinary upload
+continues to preserve every caller source.
+
 ## 6. CLI
 
 The planned binary names are `sparrowd` for the daemon and `sparrow` for its

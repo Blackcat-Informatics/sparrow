@@ -1255,6 +1255,8 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "purrdf-hash",
+ "purrdf-lex",
+ "rustix",
  "tempfile",
  "tokio",
  "tokio-util",

@@ -35,7 +35,7 @@ daemon imports the generated contract from this crate. The CLI uses its public
 path. The existing server exports are reexports of these same generated types.
 
 `sparrow_client::Client::connect` checks discovery before producer mutations.
-Within a Tokio `LocalSet`, callers can use `ingest`, `events`, `import_file`, `artifact`,
+Within a Tokio `LocalSet`, callers can use `ingest`, `events`, `import_file`, `import_open_file`, `artifact`,
 `discovery`, and the generated query capability. Direct ingestion rejects inputs
 above the discovered buffered-input limit; file imports hash and upload through
 one 64 KiB buffer. Both return owned `ArtifactReceipt` values. Reuse the original
@@ -44,7 +44,8 @@ their exact daemon code, message and retryability; incompatible discovery, I/O,
 protocol and transport failures remain explicit.
 
 The producer dependency graph was checked with `cargo tree -p sparrow-client -e
-normal`: it contains the Cap'n Proto/Tokio transport and native PurRDF hashing,
+normal`: it contains the Cap'n Proto/Tokio transport, native PurRDF hashing/JSON
+and safe Rustix filesystem calls,
 without RocksDB, `sparrow-core`, or the semantic engine. Release acceptance now
 uses the SDK to recover a partially prepared oversized record after a daemon
 crash, verifies the same receipt through CLI retries and SDK inspection, then
@@ -377,6 +378,81 @@ that acceptance pin. No producer source or sibling/model service was changed.
 Full governed SPARQL, diagnostic normalization/correlation, remaining scope
 filters and query snapshots/paging, watchers/syslog, retention/pressure/RSS and
 corpus performance qualification, and final deployment acceptance remain unmet.
+
+### Completed descriptor upload and verified acknowledgments
+
+The SDK and CLI now route file uploads through `imports::upload`, with one
+opened-file generation guard and one native content hash/read path. The public
+`Client::import_open_file` and capability-level helper borrow an
+already opened completed regular file without reopening its path. Caller
+descriptor ownership and cursor survive success or failure; positional reads
+start at byte zero independently of shared descriptor offsets. `CompletedFileIdentity`
+supplies the same metadata observation/guard to uploader and future claim
+coordination. Path imports use safe Rustix `openat2` with symlink resolution
+refused and nonblocking special-file opens; tests reject final/intermediate
+symlinks, directories and FIFOs. Unsupported kernels fail explicitly.
+Rustix 1.1.5 was already locked for dev tooling and is now a direct producer
+filesystem dependency; PurRDF's pinned `purrdf-lex` supplies the native JSON
+writer. Neither storage nor the SPARQL engine enters the producer graph.
+
+`ExpectedArtifact::certify` is the shared producer receipt owner. Direct inputs,
+event batches and completed files must receive their discovered store/session,
+source, format, exact byte length/native BLAKE3 identity, admitted membership
+and required durability. A stronger durable reply to a buffered request is
+valid. Record identities, retention intervals and payload identity syntax are
+validated; inspection also refuses a different requested artifact. Metadata
+stability is checked after accepted-retry and final publication replies as well
+as hashing/uploading, so a late source rewrite produces no certification.
+
+The existing `sparrow.events/1` source codec moved from the daemon adapter to
+`EventBatch::source_bytes` in the SDK. Daemon publication and producer payload
+verification now invoke one native JSON implementation, preserving its format
+and source profile. The bounded delivery worker still retires only certified
+durable batches; permanent contradictions preserve the immutable pending body
+and charge for diagnosis rather than certify a prefix.
+
+Focused acceptance exercises opened-file upload after source-path replacement,
+nonzero descriptor offsets, stable accepted retries and exact daemon byte reads.
+The typed real-daemon relay corrupts direct/event/file-retry and final-publication
+acknowledgments, substitutes a foreign staging store, and rewrites a source after
+accepted-retry/final-publication replies. Every inconsistent receipt is refused;
+late rewrites remain on disk, and the original durable commit remains recoverable.
+The producer queue reports zero durable events and retains its pending input
+on a receipt mismatch. These checks establish uploader/certification behavior,
+not completed-consumption deletion authority or claim-journal recovery.
+
+Run the application-owned example with:
+
+```sh
+cargo run --release -p sparrow-client --example descriptor -- SOCKET REQUEST_ID SOURCE FORMAT FILE
+```
+
+The full `make check` gate passed with 10 client unit tests, 62 storage scenarios,
+12 real-daemon/MCP scenarios, the other workspace tests, release Clippy with
+warnings denied, seeded census self-tests and all 75 ledger jobs. No distinct
+exceptions or unsanctioned isomorphic groups were added.
+
+On 2026-10-07 the owned development daemon was gracefully drained and replaced
+with this release build. It retains schema 13, the same private endpoint and
+persistent store identity. Live descriptor acceptance published 82 original
+JSONL bytes as `artifact:d066e0d527e9e82ec11e13388b386c13`, record
+`record:23febe08e38e42deea0f58e4880b9358`, payload
+`blake3:b27c4ccab9c865986c3893a6c8916186ab01f3d86e8a72dbedda94dec2f61389`.
+Stable retry returned the identical durable receipt; CLI byte export matched
+the preserved source. Native key discovery returned four rows and value lookup
+returned the exact message scalar. The typed event example also passed native
+source-byte certification and stable retry as
+`artifact:6ac189d158e9e25014411efc779ac825` (one record, 374 bytes).
+The directory remains mode 0700 and its Unix socket mode 0600. Only synthetic
+acceptance inputs and the owned Sparrow unit were used; no production source
+was claimed or removed and no sibling/model service was managed.
+
+The next completed-consumption requirement is a durable watch/claim journal
+binding source generation and original publication identity across lost replies
+and the ordinary retry horizon, then qualified atomic claiming/deletion and
+inotify reconciliation. No production sample watch is connected; source removal,
+full governed SPARQL, other continuous intake, and full architecture acceptance
+remain unfinished.
 
 ## CLI investigations
 

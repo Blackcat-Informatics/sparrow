@@ -32,7 +32,7 @@ pub use error::Error;
 mod receipt;
 pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through};
 mod imports;
-pub use imports::import_file;
+pub use imports::{CompletedFileIdentity, import_file, import_open_file, open_completed_file};
 mod events;
 pub use events::{
     EventBatch, EventField, EventSpan, FieldValue, MAX_EVENT_BATCH_BYTES, MAX_EVENT_BATCH_EVENTS,
@@ -121,12 +121,21 @@ impl Client {
         batch: &EventBatch,
         durability: Durability,
     ) -> Result<ArtifactReceipt, Error> {
+        let bytes = batch.source_bytes()?;
+        let expected = receipt::ExpectedArtifact::bytes(
+            &self.discovery,
+            &batch.source,
+            Format::Jsonl,
+            &bytes,
+            durability,
+            Some(batch.events.len()),
+        );
         let mut request = self.capability().events_ingest_request();
         request.get().set_durability(durability);
         batch.encode(request.get().init_batch())?;
         let response = request.send().promise.await?;
         match response.get()?.get_result()?.which()? {
-            sparrow_capnp::result::Ok(value) => ArtifactReceipt::decode(value?),
+            sparrow_capnp::result::Ok(value) => expected.certify(ArtifactReceipt::decode(value?)?),
             sparrow_capnp::result::Error(error) => Err(Error::domain(error?)),
         }
     }
@@ -186,6 +195,14 @@ impl Client {
                 "input exceeds buffered artifact limit; use import_file",
             ));
         }
+        let expected = receipt::ExpectedArtifact::bytes(
+            &self.discovery,
+            source,
+            format,
+            bytes,
+            durability,
+            None,
+        );
         let mut request = self.capability().ingest_request();
         let mut input = request.get().init_request();
         input.set_request_id(request_id);
@@ -195,7 +212,7 @@ impl Client {
         input.set_durability(durability);
         let response = request.send().promise.await?;
         match response.get()?.get_result()?.which()? {
-            sparrow_capnp::result::Ok(value) => ArtifactReceipt::decode(value?),
+            sparrow_capnp::result::Ok(value) => expected.certify(ArtifactReceipt::decode(value?)?),
             sparrow_capnp::result::Error(error) => Err(Error::domain(error?)),
         }
     }
@@ -219,7 +236,29 @@ impl Client {
         format: Format,
         path: &std::path::Path,
     ) -> Result<ArtifactReceipt, Error> {
-        import_file(self.capability(), request_id, source, format, path).await
+        let mut file = open_completed_file(path)?;
+        self.import_open_file(request_id, source, format, &mut file)
+            .await
+    }
+
+    /// Upload an already opened completed file, preserving descriptor ownership.
+    /// Uses this connection's discovered store identity; never reopens or deletes a path.
+    pub async fn import_open_file(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: Format,
+        file: &mut std::fs::File,
+    ) -> Result<ArtifactReceipt, Error> {
+        imports::upload(
+            self.capability(),
+            &self.discovery,
+            request_id,
+            source,
+            format,
+            file,
+        )
+        .await
     }
 
     /// Inspect the daemon's recorded artifact receipt by persistent store-scoped ID.
@@ -230,7 +269,16 @@ impl Client {
         reference.set_id(id);
         let response = request.send().promise.await?;
         match response.get()?.get_result()?.which()? {
-            sparrow_capnp::result::Ok(value) => ArtifactReceipt::decode(value?),
+            sparrow_capnp::result::Ok(value) => {
+                let receipt = ArtifactReceipt::decode(value?)?;
+                receipt.require_store(&self.discovery)?;
+                if receipt.id != id {
+                    return Err(Error::Protocol(
+                        "artifact inspection returned another occurrence",
+                    ));
+                }
+                Ok(receipt)
+            }
             sparrow_capnp::result::Error(error) => Err(Error::domain(error?)),
         }
     }
