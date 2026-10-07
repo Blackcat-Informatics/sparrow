@@ -75,6 +75,36 @@ seeded census self-tests and 122 helper ownership jobs with no distinct exceptio
 or unsanctioned duplicate groups. This qualifies the admission/worker/status
 integration described here, not the remaining full-architecture acceptance.
 
+On 2026-10-07 at 21:55 UTC, the owned development service was gracefully reopened
+on implementation commit `9f320cd`. It serves schema 17 at
+`/home/paudley/.local/state/sparrow/development-v5/rpc.sock`, with directory mode
+0700 and socket mode 0600. The persistent store remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/8`, with 192 live
+records and no active pins. The opened session is
+`session:9dba87291fed3b9bd2d81ed9cf3b6f56`; CLI and live stdio MCP status both
+reported ready pressure, zero requested bytes, no evictions and no maintenance
+failure. The sole configured synthetic watch remains `development-completed`
+revision 1, covered, with no pending claims. This is the existing transient user
+unit, not reboot/deployment qualification.
+
+The saved descriptor request `descriptor-acceptance-20261007-01` returned its
+original durable artifact `artifact:d066e0d527e9e82ec11e13388b386c13`; an 82-byte
+export matched its original source exactly. Both status and admission retry of
+the saved completed-file handoff `handoff-acceptance-20261007-01` returned the
+original removed import and artifact `artifact:eec8eedea8b05f3d9512e88ff8ddd61f`.
+Its 87-byte CRLF export matched the original source, and the replacement producer
+pathname still contained `replacement preserved after handoff` plus newline.
+Exports and live MCP messages are under `/tmp/sparrow-pressure-live.vQGn2o`.
+No pressure ballast or live producer intake was added to this development store.
+
+The initial workspace run hit a transient `WouldBlock` on the existing claim
+recovery fixture's coordination lock, alongside the corrected MCP fixture
+assertion. The final workspace gate and mandatory commit hook both passed that
+recovery fixture. This change does not claim to explain or fix the transient
+lock refusal. Logs are `/tmp/sparrow-pressure-check-20261007.log`,
+`/tmp/sparrow-pressure-final-check-20261007.log` and
+`/tmp/sparrow-pressure-commit-20261007.log`.
+
 ## Typed explicit completed handoff
 
 Schema 16 adds `watchHandoff` and read-only `watchHandoffGet`. The Rust SDK and
