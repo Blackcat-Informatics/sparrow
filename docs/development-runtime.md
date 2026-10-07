@@ -58,6 +58,41 @@ records. These checks qualify explicit handoff; full architecture acceptance,
 active tailing, syslog and the other outstanding query/operational work remain
 unfinished.
 
+The owned development daemon was updated from signed implementation `7aea5fc`
+and reopened successfully after the live acceptance. It serves schema 16 at
+`/home/paudley/.local/state/sparrow/development-v5/rpc.sock`, preserving store
+`store:46c88e949ccec658600b66c7becd5bb7` and now fencing writers with
+`sparrow.store/8`. Directory/socket modes remain 0700/0600. Captured status shows
+192 live records, no pins, no pending durability writes and no watch failure.
+The current daemon is the owned transient user unit `sparrow-development.service`;
+this is not reboot-persistent packaging or full crash-lifecycle qualification.
+
+The live synthetic watch `development-handoff` was created at revision 5 with a
+600,000 ms quiet interval and source `development-handoff`. Its mode-0600 intent
+`/tmp/sparrow-handoff-live.b62DhU/intent.capnp` binds request
+`handoff-acceptance-20261007-01`. Explicit handoff advanced from durable `reserved`
+to `removed` without waiting for that quiet interval, preserving import
+`import:10275c3eb8af097970ac07ac615480a416e5242f58488680fdea93de4641b71a`,
+artifact `artifact:eec8eedea8b05f3d9512e88ff8ddd61f`, and record
+`record:380ba5359ea12540f996eef35cd723ac`. Exact export matched the complete
+87-byte CRLF input saved as `/tmp/sparrow-handoff-live.b62DhU/expected.jsonl`.
+Value and full-text searches each returned this record with complete coverage.
+An event interval from `2026-10-07T21:00:00Z` to `21:01:00Z` returned the one
+known event with zero unknown membership, using captured profile
+`time-profile:d05caa4278d528afb294b4eee05255daa042b0ab818ba5f451b2f5350a63e2fb`.
+
+The watch was removed at revision 6 after publication. Retrying the original
+intent before and after a graceful daemon reopen returned the identical import,
+artifact and `removed` phase; a replacement at the original source path remained
+intact at
+`/home/paudley/.local/state/sparrow/development-handoff-acceptance/finished.jsonl`.
+The live count remained 192; no retry allocated another occurrence. The earlier
+ordinary descriptor-import retry still returned original artifact
+`artifact:d066e0d527e9e82ec11e13388b386c13` and record
+`record:23febe08e38e42deea0f58e4880b9358`. Current admission contains only the
+original `development-completed` revision-1 synthetic watch. No live producer
+directory is configured, and no sibling/model service was modified.
+
 ## Explicit handoff storage foundation
 
 Core storage now binds a caller-owned `ConsumptionHandoff` request ID, exact
