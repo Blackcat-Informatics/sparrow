@@ -1296,6 +1296,7 @@ dependencies = [
  "purrdf",
  "purrdf-hash",
  "purrdf-lex",
+ "rustix",
  "serde",
  "sparrow-client",
  "sparrow-core",

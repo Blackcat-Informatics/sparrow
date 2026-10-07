@@ -14,6 +14,38 @@ const MAX_JOURNALS: usize = 16;
 const JOURNAL_BYTES: usize = 8192;
 pub(super) const FORMAT: &[u8] = b"sparrow.store/6";
 
+/// Directory identities anchoring the source namespace across recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumptionDirectories {
+    /// Watch-root filesystem device.
+    pub root_device: u64,
+    /// Watch-root inode.
+    pub root_inode: u64,
+    /// Original source-parent filesystem device.
+    pub parent_device: u64,
+    /// Original source-parent inode.
+    pub parent_inode: u64,
+}
+
+impl Catalog for ConsumptionDirectories {
+    fn encode(&self) -> Value {
+        Object::new()
+            .with("root_device", self.root_device.to_string())
+            .with("root_inode", self.root_inode.to_string())
+            .with("parent_device", self.parent_device.to_string())
+            .with("parent_inode", self.parent_inode.to_string())
+            .into()
+    }
+    fn decode(value: &Value) -> Result<Self, Error> {
+        Ok(Self {
+            root_device: integer(value, "root_device")?,
+            root_inode: integer(value, "root_inode")?,
+            parent_device: integer(value, "parent_device")?,
+            parent_inode: integer(value, "parent_inode")?,
+        })
+    }
+}
+
 /// One observed completed-file generation. The filesystem coordinator supplies
 /// these observations from its already opened regular-file descriptor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +130,8 @@ pub struct ConsumptionJournal {
     pub format: String,
     /// Observation before atomic filesystem claim.
     pub observed: ConsumptionGeneration,
+    /// Namespace identities captured before claiming.
+    pub directories: ConsumptionDirectories,
     /// Observation after claim and directory synchronization.
     pub claimed: Option<ConsumptionGeneration>,
     /// Original atomically published artifact, independent of retry expiry.
@@ -124,6 +158,7 @@ impl Catalog for ConsumptionJournal {
             .with("source", self.source.clone())
             .with("format", self.format.clone())
             .with("observed", self.observed.encode())
+            .with("directories", self.directories.encode())
             .with(
                 "claimed",
                 self.claimed
@@ -146,6 +181,7 @@ impl Catalog for ConsumptionJournal {
             source: read_field(value, "source")?,
             format: read_field(value, "format")?,
             observed: ConsumptionGeneration::decode(super::field(value, "observed")?)?,
+            directories: ConsumptionDirectories::decode(super::field(value, "directories")?)?,
             claimed: match super::field(value, "claimed")? {
                 Value::Null => None,
                 value => Some(ConsumptionGeneration::decode(value)?),
@@ -182,6 +218,14 @@ impl Catalog for ConsumptionJournal {
 impl ConsumptionJournal {
     fn validate(&self) -> Result<(), Error> {
         self.observed.validate()?;
+        if self.directories.root_device != self.directories.parent_device
+            || self.directories.root_device != self.observed.device
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "consumption requires source and anchored directories on the same filesystem",
+            ));
+        }
         validate_ingest_labels(&self.request_id, &self.source, &self.format)?;
         if self.watch.is_empty()
             || self.watch.len() > 128
@@ -217,6 +261,7 @@ impl ConsumptionJournal {
             self.watch.clone().into(),
             hex::encode(&self.relative_path).into(),
             self.observed.encode(),
+            self.directories.encode(),
         ]));
         format!(
             "consume:{}",
@@ -330,6 +375,7 @@ impl Store {
         source: &str,
         format: &str,
         observed: ConsumptionGeneration,
+        directories: ConsumptionDirectories,
     ) -> Result<ConsumptionJournal, Error> {
         let mut journal = ConsumptionJournal {
             import_id: String::new(),
@@ -339,6 +385,7 @@ impl Store {
             source: source.into(),
             format: format.into(),
             observed,
+            directories,
             claimed: None,
             published_artifact: None,
             removed_at: None,

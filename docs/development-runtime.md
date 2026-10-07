@@ -498,9 +498,10 @@ Storage scenarios exercise reserved/claimed restart, staging beyond its former
 lease, atomic publication with a lost reply, recovery after 40 days and evidence
 expiry, replacement-generation refusal, idempotent removal confirmation,
 completion cleanup, journal capacity and corrupted/missing publication proof.
-The filesystem coordinator, atomic no-overwrite claim/unlink, watch configuration
-and inotify reconciliation are still required before completed consumption is
-exposed as a daemon operation. Production sample directories remain untouched.
+The anchored filesystem coordinator below now supplies claim/unlink mechanics.
+Watch configuration, inotify reconciliation and whole-daemon crash qualification
+are still required before completed consumption is exposed as a daemon operation.
+Production sample directories remain untouched.
 
 The full `make check` gate passed with 65 storage scenarios, 12 real-daemon/MCP
 scenarios, other workspace tests, release Clippy with warnings denied, seeded
@@ -512,6 +513,94 @@ coordinator it remains `sparrow.store/5`; version-6 admission/reopen is qualifie
 in temporary storage scenarios. Live descriptor retry recovered its original
 durable artifact. An unreserved `consume:` request failed with `CONFLICT`, and
 native key discovery confirmed zero eligible records for its source.
+
+## Anchored filesystem claim coordination
+
+`consumption::ClaimRoot` is the sole filesystem coordinator for the persistent
+completed-input journal. Its admitted producer root and private claim directory
+remain open as directory descriptors. Child resolution uses safe Rustix Linux
+`openat2` with beneath-root, no-symlink and no-mount-crossing flags; special-file
+opens are nonblocking. Unsupported kernels fail explicitly. The constructor
+rejects ordinary path overlap with the actual store, requires a daemon-owned
+mode-0700 `.sparrow-inflight` directory, and holds a mode-0600 single-link
+regular-file `flock` for exclusive coordination. A bounded private-directory
+audit preserves and reports unknown entries instead of silently cleaning them.
+Each transfer also checks that the held directory and coordination lock still
+have their original linked inode identities; replacing the lock fences the old
+coordinator before it reserves or moves another source.
+No unsafe code or new semantic codec is introduced.
+
+The journal now includes device/inode bindings for the root and original parent
+directory. Its reserved request hash includes those namespace bindings. Current
+version-6 journal records require these fields; missing fields fail rather than
+rebind a source. No live consumption journal or production watch was created by
+this change. A replaced root with active recovery ownership refuses coordinator
+startup before creating another claim directory.
+
+`reserve` requires an exact opened-file identity supplied by a readiness/handoff
+scheduler. It checks the regular file and synchronizes it and its original
+parent before reserving ownership. `recover` uses `renameat2(RENAME_NOREPLACE)`
+into the excluded private directory; it checks the named private file against
+the opened descriptor before recording a claim. The claimed file and destination
+directory become durable before synchronizing source-parent removal and
+committing the claim observation. A changed/missing source or occupied target
+is refused and preserved for reconciliation. After that checkpoint, the old
+parent is no longer an upload/removal capability: its later replacement cannot
+redirect the claimed descriptor or prevent completion of the original claim.
+
+`publish` calls the existing SDK `Client::import_open_file` over Cap'n Proto and
+verifies the receipt against the same persistent store/journal. It adds no
+second uploader, record preparation or publication law. `remove` recovers the
+original durable publication proof, checks both held and named generations,
+unlinks only the private claim entry, synchronizes its directory and then
+records removal. An error leaves source recovery ownership unresolved. Recovery
+of a published absent claim synchronizes that absence and completes only its
+original publication; an unpublished missing claim never uploads a replacement
+from the original path. The configured producer contract still forbids writes
+after handoff; identity checks do not lock arbitrary producer file descriptors.
+
+Acceptance shares one in-process storage owner with the production RPC adapter,
+generated Unix client and configuration/open-store factory. Synthetic cases
+cover coordinator restart after reservation, rename, publication and unlink;
+exact original-byte acceptance and stable retry; replacements of old paths and
+parents; unpublished removal refusal; late source rewrite; occupied private
+names; missing unpublished claims; symlink escape; exclusive ownership;
+store overlap; orphan preservation; and root replacement. These are component
+and typed-upload checks, not whole-daemon power-loss or inotify qualification.
+The daemon's startup configuration reader moved from `main` to `ServerConfig`,
+so the fixture does not copy native analyzer or store setup.
+Separate admission checks bound FIFO refusal by a two-second test deadline and
+verify that a replaced coordination lock leaves the source untouched.
+
+The full gate uncovered an existing race in physical accounting: native RocksDB
+compaction can remove a listed file before its metadata observation. The shared
+`Writer::physical_bytes` owner now retries the entire measurement at most three
+times for disappearing entries. It never returns the sum accumulated before
+the failure. Persistent churn refuses accounting/admission with retryable
+`STORAGE_PRESSURE`; the producer keeps its input rather than latch a permanent
+protocol failure. Missing
+root directories, permission errors and other failures remain hard failures.
+An owned sidecar create/remove scenario exercises status under directory churn.
+This is a bounded point observation, not an atomic filesystem snapshot or whole
+store pressure/physical-reclamation qualification.
+
+This coordinator is not yet connected to a production watch. Inotify admission,
+recursive bounded reconciliation, quiet timers, configured root overlap rules,
+worker backpressure and observable watch administration remain required to
+expose completed consumption. No production samples were renamed or deleted.
+
+The full normal commit hook passed with 66 storage scenarios, 14
+RPC/filesystem/MCP scenarios, other workspace tests, release Clippy with warnings
+denied, seeded census self-tests and all 89 ledger jobs. There are no distinct
+exceptions or unsanctioned isomorphic groups. The matching release binaries were
+installed in the owned development unit on 2026-10-07 after successful graceful
+shutdown. Live status retained the original store identity, schema 13 and
+`sparrow.store/5` (no consumption root is configured), with 189 live records and
+no pending durability writes. Descriptor retry returned its original durable
+artifact and native scalar lookup returned the original message evidence.
+The private directory/socket remain mode 0700/0600. This is live regression
+acceptance of existing intake/query paths; source claiming/deletion was exercised
+only in synthetic component fixtures.
 
 ## CLI investigations
 

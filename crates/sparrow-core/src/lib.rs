@@ -15,7 +15,7 @@ pub use query::{
     EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, QuerySelection,
     RecordQuery,
 };
-pub use storage::consumption::{ConsumptionGeneration, ConsumptionJournal};
+pub use storage::consumption::{ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal};
 pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::durability::{
     DEFAULT_FLUSH_INTERVAL_MS, Durability, DurabilityStatus, DurabilityWatermark,

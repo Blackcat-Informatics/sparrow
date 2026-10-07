@@ -4,6 +4,9 @@
 //! Typed Cap'n Proto contract and daemon RPC implementation.
 
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
+mod config;
+pub use config::ServerConfig;
+pub mod consumption;
 mod transport;
 pub use transport::serve_connection;
 

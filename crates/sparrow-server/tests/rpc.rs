@@ -12,6 +12,374 @@ use std::{
 
 struct Daemon(Child);
 
+#[test]
+fn anchored_claim_open_refuses_fifos_and_replaced_coordination_locks() {
+    use sparrow_client::CompletedFileIdentity;
+    use sparrow_server::{ServerConfig, consumption::ClaimRoot};
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let store = ServerConfig::read(&write_server_config(
+        dir.path(),
+        &data,
+        &data.join("rpc.sock"),
+    ))
+    .unwrap()
+    .open_store()
+    .unwrap();
+    let producer = dir.path().join("producer");
+    std::fs::create_dir(&producer).unwrap();
+    let root = ClaimRoot::open(store, "watch", &producer).unwrap();
+    let fifo = producer.join("pipe");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    let expected = CompletedFileIdentity::capture(&fifo.metadata().unwrap());
+    let (sent, received) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        assert!(
+            root.reserve(Path::new("pipe"), expected, "source", "log")
+                .is_err()
+        );
+        let file = producer.join("file");
+        std::fs::write(&file, b"keep source").unwrap();
+        let lock = producer.join(".sparrow-inflight/.lock");
+        std::fs::rename(&lock, producer.join(".sparrow-inflight/old-lock")).unwrap();
+        std::fs::write(&lock, b"replacement lock").unwrap();
+        assert!(
+            root.reserve(
+                Path::new("file"),
+                CompletedFileIdentity::capture(&file.metadata().unwrap()),
+                "source",
+                "log"
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep source");
+        sent.send(()).unwrap();
+    });
+    received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a FIFO admission must not block waiting for a writer");
+    worker.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_replacements() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_client::CompletedFileIdentity;
+            use sparrow_server::{
+                Rpc, ServerConfig,
+                consumption::{ClaimRoot, Recovery},
+            };
+            use std::{os::unix::fs::symlink, sync::Arc};
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config =
+                ServerConfig::read(&write_server_config(dir.path(), &data, &socket)).unwrap();
+            let store = config.open_store().unwrap();
+            let producer = dir.path().join("producer");
+            std::fs::create_dir_all(producer.join("nested")).unwrap();
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
+                store.clone(),
+                Arc::new(tokio::sync::Semaphore::new(4)),
+                config.max_artifact_bytes,
+                config.max_pin_members,
+            ));
+            let serving = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                sparrow_server::serve_connection(stream, capability)
+                    .await
+                    .unwrap();
+            });
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert!(ClaimRoot::open(store.clone(), "watch", &data).is_err());
+            assert!(ClaimRoot::open(store.clone(), "watch", dir.path()).is_err());
+            let root = ClaimRoot::open(store.clone(), "watch", &producer).unwrap();
+            assert!(ClaimRoot::open(store.clone(), "watch", &producer).is_err());
+            let outside = dir.path().join("outside");
+            std::fs::write(&outside, b"outside").unwrap();
+            symlink(&outside, producer.join("link")).unwrap();
+            let expected = CompletedFileIdentity::capture(&outside.metadata().unwrap());
+            assert!(
+                root.reserve(Path::new("link"), expected, "source", "log")
+                    .is_err()
+            );
+            symlink(dir.path(), producer.join("escape")).unwrap();
+            assert!(
+                root.reserve(Path::new("escape/outside"), expected, "source", "log")
+                    .is_err()
+            );
+
+            let original = producer.join("nested/file.jsonl");
+            let input = b"{\"message\":\"claimed exact generation\"}\n";
+            std::fs::write(&original, input).unwrap();
+            let reservation = root
+                .reserve(
+                    Path::new("nested/file.jsonl"),
+                    CompletedFileIdentity::capture(&original.metadata().unwrap()),
+                    "claim-source",
+                    "jsonl",
+                )
+                .unwrap();
+            drop(root); // Interrupted after durable reservation, before rename.
+            let root = ClaimRoot::open(store.clone(), "watch", &producer).unwrap();
+            let mut claim = match root
+                .recover(&reservation.import_id, sparrow_server::now().unwrap())
+                .unwrap()
+            {
+                Recovery::Claimed(value) => value,
+                Recovery::Removed(_) => panic!("unpublished source cannot be complete"),
+            };
+            let private = producer
+                .join(".sparrow-inflight")
+                .join(&reservation.import_id);
+            assert!(!original.exists());
+            assert_eq!(std::fs::read(&private).unwrap(), input);
+            assert!(root.remove(&claim, sparrow_server::now().unwrap()).is_err());
+            assert!(private.exists());
+            std::fs::write(&original, b"replacement generation\n").unwrap();
+            std::fs::rename(producer.join("nested"), producer.join("old-nested")).unwrap();
+            std::fs::create_dir(producer.join("nested")).unwrap();
+            std::fs::write(&original, b"replacement generation\n").unwrap();
+            let receipt = root.publish(&client, &mut claim).await.unwrap();
+            assert_eq!(
+                store
+                    .bytes(&receipt.id, 0, input.len(), sparrow_server::now().unwrap())
+                    .unwrap(),
+                input
+            );
+            drop(claim);
+            drop(root); // Publication succeeded, but removal was not attempted.
+            let root = ClaimRoot::open(store.clone(), "watch", &producer).unwrap();
+            let mut claim = match root
+                .recover(&reservation.import_id, sparrow_server::now().unwrap())
+                .unwrap()
+            {
+                Recovery::Claimed(value) => value,
+                Recovery::Removed(_) => panic!("claim still exists"),
+            };
+            assert_eq!(root.publish(&client, &mut claim).await.unwrap(), receipt);
+            let removed = root.remove(&claim, sparrow_server::now().unwrap()).unwrap();
+            assert!(removed.removed_at.is_some());
+            assert!(!private.exists());
+            assert_eq!(
+                std::fs::read(&original).unwrap(),
+                b"replacement generation\n"
+            );
+            assert_eq!(
+                std::fs::read(producer.join("old-nested/file.jsonl")).unwrap(),
+                b"replacement generation\n"
+            );
+            assert_eq!(
+                root.remove(&claim, sparrow_server::now().unwrap()).unwrap(),
+                removed
+            );
+            drop(claim);
+
+            // Interrupted after rename, before the directory/claim checkpoint.
+            let before = producer.join("renamed.log");
+            std::fs::write(&before, b"rename checkpoint\n").unwrap();
+            let renamed = root
+                .reserve(
+                    Path::new("renamed.log"),
+                    CompletedFileIdentity::capture(&before.metadata().unwrap()),
+                    "renamed-source",
+                    "log",
+                )
+                .unwrap();
+            let renamed_private = producer.join(".sparrow-inflight").join(&renamed.import_id);
+            std::fs::rename(&before, &renamed_private).unwrap();
+            drop(root);
+            let root = ClaimRoot::open(store.clone(), "watch", &producer).unwrap();
+            let mut claim = match root
+                .recover(&renamed.import_id, sparrow_server::now().unwrap())
+                .unwrap()
+            {
+                Recovery::Claimed(value) => value,
+                Recovery::Removed(_) => panic!("unpublished moved source"),
+            };
+            assert!(claim.journal().claimed.is_some());
+            let accepted = root.publish(&client, &mut claim).await.unwrap();
+            std::fs::remove_file(&renamed_private).unwrap(); // Interrupted after unlink, before sync/confirmation.
+            std::fs::write(&before, b"new renamed generation\n").unwrap();
+            drop(claim);
+            drop(root);
+            let root = ClaimRoot::open(store.clone(), "watch", &producer).unwrap();
+            match root
+                .recover(&renamed.import_id, sparrow_server::now().unwrap())
+                .unwrap()
+            {
+                Recovery::Removed(saved) => {
+                    assert_eq!(saved.published_artifact, Some(accepted.id));
+                    assert!(saved.removed_at.is_some());
+                }
+                Recovery::Claimed(_) => {
+                    panic!("directory-synced absence must complete the original publication")
+                }
+            }
+            assert_eq!(std::fs::read(&before).unwrap(), b"new renamed generation\n");
+            assert_eq!(
+                store.records(sparrow_server::now().unwrap()).unwrap().len(),
+                2
+            );
+
+            // A changed private generation remains recoverable and cannot be removed.
+            let changing = producer.join("changing.log");
+            std::fs::write(&changing, b"initial\n").unwrap();
+            let journal = root
+                .reserve(
+                    Path::new("changing.log"),
+                    CompletedFileIdentity::capture(&changing.metadata().unwrap()),
+                    "changing-source",
+                    "log",
+                )
+                .unwrap();
+            let mut claim = match root
+                .recover(&journal.import_id, sparrow_server::now().unwrap())
+                .unwrap()
+            {
+                Recovery::Claimed(value) => value,
+                Recovery::Removed(_) => panic!("new claim"),
+            };
+            root.publish(&client, &mut claim).await.unwrap();
+            let path = producer.join(".sparrow-inflight").join(&journal.import_id);
+            std::fs::write(&path, b"changed\n").unwrap();
+            assert!(root.remove(&claim, sparrow_server::now().unwrap()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"changed\n");
+            assert!(
+                store
+                    .consumption_get(&journal.import_id)
+                    .unwrap()
+                    .removed_at
+                    .is_none()
+            );
+            drop(claim);
+
+            // Occupied private names are never overwritten before a claim checkpoint.
+            let collision = producer.join("collision.log");
+            std::fs::write(&collision, b"expected collision source\n").unwrap();
+            let collision_journal = root
+                .reserve(
+                    Path::new("collision.log"),
+                    CompletedFileIdentity::capture(&collision.metadata().unwrap()),
+                    "collision-source",
+                    "log",
+                )
+                .unwrap();
+            let collision_private = producer
+                .join(".sparrow-inflight")
+                .join(&collision_journal.import_id);
+            std::fs::write(&collision_private, b"never overwrite these bytes\n").unwrap();
+            assert!(
+                root.recover(&collision_journal.import_id, sparrow_server::now().unwrap())
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(&collision).unwrap(),
+                b"expected collision source\n"
+            );
+            assert_eq!(
+                std::fs::read(&collision_private).unwrap(),
+                b"never overwrite these bytes\n"
+            );
+            assert!(
+                store
+                    .consumption_get(&collision_journal.import_id)
+                    .unwrap()
+                    .claimed
+                    .is_none()
+            );
+
+            // An unpublished missing claim never falls back to a replacement source path.
+            let missing = producer.join("missing.log");
+            std::fs::write(&missing, b"missing original\n").unwrap();
+            let missing_journal = root
+                .reserve(
+                    Path::new("missing.log"),
+                    CompletedFileIdentity::capture(&missing.metadata().unwrap()),
+                    "missing-source",
+                    "log",
+                )
+                .unwrap();
+            let claim = match root
+                .recover(&missing_journal.import_id, sparrow_server::now().unwrap())
+                .unwrap()
+            {
+                Recovery::Claimed(value) => value,
+                Recovery::Removed(_) => panic!("unpublished source"),
+            };
+            std::fs::remove_file(
+                producer
+                    .join(".sparrow-inflight")
+                    .join(&missing_journal.import_id),
+            )
+            .unwrap();
+            std::fs::write(&missing, b"unaccepted replacement\n").unwrap();
+            assert!(
+                root.recover(&missing_journal.import_id, sparrow_server::now().unwrap())
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(&missing).unwrap(),
+                b"unaccepted replacement\n"
+            );
+            assert_eq!(
+                store.records(sparrow_server::now().unwrap()).unwrap().len(),
+                3
+            );
+            drop(claim);
+
+            // Parent replacement refuses before moving either generation.
+            std::fs::create_dir(producer.join("parent")).unwrap();
+            let file = producer.join("parent/file");
+            std::fs::write(&file, b"old parent\n").unwrap();
+            let parent_claim = root
+                .reserve(
+                    Path::new("parent/file"),
+                    CompletedFileIdentity::capture(&file.metadata().unwrap()),
+                    "parent-source",
+                    "log",
+                )
+                .unwrap();
+            std::fs::rename(producer.join("parent"), producer.join("old-parent")).unwrap();
+            std::fs::create_dir(producer.join("parent")).unwrap();
+            std::fs::write(&file, b"new parent\n").unwrap();
+            assert!(
+                root.recover(&parent_claim.import_id, sparrow_server::now().unwrap())
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"new parent\n");
+            assert_eq!(
+                std::fs::read(producer.join("old-parent/file")).unwrap(),
+                b"old parent\n"
+            );
+            drop(root);
+
+            // Unrecognized private files are preserved and prevent blind startup cleanup.
+            let orphan = producer.join(".sparrow-inflight/orphan");
+            std::fs::write(&orphan, b"orphan bytes").unwrap();
+            assert!(ClaimRoot::open(store.clone(), "watch", &producer).is_err());
+            assert_eq!(std::fs::read(&orphan).unwrap(), b"orphan bytes");
+            std::fs::remove_file(&orphan).unwrap();
+            std::fs::rename(&producer, dir.path().join("old-producer")).unwrap();
+            std::fs::create_dir(&producer).unwrap();
+            assert!(ClaimRoot::open(store.clone(), "watch", &producer).is_err());
+            assert!(!producer.join(".sparrow-inflight").exists());
+            drop(client);
+            serving.await.unwrap();
+            store.flush().unwrap();
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn query_selection_is_shared_by_typed_cli_and_mcp_surfaces() {
     use purrdf_lex::json::{Object, Value};

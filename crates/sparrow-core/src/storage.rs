@@ -630,17 +630,25 @@ impl Writer {
     }
 
     fn physical_bytes(&self) -> Result<u64, Error> {
-        fn directory(path: &Path) -> Result<u64, Error> {
+        fn failure(error: std::io::Error, path: &Path, root: &Path) -> Error {
+            Error::new(
+                if error.kind() == std::io::ErrorKind::NotFound && path != root {
+                    "ACCOUNTING_CHANGED"
+                } else {
+                    "STORAGE_FAILURE"
+                },
+                format!("{}: {error}", path.display()),
+            )
+        }
+        fn directory(path: &Path, root: &Path) -> Result<u64, Error> {
             let mut size = 0_u64;
-            for entry in
-                std::fs::read_dir(path).map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?
-            {
+            for entry in std::fs::read_dir(path).map_err(|e| failure(e, path, root))? {
                 let entry = entry.map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
                 let metadata = entry
                     .metadata()
-                    .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+                    .map_err(|e| failure(e, &entry.path(), root))?;
                 let bytes = if metadata.is_dir() {
-                    directory(&entry.path())?
+                    directory(&entry.path(), root)?
                 } else {
                     metadata.len()
                 };
@@ -650,7 +658,20 @@ impl Writer {
             }
             Ok(size)
         }
-        directory(self.db.path())
+        let mut last = String::new();
+        for _ in 0..3 {
+            match directory(self.db.path(), self.db.path()) {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if error.code == "ACCOUNTING_CHANGED" => last = error.message,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::new(
+            "STORAGE_PRESSURE",
+            format!(
+                "database footprint stayed unstable across 3 complete measurements; retry accounting before admission: {last}"
+            ),
+        ))
     }
 }
 
@@ -659,6 +680,11 @@ fn put<T: Catalog>(batch: &mut WriteBatch, key: &str, value: &T) {
 }
 
 impl Store {
+    /// Actual single-writer database location, for excluding it from intake roots.
+    pub fn data_path(&self) -> Result<std::path::PathBuf, Error> {
+        Ok(self.lock()?.db.path().to_path_buf())
+    }
+
     /// Open a single-writer RocksDB store with an explicit disk budget.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         config.validate()?;

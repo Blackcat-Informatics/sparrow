@@ -6,6 +6,57 @@
 use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 
 const DAY: u64 = 86_400_000;
+const CONSUMPTION_DIRECTORIES: sparrow_core::ConsumptionDirectories =
+    sparrow_core::ConsumptionDirectories {
+        root_device: 1,
+        root_inode: 100,
+        parent_device: 1,
+        parent_inode: 101,
+    };
+
+#[test]
+fn physical_accounting_handles_directory_churn_with_bounded_measurement_failures() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let running = stop.clone();
+    let file = dir.path().join("accounting-churn");
+    let worker = std::thread::spawn(move || {
+        while !running.load(Ordering::Relaxed) {
+            std::fs::write(&file, b"owned accounting sidecar").unwrap();
+            std::fs::remove_file(&file).unwrap();
+        }
+    });
+    let observations = (0..100).map(|_| store.status(0)).collect::<Vec<_>>();
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    for observation in observations {
+        match observation {
+            Ok(status) => assert!(
+                status["physical_bytes"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    > 0
+            ),
+            Err(error) => {
+                assert_eq!(error.code, "STORAGE_PRESSURE");
+                assert!(
+                    error.message.starts_with(
+                        "database footprint stayed unstable across 3 complete measurements"
+                    ),
+                    "{error}"
+                );
+            }
+        }
+    }
+    assert!(store.status(0).is_ok());
+}
 
 #[test]
 fn consumption_recovery_preserves_original_publication_beyond_retry_and_retention() {
@@ -36,6 +87,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
             "source",
             "log",
             observed.clone(),
+            CONSUMPTION_DIRECTORIES,
         )
         .unwrap();
     assert_eq!(
@@ -49,7 +101,8 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
                 b"nested/\xff.log",
                 "source",
                 "log",
-                observed.clone()
+                observed.clone(),
+                CONSUMPTION_DIRECTORIES
             )
             .unwrap(),
         reserved
@@ -206,18 +259,39 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
     ] {
         assert_eq!(
             store
-                .consumption_reserve("watch", path, "source", "log", observed.clone())
+                .consumption_reserve(
+                    "watch",
+                    path,
+                    "source",
+                    "log",
+                    observed.clone(),
+                    CONSUMPTION_DIRECTORIES
+                )
                 .unwrap_err()
                 .code,
             "INVALID_ARGUMENT"
         );
     }
     let first = store
-        .consumption_reserve("watch", b"file", "source", "log", observed.clone())
+        .consumption_reserve(
+            "watch",
+            b"file",
+            "source",
+            "log",
+            observed.clone(),
+            CONSUMPTION_DIRECTORIES,
+        )
         .unwrap();
     assert_eq!(
         store
-            .consumption_reserve("watch", b"file", "other", "log", observed.clone())
+            .consumption_reserve(
+                "watch",
+                b"file",
+                "other",
+                "log",
+                observed.clone(),
+                CONSUMPTION_DIRECTORIES
+            )
             .unwrap_err()
             .code,
         "CONFLICT"
@@ -249,19 +323,34 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "source",
                 "log",
                 observed.clone(),
+                CONSUMPTION_DIRECTORIES,
             )
             .unwrap();
     }
     assert_eq!(
         store
-            .consumption_reserve("watch", b"overflow", "source", "log", observed.clone())
+            .consumption_reserve(
+                "watch",
+                b"overflow",
+                "source",
+                "log",
+                observed.clone(),
+                CONSUMPTION_DIRECTORIES
+            )
             .unwrap_err()
             .code,
         "RESOURCE_LIMIT"
     );
     assert_eq!(
         store
-            .consumption_reserve("watch", b"file", "source", "log", observed)
+            .consumption_reserve(
+                "watch",
+                b"file",
+                "source",
+                "log",
+                observed,
+                CONSUMPTION_DIRECTORIES
+            )
             .unwrap()
             .import_id,
         first.import_id
@@ -287,14 +376,21 @@ fn consumption_missing_publication_receipt_is_a_hard_failure_without_republicati
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(b"one\n").as_bytes())
     );
     let observation = ConsumptionGeneration {
-        device: 7,
+        device: 1,
         inode: 8,
         byte_length: 4,
         modified: (0, 0),
         changed: (0, 0),
     };
     let journal = store
-        .consumption_reserve("fault-watch", b"file", "source", "log", observation.clone())
+        .consumption_reserve(
+            "fault-watch",
+            b"file",
+            "source",
+            "log",
+            observation.clone(),
+            CONSUMPTION_DIRECTORIES,
+        )
         .unwrap();
     store
         .consumption_claimed(&journal.import_id, observation)

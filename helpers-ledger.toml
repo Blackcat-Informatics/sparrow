@@ -2,6 +2,132 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "storage-physical-footprint"
+summary = "Measure all database filesystem bytes through one owner, retry complete observations when compaction removes an entry, and refuse an unstable or broken measurement without a partial sum."
+home = "sparrow_core::storage::Writer::physical_bytes"
+entry_points = []
+spec = "docs/development-runtime.md: bounded physical accounting under directory churn."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(measure_ingest_physical_bytes|measure_status_physical_bytes)$']
+
+[[job]]
+id = "daemon-configuration"
+summary = "One strict configuration and single-writer open path serves the daemon and filesystem acceptance fixtures without copied analyzer/storage setup."
+home = "sparrow_server::config::ServerConfig::read"
+entry_points = ["sparrow_server::config::ServerConfig::open_store", "sparrow_core::storage::Store::data_path"]
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(read_test_server_config|open_test_server_store)$']
+
+[[job]]
+id = "claim-anchored-open"
+summary = "One safe openat2 owner opens the admitted root and descriptor-relative no-symlink/no-mount-crossing children, with nonblocking special-file admission and no weak kernel fallback."
+home = "sparrow_server::consumption::open"
+entry_points = ["sparrow_server::consumption::ClaimRoot::open"]
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(open_claim_input_path|open_claim_recovery_path)$']
+
+[[job]]
+id = "claim-descriptor-observation"
+summary = "Convert the SDK-owned opened-file metadata observation to the persistent typed generation; no second file-clock observation implementation."
+home = "sparrow_server::consumption::observation"
+entry_points = ["sparrow_server::consumption::require"]
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(capture_claimed_file_metadata|capture_reserved_file_metadata)$']
+
+[[job]]
+id = "claim-namespace-binding"
+summary = "Bind watch root and private directory to held descriptors, requiring the original parent only until the durable move checkpoint."
+home = "sparrow_server::consumption::ClaimRoot::namespace"
+entry_points = ["sparrow_server::consumption::ClaimRoot::scope", "sparrow_server::consumption::ClaimRoot::directories", "sparrow_server::consumption::ClaimRoot::private_namespace"]
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_claim_upload_directory|validate_claim_removal_directory)$']
+
+[[job]]
+id = "claim-source-reservation"
+summary = "Synchronize and validate one scheduler-admitted regular-file generation and original parent before reserving its durable managed import identity."
+home = "sparrow_server::consumption::ClaimRoot::reserve"
+entry_points = []
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(reserve_watch_source|reserve_scan_source)$']
+
+[[job]]
+id = "claim-filesystem-recovery"
+summary = "Recover reserved moves, claimed descriptors and published missing sources through one no-overwrite atomic move and ordered directory-sync owner."
+home = "sparrow_server::consumption::ClaimRoot::recover"
+entry_points = []
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(recover_started_claim|recover_published_claim|move_fresh_claim)$']
+
+[[job]]
+id = "claim-descriptor-publication"
+summary = "Publish only the original opened generation through the typed SDK's canonical uploader and verify persistent source ownership against its receipt."
+home = "sparrow_server::consumption::ClaimRoot::publish"
+entry_points = ["sparrow_server::consumption::ClaimRoot::publication"]
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(upload_watch_claim|upload_recovered_claim)$']
+
+[[job]]
+id = "claim-source-removal"
+summary = "Unlink only the exact private opened generation after durable original-publication proof, sync its directory, then archive recovery ownership."
+home = "sparrow_server::consumption::ClaimRoot::remove"
+entry_points = []
+spec = "docs/development-runtime.md: anchored filesystem claim coordination."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(unlink_finished_watch_source|unlink_finished_recovery_source)$']
+
+[[job]]
 id = "consumption-reservation-identity"
 summary = "Bind one completed source generation, watch and exact relative Unix path to one reserved import request using native JSON and BLAKE3."
 home = "sparrow_core::storage::consumption::ConsumptionJournal::reserved_request"
