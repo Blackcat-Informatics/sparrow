@@ -12,6 +12,71 @@ use std::{
 
 struct Daemon(Child);
 
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status() {
+    tokio::task::LocalSet::new().run_until(async {
+        use purrdf_lex::json::{Object, Value};
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        let text = std::fs::read_to_string(&config).unwrap()
+            .replace("disk_budget = 134217728", "disk_budget = 16777216")
+            .replace("maintenance_reserve = 8388608", "maintenance_reserve = 4194304");
+        std::fs::write(&config, text).unwrap();
+        let daemon = start(&config, &socket).await;
+        let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+        let old = producer.ingest("pressure-old", "source", wire::Format::Log, b"old\n").await.unwrap();
+        let protected = producer.ingest("pressure-pinned", "source", wire::Format::Log, b"pinned\n").await.unwrap();
+        let mut mcp = Mcp::start(&socket);
+        mcp.initialize(1).await;
+        let pin = mcp.tool(2, "pin", Object::new().with("store_id", &protected.store_id)
+            .with("request_id", "pressure-pin").with("name", "case")
+            .with("targets", Value::array([protected.id.as_str()])).with("days", 40_u64).into()).await;
+        assert_eq!(pin["isError"].as_bool(), Some(false));
+        let pin_id = pin["structuredContent"]["pin_id"].as_str().unwrap().to_owned();
+        let ballast = data.join("test-owned-pressure-ballast");
+        std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
+        let error = producer.ingest("pressure-retry", "source", wire::Format::Log, b"later\n").await.unwrap_err();
+        assert!(matches!(error, sparrow_client::Error::Domain { ref code, retryable: true, .. } if code == "STORAGE_PRESSURE"));
+        let connection = connect(&socket).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = connection.client.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let pressure = status.get_pressure_status().unwrap();
+            assert_eq!(status.get_schema_version(), sparrow_client::SCHEMA_VERSION);
+            if pressure.get_evicted_records() == 1 {
+                assert!(pressure.get_requested_bytes() > 0);
+                assert!(matches!(pressure.get_failure().unwrap().which().unwrap(), wire::optional_text::Absent(())));
+                break;
+            }
+            assert!(Instant::now() < deadline, "owned daemon did not run pressure retirement");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let cli_status = cli(&socket, &["status"]);
+        let mcp_status = mcp.tool(3, "status", Object::new().into()).await;
+        assert_eq!(cli_status["pressure"]["evicted_records"].as_str(), Some("1"));
+        assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_records"], cli_status["pressure"]["evicted_records"]);
+        let retained = mcp.tool(4, "bytes_read", Object::new().with("store_id", &protected.store_id)
+            .with("id", &protected.id).with("offset", "0").with("length", 7_u64).into()).await;
+        assert_eq!(retained["isError"].as_bool(), Some(false));
+        let unavailable = mcp.tool(5, "bytes_read", Object::new().with("store_id", &old.store_id)
+            .with("id", &old.id).with("offset", "0").with("length", 1_u64).into()).await;
+        assert_eq!(unavailable["structuredContent"]["error"]["code"].as_str(), Some("EVIDENCE_UNAVAILABLE"));
+        let released = mcp.tool(6, "pin_release", Object::new().with("store_id", &protected.store_id)
+            .with("request_id", "pressure-release").with("pin_id", &pin_id).into()).await;
+        assert_eq!(released["isError"].as_bool(), Some(false));
+        std::fs::remove_file(ballast).unwrap();
+        let accepted = producer.ingest("pressure-retry", "source", wire::Format::Log, b"later\n").await.unwrap();
+        assert_eq!(producer.ingest("pressure-retry", "source", wire::Format::Log, b"later\n").await.unwrap(), accepted);
+        mcp.close(true).await;
+        drop(connection);
+        drop(producer);
+        drop(daemon);
+    }).await;
+}
+
 fn watch_definition(
     root: &Path,
     id: &str,

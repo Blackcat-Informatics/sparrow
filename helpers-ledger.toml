@@ -1352,8 +1352,8 @@ names = ['^(drop_prepared_record|remove_ingest_record)$']
 [[job]]
 id = "oldest-unpinned-eviction"
 summary = "Serialize bounded chronological evidence retirement against pins through the shared dependency owner."
-home = "sparrow_core::storage::eviction::Store::evict_oldest"
-entry_points = []
+home = "sparrow_core::storage::eviction::Writer::evict_oldest"
+entry_points = ["sparrow_core::storage::eviction::Store::evict_oldest"]
 spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -1404,6 +1404,62 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(decode_eviction_catalog|decode_pressure_catalog)$']
+
+[[job]]
+id = "data-write-capacity-admission"
+summary = "One measured physical-space law signals pressure for direct and staged data writes before publication."
+home = "sparrow_core::storage::pressure::Writer::admit_data_write"
+entry_points = []
+spec = "docs/development-runtime.md: schema 17 pressure maintenance."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(admit_direct_disk_write|admit_staged_disk_write)$']
+
+[[job]]
+id = "physical-pressure-maintenance"
+summary = "Drive shared oldest-unpinned retirement, finite native flush scheduling and measured recovery without repeated deletion during lag."
+home = "sparrow_core::storage::pressure::Writer::maintain_pressure"
+entry_points = ["sparrow_core::storage::pressure::Store::pressure_maintain", "sparrow_core::storage::pressure::Writer::native_property"]
+spec = "docs/development-runtime.md: schema 17 pressure maintenance."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(reclaim_direct_pressure|reclaim_import_pressure)$']
+
+[[job]]
+id = "typed-pressure-status"
+summary = "Encode native pressure phases and explicit retirement frontiers into one typed status contract."
+home = "sparrow_server::pressure::encode"
+entry_points = []
+spec = "docs/development-runtime.md: schema 17 pressure maintenance."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_cli_pressure|encode_mcp_pressure)$']
+
+[[job]]
+id = "agent-pressure-rendering"
+summary = "CLI and MCP render the same typed pressure observations and logical frontiers."
+home = "sparrow_server::pressure::decode"
+entry_points = []
+spec = "docs/development-runtime.md: schema 17 pressure maintenance."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_cli_pressure|render_mcp_pressure)$']
 
 [[job]]
 id = "complete-import-publication"

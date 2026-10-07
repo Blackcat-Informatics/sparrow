@@ -18,11 +18,10 @@ downloadable as a complete file. Reports expose visited/protected counts,
 remaining touched-parent manifest references and an explicit traversal frontier.
 Logical reference retirement does not certify physical bytes freed or peak RSS.
 
-This is the core retirement primitive. Automatic pressure admission, continuation
-past a protected prefix larger than the scan budget, recordless-artifact eviction,
-bounded expiry and native compaction/blob reclamation remain unfinished. The
-daemon does not yet invoke this primitive automatically. It continues to refuse
-unsafe write admission rather than claim reclaimed physical capacity.
+The daemon now invokes this primitive through the schema 17 pressure worker
+below. Continuation past a protected prefix larger than the scan budget,
+recordless-artifact eviction, bounded expiry, forced native compaction and
+sustained physical reclamation qualification remain unfinished.
 
 Temporary-store scenarios cover native RDF/JSON/text and exact-byte survival for
 record pins and shared occurrences, stable retries after reopen, whole-artifact
@@ -33,8 +32,48 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 16; the schema sections
+The current source implements schema 17; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 17 pressure maintenance
+
+Direct record ingestion and staged import writes share one measured physical
+admission law. A prepared batch is refused before publication when its estimate
+would cross the disk budget minus maintenance reserve. The smallest outstanding
+refused estimate requests reclamation; a batch that cannot fit the entire data
+allowance returns `RESOURCE_LIMIT` without requesting eviction. Buffered WAL
+queue pressure and administrative control-write refusal are separate signals.
+
+The daemon schedules one pressure pass per second, serialized with ingestion and
+pin mutations. It captures native flush/compaction and snapshot observations,
+uses the shared bounded oldest-unpinned retirement path, and requests nonwaiting
+native flushes of both families. Automatic RocksDB compaction and blob GC use
+the configured two background jobs. Missing native properties, background errors
+and flush scheduling failures are actionable errors, retained in pressure status.
+The worker does not manufacture a successful physical reclamation receipt.
+
+After retirement, another destructive pass waits for native work and read
+snapshots to finish and for measured physical bytes to fall below its preceding
+observation. Writes continue to check their own complete estimate. Status and
+pin release remain available under data pressure. A reopened over-budget store
+requests maintenance from its current footprint; pressure counters and refused
+estimates are session-local observations, not durable producer retry receipts.
+
+Typed status exposes ready/requested/awaiting-reclamation/blocked phase,
+requested bytes, pass and retirement totals, native activity and snapshot counts,
+the last explicit logical frontier, and any maintenance failure. CLI and stdio
+MCP share one renderer. Temporary-store and real-daemon acceptance use owned
+ballast to force admission refusal and then remove it to prove capacity-based
+retry. That does not qualify forced compaction, sustained physical reclamation,
+peak RSS or the complete pressure architecture. A stalled native reclamation
+cycle remains visible and backpressures writes instead of repeatedly deleting
+additional evidence.
+
+The full workspace gate passed with 75 storage scenarios, 24 real-daemon/RPC/MCP
+scenarios, all SDK and other workspace tests, release Clippy with warnings denied,
+seeded census self-tests and 122 helper ownership jobs with no distinct exceptions
+or unsanctioned duplicate groups. This qualifies the admission/worker/status
+integration described here, not the remaining full-architecture acceptance.
 
 ## Typed explicit completed handoff
 

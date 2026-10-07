@@ -3,7 +3,7 @@
 
 //! Serialized oldest-unpinned logical retirement. Physical reclamation is separate.
 
-use super::{Artifact, DAY, Error, Store, put, retire};
+use super::{Artifact, DAY, Error, Store, Writer, put, retire};
 use std::collections::BTreeMap;
 
 /// Finite per-pass admission. Catalog charge includes decoded and retained shapes.
@@ -71,6 +71,16 @@ impl Store {
     /// Records retire in full; parent manifest cleanup can continue in later passes.
     /// Admission failure commits nothing. This does not run native compaction.
     pub fn evict_oldest(&self, now: u64, limits: EvictionLimits) -> Result<EvictionReport, Error> {
+        self.lock()?.evict_oldest(now, limits)
+    }
+}
+
+impl Writer {
+    pub(super) fn evict_oldest(
+        &self,
+        now: u64,
+        limits: EvictionLimits,
+    ) -> Result<EvictionReport, Error> {
         for (value, maximum) in [
             (limits.max_records, 128),
             (limits.scan_budget, 100000),
@@ -85,7 +95,7 @@ impl Store {
                 ));
             }
         }
-        let writer = self.lock()?;
+        let writer = self;
         let mut catalog = limits.max_catalog_bytes;
         let mut pins = 0;
         let protected = writer.protected_matching(
@@ -105,7 +115,7 @@ impl Store {
             None,
             Some(&mut catalog),
         )?;
-        let mut retirement = retire::Retirement::new(&writer)?;
+        let mut retirement = retire::Retirement::new(writer)?;
         let mut parents = BTreeMap::<String, Artifact>::new();
         let mut report = EvictionReport {
             records: Vec::new(),

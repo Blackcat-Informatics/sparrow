@@ -320,14 +320,7 @@ impl<'a> RecordBatch<'a> {
                     .saturating_mul(2)
                     .saturating_add(4096),
             );
-        if self.writer.physical_bytes()?.saturating_add(estimate)
-            > self.writer.config.disk_budget - self.writer.config.maintenance_reserve
-        {
-            return Err(Error::new(
-                "STORAGE_PRESSURE",
-                "insufficient capacity below maintenance reserve; release pins or reclaim storage before retrying",
-            ));
-        }
+        self.writer.admit_data_write(estimate)?;
 
         Ok(PreparedRecords {
             batch: self.batch,

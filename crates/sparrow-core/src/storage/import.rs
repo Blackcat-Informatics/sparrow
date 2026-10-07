@@ -311,15 +311,7 @@ impl Writer {
         let estimate = (batch.size_in_bytes() as u64)
             .saturating_mul(4)
             .saturating_add(65536);
-        if self.physical_bytes()?.saturating_add(estimate)
-            > self.config.disk_budget - self.config.maintenance_reserve
-        {
-            return Err(Error::new(
-                "STORAGE_PRESSURE",
-                "staging would cross the disk maintenance reserve",
-            ));
-        }
-        Ok(())
+        self.admit_data_write(estimate)
     }
 
     fn commit_layout_page(

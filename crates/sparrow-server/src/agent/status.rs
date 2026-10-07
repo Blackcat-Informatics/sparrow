@@ -85,6 +85,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         watches.push(Value::from(status));
     }
     let output = Object::new()
+        .with(
+            "pressure",
+            crate::pressure::decode(value.get_pressure_status()?)?,
+        )
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)

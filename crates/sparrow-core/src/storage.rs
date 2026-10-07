@@ -23,6 +23,7 @@ pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
 pub(crate) mod pin_read;
+pub(crate) mod pressure;
 pub(crate) mod publication;
 mod query_membership;
 mod rdf_index;
@@ -305,6 +306,7 @@ struct Writer {
     id: String,
     config: Config,
     durability: std::cell::RefCell<durability::State>,
+    pressure: std::cell::RefCell<pressure::State>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -859,6 +861,7 @@ impl Store {
                 id,
                 config,
                 durability,
+                pressure: std::cell::RefCell::new(pressure::State::default()),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
         })

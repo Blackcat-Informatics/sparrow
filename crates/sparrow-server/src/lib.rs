@@ -8,6 +8,7 @@ mod config;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;
+mod pressure;
 mod transport;
 mod watch_admin;
 pub mod watches;

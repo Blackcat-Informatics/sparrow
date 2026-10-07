@@ -55,6 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
         let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(30));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pressure = tokio::time::interval(std::time::Duration::from_secs(1));
+        pressure.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut synchronize = tokio::time::interval(std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)));
         synchronize.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Consume interval's immediate first tick; the intended delay starts now.
@@ -78,6 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let owner = store.clone();
                     if let Err(e) = tokio::task::spawn_blocking(move || owner.expire(sparrow_server::now()?)).await? {
                         eprintln!("sparrowd: retention maintenance failed: {e}");
+                    }
+                }
+                _ = pressure.tick() => {
+                    let owner = store.clone();
+                    if let Err(error) = tokio::task::spawn_blocking(move || owner.pressure_maintain(
+                        sparrow_server::now()?, sparrow_core::EvictionLimits::default())).await? {
+                        eprintln!("sparrowd: pressure maintenance failed: {error}");
                     }
                 }
                 accepted = listener.accept() => {

@@ -78,6 +78,21 @@ struct Status {
   maxEventBatchBytes @22 :UInt32; maxEventBatchEvents @23 :UInt32;
   durabilityStatus @24 :DurabilityStatus;
   consumeWatches @25 :List(ConsumeWatchStatus);
+  pressureStatus @26 :PressureStatus;
+}
+
+enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; }
+enum EvictionFrontier { exhausted @0; recordLimit @1; scanBudget @2; payloadBudget @3; }
+struct EvictionPass {
+  records @0 :UInt32; artifacts @1 :UInt32; visited @2 :UInt32; protected @3 :UInt32;
+  payloadRefs @4 :UInt32; pendingManifestRefs @5 :UInt64; frontier @6 :EvictionFrontier;
+}
+struct PressurePass { union { absent @0 :Void; present @1 :EvictionPass; } }
+struct PressureStatus {
+  phase @0 :PressurePhase; requestedBytes @1 :UInt64; passes @2 :UInt64;
+  evictedRecords @3 :UInt64; payloadRefsRetired @4 :UInt64;
+  pendingFlushes @5 :UInt64; pendingCompactions @6 :UInt64; snapshots @7 :UInt64;
+  lastPass @8 :PressurePass; failure @9 :OptionalText;
 }
 
 enum WatchCoverage { reconciling @0; covered @1; }

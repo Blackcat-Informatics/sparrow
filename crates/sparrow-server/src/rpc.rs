@@ -1424,12 +1424,19 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::StatusResults,
     ) -> capnp::Result<()> {
         match self
-            .work(|store, now| Ok((store.status(now)?, store.durability_status()?)))
+            .work(|store, now| {
+                Ok((
+                    store.status(now)?,
+                    store.durability_status()?,
+                    store.pressure_status()?,
+                ))
+            })
             .await
         {
             Err(e) => failure(results.get().init_result(), e),
-            Ok((value, durability)) => {
+            Ok((value, durability, pressure)) => {
                 let mut out = results.get().init_result().init_ok();
+                crate::pressure::encode(out.reborrow().init_pressure_status(), &pressure)?;
                 let watches = self
                     .watches
                     .snapshot()

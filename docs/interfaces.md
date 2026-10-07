@@ -587,6 +587,16 @@ its durable acknowledgment law.
 
 ### Server WAL acceptance and synchronization
 
+Schema 17 adds typed `Status.pressureStatus`, shared by CLI and MCP status.
+It distinguishes physical disk admission from buffered WAL queue pressure.
+Its phases are `ready`, `requested`, `awaitingReclamation` and `blocked`;
+integer fields report the outstanding write estimate, session-local retirement
+totals and sampled native activity. The last logical pass includes an explicit
+exhausted/record-limit/scan-budget/payload-budget frontier. Retirement counts do
+not assert physical space freed. Writes are retried with their original request
+identity and their own full physical admission check. A batch larger than the
+entire data allowance is a `RESOURCE_LIMIT`, rather than a reclamation request.
+
 `Ingest.durability` and `eventsIngest`'s durability argument default to `durable`.
 Buffered mode publishes the same atomic catalog/payload/index batch with WAL
 enabled, without promising synchronization. Its artifact receipt carries

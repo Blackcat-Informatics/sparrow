@@ -32,6 +32,7 @@ pub use storage::import::{
 };
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};
+pub use storage::pressure::{PressurePhase, PressureStatus};
 pub use storage::publication::{ImportPreparation, RawPreparation};
 pub use storage::rdf_view::{
     RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,

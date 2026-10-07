@@ -8,6 +8,201 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn pressure_admission_drives_bounded_retirement_and_waits_for_physical_capacity() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let old = store
+        .ingest("pressure-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    let protected = store
+        .ingest("pressure-pinned", "source", "log", b"pinned\n", 2)
+        .unwrap();
+    let pin = store
+        .pin(
+            "pressure-pin",
+            "case",
+            std::slice::from_ref(&protected.id),
+            40,
+            3,
+        )
+        .unwrap();
+    assert_eq!(store.pressure_status().unwrap().phase, PressurePhase::Ready);
+    let ballast = dir.path().join("test-owned-pressure-ballast");
+    std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
+    assert_eq!(
+        store
+            .ingest("pressure-refused", "source", "log", b"later\n", 4)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    let requested = store.pressure_status().unwrap();
+    assert_eq!(requested.phase, PressurePhase::Requested);
+    assert!(requested.requested_bytes > 0);
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let state = store.pressure_maintain(5, limits).unwrap();
+    assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!(state.evicted_records, 1);
+    assert_eq!(state.last_pass.unwrap().records, old.record_ids);
+    assert_eq!(store.bytes(&protected.id, 0, 7, 5).unwrap(), b"pinned\n");
+    for _ in 0..3 {
+        store.pressure_maintain(6, limits).unwrap();
+        assert_eq!(store.bytes(&protected.id, 0, 7, 6).unwrap(), b"pinned\n");
+    }
+    assert_eq!(
+        store
+            .ingest("pressure-refused", "source", "log", b"later\n", 6)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    // Status and durable control writes remain usable above the data allowance.
+    assert_eq!(store.status(6).unwrap()["active_pins"].as_str(), Some("1"));
+    store.release(&pin.id).unwrap();
+    std::fs::remove_file(ballast).unwrap();
+    let recovered = store.pressure_maintain(7, limits).unwrap();
+    assert_eq!(recovered.phase, PressurePhase::Ready);
+    assert_eq!(recovered.requested_bytes, 0);
+    assert_eq!(
+        store
+            .ingest("pressure-refused", "source", "log", b"later\n", 7)
+            .unwrap()
+            .record_ids
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.bytes(&old.id, 0, 1, 7).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+}
+
+#[test]
+fn staged_import_pressure_and_impossible_writes_have_distinct_admission_outcomes() {
+    use sparrow_core::PressurePhase;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 2 * 1024 * 1024;
+    settings.maintenance_reserve = 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    assert_eq!(
+        store
+            .ingest(
+                "impossible-write",
+                "source",
+                "log",
+                &vec![b'x'; 2 * 1024 * 1024],
+                1
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(store.pressure_status().unwrap().phase, PressurePhase::Ready);
+    let ballast = dir.path().join("test-owned-import-ballast");
+    std::fs::write(&ballast, vec![0_u8; 1024 * 1024]).unwrap();
+    let input = b"import\n";
+    let payload_id = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    assert_eq!(
+        store
+            .import_start(
+                "pressure-import",
+                "source",
+                "log",
+                input.len() as u64,
+                &payload_id,
+                2
+            )
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    assert_eq!(
+        store.pressure_status().unwrap().phase,
+        PressurePhase::Requested
+    );
+    std::fs::remove_file(ballast).unwrap();
+    assert_eq!(
+        store
+            .pressure_maintain(3, sparrow_core::EvictionLimits::default())
+            .unwrap()
+            .phase,
+        PressurePhase::Ready
+    );
+}
+
+#[test]
+fn blocked_pressure_rechecks_released_pins_without_breaking_existing_protection() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let artifact = store
+        .ingest("blocked-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    let pin = store
+        .pin(
+            "blocked-pin",
+            "case",
+            std::slice::from_ref(&artifact.id),
+            40,
+            2,
+        )
+        .unwrap();
+    std::fs::write(
+        dir.path().join("test-owned-blocked-ballast"),
+        vec![0_u8; 13 * 1024 * 1024],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .ingest("blocked-new", "source", "log", b"new\n", 3)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    let invalid = EvictionLimits {
+        max_records: 0,
+        ..EvictionLimits::default()
+    };
+    assert_eq!(
+        store.pressure_maintain(4, invalid).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+    assert!(store.pressure_status().unwrap().failure.is_some());
+    let blocked = store
+        .pressure_maintain(5, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(blocked.phase, PressurePhase::Blocked);
+    assert!(blocked.failure.is_none());
+    assert_eq!(blocked.evicted_records, 0);
+    assert_eq!(blocked.last_pass.unwrap().protected, 1);
+    assert_eq!(store.bytes(&artifact.id, 0, 4, 5).unwrap(), b"old\n");
+    store.release(&pin.id).unwrap();
+    let resumed = store
+        .pressure_maintain(6, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(resumed.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!(resumed.evicted_records, 1);
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 6).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+}
+
+#[test]
 fn eviction_preserves_record_pins_shared_projections_and_durable_retry_identity() {
     use sparrow_core::{EvictionLimits, JsonQuery, QueryScope, QuerySelection};
     let dir = tempfile::tempdir().unwrap();
@@ -1318,6 +1513,10 @@ fn buffered_ledger_refuses_the_next_write_without_publishing_a_prefix() {
     assert_eq!(
         store.artifacts(0).unwrap().len(),
         sparrow_core::MAX_BUFFERED_WRITES
+    );
+    assert_eq!(
+        store.pressure_status().unwrap().phase,
+        sparrow_core::PressurePhase::Ready
     );
     store
         .flush_through(first.unwrap().buffered.as_ref().unwrap())
