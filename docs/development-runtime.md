@@ -82,6 +82,39 @@ SPARQL and the remaining full architecture/pressure/memory/deployment acceptance
 are still unfinished. Administrative catalog publication does not establish
 those results.
 
+The signed implementation `c7adbbc` passed its final ordinary pre-commit gate
+on 2026-10-07, including all 22 RPC/filesystem/MCP scenarios and the 105-job
+pinned census. The previous owned development PID 2566561 exited successfully
+on SIGINT and removed its endpoint. The updated unit is active as PID 3067453
+at the same mode-0600 Unix socket, with mode-0700 data and the original store
+`store:46c88e949ccec658600b66c7becd5bb7`. Its first administrative catalog commit
+upgraded the marker to `sparrow.store/7`; discovery reports schema 15. Existing
+190 records were present before this acceptance input.
+
+Live typed administration created the owned synthetic root
+`/home/paudley/.local/state/sparrow/development-admin-acceptance` at revision 2,
+updated its quiet interval from one to three seconds at revision 3, and later
+removed it at revision 4. Its exact 90-byte CRLF JSONL input was consumed as
+`artifact:f63d6185e7f7a6abaf49b34f0dc6970c`, record
+`record:bd6303bb090e0faf83f4050d3a8a7ba1`. Native byte retrieval compared equal to
+the original input; value searching and the declared `/at` RFC3339 event interval
+returned one exact row with complete membership and zero unknown events. Its
+immutable time profile is
+`time-profile:5ed7182c60ad536eea8a18d827ddb592dd263c19af4b0a284d2754d6816fb2eb`.
+
+Retrying `watch-admin-create-20261007-01` with its original definition returned
+the original revision-2 receipt after removal, while current list/status still
+contained only `development-completed`, revision 1. A new file published after
+removal remained untouched beyond the removed watch's quiet interval. The
+final observed status showed 191 live records, no pending claims, no watch or
+durability failure, and no pending durability writes. Retrying the earlier
+ordinary descriptor fixture retained
+`artifact:d066e0d527e9e82ec11e13388b386c13` and
+`record:23febe08e38e42deea0f58e4880b9358`.
+Only owned synthetic roots were administered. No live producer/model directory
+or sibling service was changed; permanent deployment and the full architecture
+remain unqualified.
+
 ## Configured recursive completed consumption (schema 14 qualification)
 
 Schema 14 adds typed `Status.consumeWatches`; the daemon now starts one owned
