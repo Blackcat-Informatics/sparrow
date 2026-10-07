@@ -8,6 +8,345 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn consumption_recovery_preserves_original_publication_beyond_retry_and_retention() {
+    use sparrow_core::{ConsumptionGeneration, ImportStart};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"one\n";
+    let identity = store.store_id().unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/5")
+    );
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let observed = ConsumptionGeneration {
+        device: 1,
+        inode: 2,
+        byte_length: input.len() as u64,
+        modified: (10, 20),
+        changed: (10, 30),
+    };
+    let reserved = store
+        .consumption_reserve(
+            "watch",
+            b"nested/\xff.log",
+            "source",
+            "log",
+            observed.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/6")
+    );
+    assert_eq!(
+        store
+            .consumption_reserve(
+                "watch",
+                b"nested/\xff.log",
+                "source",
+                "log",
+                observed.clone()
+            )
+            .unwrap(),
+        reserved
+    );
+    assert_eq!(
+        store
+            .import_start(&reserved.request_id, "source", "log", 4, &digest, 0)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store
+            .ingest(&reserved.request_id, "source", "log", input, 0)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    let mut claimed = observed.clone();
+    claimed.changed = (11, 0); // Rename may change ctime, but cannot change content identity.
+    store
+        .consumption_claimed(&reserved.import_id, claimed.clone())
+        .unwrap();
+    let manifest = store
+        .import_begin(&reserved.request_id, "source", "log", 4, &digest, 0)
+        .unwrap();
+    assert!(manifest.consumption);
+    store.import_append(&manifest.id, 0, input, 0).unwrap();
+    assert_eq!(
+        store.import_cancel(&manifest.id, 1).unwrap_err().code,
+        "CONFLICT"
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.store_id().unwrap(), identity);
+    assert_eq!(store.consumption_pending().unwrap().len(), 1);
+    store.expire(3 * DAY).unwrap();
+    assert_eq!(
+        store
+            .import_get(&manifest.id, 3 * DAY)
+            .unwrap()
+            .received_bytes,
+        4
+    );
+    store.import_seal(&manifest.id, 3 * DAY).unwrap();
+    store.import_prepare_layout(&manifest.id, 3 * DAY).unwrap();
+    store
+        .import_prepare_record(&manifest.id, 0, 3 * DAY)
+        .unwrap();
+    assert_eq!(
+        store
+            .consumption_removed(&manifest.id, "artifact:fake", &claimed, 3 * DAY)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let artifact = store.import_publish(&manifest.id, 3 * DAY).unwrap();
+    assert_eq!(store.bytes(&artifact.id, 0, 4, 3 * DAY).unwrap(), input);
+    assert_eq!(
+        store
+            .consumption_get(&manifest.id)
+            .unwrap()
+            .published_artifact
+            .as_deref(),
+        Some(artifact.id.as_str())
+    );
+    drop(store); // Model a lost publication reply and daemon restart.
+    let store = Store::open(dir.path(), config()).unwrap();
+    for _ in 0..4 {
+        store.expire(40 * DAY).unwrap();
+    }
+    assert_eq!(
+        store.status(40 * DAY).unwrap()["live_records"].as_str(),
+        Some("0")
+    );
+    let recovered = match store
+        .import_start(&reserved.request_id, "source", "log", 4, &digest, 40 * DAY)
+        .unwrap()
+    {
+        ImportStart::Accepted(recovered) => recovered,
+        ImportStart::Staging(_) => {
+            panic!("published claim must never allocate another staging occurrence")
+        }
+    };
+    for receipt in [
+        store.import_publish(&manifest.id, 40 * DAY).unwrap(),
+        recovered,
+    ] {
+        assert_eq!(receipt.id, artifact.id);
+        assert_eq!(receipt.payload_id, artifact.payload_id);
+        assert_eq!(receipt.byte_length, artifact.byte_length);
+        assert_eq!(receipt.record_ids, artifact.record_ids);
+        assert_eq!(receipt.received_at, artifact.received_at);
+        assert_eq!(receipt.expires_at, artifact.expires_at);
+        assert_eq!(receipt.source, artifact.source);
+        assert_eq!(receipt.format, artifact.format);
+        assert!(receipt.buffered.is_none());
+    }
+    assert!(store.bytes(&artifact.id, 0, 4, 40 * DAY).is_err()); // Journal is no implicit pin.
+    let mut replacement = claimed.clone();
+    replacement.inode += 1;
+    assert_eq!(
+        store
+            .consumption_removed(&manifest.id, &artifact.id, &replacement, 40 * DAY)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let removed = store
+        .consumption_removed(&manifest.id, &artifact.id, &claimed, 40 * DAY)
+        .unwrap();
+    assert!(store.consumption_pending().unwrap().is_empty());
+    assert_eq!(
+        store
+            .consumption_removed(&manifest.id, &artifact.id, &claimed, 41 * DAY)
+            .unwrap(),
+        removed
+    );
+    store.expire(43 * DAY).unwrap();
+    store.expire(43 * DAY).unwrap();
+    assert_eq!(
+        store.consumption_get(&manifest.id).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        store
+            .import_start(&reserved.request_id, "source", "log", 4, &digest, 43 * DAY)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert!(store.records(43 * DAY).unwrap().is_empty());
+}
+
+#[test]
+fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
+    use sparrow_core::ConsumptionGeneration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let observed = ConsumptionGeneration {
+        device: 1,
+        inode: 2,
+        byte_length: 4,
+        modified: (10, 20),
+        changed: (10, 30),
+    };
+    for path in [
+        b"".as_slice(),
+        b"/absolute",
+        b"a/../b",
+        b"a//b",
+        b".sparrow-inflight/file",
+        b"a\0b",
+    ] {
+        assert_eq!(
+            store
+                .consumption_reserve("watch", path, "source", "log", observed.clone())
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    let first = store
+        .consumption_reserve("watch", b"file", "source", "log", observed.clone())
+        .unwrap();
+    assert_eq!(
+        store
+            .consumption_reserve("watch", b"file", "other", "log", observed.clone())
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let mut changed = observed.clone();
+    changed.modified.1 += 1;
+    assert_eq!(
+        store
+            .consumption_claimed(&first.import_id, changed)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert!(
+        store
+            .consumption_get(&first.import_id)
+            .unwrap()
+            .claimed
+            .is_none()
+    );
+    store
+        .consumption_claimed(&first.import_id, observed.clone())
+        .unwrap();
+    for index in 1..16 {
+        store
+            .consumption_reserve(
+                "watch",
+                format!("file-{index}").as_bytes(),
+                "source",
+                "log",
+                observed.clone(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .consumption_reserve("watch", b"overflow", "source", "log", observed.clone())
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store
+            .consumption_reserve("watch", b"file", "source", "log", observed)
+            .unwrap()
+            .import_id,
+        first.import_id
+    );
+    store.expire(100 * DAY).unwrap();
+    assert_eq!(store.consumption_pending().unwrap().len(), 16);
+    assert!(
+        store
+            .consumption_get(&first.import_id)
+            .unwrap()
+            .published_artifact
+            .is_none()
+    );
+}
+
+#[test]
+fn consumption_missing_publication_receipt_is_a_hard_failure_without_republication() {
+    use sparrow_core::ConsumptionGeneration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(b"one\n").as_bytes())
+    );
+    let observation = ConsumptionGeneration {
+        device: 7,
+        inode: 8,
+        byte_length: 4,
+        modified: (0, 0),
+        changed: (0, 0),
+    };
+    let journal = store
+        .consumption_reserve("fault-watch", b"file", "source", "log", observation.clone())
+        .unwrap();
+    store
+        .consumption_claimed(&journal.import_id, observation)
+        .unwrap();
+    store
+        .import_begin(&journal.request_id, "source", "log", 4, &digest, 0)
+        .unwrap();
+    store
+        .import_append(&journal.import_id, 0, b"one\n", 0)
+        .unwrap();
+    store.import_seal(&journal.import_id, 0).unwrap();
+    store.import_prepare_layout(&journal.import_id, 0).unwrap();
+    store
+        .import_prepare_record(&journal.import_id, 0, 0)
+        .unwrap();
+    let artifact = store.import_publish(&journal.import_id, 0).unwrap();
+    for _ in 0..4 {
+        store.expire(3 * DAY).unwrap();
+    }
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    db.delete(format!("request:import-publication:{}", journal.import_id))
+        .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .import_start(&journal.request_id, "source", "log", 4, &digest, 3 * DAY)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store
+            .import_publish(&journal.import_id, 3 * DAY)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store
+            .consumption_get(&journal.import_id)
+            .unwrap()
+            .published_artifact,
+        Some(artifact.id.clone())
+    );
+    assert_eq!(store.records(3 * DAY).unwrap().len(), 1);
+    assert_eq!(store.bytes(&artifact.id, 0, 4, 3 * DAY).unwrap(), b"one\n");
+}
+
+#[test]
 fn query_selection_intersects_filters_deduplicates_and_seeks_selected_evidence() {
     use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery};
     let dir = tempfile::tempdir().unwrap();

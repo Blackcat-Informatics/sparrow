@@ -152,12 +152,39 @@ pub(super) fn published(
     id: &str,
     now: u64,
 ) -> Result<Option<(ImportManifest, Artifact)>, Error> {
-    let Some(saved) = writer.retry(&receipt_key(id), now)? else {
+    let managed = writer.consumption(id)?;
+    let saved = if managed
+        .as_ref()
+        .is_some_and(|journal| journal.published_artifact.is_some())
+    {
+        Some(parse(&writer.db.get(receipt_key(id))?.ok_or_else(
+            || Error::new("STORAGE_FAILURE", "consumption publication receipt missing"),
+        )?)?)
+    } else {
+        writer.retry(&receipt_key(id), now)?
+    };
+    let Some(saved) = saved else {
         return Ok(None);
     };
     let manifest = ImportManifest::decode(field(&saved, "manifest")?)?;
     let artifact = Artifact::decode(field(&saved, "receipt")?)?;
+    integer(&saved, "expires_at")?;
+    if manifest.consumption {
+        writer
+            .require_consumption(
+                &manifest.request_id,
+                &manifest.source,
+                &manifest.format,
+                manifest.byte_length,
+            )
+            .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+    }
     if manifest.id != id
+        || (manifest.consumption
+            && managed
+                .as_ref()
+                .and_then(|journal| journal.published_artifact.as_ref())
+                != Some(&artifact.id))
         || manifest.published_artifact.as_ref() != Some(&artifact.id)
         || manifest.payload_id != artifact.payload_id
         || manifest.byte_length != artifact.byte_length
@@ -450,6 +477,7 @@ impl Store {
         parse(json::write_compact(&artifact.encode()).as_bytes())?;
         put(&mut batch, &artifact.id, &artifact);
         manifest.published_artifact = Some(artifact.id.clone());
+        writer.publish_consumption(&mut batch, &manifest, &artifact)?;
         put(&mut batch, id, &manifest);
         let saved: Value = Object::new()
             .with("manifest", manifest.encode())

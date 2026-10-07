@@ -2,6 +2,76 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "consumption-reservation-identity"
+summary = "Bind one completed source generation, watch and exact relative Unix path to one reserved import request using native JSON and BLAKE3."
+home = "sparrow_core::storage::consumption::ConsumptionJournal::reserved_request"
+entry_points = []
+spec = "docs/development-runtime.md: durable completed-input ownership."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(make_watch_request_identity|make_claim_request_identity)$']
+
+[[job]]
+id = "consumption-generation-binding"
+summary = "One validator checks bounded watch/path identity and prevents a claim observation from substituting another inode, length or modification clock."
+home = "sparrow_core::storage::consumption::ConsumptionJournal::validate"
+entry_points = ["sparrow_core::storage::Store::consumption_reserve", "sparrow_core::storage::Store::consumption_claimed"]
+spec = "docs/development-runtime.md: durable completed-input ownership."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_reserved_file_generation|validate_claimed_file_generation)$']
+
+[[job]]
+id = "consumption-recovery-journal"
+summary = "One bounded native catalog reader recovers active and completed ownership, outside the ordinary publication retry lease."
+home = "sparrow_core::storage::Writer::consumption"
+entry_points = ["sparrow_core::storage::Writer::require_consumption", "sparrow_core::storage::Store::consumption_get", "sparrow_core::storage::Store::consumption_pending"]
+spec = "docs/development-runtime.md: durable completed-input ownership."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(read_claim_recovery_journal|read_watch_recovery_journal)$']
+
+[[job]]
+id = "consumption-atomic-publication"
+summary = "Record a managed claim's original artifact in the existing native complete-publication batch; no second ingestion/publication implementation."
+home = "sparrow_core::storage::Writer::publish_consumption"
+entry_points = []
+spec = "docs/development-runtime.md: durable completed-input ownership."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(publish_watch_artifact|publish_claim_artifact)$']
+
+[[job]]
+id = "consumption-removal-confirmation"
+summary = "Archive ownership only after a matching original artifact and exact claimed generation are confirmed removed and directory-synced by the filesystem coordinator."
+home = "sparrow_core::storage::Store::consumption_removed"
+entry_points = []
+spec = "docs/development-runtime.md: durable completed-input ownership."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(finish_watch_consumption|finish_claim_consumption)$']
+
+[[job]]
 id = "producer-acceptance-certification"
 summary = "All producer mutations certify returned store/session, source, format, exact bytes, membership and acknowledgment durability before retiring input."
 home = "sparrow_client::receipt::ExpectedArtifact::certify"

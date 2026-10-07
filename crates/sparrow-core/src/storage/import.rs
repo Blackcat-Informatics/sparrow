@@ -57,6 +57,8 @@ pub struct ImportManifest {
     pub layout_complete: bool,
     /// Complete published artifact identity, absent during private preparation.
     pub published_artifact: Option<String>,
+    /// Source ownership persists until its consumption journal is resolved.
+    pub consumption: bool,
     reclaimed_chunks: u64,
     reclaimed_layout_pages: u64,
 }
@@ -76,6 +78,7 @@ impl Catalog for ImportManifest {
             .with("layout_records", self.layout_records.to_string())
             .with("layout_complete", self.layout_complete)
             .with("published_artifact", self.published_artifact.clone())
+            .with("consumption", self.consumption)
             .with("reclaimed_chunks", self.reclaimed_chunks.to_string())
             .with(
                 "reclaimed_layout_pages",
@@ -111,6 +114,11 @@ impl Catalog for ImportManifest {
                 .map(|_| read_field(value, "published_artifact"))
                 .transpose()?
                 .unwrap_or(None),
+            consumption: value
+                .get("consumption")
+                .map(|_| read_field(value, "consumption"))
+                .transpose()?
+                .unwrap_or(false),
             reclaimed_layout_pages: value
                 .get("reclaimed_layout_pages")
                 .map(|_| integer(value, "reclaimed_layout_pages"))
@@ -121,6 +129,7 @@ impl Catalog for ImportManifest {
             .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
         let lines = ["jsonl", "log"].contains(&manifest.format.as_str());
         if manifest.id != import_id(&manifest.request_id)
+            || manifest.consumption != manifest.request_id.starts_with("consume:")
             || !valid_payload_id(&manifest.payload_id)
             || manifest.received_bytes > manifest.byte_length
             || (manifest.received_bytes != manifest.byte_length
@@ -162,7 +171,9 @@ impl ImportManifest {
             .div_ceil(IMPORT_LAYOUT_PAGE_RECORDS as u64)
     }
     pub(super) fn require_live(&self, now: u64) -> Result<(), Error> {
-        if now >= self.expires_at || self.reclaimed_chunks != 0 || self.reclaimed_layout_pages != 0
+        if (!self.consumption && now >= self.expires_at)
+            || self.reclaimed_chunks != 0
+            || self.reclaimed_layout_pages != 0
         {
             return Err(Error::new(
                 "IMPORT_EXPIRED",
@@ -436,6 +447,7 @@ impl Store {
             ));
         }
         let writer = self.lock()?;
+        writer.require_consumption(request_id, source, format, byte_length)?;
         if let Some(receipt) =
             writer.accepted_ingest(request_id, source, format, byte_length, payload_id, now)?
         {
@@ -599,6 +611,12 @@ impl Store {
     pub fn import_cancel(&self, id: &str, now: u64) -> Result<(), Error> {
         let writer = self.lock()?;
         let mut manifest: ImportManifest = writer.get(id)?;
+        if manifest.consumption {
+            return Err(Error::new(
+                "CONFLICT",
+                "consumption staging owns a claimed source; reconcile its journal instead of canceling its recovery state",
+            ));
+        }
         if manifest.published_artifact.is_some() {
             return Err(Error::new(
                 "CONFLICT",
@@ -752,7 +770,9 @@ impl Store {
         let mut batch = WriteBatch::default();
         let mut removed = 0;
         for mut manifest in writer.imports()? {
-            if manifest.expires_at > now {
+            if manifest.expires_at > now
+                || (manifest.consumption && manifest.published_artifact.is_none())
+            {
                 continue;
             }
             let preparation_done = if !prepared_reclaimed && removed < RECLAIM_CHUNKS {
@@ -813,6 +833,7 @@ impl Writer {
             ));
         }
         let writer = self;
+        let consumption = writer.require_consumption(request_id, source, format, byte_length)?;
         let id = import_id(request_id);
         if let Some(previous) = super::publication::published(writer, &id, now)? {
             let saved = previous.0;
@@ -885,6 +906,7 @@ impl Writer {
             layout_records: 0,
             layout_complete: false,
             published_artifact: None,
+            consumption,
             reclaimed_layout_pages: 0,
         };
         let mut batch = WriteBatch::default();

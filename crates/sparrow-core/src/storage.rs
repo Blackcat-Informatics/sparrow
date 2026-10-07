@@ -15,6 +15,7 @@ use rocksdb::{
     ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions,
 };
 
+pub(crate) mod consumption;
 pub(crate) mod context;
 pub(crate) mod durability;
 pub(crate) mod import;
@@ -687,7 +688,7 @@ impl Store {
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
         let rdf_fingerprint = rdf_index::profile_identity()?;
         let id = match db.get("store_format")? {
-            Some(format) if format == FORMAT => {
+            Some(format) if format == FORMAT || format == consumption::FORMAT => {
                 let id = db
                     .get("store_id")?
                     .ok_or_else(|| Error::new("STORAGE_FAILURE", "store identity missing"))?;
@@ -820,6 +821,12 @@ impl Store {
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
         validate_ingest_labels(request_id, source, format)?;
+        if request_id.starts_with("consume:") {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "consumption requests require the durable staged import path",
+            ));
+        }
         let writer = self.lock()?;
         if bytes.len() > writer.config.max_artifact_bytes {
             return Err(Error::new(
@@ -1426,7 +1433,18 @@ impl Store {
             if !key.starts_with(b"request:") {
                 break;
             }
-            if integer(&parse(&bytes)?, "expires_at")? <= now {
+            let managed = key
+                .strip_prefix(b"request:import-publication:")
+                .map(|id| {
+                    std::str::from_utf8(id)
+                        .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))
+                })
+                .transpose()?
+                .map(|id| writer.consumption(id))
+                .transpose()?
+                .flatten()
+                .is_some();
+            if !managed && integer(&parse(&bytes)?, "expires_at")? <= now {
                 batch.delete(key);
             }
         }
@@ -1474,6 +1492,10 @@ impl Store {
             .filter(|record| writer.live_record(record, now, &protected))
             .count();
         let unique_chunks = writer.count_prefix("ref:")?;
+        let format = writer
+            .db
+            .get("store_format")?
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "store format missing"))?;
         Ok(Object::new()
             .with("pin_read_handles", pin_handles.to_string())
             .with("pin_read_bytes", pin_bytes.to_string())
@@ -1483,7 +1505,7 @@ impl Store {
             .with("store_id", writer.id.clone())
             .with(
                 "store_format",
-                std::str::from_utf8(FORMAT)
+                std::str::from_utf8(&format)
                     .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?,
             )
             .with("rdf_profile", rdf_index::profile_identity()?)

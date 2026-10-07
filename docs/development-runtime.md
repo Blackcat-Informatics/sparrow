@@ -447,12 +447,71 @@ The directory remains mode 0700 and its Unix socket mode 0600. Only synthetic
 acceptance inputs and the owned Sparrow unit were used; no production source
 was claimed or removed and no sibling/model service was managed.
 
-The next completed-consumption requirement is a durable watch/claim journal
-binding source generation and original publication identity across lost replies
-and the ordinary retry horizon, then qualified atomic claiming/deletion and
-inotify reconciliation. No production sample watch is connected; source removal,
+The durable core journal described below now binds source generation and
+original publication identity across lost replies and the ordinary retry horizon.
+Qualified filesystem claiming/deletion and inotify reconciliation remain required.
+No production sample watch is connected; source removal,
 full governed SPARQL, other continuous intake, and full architecture acceptance
 remain unfinished.
+
+## Durable completed-input ownership
+
+The core now reserves each completed file generation before filesystem claiming.
+`consumption_reserve` binds the watch, original relative Unix path bytes and
+device/inode/length/modification/change clocks to one native BLAKE3 request
+identity. The path is bounded and excludes traversal, NUL, absolute paths and
+`.sparrow-inflight` components; non-UTF-8 filenames remain representable. Source
+and format cannot change on retry. At most 16 active journals occupy this owner.
+The first reservation atomically changes the store marker from `sparrow.store/5`
+to `sparrow.store/6` with the journal. The current writer reads both versions;
+older writers refuse version 6 instead of reclaiming managed recovery state.
+Stores without consumption reservations keep version 5 and their identity.
+`consumption_pending` enumerates the bounded active recovery set through the
+same journal reader; completed removal tombstones do not occupy active slots.
+
+`consumption_claimed` records the post-rename descriptor observation after the
+coordinator has synchronized affected directories. Rename may change ctime, but
+device, inode, size and modification clock must agree with the original
+observation. Repeated claim confirmation must agree exactly. These core methods
+record an admitted coordinator's assertions; they do not inspect paths, prove
+quiet-time readiness, rename files or authorize an unlink by themselves.
+
+The reserved `consume:` request namespace uses the existing durable staged
+import implementation exclusively. Missing or unconfirmed ownership refuses
+admission. Unpublished managed staging survives the ordinary 48-hour import
+lease and reclamation; cancellation cannot discard its source recovery state.
+The final publication batch atomically records the original artifact in the
+consumption journal alongside catalog/record publication and the original
+receipt. Receipt reclamation preserves that publication proof while recovery
+ownership remains. A missing or contradictory proof is a hard failure, never
+permission to allocate another occurrence.
+
+`consumption_removed` requires the original artifact and exact claimed
+observation. It records successful coordinator unlink plus directory sync and
+archives the journal in ordinary 48-hour completion retry storage, freeing the
+active slot. Expired completed requests cannot start another managed import
+without a source reservation. Recovery journals are not pins: ordinary 30-day
+retention and physical reference retirement still apply, and retry does not
+renew acceptance clocks or reconstruct expired evidence.
+
+Storage scenarios exercise reserved/claimed restart, staging beyond its former
+lease, atomic publication with a lost reply, recovery after 40 days and evidence
+expiry, replacement-generation refusal, idempotent removal confirmation,
+completion cleanup, journal capacity and corrupted/missing publication proof.
+The filesystem coordinator, atomic no-overwrite claim/unlink, watch configuration
+and inotify reconciliation are still required before completed consumption is
+exposed as a daemon operation. Production sample directories remain untouched.
+
+The full `make check` gate passed with 65 storage scenarios, 12 real-daemon/MCP
+scenarios, other workspace tests, release Clippy with warnings denied, seeded
+census self-tests and all 80 ledger jobs. No distinct exceptions were added.
+The matching release daemon was gracefully installed in the owned development
+unit on 2026-10-07. It retains schema 13, its original persistent store identity,
+mode-0700 directory and mode-0600 Unix socket. With no configured consumption
+coordinator it remains `sparrow.store/5`; version-6 admission/reopen is qualified
+in temporary storage scenarios. Live descriptor retry recovered its original
+durable artifact. An unreserved `consume:` request failed with `CONFLICT`, and
+native key discovery confirmed zero eligible records for its source.
 
 ## CLI investigations
 
