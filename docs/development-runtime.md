@@ -9,7 +9,7 @@ below retain their historical qualification evidence.
 
 Schema 14 adds typed `Status.consumeWatches`; the daemon now starts one owned
 Linux consumption worker for explicit `[[consume]]` roots. The development
-configuration still has no producer roots. An example for a directory that the
+configuration has only the owned synthetic intake described below. An example for a directory that the
 operator explicitly owns and authorizes Sparrow to consume is:
 
 ```toml
@@ -94,6 +94,37 @@ overflow and watch-exhaustion injection, whole-process crash injection at every
 claim boundary, fairness across continuously busy roots, active-log tailing and
 whole-corpus memory/throughput acceptance remain unfinished. No reboot-persistent
 service or production producer handoff has been qualified by this change.
+
+The signed implementation `5126d8b` passed its ordinary final pre-commit gate on
+2026-10-07. The previous owned development unit, PID 2481486, exited successfully
+on SIGINT and removed its socket. The updated unit is active as PID 2566561,
+serving the same private `development-v5/rpc.sock` and persistent store
+`store:46c88e949ccec658600b66c7becd5bb7`. Its configuration now authorizes only
+the owned mode-0700 synthetic directory
+`/home/paudley/.local/state/sparrow/development-completed`, with a 30-second quiet
+interval, 16 directory watches and 64 candidates. The excluded private claim
+directory is also mode 0700; the RPC socket is mode 0600.
+
+A synthetic 82-byte CRLF JSONL input was atomically published into that root.
+The live worker durably consumed it as
+`artifact:751286900f498e0c4a3cf272fce7376d`, record
+`record:bccb3dfc0bea556833fba8f475b0fb2f`, and retired only its private claim.
+CLI byte retrieval compared equal to all original bytes, including the CRLF.
+Native value searching returned the exact message; event-time searching for
+`2026-10-07T20:00:00Z` through `20:01:00Z` returned its known source instant with
+zero unknown events and complete membership. The explicitly defined `/at`
+RFC3339 profile is
+`time-profile:4923153986ea40fed2adcd0e58d54f57fd04c2fea3e608cb294cef8fab62cdf1`.
+
+The first live consumption reservation upgraded the store marker to
+`sparrow.store/6`. Status reported schema 14, 190 live records, one completed
+claim, no pending claims, no failure and no pending durability writes. Retrying
+the previous independent descriptor fixture retained
+`artifact:d066e0d527e9e82ec11e13388b386c13` and
+`record:23febe08e38e42deea0f58e4880b9358`. No live application/Brainstem directory
+was configured or consumed, and no sibling/model service was changed. This is
+live development acceptance; the full architecture and permanent deployment
+remain unqualified.
 
 ## Transport and present operations
 

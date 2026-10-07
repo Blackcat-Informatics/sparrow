@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Development store only. Live producer directories are not watched or consumed.
+# Development store and owned synthetic intake only. No live producer directories.
 socket_path = "/home/paudley/.local/state/sparrow/development-v5/rpc.sock"
 data_dir = "/home/paudley/.local/state/sparrow/development-v5"
 disk_budget = 536870912
@@ -12,3 +12,13 @@ max_pin_members = 10000
 max_concurrent_requests = 4
 buffered_flush_interval_ms = 2000
 text_lexicon_dir = "/home/paudley/Active/purrdf/crates/text/lexicons/artifacts"
+
+[[consume]]
+id = "development-completed"
+root = "/home/paudley/.local/state/sparrow/development-completed"
+producer_contract = "finished_files"
+source = "development-consume"
+format = "jsonl"
+quiet_ms = 30000
+max_directories = 16
+max_candidates = 64
