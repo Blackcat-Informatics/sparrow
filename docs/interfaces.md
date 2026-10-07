@@ -605,6 +605,16 @@ at its unfinished ownership; hard failures leave the position unchanged.
 Exhausted traversal is reused only while protection and publication remain
 unchanged. Continuation and retirement counts do not certify physical recovery.
 
+Schema 19 merges record and recordless-artifact eviction timelines by receipt
+time and stable evidence ID. `EvictionPass.recordlessArtifacts` counts reclaimed
+empty artifact catalogs, also included in its total `artifacts` count.
+`PressureStatus.evictedRecordlessArtifacts` is a cumulative session-local count.
+The former record-only frontier is named `unitLimit`: one new record or one
+recordless artifact consumes one retirement unit. Protected counts include
+whole-artifact protection of empty inputs. Reclaimed empty artifacts return
+`NOT_FOUND` on metadata/byte reads; accepted request/import retries still return
+their original receipt identities and cannot recreate the retired catalog.
+
 `Ingest.durability` and `eventsIngest`'s durability argument default to `durable`.
 Buffered mode publishes the same atomic catalog/payload/index batch with WAL
 enabled, without promising synchronization. Its artifact receipt carries

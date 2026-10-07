@@ -34,6 +34,8 @@ pub struct PressureStatus {
     pub passes: u64,
     /// Total record occurrences evicted by this session's pressure worker.
     pub evicted_records: u64,
+    /// Recordless artifact catalogs reclaimed by this session's pressure worker.
+    pub evicted_recordless_artifacts: u64,
     /// Payload ownership references retired by this session's pressure worker.
     pub payload_refs_retired: u64,
     /// Native flush pending/running observations across both families.
@@ -160,6 +162,10 @@ impl Writer {
             .status
             .evicted_records
             .saturating_add(report.records.len() as u64);
+        state.status.evicted_recordless_artifacts = state
+            .status
+            .evicted_recordless_artifacts
+            .saturating_add(report.recordless_artifacts as u64);
         state.status.payload_refs_retired = state
             .status
             .payload_refs_retired

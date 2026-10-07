@@ -179,6 +179,14 @@ survives eviction of its parent file. If reclamation lags, maintenance reserve i
 insufficient, or pinned data occupies the available capacity, stop admitting
 further writes and report storage pressure. Pins are never silently broken.
 
+Recordless artifacts participate through a separate chronological catalog index.
+Eviction merges it with the record timeline by receipt time and evidence identity
+using native bounded cursors; queries retain their record-only timeline. Whole
+artifact pins protect empty inputs. Index publication and removal share the
+artifact's atomic boundary. Older stores build this required index through
+durable finite upgrade pages after fencing earlier writers, and are not served
+until the upgrade is complete.
+
 Application accounting is an admission policy, not a hard guarantee about every
 native engine allocation. A strict physical byte ceiling requires a configured
 filesystem/volume quota. Reserve maintenance space below that ceiling and handle

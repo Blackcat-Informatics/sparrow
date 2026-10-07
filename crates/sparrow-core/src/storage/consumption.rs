@@ -13,7 +13,7 @@ use rocksdb::WriteBatch;
 /// Maximum simultaneously active source-ownership journals in one store.
 pub const MAX_CONSUMPTION_JOURNALS: usize = 16;
 const JOURNAL_BYTES: usize = 8192;
-pub(super) const FORMAT: &[u8] = b"sparrow.store/6";
+pub(super) const FORMAT: &[u8] = b"sparrow.store/10";
 
 /// Directory identities anchoring the source namespace across recovery.
 #[derive(Clone, Debug, PartialEq, Eq)]

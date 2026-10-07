@@ -8,6 +8,214 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn recordless_eviction_merges_receipt_order_preserves_pins_and_retries() {
+    use sparrow_core::{EvictionFrontier, EvictionLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let pinned = store
+        .ingest("empty-protected", "source", "jsonl", b"", 1)
+        .unwrap();
+    let first = store
+        .ingest("empty-first", "source", "log", b"", 2)
+        .unwrap();
+    let record = store
+        .ingest("empty-between", "source", "log", b"record\n", 3)
+        .unwrap();
+    let last = store
+        .ingest("empty-last", "source", "jsonl", b"", 4)
+        .unwrap();
+    let pin = store
+        .pin("empty-pin", "case", std::slice::from_ref(&pinned.id), 40, 5)
+        .unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        scan_budget: 2,
+        ..EvictionLimits::default()
+    };
+    let report = store.evict_oldest(6, limits).unwrap();
+    assert_eq!(report.artifacts.as_slice(), std::slice::from_ref(&first.id));
+    assert_eq!(report.recordless_artifacts, 1);
+    assert_eq!(report.protected, 1);
+    assert_eq!(report.frontier, EvictionFrontier::ScanBudget);
+    assert!(report.records.is_empty());
+    let report = store.evict_oldest(6, limits).unwrap();
+    assert_eq!(report.records, record.record_ids);
+    assert_eq!(report.recordless_artifacts, 0);
+    assert_eq!(report.frontier, EvictionFrontier::UnitLimit);
+    let report = store.evict_oldest(6, limits).unwrap();
+    assert_eq!(report.artifacts.as_slice(), std::slice::from_ref(&last.id));
+    assert_eq!(report.recordless_artifacts, 1);
+    assert!(!report.continuation);
+    assert_eq!(store.bytes(&pinned.id, 0, 0, 6).unwrap(), b"");
+    assert_eq!(
+        store.bytes(&first.id, 0, 0, 6).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        store
+            .ingest("empty-first", "source", "log", b"", 7)
+            .unwrap()
+            .id,
+        first.id
+    );
+    assert_eq!(store.artifact(&first.id).unwrap_err().code, "NOT_FOUND");
+    store.release(&pin.id).unwrap();
+    assert_eq!(
+        store.evict_oldest(8, limits).unwrap().artifacts,
+        [pinned.id]
+    );
+}
+
+#[test]
+fn recordless_publication_resets_continuation_and_staged_import_uses_the_same_index() {
+    use sparrow_core::{EvictionLimits, ImportStart};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let empty = store
+        .ingest("empty-later", "source", "log", b"", 10)
+        .unwrap();
+    let record = store
+        .ingest("empty-younger-record", "source", "log", b"younger\n", 20)
+        .unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    assert_eq!(
+        store.evict_oldest(21, limits).unwrap().artifacts.as_slice(),
+        std::slice::from_ref(&empty.id)
+    );
+    let earlier = store
+        .ingest("empty-earlier", "source", "log", b"", 5)
+        .unwrap();
+    assert_eq!(
+        store.evict_oldest(21, limits).unwrap().artifacts,
+        [earlier.id]
+    );
+    assert_eq!(
+        store.evict_oldest(21, limits).unwrap().records,
+        record.record_ids
+    );
+    assert!(store.evict_oldest(21, limits).unwrap().records.is_empty());
+    let stage = match store
+        .import_start("empty-staged", "source", "jsonl", 0, &empty.payload_id, 22)
+        .unwrap()
+    {
+        ImportStart::Staging(stage) => stage,
+        ImportStart::Accepted(_) => panic!("new empty import was already accepted"),
+    };
+    store.import_seal(&stage.id, 22).unwrap();
+    store.import_prepare_layout(&stage.id, 22).unwrap();
+    store.import_prepare_record(&stage.id, 0, 22).unwrap();
+    let staged = store.import_publish(&stage.id, 22).unwrap();
+    let report = store.evict_oldest(23, limits).unwrap();
+    assert_eq!(
+        report.artifacts.as_slice(),
+        std::slice::from_ref(&staged.id)
+    );
+    assert_eq!(report.visited, 1);
+    assert_eq!(report.recordless_artifacts, 1);
+    assert_eq!(store.import_publish(&stage.id, 23).unwrap().id, staged.id);
+    assert_eq!(store.artifact(&staged.id).unwrap_err().code, "NOT_FOUND");
+}
+
+#[test]
+fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let first = store
+        .ingest("empty-atomic", "source", "log", b"", 1)
+        .unwrap();
+    assert_eq!(
+        store
+            .evict_oldest(
+                2,
+                EvictionLimits {
+                    max_batch_bytes: 1,
+                    ..EvictionLimits::default()
+                }
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(store.artifact(&first.id).unwrap().id, first.id);
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let key = "empty-time:00000000000000000002:artifact:missing";
+    db.put(key, b"artifact:missing").unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .evict_oldest(3, EvictionLimits::default())
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(store.artifact(&first.id).unwrap().id, first.id);
+}
+
+#[test]
+fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity() {
+    use sparrow_core::EvictionLimits;
+    for (legacy, current, watch) in [(5, 9, false), (6, 10, false), (7, 11, true), (8, 12, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let identity = store.store_id().unwrap();
+        let empty = store
+            .ingest("empty-legacy", "source", "log", b"", 1)
+            .unwrap();
+        let populated = store
+            .ingest("populated-legacy", "source", "log", b"preserved\n", 2)
+            .unwrap();
+        if watch {
+            store
+                .watch_registry_replace(None, b"preserved-catalog")
+                .unwrap();
+        }
+        drop(store);
+        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        db.delete("recordless-index-upgrade").unwrap();
+        db.delete(format!("empty-time:{:020}:{}", empty.received_at, empty.id))
+            .unwrap();
+        db.put("store_format", format!("sparrow.store/{legacy}"))
+            .unwrap();
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(store.store_id().unwrap(), identity);
+        assert_eq!(
+            store.status(3).unwrap()["store_format"].as_str(),
+            Some(format!("sparrow.store/{current}").as_str())
+        );
+        assert_eq!(
+            store.bytes(&populated.id, 0, 10, 3).unwrap(),
+            b"preserved\n"
+        );
+        let report = store
+            .evict_oldest(
+                3,
+                EvictionLimits {
+                    max_records: 1,
+                    ..EvictionLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(report.artifacts, [empty.id]);
+        assert!(report.records.is_empty());
+        if watch {
+            assert_eq!(
+                store.watch_registry().unwrap().as_deref(),
+                Some(b"preserved-catalog".as_slice())
+            );
+        }
+    }
+}
+
+#[test]
 fn bounded_expiry_recaptures_pin_release_and_expiry_between_pages() {
     use sparrow_core::EvictionLimits;
     for release in [true, false] {
@@ -746,7 +954,7 @@ fn eviction_manifest_cleanup_is_bounded_resumable_and_never_returns_partial_file
     assert_eq!(first.records.len(), 1);
     assert_eq!(first.payload_refs, 1);
     assert!(first.pending_manifest_refs > 0);
-    assert_eq!(first.frontier, EvictionFrontier::RecordLimit);
+    assert_eq!(first.frontier, EvictionFrontier::UnitLimit);
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
     let cleanup = store.evict_oldest(3, limits).unwrap();
@@ -934,7 +1142,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/7")
+        Some("sparrow.store/11")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -949,7 +1157,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/7")
+        Some("sparrow.store/11")
     );
 }
 
@@ -1006,7 +1214,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/5")
+        Some("sparrow.store/9")
     );
     let digest = format!(
         "blake3:{}",
@@ -1031,7 +1239,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/6")
+        Some("sparrow.store/10")
     );
     assert_eq!(
         store
@@ -1065,7 +1273,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/8")
+        Some("sparrow.store/12")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     store
@@ -1073,7 +1281,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/8")
+        Some("sparrow.store/12")
     );
     assert_eq!(
         store
@@ -1300,7 +1508,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/7")
+        Some("sparrow.store/11")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -4611,7 +4819,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/5")
+        Some("sparrow.store/9")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]

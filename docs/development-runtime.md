@@ -20,7 +20,7 @@ remaining touched-parent manifest references and an explicit traversal frontier.
 Logical reference retirement does not certify physical bytes freed or peak RSS.
 
 The daemon now invokes this primitive through the pressure worker below.
-Recordless-artifact eviction, forced native compaction and
+Forced native compaction and
 sustained physical reclamation qualification remain unfinished.
 
 Temporary-store scenarios cover native RDF/JSON/text and exact-byte survival for
@@ -32,8 +32,69 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 18; the schema sections
+The current source implements schema 19; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 19 recordless artifact eviction
+
+Empty JSONL and log artifacts have no addressable records but retain catalog
+and retry metadata. They now publish one native `empty-time:` entry in the same
+atomic batch as their artifact and acceptance receipt. Direct and staged upload
+paths use one index/key owner. Ordinary metadata expiry deletes this index entry
+in the same batch as its artifact; publication does not fabricate a record for
+an empty input. A recordless artifact with nonzero bytes or payload references
+is a hard ownership failure.
+
+Pressure eviction merges the existing record timeline with this index through
+two native peeking cursors, ordered by `(received_at, evidence_id)`. Pins protect
+recordless artifacts exactly as other complete artifacts. The traversal cursor
+uses the common timestamp/identity suffix; either index's earlier publication
+invalidates it, and new publication after exhaustion starts directly at the new
+candidate. Record queries and context continue to use their record-only index.
+Each new record or recordless artifact consumes one retirement unit. Schema 19
+names that frontier `unitLimit`, exposes `recordlessArtifacts` in the typed
+last-pass report, and adds the session's cumulative `evictedRecordlessArtifacts`
+to pressure status. CLI and stdio MCP use the same renderer.
+
+A retired recordless artifact has no byte dependencies; its catalog and index
+are removed atomically, while original acceptance/import retry receipts retain
+their stable identities. Retrying the request cannot resurrect its catalog or
+bytes. Native disk recovery remains separately measured and required before
+further pressure retirement; catalog deletion alone does not prove space freed.
+
+Legacy store formats 5, 6, 7 and 8 upgrade to 9, 10, 11 and 12 respectively,
+preserving the existing basic/consumption/watch/handoff writer fences and watch
+registry presence checks. Startup fences older writers before building the new
+index. Each durable upgrade page inspects at most 512 artifact entries and
+admits 32 MiB of raw/decoded catalog capture. Populated record membership is
+inspected through PurRDF's native JSON event reader without materializing its
+record-ID list. Complete index pages and their checkpoints publish atomically;
+reopen resumes the checkpoint. Startup remains unavailable until the required
+index is complete. Missing, malformed or unfenced index state fails explicitly;
+unsupported writers cannot reopen an upgraded store. Upgrade does not change
+artifact IDs, receipt times, content, query projections or watch authority.
+
+Qualification covers mixed record/empty-artifact receipt order, protection and
+release, direct and staged retries without resurrection, earlier publication
+and publication after exhaustion, admission refusal, corrupt index rollback,
+all four legacy writer-fence upgrades, durable page/checkpoint resumption after
+reopen, and native duplicate-member validation with a 100,000-member populated
+manifest. Real-daemon pressure acceptance retires an empty artifact and an
+unpinned record while preserving pinned bytes, and compares cumulative counters
+through CLI and stdio MCP. The full gate passed with 87 storage scenarios,
+eight core units, three server units, 25 RPC/daemon/MCP scenarios, all remaining
+workspace tests and 128 ownership jobs without distinct exceptions or
+unsanctioned duplicate groups. Physical reclamation and corpus-scale RSS/latency
+acceptance remain unfinished.
+
+A separate owned private-store acceptance archived the pre-upgrade daemon
+(schema 18 binary SHA-256
+`0a60c01b63aa832ae364d04ea809dc399dd6df841b12c0c20985441d1f3f1d67`).
+The new daemon accepted an empty input and stopped gracefully. The archived
+daemon refused that store with `UNSUPPORTED` rather than opening it under the
+old writer contract. The new daemon then reopened with the same store identity
+and original empty-artifact receipt. Config, native store and rejection output
+are under `/tmp/sparrow-recordless-writer-fence.gabyjuhl`.
 
 ## Bounded catalog expiry
 

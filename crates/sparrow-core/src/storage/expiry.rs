@@ -195,6 +195,7 @@ impl Writer {
                             }
                             if artifact.expires_at.saturating_add(DAY) <= now {
                                 retirement.batch.delete(&key);
+                                retirement.batch.delete(super::recordless::key(&artifact));
                                 report.deleted += 1;
                             }
                         }

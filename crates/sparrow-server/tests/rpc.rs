@@ -121,6 +121,7 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
         std::fs::write(&config, text).unwrap();
         let daemon = start(&config, &socket).await;
         let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+        let empty = producer.ingest("pressure-empty-old", "source", wire::Format::Log, b"").await.unwrap();
         let old = producer.ingest("pressure-old", "source", wire::Format::Log, b"old\n").await.unwrap();
         let protected = producer.ingest("pressure-pinned", "source", wire::Format::Log, b"pinned\n").await.unwrap();
         let mut mcp = Mcp::start(&socket);
@@ -142,6 +143,7 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
             let pressure = status.get_pressure_status().unwrap();
             assert_eq!(status.get_schema_version(), sparrow_client::SCHEMA_VERSION);
             if pressure.get_evicted_records() == 1 {
+                assert_eq!(pressure.get_evicted_recordless_artifacts(), 1);
                 assert!(pressure.get_requested_bytes() > 0);
                 assert!(matches!(pressure.get_failure().unwrap().which().unwrap(), wire::optional_text::Absent(())));
                 break;
@@ -152,6 +154,8 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
         let cli_status = cli(&socket, &["status"]);
         let mcp_status = mcp.tool(3, "status", Object::new().into()).await;
         assert_eq!(cli_status["pressure"]["evicted_records"].as_str(), Some("1"));
+        assert_eq!(cli_status["pressure"]["evicted_recordless_artifacts"].as_str(), Some("1"));
+        assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_recordless_artifacts"], cli_status["pressure"]["evicted_recordless_artifacts"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_records"], cli_status["pressure"]["evicted_records"]);
         let retained = mcp.tool(4, "bytes_read", Object::new().with("store_id", &protected.store_id)
             .with("id", &protected.id).with("offset", "0").with("length", 7_u64).into()).await;
@@ -164,6 +168,7 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
         assert_eq!(released["isError"].as_bool(), Some(false));
         std::fs::remove_file(ballast).unwrap();
         let accepted = producer.ingest("pressure-retry", "source", wire::Format::Log, b"later\n").await.unwrap();
+        assert_eq!(producer.ingest("pressure-empty-old", "source", wire::Format::Log, b"").await.unwrap(), empty);
         assert_eq!(producer.ingest("pressure-retry", "source", wire::Format::Log, b"later\n").await.unwrap(), accepted);
         mcp.close(true).await;
         drop(connection);
@@ -370,7 +375,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/8");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/12");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -587,7 +592,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/7")
+                Some("sparrow.store/11")
             );
         })
         .await;
@@ -950,7 +955,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/7"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/11"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,

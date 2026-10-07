@@ -20,6 +20,7 @@ pub(crate) fn encode(
     out.set_requested_bytes(status.requested_bytes);
     out.set_passes(status.passes);
     out.set_evicted_records(status.evicted_records);
+    out.set_evicted_recordless_artifacts(status.evicted_recordless_artifacts);
     out.set_payload_refs_retired(status.payload_refs_retired);
     out.set_pending_flushes(status.pending_flushes);
     out.set_pending_compactions(status.pending_compactions);
@@ -28,6 +29,7 @@ pub(crate) fn encode(
         let mut pass = out.reborrow().init_last_pass().init_present();
         pass.set_records(report.records.len() as u32);
         pass.set_artifacts(report.artifacts.len() as u32);
+        pass.set_recordless_artifacts(report.recordless_artifacts as u32);
         pass.set_visited(report.visited as u32);
         pass.set_protected(report.protected as u32);
         pass.set_payload_refs(report.payload_refs as u32);
@@ -35,7 +37,7 @@ pub(crate) fn encode(
         pass.set_continuation(report.continuation);
         pass.set_frontier(match report.frontier {
             EvictionFrontier::Exhausted => wire::EvictionFrontier::Exhausted,
-            EvictionFrontier::RecordLimit => wire::EvictionFrontier::RecordLimit,
+            EvictionFrontier::UnitLimit => wire::EvictionFrontier::UnitLimit,
             EvictionFrontier::ScanBudget => wire::EvictionFrontier::ScanBudget,
             EvictionFrontier::PayloadBudget => wire::EvictionFrontier::PayloadBudget,
             EvictionFrontier::CatalogBudget => wire::EvictionFrontier::CatalogBudget,
@@ -65,7 +67,7 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
             let pass = pass?;
             let frontier = match pass.get_frontier()? {
                 wire::EvictionFrontier::Exhausted => "exhausted",
-                wire::EvictionFrontier::RecordLimit => "record_limit",
+                wire::EvictionFrontier::UnitLimit => "unit_limit",
                 wire::EvictionFrontier::ScanBudget => "scan_budget",
                 wire::EvictionFrontier::PayloadBudget => "payload_budget",
                 wire::EvictionFrontier::CatalogBudget => "catalog_budget",
@@ -73,6 +75,10 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
             Object::new()
                 .with("records", u64::from(pass.get_records()))
                 .with("artifacts", u64::from(pass.get_artifacts()))
+                .with(
+                    "recordless_artifacts",
+                    u64::from(pass.get_recordless_artifacts()),
+                )
                 .with("visited", u64::from(pass.get_visited()))
                 .with("protected", u64::from(pass.get_protected()))
                 .with("payload_refs", u64::from(pass.get_payload_refs()))
@@ -94,6 +100,10 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
         .with("requested_bytes", value.get_requested_bytes().to_string())
         .with("passes", value.get_passes().to_string())
         .with("evicted_records", value.get_evicted_records().to_string())
+        .with(
+            "evicted_recordless_artifacts",
+            value.get_evicted_recordless_artifacts().to_string(),
+        )
         .with(
             "payload_refs_retired",
             value.get_payload_refs_retired().to_string(),
@@ -121,6 +131,7 @@ mod tests {
             last_pass: Some(sparrow_core::EvictionReport {
                 visited: 1,
                 protected: 1,
+                recordless_artifacts: 1,
                 frontier: EvictionFrontier::CatalogBudget,
                 continuation: true,
                 ..sparrow_core::EvictionReport::default()
@@ -137,5 +148,12 @@ mod tests {
         );
         assert_eq!(value["last_pass"]["continuation"].as_bool(), Some(true));
         assert_eq!(value["requested_bytes"].as_str(), Some("1024"));
+        assert_eq!(
+            value["last_pass"]["recordless_artifacts"]
+                .as_number()
+                .unwrap()
+                .as_u64(),
+            Some(1)
+        );
     }
 }

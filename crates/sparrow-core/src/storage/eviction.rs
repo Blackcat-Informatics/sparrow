@@ -3,9 +3,11 @@
 
 //! Serialized oldest-unpinned logical retirement. Physical reclamation is separate.
 
-use super::{Artifact, DAY, Error, Store, Writer, put, retire};
+use super::{Artifact, DAY, Error, Store, Writer, put, recordless, retire};
 use rocksdb::{Direction, IteratorMode, WriteBatchIteratorCf};
 use std::collections::{BTreeMap, BTreeSet};
+
+type IndexEntry = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>;
 
 /// One session-local position, valid only while the captured protection is unchanged.
 #[derive(Default)]
@@ -60,8 +62,12 @@ impl Publication {
 
 impl WriteBatchIteratorCf for Publication {
     fn put_cf(&mut self, cf_id: u32, key: &[u8], _value: &[u8]) {
-        if cf_id == 0 && key.starts_with(b"time:") {
-            if key.len() > b"time:".len() + 20 + 1 + 128 {
+        if cf_id == 0
+            && let Some(key) = key
+                .strip_prefix(b"time:")
+                .or_else(|| key.strip_prefix(recordless::PREFIX))
+        {
+            if key.len() > 20 + 1 + 128 {
                 self.invalid = true;
             } else if self
                 .earliest
@@ -85,7 +91,7 @@ impl WriteBatchIteratorCf for Publication {
 /// Finite per-pass admission. Catalog charge includes decoded and retained shapes.
 #[derive(Clone, Copy, Debug)]
 pub struct EvictionLimits {
-    /// Maximum newly evicted records, or expiry dependency units (1..=128).
+    /// Maximum record/recordless-artifact retirement units (1..=128).
     pub max_records: usize,
     /// Maximum traversal entries and, independently, pin entries (1..=100000).
     pub scan_budget: usize,
@@ -135,8 +141,8 @@ pub enum EvictionFrontier {
     /// All time entries were visited.
     #[default]
     Exhausted,
-    /// Maximum newly retired record count reached.
-    RecordLimit,
+    /// Maximum newly retired record/recordless-artifact unit count reached.
+    UnitLimit,
     /// Maximum visited time entries reached.
     ScanBudget,
     /// Next complete record cannot fit the remaining reference allowance.
@@ -152,9 +158,11 @@ pub struct EvictionReport {
     pub records: Vec<String>,
     /// Complete parent representations made unavailable by this pass.
     pub artifacts: Vec<String>,
+    /// Recordless artifact catalogs reclaimed by this pass, also included in `artifacts`.
+    pub recordless_artifacts: usize,
     /// Time entries inspected, including protected and retired evidence.
     pub visited: usize,
-    /// Eligible records skipped because a record or parent pin protects them.
+    /// Entries skipped because an active record or artifact pin protects them.
     pub protected: usize,
     /// Payload ownership references retired, including parent manifests.
     pub payload_refs: usize,
@@ -167,7 +175,7 @@ pub struct EvictionReport {
 }
 
 impl Store {
-    /// Durably retire oldest unpinned records and invalidate their complete parents.
+    /// Durably retire oldest unpinned records and recordless artifacts.
     /// Pins are captured under the same writer lock as the atomic retirement.
     /// Records retire in full; parent manifest cleanup can continue in later passes.
     /// Hard failures commit nothing; bounded frontiers publish only complete retirement units.
@@ -217,25 +225,49 @@ impl Writer {
         let mut retirement = retire::Retirement::new(writer)?;
         let mut parents = BTreeMap::<String, Artifact>::new();
         let mut report = EvictionReport::default();
-        let start_key = start
-            .as_ref()
-            .map_or(b"time:".as_slice(), |(key, _)| key.as_slice());
-        for entry in writer
-            .db
-            .iterator(IteratorMode::From(start_key, Direction::Forward))
-        {
+        for entry in writer.eviction_entries(start.as_ref().map(|(key, _)| key.as_slice())) {
             let (key, value) = entry?;
-            if !key.starts_with(b"time:") {
-                break;
-            }
-            if start.as_ref().is_some_and(|(previous, inclusive)| {
-                !inclusive && key.as_ref() == previous.as_slice()
-            }) {
+            let recordless = key.starts_with(recordless::PREFIX);
+            let position = &key[if recordless {
+                recordless::PREFIX.len()
+            } else {
+                b"time:".len()
+            }..];
+            if start
+                .as_ref()
+                .is_some_and(|(previous, inclusive)| !inclusive && position == previous.as_slice())
+            {
                 continue;
             }
             if report.visited == limits.scan_budget {
                 report.frontier = EvictionFrontier::ScanBudget;
                 break;
+            }
+            if recordless {
+                let artifact = match writer.indexed_recordless(&key, &value, &mut catalog) {
+                    Ok(artifact) => artifact,
+                    Err(error) if error.code == "RESOURCE_LIMIT" && next != start => {
+                        report.frontier = EvictionFrontier::CatalogBudget;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                report.visited += 1;
+                if protected.contains(&artifact.id) {
+                    report.protected += 1;
+                    next = Some((position.to_vec(), false));
+                    continue;
+                }
+                if report.records.len() + report.recordless_artifacts == limits.max_records {
+                    report.frontier = EvictionFrontier::UnitLimit;
+                    break;
+                }
+                retirement.batch.delete(&artifact.id);
+                retirement.batch.delete(&key);
+                report.artifacts.push(artifact.id);
+                report.recordless_artifacts += 1;
+                next = Some((position.to_vec(), false));
+                continue;
             }
             let mut record = match writer.time_record(&key, &value, &mut catalog) {
                 Ok(record) => record,
@@ -248,7 +280,7 @@ impl Writer {
             report.visited += 1;
             if protected.contains(&record.id) || protected.contains(&record.artifact_id) {
                 report.protected += 1;
-                next = Some((key.to_vec(), false));
+                next = Some((position.to_vec(), false));
                 continue;
             }
             if !parents.contains_key(&record.artifact_id) {
@@ -282,8 +314,8 @@ impl Writer {
                 ));
             }
             if !record.evicted {
-                if report.records.len() == limits.max_records {
-                    report.frontier = EvictionFrontier::RecordLimit;
+                if report.records.len() + report.recordless_artifacts == limits.max_records {
+                    report.frontier = EvictionFrontier::UnitLimit;
                     break;
                 }
                 if record.chunks.len() > limits.max_payload_refs - report.payload_refs {
@@ -309,16 +341,18 @@ impl Writer {
                 report.payload_refs +=
                     retirement.artifact(parent, limits.max_payload_refs - report.payload_refs)?;
                 if !parent.chunks.is_empty() {
-                    next = Some((key.to_vec(), true));
-                    report.frontier = if report.records.len() == limits.max_records {
-                        EvictionFrontier::RecordLimit
+                    next = Some((position.to_vec(), true));
+                    report.frontier = if report.records.len() + report.recordless_artifacts
+                        == limits.max_records
+                    {
+                        EvictionFrontier::UnitLimit
                     } else {
                         EvictionFrontier::PayloadBudget
                     };
                     break;
                 }
             }
-            next = Some((key.to_vec(), false));
+            next = Some((position.to_vec(), false));
         }
         for parent in parents.values().filter(|parent| parent.evicted) {
             report.pending_manifest_refs += parent.chunks.len();
@@ -341,6 +375,53 @@ impl Writer {
         cursor.exhausted = report.frontier == EvictionFrontier::Exhausted;
         Ok(report)
     }
+
+    /// Merge two native ordered cursors by their identical timestamp/identity suffix.
+    /// Only one entry from each index is peeked; no resident corpus is captured.
+    fn eviction_entries(&self, after: Option<&[u8]>) -> impl Iterator<Item = IndexEntry> + '_ {
+        let mut record_start = b"time:".to_vec();
+        let mut empty_start = recordless::PREFIX.to_vec();
+        if let Some(after) = after {
+            record_start.extend_from_slice(after);
+            empty_start.extend_from_slice(after);
+        }
+        let mut records = self
+            .db
+            .iterator(IteratorMode::From(&record_start, Direction::Forward))
+            .peekable();
+        let mut empty = self
+            .db
+            .iterator(IteratorMode::From(&empty_start, Direction::Forward))
+            .peekable();
+        std::iter::from_fn(move || {
+            if records.peek().is_some_and(Result::is_err) {
+                return records.next();
+            }
+            if empty.peek().is_some_and(Result::is_err) {
+                return empty.next();
+            }
+            let record = records
+                .peek()
+                .and_then(|row| row.as_ref().ok())
+                .filter(|(key, _)| key.starts_with(b"time:"));
+            let artifact = empty
+                .peek()
+                .and_then(|row| row.as_ref().ok())
+                .filter(|(key, _)| key.starts_with(recordless::PREFIX));
+            match (record, artifact) {
+                (None, None) => None,
+                (Some(_), None) => records.next(),
+                (None, Some(_)) => empty.next(),
+                (Some((record, _)), Some((artifact, _))) => {
+                    if record[b"time:".len()..] < artifact[recordless::PREFIX.len()..] {
+                        records.next()
+                    } else {
+                        empty.next()
+                    }
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -358,7 +439,7 @@ mod tests {
         observation.check().unwrap();
         assert_eq!(
             observation.earliest.as_deref(),
-            Some(b"time:00000000000000000001:record:earlier".as_slice())
+            Some(b"00000000000000000001:record:earlier".as_slice())
         );
         observation.put_cf(
             1,
@@ -367,7 +448,7 @@ mod tests {
         );
         assert_eq!(
             observation.earliest.as_deref(),
-            Some(b"time:00000000000000000001:record:earlier".as_slice())
+            Some(b"00000000000000000001:record:earlier".as_slice())
         );
         let mut invalid = rocksdb::WriteBatch::default();
         invalid.put(format!("time:{}", "x".repeat(200)), "record:invalid");

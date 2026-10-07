@@ -30,12 +30,13 @@ mod query_membership;
 mod rdf_index;
 pub(crate) mod rdf_view;
 mod record_fields;
+mod recordless;
 mod retire;
 pub(crate) mod source_time;
 mod text_index;
 pub(crate) mod watch_registry;
 
-const FORMAT: &[u8] = b"sparrow.store/5";
+const FORMAT: &[u8] = b"sparrow.store/9";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -329,7 +330,13 @@ fn parse(bytes: &[u8]) -> Result<Value, Error> {
             unique_members: true,
         },
     )
-    .map_err(|e| Error::new("STORAGE_FAILURE", format!("corrupt catalog JSON: {e}")))
+    .map_err(Error::from)
+}
+
+impl From<json::Error> for Error {
+    fn from(error: json::Error) -> Self {
+        Self::new("STORAGE_FAILURE", format!("corrupt catalog JSON: {error}"))
+    }
 }
 
 impl From<DecodeError> for Error {
@@ -586,7 +593,9 @@ impl Writer {
                 error
             }
         })?;
-        if key != format!("time:{:020}:{}", record.received_at, record.id).as_bytes() {
+        if record.id != id
+            || key != format!("time:{:020}:{}", record.received_at, record.id).as_bytes()
+        {
             return Err(Error::new(
                 "STORAGE_FAILURE",
                 "time index does not match its record",
@@ -779,9 +788,10 @@ impl Store {
                 if format == FORMAT
                     || format == consumption::FORMAT
                     || format == watch_registry::FORMAT
-                    || format == handoff::FORMAT =>
+                    || format == handoff::FORMAT
+                    || recordless::legacy_target(&format).is_some() =>
             {
-                if (format == watch_registry::FORMAT || format == handoff::FORMAT)
+                if recordless::requires_watch_registry(&format)
                     != db.get("watch_registry")?.is_some()
                 {
                     return Err(Error::new(
@@ -806,7 +816,7 @@ impl Store {
                 }
                 let id = random_id("store")?;
                 let mut batch = WriteBatch::default();
-                batch.put("store_format", FORMAT);
+                batch.put("store_format", b"sparrow.store/5");
                 batch.put("store_id", &id);
                 batch.put("text_analyzer", &fingerprint);
                 batch.put("rdf_profile", &rdf_fingerprint);
@@ -858,6 +868,7 @@ impl Store {
                 ));
             }
         }
+        recordless::upgrade(&db)?;
         // Recovered buffered writes are certified only after a real synchronization.
         db.flush_wal(true)?;
         let durability = std::cell::RefCell::new(durability::State::new(
@@ -1006,6 +1017,7 @@ impl Store {
             evicted: false,
         };
         put(&mut batch, &artifact.id, &artifact);
+        recordless::publish(&mut batch, &artifact)?;
         writer.ingest_receipt(&mut batch, request_id, &artifact, now)?;
         if batch.size_in_bytes() > 128 * 1024 * 1024 {
             return Err(Error::new(
