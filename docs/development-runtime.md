@@ -75,6 +75,24 @@ storage scenarios, six core units, two server units, 24 RPC/daemon/MCP scenarios
 all other workspace tests and 123 helper ownership jobs with no distinct
 exceptions or unsanctioned duplicate groups.
 
+At 2026-10-07 22:17 UTC, the owned development daemon was gracefully reopened
+on implementation commit `e19ce63` and served schema 18 on the same private
+`development-v5/rpc.sock`. Store identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/8`, with 192 live
+records. The new session is `session:f64e79a8431598645ffb3852bddcb1d2`;
+pressure status remained ready, without requested capacity or retirement.
+Directory/socket modes remain 0700/0600 and the sole synthetic consume watch
+remains covered at revision 1, without pending claims.
+
+The saved descriptor retry returned `artifact:d066e0d527e9e82ec11e13388b386c13`
+and its 82-byte export matched the original. The saved completed handoff again
+returned its original removed import and `artifact:eec8eedea8b05f3d9512e88ff8ddd61f`;
+its 87-byte CRLF export matched the source, and the replacement producer pathname
+remained intact. Live stdio MCP status reported schema 18 and the same persistent
+store and record count. Acceptance exports and MCP output are under
+`/tmp/sparrow-continuation-live.HVXiqO`. This verifies cutover and retained-evidence
+regressions, not sustained pressure or reboot/deployment qualification.
+
 ## Schema 17 pressure maintenance
 
 Direct record ingestion and staged import writes share one measured physical
