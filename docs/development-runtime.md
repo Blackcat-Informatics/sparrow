@@ -1,0 +1,187 @@
+# Development runtime
+
+Implementation is in progress in `/home/paudley/Active/sparrow`, on
+`implementation/helper-census`. Full architecture acceptance remains unmet.
+
+## Transport and present operations
+
+The daemon uses **Cap'n Proto RPC over a private Unix-domain socket**. The HTTP
+implementation and its dependency were removed following the transport decision
+on 2026-10-06. No JSON operation envelope is sent between clients and the daemon.
+The generated typed contract is
+[`sparrow.capnp`](../crates/sparrow-server/schema/sparrow.capnp). Domain results
+and failures are explicit unions; counts and clock instants are unsigned integer
+fields, formats and JSON kinds are enums, and references carry a store identity.
+
+Present RPC methods are `status`, `ingest`, `artifactGet`, `recordGet`,
+`bytesRead`, `pin`, `pinRelease`, `keysList`, `valuesSearch` and `textSearch`. The shared typed
+client transport is `sparrow_server::connect`, used within a Tokio `LocalSet`.
+The `sparrow` CLI uses that generated client for status, non-destructive buffered
+file ingestion, exact byte-range export, key listing, value searches and full-text searches. Pin
+commands, other query surfaces and the stdio MCP adapter remain required work.
+
+```sh
+CARGO_BUILD_JOBS=4 cargo build --locked --release -p sparrow-server
+target/release/sparrowd --config config/development.toml
+target/release/sparrow /home/paudley/.local/state/sparrow/development-v3/rpc.sock status
+```
+
+## CLI investigations
+
+Every command starts with `sparrow SOCKET_PATH`. These examples use a synthetic
+completed file; production sample locations remain read-only references.
+
+```sh
+sparrow SOCKET_PATH ingest case-001 synthetic jsonl /tmp/diagnostic-copy.jsonl
+sparrow SOCKET_PATH keys --source synthetic --received-from 2026-10-06T00:00:00Z --received-before 2026-10-07T00:00:00Z
+sparrow SOCKET_PATH values --source synthetic --path /message --kind string --decoded 'hello world'
+sparrow SOCKET_PATH text 'allocation failed' --source synthetic
+sparrow SOCKET_PATH bytes STORE_ID ARTIFACT_ID 0 256 /tmp/evidence.bin
+```
+
+Use a stable request identity for retrying ingestion of the same source, format
+and byte sequence. Conflicting reuse is refused. The importer reads at most the
+daemon's artifact limit plus one byte, capped locally at 64 MiB plus one byte,
+and refuses oversized input without sending ingestion. It does not stream large
+files yet, delete inputs or tail active files. Supported explicit formats are
+`jsonl`, `log`, `json`, `markdown` and `opaque`; raw preservation is independent
+of projection support. Its receipt includes concrete artifact/record IDs and
+the daemon's durability acknowledgement.
+
+`bytes` takes store identity, an `artifact:` or `record:` ID, a relative offset,
+length (at most 1 MiB) and a new output filename. It writes raw bytes and syncs
+the output file; it refuses to overwrite existing files. Its stdout is a JSON
+receipt. A local write failure reports that the new output may be incomplete.
+
+Key/value scope defaults to every retained source and acceptance time, 100 rows
+and a 10,000-entry scan budget. `--received-from` and `--received-before` accept
+millisecond-exact RFC 3339 instants through the native PurRDF codec. Options
+`--limit` and `--scan-budget` select the daemon's bounded work. Value filters
+`--path`, `--kind`, `--lexical` and `--decoded` combine as an intersection.
+`--decoded` matches exact decoded string equality; it is not token search.
+JSON kinds are `string`, `number`, `true`, `false`, `null`, `array` and `object`.
+Duplicate/unknown options and invalid intervals are rejected. JSON output keeps
+unsigned counts as decimal strings and includes the daemon's completeness and
+coverage receipt. Transport/domain failures exit unsuccessfully without a
+successful result prefix.
+
+Development configuration selects
+`/home/paudley/.local/state/sparrow/development-v3/rpc.sock` and the database in its
+parent directory. The directory is mode 0700 and socket mode 0600. The daemon
+refuses an existing endpoint rather than unlinking a listener's socket. An owned
+dead endpoint must be reconciled before restart after an unclean shutdown.
+Connections have a 60-second lease. A configured endpoint is not evidence of a
+running server; verify startup and a typed `status` call.
+
+Ingestion acknowledges only after the atomic RocksDB write is synchronized. A
+connection failure before acknowledgement leaves delivery unknown; retry with
+the same request identity. Ingestion and pin/release receipts last 48 hours.
+Expired evidence metadata has a one-day tombstone window, except live pinned
+records. Retention maintenance runs every 30 seconds.
+
+## Storage and queries
+
+Core storage implements exact-byte content-addressed chunks, independent
+occurrences, references, thirty-day acceptance retention, named overlapping
+pins, record survival after parent expiry, bounded uploads and durable release
+retries. PurRDF runtime dependencies are locked to
+`e58974e504b9681597faea1490002ce8ddaf7448`.
+
+JSON search facts come from `purrdf::json::analyze`. They preserve member order,
+duplicate names, exact RFC 6901 pointers, native kinds, number spellings and
+original spans. Full content digest and native profile identity bind shared
+facts. Decoded equality uses PurRDF's lexical decoder. Parser failures keep raw
+evidence and appear in query coverage.
+
+The native JSON fact profile caps a record at 16 MiB source bytes, 65,536 values,
+depth 128 and 2 MiB aggregate pointer text. Atomic ingestion batches are capped
+at 128 MiB. `bytesRead` is capped at 1 MiB. Query limits are 1..1000 rows and
+1..100000 catalog/value visits. Scans and response construction are bounded;
+limited work is explicitly reported.
+
+`keysList` and `valuesSearch` use temporal catalog scans over stored native
+facts. These are not yet field-posting indexes. Scope selects exact source and
+a half-open server-acceptance interval in typed Unix milliseconds. Event-time
+interpretation remains pending. Value predicates include existence, kind,
+exact lexical equality, decoded string equality and an exact pointer; no
+wildcard selector is inferred.
+
+## Persistent full text
+
+Store format 3 binds native standard analyzer identity at atomic store creation.
+The configured `text_lexicon_dir` must contain exactly five standard CBOR
+lexicons; native `Analyzer::resolve` verifies their pinned physical identities.
+Missing or changed artifacts refuse startup. A changed analyzer identity refuses
+reopening without explicit migration. Format 2 stores are preserved and require
+migration; development uses a separate `development-v3` directory.
+
+Ingestion stores native lexical terms, record token lengths, sparse frequency
+postings and separate source-evidence postings in the same synchronized batch as
+raw evidence. Expiry removes those postings with the owning record; pins retain
+them. Queries never reread or reanalyze retained payloads. The initial record
+search profile indexes raw UTF-8 text and decoded JSON string scalars together
+as one explicitly named field. Non-UTF-8 and oversized records retain raw bytes
+and report failed text coverage; opaque inputs report not applicable.
+
+`text QUERY` uses the same source/time and work-limit options as `keys`. Native
+query analysis and prepared BM25 scoring rank records matching any analyzed
+query term. A digest identifies captured document membership, token lengths,
+store and analysis/ranking laws. Query output includes profile identities,
+population and token totals. Do not compare scores across different corpora.
+When membership scanning is limited, ranking is over the explicitly incomplete
+captured membership. Posting-budget exhaustion refuses ranked publication,
+rather than scoring with incomplete document frequencies. This is bounded
+stored-fact retrieval, not yet the governed SPARQL text relation or a pagination
+lease.
+
+The aligned text profile currently bounds a record at 1 MiB and 16,384 lexical
+occurrences across raw and decoded views. Evidence output is at most 64 spans
+per returned record, with an explicit `evidence_limited` flag. Raw matches retain
+native contributors and highlights; decoded-string matches conservatively cite
+the complete original JSON scalar with `coarse=true`. Membership and posting
+scans each use the requested scan budget. Document lengths are persisted;
+corpus/term populations are measured from the captured scope. Source/time corpus
+aggregates and further posting access paths remain performance work.
+
+## Verification and remaining work
+
+The release-profile `make check` gate passed on 2026-10-06, including formatting,
+Clippy with warnings denied, workspace tests and the helper-census self-test and
+cross check. The real-daemon Cap'n Proto test passed for ingestion, original byte
+retrieval, temporal key discovery, decoded string search, malformed JSON
+coverage, typed store mismatch, durable occurrence identity after crash/reopen,
+durable pin-release retry and rejection of partially valid pin requests. All
+fifteen core storage/clock/query/text tests passed in the focused release run.
+
+The same daemon fixture also exercises the CLI before and after crash/reopen:
+stable ingest identity across RPC and CLI, unchanged input bytes, oversized
+import refusal, exact byte export and overwrite refusal, time-scoped duplicate
+keys, decoded value matches, source exclusion, explicit limited execution and
+invalid command rejection.
+
+The latest release workspace build and full `make check` passed. The format-3
+development daemon was started and its typed status client succeeded on
+2026-10-06 local time (2026-10-07 UTC) with identity
+`store:4b5ebc0de33ba66b6bf0892db5168bca`. A synthetic two-line log was durably
+imported under `diagnostic-demo`; `text failed --source diagnostic-demo` returned
+one record, native BM25 score `0.628834555557`, complete/exact coverage, and the
+original `failed` span `[11,17)`. The query returned analyzer and corpus digests.
+Directory mode 0700 and socket mode 0600 were verified. The owned format-2
+development process was cleanly stopped after confirming its identity and empty
+store; its database directory was preserved. These are development runtime
+observations, not final architecture acceptance or a guarantee of later liveness.
+
+Remaining final-server acceptance includes full native JSON/Markdown RDF
+projection, persistent RDF indexes, governed stored-view SPARQL, further
+text qualification, event-time and combined predicates, context and
+correlation, final scope/pagination contracts, streaming imports and recovery
+journals, durable completed-file consumption, inotify/tailing, stdio MCP, CLI,
+syslog, the Rust logging client, pressure eviction/reclamation, codec
+verification, bounded buffered durability, fault/performance qualification,
+packaging and a verified running-server handoff.
+
+The five standard text lexicon artifacts are available in the sibling PurRDF
+checkout under `crates/text/lexicons/artifacts/`. Native `Analyzer::resolve` must
+verify their physical identities and bind the fingerprint to persistent text
+projections. Do not substitute an empty lexicon or rebuild the retained corpus
+as a resident index on each query.

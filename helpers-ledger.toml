@@ -1,0 +1,210 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The helpers ledger: one row per job — a piece of functionality the workspace
+# implements exactly once — naming its single home and the sanctioned second
+# implementations. Read by crates/sparrow-helper-census (`make census`;
+# `cargo run -p sparrow-helper-census -- --check` is the gate). The schema is
+# purrdf's, ported with the census; the keys that named purrdf's own manifests
+# (`sites`, `replaces_external`) are not part of it and are refused.
+#
+# The file is written in a strict TOML subset (bare keys, `[t]`/`[[t]]` headers,
+# basic and literal strings, booleans, decimal integers, arrays); anything else
+# is refused with its line number. `--dump-ledger` prints what the census read.
+#
+# [[job]] — every key is required; an empty array states "none".
+#   id                = the row id, used by `--census <id>` and `--count <id>`.
+#   summary           = what the job is, in one line.
+#   home              = the single implementation, `crate::path::item`; it must
+#                       resolve (through re-exports) to a defined item. The home
+#                       CRATE is the job's home: a forbidden match elsewhere is a
+#                       copy, and copies inside the home crate are the isomorphic
+#                       group rule's business.
+#                       Prefixed `purrdf:` (`purrdf:purrdf_hash::hex::encode`),
+#                       the home is a purrdf item at the revision
+#                       registry/compatibility.toml pins for the purrdf
+#                       supplier, and `entry_points` are purrdf paths too. Every
+#                       Sparrow match of such a job is a copy; nothing inside
+#                       purrdf is ever this ledger's finding. It is judged only by
+#                       `--check --cross` (otherwise reported NOT CHECKED), and
+#                       its `vectors` and `bench` must be empty.
+#   entry_points      = further public paths to the same implementation (aliases,
+#                       re-exports, thin shims); each must resolve.
+#   spec              = the specification or contract the home implements (an
+#                       ADR clause, an RFC).
+#   vectors           = repo-relative frozen vector files or directories; each
+#                       must exist.
+#   bench             = `package:bench-target` ids; each must be a bench target.
+#   enforced          = true: a forbidden match outside the home fails the gate.
+#                       false: the job still has copies; --census and --count
+#                       report them. A job with no copies left must be enforced.
+#
+# [job.forbidden] — what may not appear outside the home crate.
+#   constants    = integer literals, any spelling, compared by value
+#                  (`0xcbf2_9ce4_8422_2325` is its decimal spelling too).
+#   fingerprints = helper-census ids: `body:<hex>` (a structural body shape),
+#                  `shim:<hex>` (a forwarder shape), `table:hex-lower` or
+#                  `table:hex-upper` (a hex-digit table), or a census rule over
+#                  every first-party file, tests and benches included
+#                  (`rule:std-default-hasher`: a std HashMap/HashSet left on its
+#                  random default hasher; `rule:hex-format-loop`: a
+#                  `{:02x}`/`{:02X}` format inside a loop or closure;
+#                  `rule:hex-pair-radix`: `u8::from_str_radix(_, 16)`;
+#                  `rule:hex-table`: a hex-digit table, exempt inside the home
+#                  package), or a literal rule over shipping code
+#                  (`rule:vocabulary-literal`: a string literal equal to or
+#                  starting with a namespace constant — a `NS` or `*_NS` const —
+#                  declared under the job's home and entry-point modules, outside
+#                  those modules, an embedded Turtle/SPARQL document excepted;
+#                  `rule:home-literal`: a string literal equal to one the home
+#                  item's own bodies spell, outside the home item;
+#                  `rule:sole-name`: a function inside the home crate that a
+#                  `names` pattern matches is a copy unless it is the home or an
+#                  entry point). A body or shim fingerprint must still match
+#                  some unit.
+#   names        = regular expressions over function and constant names (a bound
+#                  redeclared under a home's name is a copy; a value such as 16
+#                  or 128 is too common to forbid by `constants`).
+#
+# [[job.variant]] — a sanctioned second implementation; each is re-checked on
+# every run, and one that no longer matches anything is STALE and fails.
+#   symbol    = the variant, `crate::path::item`; must resolve, in `file`.
+#   file      = the repo-relative file that defines it.
+#   detector  = what it is exempt from: `isomorphic` (it may share a body shape
+#               with the home) or `forbidden` (it may hold a forbidden pattern).
+#   criterion = why it may exist: `a` (a specification or conformance suite
+#               requires the difference), `b` (a tangible benefit its
+#               documentation states), `c` (a measured, significant speedup that
+#               cannot be centralised), or `layering` (its callers cannot reach
+#               the home).
+#   anchor    = the documented item that states the reason; it must resolve and
+#               carry documentation.
+#   reason    = the reason, in one or two sentences.
+#
+# The census walks shipping code and every test, bench and example target (each a
+# crate named `<package>::test_crate::<target>`, `bench_crate`, `example_crate`); a
+# file several targets declare is fingerprinted once, under the first. Generated
+# Cap'n Proto code (`include!` of an `OUT_DIR` file) is never walked. A body is
+# compared in its value form: borrows, derefs, `ref`, the value adapters
+# (`.as_str()`, `.clone()`, `.to_owned()`, …), a full-range reindex, `let` type
+# annotations and type-only turbofishes are dropped, local names are renamed and
+# field names kept; a body of 20 to 29 tokens is compared with its literals
+# verbatim, a longer one with them abstracted. Names, constants and fingerprints
+# of a job apply to test code too; the literal rules read shipping code only.
+#
+# [[distinct]] — a set of items that share a body or forwarder shape and share no
+# job, so no [[job.variant]] can name them. Each row sanctions exactly one group:
+# the census group of its `kind` whose member set EQUALS `members`. A group that
+# gains a member is reported again, so a new clone of a sanctioned shape still
+# fails; a row that equals no current group, or names a member that is no longer
+# defined, is STALE and fails. Every key is required.
+#   members   = the group's members, `crate::path::item`, as `--check` names them;
+#               two or more. A symbol two members share (two trait impls on one
+#               type) is listed once per member.
+#   kind      = `body` (an isomorphic-bodies group) or `shim` (an isomorphic-shims
+#               group).
+#   criterion = why the members stay apart, as for a variant: `a`, `b`, `c` or
+#               `layering`.
+#   anchor    = the documented item that states the reason; it must resolve and
+#               carry documentation.
+#   reason    = the reason, in one or two sentences.
+#
+# `make all` runs the gate (`make census-check`: `--cross --check`, release
+# build). Every isomorphic group in the workspace is either collapsed to one home
+# or recorded below with its reason; `make census` and `make census-cross` write
+# the reports new rows are drawn from.
+
+# --- PurRDF-owned helpers: prevent new local implementations -------------
+# These are reuse rules, not declarations of compiled runtime dependencies.
+# Runtime callers use the native owners below; there are no sanctioned clones.
+
+[[job]]
+id = "hex"
+summary = "Base16: render bytes as lowercase hex, and read hex text back into bytes."
+home = "purrdf:purrdf_hash::hex::encode"
+entry_points = [
+  "purrdf_hash::hex::encode_upper",
+  "purrdf_hash::hex::decode",
+  "purrdf_hash::hex::decode_canonical",
+  "purrdf_hash::hex::decode_32",
+  "purrdf_hash::hex::decode_32_canonical",
+]
+spec = "RFC 4648 section 8 (base16)."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+# A per-byte `{:02x}` loop, a `u8::from_str_radix(_, 16)` pair decode, or a
+# spelt-out digit table is a second base16 codec.
+fingerprints = ["rule:hex-format-loop", "rule:hex-pair-radix", "rule:hex-table"]
+names = ['^(un)?hex$']
+
+[[job]]
+id = "splitmix64"
+summary = "SplitMix64: the golden-ratio counter stream and its finaliser."
+home = "purrdf:purrdf_hash::mix::splitmix64_next"
+entry_points = [
+  "purrdf_hash::mix::splitmix64_finalize",
+  "purrdf_hash::mix::splitmix64_step",
+  "purrdf_hash::mix::GOLDEN_GAMMA",
+]
+spec = "Steele, Lea and Flood, Fast Splittable Pseudorandom Number Generators (OOPSLA 2014)."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+# The increment and the two finaliser multipliers, in any spelling.
+constants = ["0x9e3779b97f4a7c15", "0xbf58476d1ce4e5b9", "0x94d049bb133111eb"]
+fingerprints = []
+names = ['^splitmix']
+
+[[job]]
+id = "lcg64"
+summary = "The 64-bit linear congruential generator with Knuth's MMIX constants."
+home = "purrdf:purrdf_hash::mix::lcg64_next"
+entry_points = [
+  "purrdf_hash::mix::LCG64_MULTIPLIER",
+  "purrdf_hash::mix::LCG64_MMIX_INCREMENT",
+]
+spec = "Knuth, TAOCP vol. 2, MMIX LCG modulo 2^64."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = ["0x5851f42d4c957f2d", "0x14057b7ef767814f"]
+fingerprints = []
+names = ['^lcg']
+
+[[job]]
+id = "text-analysis"
+summary = "Resolve and apply the profiled native text analyzer with source-aligned evidence."
+home = "purrdf:purrdf_text::analysis::Analyzer::resolve"
+entry_points = ["purrdf_text::Analyzer::resolve"]
+spec = "PurRDF purrdf-profiled-text-v4, including standard artifact identity qualification."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^tokenize$']
+
+[[job]]
+id = "text-ranking"
+summary = "Exact prepared BM25F scoring from persistent document and term statistics."
+home = "purrdf:purrdf_text::ranking::PreparedQuery::score"
+entry_points = ["purrdf_text::PreparedQuery::score"]
+spec = "PurRDF purrdf-bm25f-fixed-v1; no local arithmetic or floating-point ranking law."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^bm25(f)?$']

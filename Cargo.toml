@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[workspace]
+resolver = "3"
+members = ["crates/sparrow-helper-census", "crates/sparrow-core", "crates/sparrow-server"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+authors = ["Blackcat Informatics Inc."]
+publish = false
+
+[workspace.dependencies]
+blake3 = "1"
+rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
+purrdf = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "e58974e504b9681597faea1490002ce8ddaf7448" }
+purrdf-hash = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "e58974e504b9681597faea1490002ce8ddaf7448" }
+purrdf-lex = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "e58974e504b9681597faea1490002ce8ddaf7448" }
+getrandom = "0.3"
+capnp = "0.27"
+capnp-rpc = "0.27"
+capnpc = "0.27"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[workspace.lints.rust]
+unreachable_pub = "deny"
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

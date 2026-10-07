@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Development store only. Live producer directories are not watched or consumed.
+socket_path = "/home/paudley/.local/state/sparrow/development-v3/rpc.sock"
+data_dir = "/home/paudley/.local/state/sparrow/development-v3"
+disk_budget = 536870912
+maintenance_reserve = 67108864
+max_artifact_bytes = 16777216
+max_records = 100000
+max_pin_members = 10000
+max_concurrent_requests = 4
+text_lexicon_dir = "/home/paudley/Active/purrdf/crates/text/lexicons/artifacts"

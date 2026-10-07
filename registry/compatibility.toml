@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The census reference tree, not a compiled Sparrow dependency lock.
+# Advance deliberately, record the reason, and run make check at the new revision.
+manifest_version = 1
+recorded = "2026-10-06"
+
+[[supplier]]
+name = "purrdf"
+version = "3.0.1"
+git_revision = "e58974e504b9681597faea1490002ce8ddaf7448"
+repository = "../purrdf"
+role = "Reference tree for structural helper discovery and PurRDF-owned ledger jobs."
+
+[[event]]
+date = "2026-10-06"
+supplier = "purrdf"
+revision = "e58974e504b9681597faea1490002ce8ddaf7448"
+reason = "Initial census reference: local PurRDF HEAD; workspace Cargo.toml declares version 3.0.1 and Rust 1.98. This does not replace the architecture document's earlier inspected baseline or select a runtime dependency."

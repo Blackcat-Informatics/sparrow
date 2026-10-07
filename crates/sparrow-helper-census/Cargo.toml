@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "sparrow-helper-census"
+version = "0.0.0"
+description = "The structural helper census: finds functionality written more than once across the workspace and checks it against helpers-ledger.toml (repository gate; not a runtime crate)."
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-only"
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "helper-census"
+path = "src/main.rs"
+
+[dependencies]
+# Fingerprints are BLAKE3 digests of normalised token streams, so a body's id is
+# the same on every host and every build.
+blake3 = { workspace = true }
+# The Rust parser and its token substrate: items, attributes and module structure
+# come from `syn`; bodies are re-lexed into `proc_macro2` tokens so macro arguments
+# are normalised along with everything else. `span-locations` gives every token its
+# line, which is how a finding names `file:line`.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+# Forbidden-name patterns in the ledger are regular expressions.
+regex = "1"
+
+[lints]
+workspace = true

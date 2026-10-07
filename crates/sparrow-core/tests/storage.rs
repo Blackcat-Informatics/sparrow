@@ -1,0 +1,617 @@
+// SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Persistent lifetime scenarios using temporary stores and injected UTC instants.
+
+use sparrow_core::{Config, Store};
+
+const DAY: u64 = 86_400_000;
+
+#[test]
+fn persisted_text_ranking_spans_scope_and_record_pins_survive_reopen() {
+    use sparrow_core::QueryScope;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("text-a", "logs", "log", b"Cat cat\n", 0)
+        .unwrap();
+    let b = store
+        .ingest("text-b", "logs", "log", b"cat dog dog\n", 1)
+        .unwrap();
+    let mut scope = QueryScope {
+        source: Some("logs".into()),
+        received_from: 0,
+        received_before: 2,
+        limit: 100,
+        scan_budget: 10000,
+    };
+    let result = store.text_query(&scope, "CAT", 2).unwrap();
+    assert_eq!(result["ranking"]["documents"].as_str(), Some("2"));
+    assert_eq!(result["ranking"]["tokens"].as_str(), Some("5"));
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        result["rows"][0]["record_id"].as_str(),
+        Some(a.record_ids[0].as_str())
+    );
+    assert_eq!(
+        result["rows"][0]["evidence"][0]["source_start"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        result["rows"][0]["evidence"][0]["source_end"].as_str(),
+        Some("3")
+    );
+    assert_eq!(result["certainty"].as_str(), Some("exact"));
+    assert_eq!(
+        result["rows"][1]["record_id"].as_str(),
+        Some(b.record_ids[0].as_str())
+    );
+    scope.received_from = 1;
+    assert_eq!(
+        store.text_query(&scope, "cat", 2).unwrap()["ranking"]["documents"].as_str(),
+        Some("1")
+    );
+    scope.received_from = 0;
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.text_query(&scope, "CAT", 2).unwrap(), result);
+    let pin = store
+        .pin(
+            "text-pin",
+            "text-case",
+            &[a.record_ids[0].clone()],
+            2,
+            29 * DAY,
+        )
+        .unwrap();
+    store.expire(30 * DAY + 2).unwrap();
+    let retained = store.text_query(&scope, "cat", 30 * DAY + 2).unwrap();
+    assert_eq!(retained["ranking"]["documents"].as_str(), Some("1"));
+    assert_eq!(
+        retained["rows"][0]["record_id"].as_str(),
+        Some(a.record_ids[0].as_str())
+    );
+    store.release(&pin.id).unwrap();
+    store.expire(30 * DAY + 3).unwrap();
+    assert!(
+        store.text_query(&scope, "cat", 30 * DAY + 3).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn decoded_text_uses_scalar_evidence_and_failed_coverage_is_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = br#"{"m":"\u0068\u0065\u006c\u006c\u006f"}"#;
+    let artifact = store
+        .ingest("decoded-text", "json", "json", bytes, 0)
+        .unwrap();
+    store
+        .ingest("malformed-text", "json", "jsonl", b"{invalid}\n", 0)
+        .unwrap();
+    let scope = sparrow_core::QueryScope {
+        source: None,
+        received_from: 0,
+        received_before: 1,
+        limit: 100,
+        scan_budget: 10000,
+    };
+    let result = store.text_query(&scope, "hello", 0).unwrap();
+    let row = &result["rows"][0];
+    assert_eq!(
+        row["record_id"].as_str(),
+        Some(artifact.record_ids[0].as_str())
+    );
+    assert_eq!(
+        row["evidence"][0]["span"]["basis"].as_str(),
+        Some("decoded_json_scalar")
+    );
+    assert_eq!(row["evidence"][0]["span"]["coarse"].as_bool(), Some(true));
+    assert_eq!(row["evidence"][0]["span"]["path"].as_str(), Some("/m"));
+    assert_eq!(
+        result["text_coverage"]["failed_or_incomplete"].as_str(),
+        Some("1")
+    );
+    assert_eq!(result["certainty"].as_str(), Some("incomplete"));
+    let mut small = scope;
+    small.scan_budget = 1;
+    assert_eq!(
+        store
+            .text_query(&small, "hello invalid", 0)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+}
+
+#[test]
+fn standard_text_lexicons_are_required() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        sparrow_core::resolve_text_analyzer(dir.path())
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+}
+
+fn config() -> Config {
+    Config {
+        disk_budget: 128 * 1024 * 1024,
+        maintenance_reserve: 8 * 1024 * 1024,
+        max_artifact_bytes: 8 * 1024 * 1024,
+        max_records: 10_000,
+        max_pin_members: 100,
+        text_analyzer: {
+            static ANALYZER: std::sync::OnceLock<purrdf::text::Analyzer> =
+                std::sync::OnceLock::new();
+            ANALYZER
+                .get_or_init(|| {
+                    sparrow_core::resolve_text_analyzer(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../purrdf/crates/text/lexicons/artifacts"
+                    ))
+                    .unwrap()
+                })
+                .clone()
+        },
+    }
+}
+
+#[test]
+fn native_instants_keep_precision_and_reject_invalid_bounds() {
+    use sparrow_core::{format_instant, parse_instant};
+    assert_eq!(parse_instant("1970-01-01T01:00:00.001+01:00").unwrap(), 1);
+    assert_eq!(format_instant(1).unwrap(), "1970-01-01T00:00:00.001Z");
+    assert!(parse_instant("1970-01-01T00:00:00.0001Z").is_err());
+    assert!(parse_instant("yesterday").is_err());
+}
+
+#[test]
+fn release_retry_is_durable_and_cannot_release_a_reused_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store.ingest("a", "source", "log", b"event\n", 0).unwrap();
+    let targets = vec![artifact.id];
+    let old = store.pin("p", "case", &targets, 1, 0).unwrap();
+    let receipt = store.release_retry("r", &old.id, 1).unwrap();
+    let replacement = store.pin("new", "case", &targets, 1, 2).unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.release_retry("r", &old.id, 3).unwrap(), receipt);
+    assert_eq!(
+        store
+            .release_retry("r", &replacement.id, 3)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(store.pins(3).unwrap()[0].id, replacement.id);
+}
+
+#[test]
+fn receipt_and_catalog_cleanup_are_bounded_and_empty_projection_is_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let original = store.ingest("a", "source", "json", b"", 0).unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["unique_json_projections"].as_str(),
+        Some("1")
+    );
+    let retry = store.ingest("a", "source", "json", b"", DAY).unwrap();
+    assert_eq!(retry.id, original.id);
+    let next = store.ingest("a", "source", "json", b"", 2 * DAY).unwrap();
+    assert_ne!(next.id, original.id);
+    store.expire(32 * DAY).unwrap();
+    assert_eq!(
+        store.status(32 * DAY).unwrap()["unique_json_projections"].as_str(),
+        Some("0")
+    );
+    assert_eq!(store.artifact(&original.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(
+        store.record(&original.record_ids[0]).unwrap_err().code,
+        "NOT_FOUND"
+    );
+}
+
+#[test]
+fn native_json_discovery_preserves_duplicates_lexical_values_and_time_scope() {
+    use sparrow_core::{JsonQuery, QueryScope};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = br#"{"x":1e0,"x":1.00,"nested":{"a/b":"hello\u0020world"}}"#;
+    let first = store.ingest("a", "alpha", "json", bytes, 100).unwrap();
+    store.ingest("b", "alpha", "json", bytes, 200).unwrap();
+    store.ingest("c", "beta", "json", bytes, 100).unwrap();
+    let scope = QueryScope {
+        source: Some("alpha".into()),
+        received_from: 100,
+        received_before: 200,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    let keys = store.json_query(&scope, &JsonQuery::Keys, 201).unwrap();
+    let rows = keys.get("rows").unwrap().as_array().unwrap();
+    let x = rows
+        .iter()
+        .find(|row| row.get("path").unwrap().as_str() == Some("/x"))
+        .unwrap();
+    assert_eq!(x.get("occurrences").unwrap().as_str(), Some("2"));
+    assert_eq!(x.get("records").unwrap().as_str(), Some("1"));
+    let query = JsonQuery::Values {
+        path: Some("/x".into()),
+        kind: Some("number".into()),
+        lexical: Some("1.00".into()),
+        decoded: None,
+    };
+    let values = store.json_query(&scope, &query, 201).unwrap();
+    let matches = values.get("rows").unwrap().as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        matches[0].get("record_id").unwrap().as_str(),
+        Some(first.record_ids[0].as_str())
+    );
+    assert_eq!(matches[0].get("source_start").unwrap().as_str(), Some("13"));
+    let decoded = JsonQuery::Values {
+        path: Some("/nested/a~1b".into()),
+        kind: None,
+        lexical: None,
+        decoded: Some("hello world".into()),
+    };
+    assert_eq!(
+        store
+            .json_query(&scope, &decoded, 201)
+            .unwrap()
+            .get("rows")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    store.flush().unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.json_query(&scope, &query, 201).unwrap(), values);
+}
+
+#[test]
+fn projection_failure_is_visible_without_discarding_raw_evidence() {
+    use sparrow_core::{JsonQuery, QueryScope};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = b"{invalid}\n{\"ok\":true}\n";
+    let artifact = store.ingest("a", "source", "jsonl", bytes, 100).unwrap();
+    assert_eq!(
+        store.bytes(&artifact.id, 0, bytes.len(), 101).unwrap(),
+        bytes
+    );
+    let scope = QueryScope {
+        source: None,
+        received_from: 0,
+        received_before: 200,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    let result = store.json_query(&scope, &JsonQuery::Keys, 101).unwrap();
+    assert_eq!(
+        result.get("certainty").unwrap().as_str(),
+        Some("incomplete")
+    );
+    assert_eq!(
+        result
+            .get("coverage")
+            .unwrap()
+            .get("failed_json_records")
+            .unwrap()
+            .as_str(),
+        Some("1")
+    );
+    let pin = store
+        .pin("p", "evidence", &artifact.record_ids[1..], 40, 101)
+        .unwrap();
+    store.expire(100 + 30 * DAY).unwrap();
+    let retained = store
+        .json_query(&scope, &JsonQuery::Keys, 100 + 30 * DAY)
+        .unwrap();
+    assert_eq!(
+        retained
+            .get("coverage")
+            .unwrap()
+            .get("eligible_records")
+            .unwrap()
+            .as_str(),
+        Some("1")
+    );
+    store.release(&pin.id).unwrap();
+    store.expire(100 + 30 * DAY).unwrap();
+    assert!(
+        store
+            .json_query(&scope, &JsonQuery::Keys, 100 + 30 * DAY)
+            .unwrap()
+            .get("rows")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn query_budget_and_row_limit_do_not_claim_complete_coverage() {
+    use sparrow_core::{JsonQuery, QueryScope};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("a", "source", "json", br#"{"x":1,"x":2}"#, 100)
+        .unwrap();
+    let mut scope = QueryScope {
+        source: None,
+        received_from: 0,
+        received_before: 200,
+        limit: 1,
+        scan_budget: 100,
+    };
+    let query = JsonQuery::Values {
+        path: Some("/x".into()),
+        kind: None,
+        lexical: None,
+        decoded: None,
+    };
+    let result = store.json_query(&scope, &query, 101).unwrap();
+    assert_eq!(result.get("execution").unwrap().as_str(), Some("limited"));
+    assert_eq!(result.get("rows").unwrap().as_array().unwrap().len(), 1);
+    scope.scan_budget = 1;
+    let result = store.json_query(&scope, &query, 101).unwrap();
+    assert_eq!(
+        result.get("certainty").unwrap().as_str(),
+        Some("incomplete")
+    );
+    assert!(result.get("rows").unwrap().as_array().unwrap().is_empty());
+}
+
+#[test]
+fn bytes_occurrences_and_retry_receipts_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"{\"a\":1}\r\n\n{\"a\":2}";
+    let (id, artifact) = {
+        let store = Store::open(dir.path(), config()).unwrap();
+        let artifact = store
+            .ingest("first", "source", "jsonl", bytes, 100)
+            .unwrap();
+        assert_eq!(artifact.record_ids.len(), 3);
+        assert_eq!(
+            store.bytes(&artifact.id, 0, bytes.len(), 101).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            store.bytes(&artifact.record_ids[0], 0, 9, 101).unwrap(),
+            b"{\"a\":1}\r\n"
+        );
+        assert_eq!(
+            store.bytes(&artifact.record_ids[1], 0, 1, 101).unwrap(),
+            b"\n"
+        );
+        assert_eq!(
+            store.bytes(&artifact.record_ids[2], 0, 7, 101).unwrap(),
+            b"{\"a\":2}"
+        );
+        assert_eq!(
+            store
+                .ingest("first", "source", "jsonl", bytes, 200)
+                .unwrap()
+                .id,
+            artifact.id
+        );
+        assert_eq!(
+            store
+                .ingest("first", "source", "jsonl", b"changed", 200)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        let second = store
+            .ingest("second", "source", "jsonl", bytes, 200)
+            .unwrap();
+        assert_ne!(second.id, artifact.id);
+        assert_eq!(second.payload_id, artifact.payload_id);
+        assert_eq!(
+            store.status(201).unwrap()["unique_payload_chunks"].as_str(),
+            Some("3")
+        );
+        store.flush().unwrap();
+        (store.store_id().unwrap(), artifact)
+    };
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.store_id().unwrap(), id);
+    assert_eq!(
+        store.bytes(&artifact.id, 0, bytes.len(), 300).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        store
+            .ingest("first", "source", "jsonl", bytes, 400)
+            .unwrap()
+            .record_ids,
+        artifact.record_ids
+    );
+    assert_eq!(store.records(401).unwrap().len(), 6);
+}
+
+#[test]
+fn record_pin_retains_only_selected_evidence_after_parent_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("file", "source", "log", b"keep\r\nremove\n", 0)
+        .unwrap();
+    let pin = store
+        .pin(
+            "pin-1",
+            "investigation",
+            &[artifact.record_ids[0].clone()],
+            10,
+            29 * DAY,
+        )
+        .unwrap();
+    assert_eq!(pin.expires_at, 39 * DAY);
+    assert_eq!(store.expire(30 * DAY).unwrap(), 2);
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        store
+            .bytes(&artifact.record_ids[0], 0, 6, 30 * DAY)
+            .unwrap(),
+        b"keep\r\n"
+    );
+    assert_eq!(
+        store
+            .bytes(&artifact.record_ids[1], 0, 1, 30 * DAY)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(store.records(30 * DAY).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .pin("late", "resurrect", &[artifact.id], 1, 30 * DAY)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.release(&pin.id).unwrap();
+    assert!(store.records(30 * DAY).unwrap().is_empty());
+    store.expire(30 * DAY).unwrap();
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn overlapping_pins_extend_without_renewal_on_retry_and_name_reuse_is_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store.ingest("file", "source", "log", b"line\n", 0).unwrap();
+    let targets = vec![artifact.record_ids[0].clone()];
+    let first = store.pin("create", "case", &targets, 40, 0).unwrap();
+    let retry = store.pin("create", "case", &targets, 40, DAY).unwrap();
+    assert_eq!(retry.expires_at, 40 * DAY);
+    assert_eq!(retry.revision, 1);
+    let union = store.pin("union", "case", &targets, 1, DAY).unwrap();
+    assert_eq!(union.id, first.id);
+    assert_eq!(union.expires_at, 40 * DAY);
+    let other = store.pin("other", "other", &targets, 50, 0).unwrap();
+    store.release(&first.id).unwrap();
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(store.records(31 * DAY).unwrap().len(), 1);
+    let replacement = store
+        .pin("replacement", "case", &targets, 1, 31 * DAY)
+        .unwrap();
+    assert_ne!(first.id, replacement.id);
+    assert_eq!(store.release(&first.id).unwrap_err().code, "NOT_FOUND");
+    store.release(&other.id).unwrap();
+    assert_eq!(store.records(32 * DAY).unwrap().len(), 0);
+}
+
+#[test]
+fn pin_validation_is_atomic_and_complete_artifact_pins_cover_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("file", "source", "log", b"one\ntwo\n", 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .pin(
+                "bad",
+                "case",
+                &[artifact.id.clone(), "record:missing".into()],
+                40,
+                0
+            )
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+    assert_eq!(store.status(1).unwrap()["active_pins"].as_str(), Some("0"));
+    store
+        .pin("whole", "case", std::slice::from_ref(&artifact.id), 40, 0)
+        .unwrap();
+    assert_eq!(store.expire(30 * DAY).unwrap(), 0);
+    assert_eq!(store.records(30 * DAY).unwrap().len(), 2);
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 8, 30 * DAY).unwrap(),
+        b"one\ntwo\n"
+    );
+    store.expire(40 * DAY).unwrap();
+    assert!(store.records(40 * DAY).unwrap().is_empty());
+}
+
+#[test]
+fn shared_content_remains_until_last_occurrence_expires_and_ranges_are_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let first = store
+        .ingest("first", "source", "opaque", &vec![0xff; 150_000], 0)
+        .unwrap();
+    let later = store
+        .ingest("later", "source", "opaque", &vec![0xff; 150_000], DAY)
+        .unwrap();
+    assert_eq!(
+        store.bytes(&later.id, 60_000, 80_000, DAY).unwrap(),
+        vec![0xff; 80_000]
+    );
+    assert_eq!(
+        store.bytes(&later.id, 149_999, 2, DAY).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        store.bytes(&later.id, u64::MAX, 1, DAY).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+    store.expire(30 * DAY).unwrap();
+    assert_eq!(
+        store.bytes(&first.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(store.bytes(&later.id, 0, 1, 30 * DAY).unwrap(), vec![0xff]);
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn bounded_admission_refuses_work_without_publishing_and_control_remains_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.max_artifact_bytes = 4;
+    limits.max_records = 1;
+    let store = Store::open(dir.path(), limits).unwrap();
+    assert_eq!(
+        store
+            .ingest("too-big", "source", "opaque", b"12345", 0)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store
+            .ingest("too-many", "source", "log", b"a\nb\n", 0)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert!(store.records(0).unwrap().is_empty());
+    let artifact = store.ingest("one", "source", "opaque", b"1234", 0).unwrap();
+    let pin = store.pin("pin", "case", &[artifact.id], 1, 0).unwrap();
+    store.release(&pin.id).unwrap();
+    assert!(store.status(0).is_ok());
+}
