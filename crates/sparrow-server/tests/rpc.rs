@@ -13,6 +13,101 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn daemon_expiry_resumes_multiple_passes_and_keeps_pinned_evidence() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let settings = sparrow_server::ServerConfig::read(&config).unwrap();
+            let store = settings.open_store().unwrap();
+            let store_id = store.store_id().unwrap();
+            let artifact = store
+                .ingest(
+                    "daemon-expiry-old",
+                    "source",
+                    "log",
+                    &b"expired occurrence\n".repeat(70),
+                    0,
+                )
+                .unwrap();
+            // Protection was established while the original evidence was live.
+            store
+                .pin(
+                    "daemon-expiry-original-pin",
+                    "case",
+                    &artifact.record_ids[..1],
+                    30000,
+                    0,
+                )
+                .unwrap();
+            drop(store);
+            let daemon = start(&config, &socket).await;
+            let connection = connect(&socket).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut retained_catalogs = 0;
+                for id in &artifact.record_ids[1..] {
+                    let mut request = connection.client.record_get_request();
+                    let mut reference = request.get().init_record();
+                    reference.set_store_id(&store_id);
+                    reference.set_id(id);
+                    let response = request.send().promise.await.unwrap();
+                    match response
+                        .get()
+                        .unwrap()
+                        .get_result()
+                        .unwrap()
+                        .which()
+                        .unwrap()
+                    {
+                        wire::result::Ok(_) => retained_catalogs += 1,
+                        wire::result::Error(error) => assert_eq!(
+                            error.unwrap().get_code().unwrap().to_str().unwrap(),
+                            "NOT_FOUND"
+                        ),
+                    }
+                }
+                if retained_catalogs == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not finish bounded expiry passes"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut request = connection.client.bytes_read_request();
+            let mut read = request.get().init_request();
+            read.set_length(19);
+            let mut evidence = read.init_evidence();
+            evidence.set_store_id(&store_id);
+            evidence.set_record(&artifact.record_ids[0]);
+            let response = request.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap())
+                    .get_data()
+                    .unwrap(),
+                b"expired occurrence\n"
+            );
+            drop(connection);
+            drop(daemon);
+            let store = settings.open_store().unwrap();
+            let now = sparrow_server::now().unwrap();
+            assert_eq!(store.records(now).unwrap().len(), 1);
+            assert_eq!(
+                store.status(now).unwrap()["unique_payload_chunks"].as_str(),
+                Some("1")
+            );
+            for id in &artifact.record_ids[1..] {
+                assert_eq!(store.record(id).unwrap_err().code, "NOT_FOUND");
+            }
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status() {
     tokio::task::LocalSet::new().run_until(async {
         use purrdf_lex::json::{Object, Value};

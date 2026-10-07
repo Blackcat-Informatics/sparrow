@@ -119,7 +119,45 @@ pub struct ClaimRoot {
     watch: String,
     root: File,
     inflight: File,
-    lock: File,
+    lock: ClaimLock,
+}
+
+/// Explicitly release ownership even if a fork temporarily inherited the open description.
+struct ClaimLock(File);
+
+impl ClaimLock {
+    fn acquire(file: File) -> Result<Self, Error> {
+        fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for ClaimLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs::flock(&self.0, FlockOperation::Unlock) {
+            eprintln!("sparrowd: releasing completed-consumption ownership lock failed: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_release_is_independent_of_inherited_descriptor_lifetime() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let owner = ClaimLock::acquire(path.reopen().unwrap()).unwrap();
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
+        drop(owner);
+        let replacement = ClaimLock::acquire(path.reopen().unwrap()).unwrap();
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
+        drop(inherited);
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
+        drop(replacement);
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_ok());
+    }
 }
 
 /// The opened claimed generation. The original pathname is never reopened for upload.
@@ -277,8 +315,8 @@ impl ClaimRoot {
                 "claim lock must be one daemon-owned regular file, mode 0600",
             ));
         }
-        fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
-        lock.sync_all()?;
+        let lock = ClaimLock::acquire(lock)?;
+        lock.0.sync_all()?;
         inflight.sync_all()?;
         let known = pending
             .iter()
@@ -365,7 +403,7 @@ impl ClaimRoot {
         }
         let current = open(&self.inflight, Path::new(".lock"), OFlags::RDONLY, BENEATH)?;
         let current = CompletedFileIdentity::capture(&current.metadata()?);
-        let held = CompletedFileIdentity::capture(&self.lock.metadata()?);
+        let held = CompletedFileIdentity::capture(&self.lock.0.metadata()?);
         if current.device != held.device || current.inode != held.inode {
             return Err(Error::State(
                 "private coordination lock was replaced; source transfer refused",

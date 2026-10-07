@@ -85,9 +85,9 @@ impl WriteBatchIteratorCf for Publication {
 /// Finite per-pass admission. Catalog charge includes decoded and retained shapes.
 #[derive(Clone, Copy, Debug)]
 pub struct EvictionLimits {
-    /// Maximum newly evicted records (1..=128).
+    /// Maximum newly evicted records, or expiry dependency units (1..=128).
     pub max_records: usize,
-    /// Maximum time entries and, independently, pin entries (1..=100000).
+    /// Maximum traversal entries and, independently, pin entries (1..=100000).
     pub scan_budget: usize,
     /// Maximum payload ownership references retired (1..=65536).
     pub max_payload_refs: usize,
@@ -106,6 +106,26 @@ impl Default for EvictionLimits {
             max_catalog_bytes: 32 * 1024 * 1024,
             max_batch_bytes: 128 * 1024 * 1024,
         }
+    }
+}
+
+impl EvictionLimits {
+    pub(super) fn validate(self) -> Result<(), Error> {
+        for (value, maximum) in [
+            (self.max_records, 128),
+            (self.scan_budget, 100000),
+            (self.max_payload_refs, 65536),
+            (self.max_catalog_bytes, 32 * 1024 * 1024),
+            (self.max_batch_bytes, 128 * 1024 * 1024),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(Error::new(
+                    "INVALID_ARGUMENT",
+                    "retirement limit outside supported bounds",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -163,20 +183,7 @@ impl Writer {
         now: u64,
         limits: EvictionLimits,
     ) -> Result<EvictionReport, Error> {
-        for (value, maximum) in [
-            (limits.max_records, 128),
-            (limits.scan_budget, 100000),
-            (limits.max_payload_refs, 65536),
-            (limits.max_catalog_bytes, 32 * 1024 * 1024),
-            (limits.max_batch_bytes, 128 * 1024 * 1024),
-        ] {
-            if value == 0 || value > maximum {
-                return Err(Error::new(
-                    "INVALID_ARGUMENT",
-                    "eviction limit outside supported bounds",
-                ));
-            }
-        }
+        limits.validate()?;
         let writer = self;
         let mut catalog = limits.max_catalog_bytes;
         let mut pins = 0;

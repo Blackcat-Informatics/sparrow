@@ -1901,3 +1901,33 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(serve_test_rpc_connection|serve_daemon_rpc_connection)$']
+
+[[job]]
+id = "bounded-catalog-expiry"
+summary = "Resume finite artifact, record, pin and retry catalog expiry through the shared dependency retirement owner, advancing only after durable publication."
+home = "sparrow_core::storage::expiry::Writer::expire_bounded"
+entry_points = ["sparrow_core::storage::expiry::Store::expire_bounded", "sparrow_core::storage::expiry::Store::expire"]
+spec = "docs/development-runtime.md: bounded catalog expiry."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(expire_resident_corpus|collect_expiry_catalog)$']
+
+[[job]]
+id = "completed-consumption-lock-lifetime"
+summary = "Acquire one nonblocking exclusive native lock and release it explicitly when ownership ends, independent of inherited descriptor lifetime."
+home = "sparrow_server::consumption::ClaimLock::acquire"
+entry_points = ["sparrow_server::consumption::ClaimRoot::open", "sparrow_server::consumption::ClaimLock::drop"]
+spec = "docs/development-runtime.md: bounded catalog expiry qualification and claim lock release."
+vectors = ["crates/sparrow-server/src/consumption.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(retry_claim_lock|wait_for_claim_lock)$']

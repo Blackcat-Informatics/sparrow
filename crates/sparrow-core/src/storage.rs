@@ -19,6 +19,7 @@ pub(crate) mod consumption;
 pub(crate) mod context;
 pub(crate) mod durability;
 pub(crate) mod eviction;
+pub(crate) mod expiry;
 pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
@@ -308,6 +309,7 @@ struct Writer {
     durability: std::cell::RefCell<durability::State>,
     pressure: std::cell::RefCell<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
+    expiry: std::cell::RefCell<expiry::Cursor>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -870,6 +872,7 @@ impl Store {
                 durability,
                 pressure: std::cell::RefCell::new(pressure::State::default()),
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
+                expiry: std::cell::RefCell::new(expiry::Cursor::default()),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
         })
@@ -1497,64 +1500,6 @@ impl Store {
         batch.put(key, json::write_compact(&saved));
         writer.commit(batch)?;
         Ok(receipt)
-    }
-
-    /// Reclaim unreachable payload references; record pins survive parent expiry.
-    pub fn expire(&self, now: u64) -> Result<u64, Error> {
-        self.import_reclaim(now)?;
-        self.pin_read_stats(now)?;
-        let writer = self.lock()?;
-        let protected = writer.protected(now)?;
-        let mut retirement = retire::Retirement::new(&writer)?;
-        let mut expired = 0;
-        for mut artifact in writer.list::<Artifact>("artifact:")? {
-            if !writer.live_artifact(&artifact, now, &protected) && !artifact.chunks.is_empty() {
-                retirement.artifact(&mut artifact, usize::MAX)?;
-                put(&mut retirement.batch, &artifact.id, &artifact);
-                expired += 1;
-            }
-        }
-        for mut record in writer.list::<Record>("record:")? {
-            if !writer.live_record(&record, now, &protected) && retirement.record(&mut record, 1)? {
-                put(&mut retirement.batch, &record.id, &record);
-                expired += 1;
-            }
-        }
-        let mut batch = retirement.finish()?;
-        for pin in writer.list::<Pin>("pin:")? {
-            if pin.expires_at <= now {
-                batch.delete(pin.id);
-            }
-        }
-        for entry in writer.db.prefix_iterator("request:") {
-            let (key, bytes) = entry?;
-            if !key.starts_with(b"request:") {
-                break;
-            }
-            let value = parse(&bytes)?;
-            if !writer.managed_consumption_request(&key, &value)?
-                && integer(&value, "expires_at")? <= now
-            {
-                batch.delete(key);
-            }
-        }
-        for record in writer.list::<Record>("record:")? {
-            if !writer.live_record(&record, now, &protected)
-                && record.expires_at.saturating_add(DAY) <= now
-            {
-                batch.delete(&record.id);
-                batch.delete(format!("time:{:020}:{}", record.received_at, record.id));
-            }
-        }
-        for artifact in writer.list::<Artifact>("artifact:")? {
-            if !writer.live_artifact(&artifact, now, &protected)
-                && artifact.expires_at.saturating_add(DAY) <= now
-            {
-                batch.delete(artifact.id);
-            }
-        }
-        writer.commit(batch)?;
-        Ok(expired)
     }
 
     /// Synchronize accepted writes and flush both catalog and payload families.

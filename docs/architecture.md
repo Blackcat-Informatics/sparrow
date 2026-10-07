@@ -233,6 +233,15 @@ investigation pins. Expiry affects subsequent queries immediately; physical
 reclamation waits for those short-lived leases and native engine maintenance.
 Report reclamation lag separately from logical expiry.
 
+Ordinary cleanup traverses catalog prefixes in finite passes rather than
+collecting resident evidence. Each pass captures current pin protection under
+the writer lock, admits complete record dependency retirement and bounded parent
+manifest ownership, and advances its session-local seek position only after
+durable publication. A completed traversal or reopen starts a fresh traversal;
+new entries and changed protection behind a position are revisited then. Logical
+eligibility always uses the current read instant, independently of this physical
+cleanup schedule. Oversized indivisible catalog or record units fail explicitly.
+
 ## 6. Ingestion and recovery
 
 ### 6.1 Publication and durability

@@ -8,6 +8,224 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn bounded_expiry_recaptures_pin_release_and_expiry_between_pages() {
+    use sparrow_core::EvictionLimits;
+    for release in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let artifact = store
+            .ingest("expiry-protected-pages", "source", "log", b"a\nb\nc\n", 0)
+            .unwrap();
+        let pin = store
+            .pin(
+                "expiry-pages-pin",
+                "case",
+                std::slice::from_ref(&artifact.id),
+                40,
+                0,
+            )
+            .unwrap();
+        let limits = EvictionLimits {
+            scan_budget: 1,
+            max_records: 1,
+            ..EvictionLimits::default()
+        };
+        assert_eq!(store.expire_bounded(30 * DAY, limits).unwrap().records, 0);
+        let now = if release {
+            store.release(&pin.id).unwrap();
+            30 * DAY
+        } else {
+            40 * DAY
+        };
+        assert_eq!(store.expire_bounded(now, limits).unwrap().records, 1);
+        for _ in 0..2 {
+            loop {
+                if !store.expire_bounded(now, limits).unwrap().continuation {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            store.status(now).unwrap()["unique_payload_chunks"].as_str(),
+            Some("0")
+        );
+    }
+}
+
+#[test]
+fn bounded_expiry_drains_manifests_and_preserves_pinned_shared_evidence() {
+    use sparrow_core::{EvictionLimits, ExpiryFrontier};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut line = vec![b'r'; 1000];
+    line.extend_from_slice(b"\r\n");
+    let input = line.repeat(66);
+    let old = store
+        .ingest("expiry-old", "source", "log", &input, 0)
+        .unwrap();
+    let later = store
+        .ingest("expiry-later", "source", "log", &input, DAY)
+        .unwrap();
+    let pin = store
+        .pin("expiry-pin", "case", &old.record_ids[..1], 40, 0)
+        .unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        scan_budget: 2,
+        max_payload_refs: 1,
+        ..EvictionLimits::default()
+    };
+    let mut partial = false;
+    let mut retired = 0;
+    for pass in 0..10000 {
+        let report = store.expire_bounded(30 * DAY, limits).unwrap();
+        assert!(report.visited <= 2);
+        assert!(report.payload_refs <= 1);
+        assert!(report.records + report.artifacts <= 1);
+        partial |= report.frontier == ExpiryFrontier::PayloadBudget;
+        retired += report.records;
+        if !report.continuation {
+            break;
+        }
+        assert!(pass < 9999, "bounded expiry failed to finish its traversal");
+    }
+    assert!(partial);
+    assert_eq!(retired, old.record_ids.len() as u64 - 1);
+    assert_eq!(
+        store
+            .bytes(&old.record_ids[0], 0, line.len(), 30 * DAY)
+            .unwrap(),
+        line
+    );
+    assert_eq!(
+        store.bytes(&later.id, 0, input.len(), 30 * DAY).unwrap(),
+        input
+    );
+    assert_eq!(
+        store.bytes(&old.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.release(&pin.id).unwrap();
+    // A fresh traversal revisits members made eligible behind the prior cursor.
+    loop {
+        if !store.expire_bounded(30 * DAY, limits).unwrap().continuation {
+            break;
+        }
+    }
+    assert_eq!(
+        store.records(30 * DAY).unwrap().len(),
+        later.record_ids.len()
+    );
+    assert_eq!(
+        store.bytes(&later.id, 0, input.len(), 30 * DAY).unwrap(),
+        input
+    );
+}
+
+#[test]
+fn bounded_expiry_reclaims_recordless_catalog_and_restarts_after_reopen() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let empty = store
+        .ingest("expiry-empty", "source", "log", b"", 0)
+        .unwrap();
+    let old = store
+        .ingest(
+            "expiry-record",
+            "source",
+            "jsonl",
+            b"{\"message\":\"old\"}\n",
+            0,
+        )
+        .unwrap();
+    let limits = EvictionLimits {
+        scan_budget: 1,
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let first = store.expire_bounded(31 * DAY, limits).unwrap();
+    assert_eq!(first.visited, 1);
+    assert!(first.continuation);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut passes = 0;
+    loop {
+        let report = store.expire_bounded(31 * DAY, limits).unwrap();
+        assert!(report.visited <= 1);
+        passes += 1;
+        assert!(passes < 20);
+        if !report.continuation {
+            break;
+        }
+    }
+    assert_eq!(store.artifact(&empty.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(store.artifact(&old.id).unwrap_err().code, "NOT_FOUND");
+    assert!(store.records(31 * DAY).unwrap().is_empty());
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+    // New publication after a completed traversal is processed by the next traversal.
+    let added = store
+        .ingest("expiry-new", "source", "log", b"new\n", 0)
+        .unwrap();
+    loop {
+        if !store.expire_bounded(31 * DAY, limits).unwrap().continuation {
+            break;
+        }
+    }
+    assert_eq!(store.artifact(&added.id).unwrap_err().code, "NOT_FOUND");
+}
+
+#[test]
+fn bounded_expiry_batch_and_catalog_refusal_preserve_dependencies_and_position() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let old = store
+        .ingest(
+            "expiry-refusal",
+            "source",
+            "jsonl",
+            b"{\"message\":\"keep\"}\n",
+            0,
+        )
+        .unwrap();
+    for limits in [
+        EvictionLimits {
+            max_batch_bytes: 1,
+            ..EvictionLimits::default()
+        },
+        EvictionLimits {
+            max_catalog_bytes: 1,
+            ..EvictionLimits::default()
+        },
+    ] {
+        assert_eq!(
+            store.expire_bounded(31 * DAY, limits).unwrap_err().code,
+            "RESOURCE_LIMIT"
+        );
+        assert_eq!(store.artifact(&old.id).unwrap().id, old.id);
+        assert_eq!(
+            store.status(0).unwrap()["unique_payload_chunks"].as_str(),
+            Some("1")
+        );
+        assert_eq!(store.bytes(&old.id, 0, 1, 0).unwrap(), b"{");
+    }
+    let report = store
+        .expire_bounded(31 * DAY, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(report.artifacts, 1);
+    assert_eq!(report.records, 1);
+    assert!(!report.continuation);
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
 fn pressure_continues_past_a_protected_prefix_without_restarting_after_renewal() {
     use sparrow_core::{EvictionFrontier, EvictionLimits, PressurePhase};
     let dir = tempfile::tempdir().unwrap();

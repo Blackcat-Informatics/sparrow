@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serving = local.run_until(async {
         let serving = async {
         let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
-        let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut pressure = tokio::time::interval(std::time::Duration::from_secs(1));
         pressure.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -78,7 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ = maintenance.tick() => {
                     let owner = store.clone();
-                    if let Err(e) = tokio::task::spawn_blocking(move || owner.expire(sparrow_server::now()?)).await? {
+                    if let Err(e) = tokio::task::spawn_blocking(move || owner.expire_bounded(
+                        sparrow_server::now()?, sparrow_core::EvictionLimits::default())).await? {
                         eprintln!("sparrowd: retention maintenance failed: {e}");
                     }
                 }

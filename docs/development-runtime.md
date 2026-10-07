@@ -20,7 +20,7 @@ remaining touched-parent manifest references and an explicit traversal frontier.
 Logical reference retirement does not certify physical bytes freed or peak RSS.
 
 The daemon now invokes this primitive through the pressure worker below.
-Recordless-artifact eviction, bounded expiry, forced native compaction and
+Recordless-artifact eviction, forced native compaction and
 sustained physical reclamation qualification remain unfinished.
 
 Temporary-store scenarios cover native RDF/JSON/text and exact-byte survival for
@@ -34,6 +34,59 @@ Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
 The current source implements schema 18; the schema sections
 below retain their historical qualification evidence.
+
+## Bounded catalog expiry
+
+Ordinary expiry no longer collects the artifact, record and pin corpus or
+constructs one corpus-sized native write batch. `Store::expire_bounded` uses
+native ordered seek over artifact, record, pin and request catalogs. Its
+session-local cursor resumes complete safe prefixes, and restarts after a
+completed traversal or reopen. New entries behind a position and released pins
+are revisited on the next traversal. Every pass recaptures current protection
+under the same serialized writer lock; progress never grants stale deletion
+authority. Eligibility continues to use the current server instant, so logical
+expiry does not wait for the cleanup cursor.
+
+The existing retirement admission limits bound visited catalog entries, active
+pin capture, dependency units, payload ownership references, conservative decoded
+catalog shapes and final atomic write size. Complete artifact manifests drain
+across passes. Individual records retire atomically through the same JSON, RDF,
+text and payload owner used by pressure eviction and abandoned preparation.
+An indivisible record or catalog entry that exceeds a fresh allowance fails
+explicitly. Hard decode, ownership and native batch failures publish no prefix
+and do not advance the cursor. Empty artifact catalogs are removed after their
+ordinary metadata grace period even though they have no records or payloads.
+Active consumption and handoff request receipts retain the existing ownership
+law rather than being discarded as ordinary expired retries.
+
+The daemon runs one finite pass each second; it does not hold the catalog writer
+through a loop draining the corpus. `Store::expire` now invokes the same bounded
+implementation with default limits and returns that pass's retirement-unit
+count. Callers needing traversal evidence use the explicit frontier and
+continuation in `ExpiryReport`. This changes no wire schema or store format.
+Native compaction, bounded individual manifest encoding and sustained physical
+reclamation qualification remain unfinished.
+
+Qualification covers bounded manifest drainage with shared bytes and a record
+pin; release and expiry of protection between pages; empty artifact cleanup;
+reopen and fresh-publication traversal; atomic batch/catalog admission refusal;
+and a real private-socket daemon draining 70 expired records across multiple
+passes while preserving one pinned occurrence and its exact bytes. The full
+gate passed with 83 storage scenarios, six core units, three server units,
+25 RPC/daemon/MCP scenarios, all other workspace tests and 125 helper ownership
+jobs, with no distinct exceptions or unsanctioned duplicate groups.
+
+The initial full gate encountered the previously recorded nonblocking claim
+lock failure in parallel recovery acceptance. A local native probe verified that
+descriptor close can leave an exclusive `flock` held by an inherited open file
+description. Completed-consumption ownership now releases the native lock
+explicitly when its guard is dropped, including failures during subsequent root
+initialization. Acquisition remains nonblocking and exclusive; release failures
+are reported. A deterministic unit retains a duplicated descriptor across owner
+release, proves immediate replacement acquisition, and proves that dropping the
+old descriptor does not disturb the replacement's ownership. The subsequent
+full gate passed. This verifies that lifecycle rule without claiming which
+particular child inherited the descriptor in the earlier parallel failure.
 
 ## Schema 18 bounded eviction traversal
 
