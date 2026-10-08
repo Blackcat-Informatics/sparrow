@@ -21,6 +21,27 @@ use budget::{Budget, Reservation};
 /// Sticky operational root cause shared by native readers and their guards.
 pub type ReadError = Arc<Error>;
 
+/// Independent occurrence metadata, normalized diagnostic and shared content layers.
+/// Selection changes visible graph owners, never RDF semantics or evidence lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RdfGraphLayers {
+    /// Record/source/time/byte provenance and projection links.
+    pub metadata: bool,
+    /// Interpreted diagnostic values, unknown reasons and original-byte witnesses.
+    pub diagnostic: bool,
+    /// Native JSON/Markdown content projections, shared by equal payloads.
+    pub content: bool,
+}
+
+impl RdfGraphLayers {
+    /// Existing stored-read behavior: all three layers, with strict content readiness.
+    pub const ALL: Self = Self {
+        metadata: true,
+        diagnostic: true,
+        content: true,
+    };
+}
+
 /// Inclusive host ceilings for one stored RDF operation; zero is a hard limit.
 #[derive(Clone, Copy, Debug)]
 pub struct RdfReadLimits {
@@ -722,6 +743,20 @@ impl Store {
         limits: RdfReadLimits,
         operation: impl FnOnce(&StoredRdfView<'_>) -> T,
     ) -> Result<T, ReadError> {
+        self.with_rdf_record_layers(ids, RdfGraphLayers::ALL, now, limits, operation)
+    }
+
+    /// Select physical graph layers through the same retained-record and snapshot owner.
+    /// Content readiness is required only when content is selected. Empty layer selection
+    /// exposes an empty dataset after validating every referenced record's eligibility.
+    pub fn with_rdf_record_layers<T>(
+        &self,
+        ids: &[String],
+        layers: RdfGraphLayers,
+        now: u64,
+        limits: RdfReadLimits,
+        operation: impl FnOnce(&StoredRdfView<'_>) -> T,
+    ) -> Result<T, ReadError> {
         if ids.is_empty() || ids.len() > 1000 {
             return Err(Arc::new(Error::new(
                 "INVALID_ARGUMENT",
@@ -812,11 +847,15 @@ impl Store {
                     "RDF selection contains expired evidence",
                 )));
             }
-            if let Some(owner) = super::diagnostic::graph_owner(&record) {
+            if layers.diagnostic
+                && let Some(owner) = super::diagnostic::graph_owner(&record)
+            {
                 graphs.insert(owner);
             }
-            graphs.insert(record.id);
-            if !record.rdf_projection_id.is_empty() {
+            if layers.metadata {
+                graphs.insert(record.id);
+            }
+            if layers.content && !record.rdf_projection_id.is_empty() {
                 let _decode = view.budget.reserve(4096 * 64)?;
                 let key = format!("rdf:state:{}", record.rdf_projection_id);
                 let bytes = view.point(key.as_bytes(), 4096)?.ok_or_else(|| {

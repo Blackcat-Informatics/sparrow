@@ -285,8 +285,18 @@ from metadata and shared content; it includes interpreted values or reasons,
 profile references, native occurrences and byte evidence. RDF inspection exposes
 the graph and exact persisted primary-row count. Pin retention, expiry, eviction
 and canceled private preparation use the existing graph retirement owner.
-Scoped native views include it without resident-corpus replay. Full graph-layer
-selection and correlation/explanation queries remain unfinished.
+Scoped native views include it without resident-corpus replay.
+`Store::with_rdf_record_layers` accepts typed `RdfGraphLayers` flags for
+`metadata`, `diagnostic` and `content`, selecting their physical graph owners
+through the existing bounded native snapshot. Shared content owners remain
+deduplicated. `with_rdf_records` delegates to this implementation with all three
+layers, preserving its strict content-readiness behavior. A selected content
+projection must be ready; an excluded content projection's failed or corrupt
+state does not block metadata/diagnostic reads. Record identity, eligibility,
+pins and read admission remain mandatory even for an empty layer selection.
+This is a native storage integration seam, not a complete public SPARQL surface:
+CLI/MCP graph-layer queries, native admission for all required forms, diagnostic
+coverage/correlation and explanation contracts remain unfinished.
 
 Storage formats 13/14/15/16 fence older writers for the basic, consumption,
 watch-registry and handoff states. Existing 9/10/11/12 stores durably advance to

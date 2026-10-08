@@ -50,7 +50,7 @@ pub use storage::producer_stream::{
 };
 pub use storage::publication::{ImportPreparation, RawPreparation};
 pub use storage::rdf_view::{
-    RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
+    RdfGraphLayers, RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
 };
 pub use storage::record_read::{
     JsonRead, QUERY_CAPTURE_PROFILE, RecordOperation, RecordPageBody, RecordRead, RecordReadPage,

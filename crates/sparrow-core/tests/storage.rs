@@ -8120,6 +8120,197 @@ fn artifact_selection_seeks_members_without_reading_unrelated_corrupt_catalog_en
 }
 
 #[test]
+fn stored_rdf_layers_select_native_graph_owners_and_keep_failure_and_retention_boundaries() {
+    use purrdf::{DatasetView, SparqlResult};
+    use sparrow_core::{DiagnosticDimension as D, RdfGraphLayers, RdfReadLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_diagnostic_profile("layers", [(D::Service, "/svc".into())].into())
+        .unwrap();
+    let raw = br#"{"svc":"worker","message":"payload"}"#;
+    let a = store.ingest("layers-a", "layers", "json", raw, 0).unwrap();
+    let b = store.ingest("layers-b", "layers", "json", raw, 1).unwrap();
+    let ids = vec![a.record_ids[0].clone(), b.record_ids[0].clone()];
+    for mask in 0_u8..8 {
+        let layers = RdfGraphLayers {
+            metadata: mask & 1 != 0,
+            diagnostic: mask & 2 != 0,
+            content: mask & 4 != 0,
+        };
+        let observed = store.with_rdf_record_layers(&ids, layers, 2, RdfReadLimits::default(), |view| {
+            let graphs = view.named_graphs().count();
+            let results = [
+                "SELECT ?record ?service WHERE { ?record <urn:sparrow:vocab:service> ?service }",
+                "SELECT ?record ?service ?source WHERE { ?record <urn:sparrow:vocab:service> ?service . ?record <urn:sparrow:vocab:sourceName> ?source }",
+            ].map(|query| purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
+                purrdf::SparqlRequest { query, base_iri: None, substitutions: &[] },
+                purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
+                    .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0)).unwrap().result);
+            (graphs, results)
+        }).unwrap();
+        assert_eq!(
+            observed.0,
+            usize::from(layers.metadata) * 2
+                + usize::from(layers.diagnostic) * 2
+                + usize::from(layers.content)
+        );
+        for (result, present) in observed
+            .1
+            .into_iter()
+            .zip([layers.diagnostic, layers.metadata && layers.diagnostic])
+        {
+            let SparqlResult::Solutions { rows, .. } = result else {
+                panic!("native SELECT required")
+            };
+            assert_eq!(rows.len(), if present { 2 } else { 0 });
+            if present {
+                assert!(format!("{rows:?}").contains("worker"));
+            }
+        }
+    }
+    let old = store
+        .with_rdf_records(&ids, 2, RdfReadLimits::default(), |view| {
+            view.named_graphs().collect::<Vec<_>>()
+        })
+        .unwrap();
+    let all = store
+        .with_rdf_record_layers(
+            &ids,
+            RdfGraphLayers::ALL,
+            2,
+            RdfReadLimits::default(),
+            |view| view.named_graphs().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_eq!(old, all);
+    let projection = store.record(&a.record_ids[0]).unwrap().rdf_projection_id;
+    let broken = store
+        .ingest("layers-broken", "layers", "json", b"{\"svc\":", 2)
+        .unwrap();
+    for diagnostic in [false, true] {
+        let layers = RdfGraphLayers {
+            metadata: !diagnostic,
+            diagnostic,
+            content: false,
+        };
+        assert_eq!(
+            store
+                .with_rdf_record_layers(
+                    &broken.record_ids,
+                    layers,
+                    3,
+                    RdfReadLimits::default(),
+                    |view| view.named_graphs().count()
+                )
+                .unwrap(),
+            1
+        );
+    }
+    assert_eq!(
+        store
+            .with_rdf_records(&broken.record_ids, 3, RdfReadLimits::default(), |_| ())
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    assert_eq!(
+        store
+            .with_rdf_record_layers(
+                &ids,
+                RdfGraphLayers::ALL,
+                3,
+                RdfReadLimits {
+                    requests: 0,
+                    ..Default::default()
+                },
+                |_| ()
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    let pin = store
+        .pin("layers-pin", "protected", &a.record_ids, 40, 3)
+        .unwrap();
+    let none = RdfGraphLayers {
+        metadata: false,
+        diagnostic: false,
+        content: false,
+    };
+    assert_eq!(
+        store
+            .with_rdf_record_layers(
+                &a.record_ids,
+                none,
+                31 * DAY,
+                RdfReadLimits::default(),
+                |view| view.named_graphs().count()
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .with_rdf_record_layers(
+                &b.record_ids,
+                none,
+                31 * DAY,
+                RdfReadLimits::default(),
+                |_| ()
+            )
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store
+        .release_retry("layers-release", &pin.id, 31 * DAY)
+        .unwrap();
+    assert_eq!(
+        store
+            .with_rdf_record_layers(
+                &a.record_ids,
+                none,
+                31 * DAY,
+                RdfReadLimits::default(),
+                |_| ()
+            )
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put(
+        format!("rdf:state:{projection}"),
+        b"corrupt excluded projection state",
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let diagnostics = RdfGraphLayers {
+        metadata: false,
+        diagnostic: true,
+        content: false,
+    };
+    assert_eq!(
+        store
+            .with_rdf_record_layers(&ids, diagnostics, 4, RdfReadLimits::default(), |view| view
+                .named_graphs()
+                .count())
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .with_rdf_records(&ids, 4, RdfReadLimits::default(), |_| ())
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+}
+
+#[test]
 fn source_discovery_freezes_bounded_syslog_bindings_without_inventing_continuity() {
     use sparrow_core::{SourceRead, SourceSelector, SourceSyslogBinding};
     let dir = tempfile::tempdir().unwrap();
