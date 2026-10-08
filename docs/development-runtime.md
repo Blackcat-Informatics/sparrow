@@ -76,8 +76,36 @@ The current client refused status, keys, sources and artifacts against a private
 archived schema-25 daemon with `UNSUPPORTED`, exit 1 and zero stdout bytes.
 Evidence is `/tmp/sparrow-artifact-scope-schema25-compat.as360qne`; the archive
 digest is `51145f2be6894f887324d63f8d1d9c99a2d53b90aef9c3a737647cafefdc336d`.
-That owned child exited cleanly under SIGINT and removed its socket. Development
-runtime adoption remains to be qualified.
+That owned child exited cleanly under SIGINT and removed its socket.
+
+Signed implementation `d9baf89` passed its normal full verification hook. The
+owned schema-25 development unit exited successfully under SIGINT, with PID zero
+and its socket removed, before the same unit/config/store reopened under schema
+26 at 2026-10-08 02:43:52 UTC (observed PID 1181470). Store identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`, with 195 live
+records and no pending writes. Directory/socket permissions remain 0700/0600.
+
+Live evidence in `/tmp/sparrow-artifact-scope-live.74p9pwyd` verifies an original
+pin revision 1 capture of two records, a revision 2 expansion to three records,
+stale-revision refusal before source filtering, then release of that temporary
+pin. CLI/MCP continuation preserves the original two-record capture after both
+mutation and release. The selected 240-byte parent reports one retained record
+in scope and two original records, with complete bytes still available. Explicit
+overlapping selections deduplicate counts and agree with shared scoped key
+discovery. Missing/foreign/released references, changed cursor membership,
+unadmitted filters and scan refusal produce no successful stdout prefix. The
+temporary pin is released and the store retains zero active pins.
+
+`/tmp/sparrow-source-wire-live.a74400mt` verifies all 16 source pages, CLI/MCP
+equal continuation and scope/source/profile/watch agreement under schema 26.
+`/tmp/sparrow-artifact-scope-regression.chr0mnjz` preserves default/strict
+diagnostic coverage, native text/context behavior, CLI/MCP equivalence and exact
+104-byte retry/export. `/tmp/sparrow-artifact-scope-raw-regression.wp5s36hf`
+preserves descriptor and handoff identities, exact 82/87-byte exports, durable
+removed handoff state and the producer replacement. All 195 live records remain.
+Full architecture acceptance remains unmet, including artifact diagnostic
+filtering, record/field/text pagination, stream generations/gaps, full governed
+SPARQL surfaces and whole-corpus resource/recovery qualification.
 
 ## Schema 25 source discovery
 
