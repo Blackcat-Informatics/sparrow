@@ -470,6 +470,7 @@ struct RecordQuery {
   requireCompleteIndex @3 :Bool;
   eventInterval @4 :OptionalEventInterval;
   cursor @5 :OptionalText;
+  groupByArtifact @6 :Bool;
 }
 struct OptionalOccurrence { union { absent @0 :Void; value @1 :UInt64; } }
 struct FieldEvidence {
@@ -490,7 +491,10 @@ struct RecordsResults {
   timeBasis @5 :TimeBasis; eventCoverage @6 :EventCoverage;
   knownQualifiedRecords @7 :UInt64;
   page @8 :CatalogReadReceipt;
+  artifactGroups @9 :OptionalArtifactMatchGroups;
 }
+struct ArtifactMatchGroup { artifactId @0 :Text; capturedMatches @1 :UInt64; pageIndices @2 :List(UInt32); }
+struct OptionalArtifactMatchGroups { union { absent @0 :Void; value @1 :List(ArtifactMatchGroup); } }
 # Private upload progress is distinct from accepted evidence.
 struct ImportRef { storeId @0 :Text; id @1 :Text; }
 struct ImportBegin {

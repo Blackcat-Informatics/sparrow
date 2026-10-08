@@ -13,6 +13,7 @@ use purrdf_lex::json::{
 };
 
 pub(crate) struct Input {
+    pub group_by_artifact: bool,
     pub options: Options,
     pub text: Option<String>,
     pub fields: Vec<sparrow_core::FieldConstraint>,
@@ -108,6 +109,7 @@ impl Input {
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
         let mut call = client.records_search_request();
         let mut input = call.get().init_query();
+        input.set_group_by_artifact(self.group_by_artifact);
         fill_scope(input.reborrow().init_scope(), &self.options)?;
         optional(input.reborrow().init_cursor(), &self.options.cursor);
         optional(input.reborrow().init_text(), &self.text);
@@ -144,6 +146,16 @@ impl Input {
             wire::result::Error(error) => return Err(failure(error?)),
         };
         let basis = found.get_time_basis()?;
+        let grouped = matches!(
+            found.get_artifact_groups()?.which()?,
+            wire::optional_artifact_match_groups::Value(_)
+        );
+        if grouped != self.group_by_artifact {
+            return Err(sparrow_client::Error::Protocol(
+                "daemon did not honor requested artifact grouping",
+            )
+            .into());
+        }
         if (basis == wire::TimeBasis::EventTime) != self.event_interval.is_some() {
             return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon did not honor the requested time basis; use the matching schema-10 executable".into(), retryable: false });
         }
@@ -152,6 +164,22 @@ impl Input {
 }
 
 pub(super) fn render(found: wire::records_results::Reader<'_>) -> Result<Value> {
+    let groups = match found.get_artifact_groups()?.which()? {
+        wire::optional_artifact_match_groups::Absent(()) => Value::Null,
+        wire::optional_artifact_match_groups::Value(groups) => {
+            let mut rendered = Vec::new();
+            for group in groups? {
+                let indices = group.get_page_indices()?.iter().collect::<Vec<_>>();
+                rendered.push(Value::from(
+                    Object::new()
+                        .with("artifact_id", group.get_artifact_id()?.to_str()?)
+                        .with("captured_matches", group.get_captured_matches().to_string())
+                        .with("page_indices", Value::array(indices)),
+                ));
+            }
+            Value::array(rendered)
+        }
+    };
     let basis = found.get_time_basis()?;
     let text = match found.get_text()?.which()? {
         wire::optional_text_results::Absent(()) => Value::Null,
@@ -207,6 +235,7 @@ pub(super) fn render(found: wire::records_results::Reader<'_>) -> Result<Value> 
     let page = super::catalog::page(found.get_page()?)?;
     Ok(Object::new()
         .with("operation", "records_search")
+        .with("artifact_groups", groups)
         .with("page", page)
         .with(
             "event_coverage",

@@ -8082,6 +8082,100 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
             let id = a.store_id.as_str();
             let mut mcp = Mcp::start(&socket);
             mcp.initialize(1).await;
+            let ordinary = cli(
+                &socket,
+                &["records", "--source", "next-source", "--text", "needle"],
+            );
+            assert!(ordinary["artifact_groups"].is_null());
+            let grouped = cli(
+                &socket,
+                &[
+                    "records",
+                    "--source",
+                    "next-source",
+                    "--text",
+                    "needle",
+                    "--group-by-artifact",
+                    "true",
+                    "--page-size",
+                    "1",
+                ],
+            );
+            let group = &grouped["artifact_groups"][0];
+            assert_eq!(group["artifact_id"].as_str(), Some(a.id.as_str()));
+            assert_eq!(group["captured_matches"].as_str(), Some("2"));
+            assert_eq!(group["page_indices"], Value::array([0_u32]));
+            assert_eq!(grouped["rows"][0], ordinary["rows"][0]);
+            let group_cursor = grouped["page"]["next_cursor"].as_str().unwrap();
+            let next_group = cli(&socket, &["result-next", id, group_cursor]);
+            assert_eq!(next_group["artifact_groups"], grouped["artifact_groups"]);
+            assert_eq!(next_group["rows"][0], ordinary["rows"][1]);
+            let replay = mcp
+                .tool(
+                    50,
+                    "records_search",
+                    Object::new()
+                        .with("source", "next-source")
+                        .with("text", "needle")
+                        .with("group_by_artifact", true)
+                        .with("page_size", 1_u32)
+                        .with("cursor", group_cursor)
+                        .into(),
+                )
+                .await;
+            assert!(!replay["isError"].as_bool().unwrap());
+            assert_eq!(replay["structuredContent"], next_group);
+            let rejected = mcp
+                .tool(
+                    51,
+                    "records_search",
+                    Object::new()
+                        .with("source", "next-source")
+                        .with("text", "needle")
+                        .with("page_size", 1_u32)
+                        .with("cursor", group_cursor)
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                rejected["structuredContent"]["error"]["code"].as_str(),
+                Some("CONFLICT")
+            );
+            assert!(
+                client
+                    .release_result(grouped["page"]["snapshot_id"].as_str().unwrap())
+                    .await
+                    .unwrap()
+                    .released
+            );
+            let empty = cli(
+                &socket,
+                &[
+                    "records",
+                    "--source",
+                    "does-not-exist",
+                    "--group-by-artifact",
+                    "true",
+                ],
+            );
+            assert_eq!(empty["artifact_groups"], Value::array(Vec::<Value>::new()));
+            assert_eq!(empty["rows"], Value::array(Vec::<Value>::new()));
+            for (number, invalid) in [Value::from("true"), Value::Null, Value::from(1_u32)]
+                .into_iter()
+                .enumerate()
+            {
+                let rejected = mcp
+                    .tool(
+                        number as u64 + 60,
+                        "records_search",
+                        Object::new().with("group_by_artifact", invalid).into(),
+                    )
+                    .await;
+                assert_eq!(
+                    rejected["structuredContent"]["error"]["code"].as_str(),
+                    Some("INVALID_ARGUMENT")
+                );
+            }
             let pin = mcp
                 .tool(
                     2,

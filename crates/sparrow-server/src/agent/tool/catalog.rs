@@ -354,6 +354,8 @@ pub(crate) fn definitions() -> Value {
             }
         }
         if *name == "records_search" {
+            properties =
+                properties.with("group_by_artifact", Object::new().with("type", "boolean"));
             for field in ["event_from", "event_before"] {
                 properties = properties.with(
                     field,

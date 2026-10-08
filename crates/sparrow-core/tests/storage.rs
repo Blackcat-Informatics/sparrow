@@ -10449,6 +10449,87 @@ fn record_pages_keep_pin_capture_after_release_and_retirement_and_expire_absolut
 }
 
 #[test]
+fn artifact_groups_freeze_parent_counts_without_changing_native_match_order_scores_or_evidence() {
+    use sparrow_core::{RecordOperation, RecordQuery, RecordRead, ResultPage};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"{\"message\":\"needle\"}\n".repeat(3);
+    let a = store
+        .ingest("groups-a", "pages", "jsonl", &input, 1)
+        .unwrap();
+    let b = store
+        .ingest("groups-b", "pages", "jsonl", &input, 1)
+        .unwrap();
+    let mut query = RecordRead {
+        operation: RecordOperation::Records,
+        scope: record_page_scope("pages", 1000),
+        query: RecordQuery {
+            text: Some("needle".into()),
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let ordinary = store
+        .records_read(&query, 2)
+        .unwrap()
+        .body
+        .result()
+        .unwrap();
+    assert!(ordinary.get("artifact_group_counts").is_none());
+    query.operation = RecordOperation::ArtifactGroups;
+    query.scope.limit = 1;
+    let first = store.records_read(&query, 2).unwrap();
+    assert_eq!(first.total_items, 6);
+    let first_value = first.body.result().unwrap();
+    for artifact in [&a, &b] {
+        assert_eq!(
+            first_value["artifact_group_counts"][artifact.id.as_str()].as_u64(),
+            Some(3)
+        );
+    }
+    assert_eq!(first_value["rows"][0], ordinary["rows"][0]);
+    let cursor = first.next_cursor.clone().unwrap();
+    query.cursor = Some(cursor.clone());
+    query.operation = RecordOperation::Records;
+    assert_eq!(store.records_read(&query, 2).unwrap_err().code, "CONFLICT");
+    query.operation = RecordOperation::ArtifactGroups;
+    store
+        .ingest("groups-later", "pages", "jsonl", &input, 3)
+        .unwrap();
+    let mut captured = first_value["rows"].as_array().unwrap().to_vec();
+    let mut next = Some(cursor);
+    while let Some(cursor) = next {
+        let ResultPage::Records(page) = store.result_next(&first.store_id, &cursor, 4).unwrap()
+        else {
+            panic!("grouped continuation changed its record family")
+        };
+        let value = page.body.result().unwrap();
+        assert_eq!(
+            value["artifact_group_counts"],
+            first_value["artifact_group_counts"]
+        );
+        assert_eq!(value["ranking"], first_value["ranking"]);
+        captured.extend(value["rows"].as_array().unwrap().iter().cloned());
+        next = page.next_cursor;
+    }
+    assert_eq!(captured, ordinary["rows"].as_array().unwrap().to_vec());
+    assert!(
+        store
+            .result_release(&first.store_id, &first.snapshot_id, 4)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .result_next(&first.store_id, first.next_cursor.as_ref().unwrap(), 4)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(store.bytes(&a.id, 0, input.len(), 4).unwrap(), input);
+    assert_eq!(store.records(4).unwrap().len(), 9);
+}
+
+#[test]
 fn ranked_record_pages_freeze_native_corpus_scores_and_diagnostic_coverage() {
     use sparrow_core::{DiagnosticDimension as D, QueryAlternatives, RecordQuery, RecordRead};
     let dir = tempfile::tempdir().unwrap();

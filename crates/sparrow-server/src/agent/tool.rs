@@ -263,6 +263,11 @@ impl Operation {
                         .unwrap_or(false);
                     if name == "records_search" {
                         let input = super::records::Input {
+                            group_by_artifact: fields
+                                .raw("group_by_artifact")?
+                                .map(bool::from_json)
+                                .transpose()?
+                                .unwrap_or(false),
                             event_interval: super::records::interval(
                                 fields.optional("event_from")?,
                                 fields.optional("event_before")?,

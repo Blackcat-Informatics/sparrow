@@ -15,6 +15,8 @@ pub enum RecordOperation {
     /// Combined record qualification, including fields and source time.
     #[default]
     Records,
+    /// Same record matcher and order, with frozen artifact membership counts.
+    ArtifactGroups,
     /// Standalone native text search, sharing query capture and ranking.
     Text,
 }
@@ -376,6 +378,27 @@ impl Store {
             Selector::Records(q) => self.records_query_capture(&q.scope, &q.query, now, true)?,
             Selector::Json(q) => self.json_query_capture(&q.scope, &q.query, now, true)?,
         };
+        if matches!(&selector, Selector::Records(q) if q.operation == RecordOperation::ArtifactGroups)
+        {
+            let rows = value
+                .get("rows")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "record capture rows missing"))?;
+            let mut counts = std::collections::BTreeMap::<String, u64>::new();
+            for row in rows {
+                *counts
+                    .entry(super::read_field::<String>(row, "artifact_id")?)
+                    .or_default() += 1;
+            }
+            let mut groups = purrdf_lex::json::Object::new();
+            for (artifact, count) in counts {
+                groups.insert(artifact, Value::from(count));
+            }
+            value
+                .as_object_mut()
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "record capture is not an object"))?
+                .insert("artifact_group_counts", groups);
+        }
         let evidence = query_evidence(&selector, &value)?;
         value
             .as_object_mut()

@@ -84,7 +84,8 @@ impl Store {
             if let Some((selector, page)) = reads.resume_captured(&cursor, now)? {
                 return Ok(match selector {
                     record_read::Selector::Records(query) => match query.operation {
-                        crate::RecordOperation::Records => ResultPage::Records(page),
+                        crate::RecordOperation::Records
+                        | crate::RecordOperation::ArtifactGroups => ResultPage::Records(page),
                         crate::RecordOperation::Text => ResultPage::Text(page),
                     },
                     record_read::Selector::Json(query) => match query.query {

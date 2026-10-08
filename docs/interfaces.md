@@ -348,6 +348,37 @@ storage formats remain unchanged. `scanned` records candidate visits, not all I/
 reference expansion, field visits and posting visits retain their independent
 documented bounds and original coverage evidence.
 
+### Artifact match grouping
+
+Schema 43 adds explicit artifact grouping to `recordsSearch`: typed
+`RecordQuery.groupByArtifact`, CLI `records --group-by-artifact true` and MCP
+`records_search.group_by_artifact=true`. Grouping uses the same complete captured
+record matcher, including source/time/field predicates, diagnostic coverage and
+native ranked text. It does not rescore, reorder, merge or replace independent
+record occurrences, or invent a file-level score.
+
+`RecordsResults.artifactGroups` is a typed absent/list union. Agent output uses
+`artifact_groups=null` when grouping was not requested and a list when it was,
+including an empty list for no captured matches. Each group contains an opaque
+`artifact_id`, exact `captured_matches` across the frozen capture (a UInt64 decimal
+string in agent output), and `page_indices` into this page's unchanged `rows`
+(bounded UInt32 integers). Groups are ordered by artifact ID; indices preserve
+the record matcher order. Text scores and evidence remain in the original text
+result. The count is of proven captured record occurrences, not all file lines,
+all possible matches under incomplete indexing, or a complete file's byte length.
+The original certainty and coverage govern those distinctions.
+
+A group can span pages. Its count is frozen across continuations, while its
+indices refer only to the current page. An artifact absent from a page has no
+group on that page. `page.total_items` and `page_start` remain record positions,
+and page size remains a record ceiling. Counts are charged to existing metadata
+and capture limits; grouping does not enlarge them or bypass broad-capture
+refusals. The grouping flag is part of cursor identity; changing it refuses
+`CONFLICT`. Cursor-only continuation, lease release and expiry use their existing
+owners. Artifact grouping creates no pin or complete-file download promise;
+retrieve the original artifact or record bytes through its concrete evidence ID.
+Schema discovery requires 43; the storage representation is unchanged.
+
 ### Cursor-only continuation
 
 Schema 31 implements typed ResultNextQuery and resultNext. CLI

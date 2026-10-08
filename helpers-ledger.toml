@@ -2,6 +2,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "artifact-match-capture-counts"
+summary = "Artifact grouping counts the existing complete native record capture once; predicates, ranking, witnesses and row order remain owned by their existing helpers."
+home = "sparrow_core::storage::record_read::Store::query_read"
+entry_points = ["sparrow_core::storage::record_read::Store::records_read", "sparrow_core::storage::result_read::Store::result_next"]
+spec = "docs/interfaces.md: schema 43 frozen artifact match grouping."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(group_cli_matches|group_mcp_matches|count_agent_artifact_matches)$']
+
+[[job]]
+id = "artifact-match-page-references"
+summary = "One records-page encoder links typed artifact groups to existing page row indices and frozen core counts; original and cursor-only replies share the encoder and renderer."
+home = "sparrow_server::rpc::records_page"
+entry_points = ["sparrow_server::rpc::Rpc::records_search", "sparrow_server::rpc::Rpc::result_next", "sparrow_server::agent::records::render"]
+spec = "docs/interfaces.md: typed ArtifactMatchGroup page references."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_grouped_continuation|render_grouped_cli_records|render_grouped_mcp_records)$']
+
+[[job]]
 id = "published-staging-retirement"
 summary = "One finite import reclaimer releases published staging before expiry while preserving accepted evidence and independent durable retry receipts."
 home = "sparrow_core::storage::import::Store::import_reclaim"

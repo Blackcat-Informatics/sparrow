@@ -343,6 +343,34 @@ fn records_page(
         text_results(out.reborrow().init_text().init_value(), value, page)?;
     }
     let source = rows(value)?;
+    if let Some(counts) = value.get("artifact_group_counts") {
+        let mut groups = std::collections::BTreeMap::<String, Vec<u32>>::new();
+        for (index, row) in source.iter().enumerate() {
+            groups
+                .entry(field::<String>(row, "artifact_id")?)
+                .or_default()
+                .push(index as u32);
+        }
+        let mut targets = out
+            .reborrow()
+            .init_artifact_groups()
+            .init_value(groups.len() as u32);
+        for (index, (artifact, indices)) in groups.into_iter().enumerate() {
+            let mut target = targets.reborrow().get(index as u32);
+            target.set_artifact_id(&artifact);
+            let captured = counts
+                .get(&artifact)
+                .ok_or_else(|| capnp::Error::failed("captured artifact count missing".into()))?;
+            target.set_captured_matches(
+                <u64 as purrdf_lex::json::record::FromJson>::from_json(captured)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+            );
+            let mut positions = target.init_page_indices(indices.len() as u32);
+            for (position, row) in indices.into_iter().enumerate() {
+                positions.set(position as u32, row);
+            }
+        }
+    }
     let mut targets = out.init_rows(source.len() as u32);
     for (index, row) in source.iter().enumerate() {
         let mut target = targets.reborrow().get(index as u32);
@@ -2098,11 +2126,16 @@ impl wire::sparrow::Server for Rpc {
             require_complete_index: input.get_require_complete_index(),
         };
         let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
+        let operation = if input.get_group_by_artifact() {
+            sparrow_core::RecordOperation::ArtifactGroups
+        } else {
+            sparrow_core::RecordOperation::Records
+        };
         match self
             .work(move |store, now| {
                 let page = store.records_read(
                     &sparrow_core::RecordRead {
-                        operation: sparrow_core::RecordOperation::Records,
+                        operation,
                         scope: scope?,
                         query,
                         cursor: cursor?,
