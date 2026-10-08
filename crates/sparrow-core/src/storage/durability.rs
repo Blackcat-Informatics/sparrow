@@ -123,7 +123,33 @@ impl Writer {
     }
 
     /// Every write uses WAL. Only complete intake batches may request buffered acknowledgment.
-    pub(super) fn apply(&self, batch: WriteBatch, buffered_id: Option<&str>) -> Result<(), Error> {
+    pub(super) fn apply(
+        &self,
+        mut batch: WriteBatch,
+        buffered_id: Option<&str>,
+    ) -> Result<(), Error> {
+        if buffered_id.is_none() && batch.is_empty() {
+            return self.synchronize().map(|_| ());
+        }
+        let mut publication = super::eviction::Publication::default();
+        batch.iterate_cf(&mut publication);
+        publication.check()?;
+        if publication.pressure_wait
+            || matches!(
+                self.db.get("store_format")?.as_deref(),
+                Some(super::pressure::FORMAT | super::pressure::WATCH_FORMAT)
+            )
+        {
+            let watch = publication.watch_registry || self.db.get("watch_registry")?.is_some();
+            batch.put(
+                "store_format",
+                if watch {
+                    super::pressure::WATCH_FORMAT
+                } else {
+                    super::pressure::FORMAT
+                },
+            );
+        }
         let bytes = batch.size_in_bytes();
         {
             let state = self.durability.borrow();
@@ -145,14 +171,7 @@ impl Writer {
                 }
             }
         }
-        if buffered_id.is_none() && batch.is_empty() {
-            self.synchronize()?;
-            return Ok(());
-        }
         let mut options = WriteOptions::default();
-        let mut publication = super::eviction::Publication::default();
-        batch.iterate_cf(&mut publication);
-        publication.check()?;
         options.disable_wal(false);
         options.set_sync(buffered_id.is_none());
         if let Err(error) = self.db.write_opt(batch, &options) {

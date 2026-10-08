@@ -881,6 +881,13 @@ impl Writer {
     }
 
     fn physical_bytes(&self) -> Result<u64, Error> {
+        Ok(self.linked_physical_bytes()?.saturating_add(
+            self.query_staging
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+
+    fn linked_physical_bytes(&self) -> Result<u64, Error> {
         fn failure(error: std::io::Error, path: &Path, root: &Path) -> Error {
             Error::new(
                 if error.kind() == std::io::ErrorKind::NotFound && path != root {
@@ -912,12 +919,7 @@ impl Writer {
         let mut last = String::new();
         for _ in 0..3 {
             match directory(self.db.path(), self.db.path()) {
-                Ok(bytes) => {
-                    return Ok(bytes.saturating_add(
-                        self.query_staging
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ));
-                }
+                Ok(bytes) => return Ok(bytes),
                 Err(error) if error.code == "ACCOUNTING_CHANGED" => last = error.message,
                 Err(error) => return Err(error),
             }
@@ -976,6 +978,8 @@ impl Store {
                     || format == watch_registry::FORMAT
                     || format == handoff::FORMAT
                     || format == consumption::TAIL_FORMAT
+                    || format == pressure::FORMAT
+                    || format == pressure::WATCH_FORMAT
                     || recordless::legacy_format(&format).is_some() =>
             {
                 if recordless::requires_watch_registry(&format)
@@ -1070,13 +1074,14 @@ impl Store {
             random_id("session")?,
             db.latest_sequence_number(),
         ));
+        let pressure = pressure::State::load(&db)?;
         let store = Self {
             inner: Arc::new(Mutex::new(Writer {
                 db: Arc::new(db),
                 id,
                 config,
                 durability,
-                pressure: std::cell::RefCell::new(pressure::State::default()),
+                pressure: std::cell::RefCell::new(pressure),
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),

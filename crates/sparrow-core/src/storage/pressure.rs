@@ -9,6 +9,17 @@ use super::{
 };
 use rocksdb::FlushOptions;
 
+pub(super) const WAIT_KEY: &str = "pressure-reclamation-wait";
+pub(super) const FORMAT: &[u8] = b"sparrow.store/38";
+pub(super) const WATCH_FORMAT: &[u8] = b"sparrow.store/39";
+
+pub(super) fn stage_wait(batch: &mut rocksdb::WriteBatch, physical: u64, requested: u64) {
+    let value = purrdf_lex::json::Object::new()
+        .with("physical_before", physical.to_string())
+        .with("requested_bytes", requested.to_string());
+    batch.put(WAIT_KEY, purrdf_lex::json::write_compact(&value.into()));
+}
+
 /// Pressure worker state, independent of buffered WAL queue pressure.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PressurePhase {
@@ -23,7 +34,7 @@ pub enum PressurePhase {
     Blocked,
 }
 
-/// Session-local operational evidence sampled by pressure maintenance.
+/// Durable phase/request recovery with session-local maintenance counters and observations.
 #[derive(Clone, Debug, Default)]
 pub struct PressureStatus {
     /// Current maintenance phase.
@@ -54,6 +65,46 @@ pub struct PressureStatus {
 pub(super) struct State {
     status: PressureStatus,
     awaiting_physical: Option<u64>,
+}
+
+impl State {
+    pub(super) fn load(db: &rocksdb::DB) -> Result<Self, Error> {
+        let Some(bytes) = db.get_pinned(WAIT_KEY)? else {
+            return Ok(Self::default());
+        };
+        if !matches!(
+            db.get("store_format")?.as_deref(),
+            Some(FORMAT | WATCH_FORMAT)
+        ) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "pressure recovery marker is missing its writer fence",
+            ));
+        }
+        if bytes.len() > 512 {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "pressure recovery marker exceeds its bounded encoding",
+            ));
+        }
+        let value = super::parse(&bytes)?;
+        let physical = super::integer(&value, "physical_before")?;
+        let requested = super::integer(&value, "requested_bytes")?;
+        if physical == 0 || requested == 0 {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "pressure recovery marker requires positive physical and request bounds",
+            ));
+        }
+        Ok(Self {
+            status: PressureStatus {
+                phase: PressurePhase::AwaitingReclamation,
+                requested_bytes: requested,
+                ..PressureStatus::default()
+            },
+            awaiting_physical: Some(physical),
+        })
+    }
 }
 
 impl Writer {
@@ -106,6 +157,7 @@ impl Writer {
 
     fn maintain_pressure(&self, now: u64, limits: EvictionLimits) -> Result<PressureStatus, Error> {
         let physical = self.physical_bytes()?;
+        let linked = self.linked_physical_bytes()?;
         let limit = self.config.disk_budget - self.config.maintenance_reserve;
         let mut state = self.pressure.borrow_mut();
         if state.status.requested_bytes == 0 && physical <= limit {
@@ -117,11 +169,20 @@ impl Writer {
             state.status.phase = PressurePhase::Requested;
         }
         if physical.saturating_add(state.status.requested_bytes) <= limit {
+            if state.awaiting_physical.is_some() {
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.delete(WAIT_KEY);
+                self.commit(batch)?;
+            }
             state.status.requested_bytes = 0;
             state.status.phase = PressurePhase::Ready;
             state.status.failure = None;
             state.awaiting_physical = None;
             self.eviction.borrow_mut().reset();
+            return Ok(state.status.clone());
+        }
+        if linked.saturating_add(state.status.requested_bytes) <= limit {
+            // Temporary query reservations alone are not authority to retire evidence.
             return Ok(state.status.clone());
         }
         state.status.pending_flushes = 0;
@@ -149,7 +210,7 @@ impl Writer {
         }
         if state
             .awaiting_physical
-            .is_some_and(|before| physical >= before)
+            .is_some_and(|before| linked >= before)
         {
             // Do not repeatedly retire more evidence while native reclamation lags.
             state.status.phase = PressurePhase::AwaitingReclamation;
@@ -157,7 +218,8 @@ impl Writer {
         }
         state.awaiting_physical = None;
         state.status.passes = state.status.passes.saturating_add(1);
-        let report = self.evict_oldest(now, limits)?;
+        let report =
+            self.evict_oldest(now, limits, Some((linked, state.status.requested_bytes)))?;
         state.status.evicted_records = state
             .status
             .evicted_records
@@ -176,7 +238,7 @@ impl Writer {
         state.status.last_pass = Some(report);
         state.status.failure = None;
         if changed {
-            state.awaiting_physical = Some(physical);
+            state.awaiting_physical = Some(linked);
             state.status.phase = PressurePhase::AwaitingReclamation;
             // Schedule native flushes without holding the writer through disk I/O.
             // Automatic native compaction/blob GC remains limited to two background jobs.

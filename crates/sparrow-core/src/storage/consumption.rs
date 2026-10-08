@@ -407,7 +407,12 @@ impl Writer {
         }
         let value = parse(&bytes)?;
         let journal = ConsumptionJournal::decode(value.get("journal").unwrap_or(&value))?;
-        if journal.tail.is_some() && self.db.get("store_format")?.as_deref() != Some(TAIL_FORMAT) {
+        if journal.tail.is_some()
+            && !matches!(
+                self.db.get("store_format")?.as_deref(),
+                Some(TAIL_FORMAT | super::pressure::WATCH_FORMAT)
+            )
+        {
             return Err(Error::new(
                 "STORAGE_FAILURE",
                 "tail source ownership is missing its writer fence",

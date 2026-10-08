@@ -44,6 +44,8 @@ impl Cursor {
 #[derive(Default)]
 pub(super) struct Publication {
     pub(super) earliest: Option<Vec<u8>>,
+    pub(super) pressure_wait: bool,
+    pub(super) watch_registry: bool,
     invalid: bool,
 }
 
@@ -62,6 +64,10 @@ impl Publication {
 
 impl WriteBatchIteratorCf for Publication {
     fn put_cf(&mut self, cf_id: u32, key: &[u8], _value: &[u8]) {
+        if cf_id == 0 {
+            self.pressure_wait |= key == super::pressure::WAIT_KEY.as_bytes();
+            self.watch_registry |= key == b"watch_registry";
+        }
         if cf_id == 0
             && let Some(key) = key
                 .strip_prefix(b"time:")
@@ -181,7 +187,7 @@ impl Store {
     /// Hard failures commit nothing; bounded frontiers publish only complete retirement units.
     /// The session-local traversal resumes safely and does not run native compaction.
     pub fn evict_oldest(&self, now: u64, limits: EvictionLimits) -> Result<EvictionReport, Error> {
-        self.lock()?.evict_oldest(now, limits)
+        self.lock()?.evict_oldest(now, limits, None)
     }
 }
 
@@ -190,6 +196,7 @@ impl Writer {
         &self,
         now: u64,
         limits: EvictionLimits,
+        pressure: Option<(u64, u64)>,
     ) -> Result<EvictionReport, Error> {
         limits.validate()?;
         let writer = self;
@@ -358,8 +365,16 @@ impl Writer {
             report.pending_manifest_refs += parent.chunks.len();
             put(&mut retirement.batch, &parent.id, parent);
         }
-        let batch = retirement.finish()?;
-        if batch.size_in_bytes() > limits.max_batch_bytes {
+        let mut batch = retirement.finish()?;
+        if let Some((physical, requested)) = pressure
+            && (!report.records.is_empty()
+                || !report.artifacts.is_empty()
+                || report.payload_refs != 0)
+        {
+            super::pressure::stage_wait(&mut batch, physical, requested);
+        }
+        // The shared publication owner may add the bounded pressure format fence.
+        if batch.size_in_bytes().saturating_add(128) > limits.max_batch_bytes {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "eviction batch exceeds native write admission",

@@ -3386,6 +3386,200 @@ fn pressure_admission_drives_bounded_retirement_and_waits_for_physical_capacity(
 }
 
 #[test]
+fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let first = store
+        .ingest("wait-first", "source", "log", b"first\n", 1)
+        .unwrap();
+    let second = store
+        .ingest("wait-second", "source", "log", b"second\n", 2)
+        .unwrap();
+    let ballast = dir.path().join("test-owned-pressure-ballast");
+    let file = std::fs::File::create(&ballast).unwrap();
+    file.set_len(13 * 1024 * 1024).unwrap();
+    assert_eq!(
+        store
+            .ingest("wait-refused", "source", "log", b"new\n", 3)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let state = store.pressure_maintain(4, limits).unwrap();
+    assert_eq!(state.last_pass.unwrap().records, first.record_ids);
+    assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
+    // Force a strictly larger linked footprint: this is no native recovery observation.
+    assert_eq!(
+        store.status(4).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/38")
+    );
+    file.set_len(15 * 1024 * 1024).unwrap();
+    drop(file);
+    drop(store);
+    let store = Store::open(dir.path(), settings).unwrap();
+    assert_eq!(
+        store.pressure_status().unwrap().phase,
+        PressurePhase::AwaitingReclamation
+    );
+    for _ in 0..3 {
+        let state = store.pressure_maintain(5, limits).unwrap();
+        assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
+        assert_eq!(state.passes, 0);
+        assert_eq!(store.bytes(&second.id, 0, 7, 5).unwrap(), b"second\n");
+    }
+    assert_eq!(
+        store.bytes(&first.id, 0, 1, 5).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    std::fs::remove_file(ballast).unwrap();
+    assert_eq!(
+        store.pressure_maintain(6, limits).unwrap().phase,
+        PressurePhase::Ready
+    );
+    assert_eq!(
+        store
+            .ingest("wait-refused", "source", "log", b"new\n", 6)
+            .unwrap()
+            .record_ids
+            .len(),
+        1
+    );
+    drop(store);
+    let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+    assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
+    assert_eq!(
+        db.get("store_format").unwrap().as_deref(),
+        Some(b"sparrow.store/38".as_slice())
+    );
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.watch_registry_replace(None, b"registered").unwrap();
+    assert_eq!(
+        store.status(6).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/39")
+    );
+    store
+        .watch_registry_replace(Some(b"registered"), b"updated")
+        .unwrap();
+    assert_eq!(
+        store.status(6).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/39")
+    );
+}
+
+#[test]
+fn invalid_pressure_recovery_markers_refuse_open() {
+    for bytes in [
+        b"{".to_vec(),
+        vec![b'x'; 513],
+        b"{\"physical_before\":0,\"requested_bytes\":1}".to_vec(),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::open(dir.path(), config()).unwrap());
+        let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+        db.put("pressure-reclamation-wait", bytes).unwrap();
+        db.put("store_format", b"sparrow.store/38").unwrap();
+        drop(db);
+        match Store::open(dir.path(), config()) {
+            Ok(_) => panic!("invalid pressure marker admitted"),
+            Err(error) => assert_eq!(error.code, "STORAGE_FAILURE"),
+        }
+    }
+}
+
+#[test]
+fn anonymous_query_capacity_does_not_authorize_pressure_retirement() {
+    use sparrow_core::{EvictionLimits, PressurePhase, RecordOperation, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let artifact = store
+        .ingest("anonymous-pressure", "source", "log", b"first\nsecond\n", 1)
+        .unwrap();
+    let footprint = |now| {
+        store.status(now).unwrap()["physical_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let linked = footprint(2);
+    let page = store
+        .records_read(
+            &RecordRead {
+                operation: RecordOperation::Records,
+                scope: record_page_scope("source", 1),
+                query: RecordQuery::default(),
+                cursor: None,
+            },
+            2,
+        )
+        .unwrap();
+    assert!(page.next_cursor.is_some());
+    let charge = footprint(2) - linked;
+    assert!(charge >= 65536);
+    let ballast = dir.path().join("test-owned-anonymous-pressure-ballast");
+    let file = std::fs::File::create(&ballast).unwrap();
+    file.set_len(13 * 1024 * 1024).unwrap();
+    assert_eq!(
+        store
+            .ingest("anonymous-refused", "source", "log", b"later\n", 3)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+    let requested = store.pressure_status().unwrap().requested_bytes;
+    let limit = 12 * 1024 * 1024;
+    file.set_len(limit - requested - linked - charge / 2)
+        .unwrap();
+    let physical = footprint(4);
+    assert!(physical + requested > limit);
+    assert!(physical - charge + requested <= limit);
+    let state = store
+        .pressure_maintain(4, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(state.passes, 0);
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 13, 4).unwrap(),
+        b"first\nsecond\n"
+    );
+    assert!(
+        store
+            .result_release(&page.store_id, &page.snapshot_id, 4)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .pressure_maintain(5, EvictionLimits::default())
+            .unwrap()
+            .phase,
+        PressurePhase::Ready
+    );
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 13, 5).unwrap(),
+        b"first\nsecond\n"
+    );
+    assert_eq!(
+        store
+            .ingest("anonymous-refused", "source", "log", b"later\n", 5)
+            .unwrap()
+            .record_ids
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn staged_import_pressure_and_impossible_writes_have_distinct_admission_outcomes() {
     use sparrow_core::PressurePhase;
     let dir = tempfile::tempdir().unwrap();

@@ -33,6 +33,24 @@ only the original bound socket identity and reports a replacement as a failure.
 Socket-bind refusal joins the already-started consume worker before returning.
 The public TCP bind still happens before opening or migrating the store.
 
+### Pressure retirement recovery
+
+Pressure retirement publishes its physical recovery floor and refused-write
+estimate in the same durable native batch as evidence retirement. Reopening
+restores the wait; counters and native maintenance observations remain
+session-local. A later pass must observe a smaller linked store footprint before
+retiring more evidence. Anonymous query allocations remain included in write
+admission, but their release cannot establish stored-file reclamation. Temporary
+query allocation alone cannot authorize evidence retirement.
+
+The first such batch fences the store at format 38, or 39 when a watch registry
+is present. The shared publication owner preserves this fence through later
+watch, consumption and handoff updates; clearing a recovered wait retains the
+fence. Older binaries refuse these formats. Existing stores retain their format
+until durable pressure retirement requires the new invariant. Missing space,
+native failures and malformed or oversized recovery markers remain failures;
+logical retirement does not certify forced native physical reclamation.
+
 ## 1. Common types and defaults
 
 | Type | Contract |
