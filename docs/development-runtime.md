@@ -4,10 +4,55 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 45 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`64b69bc`; see [complete daemon teardown](#complete-daemon-teardown) for
+`dba5804`; see [syslog child task teardown](#syslog-child-task-teardown) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Syslog child task teardown
+
+Signed source `dba5804` fixes the inner syslog join paths. Previously, a failed
+listener or TCP child returned immediately from its join loop, dropping the
+remaining task set. Listener groups and TCP child groups now use one teardown
+owner: publish global stop on failure, join every admitted task and retain all
+returned errors and task panics. TCP admission drops its listener before draining
+children. TCP/UDP loops and TCP receivers check an already-published stop state
+before continuing intake. The daemon's outer teardown and final store fence
+therefore follow joined syslog work rather than an aborted child group.
+
+The full release gate and normal signed source hook pass 147 storage scenarios,
+58 RPC scenarios, all remaining workspace tests, seeded census self-tests and
+229 pinned helper ownership jobs with no distinct exceptions. A controlled
+blocking-file publication test proves the join remains pending until the write
+finishes, idle children observe stop, and a returned listener error, child panic
+and publication-completion error are all retained. A separate real TCP/native
+store scenario closes the intake semaphore after durable publication while a
+sibling holds a partial frame. The worker reports the admission failure, joins
+both connections, and reopens exactly one packet with its original bytes. Its
+60-second read timeout exceeds the five-second failure deadline so ordinary
+timeout cannot satisfy sibling shutdown. The syslog unit and RPC scenarios also
+pass on Btrfs; source identity and six-test log are retained at
+`~/.local/state/sparrow/syslog-joins-qualification-v_7ji59n`.
+
+The selected runtime build follows the source hook. Frozen images are
+`~/.local/state/sparrow/syslog-joins-images-pgsrhsie`. The closed copied corpus
+at `~/.local/state/sparrow/json-pages-qualification-xqp4kox3` preserves all 7,058
+record rows, temporal/source/text results, scores, artifact groups, 51 keys and
+286 value occurrences against predecessor evidence, with zero leases and a
+graceful close.
+
+Public adoption evidence is `/tmp/sparrow-syslog-joins-live._35m1431`, including
+the gracefully closed predecessor backup, immutable hashes, capability, unit,
+listener and final status. The enabled unit runs PID 167323 on `0.0.0.0:518` and
+the existing Unix socket. Schema 45, format 37, store identity and 212 records
+are unchanged. Saved finish/handoff retries, TCP/Unix/CLI/MCP grouped and JSON
+pagination, native field/time/text witnesses and six idle peers plus CLI status
+pass sequentially. Final status has zero pins/read leases and healthy watches
+and durability. Public syslog listeners remain unconfigured; private syslog
+fixtures provide this change's listener evidence. This closes the child-join
+failure gap, not full architecture acceptance: production volume, filesystem
+quota, forced physical reclamation, reboot and full governed stored SPARQL
+remain unqualified.
 
 ## Complete daemon teardown
 
