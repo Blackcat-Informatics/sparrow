@@ -45,3 +45,34 @@ native failure, restart, and sustained pressure over the intended corpus.
 
 This gap does not authorize synthetic progress writes, silent retries, premature
 reclamation receipts or more evidence deletion while physical recovery stalls.
+
+## Alternative binding inspection
+
+On 2026-10-08, the maintained
+[zaidoon1 binding fork](https://docs.rs/crate/rust-rocksdb/0.53.0) was inspected as
+an alternative to the selected binding. Release `v0.53.0` names tag object
+`c8b2e2c3a6939ea2cd35ff073c10b1e431615d88`; its native package declares
+`rust-librocksdb-sys 0.48.1+11.8.1`. This is discovery, not a selected dependency
+or qualified store migration.
+
+Its safe `compact_files`/`compact_files_cf` APIs return a typed native result or
+error and expose compaction output names/job information. `CompactionOptions`
+supplies per-output-file size, subcompaction, trivial-move and cancellation
+controls. Those are useful seams, but a per-file output size is not a total job
+input/output or blob-space bound. They do not establish pressure recovery.
+
+The release's `ColumnFamilyMetaDataOptions` filters by level and overlapping
+start/end keys. It does not supply a maximum admitted file count or metadata byte
+budget before collection. `get_column_family_metadata_with_options` returns all
+selected levels/files in its owned metadata result. The level and key filters
+do not prove bounded metadata capture or bounded compaction closure; overlapping
+file/blob input and total output still require admission. Range compaction also
+retains the unit-returning API. These observations are from
+[release metadata source](https://github.com/zaidoon1/rust-rocksdb/blob/v0.53.0/src/metadata.rs)
+and [release compaction source](https://github.com/zaidoon1/rust-rocksdb/blob/v0.53.0/src/compaction.rs).
+
+No dependency, sibling checkout, daemon or live store was changed for this
+inspection. A candidate binding still needs the missing bounded collection and
+resource contracts, followed by full source/copy-store/failure qualification
+before runtime adoption. The original forced-reclamation requirement remains
+unmet.

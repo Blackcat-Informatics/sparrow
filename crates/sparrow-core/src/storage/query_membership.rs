@@ -208,49 +208,233 @@ impl Writer {
                 timeline.into_iter().map(move |(_, id)| self.get(&id)),
             ));
         }
-        let start = format!("time:{:020}:", scope.received_from);
-        let mut options = ReadOptions::default();
-        // Stop before decoding a catalog record beyond the half-open interval.
-        // The forward seek supplies its inclusive lower bound; RocksDB supplies
-        // the exclusive upper bound even when the next record is corrupt.
-        options
-            .set_iterate_upper_bound(format!("time:{:020}:", scope.received_before).into_bytes());
-        let mut iterator = self.db.iterator_opt(
-            IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward),
-            options,
-        );
-        Ok(Box::new(std::iter::from_fn(move || {
-            let (key, id) = match iterator.next()? {
-                Ok(entry) => entry,
-                Err(error) => return Some(Err(error.into())),
-            };
-            if !key.starts_with(b"time:") {
-                return None;
-            }
-            Some((|| {
-                let id = std::str::from_utf8(&id).map_err(|_| {
-                    Error::new("STORAGE_FAILURE", "invalid temporal index identity")
-                })?;
-                let record: Record = self.get(id).map_err(|error| {
-                    if error.code == "NOT_FOUND" {
-                        Error::new(
-                            "STORAGE_FAILURE",
-                            "temporal index references a missing record",
-                        )
-                    } else {
-                        error
-                    }
-                })?;
-                if record.id != id
-                    || key.as_ref() != format!("time:{:020}:{id}", record.received_at).as_bytes()
-                {
-                    return Err(Error::new(
+        Ok(Box::new(temporal_candidates(
+            scope.received_from,
+            scope.received_before,
+            |mode, options| self.db.iterator_opt(mode, options),
+            |id| self.get(id),
+        )))
+    }
+}
+
+/// One temporal iterator for current and native-snapshot reads. Storage lookup
+/// remains with its backend; interval and index integrity do not diverge.
+pub(super) fn temporal_candidates<'a, I>(
+    from: u64,
+    before: u64,
+    scan: impl FnOnce(IteratorMode<'_>, ReadOptions) -> I,
+    lookup: impl Fn(&str) -> Result<Record, Error> + 'a,
+) -> impl Iterator<Item = Result<Record, Error>> + 'a
+where
+    I: Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> + 'a,
+{
+    let start = format!("time:{from:020}:");
+    let mut options = ReadOptions::default();
+    // The native upper bound stops before decoding a later record, even when
+    // its index entry or catalog body is corrupt.
+    options.set_iterate_upper_bound(format!("time:{before:020}:").into_bytes());
+    let mut iterator = scan(
+        IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward),
+        options,
+    );
+    std::iter::from_fn(move || {
+        let (key, id) = match iterator.next()? {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(error.into())),
+        };
+        if !key.starts_with(b"time:") {
+            return None;
+        }
+        Some((|| {
+            let id = std::str::from_utf8(&id)
+                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid temporal index identity"))?;
+            let record: Record = lookup(id).map_err(|error| {
+                if error.code == "NOT_FOUND" {
+                    Error::new(
                         "STORAGE_FAILURE",
-                        "temporal index disagrees with record identity/time",
-                    ));
+                        "temporal index references a missing record",
+                    )
+                } else {
+                    error
                 }
-                Ok(record)
-            })())
-        })))
+            })?;
+            if record.id != id
+                || key.as_ref() != format!("time:{:020}:{id}", record.received_at).as_bytes()
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "temporal index disagrees with record identity/time",
+                ));
+            }
+            Ok(record)
+        })())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{DAY, json, parse, source_time};
+
+    #[test]
+    fn snapshot_worker_preserves_temporal_versions_and_shared_integrity_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(rocksdb::DB::open_default(dir.path()).unwrap());
+        let raw = br#"{"job":"original"}"#;
+        let (facts, graph) = crate::projection::json_facts(
+            Some(raw),
+            raw.len() as u64,
+            &format!(
+                "blake3:{}",
+                purrdf_hash::hex::encode(purrdf_hash::blake3::hash(raw).as_bytes())
+            ),
+            &crate::projection::json_profile().unwrap(),
+        )
+        .unwrap();
+        graph.unwrap();
+        db.put("json:snapshot-fixture", json::write_compact(&facts))
+            .unwrap();
+        let template = Record {
+            id: "record:inside".into(),
+            artifact_id: "artifact:parent".into(),
+            source: "snapshot-fixture".into(),
+            received_at: 20,
+            expires_at: 30 * DAY + 20,
+            byte_start: 0,
+            byte_end: raw.len() as u64,
+            projection_id: "json:snapshot-fixture".into(),
+            rdf_projection_id: String::new(),
+            event_time: source_time::EventTime::unknown("no_profile", None),
+            diagnostics: Default::default(),
+            producer: None,
+            syslog: None,
+            tail: None,
+            chunks: Vec::new(),
+            evicted: false,
+        };
+        for (id, time) in [
+            ("record:past", 10),
+            ("record:inside", 20),
+            ("record:future", 30),
+        ] {
+            let mut record = template.clone();
+            record.id = id.into();
+            record.received_at = time;
+            db.put(id, json::write_compact(&record.encode())).unwrap();
+            db.put(format!("time:{time:020}:{id}"), id).unwrap();
+        }
+        // Corrupt bodies outside [20,30) are never loaded by either backend.
+        db.put("record:past", b"bad past catalog").unwrap();
+        db.put("record:future", b"bad future catalog").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (read_tx, read_rx) = std::sync::mpsc::sync_channel(1);
+        let decode = |bytes: Option<Vec<u8>>| {
+            Record::decode(&parse(
+                &bytes.ok_or_else(|| Error::new("NOT_FOUND", "catalog absent"))?,
+            )?)
+        };
+        let reader_db = db.clone();
+        let expected = template.encode();
+        let worker = std::thread::spawn(move || {
+            // Own the Arc and borrow the native snapshot locally: no unchecked
+            // lifetime extension or self-referential registry is required.
+            let snapshot = reader_db.snapshot();
+            ready_tx.send(snapshot.sequence_number()).unwrap();
+            read_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let records = temporal_candidates(
+                20,
+                30,
+                |mode, options| snapshot.iterator_opt(mode, options),
+                |id| decode(snapshot.get(id)?),
+            )
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].encode(), expected);
+            let mut coverage = crate::storage::record_fields::FieldCoverage::default();
+            let fields = crate::storage::record_fields::qualify_from_projection(
+                &records[0],
+                &[crate::FieldConstraint {
+                    predicate: crate::JsonPredicate {
+                        path: Some("/job".into()),
+                        kind: None,
+                        lexical: None,
+                        decoded: Some("original".into()),
+                    },
+                    parent_binding: None,
+                    parent_path: None,
+                }],
+                &mut coverage,
+                100,
+                true,
+                |id| snapshot.get_pinned(id).map_err(Error::from),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0]["path"].as_str(), Some("/job"));
+            assert_eq!(fields[0]["source_start"].as_str(), Some("8"));
+            assert_eq!(fields[0]["source_end"].as_str(), Some("16"));
+            assert_eq!(&raw[8..16], b"original");
+            assert_eq!(coverage.failed, 0);
+        });
+        let sequence = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete("record:inside");
+        batch.delete("json:snapshot-fixture");
+        batch.delete("time:00000000000000000020:record:inside");
+        let mut replacement = template.clone();
+        replacement.id = "record:new".into();
+        batch.put(&replacement.id, json::write_compact(&replacement.encode()));
+        batch.put("time:00000000000000000020:record:new", &replacement.id);
+        db.write(batch).unwrap();
+        assert!(db.latest_sequence_number() > sequence);
+        read_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let current = temporal_candidates(
+            20,
+            30,
+            |mode, options| db.iterator_opt(mode, options),
+            |id| decode(db.get(id)?),
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, replacement.id);
+        db.delete(&replacement.id).unwrap();
+        let missing = temporal_candidates(
+            20,
+            30,
+            |mode, options| db.iterator_opt(mode, options),
+            |_| Err(Error::new("NOT_FOUND", "missing")),
+        )
+        .next()
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(missing.code, "STORAGE_FAILURE");
+        let injected = temporal_candidates(
+            20,
+            30,
+            |mode, options| db.iterator_opt(mode, options),
+            |_| Err(Error::new("INJECTED_IO", "failed")),
+        )
+        .next()
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(injected.code, "INJECTED_IO");
+        let mismatch = temporal_candidates(
+            20,
+            30,
+            |mode, options| db.iterator_opt(mode, options),
+            |_| Ok(template.clone()),
+        )
+        .next()
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(mismatch.code, "STORAGE_FAILURE");
     }
 }

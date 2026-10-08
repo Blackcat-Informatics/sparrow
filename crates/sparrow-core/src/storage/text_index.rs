@@ -218,17 +218,7 @@ impl Store {
             }
             if query.text.is_none() {
                 if query.event_interval.is_some() || chronological.len() < row_limit {
-                    let row: Value = Object::new()
-                        .with("record_id", record.id.clone())
-                        .with("artifact_id", record.artifact_id.clone())
-                        .with("source", record.source.clone())
-                        .with("diagnostics", record.diagnostics.encode())
-                        .with("received_at", crate::format_instant(record.received_at)?)
-                        .with("byte_start", record.byte_start.to_string())
-                        .with("byte_end", record.byte_end.to_string())
-                        .with("event_time", record.event_time.encode())
-                        .with("fields", Value::array(fields))
-                        .into();
+                    let row: Value = record_fields::matched_record_row(&record, fields)?.into();
                     capture_bytes += json::write_compact(&row).len();
                     if capture_bytes
                         > if query.event_interval.is_some() && !capture {
@@ -503,25 +493,16 @@ impl Store {
                     );
                 }
             }
-            let row: Value = Object::new()
-                .with("record_id", id.clone())
-                .with("artifact_id", record.artifact_id.clone())
-                .with("source", record.source.clone())
-                .with("diagnostics", record.diagnostics.encode())
-                .with("received_at", crate::format_instant(record.received_at)?)
-                .with("byte_start", record.byte_start.to_string())
-                .with("byte_end", record.byte_end.to_string())
-                .with(
-                    "fields",
-                    Value::array(witnesses.remove(&id).ok_or_else(|| {
-                        Error::new("STORAGE_FAILURE", "captured field witnesses missing")
-                    })?),
-                )
-                .with("event_time", record.event_time.encode())
-                .with("score", score.to_decimal_lexical())
-                .with("evidence", Value::array(evidence))
-                .with("evidence_limited", evidence_limited)
-                .into();
+            let row: Value = record_fields::matched_record_row(
+                record,
+                witnesses.remove(&id).ok_or_else(|| {
+                    Error::new("STORAGE_FAILURE", "captured field witnesses missing")
+                })?,
+            )?
+            .with("score", score.to_decimal_lexical())
+            .with("evidence", Value::array(evidence))
+            .with("evidence_limited", evidence_limited)
+            .into();
             response_bytes += json::write_compact(&row).len();
             if response_bytes > 2 * 1024 * 1024 {
                 if capture {

@@ -1,8 +1,11 @@
 # Sparrow interfaces
 
-This document specifies the planned first-version contracts. The examples are
-design examples, not commands supported by an existing executable. Lifecycle,
-storage, and recovery requirements are in [Architecture](architecture.md).
+This document specifies the first-version contracts. Implemented schema sections
+describe current typed operations; other design examples retain their required
+target behavior. [Development runtime](development-runtime.md) identifies the
+installed and verified surfaces, and [broad query paging](query-streaming.md)
+records the remaining capture limitation. Lifecycle, storage and recovery
+requirements are in [Architecture](architecture.md).
 
 MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not
 implement separate filtering, retention, pin, or query semantics. The daemon

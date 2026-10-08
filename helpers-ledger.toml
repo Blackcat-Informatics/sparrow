@@ -2,6 +2,48 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "temporal-backend-candidates"
+summary = "Current and snapshot-bound readers use the same native half-open temporal iterator and catalog/index integrity checks; backends supply lookup only."
+home = "sparrow_core::storage::query_membership::temporal_candidates"
+entry_points = ["sparrow_core::storage::Writer::query_candidates"]
+spec = "docs/query-streaming.md: native read foundation."
+vectors = ["crates/sparrow-core/src/storage/query_membership.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(snapshot_time_candidates|stream_time_candidates)$']
+
+[[job]]
+id = "backend-field-witnesses"
+summary = "One native ordered occurrence matcher owns same-record field constraints and witnesses for current and snapshot projection reads."
+home = "sparrow_core::storage::record_fields::qualify_from_projection"
+entry_points = ["sparrow_core::storage::record_fields::Writer::qualify_fields"]
+spec = "docs/query-streaming.md: shared matcher."
+vectors = ["crates/sparrow-core/src/storage/query_membership.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(qualify_snapshot_fields|qualify_stream_fields)$']
+
+[[job]]
+id = "matched-record-summary"
+summary = "Chronological and native ranked record results share one diagnostic, time, range and field-witness summary; scoring keeps its native owner."
+home = "sparrow_core::storage::record_fields::matched_record_row"
+entry_points = ["sparrow_core::storage::text_index::Store::records_query_capture"]
+spec = "docs/query-streaming.md: shared row owner."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(stream_record_summary|snapshot_record_summary)$']
+
+[[job]]
 id = "offline-turnover-qualification"
 summary = "One offline qualifier coordinates simulated cohorts, independent deadline/pin expectations and native byte/RDF checks through existing production owners; it opens only a new explicitly configured store."
 home = "sparrow_server::example_crate::turnover::main"
