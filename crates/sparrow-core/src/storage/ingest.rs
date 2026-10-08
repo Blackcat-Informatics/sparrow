@@ -282,6 +282,7 @@ impl<'a> RecordBatch<'a> {
             json,
             format == "opaque",
         )?;
+        super::tail_ranges::publish(&mut self.batch, &record);
         self.writer.put_text(&mut self.batch, &record.id, &text)?;
         let rdf_state = self
             .rdf_projections

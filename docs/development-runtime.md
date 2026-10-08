@@ -3714,3 +3714,26 @@ the explicit failed source-byte projection, and key discovery reported one
 eligible record with one failed JSON projection. This exercises live oversized
 raw acceptance and coverage reporting, not throughput or memory qualification.
 No producer file or sibling/model service was modified.
+
+## Retained tail range index
+
+Source now fences writers at store formats 33..36. A persistent ordered
+`tail-range:` index records generation, source offset, and original record ID.
+The shared record publisher adds membership in its record/index batch; the
+shared retirement owner removes it with raw-byte dependencies. Generation
+metadata alone does not retain expired bytes, and record pins preserve their
+original byte ownership.
+
+Startup upgrades historical formats 5..32 through one bounded catalog pager,
+shared with the recordless-artifact migration. The writer fence and initial
+range checkpoint commit together; every subsequent index page and checkpoint
+commit together with synchronized WAL. Startup resumes incomplete pages and
+refuses missing or unfenced index state. Backfill adopts existing retained
+record rows, preserving occurrence IDs, acceptance clocks, finalization
+receipts, and deadlines. It does not reread source files or restore retired
+chunks.
+
+This is the ownership/index foundation for retained-file assembly. A complete
+file reader and completed-tail claim/deletion handoff remain unfinished. The
+running schema-39 deployment described above has not adopted this storage
+change yet.

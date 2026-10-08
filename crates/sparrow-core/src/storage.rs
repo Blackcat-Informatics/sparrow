@@ -17,6 +17,7 @@ use rocksdb::{
 
 pub(crate) mod artifact_read;
 pub(crate) mod catalog_lease;
+mod catalog_upgrade;
 pub(crate) mod consumption;
 pub(crate) mod context;
 pub(crate) mod diagnostic;
@@ -42,10 +43,11 @@ pub(crate) mod source_read;
 pub(crate) mod source_time;
 pub(crate) mod syslog;
 pub(crate) mod tail;
+mod tail_ranges;
 mod text_index;
 pub(crate) mod watch_registry;
 
-const FORMAT: &[u8] = b"sparrow.store/29";
+const FORMAT: &[u8] = b"sparrow.store/33";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -1047,6 +1049,7 @@ impl Store {
         }
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
+        tail_ranges::upgrade(&db)?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(
                 "STORAGE_FAILURE",

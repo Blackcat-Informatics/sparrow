@@ -29,6 +29,7 @@ impl<'a> Retirement<'a> {
     }
 
     pub(super) fn record(&mut self, record: &mut Record, owners: u64) -> Result<bool, Error> {
+        super::tail_ranges::retire(&mut self.batch, record);
         self.payloads(&record.chunks, owners)?;
         self.writer.remove_text(&mut self.batch, &record.id)?;
         if record.chunks.is_empty()

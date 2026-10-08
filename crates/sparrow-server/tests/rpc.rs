@@ -958,6 +958,9 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         let socket = data.join("rpc.sock");
         let config = write_server_config(dir.path(), &data, &socket);
         let mut text = std::fs::read_to_string(&config).unwrap();
+        // Four independent packet publishers plus the status observer need five permits.
+        assert_eq!(text.matches("max_concurrent_requests = 4").count(), 1);
+        text = text.replace("max_concurrent_requests = 4", "max_concurrent_requests = 5");
         for (id, transport, framing) in [("octets", "tcp", Some("octet_counting")), ("datagrams", "udp", None), ("lf", "tcp", Some("lf")), ("crlf", "tcp", Some("cr_lf"))] {
             text.push_str(&format!("\n[[syslog]]\nid = \"{id}\"\naddress = \"127.0.0.1:0\"\nsource = \"syslog-{id}\"\ntransport = \"{transport}\"\nmax_message_bytes = 480\nmax_connections = 1\nread_timeout_ms = 1000\n"));
             if let Some(framing) = framing { text.push_str(&format!("framing = \"{framing}\"\n")); }
@@ -2436,7 +2439,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/32");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/36");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -2653,7 +2656,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/31")
+                Some("sparrow.store/35")
             );
         })
         .await;
@@ -3017,7 +3020,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/31"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/35"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,

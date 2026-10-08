@@ -693,6 +693,7 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
             if super::tail::decode_registry(&raw)?
                 .iter()
                 .any(|row| row.finish.is_some())
+                && !legacy.finish_authority
             {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
@@ -705,6 +706,7 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
         if !legacy.producer_registry {
             batch.put(super::producer_stream::KEY, b"[]");
         }
+        super::tail_ranges::seed(db, &mut batch)?;
         let mut options = WriteOptions::default();
         options.set_sync(true);
         options.disable_wal(false);

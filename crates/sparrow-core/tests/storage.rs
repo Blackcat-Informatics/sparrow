@@ -4,9 +4,137 @@
 //! Persistent lifetime scenarios using temporary stores and injected UTC instants.
 
 use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
-use sparrow_test_support::catalog_db;
+use sparrow_test_support::{catalog_db, remove_tail_range_index};
 
 const DAY: u64 = 86_400_000;
+
+#[test]
+fn retained_tail_ranges_follow_pins_and_upgrade_without_resurrecting_retired_bytes() {
+    use sparrow_core::{ConsumptionGeneration, TailFinishIntent, TailStart};
+    for legacy in 29..=32 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        if legacy >= 31 {
+            store
+                .watch_registry_replace(None, b"preserved-tail-watch")
+                .unwrap();
+        }
+        let generation = store
+            .tail_start(
+                &TailStart {
+                    request_id: "range-start".into(),
+                    watch: "tail".into(),
+                    watch_revision: 1,
+                    directories: CONSUMPTION_DIRECTORIES,
+                    path: b"range.log".to_vec(),
+                    source: "range-source".into(),
+                    format: "log".into(),
+                    device: 7,
+                    inode: 42,
+                },
+                1,
+            )
+            .unwrap();
+        let intent = TailFinishIntent {
+            request_id: "range-finish".into(),
+            generation_id: generation.id.clone(),
+            watch_revision: 1,
+            observed: ConsumptionGeneration {
+                device: 7,
+                inode: 42,
+                byte_length: 6,
+                modified: (1, 2),
+                changed: (3, 4),
+            },
+        };
+        store.tail_finish_start(&intent, 2).unwrap();
+        let artifact = store
+            .tail_append(&generation.id, 0, b"a\nb\nc\n", true, 3)
+            .unwrap()
+            .artifact
+            .unwrap();
+        let original = store.record(&artifact.record_ids[1]).unwrap();
+        let finished = store.tail_finish_get(&intent).unwrap().unwrap();
+        assert!(finished.complete);
+        let pin = store
+            .pin("range-pin", "case", &artifact.record_ids[1..2], 40, 4)
+            .unwrap();
+        drop(store);
+        {
+            let db = catalog_db(dir.path()).unwrap();
+            let rows = db
+                .prefix_iterator(b"tail-range:")
+                .map(|row| row.unwrap())
+                .take_while(|(key, _)| key.starts_with(b"tail-range:"))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 3);
+            for (index, (key, value)) in rows.iter().enumerate() {
+                assert_eq!(value.as_ref(), artifact.record_ids[index].as_bytes());
+                assert!(
+                    std::str::from_utf8(key)
+                        .unwrap()
+                        .contains(&format!(":{:020}:", index * 2))
+                );
+            }
+        }
+        let store = Store::open(dir.path(), config()).unwrap();
+        store.expire(31 * DAY).unwrap();
+        assert_eq!(store.bytes(&original.id, 0, 2, 31 * DAY).unwrap(), b"b\n");
+        drop(store);
+        {
+            let db = catalog_db(dir.path()).unwrap();
+            assert_eq!(
+                db.prefix_iterator(b"tail-range:")
+                    .take_while(|row| row.as_ref().unwrap().0.starts_with(b"tail-range:"))
+                    .count(),
+                1
+            );
+            remove_tail_range_index(&db).unwrap();
+            db.put("store_format", format!("sparrow.store/{legacy}"))
+                .unwrap();
+        }
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(store.tail_finish_get(&intent).unwrap(), Some(finished));
+        let recovered = store.record(&original.id).unwrap();
+        assert_eq!(recovered.received_at, original.received_at);
+        assert_eq!(recovered.expires_at, original.expires_at);
+        assert_eq!(recovered.tail, original.tail);
+        assert_eq!(store.bytes(&original.id, 0, 2, 31 * DAY).unwrap(), b"b\n");
+        for index in [0, 2] {
+            assert!(
+                store
+                    .bytes(&artifact.record_ids[index], 0, 2, 31 * DAY)
+                    .is_err()
+            );
+        }
+        drop(store);
+        {
+            let db = catalog_db(dir.path()).unwrap();
+            assert_eq!(
+                db.prefix_iterator(b"tail-range:")
+                    .take_while(|row| row.as_ref().unwrap().0.starts_with(b"tail-range:"))
+                    .count(),
+                1
+            );
+        }
+        let store = Store::open(dir.path(), config()).unwrap();
+        store.release(&pin.id).unwrap();
+        store.expire(31 * DAY).unwrap();
+        drop(store);
+        let db = catalog_db(dir.path()).unwrap();
+        assert!(
+            db.prefix_iterator(b"tail-range:")
+                .next()
+                .is_none_or(|row| !row.unwrap().0.starts_with(b"tail-range:"))
+        );
+        db.delete("tail-range-index-upgrade").unwrap();
+        drop(db);
+        assert_eq!(
+            Store::open(dir.path(), config()).err().unwrap().code,
+            "STORAGE_FAILURE"
+        );
+    }
+}
 
 #[test]
 fn tail_finish_admission_and_terminal_publication_survive_reopen_without_duplicate_records_or_refreshed_clocks()
@@ -151,13 +279,14 @@ fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfe
             if legacy >= 27 {
                 db.put("watch_registry", b"fixture").unwrap();
             }
+            remove_tail_range_index(&db).unwrap();
             db.put("store_format", format!("sparrow.store/{legacy}"))
                 .unwrap();
         }
         let store = Store::open(dir.path(), config()).unwrap();
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", legacy + 4).as_str())
+            Some(format!("sparrow.store/{}", legacy + 8).as_str())
         );
         assert_eq!(store.tail_generation(&generation.id).unwrap(), original);
         assert_eq!(store.bytes(&first.record_ids[0], 0, 2, 3).unwrap(), b"n\n");
@@ -177,6 +306,7 @@ fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfe
         drop(store);
         {
             let db = catalog_db(dir.path()).unwrap();
+            remove_tail_range_index(&db).unwrap();
             db.put("store_format", format!("sparrow.store/{legacy}"))
                 .unwrap();
         }
@@ -587,14 +717,14 @@ fn malformed_syslog_preserves_raw_evidence_and_reports_admission_without_inventi
 fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() {
     use sparrow_core::{Durability, ProducerBatch};
     for (legacy, current, watch) in [
-        (17, 29, false),
-        (18, 30, false),
-        (19, 31, true),
-        (20, 32, true),
-        (21, 29, false),
-        (22, 30, false),
-        (23, 31, true),
-        (24, 32, true),
+        (17, 33, false),
+        (18, 34, false),
+        (19, 35, true),
+        (20, 36, true),
+        (21, 33, false),
+        (22, 34, false),
+        (23, 35, true),
+        (24, 36, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
@@ -634,6 +764,7 @@ fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() 
         }
         drop(store);
         let db = catalog_db(dir.path()).unwrap();
+        remove_tail_range_index(&db).unwrap();
         db.put("store_format", format!("sparrow.store/{legacy}"))
             .unwrap();
         db.delete("tail-generation-registry").unwrap();
@@ -949,10 +1080,10 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
 fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_annotation() {
     use sparrow_core::DiagnosticDimension;
     for (legacy, current, watch) in [
-        (13, 29, false),
-        (14, 30, false),
-        (15, 31, true),
-        (16, 32, true),
+        (13, 33, false),
+        (14, 34, false),
+        (15, 35, true),
+        (16, 36, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
@@ -979,6 +1110,7 @@ fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_anno
         let identity = store.store_id().unwrap();
         drop(store);
         let db = catalog_db(dir.path()).unwrap();
+        remove_tail_range_index(&db).unwrap();
         db.put("store_format", format!("sparrow.store/{legacy}"))
             .unwrap();
         db.delete("tail-generation-registry").unwrap();
@@ -1615,6 +1747,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         let id = store.store_id().unwrap();
         drop(store);
         let db = catalog_db(dir.path()).unwrap();
+        remove_tail_range_index(&db).unwrap();
         db.put("store_format", format!("sparrow.store/{version}"))
             .unwrap();
         db.delete("tail-generation-registry").unwrap();
@@ -1627,7 +1760,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 20).as_str())
+            Some(format!("sparrow.store/{}", version + 24).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -2099,7 +2232,7 @@ fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() 
 #[test]
 fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity() {
     use sparrow_core::EvictionLimits;
-    for (legacy, current, watch) in [(5, 29, false), (6, 30, false), (7, 31, true), (8, 32, true)] {
+    for (legacy, current, watch) in [(5, 33, false), (6, 34, false), (7, 35, true), (8, 36, true)] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
         let identity = store.store_id().unwrap();
@@ -2119,6 +2252,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
         db.delete("recordless-index-upgrade").unwrap();
         db.delete(format!("empty-time:{:020}:{}", empty.received_at, empty.id))
             .unwrap();
+        remove_tail_range_index(&db).unwrap();
         db.put("store_format", format!("sparrow.store/{legacy}"))
             .unwrap();
         db.delete("tail-generation-registry").unwrap();
@@ -3086,7 +3220,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/31")
+        Some("sparrow.store/35")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -3101,7 +3235,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/31")
+        Some("sparrow.store/35")
     );
 }
 
@@ -3158,7 +3292,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/29")
+        Some("sparrow.store/33")
     );
     let digest = format!(
         "blake3:{}",
@@ -3183,7 +3317,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/30")
+        Some("sparrow.store/34")
     );
     assert_eq!(
         store
@@ -3217,7 +3351,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/32")
+        Some("sparrow.store/36")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     store
@@ -3225,7 +3359,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/32")
+        Some("sparrow.store/36")
     );
     assert_eq!(
         store
@@ -3452,7 +3586,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/31")
+        Some("sparrow.store/35")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -7643,7 +7777,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/29")
+        Some("sparrow.store/33")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]

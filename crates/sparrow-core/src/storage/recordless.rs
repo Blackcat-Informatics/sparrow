@@ -3,12 +3,16 @@
 
 //! Chronological recordless-artifact catalog and resumable legacy writer upgrade.
 
-use super::{Artifact, Catalog, Error, Writer, json, parse, read_field};
-use rocksdb::{DB, Direction, IteratorMode, WriteBatch, WriteOptions};
+#[cfg(test)]
+use super::catalog_upgrade::Progress;
+use super::catalog_upgrade::commit;
+use super::{Artifact, Catalog, Error, Writer, json, parse};
+use rocksdb::{DB, WriteBatch};
 
 pub(super) const PREFIX: &[u8] = b"empty-time:";
 const UPGRADE: &str = "recordless-index-upgrade";
 const PAGE_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(test)]
 const PAGE_ENTRIES: usize = 512;
 
 pub(super) fn key(artifact: &Artifact) -> String {
@@ -37,23 +41,32 @@ pub(super) struct LegacyFormat {
     pub diagnostic_mappings: bool,
     pub producer_registry: bool,
     pub tail_registry: bool,
+    pub finish_authority: bool,
 }
 
 /// Preserve consumption/watch/handoff authority through every admitted upgrade.
 pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
     let target = match format {
         b"sparrow.store/5" | b"sparrow.store/9" | b"sparrow.store/13" | b"sparrow.store/17"
-        | b"sparrow.store/21" | b"sparrow.store/25" => super::FORMAT,
+        | b"sparrow.store/21" | b"sparrow.store/25" | b"sparrow.store/29" => super::FORMAT,
         b"sparrow.store/6" | b"sparrow.store/10" | b"sparrow.store/14" | b"sparrow.store/18"
-        | b"sparrow.store/22" | b"sparrow.store/26" => super::consumption::FORMAT,
+        | b"sparrow.store/22" | b"sparrow.store/26" | b"sparrow.store/30" => {
+            super::consumption::FORMAT
+        }
         b"sparrow.store/7" | b"sparrow.store/11" | b"sparrow.store/15" | b"sparrow.store/19"
-        | b"sparrow.store/23" | b"sparrow.store/27" => super::watch_registry::FORMAT,
+        | b"sparrow.store/23" | b"sparrow.store/27" | b"sparrow.store/31" => {
+            super::watch_registry::FORMAT
+        }
         b"sparrow.store/8" | b"sparrow.store/12" | b"sparrow.store/16" | b"sparrow.store/20"
-        | b"sparrow.store/24" | b"sparrow.store/28" => super::handoff::FORMAT,
+        | b"sparrow.store/24" | b"sparrow.store/28" | b"sparrow.store/32" => super::handoff::FORMAT,
         _ => return None,
     };
     Some(LegacyFormat {
         target,
+        finish_authority: matches!(
+            format,
+            b"sparrow.store/29" | b"sparrow.store/30" | b"sparrow.store/31" | b"sparrow.store/32"
+        ),
         diagnostic_mappings: matches!(
             format,
             b"sparrow.store/13"
@@ -72,6 +85,10 @@ pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
                 | b"sparrow.store/26"
                 | b"sparrow.store/27"
                 | b"sparrow.store/28"
+                | b"sparrow.store/29"
+                | b"sparrow.store/30"
+                | b"sparrow.store/31"
+                | b"sparrow.store/32"
         ),
         producer_registry: matches!(
             format,
@@ -87,10 +104,21 @@ pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
                 | b"sparrow.store/26"
                 | b"sparrow.store/27"
                 | b"sparrow.store/28"
+                | b"sparrow.store/29"
+                | b"sparrow.store/30"
+                | b"sparrow.store/31"
+                | b"sparrow.store/32"
         ),
         tail_registry: matches!(
             format,
-            b"sparrow.store/25" | b"sparrow.store/26" | b"sparrow.store/27" | b"sparrow.store/28"
+            b"sparrow.store/25"
+                | b"sparrow.store/26"
+                | b"sparrow.store/27"
+                | b"sparrow.store/28"
+                | b"sparrow.store/29"
+                | b"sparrow.store/30"
+                | b"sparrow.store/31"
+                | b"sparrow.store/32"
         ),
         needs_recordless_index: matches!(
             format,
@@ -114,66 +142,16 @@ pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
             | b"sparrow.store/24"
             | b"sparrow.store/27"
             | b"sparrow.store/28"
+            | b"sparrow.store/31"
+            | b"sparrow.store/32"
     ) || format == super::watch_registry::FORMAT
         || format == super::handoff::FORMAT
-}
-
-#[derive(Default)]
-struct Progress {
-    after: Option<String>,
-    complete: bool,
-}
-
-impl Catalog for Progress {
-    fn encode(&self) -> json::Value {
-        json::Object::new()
-            .with("after", self.after.clone())
-            .with("complete", self.complete)
-            .into()
-    }
-
-    fn decode(value: &json::Value) -> Result<Self, Error> {
-        let progress = Self {
-            after: read_field(value, "after")?,
-            complete: read_field(value, "complete")?,
-        };
-        if progress
-            .after
-            .as_ref()
-            .is_some_and(|key| !key.starts_with("artifact:") || key.len() > 128)
-            || (progress.complete && progress.after.is_some())
-        {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "invalid recordless index upgrade checkpoint",
-            ));
-        }
-        Ok(progress)
-    }
 }
 
 /// Startup is unavailable until this persistent index is complete. Each page is durable.
 pub(super) fn upgrade(db: &DB) -> Result<(), Error> {
     fence(db)?;
-    loop {
-        let bytes = db.get(UPGRADE)?.ok_or_else(|| {
-            Error::new(
-                "STORAGE_FAILURE",
-                "required recordless index upgrade state missing; restore the original catalog",
-            )
-        })?;
-        if bytes.len() > 1024 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "recordless upgrade checkpoint exceeds its bound",
-            ));
-        }
-        let progress = Progress::decode(&parse(&bytes)?)?;
-        if progress.complete {
-            return Ok(());
-        }
-        step(db, progress, PAGE_ENTRIES)?;
-    }
+    super::catalog_upgrade::run(db, &JOB)
 }
 
 fn fence(db: &DB) -> Result<(), Error> {
@@ -184,16 +162,6 @@ fn fence(db: &DB) -> Result<(), Error> {
         )
     })?;
     if let Some(legacy) = legacy_format(&format).filter(|legacy| legacy.needs_recordless_index) {
-        let present = match db.prefix_iterator(PREFIX).next() {
-            Some(row) => row?.0.starts_with(PREFIX),
-            None => false,
-        };
-        if db.get(UPGRADE)?.is_some() || present {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "legacy store contains unfenced recordless index state",
-            ));
-        }
         let mut batch = WriteBatch::default();
         batch.put("store_format", legacy.target);
         if db.get(super::producer_stream::KEY)?.is_some() {
@@ -210,90 +178,53 @@ fn fence(db: &DB) -> Result<(), Error> {
             ));
         }
         batch.put(super::tail::KEY, b"[]");
-        super::put(&mut batch, UPGRADE, &Progress::default());
+        super::catalog_upgrade::seed(db, &JOB, &mut batch)?;
+        super::tail_ranges::seed(db, &mut batch)?;
         commit(db, batch)?;
     }
     Ok(())
 }
 
-fn commit(db: &DB, batch: WriteBatch) -> Result<(), Error> {
-    let mut options = WriteOptions::default();
-    options.set_sync(true);
-    options.disable_wal(false);
-    db.write_opt(batch, &options)?;
+const JOB: super::catalog_upgrade::Job = super::catalog_upgrade::Job {
+    checkpoint: UPGRADE,
+    source: "artifact:",
+    target: PREFIX,
+    page_bytes: PAGE_BYTES,
+    charge: upgrade_charge,
+    publish: upgrade_publish,
+};
+
+fn upgrade_charge(bytes: &[u8]) -> Result<usize, Error> {
+    Ok(if has_records(bytes)? {
+        bytes.len()
+    } else {
+        bytes.len().saturating_mul(65)
+    })
+}
+
+fn upgrade_publish(
+    identity: &str,
+    bytes: &[u8],
+    charge: usize,
+    batch: &mut WriteBatch,
+) -> Result<(), Error> {
+    // Populated manifests were validated by the native streaming reader without materialization.
+    if charge != bytes.len() {
+        let artifact = Artifact::decode(&parse(bytes)?)?;
+        if artifact.id != identity {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "recordless upgrade artifact identity mismatch",
+            ));
+        }
+        publish(batch, &artifact)?;
+    }
     Ok(())
 }
 
-fn step(db: &DB, mut progress: Progress, maximum: usize) -> Result<(), Error> {
-    let start = progress.after.clone();
-    let key = start.as_deref().unwrap_or("artifact:");
-    let mut batch = WriteBatch::default();
-    let mut remaining = PAGE_BYTES;
-    let mut visited = 0;
-    progress.complete = true;
-    for entry in db.iterator(IteratorMode::From(key.as_bytes(), Direction::Forward)) {
-        let (key, bytes) = entry?;
-        if !key.starts_with(b"artifact:") {
-            break;
-        }
-        if start
-            .as_ref()
-            .is_some_and(|after| key.as_ref() == after.as_bytes())
-        {
-            continue;
-        }
-        if visited == maximum {
-            progress.complete = false;
-            break;
-        }
-        let identity = std::str::from_utf8(&key).map_err(|_| {
-            Error::new(
-                "STORAGE_FAILURE",
-                "invalid artifact catalog key during recordless upgrade",
-            )
-        })?;
-        if identity.len() > 128 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "artifact key exceeds recordless upgrade bound",
-            ));
-        }
-        let populated = has_records(&bytes)?;
-        let charge = if populated {
-            bytes.len()
-        } else {
-            bytes.len().saturating_mul(65)
-        };
-        if charge > remaining {
-            if visited == 0 {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "one artifact exceeds the recordless upgrade page admission",
-                ));
-            }
-            progress.complete = false;
-            break;
-        }
-        remaining -= charge;
-        // Large populated manifests are validated by the native streaming reader, not materialized.
-        if !populated {
-            let artifact = Artifact::decode(&parse(&bytes)?)?;
-            if artifact.id != identity {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "recordless upgrade artifact identity mismatch",
-                ));
-            }
-            publish(&mut batch, &artifact)?;
-        }
-        progress.after = Some(identity.to_owned());
-        visited += 1;
-    }
-    if progress.complete {
-        progress.after = None;
-    }
-    super::put(&mut batch, UPGRADE, &progress);
-    commit(db, batch)
+#[cfg(test)]
+fn step(db: &DB, progress: Progress, maximum: usize) -> Result<(), Error> {
+    super::catalog_upgrade::step(db, &JOB, progress, maximum)
 }
 
 /// Native JSON event traversal inspects only the storage manifest's record membership.

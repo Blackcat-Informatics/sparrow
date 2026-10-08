@@ -2007,7 +2007,7 @@ names = ['^(publish_empty_artifact_index|make_recordless_time_key)$']
 id = 'recordless-index-upgrade'
 summary = 'Fence legacy writers and durably resume finite native catalog pages, using the public PurRDF event reader without materializing populated manifests.'
 home = 'sparrow_core::storage::recordless::upgrade'
-entry_points = ['sparrow_core::storage::recordless::fence', 'sparrow_core::storage::recordless::step', 'sparrow_core::storage::recordless::has_records']
+entry_points = ['sparrow_core::storage::recordless::fence', 'sparrow_core::storage::recordless::has_records']
 spec = "docs/development-runtime.md: schema 19 recordless artifact eviction."
 vectors = ["crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2234,7 +2234,7 @@ names = ['^(encode_eligible_count|encode_qualified_count|render_eligible_count|r
 id = "storage-test-catalog-open"
 summary = "One dev-only owner opens every declared native RocksDB family for closed-store corruption and identity fixtures."
 home = "sparrow_test_support::catalog_db"
-entry_points = []
+entry_points = ["sparrow_test_support::remove_tail_range_index"]
 spec = "AGENTS.md: shared test scaffolding and one local helper implementation."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2975,3 +2975,33 @@ enforced = true
 constants = []
 fingerprints = []
 names = []
+
+[[job]]
+id = "catalog-upgrade-pager"
+summary = "One durable bounded catalog pager owns checkpoints, admission, and atomic index pages for startup migrations."
+home = "sparrow_core::storage::catalog_upgrade::step"
+entry_points = ["sparrow_core::storage::catalog_upgrade::run", "sparrow_core::storage::catalog_upgrade::seed", "sparrow_core::storage::catalog_upgrade::commit"]
+spec = "docs/architecture.md: retained tail byte ownership and recovery."
+vectors = ["crates/sparrow-core/src/storage/catalog_upgrade.rs", "crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/src/storage/tail_ranges.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(rebuild_tail_range_index|resume_catalog_index_page)$']
+
+[[job]]
+id = "retained-tail-range-membership"
+summary = "One ordered range key owner publishes retained tail bytes and retires their membership in the same catalog batches."
+home = "sparrow_core::storage::tail_ranges::key"
+entry_points = ["sparrow_core::storage::tail_ranges::publish", "sparrow_core::storage::tail_ranges::retire", "sparrow_core::storage::tail_ranges::upgrade", "sparrow_core::storage::tail_ranges::upgrade_publish"]
+spec = "docs/architecture.md: section 6.4, earlier retired tail bytes remain retired."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/tail_ranges.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(make_tail_range_key|publish_tail_range_index)$']
