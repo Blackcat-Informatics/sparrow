@@ -102,9 +102,15 @@ result lease or removal of the broad capture limit.
 
 ## Remaining integration
 
-Qualify the disk-backed traversal against the real copied corpus,
-including exact replay, release, expiry, owner restart, disk-pressure refusal and
-all transport renderers. The chronological writer remains serialized during
+Signed source `6176223` passed the full source hook and the disk-backed traversal
+returned all 7,058 copied-corpus records over 48 pages, exactly matching the
+original ingestion receipts. The gate covers replay, release, absolute expiry,
+owner restart and disk-pressure refusal; live TCP/Unix/CLI/MCP checks passed.
+The private SIGKILL recovery check preserves evidence and rejects old cursors,
+with explicit removal of the verified dead owner's stale Unix socket. See
+[adoption evidence](development-runtime.md#disk-backed-record-query-adoption).
+
+The chronological writer remains serialized during
 capture; concurrency and cancellation latency require measurement rather than a
 claim of asynchronous native snapshot execution. Read leases do not create pins
 or renew retention. Typed, CLI and MCP rendering must retain their contracts.

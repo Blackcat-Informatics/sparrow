@@ -2,12 +2,84 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 43 and store format 37. The stable installed
+private Unix socket. It uses schema 44 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`5ae4fd7`; see [shared native read adoption](#shared-native-read-adoption) for
+`6176223`; see [disk-backed record query adoption](#disk-backed-record-query-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Disk-backed record query adoption
+
+Signed source `6176223` stages immutable chronological, source-time and globally
+ranked record summaries one row at a time into an anonymous disk file. Bounded
+offsets serve replayable pages; source-time sorting retains only finite sort
+keys, and text still uses PurRDF's original complete-corpus scorer. Artifact
+counts accumulate over final matching occurrences. No larger resident row vector,
+page-local ranker, retained original payload version or implicit pin was added.
+The native 10,000-match/scan-work limits remain. JSON discovery retains its
+earlier 2 MiB resident capture. See [query streaming](query-streaming.md).
+
+The final normal signed commit hook passed release Clippy with warnings denied,
+11 core unit tests, 143 storage scenarios, 52 RPC scenarios, 17 SDK tests, the
+remaining workspace tests, census self-tests and the 223-job pinned census gate.
+The new large scenario traverses 3,000 field-qualified rows above 2 MiB in each
+of chronological, source-time and ranked order; it freezes replay after intake,
+checks complete global ranking and source-time order, releases each lease,
+refuses disk pressure without a handle, and recovers after that pressure clears.
+The anonymous-file unit checks no linked pathname, allocation ownership through
+the last Arc, and a typed page failure after an injected truncation. No hook or
+detector was bypassed. The final selected runtime build followed the source hook.
+
+Disk qualification is
+`~/.local/state/sparrow/disk-records-qualification-_gswvj_y`, cloned from the
+previous closed 7,058-record corpus. Both ordinary and grouped broad traversals
+return all 7,058 occurrences over 48 pages. Every record ID, parent, source and
+receipt-time ordering matches all eight original ingestion receipts. Their
+measured complete CLI traversal times were 0.126807 and 0.128614 seconds on this
+host; these are one-run observations, not a throughput or production-volume
+claim. The 286 source matches, 3,529 temporal matches and 12 text matches retain
+exact predecessor rows, scores, witnesses and grouped page counts. Every lease
+was explicitly released and the private daemon closed gracefully.
+
+The additional lifecycle check held a complete broad capture with page size one:
+resident lease charge was 133,890 bytes, with one anonymous descriptor observed.
+The admission footprint went from 22,758,408 to 25,269,256 bytes, including its
+conservative anonymous staging charge. One post-capture RSS sample was 93,300 KiB;
+this is not a peak or a memory-budget certificate. After SIGKILL and reopening,
+the footprint was 22,812,660 bytes, all 7,058 records remained, no result handle
+survived, and the old cursor failed with `RESULT_EXPIRED`. Native engine files
+and logs can change on reopening; these observations do not certify bounded
+physical reclamation of retained database evidence.
+
+SIGKILL leaves the existing Unix socket pathname behind. The first recovery
+attempt refused `Address already in use`; the qualified rerun verified its
+known-dead private owner and the original socket device/inode before removing
+only that fixture socket. Automatic stale-socket recovery remains unimplemented.
+The public unit still uses `Restart=no`; graceful stop removes its socket.
+Development test failures also exposed an insufficient field-work budget and an
+incorrect boolean-as-decoded-string fixture; the final test uses an explicit
+100,000-visit budget and native decoded string matching. A misplaced fixture
+edit was corrected before the final gate.
+
+Adoption evidence is `/tmp/sparrow-disk-records-live.uu_88yi0`. The old daemon
+stopped gracefully before the closed store was copied. The enabled public unit
+then started as PID 3335666 with
+`~/.local/libexec/sparrow/sparrowd-schema44-6176223`, SHA-256
+`43b605eb5cfdc2312e61f9b248bb89ecec0f335b1258813bb0fd76a47998f410`.
+The stable CLI selects `sparrow-schema44-6176223`, SHA-256
+`e7dd491565c2859e7e1fb43f40c653f060b1fd5a5ac0a1dde90341f359c6934d`.
+All five installed images exactly match the qualified frozen images. The daemon
+retains only `cap_net_bind_service=ep`; `0.0.0.0:518` was verified listening.
+Schema is 44, store format remains 37, and the PurRDF runtime/census pin is unchanged.
+
+The saved public tail-handoff retries preserve the original receipt, exact bytes,
+clocks and replacement without another import. Public TCP/Unix grouping and MCP
+continuation agree with CLI pages. Temporal/field witnesses and native text scores
+match the pre-cutover results exactly. Cursor conflict, release, expiry, empty
+groups, strict booleans and schema-42/43 refusal passed. Six idle MCP connections
+plus CLI status succeeded under four storage-operation permits. The live store
+retains 212 records, no pins, healthy owned watches and zero read handles.
 
 ## Shared native read adoption
 
