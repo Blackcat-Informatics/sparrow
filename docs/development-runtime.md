@@ -76,7 +76,34 @@ keys, sources and artifacts with `UNSUPPORTED`, exit 1 and zero stdout bytes
 against a private owned archived daemon. Its archive digest is
 `d2fa1260d05c84a67e0ea1fda0a11ec7851a82fdd75593f3045a4301090a50ff`;
 the child exited cleanly under SIGINT and removed its socket. There is no fallback
-to the old contract. Owned development runtime adoption remains to be qualified.
+to the old contract.
+
+Signed implementation `f3b9be3` passed its normal full verification hook. The owned
+schema-24 development unit exited successfully under SIGINT, with PID zero and
+socket removed, before the same unit/config/store reopened under schema 25 at
+2026-10-08 02:01:11 UTC (observed PID 1048879). Store identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`, with 195 live
+records and no pending writes. Directory/socket permissions remain 0700/0600.
+
+Live evidence in `/tmp/sparrow-source-wire-live.kmsu0b54` verifies all 16 source
+pages, CLI/MCP equal continuation, mapping IDs matching their get operations,
+exact source keys accepted by scoped key discovery and artifact listing, and
+store/budget/changed-selector refusal with exit 1 and zero successful stdout.
+The diagnostic source has two complete artifacts and three retained records;
+the configured development watch source has one complete artifact and one
+retained record, plus watch ID `development-completed`, revision 1, enabled true.
+All sources explicitly report unknown producer continuity. MCP advertises 23
+implemented tools and marks source discovery read-only. The captured source
+handles obey the eight-handle ceiling and subsequently expire to zero.
+
+Regression evidence in `/tmp/sparrow-source-diagnostic-regression.m5n3m2lj`
+preserves default/strict diagnostic coverage, native text/context behavior,
+CLI/MCP equivalence and the exact 104-byte stable retry export.
+`/tmp/sparrow-source-raw-regression.jn5gofsa` preserves the descriptor and
+completed handoff identities, exact 82/87-byte exports, durable removed phase
+and the producer's replacement file. These checks preserve all 195 live records.
+Full architecture acceptance, stream generations/gap tracking, broader
+live/pin/selection pagination and governed SPARQL surfaces remain unfinished.
 
 ## Schema 24 typed artifact pages
 
