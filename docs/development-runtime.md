@@ -57,8 +57,41 @@ require complete execution plus a continuation. Equal receipt timestamps are
 ordered by record ID; the test verifies occurrence identity rather than assuming
 line order across records.
 
-Source validation and running daemon qualification are separate; the following
-schema 29 section records the preceding daemon evidence.
+The signed source commit is `2a7b7d6`. The owned development unit was adopted
+after graceful exit of PID 1445461, successful inactive state and socket removal.
+The same unit/config/store reopened under schema 30 at
+`2026-10-08T04:12:39Z`, PID 1619807. Store identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`, with 195 live
+records. The directory/socket retain modes 0700/0600.
+
+Live evidence in `/tmp/sparrow-json-pages-live.hoid5ql6` captures all seven
+observed key/kind rows and three message values from the owned diagnostic source
+through one-item pages. Native counts and occurrence rows match the unpaged
+baseline; continuation CLI/MCP replies are identical, with frozen receipts.
+Key/value cursor crossover, changed value path, scan exhaustion and conflicting
+limit aliases refuse without successful stdout. Both JSON surfaces preserve
+one unknown diagnostic membership and null eligible counts; strict reads refuse
+`INDEX_NOT_READY`. A revision-guarded pin captures two message occurrences;
+membership expansion then release does not alter its captured continuation.
+Fresh stale/released scopes refuse. Record/text native rows and ranking agree.
+The captured pin cursor refuses `RESULT_EXPIRED` after its absolute deadline
+`2026-10-08T04:13:41.008Z`, without renewal. Final status has zero pins, pending
+writes and query/artifact/source/pin read handles.
+
+`/tmp/sparrow-artifact-filters-raw-regression.2smyxdxj` verifies the retained
+82-byte descriptor and 87-byte CRLF handoff artifact exactly, their stable retry
+identities, removed handoff phase and preserved producer replacement.
+`/tmp/sparrow-artifact-scope-schema29-compat.5e9izmxl` records current client
+status/key/value/record/text/source/artifact refusal against the archived prior
+daemon: each exits 1 with `UNSUPPORTED` and empty stdout. Archive SHA-256 is
+`694321bbad921c52fc30ac2c5c9bf5cd78087561b99bc821335da3ea498319d0`;
+the private compatibility child exits cleanly and removes its socket.
+
+Full architecture acceptance remains unmet. Complete scope receipts, indexed
+corpus-scale selection, the recorded upstream governed SPARQL seam, stream/tail/
+syslog generation and gap contracts, and full physical/resource/recovery
+qualification remain required. The schema 29 section below retains preceding
+runtime evidence.
 
 ## Schema 29 standalone text result pages
 
