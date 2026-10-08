@@ -106,6 +106,8 @@ text analysis, scoring, and query governors.
   verification evidence and unfinished server acceptance.
 - [Deployment](docs/deployment.md): persistent Linux user-service installation,
   runtime asset ownership and cutover verification.
+- [Performance baseline](docs/performance-baseline.md): copied-corpus disk
+  measurements, explicit query-capacity refusals and remaining qualification.
 
 The first useful agent query surfaces are full-text log and JSONL searches,
 temporal/field filtering, key listing, and value search. Results lead back to
