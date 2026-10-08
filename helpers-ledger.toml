@@ -2765,3 +2765,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = []
+
+[[job]]
+id = "file-generation-wire-declaration"
+summary = "Record positions and generation metadata share one typed original watch/path and namespace identity encoder."
+home = "sparrow_server::tail_wire::declaration"
+entry_points = ["sparrow_server::tail_wire::position", "sparrow_server::tail_wire::generation"]
+spec = "docs/interfaces.md: schema 37 file-generation queries."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "file-generation-agent-declaration"
+summary = "CLI and MCP records, contexts and generation reads share native raw-path hex rendering and exact integer spelling."
+home = "sparrow_server::tail_wire::render_declaration"
+entry_points = ["sparrow_server::tail_wire::render_position", "sparrow_server::tail_wire::render_generation"]
+spec = "docs/interfaces.md: schema 37 file-generation queries."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []

@@ -704,6 +704,7 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> cap
     event_time(out.reborrow().init_event_time(), &value.event_time)?;
     crate::diagnostics::snapshot(out.reborrow().init_diagnostics(), &value.diagnostics);
     crate::syslog_wire::snapshot(out.reborrow().init_syslog(), value.syslog.as_ref())?;
+    crate::tail_wire::position(out.reborrow().init_tail(), value.tail.as_ref())?;
     match value.producer {
         Some(position) => {
             let mut producer = out.init_producer().init_value();
@@ -2496,6 +2497,49 @@ impl wire::sparrow::Server for Rpc {
             Ok(page) => {
                 artifacts_page(results.get().init_result().init_ok(), &page)?;
             }
+        }
+        Ok(())
+    }
+
+    async fn tail_generation_get(
+        self: Rc<Self>,
+        params: wire::sparrow::TailGenerationGetParams,
+        mut results: wire::sparrow::TailGenerationGetResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(query.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "file-generation reads require the current discovered schema",
+                ),
+            );
+            return Ok(());
+        }
+        let id = query.get_id()?;
+        if id.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("file-generation ID exceeds 128 bytes"),
+            );
+            return Ok(());
+        }
+        let id = id.to_str()?.to_owned();
+        match self.work(move |store, _| store.tail_generation(&id)).await {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(generation) => crate::tail_wire::generation(
+                results.get().init_result().init_ok(),
+                &generation,
+                &self
+                    .store
+                    .store_id()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?,
+            )?,
         }
         Ok(())
     }

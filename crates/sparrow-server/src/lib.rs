@@ -8,6 +8,7 @@ mod config;
 mod diagnostics;
 pub mod syslog_listener;
 mod syslog_wire;
+mod tail_wire;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;

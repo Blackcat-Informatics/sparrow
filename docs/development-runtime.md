@@ -32,8 +32,38 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 36; the schema sections
+The current source implements schema 37; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 37 file-generation checkpoint queries (not deployed)
+
+Signed core source `67f168b` publishes complete line prefixes and generation
+checkpoints through the existing atomic durable record ingestion path. Partial
+lines remain unaccepted until more bytes arrive or completion is explicitly
+declared. Retry receipts preserve original occurrences after reopen and after
+a declared discontinuity. Original raw paths, watch revisions, namespace/file
+identities and half-open byte ranges survive with pinned records. Old writer
+families 21..24 migrate to 25..28 with an explicitly seeded checkpoint registry;
+missing registry state in a current store is a hard failure.
+
+Schema 37 adds a typed finite generation read and optional record file positions.
+CLI `file-generation` and MCP `file_generation_get` share the generated operation
+and renderer. Record/context rendering uses the same original declaration codec;
+raw relative paths are wire `Data` and agent hex, with no lossy conversion.
+Terminal replacement eligibility is separate from retained evidence membership.
+Accepted prefixes and unknown continuity do not certify whole-file capture.
+
+The full local gate passed 133 storage and 43 real-daemon RPC scenarios, seeded
+census self-tests and 186 ownership jobs with zero distinct exceptions. The new
+scenario reads a reopened truncated generation over public TCP, compares CLI/MCP
+metadata and context provenance, and refuses foreign stores and stale schemas.
+The shared TCP fixture selects outside the native outbound ephemeral pool to
+avoid released reservation races with concurrent clients. Evidence is in
+`/tmp/sparrow-tail-core-commit.log` and `/tmp/sparrow-tail-wire-gate.log`.
+
+This source has not replaced the qualified schema-36 public daemon below.
+Daemon tail administration, active discovery, retained rotated descriptors and
+completed tail handoff remain unfinished. Full architecture acceptance is unmet.
 
 ## Public TCP logging worker
 

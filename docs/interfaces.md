@@ -629,6 +629,16 @@ accepted offset without inventing overwritten bytes; a replacement has a new
 opaque identity. Missing/corrupt registries refuse startup. The 25..28 writer
 fences preserve the prior consumption/watch/handoff family across upgrade.
 
+Schema 37 exposes `tailGenerationGet` as a finite metadata read guarded by the
+current schema and persistent store identity. CLI `file-generation STORE_ID
+GENERATION_ID` and MCP `file_generation_get` share this operation and rendering.
+The original relative path is `Data` on the wire and native hex in agent output;
+no UTF-8 replacement is used. Record metadata and context include optional typed
+file positions with the full original declaration and half-open byte range.
+`replacement_eligible_at` is a terminal registry replacement deadline, not an
+evidence pin or an assertion that all bytes remain retained. Continuity remains
+unknown; a checkpoint reports the accepted prefix, not a whole-file receipt.
+
 These storage APIs are not yet wired to daemon tail-watch administration,
 inotify discovery, retained rotated descriptors or completed-file handoff.
 Those integration and acceptance requirements remain unfinished.

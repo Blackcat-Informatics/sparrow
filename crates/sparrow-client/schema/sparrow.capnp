@@ -74,7 +74,28 @@ struct Record {
   diagnostics @9 :DiagnosticSnapshot;
   producer @10 :OptionalProducerPosition;
   syslog @11 :OptionalSyslogSnapshot;
+  tail @12 :OptionalTailPosition;
 }
+struct TailDeclaration {
+  requestId @0 :Text; watch @1 :Text; watchRevision @2 :UInt64;
+  relativePath @3 :Data; source @4 :Text; format @5 :Format;
+  device @6 :UInt64; inode @7 :UInt64;
+  rootDevice @8 :UInt64; rootInode @9 :UInt64;
+  parentDevice @10 :UInt64; parentInode @11 :UInt64;
+}
+struct TailPosition {
+  generationId @0 :Text; declaration @1 :TailDeclaration;
+  sourceStart @2 :UInt64; sourceEnd @3 :UInt64;
+}
+struct OptionalTailPosition { union { absent @0 :Void; value @1 :TailPosition; } }
+struct OptionalInstant { union { absent @0 :Void; value @1 :Instant; } }
+struct TailGeneration {
+  storeId @0 :Text; id @1 :Text; declaration @2 :TailDeclaration;
+  startedAt @3 :Instant; offset @4 :UInt64; records @5 :UInt64;
+  complete @6 :Bool; gap @7 :OptionalText; replacementEligibleAt @8 :OptionalInstant;
+  continuityUnknown @9 :Bool = true;
+}
+struct TailGenerationQuery { storeId @0 :Text; schemaVersion @1 :UInt32; id @2 :Text; }
 enum SyslogDialect { rfc5424 @0; rfc3164 @1; }
 enum SyslogHeader { timestamp @0; host @1; app @2; procid @3; msgid @4; tag @5; }
 struct SyslogField { kind @0 :SyslogHeader; value @1 :Text; sourceStart @2 :UInt64; sourceEnd @3 :UInt64; }
@@ -537,4 +558,5 @@ interface Sparrow {
   sourcesList @36 (query :SourceListQuery) -> (result :Result(SourceListPage));
   resultNext @37 (query :ResultNextQuery) -> (result :Result(ResultPage));
   producerStreamGet @38 (query :ProducerStreamQuery) -> (result :Result(ProducerStream));
+  tailGenerationGet @39 (query :TailGenerationQuery) -> (result :Result(TailGeneration));
 }

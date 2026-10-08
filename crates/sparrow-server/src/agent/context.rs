@@ -69,6 +69,10 @@ pub(super) fn render_record(value: wire::record::Reader<'_>) -> Result<Value> {
         }
     };
     Ok(Object::new()
+        .with(
+            "tail",
+            crate::tail_wire::render_position(value.get_tail()?)?,
+        )
         .with("syslog", crate::syslog_wire::render(value.get_syslog()?)?)
         .with("producer", producer)
         .with("store_id", value.get_store_id()?.to_str()?)

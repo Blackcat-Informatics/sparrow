@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "file_generation_get",
+        "Read a durable file-generation checkpoint and original raw path/namespace declaration; accepted prefixes do not certify whole-file capture or producer continuity.",
+    ),
+    (
         "producer_stream_get",
         "Read a finite accepted producer window, exact aggregate unobserved positions and bounded recent gaps; prefix and trailing continuity remain unknown.",
     ),
@@ -127,6 +131,12 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
+        if *name == "file_generation_get" {
+            properties = properties
+                .with("store_id", string())
+                .with("generation_id", string());
+            required.extend(["store_id", "generation_id"]);
+        }
         if *name == "producer_stream_get" {
             properties = properties
                 .with("store_id", string())

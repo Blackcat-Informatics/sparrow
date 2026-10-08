@@ -13,12 +13,185 @@ use std::{
 struct Daemon(Child);
 
 fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, std::net::TcpListener) {
-    let reservation = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    // Released bind(0) ports race the kernel's outbound ephemeral allocations.
+    static NEXT_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(10240);
+    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    let bounds = range
+        .split_whitespace()
+        .map(|value| value.parse::<u32>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bounds.len(), 2);
+    let mut reservation = None;
+    for _ in 0..128 {
+        let mut port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if port >= bounds[0] {
+            port += bounds[1] - bounds[0] + 1;
+        }
+        assert!(
+            port <= u32::from(u16::MAX),
+            "no non-ephemeral unprivileged test port is available"
+        );
+        match std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port as u16)) {
+            Ok(listener) => {
+                reservation = Some(listener);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("test TCP listener admission failed: {error}"),
+        }
+    }
+    let reservation = reservation.expect("test TCP listener range is occupied");
     let port = reservation.local_addr().unwrap().port();
     let mut text = std::fs::read_to_string(config).unwrap();
     text.push_str(&format!("rpc_tcp_address = \"0.0.0.0:{port}\"\n"));
     std::fs::write(config, text).unwrap();
     (([127, 0, 0, 1], port).into(), reservation)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_stale_schemas() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (store_id, generation_id, record_id) = {
+                let store = sparrow_server::ServerConfig::read(&config)
+                    .unwrap()
+                    .open_store()
+                    .unwrap();
+                let declaration = sparrow_core::TailStart {
+                    request_id: "generation-wire".into(),
+                    watch: "active-log".into(),
+                    watch_revision: 7,
+                    directories: sparrow_core::ConsumptionDirectories {
+                        root_device: 1,
+                        root_inode: 2,
+                        parent_device: 3,
+                        parent_inode: 4,
+                    },
+                    path: b"nested/active\xff.log".to_vec(),
+                    source: "wire-tail".into(),
+                    format: "log".into(),
+                    device: 5,
+                    inode: 6,
+                };
+                let generation = store
+                    .tail_start(&declaration, sparrow_server::now().unwrap())
+                    .unwrap();
+                let receipt = store
+                    .tail_append(
+                        &generation.id,
+                        0,
+                        b"event\r\nunfinished",
+                        false,
+                        sparrow_server::now().unwrap(),
+                    )
+                    .unwrap();
+                let record = receipt.artifact.unwrap().record_ids[0].clone();
+                store
+                    .tail_discontinue(
+                        &generation.id,
+                        7,
+                        "truncated",
+                        sparrow_server::now().unwrap(),
+                    )
+                    .unwrap();
+                (store.store_id().unwrap(), generation.id, record)
+            };
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let result = cli(&socket, &["file-generation", &store_id, &generation_id]);
+            assert_eq!(result["offset"].as_str(), Some("7"));
+            assert_eq!(result["records"].as_str(), Some("1"));
+            assert_eq!(result["gap"].as_str(), Some("truncated"));
+            assert_eq!(result["complete"].as_bool(), Some(false));
+            assert_eq!(result["continuity_unknown"].as_bool(), Some(true));
+            assert_eq!(
+                result["declaration"]["relative_path_hex"].as_str(),
+                Some("6e65737465642f616374697665ff2e6c6f67")
+            );
+            assert_eq!(result["declaration"]["watch_revision"].as_str(), Some("7"));
+            assert_eq!(result["declaration"]["parent_inode"].as_str(), Some("4"));
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let args = purrdf_lex::json::Object::new()
+                .with("store_id", store_id.clone())
+                .with("generation_id", generation_id.clone())
+                .into();
+            let answer = mcp.tool(2, "file_generation_get", args).await;
+            assert_eq!(answer["structuredContent"], result);
+            let record = mcp
+                .tool(
+                    3,
+                    "record_get",
+                    purrdf_lex::json::Object::new()
+                        .with("store_id", store_id.clone())
+                        .with("id", record_id.clone())
+                        .into(),
+                )
+                .await;
+            let tail = &record["structuredContent"]["tail"];
+            assert_eq!(tail["generation_id"].as_str(), Some(generation_id.as_str()));
+            assert_eq!(tail["source_start"].as_str(), Some("0"));
+            assert_eq!(tail["source_end"].as_str(), Some("7"));
+            assert_eq!(tail["declaration"], result["declaration"]);
+            let context = cli(
+                &socket,
+                &[
+                    "context", &store_id, &record_id, "--before", "0", "--after", "0",
+                ],
+            );
+            assert_eq!(context["anchor"]["tail"], *tail);
+            for (store, schema, id, expected) in [
+                (
+                    "store:foreign",
+                    sparrow_client::SCHEMA_VERSION,
+                    generation_id.as_str(),
+                    "STORE_MISMATCH",
+                ),
+                (
+                    store_id.as_str(),
+                    sparrow_client::SCHEMA_VERSION - 1,
+                    generation_id.as_str(),
+                    "UNSUPPORTED",
+                ),
+                (
+                    store_id.as_str(),
+                    sparrow_client::SCHEMA_VERSION,
+                    "file-generation:missing",
+                    "NOT_FOUND",
+                ),
+            ] {
+                let mut request = client.capability().tail_generation_get_request();
+                let mut query = request.get().init_query();
+                query.set_store_id(store);
+                query.set_schema_version(schema);
+                query.set_id(id);
+                let response = request.send().promise.await.unwrap();
+                match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
+                    wire::result::Error(error) => assert_eq!(
+                        error.unwrap().get_code().unwrap().to_str().unwrap(),
+                        expected
+                    ),
+                    _ => panic!("invalid generation query returned a successful prefix"),
+                }
+            }
+            drop(client);
+            drop(mcp);
+            drop(daemon);
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4880,7 +5053,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 25);
+    assert_eq!(definitions.len(), 26);
     assert_eq!(
         definitions
             .iter()

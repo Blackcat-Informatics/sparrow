@@ -53,6 +53,10 @@ impl Operation {
         let decode = || -> std::result::Result<Self, DecodeError> {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
+                "file_generation_get" => Self::Query(Command::Tail(super::tail::Input {
+                    store: fields.required("store_id")?,
+                    id: fields.required("generation_id")?,
+                })),
                 "producer_stream_get" => Self::Query(Command::Producer(super::producer::Input {
                     store: fields.required("store_id")?,
                     id: fields.required("stream_id")?,
