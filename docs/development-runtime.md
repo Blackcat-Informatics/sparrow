@@ -4350,3 +4350,26 @@ Existing RPC adapter acceptance compares original MCP pin/release receipts with
 CLI stable retries, checks wrong-store, zero-duration, malformed-target and
 conflicting-request refusals, and retains the shared renewal checks. These
 operations use the existing schema 42 daemon contract and need no store migration.
+
+Signed source `b17f121` passed the normal hook, including 140 storage scenarios,
+51 RPC scenarios, 17 SDK tests, remaining workspace tests and 214 helper rules
+with no distinct exceptions. Gate and hook logs are `/tmp/sparrow-cli-pin-check.log`
+and `/tmp/sparrow-cli-pin-commit.log`. The CLI was explicitly rebuilt after the
+hook (`/tmp/sparrow-cli-pin-bin.log`) and installed as
+`/home/paudley/.local/libexec/sparrow/sparrow-schema42-b17f121`, SHA-256
+`9567c010d0e985e52a5ec3c0a07a8b802e7fa9c1f6e4e2c1f176454372681e96`.
+The stable CLI alias selects those verified bytes. The daemon remains the
+schema 42 `b53f163` image at PID 2062025; no restart was needed for this client
+addition.
+
+Public TCP live evidence is `/tmp/sparrow-cli-pin-live.xfx36zzh/report.json`.
+The CLI created a one-day pin for one existing owned synthetic tail record,
+MCP replay returned the same durable receipt, the CLI released it, and MCP
+replay returned the same release receipt. Replaying the original create receipt
+after release did not resurrect protection. The final store still has 212 records
+and zero active pins, with unchanged schema, format, store identity and unit PID.
+Only finite pin control journals were added; no producer file or intake changed.
+
+The [disk crash qualification](performance-baseline.md#disk-crash-recovery)
+checks durable pin/import/release boundaries on a separate closed-store clone.
+It passed two SIGKILL/reopen cycles without affecting the production unit.

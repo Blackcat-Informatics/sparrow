@@ -187,6 +187,58 @@ Evidence in the same disk directory is `schema42-release-matrix.py`,
 `sparrowd-schema42-b53f163` and `sparrow-schema42-b53f163`, and verifies that
 the production unit remains PID 2062025 throughout this separate qualification.
 
+## Disk crash recovery
+
+A separate Btrfs clone of the closed 7,058-record fixture qualifies two abrupt
+process-death boundaries using the installed schema 42 daemon `b53f163` and CLI
+`b17f121`. Its persistent identity is inherited from the cloned fixture, not a
+new independent production store. No configured producer input or TCP listener
+was added. Evidence is
+`/home/paudley/.local/state/sparrow/crash-qualification-ci38zu1q`: `driver.py`,
+`config.toml`, `report.json`, per-phase daemon logs and exact fetched bytes.
+The original fixture remains untouched; the clone ends closed with 7,059 records.
+
+First, the CLI durably protected one record and one artifact, renewed the same
+collection to revision 2, and durably imported one synthetic log record. The
+collector issued SIGKILL immediately after the successful import reply and
+confirmed/reaped that child's `-9` exit. After reopening, the new record and exact
+bytes remained, original create/renew/import retries returned their original
+receipts, and the active collection retained revision 2. A captured continuation
+from the previous owner refused with `RESULT_EXPIRED`.
+
+Second, the CLI released that collection and issued SIGKILL immediately after
+the successful release reply. Reopening preserved zero active pins; stable
+release replay returned its original receipt. Stable original create replay
+also returned its receipt without resurrecting protection. The durable imported
+record remained exactly the same occurrence.
+
+After each reopen, all eight original durable imports were replayed with their
+original arguments and checked against complete original receipts. Every original
+artifact was fetched and compared byte-for-byte with its immutable copied input
+(1,157,768 bytes across the eight occurrences). Five complete indexed answer sets
+were compared against pre-crash rows, including native text scores and witnesses:
+
+| Query scope | Complete rows / pages |
+| --- | ---: |
+| Correction records | 286 / 2 |
+| First-pass receipt interval | 3,529 / 24 |
+| Pacman log text `error` | 12 / 1 |
+| Correction keys | 51 / 1 |
+| Correction `/timestamp` values | 286 / 3 |
+
+Each successful multi-page traversal explicitly released its capture. The text
+corpus is source-scoped so the independent synthetic import cannot legitimately
+change its native scoring inputs. These are exact replay/answer comparisons,
+not latency measurements. The production unit remained PID 2062025 throughout.
+Stale Unix endpoints were removed only after the disposable child was confirmed
+dead and reaped; the production socket was never removed.
+
+This establishes recovery after process termination at the two acknowledged
+durable publication boundaries. It does not simulate power loss, kernel or device
+failure, WAL corruption, interruption inside a storage commit, unknown buffered
+delivery, forced reclamation, or every query operator. Those acceptance cases
+remain separate.
+
 Full performance acceptance remains unmet: complete corpus census and size/
 repetition distributions, full JSON/Markdown/malformed/opaque input mix,
 concurrent ingestion and maintenance, sustained/burst backpressure, 30-day
