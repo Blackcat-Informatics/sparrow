@@ -3026,7 +3026,7 @@ summary = "One SDK byte request path and store/length certificate serve SDK, CLI
 home = "sparrow_client::bytes::certify"
 entry_points = ["sparrow_client::bytes::read_bytes", "sparrow_client::Client::bytes", "sparrow_server::agent::read::fetch"]
 spec = "docs/interfaces.md: schema 40 retained complete-file byte reads."
-vectors = ["crates/sparrow-client/src/bytes.rs", "crates/sparrow-server/tests/rpc.rs"]
+vectors = ["crates/sparrow-client/src/bytes.rs", "crates/sparrow-client/examples/bytes.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true
 [job.forbidden]

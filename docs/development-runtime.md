@@ -3739,7 +3739,7 @@ file reader and completed-tail claim/deletion handoff remain unfinished. The ado
 
 ## Retained-range daemon adoption
 
-The current `sparrow-development.service` runs PID **469821**, started at
+The retained-range adoption ran `sparrow-development.service` PID **469821**, started at
 2026-10-08T11:08:06Z, from signed functional source **cf924de**. Its executable
 is `/home/paudley/.local/libexec/sparrow/sparrowd-schema39-cf924de`, SHA-256
 `61075ed429ba5c57094ef5de2c8f5664656cc7060431e910c59ff39c5e4d2b90`,
@@ -3799,5 +3799,58 @@ refuse foreign stores and both short and long replies. The interface document
 records exact finite admission ceilings and per-read eligibility semantics.
 
 Completed-tail claim/deletion handoff remains unfinished. The live adoption
-below will identify the installed functional build and its acceptance evidence;
+below identifies the installed functional build and its acceptance evidence;
 this source section alone is not deployment evidence.
+
+## Schema 40 daemon adoption and whole-file acceptance
+
+The current `sparrow-development.service` runs PID **723224**, started at
+2026-10-08T11:39:02Z, from signed functional source **d2bdd98** plus the SDK byte
+example commit **fb49020**. Its immutable executable is
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema40-fb49020`, SHA-256
+`8dab0ebedb09bab915cde103f3212284e8cc2be138bb40298543bb49c900b91e`.
+The sole capability is `cap_net_bind_service=ep`, and the public Cap'n Proto
+listener remains **0.0.0.0:518**. The unit keeps `KillSignal=SIGINT`; the prior
+process exited and removed its Unix socket before the closed snapshot and reopen.
+This is still a transient development unit; permanent packaging remains unfinished.
+
+The matching installed clients are:
+
+- CLI `sparrow-schema40-fb49020`, SHA-256
+  `0b3bbf00afffddc87f1f6defc4f5de57a2982cd25107a382ce89af6d0cb66e7f`.
+- SDK events `events-schema40-fb49020`, SHA-256
+  `258795190a38d901bb6893dd01a40f89b1635f9fe489417507fd38d9fc0a75b4`.
+- SDK byte query `bytes-schema40-fb49020`, SHA-256
+  `8e1fdba04141cfc02ed248720ab34c65b01c769b9cc00952b2dd6dfcba827d5c`.
+
+All four installed hashes matched the explicit all-bin/example build after the
+signed hooks passed. Store `store:46c88e949ccec658600b66c7becd5bb7` retains
+format **36**, **210 records**, six tail checkpoint records and one active held
+generation, without an admission failure. No new occurrence or source removal
+was part of this adoption.
+
+SDK byte queries over **192.168.2.4:518** and Unix reconstructed the exact
+107-byte rotated generation and 52-byte explicitly completed partial-JSONL
+generation. Both were compared with owned source observations saved before the
+cutover. Cross-batch ranges and exact EOF zero-length reads also agree. CLI
+file exports and MCP base64 reads returned the same complete original bytes.
+The unfinished active generation refused the public SDK read with
+`EVIDENCE_UNAVAILABLE` and no byte prefix. The original CLI/MCP completion
+receipts, per-record byte reads and provenance/context remain unchanged; current
+SDK TCP/TCP/Unix event retries preserve the original schema-38 artifact.
+
+Live captures, binary identities, before/after status, original source bytes,
+MCP transcripts and service state are in `/tmp/sparrow-schema40-live.eqio9pik`.
+The closed snapshot is its `store-before-schema40` directory; restoration was
+not exercised. `verify.py` performs reads and exact admitted retries;
+`whole_files.py` performs reads and exclusive local exports. Neither creates
+intake occurrences or removes source files.
+
+Normal signed hooks passed release Clippy with warnings denied, **138 storage**
+scenarios, **48 RPC** scenarios, **15 SDK** tests, remaining workspace tests,
+seeded census self-tests, and the pinned cross-workspace gate: **205 ownership
+jobs, no distinct exceptions**. Evidence is in
+`/tmp/sparrow-file-bytes-commit.log`,
+`/tmp/sparrow-file-bytes-example-commit.log`, and
+`/tmp/sparrow-schema40-bins.log`. Completed-tail claim/deletion coordination and
+full architecture acceptance remain unfinished.
