@@ -40,6 +40,17 @@ an alternative: keep both local to one owned worker and send bounded page
 requests to it. No unsafe lifetime extension, dependency change, resident RDF
 replay or copied native matcher is needed for that ownership model.
 
+## Qualification
+
+Signed source `5ae4fd7` passed the complete release and census gate, including the
+snapshot backend ownership test. Its installed daemon preserves the exact live
+source/time/field rows and native ranked witnesses captured before cutover. An
+independent 7,058-record disk corpus retains predecessor source, temporal and text
+pages, including artifact counts, while the broad query still refuses at the
+existing capture bound. See [runtime adoption evidence](development-runtime.md#shared-native-read-adoption).
+This establishes a shared production/helper foundation, not a snapshot-backed
+result lease or removal of the broad capture limit.
+
 ## Remaining integration
 
 The next implementation must replace chronological full-row capture with a

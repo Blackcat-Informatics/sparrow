@@ -4,10 +4,59 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 43 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`608327f`; see [connection admission](#independent-rpc-connection-admission) for
+`5ae4fd7`; see [shared native read adoption](#shared-native-read-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Shared native read adoption
+
+Signed source `5ae4fd7` routes production chronological selection and field
+qualification through the same native backend helpers used by the isolated
+snapshot ownership test. It shares matched record summaries between chronological
+and ranked queries. This does not yet replace full-row captured result leases;
+the bounded streaming integration remains described in
+[query streaming](query-streaming.md).
+
+The full `CARGO_BUILD_JOBS=4 make check` and the normal signed commit hook passed:
+10 core unit tests, 142 storage scenarios, 52 RPC scenarios, 17 SDK tests,
+release Clippy with warnings denied, and the 222-job pinned census gate. The
+selected daemon, CLI and producer examples were rebuilt after the hook before
+installation. Schema 43, store format 37 and the PurRDF pin are unchanged.
+
+Adoption evidence is `/tmp/sparrow-snapshot-seams-live.xtmqzxot`. The enabled
+unit's new PID was 2989337, with immutable daemon image
+`~/.local/libexec/sparrow/sparrowd-schema43-5ae4fd7`, SHA-256
+`5fed827873ca7f8e90693db88dd2e4cd98e66ba8dd76640426c34d95bfe0ad42`.
+The stable daemon and CLI aliases select this source. The daemon retains only
+`cap_net_bind_service=ep`; the listener was verified at `0.0.0.0:518`.
+The old unit stopped gracefully before its closed store was copied and the
+aliases changed. The saved public tail-handoff retry checks passed without
+creating another fixture or importing another record. The live store remains
+212 records, no pins, healthy owned watches and no read handles after checks.
+
+Pre-cutover results in `/tmp/sparrow-snapshot-fields-before.2olaa9dn` were compared
+with the new daemon: all eight source rows, the one received-time/field match,
+and the combined field/time/text match retain exact row metadata, occurrence
+witnesses, native ranking, score and text spans. Public TCP and Unix grouped
+paging preserve counts, indices and ordinary rows; MCP continuation is identical
+to CLI continuation. Cursor conflict, explicit release, expired continuation,
+empty groups, strict booleans and old-schema refusal also passed. Six idle MCP
+connections plus CLI status succeeded with four storage-operation permits.
+
+The independently closed Btrfs corpus clone
+`~/.local/state/sparrow/artifact-groups-qualification-yvbywvzx` retained all 7,058
+records. Its 286 source matches, 3,529 temporal matches and 12 native text matches
+equal the predecessor qualification's rows, text witnesses and artifact groups
+across pages. All leases were released and the private daemon closed gracefully.
+The broad query still fails explicitly at the 2 MiB capture bound; no limit was
+raised. This qualifies the refactor, not completion of broad streaming queries.
+
+Development failures were corrected before the source gate: the new field test's
+initial span oracle incorrectly included JSON quotes, and two ledger entrypoint
+paths omitted their module. No detector or exception was relaxed. The first
+live idle check overlapped the grouping check's temporary leases, so its global
+zero-handle assertion failed; the isolated rerun passed after their release.
 
 ## Oldest-unpinned logical retirement
 
