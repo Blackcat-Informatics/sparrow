@@ -158,10 +158,13 @@ pub struct TailGeneration {
     pub gap: Option<String>,
     /// Terminal metadata expiry; active generations remain subject to the fixed registry quota.
     pub expires_at: Option<u64>,
+    /// Original durable completion intent and terminal publication clock, when declared.
+    pub finish: Option<TailFinish>,
 }
 impl Catalog for TailGeneration {
     fn encode(&self) -> Value {
         Object::new()
+            .with("finish", self.finish.as_ref().map(Catalog::encode))
             .with("id", self.id.clone())
             .with("declaration", self.declaration.encode())
             .with("started_at", self.started_at.to_string())
@@ -174,6 +177,11 @@ impl Catalog for TailGeneration {
     }
     fn decode(value: &Value) -> Result<Self, Error> {
         let generation = Self {
+            finish: value
+                .get("finish")
+                .filter(|value| !value.is_null())
+                .map(TailFinish::decode)
+                .transpose()?,
             id: read_field(value, "id")?,
             declaration: TailStart::decode(super::field(value, "declaration")?)?,
             started_at: integer(value, "started_at")?,
@@ -206,8 +214,135 @@ impl Catalog for TailGeneration {
                 "invalid file-generation checkpoint state",
             ));
         }
+        if let Some(finish) = &generation.finish {
+            let observed = &finish.intent.observed;
+            if finish.intent.generation_id != generation.id
+                || finish.intent.watch_revision != generation.declaration.watch_revision
+                || (observed.device, observed.inode)
+                    != (generation.declaration.device, generation.declaration.inode)
+                || generation.offset > observed.byte_length
+                || finish.finished_at.is_some() != generation.complete
+                || (generation.complete && generation.offset != observed.byte_length)
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "tail finish contradicts its generation checkpoint",
+                ));
+            }
+        }
         Ok(generation)
     }
+}
+
+/// Immutable producer assertion that one opened generation has finished writing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TailFinishIntent {
+    /// Stable completion retry identity, separate from declaration admission.
+    pub request_id: String,
+    /// Original opaque file generation.
+    pub generation_id: String,
+    /// Original watch revision authorizing this generation.
+    pub watch_revision: u64,
+    /// Exact final descriptor observation, using the shared file identity codec.
+    pub observed: super::consumption::ConsumptionGeneration,
+}
+impl TailFinishIntent {
+    fn validate(&self) -> Result<(), Error> {
+        if self.request_id.is_empty()
+            || self.request_id.len() > 128
+            || !self.generation_id.starts_with("file-generation:")
+            || self.generation_id.len() > 128
+            || self.watch_revision == 0
+            || self.observed.inode == 0
+            || self.observed.modified.1 >= 1_000_000_000
+            || self.observed.changed.1 >= 1_000_000_000
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "tail finish requires bounded request/generation identities, a revision and a valid final file observation",
+            ));
+        }
+        Ok(())
+    }
+}
+impl Catalog for TailFinishIntent {
+    fn encode(&self) -> Value {
+        Object::new()
+            .with("request_id", self.request_id.clone())
+            .with("generation_id", self.generation_id.clone())
+            .with("watch_revision", self.watch_revision.to_string())
+            .with("observed", self.observed.encode())
+            .into()
+    }
+    fn decode(value: &Value) -> Result<Self, Error> {
+        let intent = Self {
+            request_id: read_field(value, "request_id")?,
+            generation_id: read_field(value, "generation_id")?,
+            watch_revision: integer(value, "watch_revision")?,
+            observed: super::consumption::ConsumptionGeneration::decode(super::field(
+                value, "observed",
+            )?)?,
+        };
+        intent
+            .validate()
+            .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
+        Ok(intent)
+    }
+}
+
+/// Durable completion admission and the original terminal publication instant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TailFinish {
+    /// Immutable original producer intent.
+    pub intent: TailFinishIntent,
+    /// First durable completion admission.
+    pub admitted_at: u64,
+    /// Set atomically with the final checkpoint; retries never refresh it.
+    pub finished_at: Option<u64>,
+}
+impl Catalog for TailFinish {
+    fn encode(&self) -> Value {
+        Object::new()
+            .with("intent", self.intent.encode())
+            .with("admitted_at", self.admitted_at.to_string())
+            .with("finished_at", self.finished_at.map(|at| at.to_string()))
+            .into()
+    }
+    fn decode(value: &Value) -> Result<Self, Error> {
+        Ok(Self {
+            intent: TailFinishIntent::decode(super::field(value, "intent")?)?,
+            admitted_at: integer(value, "admitted_at")?,
+            finished_at: read_field::<Option<String>>(value, "finished_at")?
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|_| Error::new("STORAGE_FAILURE", "invalid tail finish instant"))
+                })
+                .transpose()?,
+        })
+    }
+}
+
+fn finished_request<'a>(
+    rows: &'a [TailGeneration],
+    intent: &TailFinishIntent,
+) -> Result<Option<&'a TailGeneration>, Error> {
+    let original = rows.iter().find(|row| {
+        row.finish
+            .as_ref()
+            .is_some_and(|finish| finish.intent.request_id == intent.request_id)
+    });
+    if original.is_some_and(|row| {
+        row.finish
+            .as_ref()
+            .is_none_or(|finish| finish.intent != *intent)
+    }) {
+        return Err(Error::new(
+            "CONFLICT",
+            "tail finish request already binds a different final generation",
+        ));
+    }
+    Ok(original)
 }
 
 /// One accepted byte prefix; any pending suffix remains at the source checkpoint.
@@ -252,13 +387,17 @@ pub(super) fn registry(writer: &Writer) -> Result<Vec<TailGeneration>, Error> {
             "file-generation checkpoint registry missing",
         )
     })?;
+    decode_registry(&raw)
+}
+
+pub(super) fn decode_registry(raw: &[u8]) -> Result<Vec<TailGeneration>, Error> {
     if raw.len() > MAX_TAIL_REGISTRY_BYTES {
         return Err(Error::new(
             "STORAGE_FAILURE",
             "file-generation registry exceeds decode ceiling",
         ));
     }
-    let value = parse(&raw)?;
+    let value = parse(raw)?;
     let rows = value.as_array().ok_or_else(|| {
         Error::new(
             "STORAGE_FAILURE",
@@ -273,14 +412,19 @@ pub(super) fn registry(writer: &Writer) -> Result<Vec<TailGeneration>, Error> {
     }
     let mut ids = BTreeSet::new();
     let mut requests = BTreeSet::new();
+    let mut finishes = BTreeSet::new();
     let generations = rows
         .iter()
         .map(TailGeneration::decode)
         .collect::<Result<Vec<_>, _>>()?;
-    if generations
-        .iter()
-        .any(|row| !ids.insert(&row.id) || !requests.insert(&row.declaration.request_id))
-    {
+    if generations.iter().any(|row| {
+        !ids.insert(&row.id)
+            || !requests.insert(&row.declaration.request_id)
+            || row
+                .finish
+                .as_ref()
+                .is_some_and(|finish| !finishes.insert(&finish.intent.request_id))
+    }) {
         return Err(Error::new(
             "STORAGE_FAILURE",
             "duplicate file-generation registry identity",
@@ -337,6 +481,15 @@ pub(super) fn prepare(
             "tail checkpoint cannot move backwards",
         ));
     }
+    if let Some(finish) = &row.finish
+        && (input.end > finish.intent.observed.byte_length
+            || (input.complete && input.end != finish.intent.observed.byte_length))
+    {
+        return Err(Error::new(
+            "CONFLICT",
+            "tail publication exceeds or incompletely finalizes its immutable finish boundary",
+        ));
+    }
     row.records = row
         .records
         .checked_add(count as u64)
@@ -344,6 +497,9 @@ pub(super) fn prepare(
     row.offset = input.end;
     row.complete = input.complete;
     if input.complete {
+        if let Some(finish) = &mut row.finish {
+            finish.finished_at = Some(now);
+        }
         row.expires_at =
             Some(now.checked_add(30 * DAY).ok_or_else(|| {
                 Error::new("INVALID_ARGUMENT", "tail terminal deadline overflow")
@@ -374,6 +530,58 @@ impl Store {
             .filter(|row| row.declaration.watch == watch)
             .collect())
     }
+    /// Read original completion admission before probing today's watch or source descriptor.
+    pub fn tail_finish_get(
+        &self,
+        intent: &TailFinishIntent,
+    ) -> Result<Option<TailGeneration>, Error> {
+        intent.validate()?;
+        let writer = self.lock()?;
+        Ok(finished_request(&registry(&writer)?, intent)?.cloned())
+    }
+
+    /// Durably bind a validated final observation; the coordinator owns descriptor certification.
+    pub fn tail_finish_start(
+        &self,
+        intent: &TailFinishIntent,
+        now: u64,
+    ) -> Result<TailGeneration, Error> {
+        intent.validate()?;
+        let writer = self.lock()?;
+        let mut rows = registry(&writer)?;
+        if let Some(original) = finished_request(&rows, intent)? {
+            return Ok(original.clone());
+        }
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == intent.generation_id)
+            .ok_or_else(|| Error::new("NOT_FOUND", "file generation absent"))?;
+        if row.complete
+            || row.gap.is_some()
+            || row.finish.is_some()
+            || row.declaration.watch_revision != intent.watch_revision
+            || (row.declaration.device, row.declaration.inode)
+                != (intent.observed.device, intent.observed.inode)
+            || row.offset > intent.observed.byte_length
+        {
+            return Err(Error::new(
+                "CONFLICT",
+                "tail finish conflicts with current generation identity, revision or checkpoint",
+            ));
+        }
+        row.finish = Some(TailFinish {
+            intent: intent.clone(),
+            admitted_at: now,
+            finished_at: None,
+        });
+        let result = row.clone();
+        let mut batch = WriteBatch::default();
+        batch.put(KEY, bytes(&rows)?);
+        writer.admit_import_batch(&batch)?;
+        writer.commit(batch)?;
+        Ok(result)
+    }
+
     /// Declare a generation once; exact declaration retries preserve its current checkpoint.
     pub fn tail_start(&self, declaration: &TailStart, now: u64) -> Result<TailGeneration, Error> {
         declaration.validate()?;
@@ -419,6 +627,7 @@ impl Store {
             complete: false,
             gap: None,
             expires_at: None,
+            finish: None,
         };
         generations.push(row.clone());
         let mut batch = WriteBatch::default();

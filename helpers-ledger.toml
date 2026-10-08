@@ -2755,8 +2755,8 @@ names = ['^(commit_tail_offset_after_ingestion|reimport_checkpointed_tail_bytes)
 [[job]]
 id = "file-generation-registry"
 summary = "One bounded native catalog decoder validates active and terminal file-generation checkpoints and startup state."
-home = "sparrow_core::storage::tail::registry"
-entry_points = ["sparrow_core::storage::tail::Store::tail_start", "sparrow_core::storage::tail::Store::tail_generation", "sparrow_core::storage::tail::Store::tail_discontinue", "sparrow_core::storage::tail::Store::tail_generations"]
+home = "sparrow_core::storage::tail::decode_registry"
+entry_points = ["sparrow_core::storage::tail::registry", "sparrow_core::storage::diagnostic::fence_format"]
 spec = "docs/interfaces.md: file-generation checkpoint core."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2871,6 +2871,20 @@ home = "sparrow_server::test_crate::rpc::ProcessStart::admitted_spawn"
 entry_points = ["sparrow_server::test_crate::rpc::configure_tcp_listener"]
 spec = "docs/interfaces.md: schema 38 active file capture qualification."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "file-generation-finish-retry"
+summary = "One bounded registry lookup certifies immutable completion retries before current watch or descriptor admission."
+home = "sparrow_core::storage::tail::finished_request"
+entry_points = ["sparrow_core::storage::tail::Store::tail_finish_get", "sparrow_core::storage::tail::Store::tail_finish_start"]
+spec = "docs/interfaces.md: durable file-generation finish admission."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
 enforced = true
 [job.forbidden]

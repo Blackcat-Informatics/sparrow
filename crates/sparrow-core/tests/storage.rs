@@ -9,6 +9,193 @@ use sparrow_test_support::catalog_db;
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn tail_finish_admission_and_terminal_publication_survive_reopen_without_duplicate_records_or_refreshed_clocks()
+ {
+    use sparrow_core::{ConsumptionGeneration, TailFinishIntent, TailStart};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let generation = store
+        .tail_start(
+            &TailStart {
+                request_id: "finish-start".into(),
+                watch: "tail".into(),
+                watch_revision: 1,
+                directories: CONSUMPTION_DIRECTORIES,
+                path: b"active.log".to_vec(),
+                source: "finish-source".into(),
+                format: "log".into(),
+                device: 7,
+                inode: 42,
+            },
+            1,
+        )
+        .unwrap();
+    let first = store
+        .tail_append(&generation.id, 0, b"first\n", false, 2)
+        .unwrap()
+        .artifact
+        .unwrap();
+    let record = store.record(&first.record_ids[0]).unwrap();
+    let intent = TailFinishIntent {
+        request_id: "finish-1".into(),
+        generation_id: generation.id.clone(),
+        watch_revision: 1,
+        observed: ConsumptionGeneration {
+            device: 7,
+            inode: 42,
+            byte_length: 10,
+            modified: (3, 4),
+            changed: (5, 6),
+        },
+    };
+    assert!(store.tail_finish_get(&intent).unwrap().is_none());
+    let admitted = store.tail_finish_start(&intent, 3).unwrap();
+    assert!(!admitted.complete);
+    assert_eq!(admitted.finish.as_ref().unwrap().admitted_at, 3);
+    assert_eq!(store.tail_finish_start(&intent, 4).unwrap(), admitted);
+    let mut changed = intent.clone();
+    changed.observed.byte_length = 11;
+    assert_eq!(
+        store.tail_finish_start(&changed, 4).unwrap_err().code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store
+            .tail_append(&generation.id, 6, b"last-extra\n", false, 4)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store
+            .tail_append(&generation.id, 6, b"x", true, 4)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(store.tail_generation(&generation.id).unwrap().offset, 6);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.tail_finish_get(&intent).unwrap(), Some(admitted));
+    let final_record = store
+        .tail_append(&generation.id, 6, b"last", true, 5)
+        .unwrap()
+        .artifact
+        .unwrap();
+    let finished = store.tail_finish_get(&intent).unwrap().unwrap();
+    assert!(finished.complete);
+    assert_eq!(finished.offset, 10);
+    assert_eq!(finished.records, 2);
+    assert_eq!(finished.finish.as_ref().unwrap().finished_at, Some(5));
+    assert_eq!(
+        store
+            .tail_append(&generation.id, 6, b"last", true, 6)
+            .unwrap()
+            .artifact
+            .unwrap()
+            .id,
+        final_record.id
+    );
+    assert_eq!(store.tail_finish_start(&intent, 100).unwrap(), finished);
+    let retried_record = store.record(&record.id).unwrap();
+    assert_eq!(retried_record.received_at, record.received_at);
+    assert_eq!(retried_record.expires_at, record.expires_at);
+    assert_eq!(retried_record.tail, record.tail);
+    assert_eq!(store.records(100).unwrap().len(), 2);
+    assert_eq!(
+        store.bytes(&final_record.record_ids[0], 0, 4, 100).unwrap(),
+        b"last"
+    );
+    drop(store);
+    assert_eq!(
+        Store::open(dir.path(), config())
+            .unwrap()
+            .tail_finish_get(&intent)
+            .unwrap(),
+        Some(finished)
+    );
+}
+
+#[test]
+fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfenced_completion_authority()
+ {
+    use sparrow_core::{ConsumptionGeneration, TailFinishIntent, TailStart};
+    for legacy in 25..=28 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let generation = store
+            .tail_start(
+                &TailStart {
+                    request_id: "upgrade-tail".into(),
+                    watch: "tail".into(),
+                    watch_revision: 1,
+                    directories: CONSUMPTION_DIRECTORIES,
+                    path: b"active.log".to_vec(),
+                    source: "upgrade-source".into(),
+                    format: "log".into(),
+                    device: 7,
+                    inode: 42,
+                },
+                1,
+            )
+            .unwrap();
+        let first = store
+            .tail_append(&generation.id, 0, b"n\n", false, 2)
+            .unwrap()
+            .artifact
+            .unwrap();
+        let original = store.tail_generation(&generation.id).unwrap();
+        drop(store);
+        {
+            let db = catalog_db(dir.path()).unwrap();
+            if legacy >= 27 {
+                db.put("watch_registry", b"fixture").unwrap();
+            }
+            db.put("store_format", format!("sparrow.store/{legacy}"))
+                .unwrap();
+        }
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store.properties().unwrap()["store_format"].as_str(),
+            Some(format!("sparrow.store/{}", legacy + 4).as_str())
+        );
+        assert_eq!(store.tail_generation(&generation.id).unwrap(), original);
+        assert_eq!(store.bytes(&first.record_ids[0], 0, 2, 3).unwrap(), b"n\n");
+        let intent = TailFinishIntent {
+            request_id: "unfenced-finish".into(),
+            generation_id: generation.id,
+            watch_revision: 1,
+            observed: ConsumptionGeneration {
+                device: 7,
+                inode: 42,
+                byte_length: 2,
+                modified: (3, 4),
+                changed: (5, 6),
+            },
+        };
+        store.tail_finish_start(&intent, 3).unwrap();
+        drop(store);
+        {
+            let db = catalog_db(dir.path()).unwrap();
+            db.put("store_format", format!("sparrow.store/{legacy}"))
+                .unwrap();
+        }
+        assert_eq!(
+            Store::open(dir.path(), config()).err().unwrap().code,
+            "STORAGE_FAILURE"
+        );
+        {
+            let db = catalog_db(dir.path()).unwrap();
+            db.delete("tail-generation-registry").unwrap();
+        }
+        assert_eq!(
+            Store::open(dir.path(), config()).err().unwrap().code,
+            "STORAGE_FAILURE"
+        );
+    }
+}
+
+#[test]
 fn tail_checkpoints_commit_exact_prefixes_and_retries_without_reimporting_or_finalizing_idle_suffixes()
  {
     use sparrow_core::TailStart;
@@ -400,14 +587,14 @@ fn malformed_syslog_preserves_raw_evidence_and_reports_admission_without_inventi
 fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() {
     use sparrow_core::{Durability, ProducerBatch};
     for (legacy, current, watch) in [
-        (17, 25, false),
-        (18, 26, false),
-        (19, 27, true),
-        (20, 28, true),
-        (21, 25, false),
-        (22, 26, false),
-        (23, 27, true),
-        (24, 28, true),
+        (17, 29, false),
+        (18, 30, false),
+        (19, 31, true),
+        (20, 32, true),
+        (21, 29, false),
+        (22, 30, false),
+        (23, 31, true),
+        (24, 32, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
@@ -762,10 +949,10 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
 fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_annotation() {
     use sparrow_core::DiagnosticDimension;
     for (legacy, current, watch) in [
-        (13, 25, false),
-        (14, 26, false),
-        (15, 27, true),
-        (16, 28, true),
+        (13, 29, false),
+        (14, 30, false),
+        (15, 31, true),
+        (16, 32, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
@@ -1440,7 +1627,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 16).as_str())
+            Some(format!("sparrow.store/{}", version + 20).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -1912,7 +2099,7 @@ fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() 
 #[test]
 fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity() {
     use sparrow_core::EvictionLimits;
-    for (legacy, current, watch) in [(5, 25, false), (6, 26, false), (7, 27, true), (8, 28, true)] {
+    for (legacy, current, watch) in [(5, 29, false), (6, 30, false), (7, 31, true), (8, 32, true)] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
         let identity = store.store_id().unwrap();
@@ -2899,7 +3086,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/27")
+        Some("sparrow.store/31")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -2914,7 +3101,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/27")
+        Some("sparrow.store/31")
     );
 }
 
@@ -2971,7 +3158,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/25")
+        Some("sparrow.store/29")
     );
     let digest = format!(
         "blake3:{}",
@@ -2996,7 +3183,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/26")
+        Some("sparrow.store/30")
     );
     assert_eq!(
         store
@@ -3030,7 +3217,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/28")
+        Some("sparrow.store/32")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     store
@@ -3038,7 +3225,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/28")
+        Some("sparrow.store/32")
     );
     assert_eq!(
         store
@@ -3265,7 +3452,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/27")
+        Some("sparrow.store/31")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -7443,7 +7630,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/25")
+        Some("sparrow.store/29")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]

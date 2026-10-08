@@ -35,6 +35,30 @@ Implementation is in progress in `/home/paudley/Active/sparrow`, on
 The current source implements schema 38; the schema sections
 below retain their historical qualification evidence.
 
+## Durable file-completion storage foundation
+
+The implementation branch adds a durable producer-finish intent to the existing
+file-generation registry. Its immutable final descriptor identity and byte length
+bound all later checkpoint publication. Original admission and terminal clocks
+survive reopen and exact retries without refreshing existing record deadlines or
+minting duplicate occurrences. Terminal publication and its final checkpoint
+share the existing record/index WAL batch. Admission alone is not completion.
+
+This source uses storage formats 29..32. Existing 25..28 registries are validated
+and preserved during upgrade; missing checkpoints or unfenced completion
+metadata refuse startup. Older executables cannot safely open the new formats.
+The deployed schema-38 process below still uses format 28; this source foundation
+has not been adopted into that process. No source file was finalized or removed
+by this change. Typed completion coordination, retained final-file byte coverage
+and the completed-tail claim/deletion handoff remain unfinished.
+
+Local `CARGO_BUILD_JOBS=4 make check` passed release Clippy with warnings denied,
+135 storage scenarios, 46 RPC scenarios, the remaining workspace tests and the
+seeded census suite. The pinned cross-workspace gate passed 193 ownership jobs
+with no distinct exceptions. Evidence: `/tmp/sparrow-finish-core-test.log` and
+`/tmp/sparrow-finish-gate.log`. These checks qualify the storage foundation,
+not a deployed completion service or full architecture acceptance.
+
 ## Schema 38 daemon adoption and active file capture
 
 The current service is `sparrow-development.service`, PID **3844123**, started

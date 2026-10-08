@@ -629,6 +629,30 @@ accepted offset without inventing overwritten bytes; a replacement has a new
 opaque identity. Missing/corrupt registries refuse startup. The 25..28 writer
 fences preserve the prior consumption/watch/handoff family across upgrade.
 
+The storage core additionally supplies `tail_finish_start` and `tail_finish_get`.
+A stable finish request binds the original generation and watch revision to the
+producer's final device/inode, byte length and nanosecond modification/change
+clocks. The descriptor coordinator must certify this observation before first
+admission; the storage core performs no filesystem probes. Exact request retries
+recover the original durable admission before checking current authority.
+Changing the request's bound observation conflicts. Admission records no new
+occurrence and is distinct from terminal publication.
+
+An admitted finish bounds every subsequent checkpoint by its final length.
+Terminal publication requires exactly that length, includes a final unterminated
+line, and durably sets the original `finished_at` in the same publication batch.
+An empty EOF completion creates no record. Retries preserve earlier occurrence
+IDs and acceptance/expiry clocks. A discontinuity retains the admitted intent and
+accepted prefix without asserting completion. This core path grants neither
+source deletion nor a complete downloadable file. Its daemon/client completion
+surface remains unfinished.
+
+Storage formats 29..32 fence older writers that cannot enforce the admitted
+completion boundary. Stores at 25..28 preserve their entire validated checkpoint
+registry while upgrading to the corresponding family. Missing registries and
+completion authority found beneath an older fence refuse startup; an upgrade
+must never substitute an empty registry for missing checkpoints.
+
 Schema 37 exposes `tailGenerationGet` as a finite metadata read guarded by the
 current schema and persistent store identity. CLI `file-generation STORE_ID
 GENERATION_ID` and MCP `file_generation_get` share this operation and rendering.

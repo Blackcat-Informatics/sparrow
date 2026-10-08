@@ -680,13 +680,28 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
         }
         let mut batch = WriteBatch::default();
         batch.put("store_format", legacy.target);
-        if db.get(super::tail::KEY)?.is_some() {
+        if db.get(super::tail::KEY)?.is_some() != legacy.tail_registry {
             return Err(Error::new(
                 "STORAGE_FAILURE",
-                "legacy store has unfenced file-generation registry",
+                "legacy file-generation registry presence contradicts its writer fence",
             ));
         }
-        batch.put(super::tail::KEY, b"[]");
+        if legacy.tail_registry {
+            let raw = db.get(super::tail::KEY)?.ok_or_else(|| {
+                Error::new("STORAGE_FAILURE", "legacy file-generation registry missing")
+            })?;
+            if super::tail::decode_registry(&raw)?
+                .iter()
+                .any(|row| row.finish.is_some())
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "legacy store contains unfenced tail completion authority",
+                ));
+            }
+        } else {
+            batch.put(super::tail::KEY, b"[]");
+        }
         if !legacy.producer_registry {
             batch.put(super::producer_stream::KEY, b"[]");
         }

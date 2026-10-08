@@ -45,7 +45,7 @@ pub(crate) mod tail;
 mod text_index;
 pub(crate) mod watch_registry;
 
-const FORMAT: &[u8] = b"sparrow.store/25";
+const FORMAT: &[u8] = b"sparrow.store/29";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
