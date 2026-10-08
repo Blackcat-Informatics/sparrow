@@ -14,12 +14,15 @@ pub fn anonymous_query_files(
         let path = entry?.path();
         let inspect = || -> std::io::Result<Option<std::fs::Metadata>> {
             let target = std::fs::read_link(&path)?;
-            if target.starts_with(store)
-                && target
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .ends_with(b" (deleted)")
-            {
+            // Linux O_TMPFILE names are `#<inode> (deleted)`. Ordinary unlinked
+            // RocksDB tables also end in `(deleted)` and are not query staging.
+            let anonymous = target.file_name().is_some_and(|name| {
+                name.as_encoded_bytes()
+                    .strip_prefix(b"#")
+                    .and_then(|name| name.strip_suffix(b" (deleted)"))
+                    .is_some_and(|inode| !inode.is_empty() && inode.iter().all(u8::is_ascii_digit))
+            });
+            if target.starts_with(store) && anonymous {
                 Ok(Some(std::fs::metadata(&path)?))
             } else {
                 Ok(None)
@@ -90,4 +93,39 @@ pub fn remove_tail_range_index(db: &rocksdb::DB) -> Result<(), rocksdb::Error> {
         batch.delete(key);
     }
     db.write(batch)
+}
+
+#[cfg(test)]
+mod observer_tests {
+    #[test]
+    fn anonymous_observer_excludes_unlinked_tables_and_other_stores() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let sibling = dir.path().join("store-other");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let table_path = store.join("000001.sst");
+        let table = std::fs::File::create(&table_path).unwrap();
+        std::fs::remove_file(&table_path).unwrap();
+        let staging = std::fs::File::from(
+            rustix::fs::open(
+                &store,
+                rustix::fs::OFlags::TMPFILE | rustix::fs::OFlags::RDWR,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .unwrap(),
+        );
+        let outside = tempfile::tempfile_in(&sibling).unwrap();
+        let observed = super::anonymous_query_files(std::process::id(), &store).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].ino(), staging.metadata().unwrap().ino());
+        drop(staging);
+        assert!(
+            super::anonymous_query_files(std::process::id(), &store)
+                .unwrap()
+                .is_empty()
+        );
+        drop((table, outside));
+    }
 }

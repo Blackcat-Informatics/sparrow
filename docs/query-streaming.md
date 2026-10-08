@@ -181,10 +181,11 @@ MCP `notifications/cancelled` aborts the selected tool's owned SDK connection;
 its stdio session and sibling tools remain open. The pending admission/ID slot
 is retained until that aborted job is actually retired, keeping both jobs and
 slots bounded by four even during cancellation floods. Cancelled jobs emit no
-tool reply. Direct Cap'n Proto promise cancellation and production tail-latency/
+tool reply. Direct Cap'n Proto promise cancellation for record, value, text and
+key captures is qualified below. Other read families and production tail-latency/
 resource bounds remain separate acceptance work.
 
-### Real MCP cancellation qualification
+### Real transport cancellation qualification
 
 The daemon integration scenario uses 8,000 separately identified occurrences
 of one native JSONL payload under a private 1 GiB test allowance. Over Unix and
@@ -194,6 +195,19 @@ cleanup without closing the stdio session. Numeric and string request IDs both
 traverse the native MCP ID owner. Ping and status continue normally, with zero
 query leases/bytes and unchanged records. A subsequent complete paged MCP read
 must return every original intake ID exactly once and release its capture.
+The same fixture also drops raw Cap'n Proto promises for records, values, text
+and keys while retaining the original SDK and transport. Each caller must still
+be pending when its staging is observed. Aborting only that caller sends native
+`Finish`; staging must disappear, and status on the same capability must report
+zero query handles/bytes, the original store and all 8,000 records. This exercises
+per-call cancellation without using connection teardown as its substitute.
+
+The shared Linux observer identifies native `O_TMPFILE` descriptor names
+(`#<inode> (deleted)`) below the owned store. A deleted RocksDB table is not an
+in-flight query witness. Its regression keeps an unlinked table open alongside
+a native temporary file and a sibling-store file, checks only the staging inode
+is observed, then requires no observations after closing it. Disappearing
+descriptors remain normal inspection races; other inspection errors fail.
 The existing fault-endpoint scenario separately checks four-call admission,
 notification cancellation, partial framing and session responsiveness. These
 are focused scenarios, not sustained production cancellation-load acceptance.

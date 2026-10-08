@@ -7711,7 +7711,7 @@ async fn mcp_cancellation_admission_and_partial_frames_do_not_lose_messages() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn mcp_notifications_cancel_actual_captures_without_closing_the_stdio_session() {
+async fn direct_promises_and_mcp_notifications_cancel_captures_without_closing_the_session() {
     use purrdf_lex::json::{Object, Value};
     use sparrow_test_support::anonymous_query_files;
     tokio::task::LocalSet::new()
@@ -7738,6 +7738,115 @@ async fn mcp_notifications_cancel_actual_captures_without_closing_the_stdio_sess
             assert_eq!(receipt.record_ids.len(), 8000);
             let tcp = format!("tcp://{address}");
             for endpoint in [socket.to_str().unwrap(), tcp.as_str()] {
+                use futures::FutureExt;
+                let direct = if endpoint == tcp {
+                    sparrow_client::Client::connect_tcp(address).await.unwrap()
+                } else {
+                    sparrow_client::Client::connect(&socket).await.unwrap()
+                };
+                let scope = |mut scope: wire::scope::Builder<'_>| {
+                    scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                    scope.reborrow().init_source().set_value("cancel");
+                    scope
+                        .reborrow()
+                        .init_received_before()
+                        .set_unix_millis(u64::MAX);
+                    scope.set_limit(1);
+                    scope.set_scan_budget(100000);
+                };
+                for name in ["records", "values", "text", "keys"] {
+                    let promise = match name {
+                        "records" => {
+                            let mut request = direct.capability().records_search_request();
+                            scope(request.get().init_query().init_scope());
+                            request
+                                .send()
+                                .promise
+                                .map(|result| result.map(|_| ()))
+                                .boxed_local()
+                        }
+                        "values" => {
+                            let mut request = direct.capability().values_search_request();
+                            scope(request.get().init_query().init_scope());
+                            request
+                                .send()
+                                .promise
+                                .map(|result| result.map(|_| ()))
+                                .boxed_local()
+                        }
+                        "text" => {
+                            let mut request = direct.capability().text_search_request();
+                            let mut query = request.get().init_query();
+                            query.set_text("needle");
+                            scope(query.init_scope());
+                            request
+                                .send()
+                                .promise
+                                .map(|result| result.map(|_| ()))
+                                .boxed_local()
+                        }
+                        "keys" => {
+                            let mut request = direct.capability().keys_list_request();
+                            scope(request.get().init_scope());
+                            request
+                                .send()
+                                .promise
+                                .map(|result| result.map(|_| ()))
+                                .boxed_local()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let caller = tokio::task::spawn_local(promise);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        assert!(
+                            !caller.is_finished(),
+                            "direct {name} finished before cancellation"
+                        );
+                        let files = anonymous_query_files(daemon.0.id(), &data).unwrap();
+                        if files
+                            .iter()
+                            .any(|file| name == "keys" || name == "text" || file.len() > 0)
+                        {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "direct {name} staging was not observed"
+                        );
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    // Drop only this promise. Keep the SDK and its transport alive;
+                    // native Cap'n Proto Finish must cancel this caller independently.
+                    caller.abort();
+                    assert!(caller.await.unwrap_err().is_cancelled());
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !anonymous_query_files(daemon.0.id(), &data)
+                        .unwrap()
+                        .is_empty()
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "direct {name} staging survived Finish"
+                        );
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    let response = direct
+                        .capability()
+                        .status_request()
+                        .send()
+                        .promise
+                        .await
+                        .unwrap();
+                    let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+                    assert_eq!(status.get_record_read_handles(), 0);
+                    assert_eq!(status.get_record_read_bytes(), 0);
+                    assert_eq!(status.get_live_records(), 8000);
+                    assert_eq!(
+                        status.get_store_id().unwrap().to_str().unwrap(),
+                        receipt.store_id
+                    );
+                }
                 let mut mcp = Mcp::start(endpoint);
                 mcp.initialize(1).await;
                 for (ordinal, name) in [

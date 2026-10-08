@@ -12,5 +12,9 @@ publish = false
 rocksdb.workspace = true
 purrdf-lex.workspace = true
 
+[dev-dependencies]
+rustix.workspace = true
+tempfile = "3"
+
 [lints]
 workspace = true

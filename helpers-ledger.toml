@@ -3414,11 +3414,11 @@ names = ['^(cancel_capture_elsewhere|release_abandoned_query_elsewhere)$']
 
 [[job]]
 id = "owned-anonymous-query-observer"
-summary = "Dev-only observation of anonymous query files in an owned uncapped Linux daemon; disappearing descriptors are races and all other inspection failures remain actionable."
+summary = "Dev-only observation of Linux O_TMPFILE query staging in an owned uncapped daemon; exclude ordinary deleted tables and other stores, tolerate disappearing descriptors, and report all other inspection failures."
 home = "sparrow_test_support::anonymous_query_files"
 entry_points = []
-spec = "docs/query-streaming.md: real MCP cancellation qualification."
-vectors = ["crates/sparrow-server/tests/rpc.rs"]
+spec = "docs/query-streaming.md: real transport cancellation qualification."
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-test-support/src/lib.rs"]
 bench = []
 enforced = true
 [job.forbidden]
@@ -3431,7 +3431,7 @@ id = "mcp-job-lifetime"
 summary = "One bounded MCP dispatcher retains each admission/ID slot through cancelled job retirement; abort drops the tool's owned SDK connection without emitting a cancelled reply or cancelling sibling tools."
 home = "sparrow_server::mcp::serve"
 entry_points = ["sparrow_server::run_mcp"]
-spec = "docs/query-streaming.md: real MCP cancellation qualification."
+spec = "docs/query-streaming.md: real transport cancellation qualification."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true
