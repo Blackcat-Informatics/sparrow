@@ -108,6 +108,10 @@ owner restart and disk-pressure refusal; live TCP/Unix/CLI/MCP checks passed.
 The private SIGKILL recovery check preserves evidence and rejects old cursors,
 with explicit removal of the verified dead owner's stale Unix socket. See
 [adoption evidence](development-runtime.md#disk-backed-record-query-adoption).
+Later signed source `5ca7eeb` qualifies recovery by the production daemon itself,
+without a driver-side unlink, on a copied 7,058-record Btrfs store. See
+[owned endpoint recovery](development-runtime.md#owned-local-endpoint-recovery)
+for ownership checks, preserved names and the unchanged service restart policy.
 
 The chronological writer remains serialized during
 capture; concurrency and cancellation latency require measurement rather than a

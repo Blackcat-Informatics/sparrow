@@ -4,10 +4,66 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 45 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`74e0935`; see [disk-backed JSON query adoption](#disk-backed-json-query-adoption) for
+`5ca7eeb`; see [owned local endpoint recovery](#owned-local-endpoint-recovery) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Owned local endpoint recovery
+
+Signed source `5ca7eeb` fixes the stale Unix socket that previously prevented
+startup after SIGKILL. Startup obtains the native exclusive store lock and
+validates the watch catalog before recovering a refused socket. It checks the
+socket type without following symlinks, bounds its liveness probe to 250 ms,
+and rechecks the original device/inode before removal. Live listeners, timeouts,
+other probe errors, non-sockets and replaced names refuse recovery. The private
+store directory is the pathname ownership boundary; the check is not a claim
+of an atomic compare-and-unlink primitive against an unrelated pathname writer.
+Shutdown similarly preserves a replacement name. Socket-bind refusal now joins
+the already-started consume worker before returning its error.
+
+The full release gate and normal signed source hook passed all workspace tests,
+including 144 storage and 55 RPC scenarios, the new endpoint cleanup unit test,
+seeded census self-tests and 225 pinned ledger jobs with zero distinct exceptions.
+Focused tests verify durable evidence and stale-cursor refusal after SIGKILL,
+restart over TCP and Unix without a test-side unlink, successful graceful socket
+cleanup, startup preservation of files/symlinks/foreign live listeners and cleanup
+preservation of replacement files and live socket names. Schema remains 45;
+this change adds no wire operation or dependency.
+
+The selected runtime build followed the source hook. Qualified frozen images are
+`~/.local/state/sparrow/endpoint-images-k169ulmi`. The closed copied corpus at
+`~/.local/state/sparrow/json-pages-qualification-axrpjx1w` preserves all 7,058
+ordinary/grouped record rows over 48 pages, native source/temporal/text results,
+51 keys and 286 value occurrences, exactly matching predecessor receipts and
+witnesses. Its `automatic-endpoint-recovery.json` records a held broad capture
+with 133,890 resident lease bytes. Admission footprint was 22,660,975 bytes before
+capture, 25,171,823 while held and 22,710,101 after SIGKILL/reopen. The restarted
+production binary removed its refused stale socket itself; the driver performed
+no unlink. All 7,058 records remained, no lease survived and the old cursor failed
+with `RESULT_EXPIRED`. The private owner then closed gracefully. Native file/log
+changes on reopening do not establish bounded database physical reclamation.
+
+Public adoption evidence is `/tmp/sparrow-endpoint-live.kedvntxw`. The old public
+daemon stopped gracefully before its closed store was copied. The enabled unit
+started as PID 3820454 with
+`~/.local/libexec/sparrow/sparrowd-schema45-5ca7eeb`, SHA-256
+`5ff818964e77c1d832001d2a5ee08b4ce073ff9a0c4f1c5be0d8cb7dadf9cd9c`.
+The stable CLI selects `sparrow-schema45-5ca7eeb`, SHA-256
+`39031f80027a5b8acc7614b060aee7bbf05db62042c41220d97503fd65dfa79f`.
+All five installed images match qualified hashes. Public `0.0.0.0:518`, the
+daemon's sole `cap_net_bind_service=ep` capability and unchanged `Restart=no`
+were recorded. Recovery on a subsequent start does not enable automatic service
+restart; the public daemon was stopped gracefully for adoption, not killed.
+
+Live TCP/Unix CLI/MCP key/value continuation, grouped record counts/indices,
+release/conflict/empty behavior, saved temporal/field/text witnesses, original
+finish/handoff intent retries and six idle MCP peers plus status all passed.
+The final public store remains `store:46c88e949ccec658600b66c7becd5bb7`, format 37,
+212 records, zero pins/result leases, healthy watches and no pending claims.
+Full governed stored SPARQL, bounded physical reclamation, capture concurrency
+and production-volume acceptance remain unfinished. Reboot acceptance was not
+run. The following sections preserve their historical evidence and limitations.
 
 ## Disk-backed JSON query adoption
 
