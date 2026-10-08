@@ -319,6 +319,10 @@ impl Detector {
                 Err(Error::Storage(error)) if error.code == "STORAGE_FAILURE" => {
                     Err(Error::Storage(error))
                 }
+                Err(Error::FinishedGeneration(message)) => {
+                    self.failure = Some(message.into());
+                    Ok(())
+                }
                 Err(error) => {
                     self.failure = Some(error.to_string().chars().take(1024).collect());
                     self.deferred = true;
@@ -722,6 +726,48 @@ fn storage_admission(error: sparrow_core::Error) -> AdminFailure {
     }
 }
 
+fn admit_tail_finish(
+    store: &Store,
+    detectors: &mut [Detector],
+    intent: &sparrow_core::TailFinishIntent,
+) -> Result<sparrow_core::TailGeneration, AdminFailure> {
+    if let Some(original) = store.tail_finish_get(intent).map_err(storage_admission)? {
+        return Ok(original);
+    }
+    let generation = store
+        .tail_generation(&intent.generation_id)
+        .map_err(storage_admission)?;
+    let detector = detectors
+        .iter_mut()
+        .find(|watch| watch.config.id == generation.declaration.watch)
+        .ok_or_else(|| {
+            AdminFailure::Refused(watch_admin::failure(
+                "NOT_FOUND",
+                "completion watch is not registered",
+            ))
+        })?;
+    if !detector.enabled || detector.revision != intent.watch_revision {
+        return Err(AdminFailure::Refused(watch_admin::failure(
+            "CONFLICT",
+            "completion requires the original enabled watch revision",
+        )));
+    }
+    detector
+        .owner
+        .root_binding(&detector.config.root)
+        .map_err(|error| AdminFailure::Refused(watch_admin::failure("CONFLICT", error)))?;
+    let Owner::Tail(owner) = &mut detector.owner else {
+        return Err(AdminFailure::Refused(watch_admin::failure(
+            "UNSUPPORTED",
+            "completion requires explicit active-file retention authority",
+        )));
+    };
+    owner.finish(intent).map_err(|error| match error {
+        Error::Storage(error) => storage_admission(error),
+        error => AdminFailure::Refused(watch_admin::failure("CONFLICT", error)),
+    })
+}
+
 fn acknowledge<T>(
     reply: tokio::sync::oneshot::Sender<Result<T, sparrow_core::Error>>,
     result: Result<T, AdminFailure>,
@@ -891,6 +937,10 @@ async fn run(
                 }
                 watch_admin::Command::Handoff { intent, reply } => {
                     let result = admit_handoff(&store, &detectors, &intent);
+                    acknowledge(reply, result, &store, &registry, &detectors)?;
+                }
+                watch_admin::Command::TailFinish { intent, reply } => {
+                    let result = admit_tail_finish(&store, &mut detectors, &intent);
                     acknowledge(reply, result, &store, &registry, &detectors)?;
                 }
             }

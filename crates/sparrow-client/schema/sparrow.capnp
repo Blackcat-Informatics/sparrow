@@ -94,7 +94,16 @@ struct TailGeneration {
   startedAt @3 :Instant; offset @4 :UInt64; records @5 :UInt64;
   complete @6 :Bool; gap @7 :OptionalText; replacementEligibleAt @8 :OptionalInstant;
   continuityUnknown @9 :Bool = true;
+  finish @10 :OptionalTailFinish;
 }
+struct TailFinishIntent {
+  storeId @0 :Text; requestId @1 :Text; generationId @2 :Text;
+  watchRevision @3 :UInt64; observed @4 :FileGeneration;
+}
+struct TailFinish {
+  request @0 :TailFinishIntent; admittedAt @1 :Instant; finishedAt @2 :OptionalInstant;
+}
+struct OptionalTailFinish { union { absent @0 :Void; value @1 :TailFinish; } }
 struct TailGenerationQuery { storeId @0 :Text; schemaVersion @1 :UInt32; id @2 :Text; }
 enum SyslogDialect { rfc5424 @0; rfc3164 @1; }
 enum SyslogHeader { timestamp @0; host @1; app @2; procid @3; msgid @4; tag @5; }
@@ -560,4 +569,6 @@ interface Sparrow {
   resultNext @37 (query :ResultNextQuery) -> (result :Result(ResultPage));
   producerStreamGet @38 (query :ProducerStreamQuery) -> (result :Result(ProducerStream));
   tailGenerationGet @39 (query :TailGenerationQuery) -> (result :Result(TailGeneration));
+  tailFinish @40 (request :TailFinishIntent) -> (result :Result(TailGeneration));
+  tailFinishGet @41 (request :TailFinishIntent) -> (result :Result(TailGeneration));
 }

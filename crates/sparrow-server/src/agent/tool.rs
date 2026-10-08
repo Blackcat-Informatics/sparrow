@@ -53,6 +53,31 @@ impl Operation {
         let decode = || -> std::result::Result<Self, DecodeError> {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
+                "file_finish" | "file_finish_get" => {
+                    let observed: Value = fields.required("observed")?;
+                    let mut observation = Record::new(&observed, "final file observation")?;
+                    let intent = sparrow_client::TailFinishIntent {
+                        store_id: fields.required("store_id")?,
+                        request_id: fields.required("request_id")?,
+                        generation_id: fields.required("generation_id")?,
+                        watch_revision: fields
+                            .required_with("watch_revision", super::decimal_u64)?,
+                        observed: sparrow_client::CompletedFileIdentity {
+                            device: observation.required_with("device", super::decimal_u64)?,
+                            inode: observation.required_with("inode", super::decimal_u64)?,
+                            length: observation.required_with("byte_length", super::decimal_u64)?,
+                            modified_seconds: observation.required("modified_seconds")?,
+                            modified_nanos: observation.required("modified_nanos")?,
+                            changed_seconds: observation.required("changed_seconds")?,
+                            changed_nanos: observation.required("changed_nanos")?,
+                        },
+                    };
+                    observation.deny_unknown()?;
+                    Self::Query(Command::TailFinish(super::tail_finish::Input::Finish {
+                        intent,
+                        read_only: name == "file_finish_get",
+                    }))
+                }
                 "file_generation_get" => Self::Query(Command::Tail(super::tail::Input {
                     store: fields.required("store_id")?,
                     id: fields.required("generation_id")?,

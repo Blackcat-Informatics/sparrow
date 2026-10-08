@@ -21,12 +21,14 @@ mod rdf;
 mod read;
 mod records;
 mod result;
+mod retry_file;
 mod search;
 mod selection;
 mod source_time;
 mod sources;
 mod status;
 mod tail;
+mod tail_finish;
 mod watch;
 pub use error::AgentError;
 /// Shared result type preserving typed failures across CLI and MCP.
@@ -39,7 +41,7 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | producer-stream STORE_ID STREAM_ID | file-generation STORE_ID GENERATION_ID",
+    " | producer-stream STORE_ID STREAM_ID | file-generation STORE_ID GENERATION_ID | file-finish-prepare REQUEST_ID STORE_ID GENERATION_ID FINAL_FILE INTENT.capnp | file-finish INTENT.capnp | file-finish-status INTENT.capnp",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR",
@@ -73,6 +75,7 @@ pub(super) enum Command {
     Sources(sources::Input),
     Producer(producer::Input),
     Tail(tail::Input),
+    TailFinish(tail_finish::Input),
     Rdf {
         store: String,
         id: String,
@@ -232,6 +235,11 @@ impl Command {
         }
         if args.first().is_some_and(|arg| arg == "sources") {
             return Ok(Self::Sources(sources::Input::parse(&args[1..])?));
+        }
+        if args.first().is_some_and(|arg| {
+            ["file-finish-prepare", "file-finish", "file-finish-status"].contains(&arg.as_str())
+        }) {
+            return Ok(Self::TailFinish(tail_finish::Input::parse(args)?));
         }
         if args.first().is_some_and(|arg| arg == "file-generation") {
             if args.len() != 3 {
@@ -485,6 +493,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Sources(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::TailFinish(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Tail(input) = self {

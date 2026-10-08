@@ -32,7 +32,7 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 38; the schema sections
+The current source implements schema 39; the schema sections
 below retain their historical qualification evidence.
 
 ## Durable file-completion storage foundation
@@ -49,8 +49,9 @@ and preserved during upgrade; missing checkpoints or unfenced completion
 metadata refuse startup. Older executables cannot safely open the new formats.
 The deployed schema-38 process below still uses format 28; this source foundation
 has not been adopted into that process. No source file was finalized or removed
-by this change. Typed completion coordination, retained final-file byte coverage
-and the completed-tail claim/deletion handoff remain unfinished.
+by that storage-only change. Schema 39 adds typed retained completion coordination
+as described below. Retained final-file byte coverage and the completed-tail
+claim/deletion handoff remain unfinished.
 
 Local `CARGO_BUILD_JOBS=4 make check` passed release Clippy with warnings denied,
 135 storage scenarios, 46 RPC scenarios, the remaining workspace tests and the
@@ -58,6 +59,46 @@ seeded census suite. The pinned cross-workspace gate passed 193 ownership jobs
 with no distinct exceptions. Evidence: `/tmp/sparrow-finish-core-test.log` and
 `/tmp/sparrow-finish-gate.log`. These checks qualify the storage foundation,
 not a deployed completion service or full architecture acceptance.
+
+## Schema 39 explicit retained completion
+
+Source now exposes `tailFinish` and `tailFinishGet` on the same generated service
+over Unix and public TCP. Immutable SDK intents reuse the completed handoff's
+strict bounded retry-file container. CLI `file-finish-prepare`, `file-finish`
+and `file-finish-status`, plus MCP `file_finish` and `file_finish_get`, use that
+one SDK intent and receipt certification path. Local preparation refuses retry
+file replacement and destinations inside enabled intake roots through one
+shared exclusive, synchronized retry-file writer.
+
+The descriptor-owning worker binds the final file observation under the original
+enabled watch revision. Pending completions drain through the existing shared
+operation budget and publication owner. Final captures check size and clocks
+before and after reads, publish the final unterminated line and terminal checkpoint
+atomically, and release the descriptor. An already accepted or empty EOF creates
+no duplicate occurrence. Completed retained files are excluded from readmission;
+changed terminal files require explicit new producer authority.
+
+Restart resumes pending final observations. Changed and missing originals produce
+durable identity/read gaps without resetting checkpoints. A discovered terminal
+generation refusal is distinct from deferred scan capacity or lost coverage, so
+it cannot prevent another missing generation from receiving its gap. Source
+files remain retained; completed-tail claim/deletion and whole-file retained
+byte-cover assembly remain unfinished. Full architecture acceptance remains unmet.
+
+The deployed process remains the schema-38 service described below while the
+schema-39 service changes undergo qualification. No schema-39 adoption is claimed
+by this source description.
+
+The full `CARGO_BUILD_JOBS=4 make check` gate passed release Clippy with warnings
+denied, 135 storage scenarios, 48 RPC scenarios, 14 client unit scenarios and
+the remaining workspace tests. Seeded census self-tests and the pinned
+cross-workspace check passed 199 ownership jobs with zero distinct exceptions.
+Evidence: `/tmp/sparrow-finish-service-gate.log`. The real-daemon cases verify
+TCP/Unix completion, CLI/MCP receipt agreement, unchanged acceptance clocks,
+final unterminated lines, original retry recovery after reopen/source removal,
+no completed-file reimport, multi-read pending recovery and independent
+changed/missing/empty generation outcomes. Publication uses the existing
+operation-budget gate, separately exercised by the tail waiting scenario.
 
 ## Schema 38 daemon adoption and active file capture
 

@@ -4,7 +4,6 @@
 //! Immutable typed completed-file handoff intents and certified admission progress.
 
 use crate::{CompletedFileIdentity, Error, sparrow_capnp as wire};
-use std::io::Read;
 
 /// Preserve this exact intent across retries; do not recapture a replacement path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,33 +115,19 @@ impl CompletedHandoff {
 
     /// Save an immutable Cap'n Proto intent, not a new filesystem observation.
     pub fn write(&self, output: impl std::io::Write) -> Result<(), Error> {
-        let mut message = capnp::message::Builder::new_default();
-        self.encode(message.init_root())?;
-        capnp::serialize::write_message(output, &message)?;
-        Ok(())
+        crate::intent_file::write(output, self)
     }
 
     /// Read one bounded intent; trailing bytes or a second message are refused.
-    pub fn read(mut input: impl std::io::Read) -> Result<Self, Error> {
-        let mut bytes = Vec::new();
-        std::io::Read::by_ref(&mut input)
-            .take(16_385)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 16_384 {
-            return Err(Error::InvalidArgument("handoff intent exceeds 16 KiB"));
-        }
-        let mut slice = bytes.as_slice();
-        let message = capnp::serialize::read_message_from_flat_slice(
-            &mut slice,
-            capnp::message::ReaderOptions {
-                traversal_limit_in_words: Some(2048),
-                nesting_limit: 16,
-            },
-        )?;
-        if !slice.is_empty() {
-            return Err(Error::InvalidArgument("handoff intent has trailing bytes"));
-        }
-        Self::decode(message.get_root()?)
+    pub fn read(input: impl std::io::Read) -> Result<Self, Error> {
+        crate::intent_file::read::<wire::watch_handoff::Owned, _>(input, Self::decode)
+    }
+}
+
+impl crate::intent_file::EncodeIntent for CompletedHandoff {
+    type Wire = wire::watch_handoff::Owned;
+    fn encode_intent(&self, out: wire::watch_handoff::Builder<'_>) -> Result<(), Error> {
+        self.encode(out)
     }
 }
 
@@ -160,15 +145,6 @@ pub struct HandoffReceipt {
 }
 
 impl HandoffReceipt {
-    fn result(
-        value: wire::result::Reader<'_, wire::handoff_receipt::Owned>,
-        expected: &CompletedHandoff,
-    ) -> Result<Self, Error> {
-        match value.which()? {
-            wire::result::Ok(value) => Self::certify(value?, expected),
-            wire::result::Error(error) => Err(Error::domain(error?)),
-        }
-    }
     fn certify(
         value: wire::handoff_receipt::Reader<'_>,
         expected: &CompletedHandoff,
@@ -242,11 +218,15 @@ pub async fn completed_handoff(
     if read_only {
         let mut call = client.watch_handoff_get_request();
         intent.encode(call.get().init_request())?;
-        HandoffReceipt::result(call.send().promise.await?.get()?.get_result()?, intent)
+        crate::receipt::certify_result(call.send().promise.await?.get()?.get_result()?, |value| {
+            HandoffReceipt::certify(value, intent)
+        })
     } else {
         let mut call = client.watch_handoff_request();
         intent.encode(call.get().init_request())?;
-        HandoffReceipt::result(call.send().promise.await?.get()?.get_result()?, intent)
+        crate::receipt::certify_result(call.send().promise.await?.get()?.get_result()?, |value| {
+            HandoffReceipt::certify(value, intent)
+        })
     }
 }
 

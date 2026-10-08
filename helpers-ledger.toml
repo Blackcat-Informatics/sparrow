@@ -19,7 +19,7 @@ names = ['^(encode_cli_handoff_intent|encode_daemon_handoff_intent)$']
 id = "handoff-receipt-certification"
 summary = "Certify the original immutable intent, durable admission phase and publication identity before reporting handoff progress."
 home = "sparrow_client::handoff::HandoffReceipt::certify"
-entry_points = ["sparrow_client::handoff::HandoffReceipt::result"]
+entry_points = ["sparrow_client::handoff::completed_handoff"]
 spec = "docs/development-runtime.md: typed explicit completed handoff."
 vectors = ["crates/sparrow-client/src/handoff.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -577,7 +577,7 @@ names = ['^(open_cli_upload_file|open_sdk_upload_file)$']
 
 [[job]]
 id = "completed-file-stability"
-summary = "One opened-file generation guard covers hashing, raw upload and both accepted-retry and final publication replies."
+summary = "One opened-file generation guard covers hashing, raw upload, explicit tail finish and accepted-retry/final publication replies."
 home = "sparrow_client::imports::CompletedFileIdentity::require"
 entry_points = []
 spec = "docs/interfaces.md: completed descriptor upload and producer receipt certification."
@@ -2885,6 +2885,90 @@ home = "sparrow_core::storage::tail::finished_request"
 entry_points = ["sparrow_core::storage::tail::Store::tail_finish_get", "sparrow_core::storage::tail::Store::tail_finish_start"]
 spec = "docs/interfaces.md: durable file-generation finish admission."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "producer-intent-container"
+summary = "One strict bounded single-message Capnp container owns retry file admission for completed handoff and retained tail completion."
+home = "sparrow_client::intent_file::read"
+entry_points = ["sparrow_client::handoff::CompletedHandoff::read", "sparrow_client::tail_finish::TailFinishIntent::read", "sparrow_client::intent_file::write"]
+spec = "docs/interfaces.md: schema 39 explicit retained completion."
+vectors = ["crates/sparrow-client/src/handoff.rs", "crates/sparrow-client/src/tail_finish.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "producer-intent-local-publication"
+summary = "One exclusive mode-0600 writer synchronizes immutable producer intents and their parent directory outside enabled intake roots."
+home = "sparrow_server::agent::retry_file::save"
+entry_points = ["sparrow_server::agent::watch::Input::execute", "sparrow_server::agent::tail_finish::Input::execute", "sparrow_server::agent::retry_file::parent"]
+spec = "docs/interfaces.md: schema 39 explicit retained completion."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "tail-finish-intent-codec"
+summary = "One SDK-owned generated intent codec bounds immutable store/request/generation authority and reuses the shared file identity codec."
+home = "sparrow_client::tail_finish::TailFinishIntent::encode"
+entry_points = ["sparrow_client::tail_finish::TailFinishIntent::decode", "sparrow_client::tail_finish::TailFinishIntent::read", "sparrow_client::tail_finish::TailFinishIntent::write", "sparrow_server::rpc::Rpc::tail_finish_request"]
+spec = "docs/interfaces.md: schema 39 explicit retained completion."
+vectors = ["crates/sparrow-client/src/tail_finish.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "tail-finish-receipt-certification"
+summary = "One certificate verifies the original admitted producer assertion and exact terminal byte boundary for SDK, CLI and MCP retries."
+home = "sparrow_client::tail_finish::TailFinishReceipt::certify"
+entry_points = ["sparrow_client::tail_finish::tail_finish"]
+spec = "docs/interfaces.md: schema 39 explicit retained completion."
+vectors = ["crates/sparrow-client/src/tail_finish.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "tail-finish-descriptor-admission"
+summary = "The one descriptor owner certifies the producer final observation and updates its held generation after durable finish admission."
+home = "sparrow_server::tailing::TailRoot::finish"
+entry_points = ["sparrow_server::watches::admit_tail_finish"]
+spec = "docs/interfaces.md: schema 39 explicit retained completion."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "typed-receipt-result-union"
+summary = "One generic generated result decoder preserves domain failures and delegates successful typed intent certificates."
+home = "sparrow_client::receipt::certify_result"
+entry_points = ["sparrow_client::handoff::completed_handoff", "sparrow_client::tail_finish::tail_finish"]
+spec = "docs/interfaces.md: schema 39 explicit retained completion."
+vectors = ["crates/sparrow-client/src/handoff.rs", "crates/sparrow-client/src/tail_finish.rs"]
 bench = []
 enforced = true
 [job.forbidden]

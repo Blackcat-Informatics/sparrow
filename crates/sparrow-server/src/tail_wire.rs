@@ -6,6 +6,31 @@
 use crate::sparrow_capnp as wire;
 use purrdf_lex::json::{Object, Value};
 
+pub(crate) fn intent(
+    value: &sparrow_client::TailFinishIntent,
+) -> Result<sparrow_core::TailFinishIntent, sparrow_core::Error> {
+    Ok(sparrow_core::TailFinishIntent {
+        request_id: value.request_id.clone(),
+        generation_id: value.generation_id.clone(),
+        watch_revision: value.watch_revision,
+        observed: crate::consumption::generation(value.observed)
+            .map_err(|error| sparrow_core::Error::new("INVALID_ARGUMENT", error.to_string()))?,
+    })
+}
+
+fn finish_request(
+    value: &sparrow_core::TailFinishIntent,
+    store: &str,
+) -> sparrow_client::TailFinishIntent {
+    sparrow_client::TailFinishIntent {
+        store_id: store.into(),
+        request_id: value.request_id.clone(),
+        generation_id: value.generation_id.clone(),
+        watch_revision: value.watch_revision,
+        observed: crate::consumption::identity(&value.observed),
+    }
+}
+
 fn declaration(
     mut out: wire::tail_declaration::Builder<'_>,
     value: &sparrow_core::TailStart,
@@ -77,6 +102,22 @@ pub(crate) fn generation(
         None => out.reborrow().init_replacement_eligible_at().set_absent(()),
     }
     out.set_continuity_unknown(true);
+    match &value.finish {
+        None => out.reborrow().init_finish().set_absent(()),
+        Some(finish) => {
+            let mut out = out.reborrow().init_finish().init_value();
+            finish_request(&finish.intent, store)
+                .encode(out.reborrow().init_request())
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            out.reborrow()
+                .init_admitted_at()
+                .set_unix_millis(finish.admitted_at);
+            match finish.finished_at {
+                None => out.init_finished_at().set_absent(()),
+                Some(at) => out.init_finished_at().init_value().set_unix_millis(at),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -147,5 +188,40 @@ pub(crate) fn render_generation(
         .with("gap", super::agent::optional_value(value.get_gap()?)?)
         .with("replacement_eligible_at", expires)
         .with("continuity_unknown", value.get_continuity_unknown())
+        .with("finish", render_finish(value.get_finish()?)?)
+        .into())
+}
+
+fn render_finish(value: wire::optional_tail_finish::Reader<'_>) -> crate::AgentResult<Value> {
+    let finish = match value.which()? {
+        wire::optional_tail_finish::Absent(()) => return Ok(Value::Null),
+        wire::optional_tail_finish::Value(finish) => finish?,
+    };
+    let intent = sparrow_client::TailFinishIntent::decode(finish.get_request()?)?;
+    let observed = intent.observed;
+    let finished_at = match finish.get_finished_at()?.which()? {
+        wire::optional_instant::Absent(()) => Value::Null,
+        wire::optional_instant::Value(at) => super::agent::instant(at?)?.into(),
+    };
+    Ok(Object::new()
+        .with("request_id", intent.request_id)
+        .with("generation_id", intent.generation_id)
+        .with("watch_revision", intent.watch_revision.to_string())
+        .with(
+            "admitted_at",
+            super::agent::instant(finish.get_admitted_at()?)?,
+        )
+        .with("finished_at", finished_at)
+        .with(
+            "observed",
+            Object::new()
+                .with("device", observed.device.to_string())
+                .with("inode", observed.inode.to_string())
+                .with("byte_length", observed.length.to_string())
+                .with("modified_seconds", observed.modified_seconds)
+                .with("modified_nanos", observed.modified_nanos)
+                .with("changed_seconds", observed.changed_seconds)
+                .with("changed_nanos", observed.changed_nanos),
+        )
         .into())
 }

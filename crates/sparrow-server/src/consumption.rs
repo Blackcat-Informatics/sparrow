@@ -24,6 +24,8 @@ pub enum Error {
     Io(std::io::Error),
     /// Contradictory or unsupported source/namespace state.
     State(&'static str),
+    /// A discovered declared-finished generation is terminal; this does not defer other scan entries.
+    FinishedGeneration(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -32,7 +34,7 @@ impl std::fmt::Display for Error {
             Self::Storage(e) => std::fmt::Display::fmt(e, f),
             Self::Upload(e) => std::fmt::Display::fmt(e, f),
             Self::Io(e) => std::fmt::Display::fmt(e, f),
-            Self::State(message) => f.write_str(message),
+            Self::State(message) | Self::FinishedGeneration(message) => f.write_str(message),
         }
     }
 }

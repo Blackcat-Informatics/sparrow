@@ -7,6 +7,14 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "file_finish",
+        "Durably admit an immutable producer assertion for a held file generation, then drain through its final size; source files remain retained and admission alone is not completion.",
+    ),
+    (
+        "file_finish_get",
+        "Read original completion progress using the unchanged admitted intent; retries never recapture files or refresh acceptance clocks.",
+    ),
+    (
         "file_generation_get",
         "Read a durable file-generation checkpoint and original raw path/namespace declaration; accepted prefixes do not certify whole-file capture or producer continuity.",
     ),
@@ -131,6 +139,55 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
+        if ["file_finish", "file_finish_get"].contains(name) {
+            let seconds: Value = Object::new().with("type", "integer").into();
+            let nanos: Value = Object::new()
+                .with("type", "integer")
+                .with("minimum", 0_u32)
+                .with("maximum", 999_999_999_u32)
+                .into();
+            properties = properties
+                .with("store_id", string())
+                .with("request_id", string())
+                .with("generation_id", string())
+                .with("watch_revision", string())
+                .with(
+                    "observed",
+                    Object::new()
+                        .with("type", "object")
+                        .with("additionalProperties", false)
+                        .with(
+                            "required",
+                            vec![
+                                "device",
+                                "inode",
+                                "byte_length",
+                                "modified_seconds",
+                                "modified_nanos",
+                                "changed_seconds",
+                                "changed_nanos",
+                            ],
+                        )
+                        .with(
+                            "properties",
+                            Object::new()
+                                .with("device", string())
+                                .with("inode", string())
+                                .with("byte_length", string())
+                                .with("modified_seconds", seconds.clone())
+                                .with("modified_nanos", nanos.clone())
+                                .with("changed_seconds", seconds)
+                                .with("changed_nanos", nanos),
+                        ),
+                );
+            required.extend([
+                "store_id",
+                "request_id",
+                "generation_id",
+                "watch_revision",
+                "observed",
+            ]);
+        }
         if *name == "file_generation_get" {
             properties = properties
                 .with("store_id", string())
@@ -453,6 +510,7 @@ pub(crate) fn definitions() -> Value {
                             "source_time_define",
                             "diagnostic_define",
                             "flush",
+                            "file_finish",
                         ]
                         .contains(name),
                     )

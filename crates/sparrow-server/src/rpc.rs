@@ -160,6 +160,43 @@ impl Rpc {
         crate::handoff::result(out, &request, result)
     }
 
+    async fn tail_finish_request(
+        &self,
+        value: wire::tail_finish_intent::Reader<'_>,
+        out: wire::result::Builder<'_, wire::tail_generation::Owned>,
+        read_only: bool,
+    ) -> capnp::Result<()> {
+        let request = match sparrow_client::TailFinishIntent::decode(value) {
+            Ok(request) => request,
+            Err(error) => {
+                failure(out, invalid(error));
+                return Ok(());
+            }
+        };
+        let result = async {
+            self.check_store(&request.store_id)?;
+            let intent = crate::tail_wire::intent(&request)?;
+            if read_only {
+                self.work(move |store, _| {
+                    store.tail_finish_get(&intent)?.ok_or_else(|| {
+                        Error::new("NOT_FOUND", "tail finish request has not been admitted")
+                    })
+                })
+                .await
+            } else {
+                self.controller()?.tail_finish(intent).await
+            }
+        }
+        .await;
+        match result {
+            Ok(generation) => {
+                crate::tail_wire::generation(out.init_ok(), &generation, &request.store_id)?
+            }
+            Err(error) => failure(out, error),
+        }
+        Ok(())
+    }
+
     async fn work<T: Send + 'static>(
         &self,
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
@@ -1281,6 +1318,32 @@ fn watch_mutation_result(
 }
 
 impl wire::sparrow::Server for Rpc {
+    async fn tail_finish(
+        self: Rc<Self>,
+        params: wire::sparrow::TailFinishParams,
+        mut results: wire::sparrow::TailFinishResults,
+    ) -> capnp::Result<()> {
+        self.tail_finish_request(
+            params.get()?.get_request()?,
+            results.get().init_result(),
+            false,
+        )
+        .await
+    }
+
+    async fn tail_finish_get(
+        self: Rc<Self>,
+        params: wire::sparrow::TailFinishGetParams,
+        mut results: wire::sparrow::TailFinishGetResults,
+    ) -> capnp::Result<()> {
+        self.tail_finish_request(
+            params.get()?.get_request()?,
+            results.get().init_result(),
+            true,
+        )
+        .await
+    }
+
     async fn watch_handoff(
         self: Rc<Self>,
         params: wire::sparrow::WatchHandoffParams,

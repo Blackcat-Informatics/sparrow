@@ -70,6 +70,10 @@ pub(crate) enum Command {
         intent: sparrow_core::ConsumptionHandoff,
         reply: oneshot::Sender<Result<sparrow_core::ConsumptionJournal, sparrow_core::Error>>,
     },
+    TailFinish {
+        intent: sparrow_core::TailFinishIntent,
+        reply: oneshot::Sender<Result<sparrow_core::TailGeneration, sparrow_core::Error>>,
+    },
 }
 
 /// Bounded typed control path to the one worker owning durable watch mutations.
@@ -174,6 +178,13 @@ pub(crate) fn encode_info(
 }
 
 impl WatchController {
+    pub(crate) async fn tail_finish(
+        &self,
+        intent: sparrow_core::TailFinishIntent,
+    ) -> Result<sparrow_core::TailGeneration, sparrow_core::Error> {
+        self.enqueue(|reply| Command::TailFinish { intent, reply })
+            .await
+    }
     pub(crate) async fn submit(&self, action: Action) -> Result<ManagedWatch, sparrow_core::Error> {
         self.enqueue(|reply| Command::Mutation { action, reply })
             .await

@@ -644,14 +644,70 @@ line, and durably sets the original `finished_at` in the same publication batch.
 An empty EOF completion creates no record. Retries preserve earlier occurrence
 IDs and acceptance/expiry clocks. A discontinuity retains the admitted intent and
 accepted prefix without asserting completion. This core path grants neither
-source deletion nor a complete downloadable file. Its daemon/client completion
-surface remains unfinished.
+source deletion nor a complete downloadable file. Schema 39 exposes the
+explicit retained completion coordinator below.
 
 Storage formats 29..32 fence older writers that cannot enforce the admitted
 completion boundary. Stores at 25..28 preserve their entire validated checkpoint
 registry while upgrading to the corresponding family. Missing registries and
 completion authority found beneath an older fence refuse startup; an upgrade
 must never substitute an empty registry for missing checkpoints.
+
+### Schema 39 explicit retained completion
+
+`tailFinish(TailFinishIntent)` admits the original producer assertion through the
+one descriptor-owning watch worker. `tailFinishGet` reads current progress for
+that exact admitted intent, returning `NOT_FOUND` before first admission.
+Both return `TailGeneration` with optional `finish` containing the original
+request, first `admittedAt`, and optional original `finishedAt`. A finished
+checkpoint is not a whole-file artifact. The SDK certifies the original request,
+store, declaration, final size and terminal state before returning a receipt.
+
+First admission requires the original enabled `active_files_retain` watch
+revision, root binding and held device/inode. It checks the final descriptor
+size and nanosecond clocks before durably binding authority. Capture holds the
+same operation semaphore as ordinary tailing, RPC and syslog. Each bounded
+read must still match the admitted final observation before and after reading;
+a change stops at a durable `identity_changed` gap without publishing the
+captured bytes. A final unterminated line is accepted only at the exact final
+boundary. Completion at an already accepted EOF, including an empty file,
+creates no extra occurrence. Source paths are never removed by these calls.
+
+Pending admissions recover against surviving original descriptors after
+restart. Missing generations receive durable `read_gap`; changed final
+observations receive `identity_changed`. A known terminal refusal does not
+defer unrelated scan entries. Capacity/coverage deferrals retain their existing
+missing-generation safeguards. An unchanged completed file is excluded from
+readmission under the same watch revision. A changed declared-terminal inode is
+refused until explicit new producer authority is established. Exact completion
+retries resolve the stored original before present-day watch/path checks,
+including after independent source removal.
+
+The client exports `TailFinishIntent`, `TailFinishReceipt`, `Client::tail_finish`
+and `Client::tail_finish_get`. Immutable local retry files share the completed
+handoff container's 16 KiB ceiling, traversal/nesting limits and refusal of
+trailing bytes/messages. CLI commands are:
+
+```sh
+sparrow SOCKET file-finish-prepare REQUEST_ID STORE_ID GENERATION_ID FINAL_FILE INTENT.capnp
+sparrow SOCKET file-finish INTENT.capnp
+sparrow SOCKET file-finish-status INTENT.capnp
+```
+
+Preparation observes a producer-supplied final file, verifies its original
+tracked device/inode/checkpoint and exclusively saves the synchronized intent
+outside enabled intake roots. It never replaces an existing retry file.
+MCP `file_finish` and `file_finish_get` share the SDK admission/certification
+path. Inputs contain `store_id`, `request_id`, `generation_id`, decimal-string
+`watch_revision`, and `observed` with decimal-string `device`, `inode` and
+`byte_length`, signed integer `modified_seconds`/`changed_seconds`, and integer
+`modified_nanos`/`changed_nanos` in 0..999999999. Persist and retry these exact
+inputs; do not recapture replacement files. Generation reads also expose the
+original completion observation and clocks.
+
+Retained byte-cover assembly and completed-tail claim/deletion handoff remain
+unfinished. Completion grants no deletion authority and never reimports retired
+prefixes to manufacture a complete downloadable file.
 
 Schema 37 exposes `tailGenerationGet` as a finite metadata read guarded by the
 current schema and persistent store identity. CLI `file-generation STORE_ID
@@ -693,8 +749,9 @@ no missing prefix is invented. Status exposes finite `tail_generation_ids`,
 counts accepted occurrences across currently known checkpoints rather than live
 retention membership. Kernel coverage and producer continuity remain separate.
 Active generations bind their watch revision and refuse definition changes or
-removal until resolved. Tail completed handoff and rotated-generation completion
-remain unfinished and are explicitly refused by ordinary consumption admission.
+removal until resolved. Schema 39 provides explicit retained-generation
+completion as above; completed-tail destructive handoff remains unfinished and
+is explicitly refused by ordinary consumption admission.
 
 ### Public TCP and syslog packet interpretation
 

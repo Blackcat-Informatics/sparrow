@@ -3,6 +3,16 @@
 
 use crate::{Error, sparrow_capnp as wire};
 
+pub(crate) fn certify_result<'a, T: capnp::traits::Owned, R>(
+    value: wire::result::Reader<'a, T>,
+    certify: impl FnOnce(T::Reader<'a>) -> Result<R, Error>,
+) -> Result<R, Error> {
+    match value.which()? {
+        wire::result::Ok(value) => certify(value?),
+        wire::result::Error(error) => Err(Error::domain(error?)),
+    }
+}
+
 /// Owned discovery information checked before producer mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {

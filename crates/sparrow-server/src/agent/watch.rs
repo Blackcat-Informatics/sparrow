@@ -111,7 +111,6 @@ impl Input {
                 relative,
                 output,
             } => {
-                use std::{io::Write, os::unix::fs::OpenOptionsExt};
                 let response = client.watch_list_request().send().promise.await?;
                 let list = match response.get()?.get_result()?.which()? {
                     wire::result::Ok(value) => value?,
@@ -120,24 +119,10 @@ impl Input {
                 if list.get_store_id()?.to_str()? != discovery.store_id {
                     return Err(invalid("watch list belongs to another persistent store"));
                 }
-                let parent = std::path::Path::new(output)
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| std::path::Path::new("."));
-                let output_parent =
-                    std::fs::canonicalize(parent).map_err(sparrow_client::Error::Io)?;
+                let parent = super::retry_file::parent(output, list)?;
                 let mut root = None;
                 for watch in list.get_watches()? {
                     let definition = watch.get_definition()?;
-                    if watch.get_enabled() {
-                        let watched_root = std::fs::canonicalize(definition.get_root()?.to_str()?)
-                            .map_err(sparrow_client::Error::Io)?;
-                        if output_parent.starts_with(watched_root) {
-                            return Err(invalid(
-                                "save handoff intents outside enabled consumption roots so the retry identity cannot itself be consumed",
-                            ));
-                        }
-                    }
                     if definition.get_id()?.to_str()? == id {
                         if !watch.get_enabled() || watch.get_revision() != *expected {
                             return Err(invalid(
@@ -162,17 +147,7 @@ impl Input {
                 // Encode before creating an output, then refuse overwriting an existing retry identity.
                 let mut bytes = Vec::new();
                 intent.write(&mut bytes)?;
-                let mut saved = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(output)
-                    .map_err(sparrow_client::Error::Io)?;
-                saved.write_all(&bytes).map_err(sparrow_client::Error::Io)?;
-                saved.sync_all().map_err(sparrow_client::Error::Io)?;
-                std::fs::File::open(parent)
-                    .and_then(|file| file.sync_all())
-                    .map_err(sparrow_client::Error::Io)?;
+                super::retry_file::save(output, &parent, &bytes)?;
                 Ok(Object::new()
                     .with("store_id", intent.store_id)
                     .with("request_id", request.clone())

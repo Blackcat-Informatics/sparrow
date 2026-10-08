@@ -35,6 +35,9 @@ mod imports;
 pub use imports::{CompletedFileIdentity, import_file, import_open_file, open_completed_file};
 mod handoff;
 pub use handoff::{CompletedHandoff, HandoffReceipt, completed_handoff};
+mod intent_file;
+mod tail_finish;
+pub use tail_finish::{TailFinishIntent, TailFinishReceipt, tail_finish};
 mod events;
 pub use events::{
     EventBatch, EventField, EventSpan, FieldValue, MAX_EVENT_BATCH_BYTES, MAX_EVENT_BATCH_EVENTS,
@@ -50,7 +53,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 38;
+pub const SCHEMA_VERSION: u32 = 39;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 

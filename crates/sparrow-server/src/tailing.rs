@@ -6,7 +6,7 @@
 use crate::{ConsumeWatch, consumption::Error, source_file};
 use rustix::fs::OFlags;
 use sparrow_client::CompletedFileIdentity;
-use sparrow_core::{Store, TailGeneration, TailStart};
+use sparrow_core::{Store, TailFinishIntent, TailGeneration, TailStart};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -91,6 +91,19 @@ impl TailRoot {
         source_file::observe(&self.root, relative)
     }
 
+    pub(crate) fn finish(&mut self, intent: &TailFinishIntent) -> Result<TailGeneration, Error> {
+        let held = self.held.get_mut(&(intent.observed.device, intent.observed.inode))
+            .ok_or(Error::State("completion requires the original held generation; wait for reconciliation or inspect its durable gap"))?;
+        if held.generation.id != intent.generation_id {
+            return Err(Error::State(
+                "completion observation belongs to another held generation",
+            ));
+        }
+        crate::consumption::identity(&intent.observed).require(&held.file)?;
+        held.generation = self.store.tail_finish_start(intent, crate::now()?)?;
+        Ok(held.generation.clone())
+    }
+
     pub(crate) fn attach(
         &mut self,
         path: &Path,
@@ -103,6 +116,27 @@ impl TailRoot {
         let key = (expected.device, expected.inode);
         if self.held.contains_key(&key) {
             return Ok(());
+        }
+        let generations = self.store.tail_generations(&config.id)?;
+        for row in &generations {
+            if row.declaration.watch_revision != revision
+                || (row.declaration.device, row.declaration.inode) != key
+                || (!row.complete && row.gap.is_none())
+            {
+                continue;
+            }
+            if row.complete
+                && row.finish.as_ref().is_some_and(|finish| {
+                    crate::consumption::identity(&finish.intent.observed) == expected
+                })
+            {
+                return Ok(());
+            }
+            if row.complete || row.finish.is_some() {
+                return Err(Error::FinishedGeneration(
+                    "terminal declared generation cannot be reimported under the same watch revision; inspect completion and establish new producer authority",
+                ));
+            }
         }
         if self.held.len()
             >= config
@@ -133,15 +167,11 @@ impl TailRoot {
                 "tail source changed during descriptor admission; reconcile before retry",
             ));
         }
-        let generation = self
-            .store
-            .tail_generations(&config.id)?
-            .into_iter()
-            .find(|row| {
-                !row.complete
-                    && row.gap.is_none()
-                    && (row.declaration.device, row.declaration.inode) == key
-            });
+        let generation = generations.into_iter().find(|row| {
+            !row.complete
+                && row.gap.is_none()
+                && (row.declaration.device, row.declaration.inode) == key
+        });
         let generation = match generation {
             Some(generation) => generation,
             None => self.store.tail_start(
@@ -159,6 +189,19 @@ impl TailRoot {
                 crate::now()?,
             )?,
         };
+        if let Some(finish) = &generation.finish
+            && crate::consumption::identity(&finish.intent.observed) != observed
+        {
+            self.store.tail_discontinue(
+                &generation.id,
+                generation.offset,
+                "identity_changed",
+                crate::now()?,
+            )?;
+            return Err(Error::FinishedGeneration(
+                "pending completion no longer matches its original final descriptor observation; accepted checkpoint preserved",
+            ));
+        }
         self.held.insert(
             key,
             Held {
@@ -188,6 +231,23 @@ impl TailRoot {
         let before = CompletedFileIdentity::capture(&held.file.metadata()?);
         if (before.device, before.inode) != key {
             return Err(Error::State("held tail descriptor identity changed"));
+        }
+        let final_identity = held
+            .generation
+            .finish
+            .as_ref()
+            .map(|finish| crate::consumption::identity(&finish.intent.observed));
+        if final_identity.is_some_and(|expected| before != expected) {
+            self.store.tail_discontinue(
+                &held.generation.id,
+                held.generation.offset,
+                "identity_changed",
+                crate::now()?,
+            )?;
+            self.held.remove(&key);
+            return Err(Error::State(
+                "producer changed a declared finished generation; accepted checkpoint preserved and completion refused",
+            ));
         }
         let discontinuity =
             if before.length < held.generation.offset || before.length < held.observed.length {
@@ -219,6 +279,17 @@ impl TailRoot {
             .read_bytes
             .min(usize::try_from(available).unwrap_or(usize::MAX));
         if length == 0 {
+            if final_identity.is_some() {
+                self.store.tail_append(
+                    &held.generation.id,
+                    held.generation.offset,
+                    &[],
+                    true,
+                    crate::now()?,
+                )?;
+                self.held.remove(&key);
+                return Ok(());
+            }
             held.observed = before;
             return Ok(());
         }
@@ -226,6 +297,18 @@ impl TailRoot {
         let read = held.file.read_at(&mut bytes, held.generation.offset)?;
         bytes.truncate(read);
         let after = CompletedFileIdentity::capture(&held.file.metadata()?);
+        if final_identity.is_some_and(|expected| after != expected) {
+            self.store.tail_discontinue(
+                &held.generation.id,
+                held.generation.offset,
+                "identity_changed",
+                crate::now()?,
+            )?;
+            self.held.remove(&key);
+            return Err(Error::State(
+                "producer changed a declared finished generation during capture; no captured bytes were published",
+            ));
+        }
         if after.length < before.length
             || (after.length == before.length
                 && (after.modified_seconds, after.modified_nanos)
@@ -251,15 +334,20 @@ impl TailRoot {
                 "tail source ended before its observed size; checkpoint unchanged",
             ));
         }
+        let complete = final_identity.is_some() && bytes.len() as u64 == available;
         let publication = self.store.tail_append(
             &held.generation.id,
             held.generation.offset,
             &bytes,
-            false,
+            complete,
             crate::now()?,
         )?;
         held.generation.offset = publication.source_end;
         held.observed = after;
+        if complete {
+            self.held.remove(&key);
+            return Ok(());
+        }
         if publication.artifact.is_none() && bytes.len() == self.read_bytes {
             return Err(Error::State(
                 "unfinished tail record exceeds the bounded capture window; source and checkpoint remain unchanged",

@@ -83,6 +83,169 @@ fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, TcpReservatio
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retained_sources_across_reopen()
+ {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use purrdf_lex::json::Object;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("active");
+            std::fs::create_dir(&root).unwrap();
+            let input = root.join("finished.log");
+            std::fs::write(&input, b"first\r\nlast").unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            append_tail_config(&config, &root, "log");
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 1
+            })
+            .await;
+            let status = cli(&socket, &["status"]);
+            let id = status["consume_watches"][0]["tail_generation_ids"][0]
+                .as_str()
+                .unwrap();
+            let store = client.discovery().store_id.clone();
+            let previous =
+                cli(&socket, &["records", "--source", "consume-acceptance"])["rows"][0].clone();
+            let intent_path = dir.path().join("finish.capnp");
+            let prepared = cli(
+                &socket,
+                &[
+                    "file-finish-prepare",
+                    "producer-finish",
+                    &store,
+                    id,
+                    input.to_str().unwrap(),
+                    intent_path.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(prepared["phase"].as_str(), Some("prepared"));
+            let saved = std::fs::read(&intent_path).unwrap();
+            let intent = sparrow_client::TailFinishIntent::read(saved.as_slice()).unwrap();
+            for destination in [intent_path.clone(), root.join("cannot-ingest-intent.capnp")] {
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args([
+                        "file-finish-prepare",
+                        "producer-finish",
+                        &store,
+                        id,
+                        input.to_str().unwrap(),
+                        destination.to_str().unwrap(),
+                    ])
+                    .admitted_output()
+                    .unwrap();
+                assert!(!output.status.success());
+            }
+            assert_eq!(std::fs::read(&intent_path).unwrap(), saved);
+            assert!(!root.join("cannot-ingest-intent.capnp").exists());
+            assert!(matches!(client.tail_finish_get(&intent).await.unwrap_err(),
+            sparrow_client::Error::Domain { ref code, .. } if code == "NOT_FOUND"));
+            let mut changed = intent.clone();
+            changed.observed.length += 1;
+            assert!(matches!(client.tail_finish(&changed).await.unwrap_err(),
+            sparrow_client::Error::Domain { ref code, .. } if code == "CONFLICT"));
+            let admitted = client.tail_finish(&intent).await.unwrap();
+            let finished = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let receipt = client.tail_finish_get(&intent).await.unwrap();
+                    if receipt.finished_at.is_some() {
+                        break receipt;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(finished.admitted_at, admitted.admitted_at);
+            assert_eq!(finished.offset, 11);
+            assert_eq!(finished.records, 2);
+            assert!(finished.gap.is_none());
+            assert_eq!(client.tail_finish(&intent).await.unwrap(), finished);
+            let original_rows =
+                cli(&socket, &["records", "--source", "consume-acceptance"])["rows"].clone();
+            assert_eq!(original_rows.as_array().unwrap().len(), 2);
+            assert!(original_rows.as_array().unwrap().contains(&previous));
+            assert_eq!(std::fs::read(&input).unwrap(), b"first\r\nlast");
+            assert!(!root.join(".sparrow-inflight").exists());
+            let rendered = cli(
+                &socket,
+                &["file-finish-status", intent_path.to_str().unwrap()],
+            );
+            assert_eq!(rendered["complete"].as_bool(), Some(true));
+            let observed = intent.observed;
+            let arguments = Object::new()
+                .with("store_id", store.clone())
+                .with("request_id", intent.request_id.clone())
+                .with("generation_id", id)
+                .with("watch_revision", intent.watch_revision.to_string())
+                .with(
+                    "observed",
+                    Object::new()
+                        .with("device", observed.device.to_string())
+                        .with("inode", observed.inode.to_string())
+                        .with("byte_length", observed.length.to_string())
+                        .with("modified_seconds", observed.modified_seconds)
+                        .with("modified_nanos", observed.modified_nanos)
+                        .with("changed_seconds", observed.changed_seconds)
+                        .with("changed_nanos", observed.changed_nanos),
+                );
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            for (number, operation) in [(2, "file_finish_get"), (3, "file_finish")] {
+                let result = mcp.tool(number, operation, arguments.clone().into()).await;
+                assert_eq!(result["isError"].as_bool(), Some(false));
+                assert_eq!(result["structuredContent"], rendered);
+            }
+            drop(mcp);
+            drop(client);
+            drop(daemon);
+            std::fs::remove_file(&socket).unwrap();
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_coverage().unwrap() == wire::WatchCoverage::Covered
+                    && watch.get_tail_descriptors() == 0
+                    && watch.get_tail_checkpoint_records() == 2
+            })
+            .await;
+            assert_eq!(client.tail_finish_get(&intent).await.unwrap(), finished);
+            assert_eq!(
+                cli(&socket, &["records", "--source", "consume-acceptance"])["rows"],
+                original_rows
+            );
+            std::fs::write(&input, b"producer violated finality\n").unwrap();
+            watch_until(client.capability(), |watch| {
+                matches!(
+                    watch.get_failure().unwrap().which().unwrap(),
+                    wire::optional_text::Value(_)
+                )
+            })
+            .await;
+            assert_eq!(
+                cli(&socket, &["records", "--source", "consume-acceptance"])["rows"],
+                original_rows
+            );
+            assert_eq!(client.tail_finish_get(&intent).await.unwrap(), finished);
+            // Original admission remains recoverable after the producer independently removes the file.
+            std::fs::remove_file(&input).unwrap();
+            assert_eq!(client.tail_finish(&intent).await.unwrap(), finished);
+            assert_eq!(std::fs::read(&intent_path).unwrap(), saved);
+            changed.observed.length = observed.length + 1;
+            assert!(matches!(client.tail_finish(&changed).await.unwrap_err(),
+            sparrow_client::Error::Domain { ref code, .. } if code == "CONFLICT"));
+            drop(client);
+            drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn tail_worker_waits_for_the_shared_operation_budget_without_advancing_or_dropping_input() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("active");
@@ -134,6 +297,153 @@ async fn tail_worker_waits_for_the_shared_operation_budget_without_advancing_or_
     }
     worker.shutdown().await.unwrap();
     assert!(!root.join(".sparrow-inflight").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_missing_generations()
+ {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use std::os::unix::fs::MetadataExt;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("active");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config_path = write_server_config(dir.path(), &data, &socket);
+            append_tail_config(&config_path, &root, "log");
+            let text = std::fs::read_to_string(&config_path)
+                .unwrap()
+                .replace("max_artifact_bytes = 8388608", "max_artifact_bytes = 1024");
+            std::fs::write(&config_path, text).unwrap();
+            let config = sparrow_server::ServerConfig::read(&config_path).unwrap();
+            let store = config.open_store().unwrap();
+            let store_id = store.store_id().unwrap();
+            let directory = root.metadata().unwrap();
+            let mut intents = Vec::new();
+            for name in ["resume.log", "changed.log", "missing.log", "empty.log"] {
+                let path = root.join(name);
+                let bytes = if name == "empty.log" {
+                    Vec::new()
+                } else {
+                    let mut bytes = b"accepted\n".repeat(300);
+                    bytes.extend_from_slice(b"final-without-newline");
+                    bytes
+                };
+                std::fs::write(&path, &bytes).unwrap();
+                let observed =
+                    sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap());
+                let generation = store
+                    .tail_start(
+                        &sparrow_core::TailStart {
+                            request_id: format!("restart-start:{name}"),
+                            watch: "completed".into(),
+                            watch_revision: 1,
+                            directories: sparrow_core::ConsumptionDirectories {
+                                root_device: directory.dev(),
+                                root_inode: directory.ino(),
+                                parent_device: directory.dev(),
+                                parent_inode: directory.ino(),
+                            },
+                            path: name.as_bytes().to_vec(),
+                            source: "consume-acceptance".into(),
+                            format: "log".into(),
+                            device: observed.device,
+                            inode: observed.inode,
+                        },
+                        sparrow_server::now().unwrap(),
+                    )
+                    .unwrap();
+                if !bytes.is_empty() {
+                    store
+                        .tail_append(
+                            &generation.id,
+                            0,
+                            &bytes[..9],
+                            false,
+                            sparrow_server::now().unwrap(),
+                        )
+                        .unwrap();
+                }
+                let intent = sparrow_client::TailFinishIntent {
+                    store_id: store_id.clone(),
+                    request_id: format!("restart-finish:{name}"),
+                    generation_id: generation.id.clone(),
+                    watch_revision: 1,
+                    observed,
+                };
+                store
+                    .tail_finish_start(
+                        &sparrow_core::TailFinishIntent {
+                            request_id: intent.request_id.clone(),
+                            generation_id: generation.id,
+                            watch_revision: 1,
+                            observed: sparrow_core::ConsumptionGeneration {
+                                device: observed.device,
+                                inode: observed.inode,
+                                byte_length: observed.length,
+                                modified: (
+                                    observed.modified_seconds,
+                                    observed.modified_nanos as u32,
+                                ),
+                                changed: (observed.changed_seconds, observed.changed_nanos as u32),
+                            },
+                        },
+                        sparrow_server::now().unwrap(),
+                    )
+                    .unwrap();
+                intents.push(intent);
+            }
+            drop(store);
+            std::fs::write(root.join("changed.log"), b"changed after admission\n").unwrap();
+            std::fs::remove_file(root.join("missing.log")).unwrap();
+            let daemon = start(&config_path, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let receipts = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut receipts = Vec::new();
+                    for intent in &intents {
+                        receipts.push(client.tail_finish_get(intent).await.unwrap());
+                    }
+                    if receipts
+                        .iter()
+                        .all(|receipt| receipt.finished_at.is_some() || receipt.gap.is_some())
+                    {
+                        break receipts;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(receipts[0].finished_at.is_some());
+            assert_eq!(receipts[0].offset, intents[0].observed.length);
+            assert_eq!(receipts[0].records, 301);
+            assert_eq!(receipts[1].gap.as_deref(), Some("identity_changed"));
+            assert_eq!(receipts[2].gap.as_deref(), Some("read_gap"));
+            for receipt in &receipts[1..3] {
+                assert_eq!(receipt.offset, 9);
+                assert!(receipt.finished_at.is_none());
+            }
+            assert_eq!(receipts[3].offset, 0);
+            assert_eq!(receipts[3].records, 0);
+            assert!(receipts[3].finished_at.is_some());
+            assert_eq!(
+                cli(&socket, &["status"])["live_records"].as_str(),
+                Some("303")
+            );
+            for (intent, expected) in intents.iter().zip(&receipts) {
+                assert_eq!(client.tail_finish(intent).await.unwrap(), *expected);
+            }
+            assert!(!root.join(".sparrow-inflight").exists());
+            assert_eq!(
+                std::fs::read(root.join("changed.log")).unwrap(),
+                b"changed after admission\n"
+            );
+            drop(client);
+            drop(daemon);
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5351,7 +5661,17 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 26);
+    assert_eq!(definitions.len(), 28);
+    for (name, read_only) in [("file_finish", false), ("file_finish_get", true)] {
+        assert_eq!(
+            definitions
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+                .unwrap()["annotations"]["readOnlyHint"]
+                .as_bool(),
+            Some(read_only)
+        );
+    }
     assert_eq!(
         definitions
             .iter()
