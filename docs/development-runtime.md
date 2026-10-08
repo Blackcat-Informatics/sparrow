@@ -4,10 +4,53 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 45 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`9103292`; see [durable pressure retirement recovery](#durable-pressure-retirement-recovery) for
+`64b69bc`; see [complete daemon teardown](#complete-daemon-teardown) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Complete daemon teardown
+
+Signed source `64b69bc` routes owned daemon teardown through one coordinator.
+Syslog startup refusal now joins the already-started consume worker, flushes
+storage and removes the owned Unix endpoint. Startup socket refusal, terminal
+serving/worker failure and graceful shutdown use the same owner. A failed join,
+flush or endpoint cleanup does not skip subsequent steps or mask the original
+failure. Normal serving teardown retains the RPC LocalSet while intake workers
+join. Replacement endpoint names remain preserved.
+
+The full release gate and signed source hook passed release Clippy with warnings
+denied, 147 storage scenarios, 57 RPC scenarios, the remaining workspace tests,
+seeded census self-tests and 228 pinned helper ledger jobs with no distinct
+exceptions. Shared syslog configuration and daemon readiness fixtures have one
+implementation. Two new daemon scenarios cover an occupied syslog listener
+during startup and a terminal consume-root identity failure together with a
+replacement endpoint name. They prove primary and cleanup errors remain visible,
+foreign names/listeners survive, corrected configuration reopens the store and
+the durable ingest retry retains its receipt. Both scenarios also passed on
+Btrfs, with source and log retained at
+`~/.local/state/sparrow/shutdown-failure-qualification-ebnxi1sl`.
+
+The selected runtime build followed the source hook; immutable qualified images
+are `~/.local/state/sparrow/shutdown-images-zlr54m4s`. The closed copied corpus at
+`~/.local/state/sparrow/json-pages-qualification-t8z8vohu` preserves all 7,058
+record rows, source/temporal/text results, native scores, artifact groups, 51 keys
+and 286 value occurrences exactly against predecessor evidence. It closes
+gracefully with zero result leases.
+
+Public adoption evidence is `/tmp/sparrow-shutdown-live.xcj03ce5`. The predecessor
+closed gracefully before a closed-store backup and immutable alias replacement.
+The enabled unit now runs PID 98545 on `0.0.0.0:518` and the existing Unix socket,
+with schema 45, format 37 and the same store identity and 212 records. Saved
+handoff/finish intents are retried without fresh imports. TCP/Unix/CLI/MCP
+grouped and JSON pagination, temporal/field witnesses, native text scores and six
+idle peers plus CLI status pass. Final status has zero pins/read leases and
+healthy watches and durability. The first live grouped-driver run overlapped a
+JSON driver's lease and failed its global zero-lease assertion; sequential
+reruns pass. This qualifies outer daemon coordination, not every possible inner
+syslog listener failure or full architecture acceptance. Reboot, production
+volume, filesystem quota, forced physical reclamation and full governed stored
+SPARQL remain unqualified.
 
 ## Durable pressure retirement recovery
 
