@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "agent-pin-mutation"
+summary = "CLI and MCP protect/release evidence through one typed request owner and canonical receipt renderers."
+home = "sparrow_server::agent::pin::Mutation::execute"
+entry_points = ["sparrow_server::agent::Command::execute", "sparrow_server::agent::tool::Operation::execute"]
+spec = "docs/interfaces.md: pin and pin-release CLI operations share MCP mutation semantics."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(execute_cli_pin|execute_mcp_pin|release_cli_pin|release_mcp_pin)$']
+
+[[job]]
 id = "result-lease-retirement"
 summary = "One generic registry removal retires replay memory for every captured result family; the store-scoped dispatcher leaves evidence and pins unchanged."
 home = "sparrow_core::storage::catalog_lease::Reads::release"

@@ -1161,7 +1161,19 @@ sparrow /path/to/rpc.sock status
 sparrow tcp://192.168.2.4:518 status
 sparrow tcp://192.168.2.4:518 records --source SOURCE
 sparrow tcp://192.168.2.4:518 mcp --stdio
+sparrow ENDPOINT pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID...
+sparrow ENDPOINT pin-release REQUEST_ID STORE_ID PIN_ID
 ```
+
+CLI `pin` and `pin-release` use the same mutation request owner and receipt
+renderers as MCP `pin` and `pin_release`. Each concrete target must identify a
+record or artifact in the supplied store; there are one to 10,000 targets and
+positive integer days. The daemon owns durable protection, request retry and
+conflict semantics. A stable request replay returns the original receipt;
+changing arguments refuses. Release takes the immutable pin ID rather than a
+name that could identify a replacement collection. Neither command changes
+ordinary evidence retention or opens another database writer. No schema or
+storage-format change is needed for these existing typed operations.
 
 File input/output and immutable-intent preparation use the client's filesystem.
 Producer-finish/handoff preparation therefore requires access to the actual

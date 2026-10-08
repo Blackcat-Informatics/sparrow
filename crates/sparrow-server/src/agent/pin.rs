@@ -3,10 +3,110 @@
 
 //! Stable-ID pin renewal and one pin receipt renderer for both agent adapters.
 
-use super::{Result, failure, instant, invalid, wire};
+use super::{Result, evidence, failure, instant, invalid, wire};
 use purrdf_lex::json::{Object, Value};
 pub(super) mod read;
 pub(crate) use read::Read;
+
+pub(crate) enum Mutation {
+    Protect {
+        request: String,
+        store: String,
+        name: String,
+        days: u32,
+        targets: Vec<String>,
+    },
+    Release {
+        request: String,
+        store: String,
+        pin: String,
+    },
+}
+
+impl Mutation {
+    pub(super) fn parse(args: &[String], release: bool) -> Result<Self> {
+        if release {
+            if args.len() != 3 {
+                return Err(invalid("usage: pin-release REQUEST_ID STORE_ID PIN_ID"));
+            }
+            return Ok(Self::Release {
+                request: args[0].clone(),
+                store: args[1].clone(),
+                pin: args[2].clone(),
+            });
+        }
+        if args.len() < 5 || args.len() > 10004 {
+            return Err(invalid(
+                "usage: pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID...; one to 10,000 targets",
+            ));
+        }
+        Ok(Self::Protect {
+            request: args[0].clone(),
+            store: args[1].clone(),
+            name: args[2].clone(),
+            days: args[3]
+                .parse()
+                .map_err(|_| invalid("DAYS requires a UInt32 integer"))?,
+            targets: args[4..].to_vec(),
+        })
+    }
+
+    pub(crate) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
+        match self {
+            Self::Protect {
+                request,
+                store,
+                name,
+                days,
+                targets,
+            } => {
+                if targets.len() > 10000 {
+                    return Err(invalid(
+                        "RESOURCE_LIMIT: pin permits at most 10,000 targets",
+                    ));
+                }
+                let mut call = client.pin_request();
+                let mut input = call.get().init_request();
+                input.set_request_id(request);
+                input.set_name(name);
+                input.set_days(*days);
+                let mut list = input.init_targets(targets.len() as u32);
+                for (index, id) in targets.iter().enumerate() {
+                    evidence(list.reborrow().get(index as u32), store, id)?;
+                }
+                let response = call.send().promise.await?;
+                match response.get()?.get_result()?.which()? {
+                    wire::result::Ok(value) => render(value?),
+                    wire::result::Error(error) => Err(failure(error?)),
+                }
+            }
+            Self::Release {
+                request,
+                store,
+                pin,
+            } => {
+                let mut call = client.pin_release_request();
+                let mut input = call.get().init_request();
+                input.set_request_id(request);
+                input.set_store_id(store);
+                input.set_pin_id(pin);
+                let response = call.send().promise.await?;
+                match response.get()?.get_result()?.which()? {
+                    wire::result::Ok(value) => {
+                        let value = value?;
+                        Ok(Object::new()
+                            .with("store_id", value.get_store_id()?.to_str()?)
+                            .with("request_id", value.get_request_id()?.to_str()?)
+                            .with("pin_id", value.get_pin_id()?.to_str()?)
+                            .with("released_at", instant(value.get_released_at()?)?)
+                            .into())
+                    }
+                    wire::result::Error(error) => Err(failure(error?)),
+                }
+            }
+        }
+    }
+}
 
 pub(crate) struct Renewal {
     pub request: String,

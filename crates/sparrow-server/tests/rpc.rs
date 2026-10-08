@@ -6644,6 +6644,53 @@ async fn mcp_exercise(
     let pin_id = pin["result"]["structuredContent"]["pin_id"]
         .as_str()
         .unwrap();
+    assert_eq!(
+        cli(
+            socket,
+            &["pin", "mcp-pin-v1", store, "mcp-case", "1", record]
+        ),
+        pin["result"]["structuredContent"]
+    );
+    for (args, code) in [
+        (
+            vec![
+                "pin",
+                "cli-invalid-store",
+                "store:foreign",
+                "foreign",
+                "1",
+                record,
+            ],
+            "STORE_MISMATCH",
+        ),
+        (
+            vec!["pin", "cli-invalid-days", store, "zero", "0", record],
+            "INVALID_ARGUMENT",
+        ),
+        (
+            vec!["pin", "mcp-pin-v1", store, "changed", "1", record],
+            "CONFLICT",
+        ),
+        (
+            vec![
+                "pin",
+                "cli-invalid-target",
+                store,
+                "target",
+                "1",
+                "not-evidence",
+            ],
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        let rejected = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            .arg(socket)
+            .args(args)
+            .admitted_output()
+            .unwrap();
+        assert!(!rejected.status.success() && rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(code));
+    }
     let cli_renewal = cli(
         socket,
         &["pin-renew", "mcp-renew-v1", store, pin_id, "2", "1"],
@@ -6724,6 +6771,10 @@ async fn mcp_exercise(
         )
         .await;
     assert_eq!(release["result"]["isError"].as_bool(), Some(false));
+    assert_eq!(
+        cli(socket, &["pin-release", "mcp-release-v1", store, pin_id]),
+        release["result"]["structuredContent"]
+    );
     let retry = mcp
         .call(
             12,

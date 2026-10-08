@@ -4340,3 +4340,13 @@ separately been restored; the earlier restoration qualification remains above.
 The [disk follow-up](performance-baseline.md#explicit-release-follow-up) shows
 ten successful source and temporal traversals each without retained-lease
 pressure; the broad capture ceiling and full architecture gaps remain unmet.
+
+## CLI evidence protection parity
+
+The CLI now exposes `pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID...` and
+`pin-release REQUEST_ID STORE_ID PIN_ID`. CLI and MCP use one typed mutation
+owner rather than duplicating request construction or receipt rendering.
+Existing RPC adapter acceptance compares original MCP pin/release receipts with
+CLI stable retries, checks wrong-store, zero-duration, malformed-target and
+conflicting-request refusals, and retains the shared renewal checks. These
+operations use the existing schema 42 daemon contract and need no store migration.

@@ -5,8 +5,7 @@
 
 use super::Result;
 use super::{
-    Command, Options, context, evidence, failure, ingest, instant, invalid, parse_kind, pin, read,
-    status, wire,
+    Command, Options, context, failure, ingest, invalid, parse_kind, pin, read, status, wire,
 };
 use purrdf_lex::json::{
     Object, Value,
@@ -31,18 +30,6 @@ pub(crate) enum Operation {
         offset: u64,
         length: u32,
         encoding: String,
-    },
-    Pin {
-        request: String,
-        name: String,
-        store: String,
-        targets: Vec<String>,
-        days: u32,
-    },
-    Release {
-        request: String,
-        store: String,
-        pin: String,
     },
     Renew(pin::Renewal),
     PinRead(pin::Read),
@@ -349,18 +336,18 @@ impl Operation {
                         .transpose()?
                         .unwrap_or_else(|| "base64".into()),
                 },
-                "pin" => Self::Pin {
+                "pin" => Self::Query(Command::PinMutation(pin::Mutation::Protect {
                     request: fields.required("request_id")?,
                     store: fields.required("store_id")?,
                     name: fields.required("name")?,
                     targets: fields.required("targets")?,
                     days: fields.required("days")?,
-                },
-                "pin_release" => Self::Release {
+                })),
+                "pin_release" => Self::Query(Command::PinMutation(pin::Mutation::Release {
                     request: fields.required("request_id")?,
                     store: fields.required("store_id")?,
                     pin: fields.required("pin_id")?,
-                },
+                })),
                 "pin_renew" => Self::Renew(pin::Renewal {
                     request: fields.required("request_id")?,
                     store: fields.required("store_id")?,
@@ -493,56 +480,6 @@ impl Operation {
                     .with("byte_length", bytes.len().to_string())
                     .with("encoding", encoding)
                     .with("data", data)
-                    .into())
-            }
-            Self::Pin {
-                request,
-                store,
-                name,
-                targets,
-                days,
-            } => {
-                if targets.len() > 10000 {
-                    return Err(invalid(
-                        "RESOURCE_LIMIT: pin tool permits at most 10,000 targets",
-                    ));
-                }
-                let mut call = client.pin_request();
-                let mut input = call.get().init_request();
-                input.set_request_id(&request);
-                input.set_name(&name);
-                input.set_days(days);
-                let mut list = input.init_targets(targets.len() as u32);
-                for (index, id) in targets.iter().enumerate() {
-                    evidence(list.reborrow().get(index as u32), &store, id)?;
-                }
-                let response = call.send().promise.await?;
-                let value = match response.get()?.get_result()?.which()? {
-                    wire::result::Ok(value) => value?,
-                    wire::result::Error(error) => return Err(failure(error?)),
-                };
-                pin::render(value)
-            }
-            Self::Release {
-                request,
-                store,
-                pin,
-            } => {
-                let mut call = client.pin_release_request();
-                let mut input = call.get().init_request();
-                input.set_request_id(&request);
-                input.set_store_id(&store);
-                input.set_pin_id(&pin);
-                let response = call.send().promise.await?;
-                let value = match response.get()?.get_result()?.which()? {
-                    wire::result::Ok(value) => value?,
-                    wire::result::Error(error) => return Err(failure(error?)),
-                };
-                Ok(Object::new()
-                    .with("store_id", value.get_store_id()?.to_str()?)
-                    .with("request_id", value.get_request_id()?.to_str()?)
-                    .with("pin_id", value.get_pin_id()?.to_str()?)
-                    .with("released_at", instant(value.get_released_at()?)?)
                     .into())
             }
         }
