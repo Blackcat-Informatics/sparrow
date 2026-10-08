@@ -4,7 +4,7 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 43 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`316d2c8`; see [artifact grouping](#frozen-artifact-match-groups) for
+`608327f`; see [connection admission](#independent-rpc-connection-admission) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
@@ -4480,3 +4480,48 @@ This is query-behavior qualification on a small copied corpus, not sustained
 performance or full architecture acceptance. Full SPARQL, forced physical
 reclamation, broad capture strategy and complete performance acceptance remain
 unfinished.
+
+## Independent RPC connection admission
+
+Signed source `608327f` separates finite transport admission from simultaneous
+storage work. Previously both semaphores used `max_concurrent_requests`, so four
+idle capabilities could occupy all four connection slots. The daemon now uses
+`max_rpc_connections` for shared Unix/TCP stream leases (1..256, default 16);
+storage operations and intake retain their independent 1..64 budget.
+The 60-second transport lease and typed operation `RESOURCE_LIMIT` remain.
+Excess connections still disconnect before capability admission. No schema,
+store format, runtime dependency or scoring law changed.
+
+Full check and normal signed hook passed 142 storage scenarios, 52 RPC scenarios,
+17 SDK tests, remaining workspace checks and 218 helper ownership rules without
+distinct exceptions. Logs are `/tmp/sparrow-connection-budget-focused.log`,
+`/tmp/sparrow-connection-budget-check.log` and
+`/tmp/sparrow-connection-budget-commit.log`. Real-daemon acceptance holds five idle
+typed peers with one storage permit, verifies a sixth can work, refuses a seventh
+over either transport under the shared six-stream budget, and verifies that
+disconnect returns its permit for successful ingestion. It also verifies the
+default and actionable refusal of zero and oversized configured ceilings.
+
+All matching bins/examples were explicitly rebuilt after the hook
+(`/tmp/sparrow-connection-budget-bins.log`). Installed daemon
+`~/.local/libexec/sparrow/sparrowd-schema43-608327f`, SHA-256
+`88373769f440a155ed861d992b3a1fc879ee3e3d3f33524ee5e142247c7767d6`,
+has sole capability `cap_net_bind_service=ep`. Stable aliases select the new
+immutable images; matching CLI and SDK example bytes are identical to their
+prior schema-43 images. Image paths/hashes and live qualification are in
+`/tmp/sparrow-connection-budget-live.ekl8f0x_`. The enabled unit gracefully stopped
+PID 2455426, captured a closed-store backup and adopted PID 2551939. Startup
+reports 16 connections and four storage operations. The listener remains
+`0.0.0.0:518`, with the same private Unix socket, store identity, format 37,
+212 records, zero pins and healthy owned watches. No intake or producer file
+changed; the new closed backup has not separately been restored.
+
+`idle-report.json` proves six live TCP/Unix MCP clients remain usable while a
+seventh CLI client reads status, with the four-operation budget unchanged.
+Saved public handoff retries and schema-43 grouping regressions pass across
+CLI/MCP/SDK and both transports, preserving receipts, native scores, bytes,
+checkpoint clocks and the producer replacement. Final read handles/bytes are
+zero. The separate
+[concurrent repeat](performance-baseline.md#independent-connection-budget-repeat)
+records zero transport disconnects, explicit storage concurrency refusals and
+successful bounded stable retries. Full architecture acceptance remains unmet.

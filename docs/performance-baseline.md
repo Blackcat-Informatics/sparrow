@@ -336,3 +336,52 @@ turnover, sparse/dense pins, forced reclamation, cache/write-amplification
 measurement, and numerical deployment targets remain required. This baseline
 does not establish whole-store steady-state compression or capacity for the
 intended daily workload.
+
+## Independent connection budget repeat
+
+Signed daemon `608327f` repeats the same copied-corpus workload with four
+simultaneous storage operations and an explicit independent 16-connection
+ceiling. Evidence is
+`~/.local/state/sparrow/connection-budget-qualification-zxoxdknt`: frozen driver,
+configuration, per-phase daemon logs, input/output bytes, native RDF inspections
+and complete report. It clones the closed 7,058-record Btrfs fixture and opens
+only its private Unix/loopback TCP endpoints, with no configured intake. Production
+PID 2551939 remains unchanged throughout qualification.
+
+Five query workers complete 20 traversals each while one sequential importer
+publishes 20 mixed JSON, JSONL, Markdown, log and opaque files, with exact stable
+retries. The timed workload takes 9.014819 seconds, with 1,002 CLI attempts:
+760 successful and 242 typed operation concurrency refusals. There are zero
+transport disconnects and zero staging-journal refusals in this run. The previous
+four-connection run recorded 134 disconnects. This change preserves actionable
+operation overload under a finite transport budget; it does not eliminate
+backpressure or establish a latency/throughput improvement. The collector retains
+its documented bounded retry policy and unchanged mutation arguments. Every
+failure is retained in the report; refusal stdout must be empty.
+
+| Query family | Rows / pages per traversal | p50 ms | inclusive p95 ms |
+| --- | --- | --- | --- |
+| Source records | 286 / 2 | 120.12 | 320.05 |
+| Half-open receipt interval | 3,529 / 24 | 181.27 | 2,084.04 |
+| Scoped native text | 12 / 1 | 118.32 | 204.34 |
+| Source keys | 51 / 1 | 83.80 | 230.75 |
+| Source timestamp values | 286 / 3 | 142.89 | 409.67 |
+
+These timings include CLI startup, bounded backoff and complete pagination;
+explicit release is recorded separately. The 20 durable imports add 140 records
+and 22,044 accepted raw bytes; final count is 7,198. All uploaded original bytes
+match their SHA-256 identities, projection inspections retain the known malformed
+JSONL failures, strict key discovery refuses `INDEX_NOT_READY`, and reopen keeps
+all durable import receipts and five original query answer sets unchanged.
+Read handles and retained read bytes return to zero. The complete collector has
+1,258 CLI attempts, including post-load inspection, reopen and the one intentional
+strict-index refusal; the 242 concurrency refusals are all in the timed load.
+
+Sampled RSS peaks at 168,224 KiB at 100 ms intervals; this is not an allocation or
+true peak bound. Closed file bytes grow from 22,531,779 to 23,061,038; final SST
+files occupy 21,705,586 bytes, blobs 170,895, controls 1,184,557, and WAL zero.
+Allocated space is 23,142,400 bytes. Reopening modifies native engine logs, so this
+is a fresh clone baseline rather than the original immutable artifact size.
+This small warm workload does not establish sustained turnover, sparse/dense pin
+capacity, full-corpus distributions, forced physical recovery or complete
+performance acceptance.
