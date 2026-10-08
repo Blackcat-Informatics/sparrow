@@ -2138,6 +2138,16 @@ impl wire::sparrow::Server for Rpc {
                 let mut states = out.reborrow().init_consume_watches(watches.len() as u32);
                 for (index, watch) in watches.into_iter().enumerate() {
                     let mut state = states.reborrow().get(index as u32);
+                    state.set_tail_admission_waiting(watch.tail_admission_waiting);
+                    state.set_tail_read_bytes(watch.tail_read_bytes);
+                    state.set_tail_descriptors(watch.tail_descriptors);
+                    state.set_tail_checkpoint_records(watch.tail_checkpoint_records);
+                    let mut generations = state
+                        .reborrow()
+                        .init_tail_generation_ids(watch.tail_generation_ids.len() as u32);
+                    for (index, id) in watch.tail_generation_ids.iter().enumerate() {
+                        generations.set(index as u32, id);
+                    }
                     state.set_id(&watch.id);
                     state.set_root(&watch.root);
                     state.set_revision(watch.revision);

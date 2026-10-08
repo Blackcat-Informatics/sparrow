@@ -89,6 +89,23 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
                 },
             )
             .with("directories", u64::from(watch.get_directories()))
+            .with(
+                "tail_generation_ids",
+                Value::array(
+                    watch
+                        .get_tail_generation_ids()?
+                        .iter()
+                        .map(|id| -> Result<Value> { Ok(id?.to_str()?.into()) })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            )
+            .with("tail_admission_waiting", watch.get_tail_admission_waiting())
+            .with("tail_read_bytes", watch.get_tail_read_bytes().to_string())
+            .with("tail_descriptors", u64::from(watch.get_tail_descriptors()))
+            .with(
+                "tail_checkpoint_records",
+                watch.get_tail_checkpoint_records().to_string(),
+            )
             .with("candidates", u64::from(watch.get_candidates()))
             .with("deferred", watch.get_deferred())
             .with("pending_claims", u64::from(watch.get_pending_claims()))

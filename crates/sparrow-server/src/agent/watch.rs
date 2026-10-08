@@ -274,8 +274,22 @@ pub(super) fn definition(value: wire::watch_definition::Reader<'_>) -> Result<Va
         .with("max_directories", definition.max_directories as u64)
         .with("max_candidates", definition.max_candidates as u64)
         .with("recursive", true)
-        .with("mode", "consume")
+        .with(
+            "mode",
+            if definition.producer_contract == crate::ProducerContract::FinishedFiles {
+                "consume"
+            } else {
+                "tail"
+            },
+        )
         .with("readiness", "close_or_idle")
-        .with("producer_contract", "finished_files")
+        .with(
+            "producer_contract",
+            if definition.producer_contract == crate::ProducerContract::FinishedFiles {
+                "finished_files"
+            } else {
+                "active_files_retain"
+            },
+        )
         .into())
 }

@@ -10,9 +10,43 @@ use std::{
     time::{Duration, Instant},
 };
 
+// A child can briefly inherit CLOEXEC sockets before exec closes them.
+static PROCESS_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
+type TcpReservation = (std::net::TcpListener, std::sync::MutexGuard<'static, ()>);
+trait ProcessStart {
+    type Child;
+    fn native_spawn(&mut self) -> std::io::Result<Self::Child>;
+    fn admitted_spawn(&mut self) -> std::io::Result<Self::Child> {
+        let _guard = PROCESS_START.lock().unwrap();
+        self.native_spawn()
+    }
+}
+impl ProcessStart for Command {
+    type Child = Child;
+    fn native_spawn(&mut self) -> std::io::Result<Self::Child> {
+        self.spawn()
+    }
+}
+impl ProcessStart for tokio::process::Command {
+    type Child = tokio::process::Child;
+    fn native_spawn(&mut self) -> std::io::Result<Self::Child> {
+        self.spawn()
+    }
+}
+trait ProcessOutput {
+    fn admitted_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+impl ProcessOutput for Command {
+    fn admitted_output(&mut self) -> std::io::Result<std::process::Output> {
+        let _guard = PROCESS_START.lock().unwrap();
+        self.output()
+    }
+}
+
 struct Daemon(Child);
 
-fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, std::net::TcpListener) {
+fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, TcpReservation) {
+    let guard = PROCESS_START.lock().unwrap();
     // Released bind(0) ports race the kernel's outbound ephemeral allocations.
     static NEXT_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(10240);
     let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
@@ -45,7 +79,258 @@ fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, std::net::Tcp
     let mut text = std::fs::read_to_string(config).unwrap();
     text.push_str(&format!("rpc_tcp_address = \"0.0.0.0:{port}\"\n"));
     std::fs::write(config, text).unwrap();
-    (([127, 0, 0, 1], port).into(), reservation)
+    (([127, 0, 0, 1], port).into(), (reservation, guard))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tail_worker_waits_for_the_shared_operation_budget_without_advancing_or_dropping_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("active");
+    std::fs::create_dir(&root).unwrap();
+    let input = root.join("current.log");
+    std::fs::write(&input, b"n\n").unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    append_tail_config(&config, &root, "log");
+    let config = sparrow_server::ServerConfig::read(&config).unwrap();
+    let store = config.open_store().unwrap();
+    let operations = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let mut lease = Some(operations.acquire().await.unwrap());
+    let registry = sparrow_server::watches::WatchRegistry::default();
+    let worker = sparrow_server::watches::ConsumeWorker::start(
+        store.clone(),
+        &config.consume,
+        socket,
+        registry.clone(),
+        operations.clone(),
+    )
+    .unwrap();
+    for waiting in [true, false] {
+        let state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = registry.snapshot().unwrap().pop().unwrap();
+                if state.tail_admission_waiting == waiting
+                    && state.tail_descriptors == 1
+                    && state.tail_checkpoint_records == u64::from(!waiting)
+                {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.failure.is_none());
+        assert_eq!(
+            store
+                .tail_generation(&state.tail_generation_ids[0])
+                .unwrap()
+                .offset,
+            if waiting { 0 } else { 2 }
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), b"n\n");
+        drop(lease.take());
+    }
+    worker.shutdown().await.unwrap();
+    assert!(!root.join(".sparrow-inflight").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tail_capture_refusal_preserves_bytes_and_missing_recovery_reports_a_durable_gap() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("active");
+            std::fs::create_dir(&root).unwrap();
+            let outside = dir.path().join("outside.log");
+            std::fs::write(&outside, b"outside\n").unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("alias.log")).unwrap();
+            let input = root.join("current.log");
+            let bytes = vec![b'x'; 1025];
+            std::fs::write(&input, &bytes).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_tail_config(&config, &root, "log");
+            let text = std::fs::read_to_string(&config)
+                .unwrap()
+                .replace("max_artifact_bytes = 8388608", "max_artifact_bytes = 1024");
+            std::fs::write(&config, text).unwrap();
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                matches!(
+                    watch.get_failure().unwrap().which().unwrap(),
+                    wire::optional_text::Value(_)
+                )
+            })
+            .await;
+            let status = cli(&socket, &["status"]);
+            let watch = &status["consume_watches"][0];
+            assert_eq!(watch["tail_read_bytes"].as_str(), Some("1024"));
+            assert_eq!(watch["tail_descriptors"].as_u64(), Some(1));
+            assert_eq!(watch["tail_checkpoint_records"].as_str(), Some("0"));
+            let first_id = watch["tail_generation_ids"][0].as_str().unwrap().to_owned();
+            assert_eq!(
+                cli(
+                    &socket,
+                    &["file-generation", &client.discovery().store_id, &first_id]
+                )["offset"]
+                    .as_str(),
+                Some("0")
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), bytes);
+            std::fs::write(&input, b"good\n").unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 1
+                    && watch.get_tail_generation_ids().unwrap().len() == 2
+            })
+            .await;
+            let status = cli(&socket, &["status"]);
+            let second_id = status["consume_watches"][0]["tail_generation_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap())
+                .find(|id| *id != first_id)
+                .unwrap()
+                .to_owned();
+            drop(client);
+            drop(daemon);
+            std::fs::remove_file(&socket).unwrap();
+            std::fs::remove_file(&input).unwrap();
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_coverage().unwrap() == wire::WatchCoverage::Covered
+                    && watch.get_tail_descriptors() == 0
+            })
+            .await;
+            let old = cli(
+                &socket,
+                &["file-generation", &client.discovery().store_id, &second_id],
+            );
+            assert_eq!(old["gap"].as_str(), Some("read_gap"));
+            assert_eq!(old["offset"].as_str(), Some("5"));
+            assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
+            assert!(root.join("alias.log").is_symlink());
+            assert!(!root.join(".sparrow-inflight").exists());
+            drop(client);
+            drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn active_tail_watches_preserve_partial_lines_rotated_descriptors_and_reopened_checkpoints() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use std::io::Write;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("active");
+            std::fs::create_dir(&root).unwrap();
+            let active = root.join("current.jsonl");
+            let mut writer = std::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&active)
+                .unwrap();
+            writer.write_all(b"{\"n\":1}\r\n{\"n\":").unwrap();
+            writer.sync_all().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_tail_config(&config, &root, "jsonl");
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 1 && watch.get_tail_descriptors() == 1
+            })
+            .await;
+            let first = cli(&socket, &["status"]);
+            assert_eq!(
+                first["consume_watches"][0]["definition"]["mode"].as_str(),
+                Some("tail")
+            );
+            assert_eq!(
+                first["consume_watches"][0]["tail_read_bytes"].as_str(),
+                Some("1048576")
+            );
+            let first_id = first["consume_watches"][0]["tail_generation_ids"][0]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let checkpoint = cli(
+                &socket,
+                &["file-generation", &client.discovery().store_id, &first_id],
+            );
+            assert_eq!(checkpoint["offset"].as_str(), Some("9"));
+            assert_eq!(checkpoint["complete"].as_bool(), Some(false));
+            assert!(!root.join(".sparrow-inflight").exists());
+            writer.write_all(b"2}\n").unwrap();
+            writer.sync_all().unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 2
+            })
+            .await;
+            let rotated = root.join("rotated.jsonl");
+            std::fs::rename(&active, &rotated).unwrap();
+            writer.write_all(b"{\"n\":3}\n").unwrap();
+            writer.sync_all().unwrap();
+            std::fs::write(&active, b"{\"n\":4}\n").unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 4 && watch.get_tail_descriptors() == 2
+            })
+            .await;
+            let rows = cli(&socket, &["records", "--source", "consume-acceptance"])["rows"].clone();
+            assert_eq!(rows.as_array().unwrap().len(), 4);
+            assert_eq!(
+                std::fs::read(&rotated).unwrap(),
+                b"{\"n\":1}\r\n{\"n\":2}\n{\"n\":3}\n"
+            );
+            drop(client);
+            drop(daemon);
+            std::fs::remove_file(&socket).unwrap();
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 4 && watch.get_tail_descriptors() == 2
+            })
+            .await;
+            assert_eq!(
+                cli(&socket, &["records", "--source", "consume-acceptance"])["rows"],
+                rows
+            );
+            let before = cli(&socket, &["status"]);
+            let generation_ids = before["consume_watches"][0]["tail_generation_ids"]
+                .as_array()
+                .unwrap();
+            let current_id = generation_ids
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .find(|id| *id != first_id)
+                .unwrap()
+                .to_owned();
+            std::fs::write(&active, b"0\n").unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 5
+                    && watch.get_tail_generation_ids().unwrap().len() == 3
+            })
+            .await;
+            let old = cli(
+                &socket,
+                &["file-generation", &client.discovery().store_id, &current_id],
+            );
+            assert_eq!(old["gap"].as_str(), Some("truncated"));
+            assert_eq!(old["offset"].as_str(), Some("8"));
+            assert_eq!(std::fs::read(&active).unwrap(), b"0\n");
+            assert!(!root.join(".sparrow-inflight").exists());
+            drop(client);
+            drop(writer);
+            drop(daemon);
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -623,7 +908,7 @@ async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages
                     "--cursor",
                     &cursor,
                 ])
-                .output()
+                .admitted_output()
                 .unwrap();
             assert!(!changed.status.success() && changed.stdout.is_empty());
             assert!(String::from_utf8_lossy(&changed.stderr).contains("CONFLICT"));
@@ -663,7 +948,7 @@ async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages
                         "--source",
                         "excluded",
                     ])
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(
@@ -862,7 +1147,7 @@ async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_sha
                 let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(args)
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(
@@ -1056,7 +1341,7 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(args)
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(
@@ -1151,7 +1436,7 @@ async fn bounded_discovery_does_not_read_corrupt_evidence_or_disguise_status_fai
             let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                 .arg(&socket)
                 .args(["keys"])
-                .output()
+                .admitted_output()
                 .unwrap();
             assert!(!output.status.success() && output.stdout.is_empty());
             assert!(String::from_utf8_lossy(&output.stderr).contains("STORAGE_FAILURE"));
@@ -1242,7 +1527,7 @@ async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
             let strict=mcp.tool(request_id,tool,input.with("require_complete_index",true).into()).await;request_id+=1;
             assert_eq!(strict["structuredContent"]["error"]["code"].as_str(),Some("INDEX_NOT_READY"));
             args.extend(["--require-complete-index","true"]);
-            let refused=Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args(&args).output().unwrap();
+            let refused=Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args(&args).admitted_output().unwrap();
             assert!(!refused.status.success() && refused.stdout.is_empty());
         }
         for filter in [Object::new(),Object::new().with("service",Vec::<String>::new()),Object::new().with("severity",vec![""]),Object::new().with("guess_field",vec!["worker"])] {
@@ -1662,6 +1947,20 @@ fn append_consume_config(
     directories: usize,
     candidates: usize,
 ) {
+    append_watch_config(
+        config,
+        &watch_definition(root, "completed", quiet_ms, directories, candidates),
+    );
+}
+
+fn append_tail_config(config: &Path, root: &Path, format: &str) {
+    let mut definition = watch_definition(root, "completed", 0, 16, 16);
+    definition.producer_contract = sparrow_server::ProducerContract::ActiveFilesRetain;
+    definition.format = format.into();
+    append_watch_config(config, &definition);
+}
+
+fn append_watch_config(config: &Path, definition: &sparrow_server::ConsumeWatch) {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -1670,14 +1969,7 @@ fn append_consume_config(
     writeln!(
         file,
         "\n[[consume]]\n{}",
-        toml::to_string(&watch_definition(
-            root,
-            "completed",
-            quiet_ms,
-            directories,
-            candidates
-        ))
-        .unwrap()
+        toml::to_string(definition).unwrap()
     )
     .unwrap();
 }
@@ -1769,12 +2061,12 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         let intent = CompletedHandoff::read(std::fs::File::open(&intent_file).unwrap()).unwrap();
         let saved_bytes = std::fs::read(&intent_file).unwrap();
         let duplicate_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
-            .args(["watch", "handoff-prepare", "explicit-1", "completed", "1", "finished.jsonl", intent_file.to_str().unwrap()]).output().unwrap();
+            .args(["watch", "handoff-prepare", "explicit-1", "completed", "1", "finished.jsonl", intent_file.to_str().unwrap()]).admitted_output().unwrap();
         assert!(!duplicate_prepare.status.success());
         assert_eq!(std::fs::read(&intent_file).unwrap(), saved_bytes);
         let unsafe_intent = root.join("must-not-consume.capnp");
         let unsafe_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
-            .args(["watch", "handoff-prepare", "unsafe-intent", "completed", "1", "finished.jsonl", unsafe_intent.to_str().unwrap()]).output().unwrap();
+            .args(["watch", "handoff-prepare", "unsafe-intent", "completed", "1", "finished.jsonl", unsafe_intent.to_str().unwrap()]).admitted_output().unwrap();
         assert!(!unsafe_prepare.status.success()); assert!(!unsafe_intent.exists());
         assert!(matches!(client.handoff_get(&intent).await, Err(sparrow_client::Error::Domain { code, .. }) if code == "NOT_FOUND"));
         for variation in 0..4 {
@@ -1911,7 +2203,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
                         expected,
                         definition_file.to_str().unwrap(),
                     ])
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!failed.status.success());
                 assert!(String::from_utf8_lossy(&failed.stderr).contains("CONFLICT"));
@@ -2130,7 +2422,7 @@ async fn removed_watch_keeps_durable_claim_recovery_and_refuses_root_rebinding()
                     "2",
                     definition.to_str().unwrap(),
                 ])
-                .output()
+                .admitted_output()
                 .unwrap();
             assert!(!failed.status.success());
             assert!(String::from_utf8_lossy(&failed.stderr).contains("CONFLICT"));
@@ -2194,7 +2486,7 @@ fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
     let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
         .arg("--config")
         .arg(&config)
-        .output()
+        .admitted_output()
         .unwrap();
     assert!(!result.status.success());
     assert!(!socket.exists());
@@ -2472,8 +2764,14 @@ async fn configured_consumer_recovers_confirmed_journal_and_reports_late_write_w
                     ids.push(journal.import_id);
                 }
                 assert!(
-                    ConsumeWorker::start(store, &[], socket.clone(), WatchRegistry::default())
-                        .is_err()
+                    ConsumeWorker::start(
+                        store,
+                        &[],
+                        socket.clone(),
+                        WatchRegistry::default(),
+                        std::sync::Arc::new(tokio::sync::Semaphore::new(4))
+                    )
+                    .is_err()
                 );
                 (ids.remove(0), ids.remove(0))
             };
@@ -2538,7 +2836,7 @@ async fn consume_coverage_limit_and_root_replacement_fail_without_source_retirem
                 .arg("--config")
                 .arg(&config)
                 .stdout(Stdio::null())
-                .spawn()
+                .admitted_spawn()
                 .unwrap(),
         );
         let preserved = if replace_root {
@@ -3710,7 +4008,7 @@ async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identit
         let token = second.buffered_through.unwrap();
         let cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow"))
             .arg(&socket).args(["flush", &token.store_id, &token.session_id, &token.sequence.to_string()])
-            .output().await.unwrap();
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).admitted_spawn().unwrap().wait_with_output().await.unwrap();
         assert!(cli.status.success(), "{}", String::from_utf8_lossy(&cli.stderr));
         assert!(String::from_utf8_lossy(&cli.stdout).contains("\"durability\":\"durable\""));
         assert_eq!(client.artifact(&second.id).await.unwrap().durability, wire::Durability::Durable);
@@ -4090,7 +4388,7 @@ async fn start(config: &Path, socket: &Path) -> Daemon {
             .arg("--config")
             .arg(config)
             .stdout(Stdio::null())
-            .spawn()
+            .admitted_spawn()
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -4567,7 +4865,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     let overwrite = Command::new(env!("CARGO_BIN_EXE_sparrow"))
         .arg(socket)
         .args(["bytes", &store, &id, "0", "1", exported.to_str().unwrap()])
-        .output()
+        .admitted_output()
         .unwrap();
     assert!(!overwrite.status.success());
     assert_eq!(std::fs::read(&exported).unwrap(), bytes);
@@ -4721,7 +5019,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
         .arg(socket)
         .args(["keys", "--decoded", "hello"])
-        .output()
+        .admitted_output()
         .unwrap();
     assert!(!invalid.status.success());
     assert!(invalid.stdout.is_empty());
@@ -4927,7 +5225,7 @@ impl Mcp {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .admitted_spawn()
             .unwrap();
         let input = child.stdin.take();
         let output = tokio::io::BufReader::new(child.stdout.take().unwrap());
@@ -6075,7 +6373,7 @@ fn cli(socket: &Path, args: &[&str]) -> purrdf_lex::json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
         .arg(socket)
         .args(args)
-        .output()
+        .admitted_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -6111,7 +6409,7 @@ async fn typed_queries_and_exact_bytes_survive_daemon_crash() {
                     "--cursor",
                     &cursor,
                 ])
-                .output()
+                .admitted_output()
                 .unwrap();
             assert!(!expired.status.success());
             assert!(expired.stdout.is_empty());
@@ -6236,7 +6534,7 @@ async fn artifact_diagnostic_scope_reports_unknown_membership_through_cli_and_mc
                     path,
                     "--require-complete-index",
                 ])
-                .output()
+                .admitted_output()
                 .unwrap();
             assert!(!output.status.success() && output.stdout.is_empty());
             assert!(String::from_utf8_lossy(&output.stderr).contains("INDEX_NOT_READY"));
@@ -6443,7 +6741,7 @@ async fn record_pages_share_frozen_ranked_receipts_after_pin_release_in_cli_and_
                 let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(arguments)
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(
@@ -6529,7 +6827,7 @@ async fn record_pages_enforce_agent_byte_ceilings_and_scan_refusal() {
             let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                 .arg(&socket)
                 .args(["records", "--source", "page-source", "--scan-budget", "1"])
-                .output()
+                .admitted_output()
                 .unwrap();
             assert!(!output.status.success() && output.stdout.is_empty());
             assert!(String::from_utf8_lossy(&output.stderr).contains("RESOURCE_LIMIT"));
@@ -6718,7 +7016,7 @@ async fn standalone_text_pages_freeze_native_ranking_and_refuse_cross_operation_
                 let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(arguments)
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(
@@ -6915,7 +7213,7 @@ async fn json_pages_replay_cli_mcp_counts_and_occurrences_and_bind_operations() 
                 let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(args)
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(
@@ -7161,7 +7459,7 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(["result-next", store, cursor])
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!out.status.success() && out.stdout.is_empty());
                 assert!(String::from_utf8_lossy(&out.stderr).contains(code));
@@ -7358,7 +7656,7 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
                     "--scan-budget",
                     "1000",
                 ])
-                .output()
+                .admitted_output()
                 .unwrap();
             assert!(!output.status.success() && output.stdout.is_empty());
             assert!(String::from_utf8_lossy(&output.stderr).contains("RESOURCE_LIMIT"));
@@ -7571,7 +7869,7 @@ async fn key_paths_share_native_counts_cursor_binding_and_typed_cli_mcp_admissio
                 let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(["keys", "--path", path])
-                    .output()
+                    .admitted_output()
                     .unwrap();
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(String::from_utf8_lossy(&output.stderr).contains("INVALID_ARGUMENT"));

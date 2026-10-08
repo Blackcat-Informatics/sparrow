@@ -6,9 +6,11 @@
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
 mod config;
 mod diagnostics;
+mod source_file;
 pub mod syslog_listener;
 mod syslog_wire;
 mod tail_wire;
+mod tailing;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;

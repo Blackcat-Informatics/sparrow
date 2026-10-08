@@ -90,20 +90,24 @@ pub(crate) fn decode_definition(
 ) -> Result<ConsumeWatch, sparrow_core::Error> {
     use crate::sparrow_capnp as wire;
     let decode = || -> capnp::Result<ConsumeWatch> {
-        if value.get_mode()? != wire::WatchMode::Consume
-            || !value.get_recursive()
-            || value.get_readiness()? != wire::WatchReadiness::CloseOrIdle
-        {
+        if !value.get_recursive() || value.get_readiness()? != wire::WatchReadiness::CloseOrIdle {
             return Err(capnp::Error::failed(
-                "only recursive consume/closeOrIdle is implemented; tail is unfinished".into(),
+                "only recursive watches with closeOrIdle readiness are implemented".into(),
             ));
         }
-        if !matches!(
-            value.get_authority()?.which()?,
-            wire::watch_authority::FinishedFilesDeleteAfterDurablePublish(())
-        ) {
-            return Err(capnp::Error::failed("explicit finished-file producer contract and durable-source retirement authority are required".into()));
-        }
+        let producer_contract = match (value.get_mode()?, value.get_authority()?.which()?) {
+            (
+                wire::WatchMode::Consume,
+                wire::watch_authority::FinishedFilesDeleteAfterDurablePublish(()),
+            ) => crate::ProducerContract::FinishedFiles,
+            (wire::WatchMode::Tail, wire::watch_authority::ActiveFilesRetain(())) => {
+                crate::ProducerContract::ActiveFilesRetain
+            }
+            _ => return Err(capnp::Error::failed(
+                "watch mode requires its explicit matching producer contract and source authority"
+                    .into(),
+            )),
+        };
         let id = value.get_id()?.to_str()?;
         let root = value.get_root()?.to_str()?;
         let source = value.get_source()?.to_str()?;
@@ -117,7 +121,7 @@ pub(crate) fn decode_definition(
             root: root.into(),
             source: source.into(),
             format: sparrow_client::format_label(value.get_format()?).into(),
-            producer_contract: crate::ProducerContract::FinishedFiles,
+            producer_contract,
             quiet_ms: value.get_quiet_ms(),
             max_directories: value.get_max_directories() as usize,
             max_candidates: value.get_max_candidates() as usize,
@@ -143,10 +147,18 @@ pub(crate) fn encode_definition(
     out.set_max_directories(value.max_directories as u32);
     out.set_max_candidates(value.max_candidates as u32);
     out.set_recursive(true);
-    out.set_mode(crate::sparrow_capnp::WatchMode::Consume);
     out.set_readiness(crate::sparrow_capnp::WatchReadiness::CloseOrIdle);
-    out.init_authority()
-        .set_finished_files_delete_after_durable_publish(());
+    match value.producer_contract {
+        crate::ProducerContract::FinishedFiles => {
+            out.set_mode(crate::sparrow_capnp::WatchMode::Consume);
+            out.init_authority()
+                .set_finished_files_delete_after_durable_publish(());
+        }
+        crate::ProducerContract::ActiveFilesRetain => {
+            out.set_mode(crate::sparrow_capnp::WatchMode::Tail);
+            out.init_authority().set_active_files_retain(());
+        }
+    }
     Ok(())
 }
 

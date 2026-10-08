@@ -23,17 +23,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("sparrowd: capnp_tcp={}", listener.local_addr()?);
     }
     let store = config.open_store()?;
+    let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let watches = sparrow_server::watches::WatchRegistry::default();
     let mut consumer = Some(sparrow_server::watches::ConsumeWorker::start(
         store.clone(),
         &config.consume,
         config.socket_path.clone(),
         watches.clone(),
+        operations.clone(),
     )?);
     // Validate the watch catalog before publishing an endpoint, and refuse an existing socket.
     let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
     std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
-    let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let connections = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
     let mut syslog = if config.syslog.is_empty() {

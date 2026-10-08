@@ -3,15 +3,13 @@
 
 //! Anchored completed-file claims. Readiness and discovery belong to the watcher.
 
-use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags};
+use crate::source_file::{BENEATH, open};
+use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
 use sparrow_client::{ArtifactReceipt, Client, CompletedFileIdentity};
 use sparrow_core::{ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, Store};
 use std::{
     fs::File,
-    os::{
-        fd::AsFd,
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::Path,
 };
 
@@ -61,17 +59,6 @@ impl From<rustix::io::Errno> for Error {
 }
 
 const INFLIGHT: &str = ".sparrow-inflight";
-const BENEATH: ResolveFlags = ResolveFlags::BENEATH
-    .union(ResolveFlags::NO_SYMLINKS)
-    .union(ResolveFlags::NO_XDEV);
-
-fn open(dir: impl AsFd, path: &Path, flags: OFlags, resolve: ResolveFlags) -> Result<File, Error> {
-    fs::openat2(dir, path, flags | OFlags::CLOEXEC | OFlags::NONBLOCK, if flags.contains(OFlags::CREATE) { Mode::from_raw_mode(0o600) } else { Mode::empty() }, resolve)
-        .map(File::from).map_err(|error| {
-            if error == rustix::io::Errno::NOSYS { Error::State("completed consumption requires Linux openat2; no weaker path-resolution fallback is admitted") }
-            else { Error::from(error) }
-        })
-}
 
 fn observation(file: &File) -> Result<ConsumptionGeneration, Error> {
     generation(CompletedFileIdentity::capture(&file.metadata()?))
@@ -187,62 +174,19 @@ pub enum Recovery {
 impl ClaimRoot {
     /// Open a discovery directory beneath the held root without following symlinks.
     pub(crate) fn directory(&self, relative: &Path) -> Result<File, Error> {
-        open(
-            &self.root,
-            if relative.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                relative
-            },
-            OFlags::RDONLY | OFlags::DIRECTORY,
-            BENEATH,
-        )
+        crate::source_file::directory(&self.root, relative)
     }
 
     /// Verify the configured root still names this owner, including its parents.
     pub(crate) fn root_binding(&self, path: &Path) -> Result<(), Error> {
         self.private_namespace()?;
-        let linked = open(
-            fs::CWD,
-            path,
-            OFlags::RDONLY | OFlags::DIRECTORY,
-            ResolveFlags::NO_SYMLINKS,
-        )?;
-        let linked = linked.metadata()?;
-        let held = self.root.metadata()?;
-        if linked.dev() != held.dev() || linked.ino() != held.ino() {
-            return Err(Error::State(
-                "configured consume root changed; preserve pending claims and restore its exact binding",
-            ));
-        }
-        Ok(())
+        crate::source_file::root_binding(&self.root, path)
     }
 
     /// Observe a directory-relative file without opening it or generating IN_OPEN.
     /// The only followed alias is the kernel-owned procfs descriptor for this held parent.
     pub(crate) fn observe(&self, relative: &Path) -> Result<Option<CompletedFileIdentity>, Error> {
-        use std::os::fd::AsRawFd;
-        let parent = match self.parent(relative) {
-            Ok(parent) => parent,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        let name = relative
-            .file_name()
-            .ok_or(Error::State("discovery requires a relative filename"))?;
-        let path =
-            std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name);
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if !metadata.is_file() || metadata.dev() != self.root.metadata()?.dev() {
-            return Ok(None);
-        }
-        Ok(Some(CompletedFileIdentity::capture(&metadata)))
+        crate::source_file::observe(&self.root, relative)
     }
 
     /// Open an admitted producer root; never follow symlinks or overlap store data.
@@ -253,19 +197,7 @@ impl ClaimRoot {
                 "require a bounded watch identity and absolute producer root",
             ));
         }
-        let root = open(
-            fs::CWD,
-            path,
-            OFlags::RDONLY | OFlags::DIRECTORY,
-            ResolveFlags::NO_SYMLINKS,
-        )?;
-        let location = std::fs::canonicalize(path)?;
-        let data = std::fs::canonicalize(store.data_path()?)?;
-        if location.starts_with(&data) || data.starts_with(&location) {
-            return Err(Error::State(
-                "producer root must not overlap Sparrow's own database",
-            ));
-        }
+        let root = crate::source_file::root(&store, path)?;
         let root_identity = CompletedFileIdentity::capture(&root.metadata()?);
         let pending = store
             .consumption_pending()?
@@ -348,26 +280,11 @@ impl ClaimRoot {
     }
 
     fn parent(&self, relative: &Path) -> Result<File, Error> {
-        open(
-            &self.root,
-            relative
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-            OFlags::RDONLY | OFlags::DIRECTORY,
-            BENEATH,
-        )
+        crate::source_file::parent(&self.root, relative)
     }
 
     fn directories(&self, parent: &File) -> Result<ConsumptionDirectories, Error> {
-        let root = CompletedFileIdentity::capture(&self.root.metadata()?);
-        let parent = CompletedFileIdentity::capture(&parent.metadata()?);
-        Ok(ConsumptionDirectories {
-            root_device: root.device,
-            root_inode: root.inode,
-            parent_device: parent.device,
-            parent_inode: parent.inode,
-        })
+        crate::source_file::directories(&self.root, parent)
     }
 
     fn scope(&self, journal: &ConsumptionJournal) -> Result<(), Error> {

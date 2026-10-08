@@ -243,7 +243,7 @@ names = ['^(render_watch_status_definition|render_watch_list_definition)$']
 id = "watch-test-definition"
 summary = "Shared dev-only watch definition scaffolding serves startup, dynamic administration and recovery scenarios without copied configuration serializers."
 home = "sparrow_server::test_crate::rpc::watch_definition"
-entry_points = ["sparrow_server::test_crate::rpc::append_consume_config"]
+entry_points = ["sparrow_server::test_crate::rpc::append_consume_config", "sparrow_server::test_crate::rpc::append_tail_config"]
 spec = "docs/development-runtime.md: durable typed watch administration."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -284,7 +284,7 @@ names = ['^(validate_cli_watch|validate_worker_watch)$']
 [[job]]
 id = "consume-discovery-observation"
 summary = "Observe regular files without generating candidate IN_OPEN, using a held no-symlink parent descriptor and the SDK generation capture owner."
-home = "sparrow_server::consumption::ClaimRoot::observe"
+home = "sparrow_server::source_file::observe"
 entry_points = ["sparrow_server::consumption::ClaimRoot::directory", "sparrow_server::consumption::ClaimRoot::root_binding"]
 spec = "docs/development-runtime.md: configured recursive completed consumption."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
@@ -382,7 +382,7 @@ names = ['^(read_test_server_config|open_test_server_store)$']
 [[job]]
 id = "claim-anchored-open"
 summary = "One safe openat2 owner opens the admitted root and descriptor-relative no-symlink/no-mount-crossing children, with nonblocking special-file admission and no weak kernel fallback."
-home = "sparrow_server::consumption::open"
+home = "sparrow_server::source_file::open"
 entry_points = ["sparrow_server::consumption::ClaimRoot::open"]
 spec = "docs/development-runtime.md: anchored filesystem claim coordination."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
@@ -2756,7 +2756,7 @@ names = ['^(commit_tail_offset_after_ingestion|reimport_checkpointed_tail_bytes)
 id = "file-generation-registry"
 summary = "One bounded native catalog decoder validates active and terminal file-generation checkpoints and startup state."
 home = "sparrow_core::storage::tail::registry"
-entry_points = ["sparrow_core::storage::tail::Store::tail_start", "sparrow_core::storage::tail::Store::tail_generation", "sparrow_core::storage::tail::Store::tail_discontinue"]
+entry_points = ["sparrow_core::storage::tail::Store::tail_start", "sparrow_core::storage::tail::Store::tail_generation", "sparrow_core::storage::tail::Store::tail_discontinue", "sparrow_core::storage::tail::Store::tail_generations"]
 spec = "docs/interfaces.md: file-generation checkpoint core."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2786,6 +2786,90 @@ summary = "CLI and MCP records, contexts and generation reads share native raw-p
 home = "sparrow_server::tail_wire::render_declaration"
 entry_points = ["sparrow_server::tail_wire::render_position", "sparrow_server::tail_wire::render_generation"]
 spec = "docs/interfaces.md: schema 37 file-generation queries."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "shared-source-root-admission"
+summary = "One anchored no-symlink root admission rejects database overlap for completed claims and active tails."
+home = "sparrow_server::source_file::root"
+entry_points = ["sparrow_server::consumption::ClaimRoot::open", "sparrow_server::tailing::TailRoot::open"]
+spec = "docs/interfaces.md: schema 38 active file capture."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "shared-source-directory-identities"
+summary = "Original root and parent descriptor identities have one capture owner across claim and tail declarations."
+home = "sparrow_server::source_file::directories"
+entry_points = ["sparrow_server::consumption::ClaimRoot::directories", "sparrow_server::tailing::TailRoot::attach"]
+spec = "docs/interfaces.md: schema 38 active file capture."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "active-file-checkpoint-attachment"
+summary = "Opened regular descriptors resume the original finite registry identity or declare one new generation through the core owner."
+home = "sparrow_server::tailing::TailRoot::attach"
+entry_points = ["sparrow_server::watches::Detector::candidate"]
+spec = "docs/interfaces.md: schema 38 active file capture."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "active-file-descriptor-draining"
+summary = "One round-robin bounded positional reader preserves partial lines and atomically publishes accepted prefixes through Store::tail_append."
+home = "sparrow_server::tailing::TailRoot::drain"
+entry_points = ["sparrow_server::watches::run"]
+spec = "docs/interfaces.md: schema 38 active file capture."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "watch-configuration-test-publication"
+summary = "Consume and tail acceptance use one native TOML definition publication fixture."
+home = "sparrow_server::test_crate::rpc::append_watch_config"
+entry_points = ["sparrow_server::test_crate::rpc::append_consume_config", "sparrow_server::test_crate::rpc::append_tail_config"]
+spec = "docs/interfaces.md: schema 38 active file capture."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "test-child-socket-admission"
+summary = "Native process starts and TCP reservations share one harness lock so forked children cannot hold a released reservation before exec."
+home = "sparrow_server::test_crate::rpc::ProcessStart::admitted_spawn"
+entry_points = ["sparrow_server::test_crate::rpc::configure_tcp_listener"]
+spec = "docs/interfaces.md: schema 38 active file capture qualification."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true

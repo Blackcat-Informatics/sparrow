@@ -54,6 +54,8 @@ pub struct ServerConfig {
 pub enum ProducerContract {
     /// Producers hand off finished files and never append after handoff.
     FinishedFiles,
+    /// Observe append-only active files without claiming or removing them.
+    ActiveFilesRetain,
 }
 
 /// Bounded recursive completed-input watch; no default deletion authority.
@@ -168,6 +170,14 @@ impl ConsumeWatch {
                 || !(1..=16384).contains(&watch.max_candidates)
             {
                 return Err("consume requires unique bounded identities, absolute roots, quiet_ms <= 600000, max_directories 1..4096 and max_candidates 1..16384".into());
+            }
+            if watch.producer_contract == ProducerContract::ActiveFilesRetain
+                && (!["log", "jsonl"].contains(&watch.format.as_str())
+                    || watch.max_candidates > sparrow_core::MAX_TAIL_GENERATIONS)
+            {
+                return Err(
+                    "tail requires log/jsonl and max_candidates <= 64 retained descriptors".into(),
+                );
             }
             sparrow_client::parse_format(&watch.format)?;
             if roots.iter().any(|other: &PathBuf| {

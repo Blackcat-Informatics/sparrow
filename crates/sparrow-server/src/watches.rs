@@ -67,6 +67,16 @@ pub struct WatchStatus {
     pub coverage_losses: u64,
     /// Most recent unresolved bounded operational failure.
     pub failure: Option<String>,
+    /// Finite retained checkpoint identities, including known terminal generations.
+    pub tail_generation_ids: Vec<String>,
+    /// Hard bytes in one active file capture.
+    pub tail_read_bytes: u64,
+    /// Held current or rotated regular file descriptors.
+    pub tail_descriptors: u32,
+    /// Accepted occurrences across currently known generation checkpoints.
+    pub tail_checkpoint_records: u64,
+    /// Publication is waiting for the shared daemon operation budget.
+    pub tail_admission_waiting: bool,
 }
 
 /// One shared bounded snapshot owner for worker updates and typed RPC status.
@@ -89,26 +99,42 @@ impl WatchRegistry {
     ) -> Result<(), Error> {
         let states = detectors
             .iter()
-            .map(|detector| WatchStatus {
-                id: detector.config.id.clone(),
-                root: detector.config.root.to_string_lossy().into_owned(),
-                definition: detector.config.clone(),
-                revision: detector.revision,
-                enabled: detector.enabled,
-                covered: detector.covered,
-                directories: detector.directories.len() as u32,
-                candidates: detector.candidates.len() as u32,
-                deferred: detector.deferred,
-                pending: pending
-                    .iter()
-                    .filter(|journal| journal.watch == detector.config.id)
-                    .count() as u32,
-                completed: detector.completed,
-                reconciliations: detector.reconciliations,
-                coverage_losses: detector.coverage_losses,
-                failure: detector.failure.clone(),
+            .map(|detector| {
+                let (
+                    tail_generation_ids,
+                    tail_read_bytes,
+                    tail_descriptors,
+                    tail_checkpoint_records,
+                ) = match &detector.owner {
+                    Owner::Consume(_) => (Vec::new(), 0, 0, 0),
+                    Owner::Tail(owner) => owner.status(&detector.config.id)?,
+                };
+                Ok(WatchStatus {
+                    id: detector.config.id.clone(),
+                    root: detector.config.root.to_string_lossy().into_owned(),
+                    definition: detector.config.clone(),
+                    revision: detector.revision,
+                    enabled: detector.enabled,
+                    covered: detector.covered,
+                    directories: detector.directories.len() as u32,
+                    candidates: detector.candidates.len() as u32,
+                    deferred: detector.deferred,
+                    pending: pending
+                        .iter()
+                        .filter(|journal| journal.watch == detector.config.id)
+                        .count() as u32,
+                    completed: detector.completed,
+                    reconciliations: detector.reconciliations,
+                    coverage_losses: detector.coverage_losses,
+                    failure: detector.failure.clone(),
+                    tail_generation_ids,
+                    tail_read_bytes,
+                    tail_descriptors,
+                    tail_checkpoint_records,
+                    tail_admission_waiting: detector.tail_admission_waiting,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, Error>>()?;
         *self
             .0
             .lock()
@@ -131,11 +157,44 @@ struct Candidate {
     stable_since: Instant,
 }
 
+enum Owner {
+    Consume(ClaimRoot),
+    Tail(crate::tailing::TailRoot),
+}
+impl Owner {
+    fn directory(&self, relative: &Path) -> Result<File, Error> {
+        match self {
+            Self::Consume(owner) => owner.directory(relative),
+            Self::Tail(owner) => owner.directory(relative),
+        }
+    }
+    fn observe(&self, relative: &Path) -> Result<Option<CompletedFileIdentity>, Error> {
+        match self {
+            Self::Consume(owner) => owner.observe(relative),
+            Self::Tail(owner) => owner.observe(relative),
+        }
+    }
+    fn root_binding(&self, path: &Path) -> Result<(), Error> {
+        match self {
+            Self::Consume(owner) => owner.root_binding(path),
+            Self::Tail(owner) => owner.root_binding(path),
+        }
+    }
+    fn claim(&self) -> Result<&ClaimRoot, Error> {
+        match self {
+            Self::Consume(owner) => Ok(owner),
+            Self::Tail(_) => Err(Error::State(
+                "tail completed handoff is unfinished; active files cannot enter ordinary consumption",
+            )),
+        }
+    }
+}
+
 struct Detector {
     config: ConsumeWatch,
     revision: u64,
     enabled: bool,
-    owner: ClaimRoot,
+    owner: Owner,
     events: OwnedFd,
     directories: BTreeMap<i32, Directory>,
     todo: VecDeque<PathBuf>,
@@ -149,12 +208,20 @@ struct Detector {
     reconciliations: u64,
     coverage_losses: u64,
     failure: Option<String>,
+    tail_admission_waiting: bool,
 }
 
 impl Detector {
     fn open(store: Store, watch: ManagedWatch) -> Result<Self, Error> {
         let config = watch.definition;
-        let owner = ClaimRoot::open(store, &config.id, &config.root)?;
+        let owner = match config.producer_contract {
+            crate::ProducerContract::FinishedFiles => {
+                Owner::Consume(ClaimRoot::open(store, &config.id, &config.root)?)
+            }
+            crate::ProducerContract::ActiveFilesRetain => Owner::Tail(
+                crate::tailing::TailRoot::open(store, &config, watch.revision)?,
+            ),
+        };
         let events = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
         let mut detector = Self {
             config,
@@ -174,6 +241,7 @@ impl Detector {
             reconciliations: 0,
             coverage_losses: 0,
             failure: None,
+            tail_admission_waiting: false,
         };
         detector.reconcile("startup")?;
         if !detector.enabled {
@@ -245,6 +313,19 @@ impl Detector {
     }
 
     fn candidate(&mut self, path: PathBuf, activity: bool) -> Result<(), Error> {
+        if let Owner::Tail(owner) = &mut self.owner {
+            return match owner.attach(&path, &self.config, self.revision) {
+                Ok(()) => Ok(()),
+                Err(Error::Storage(error)) if error.code == "STORAGE_FAILURE" => {
+                    Err(Error::Storage(error))
+                }
+                Err(error) => {
+                    self.failure = Some(error.to_string().chars().take(1024).collect());
+                    self.deferred = true;
+                    Ok(())
+                }
+            };
+        }
         let Some(identity) = self.owner.observe(&path)? else {
             self.candidates.remove(&path);
             return Ok(());
@@ -287,6 +368,11 @@ impl Detector {
                         let now = Instant::now();
                         for candidate in self.candidates.values_mut() {
                             candidate.stable_since = now;
+                        }
+                        if !self.deferred
+                            && let Owner::Tail(owner) = &mut self.owner
+                        {
+                            owner.reconcile_missing(&self.config.id)?;
                         }
                         self.covered = true;
                         self.next_reconcile = now
@@ -434,6 +520,9 @@ impl Detector {
     }
 
     fn ready(&mut self) -> Result<Option<(PathBuf, CompletedFileIdentity)>, Error> {
+        if matches!(self.owner, Owner::Tail(_)) {
+            return Ok(None);
+        }
         self.owner.root_binding(&self.config.root)?;
         if !self.covered {
             return Ok(None);
@@ -470,6 +559,7 @@ impl ConsumeWorker {
         configs: &[ConsumeWatch],
         socket: PathBuf,
         registry: WatchRegistry,
+        operations: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self, Error> {
         let mut catalog = Catalog::load(&store, configs)?;
         let definitions = catalog
@@ -512,7 +602,16 @@ impl ConsumeWorker {
                     .block_on(
                         &runtime,
                         run(
-                            store, detectors, socket, stopped, registry, catalog, commands,
+                            store,
+                            detectors,
+                            socket,
+                            stopped,
+                            registry,
+                            catalog,
+                            Control {
+                                commands,
+                                operations,
+                            },
                         ),
                     )
                     .map_err(|error| error.to_string())
@@ -598,6 +697,8 @@ fn admit_handoff(
         .map_err(|error| AdminFailure::Refused(watch_admin::failure("CONFLICT", error)))?;
     detector
         .owner
+        .claim()
+        .map_err(|error| AdminFailure::Refused(watch_admin::failure("UNSUPPORTED", error)))?
         .handoff(
             intent,
             &detector.config.source,
@@ -668,10 +769,25 @@ fn administrate(
     let old = detectors
         .iter()
         .find(|detector| detector.config.id == watch.definition.id);
+    if let Some(old) = old
+        && matches!(old.owner, Owner::Tail(_))
+        && store
+            .tail_generations(&old.config.id)
+            .map_err(storage_admission)?
+            .iter()
+            .any(|row| !row.complete && row.gap.is_none())
+    {
+        return Err(AdminFailure::Refused(watch_admin::failure(
+            "CONFLICT",
+            "active file generations bind this watch revision; complete or explicitly discontinue them before changing or removing it",
+        )));
+    }
     let mut prepared = None;
     if watch.enabled {
-        let same_root =
-            old.is_some_and(|old| old.owner.root_binding(&watch.definition.root).is_ok());
+        let same_root = old.is_some_and(|old| {
+            old.config.producer_contract == watch.definition.producer_contract
+                && old.owner.root_binding(&watch.definition.root).is_ok()
+        });
         if !same_root {
             if pending
                 .iter()
@@ -728,6 +844,11 @@ fn administrate(
     Ok(watch)
 }
 
+struct Control {
+    commands: tokio::sync::mpsc::Receiver<watch_admin::Command>,
+    operations: Arc<tokio::sync::Semaphore>,
+}
+
 async fn run(
     store: Store,
     mut detectors: Vec<Detector>,
@@ -735,7 +856,7 @@ async fn run(
     stop: Arc<AtomicBool>,
     registry: WatchRegistry,
     mut catalog: Catalog,
-    mut commands: tokio::sync::mpsc::Receiver<watch_admin::Command>,
+    mut control: Control,
 ) -> Result<(), Error> {
     let mut client: Option<Client> = None;
     let mut retry = BTreeMap::<String, Instant>::new();
@@ -752,7 +873,7 @@ async fn run(
             });
         }
         for _ in 0..watch_admin::MAX_WATCH_COMMANDS {
-            let command = match commands.try_recv() {
+            let command = match control.commands.try_recv() {
                 Ok(command) => command,
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -784,10 +905,39 @@ async fn run(
             }
             detector.scan_step()?;
             detector.drain()?;
+            if let Owner::Tail(owner) = &mut detector.owner {
+                let _permit = match control.operations.try_acquire() {
+                    Ok(permit) => {
+                        detector.tail_admission_waiting = false;
+                        permit
+                    }
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        detector.tail_admission_waiting = true;
+                        continue;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => {
+                        return Err(Error::State("tail operation budget closed unexpectedly"));
+                    }
+                };
+                match owner.drain() {
+                    Ok(()) => {}
+                    Err(Error::Storage(error)) if error.code == "STORAGE_FAILURE" => {
+                        return Err(Error::Storage(error));
+                    }
+                    Err(error) => {
+                        detector.failure = Some(error.to_string().chars().take(1024).collect())
+                    }
+                }
+            }
         }
         let pending = store.consumption_pending()?;
         registry.update(&detectors, &pending)?;
-        if detectors.is_empty() {
+        if detectors.is_empty()
+            || (pending.is_empty()
+                && detectors
+                    .iter()
+                    .all(|detector| matches!(detector.owner, Owner::Tail(_))))
+        {
             tokio::time::sleep(TICK).await;
             continue;
         }
@@ -826,7 +976,7 @@ async fn run(
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    match detector.owner.reserve(
+                    match detector.owner.claim()?.reserve(
                         &path,
                         identity,
                         &detector.config.source,
@@ -864,10 +1014,14 @@ async fn run(
                 ))?;
             let operation = async {
                 if let Recovery::Claimed(mut claimed) =
-                    detector.owner.recover(&id, crate::now()?)?
+                    detector.owner.claim()?.recover(&id, crate::now()?)?
                 {
-                    detector.owner.publish(connected, &mut claimed).await?;
-                    detector.owner.remove(&claimed, crate::now()?)?;
+                    detector
+                        .owner
+                        .claim()?
+                        .publish(connected, &mut claimed)
+                        .await?;
+                    detector.owner.claim()?.remove(&claimed, crate::now()?)?;
                 }
                 Ok::<_, Error>(())
             };

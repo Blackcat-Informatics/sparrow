@@ -234,12 +234,13 @@ struct ConsumeWatchStatus {
   reconciliations @8 :UInt64; coverageLosses @9 :UInt64;
   failure @10 :OptionalText;
   definition @11 :WatchDefinition; revision @12 :UInt64; enabled @13 :Bool;
+  tailGenerationIds @14 :List(Text); tailReadBytes @15 :UInt64; tailDescriptors @16 :UInt32; tailCheckpointRecords @17 :UInt64; tailAdmissionWaiting @18 :Bool;
 }
 
 enum WatchMode { consume @0; tail @1; }
 enum WatchReadiness { closeOrIdle @0; }
 struct WatchAuthority {
-  union { unacknowledged @0 :Void; finishedFilesDeleteAfterDurablePublish @1 :Void; }
+  union { unacknowledged @0 :Void; finishedFilesDeleteAfterDurablePublish @1 :Void; activeFilesRetain @2 :Void; }
 }
 struct WatchDefinition {
   id @0 :Text; root @1 :Text; source @2 :Text; format @3 :Format;

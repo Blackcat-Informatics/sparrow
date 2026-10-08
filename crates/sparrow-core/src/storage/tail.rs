@@ -76,6 +76,10 @@ impl Catalog for TailStart {
     }
 }
 impl TailStart {
+    /// Allocate a bounded declaration identity using the storage identity owner.
+    pub fn fresh_request_id() -> Result<String, Error> {
+        random_id("tail-request")
+    }
     fn validate(&self) -> Result<(), Error> {
         super::validate_ingest_labels(&self.request_id, &self.source, &self.format)?;
         super::consumption::validate_consumption_path(&self.watch, &self.path)?;
@@ -356,6 +360,20 @@ pub(super) fn prepare(
 }
 
 impl Store {
+    /// Capture finite checkpoint metadata for one configured watch, including terminal rows.
+    pub fn tail_generations(&self, watch: &str) -> Result<Vec<TailGeneration>, Error> {
+        if watch.is_empty() || watch.len() > 128 {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "tail watch requires 1..128 bytes",
+            ));
+        }
+        let writer = self.lock()?;
+        Ok(registry(&writer)?
+            .into_iter()
+            .filter(|row| row.declaration.watch == watch)
+            .collect())
+    }
     /// Declare a generation once; exact declaration retries preserve its current checkpoint.
     pub fn tail_start(&self, declaration: &TailStart, now: u64) -> Result<TailGeneration, Error> {
         declaration.validate()?;

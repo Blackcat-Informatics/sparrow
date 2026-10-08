@@ -598,7 +598,7 @@ days does not shorten a record that would ordinarily remain for another twenty.
 
 ## 5. Cap'n Proto ingestion, queries, and administration
 
-### File-generation checkpoint core (daemon tail watches unfinished)
+### File-generation checkpoints and active tail watches
 
 The core has `tail_start`, `tail_append`, `tail_generation` and
 `tail_discontinue`. An explicit declaration binds a stable start request,
@@ -639,9 +639,38 @@ file positions with the full original declaration and half-open byte range.
 evidence pin or an assertion that all bytes remain retained. Continuity remains
 unknown; a checkpoint reports the accepted prefix, not a whole-file receipt.
 
-These storage APIs are not yet wired to daemon tail-watch administration,
-inotify discovery, retained rotated descriptors or completed-file handoff.
-Those integration and acceptance requirements remain unfinished.
+Schema 38 enables recursive active observation through the existing watch
+catalog and bounded inotify discovery. A watch definition uses
+`producer_contract = "active_files_retain"`, `format = "log"` or `"jsonl"`, and
+`max_candidates <= 64`. Bootstrap uses the existing `[[consume]]` intake table;
+CLI `watch put` accepts the same TOML definition. The wire mode is `tail` with
+explicit `activeFilesRetain` authority. Source files remain in the producer root;
+tail observation does not create the private completed-consumption directory.
+
+Tail publication acquires the same operation budget as RPC and syslog. Busy
+work remains descriptor-owned and reports admission waiting; no checkpoint is
+advanced while waiting.
+
+Each watch retains bounded opened regular files across rename/replacement and
+drains one descriptor per worker tick in round-robin order. One capture reads
+at most the smaller of 1 MiB and `max_artifact_bytes`; a line exceeding that
+window produces a visible failure and preserves the source/checkpoint. Complete
+prefixes use the one shared durable record pipeline. Idle and close events keep
+a final unterminated line pending. Observed truncation preserves the old offset
+and starts a new opaque generation. Same-length observed modification produces
+a declared read gap. This is an append-only producer contract; these observations
+do not certify detection of every rewrite or overwrite followed by growth.
+
+Restart attaches surviving in-root identities to original checkpoints. After a
+complete reconciliation, unavailable active identities receive durable read gaps;
+no missing prefix is invented. Status exposes finite `tail_generation_ids`,
+`tail_read_bytes`, `tail_descriptors`, `tail_admission_waiting` and
+`tail_checkpoint_records`; the latter
+counts accepted occurrences across currently known checkpoints rather than live
+retention membership. Kernel coverage and producer continuity remain separate.
+Active generations bind their watch revision and refuse definition changes or
+removal until resolved. Tail completed handoff and rotated-generation completion
+remain unfinished and are explicitly refused by ordinary consumption admission.
 
 ### Public TCP and syslog packet interpretation
 

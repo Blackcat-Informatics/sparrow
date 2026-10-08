@@ -32,8 +32,41 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 37; the schema sections
+The current source implements schema 38; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 38 active file capture (local qualification)
+
+Recursive tail definitions use explicit `active_files_retain` producer authority,
+the existing watch catalog and the shared inotify reconciliation owner. Descriptor
+admission, parent/root identities and source observation share the extracted
+filesystem helpers with completed consumption. Tail observation creates no
+private claim directory. Open current and rotated files remain held within the
+finite generation/descriptor quota; round-robin reads feed the original durable
+record/checkpoint publication owner. Idle or close does not finalize a partial
+line or authorize removal. Observed truncation preserves the terminal old offset
+and starts a distinct generation. Missing identities after complete startup
+reconciliation produce durable read gaps. Append-only authority does not certify
+detection of every source rewrite.
+
+Publication shares the daemon's operation semaphore with RPC and syslog.
+Status exposes finite generation IDs, actual capture byte ceiling, held descriptor
+count, known-checkpoint record counts and admission waiting. Capture refusal keeps
+source bytes and the original checkpoint. Active generations require their
+original watch revision and refuse administrative replacement/removal until
+resolved. Completed tail handoff is explicitly unfinished.
+
+The full gate passed 133 storage and 46 RPC scenarios, seeded census self-tests
+and 192 ownership jobs with zero distinct exceptions. New scenarios cover CRLF,
+partial lines, open rotated descriptors, exact record reuse on reopen,
+copy-truncation, bounded refusal, symlink exclusion, missing-source recovery gaps
+and a fully occupied operation budget. The harness coordinates child creation
+with held TCP reservations as well as selecting outside the outbound ephemeral
+pool; parallel TCP reopen acceptance passed. Evidence is in
+`/tmp/sparrow-active-tail-test.log` and `/tmp/sparrow-tail-engine-gate.log`.
+
+Deployment evidence will be recorded separately after artifact capture and live
+acceptance. Full architecture acceptance remains unmet.
 
 ## Schema 37 file-generation checkpoint queries (not deployed)
 
