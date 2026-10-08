@@ -118,12 +118,8 @@ impl RowStorage {
     }
 }
 
-fn uses_spool(selector: &Selector) -> bool {
-    matches!(selector, Selector::Records(_))
-}
-
 /// Host-owned query admission profile; native semantic profiles remain separate.
-pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/3";
+pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/4";
 
 fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
     use purrdf_lex::json::Object;
@@ -181,6 +177,7 @@ fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
                         Value::Null
                     },
                 )
+                .with("key_aggregation_bytes", if matches!(selector, Selector::Json(q) if matches!(q.query, crate::JsonQuery::Keys { .. })) { Value::from(catalog_lease::SCAN_BYTES as u64) } else { Value::Null })
                 .with(
                     "field_visits",
                     if fields {
@@ -246,14 +243,7 @@ fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
                     super::query_membership::MAX_SELECTION_VISITS as u64,
                 )
                 .with("capture_items", catalog_lease::MAX_ITEMS as u64)
-                .with(
-                    "capture_bytes",
-                    if uses_spool(selector) {
-                        super::record_spool::DISK_BYTES
-                    } else {
-                        catalog_lease::CAPTURE_BYTES as u64
-                    },
-                )
+                .with("capture_bytes", super::record_spool::DISK_BYTES)
                 .with("row_bytes", ROW_BYTES as u64)
                 .with("metadata_bytes", METADATA_BYTES as u64)
                 .with("page_bytes", catalog_lease::PAGE_BYTES as u64)
@@ -274,43 +264,6 @@ impl RecordPageBody {
             ));
         }
         Ok(bytes)
-    }
-
-    fn capture(mut result: Value) -> Result<Self, Error> {
-        let object = result
-            .as_object_mut()
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query capture is not an object"))?;
-        let mut values = object
-            .remove("rows")
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query capture rows are missing"))?;
-        let values = values
-            .as_array_mut()
-            .map(std::mem::take)
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query capture rows are not an array"))?;
-        let metadata = Self::encode_metadata(&result)?;
-        if values.len() > catalog_lease::MAX_ITEMS {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "query capture metadata/items exceed admission; narrow query",
-            ));
-        }
-        let mut bytes = metadata.len();
-        let mut rows = Vec::with_capacity(values.len());
-        for value in values {
-            let row = json::write_compact(&value).into_bytes();
-            bytes = bytes.saturating_add(row.len() + std::mem::size_of::<Vec<u8>>());
-            if row.len() > ROW_BYTES || bytes > catalog_lease::CAPTURE_BYTES {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "query capture exceeds row/byte admission; narrow query; no page published",
-                ));
-            }
-            rows.push(row);
-        }
-        Ok(Self {
-            metadata,
-            rows: RowStorage::Memory(rows),
-        })
     }
 
     /// Reconstruct only this admitted page through PurRDF's native JSON codec.
@@ -432,32 +385,24 @@ impl Store {
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "query read deadline overflow"))?;
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
-        let mut staged = if uses_spool(&selector) {
-            Some(super::record_spool::Builder::new(
-                &*self.lock()?,
-                matches!(&selector, Selector::Records(q) if q.operation == RecordOperation::ArtifactGroups),
-                matches!(&selector, Selector::Records(q) if q.query.text.is_none() && q.query.event_interval.is_some()),
-            )?)
-        } else {
-            None
-        };
+        let mut staged = super::record_spool::Builder::new(
+            &*self.lock()?,
+            matches!(&selector, Selector::Records(q) if q.operation == RecordOperation::ArtifactGroups),
+            matches!(&selector, Selector::Records(q) if q.query.text.is_none() && q.query.event_interval.is_some()),
+        )?;
         let mut value = match &selector {
             Selector::Records(q) => {
-                self.records_query_stage(&q.scope, &q.query, now, true, staged.as_mut())?
+                self.records_query_stage(&q.scope, &q.query, now, true, Some(&mut staged))?
             }
-            Selector::Json(q) => self.json_query_capture(&q.scope, &q.query, now, true)?,
+            Selector::Json(q) => {
+                self.json_query_stage(&q.scope, &q.query, now, Some(&mut staged))?
+            }
         };
-        let finished = staged
-            .map(super::record_spool::Builder::finish)
-            .transpose()?;
-        if let Some(super::record_spool::Finished {
-            groups: Some(counts),
-            ..
-        }) = &finished
-        {
+        let super::record_spool::Finished { rows, groups } = staged.finish()?;
+        if let Some(counts) = groups {
             let mut groups = purrdf_lex::json::Object::new();
             for (artifact, count) in counts {
-                groups.insert(artifact.clone(), Value::from(*count));
+                groups.insert(artifact, Value::from(count));
             }
             value
                 .as_object_mut()
@@ -472,7 +417,7 @@ impl Store {
         let store_id = super::read_field::<String>(&value, "store_id")?;
         let scanned = usize::try_from(super::integer(&value["coverage"], "visited")?)
             .map_err(|_| Error::new("STORAGE_FAILURE", "query capture scan count overflow"))?;
-        let body = if let Some(super::record_spool::Finished { rows, .. }) = finished {
+        let body = {
             value
                 .as_object_mut()
                 .ok_or_else(|| Error::new("STORAGE_FAILURE", "record capture is not an object"))?
@@ -485,8 +430,6 @@ impl Store {
                 metadata,
                 rows: RowStorage::Spool(rows),
             }
-        } else {
-            RecordPageBody::capture(value)?
         };
         reads.publish(
             catalog_lease::Snapshot {

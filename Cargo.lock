@@ -1315,6 +1315,7 @@ dependencies = [
 name = "sparrow-test-support"
 version = "0.1.0"
 dependencies = [
+ "purrdf-lex",
  "rocksdb",
 ]
 

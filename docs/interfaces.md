@@ -1,11 +1,11 @@
 # Sparrow interfaces
 
-Schema 44 uses anonymous, disk-admitted immutable staging for record and text
-pages, including field filters, source-time ordering and artifact grouping. Each page remains bounded
+Schema 45 uses anonymous, disk-admitted immutable staging for record, text, key
+and value pages, including field filters, source-time ordering and artifact grouping. Each page remains bounded
 and replayable with the original absolute deadline; release removes only the
-query allocation. Host admission profile `sparrow-query-capture/3` advertises a
+query allocation. Host admission profile `sparrow-query-capture/4` advertises a
 64 MiB maximum disk capture for this path, subject to the configured store budget.
-Other captured query families retain the 2 MiB resident ceiling. See
+Key aggregation has a separate 32 MiB charged working allowance. See
 [query streaming](query-streaming.md) for admission, cleanup and remaining work.
 
 This document specifies the first-version contracts. Implemented schema sections
@@ -292,7 +292,7 @@ Keys and values share the existing occurrence predicate and one typed input
 admission owner. JSON query paths admit at most 65,536 UTF-8 bytes before the
 server allocates an owned spelling. The core enforces the same limit for direct
 JSON discovery calls. The updated host capture profile is
-sparrow-query-capture/3; QueryLimits.queryPathBytes reports that ceiling for
+sparrow-query-capture/4; QueryLimits.queryPathBytes reports that ceiling for
 JSON captures and explicit absence for other query phases. Stored evidence,
 native projection identities and storage formats are unchanged.
 
@@ -338,8 +338,13 @@ mark query execution limited. Query receipt, coverage, time basis, ranking corpu
 native scores and witnesses are frozen across pages. Reading summaries neither
 protects evidence nor renews the lease; raw bytes independently check retention.
 
-A capture owns at most 2 MiB including encoded native JSON metadata/rows and
-selector capacity, with 32 KiB per row and 32 KiB metadata ceilings. PurRDF's native
+A capture stages rows in an anonymous file with a maximum 64 MiB disk reservation,
+subject to store admission. Retained offsets, metadata and selector capacity remain
+bounded by 2 MiB, with 32 KiB per row and 32 KiB metadata ceilings. Keys aggregate
+complete counts in a separately charged 32 MiB working map before writing sorted
+rows; `QueryLimits.keyAggregationBytes` reports this ceiling only for keys.
+Values stage each matching native occurrence in receipt-time/record-ID order,
+then native occurrence order. PurRDF's native
 codec owns encoding and page reconstruction; no database snapshot versions are
 retained. Pages conservatively charge duplicated typed record/text rendering and
 may return fewer than the requested 1..1000 items to fit 256 KiB. Variable byte

@@ -11112,6 +11112,175 @@ fn json_capture_counts_duplicate_keys_and_shares_query_handle_admission() {
 }
 
 #[test]
+fn disk_json_pages_preserve_large_native_counts_spans_and_replay_after_retirement() {
+    use sparrow_core::{JsonQuery, JsonRead, QuerySelection, ResultPage};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 1024 * 1024 * 1024;
+    settings.maintenance_reserve = 64 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let (mut input, expected_paths) = sparrow_test_support::wide_jsonl_keys(100, 50, 900);
+    input.extend_from_slice(b"{\"dup\":\"needle\",\"dup\":\"needle\"}\n");
+    let artifact = store
+        .ingest("wide-json-pages", "wide", "jsonl", &input, 0)
+        .unwrap();
+    assert_eq!(artifact.record_ids.len(), 101);
+    let mut record_order = artifact.record_ids.iter().enumerate().collect::<Vec<_>>();
+    record_order.sort_unstable_by(|a, b| a.1.cmp(b.1));
+    let expected_values = record_order
+        .into_iter()
+        .flat_map(|(position, _)| {
+            if position == 100 {
+                vec!["/dup".to_owned(); 2]
+            } else {
+                expected_paths[position * 50..(position + 1) * 50].to_vec()
+            }
+        })
+        .collect::<Vec<_>>();
+    let pin = store
+        .pin(
+            "wide-json-pin",
+            "wide",
+            std::slice::from_ref(&artifact.id),
+            40,
+            0,
+        )
+        .unwrap();
+    let mut scope = record_page_scope("wide", 1000);
+    scope.scan_budget = 100000;
+    scope.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision),
+    };
+    let keys = JsonRead {
+        scope: scope.clone(),
+        query: JsonQuery::Keys { path: None },
+        cursor: None,
+    };
+    let values = JsonRead {
+        scope,
+        query: JsonQuery::Values {
+            path: None,
+            kind: Some("string".into()),
+            lexical: None,
+            decoded: Some("needle".into()),
+        },
+        cursor: None,
+    };
+    let admitted = 31 * DAY;
+    let key_page = store.json_read(&keys, admitted).unwrap();
+    let value_page = store.json_read(&values, admitted).unwrap();
+    assert_eq!(key_page.total_items, 5002);
+    assert_eq!(value_page.total_items, 5002);
+    let cursor = value_page.next_cursor.clone().unwrap();
+    let frozen = store
+        .result_next(&value_page.store_id, &cursor, admitted)
+        .unwrap();
+    store
+        .release_retry("wide-json-release", &pin.id, admitted + 1)
+        .unwrap();
+    store.expire(admitted + 2).unwrap();
+    assert_eq!(
+        store.status(admitted + 2).unwrap()["live_records"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store
+            .result_next(&value_page.store_id, &cursor, admitted + 3)
+            .unwrap(),
+        frozen
+    );
+    for (key_query, mut page) in [(true, key_page), (false, value_page)] {
+        let snapshot = page.snapshot_id.clone();
+        let mut paths = Vec::new();
+        let mut bytes = 0;
+        let receipt = page.body.result().unwrap()["coverage"].clone();
+        loop {
+            let result = page.body.result().unwrap();
+            assert_eq!(result["coverage"], receipt);
+            assert_eq!(result["execution"].as_str(), Some("complete"));
+            let limits = &result["query_evidence"]["limits"];
+            assert_eq!(limits["capture_bytes"].as_u64(), Some(64 * 1024 * 1024));
+            if key_query {
+                assert_eq!(
+                    limits["key_aggregation_bytes"].as_u64(),
+                    Some(32 * 1024 * 1024)
+                );
+            } else {
+                assert!(limits["key_aggregation_bytes"].is_null());
+            }
+            for row in result["rows"].as_array().unwrap() {
+                bytes += purrdf_lex::json::write_compact(row).len();
+                if key_query {
+                    let path = row["path"].as_str().unwrap();
+                    paths.push(path.to_owned());
+                    assert_eq!(
+                        row["records"].as_str(),
+                        Some(if path.is_empty() { "101" } else { "1" })
+                    );
+                    assert_eq!(
+                        row["occurrences"].as_str(),
+                        Some(if path.is_empty() {
+                            "101"
+                        } else if path == "/dup" {
+                            "2"
+                        } else {
+                            "1"
+                        })
+                    );
+                } else {
+                    paths.push(row["value"]["path"].as_str().unwrap().to_owned());
+                    let start = row["source_start"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let end = row["source_end"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    assert_eq!(&input[start..end], b"needle");
+                }
+            }
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            let next = store
+                .result_next(&page.store_id, &cursor, admitted + 3)
+                .unwrap();
+            page = match next {
+                ResultPage::Keys(page) if key_query => page,
+                ResultPage::Values(page) if !key_query => page,
+                _ => panic!("wrong discovery operation"),
+            };
+        }
+        assert!(bytes > 2 * 1024 * 1024);
+        if key_query {
+            assert_eq!(&paths[..2], &["", "/dup"]);
+            assert!(
+                paths[2..].iter().zip(&expected_paths).all(|(a, b)| a == b),
+                "key paths differ from native input names"
+            );
+        } else {
+            assert!(
+                paths.iter().zip(&expected_values).all(|(a, b)| a == b),
+                "value paths differ from receipt-time/record-ID then native occurrence order"
+            );
+        }
+        assert!(
+            store
+                .result_release(&page.store_id, &snapshot, admitted + 4)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store.status(admitted + 4).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
 fn json_pages_keep_released_pin_membership_after_native_projection_retirement() {
     use sparrow_core::{JsonQuery, JsonRead, QuerySelection};
     let dir = tempfile::tempdir().unwrap();
@@ -11454,7 +11623,11 @@ fn captured_query_evidence_freezes_native_profiles_and_applicable_admission_limi
     );
     assert_eq!(
         evidence["limits"]["capture_bytes"].as_u64(),
-        Some(2 * 1024 * 1024)
+        Some(64 * 1024 * 1024)
+    );
+    assert_eq!(
+        evidence["limits"]["key_aggregation_bytes"].as_u64(),
+        Some(32 * 1024 * 1024)
     );
     json.cursor = first.next_cursor.clone();
     store
@@ -11494,6 +11667,7 @@ fn captured_query_evidence_freezes_native_profiles_and_applicable_admission_limi
         .result()
         .unwrap();
     let context = &result["query_evidence"];
+    assert!(context["limits"]["key_aggregation_bytes"].is_null());
     assert_eq!(context["profile_ids"].as_array().unwrap().len(), 5);
     for (i, key) in [(2, "analyzer"), (3, "profile"), (4, "corpus_profile")] {
         assert_eq!(context["profile_ids"][i]["id"], result["ranking"][key]);

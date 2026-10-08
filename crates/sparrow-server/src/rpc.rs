@@ -1191,6 +1191,7 @@ fn query_capture(
     for name in [
         "json_value_visits",
         "query_path_bytes",
+        "key_aggregation_bytes",
         "field_visits",
         "posting_visits",
         "text_membership_bytes",
@@ -1202,6 +1203,7 @@ fn query_capture(
         let mut limit = match name {
             "json_value_visits" => target.reborrow().init_json_value_visits(),
             "query_path_bytes" => target.reborrow().init_query_path_bytes(),
+            "key_aggregation_bytes" => target.reborrow().init_key_aggregation_bytes(),
             "field_visits" => target.reborrow().init_field_visits(),
             "posting_visits" => target.reborrow().init_posting_visits(),
             "text_membership_bytes" => target.reborrow().init_text_membership_bytes(),

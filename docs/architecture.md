@@ -249,7 +249,7 @@ investigation pins. Expiry affects subsequent queries immediately; physical
 reclamation waits for those short-lived leases and native engine maintenance.
 Report reclamation lag separately from logical expiry.
 
-Metadata-only record and ranked-text leases may instead stage their complete
+Metadata-only record, ranked-text and JSON key/value leases may stage their complete
 immutable native summaries in bounded anonymous disk files under the same store
 admission. These preserve page replay without retaining original payload or RDF
 versions, creating pins or renewing retention. Their file allocation must be

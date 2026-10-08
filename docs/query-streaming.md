@@ -1,11 +1,10 @@
 # Broad query paging
 
-Record queries now stage their complete admitted result metadata
+Record, text, key and value queries stage their complete admitted result metadata
 incrementally into an anonymous disk file before publishing a page. This includes
 field qualification, source-time ordering, native ranked text and artifact grouping.
 They retain at most 10,000 compact offset/length pairs in memory; each page reads
-only its admitted rows. JSON discovery still uses the earlier 2 MiB resident
-capture and remains to be migrated. The 10,000-match and scan-work ceilings remain
+only its admitted rows. The 10,000-match and scan-work ceilings remain
 explicit admission boundaries.
 
 ## Bounded immutable disk staging
@@ -49,10 +48,10 @@ existing periodic expiry path purges expired leases. Page I/O is fallible throug
 the shared lease contract, and any staging or page failure returns no successful
 prefix. No durable query receipt, evidence pin or renewed retention is created.
 
-Schema 44 and host admission profile `sparrow-query-capture/3` identify this
-change. Record and text receipts advertise a 64 MiB maximum disk capture;
+Schema 45 and host admission profile `sparrow-query-capture/4` identify this
+path. Record, text, key and value receipts advertise a 64 MiB maximum disk capture;
 the configured store allowance can admit less or refuse with storage pressure.
-Other captured query families still advertise 2 MiB. Native ranked membership
+Native ranked membership
 keeps its separate 64 MiB admission; output staging does not remove that bound.
 
 ## Native read foundation
@@ -115,8 +114,26 @@ capture; concurrency and cancellation latency require measurement rather than a
 claim of asynchronous native snapshot execution. Read leases do not create pins
 or renew retention. Typed, CLI and MCP rendering must retain their contracts.
 
-JSON discovery needs its own qualified bounded execution strategy through its
-native occurrence and aggregation owners. A chronological stream must not
+JSON discovery uses the same anonymous staging owner. The native fact matcher
+stages each value occurrence directly. Key counts aggregate completely in a
+32 MiB charged map, preserving duplicate occurrences separately from record
+presence, then stage sorted rows. The typed key aggregation ceiling is absent
+for other query operations. Exhausted work, item or disk admission refuses before
+publication. Native pinned projection slices avoid copying encoded facts.
+
+The shared dev-only `wide_jsonl_keys` fixture uses PurRDF's native JSON codec.
+The core qualification captures 5,002 keys and 5,002 values, each exceeding
+2 MiB, verifies duplicate counts and exact original-byte spans, then replays
+after pin release and evidence retirement. The RPC qualification traverses
+5,001 keys and 5,000 values over TCP and Unix with identical CLI/MCP pages and
+typed admission evidence. The full release gate passed with 144 storage and
+53 RPC scenarios, all remaining workspace tests, seeded census self-tests and
+224 pinned ledger jobs without distinct exceptions. The large RPC scenario also
+passed with its private store on the deployment's Btrfs filesystem at
+`~/.local/state/sparrow/json-pages-btrfs.kQY5Pme1`; its retained log records
+that path. Installed runtime adoption evidence is recorded separately.
+
+A chronological stream must not
 silently substitute receipt time for source time or claim incomplete counts as
 exact. Other captured query families retain their previous implementation until
 their integration and complete acceptance scenarios pass. Full broad query

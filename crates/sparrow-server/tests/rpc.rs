@@ -8148,6 +8148,113 @@ async fn json_pages_replay_cli_mcp_counts_and_occurrences_and_bind_operations() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
+    use purrdf_lex::json::Object;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let text = std::fs::read_to_string(&config)
+                .unwrap()
+                .replace("disk_budget = 134217728", "disk_budget = 1073741824");
+            std::fs::write(&config, text).unwrap();
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let (input, _) = sparrow_test_support::wide_jsonl_keys(100, 50, 900);
+            let path = dir.path().join("wide.jsonl");
+            std::fs::write(&path, &input).unwrap();
+            let receipt = client
+                .import_file("wire-wide-json", "wide-json", wire::Format::Jsonl, &path)
+                .await
+                .unwrap();
+            let tcp = format!("tcp://{address}");
+            for endpoint in [socket.to_str().unwrap(), tcp.as_str()] {
+                let mut mcp = Mcp::start(endpoint);
+                mcp.initialize(1).await;
+                let mut request_id = 2;
+                for (command, total) in [("keys", 5001), ("values", 5000)] {
+                    let mut args = vec![
+                        command,
+                        "--source",
+                        "wide-json",
+                        "--page-size",
+                        "1000",
+                        "--scan-budget",
+                        "100000",
+                    ];
+                    if command == "values" {
+                        args.extend(["--kind", "string", "--decoded", "needle"]);
+                    }
+                    let first = cli(endpoint, &args);
+                    assert_eq!(
+                        first["page"]["total_items"]
+                            .as_str()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap(),
+                        total
+                    );
+                    assert_eq!(
+                        first["receipt"]["limits"]["capture_bytes"].as_str(),
+                        Some("67108864")
+                    );
+                    let aggregation = &first["receipt"]["limits"]["key_aggregation_bytes"];
+                    if command == "keys" {
+                        assert_eq!(aggregation.as_str(), Some("33554432"));
+                    } else {
+                        assert!(aggregation.is_null());
+                    }
+                    let snapshot = first["page"]["snapshot_id"].as_str().unwrap().to_owned();
+                    let mut page = first;
+                    let mut count = 0;
+                    let mut bytes = 0;
+                    loop {
+                        count += page["rows"].as_array().unwrap().len();
+                        for row in page["rows"].as_array().unwrap() {
+                            bytes += purrdf_lex::json::write_compact(row).len();
+                        }
+                        let Some(cursor) = page["page"]["next_cursor"].as_str() else {
+                            break;
+                        };
+                        let next = cli(endpoint, &["result-next", &receipt.store_id, cursor]);
+                        let resumed = mcp
+                            .tool(
+                                request_id,
+                                "result_next",
+                                Object::new()
+                                    .with("store_id", receipt.store_id.clone())
+                                    .with("cursor", cursor)
+                                    .into(),
+                            )
+                            .await;
+                        request_id += 1;
+                        assert!(!resumed["isError"].as_bool().unwrap());
+                        assert!(
+                            resumed["structuredContent"] == next,
+                            "MCP discovery continuation differs from CLI"
+                        );
+                        page = next;
+                    }
+                    assert_eq!(count, total);
+                    assert!(bytes > 2 * 1024 * 1024);
+                    let released = cli(endpoint, &["result-release", &receipt.store_id, &snapshot]);
+                    assert_eq!(released["released"].as_bool(), Some(true));
+                }
+                mcp.close(true).await;
+            }
+            assert_eq!(
+                cli(&socket, &["status"])["record_read_handles"].as_str(),
+                Some("0")
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new()
@@ -8370,8 +8477,16 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                     assert_eq!(receipt["limits"]["page_size"].as_u64(), Some(1));
                     assert_eq!(
                         receipt["limits"]["capture_bytes"].as_str(),
-                        Some(if index < 2 { "67108864" } else { "2097152" })
+                        Some("67108864")
                     );
+                    if index == 2 {
+                        assert_eq!(
+                            receipt["limits"]["key_aggregation_bytes"].as_str(),
+                            Some("33554432")
+                        );
+                    } else {
+                        assert!(receipt["limits"]["key_aggregation_bytes"].is_null());
+                    }
                     assert_eq!(receipt["limits"]["lease_ms"].as_str(), Some("60000"));
                     assert_eq!(
                         receipt["profile_ids"].as_array().unwrap().len(),

@@ -1376,16 +1376,17 @@ impl Store {
         query: &crate::JsonQuery,
         now: u64,
     ) -> Result<Value, Error> {
-        self.json_query_capture(scope, query, now, false)
+        self.json_query_stage(scope, query, now, None)
     }
 
-    pub(super) fn json_query_capture(
+    fn json_query_stage(
         &self,
         scope: &crate::QueryScope,
         query: &crate::JsonQuery,
         now: u64,
-        capture: bool,
+        mut stage: Option<&mut record_spool::Builder>,
     ) -> Result<Value, Error> {
+        let capture = stage.is_some();
         let row_limit = if capture {
             catalog_lease::MAX_ITEMS
         } else {
@@ -1408,6 +1409,7 @@ impl Store {
         let mut key_bytes = 0_usize;
         let mut value_visits = 0_usize;
         let mut response_bytes = 0_usize;
+        let mut matched_values = 0_usize;
         for record in writer.query_candidates(scope, now, &protected)? {
             let record = record?;
             if record.received_at >= scope.received_before {
@@ -1436,7 +1438,7 @@ impl Store {
             }
             let bytes = writer
                 .db
-                .get(&record.projection_id)?
+                .get_pinned(&record.projection_id)?
                 .ok_or_else(|| Error::new("STORAGE_FAILURE", "live record projection missing"))?;
             let facts = parse(&bytes)?;
             if read_field::<String>(&facts, "state")? != "complete" {
@@ -1469,7 +1471,7 @@ impl Store {
                         if capture && !keys.contains_key(&(path.clone(), kind.clone())) {
                             key_bytes = key_bytes
                                 .saturating_add(path.len() + kind.len() + record.id.len() + 256);
-                            if keys.len() >= row_limit || key_bytes > catalog_lease::CAPTURE_BYTES {
+                            if keys.len() >= row_limit || key_bytes > catalog_lease::SCAN_BYTES {
                                 return Err(Error::new(
                                     "RESOURCE_LIMIT",
                                     "key capture exceeds admission; narrow scope",
@@ -1484,7 +1486,7 @@ impl Store {
                         }
                     }
                     crate::JsonQuery::Values { .. } => {
-                        if rows.len() == row_limit {
+                        if matched_values == row_limit {
                             limited = true;
                             break;
                         }
@@ -1504,16 +1506,19 @@ impl Store {
                                 )
                                 .with("value", fact.clone()),
                         );
-                        response_bytes = response_bytes.saturating_add(if capture {
-                            json::write_compact(&row).len() + std::mem::size_of::<Vec<u8>>()
-                        } else {
-                            json::write_compact(fact).len() + 2048
-                        });
+                        if let Some(stage) = stage.as_deref_mut() {
+                            stage.push(row, None)?;
+                            matched_values += 1;
+                            continue;
+                        }
+                        response_bytes =
+                            response_bytes.saturating_add(json::write_compact(fact).len() + 2048);
                         if response_bytes > catalog_lease::CAPTURE_BYTES {
                             limited = true;
                             break;
                         }
                         rows.push(row);
+                        matched_values += 1;
                     }
                 }
             }
@@ -1529,19 +1534,25 @@ impl Store {
         }
         if matches!(query, crate::JsonQuery::Keys { .. }) {
             limited |= keys.len() > row_limit;
-            rows = keys
-                .into_iter()
-                .take(row_limit)
-                .map(|((path, kind), (occurrences, records, _))| {
-                    Value::from(
-                        Object::new()
-                            .with("path", path)
-                            .with("kind", kind)
-                            .with("occurrences", occurrences.to_string())
-                            .with("records", records.to_string()),
-                    )
-                })
-                .collect();
+            for row in
+                keys.into_iter()
+                    .take(row_limit)
+                    .map(|((path, kind), (occurrences, records, _))| {
+                        Value::from(
+                            Object::new()
+                                .with("path", path)
+                                .with("kind", kind)
+                                .with("occurrences", occurrences.to_string())
+                                .with("records", records.to_string()),
+                        )
+                    })
+            {
+                if let Some(stage) = stage.as_deref_mut() {
+                    stage.push(row, None)?;
+                } else {
+                    rows.push(row);
+                }
+            }
         }
         Ok(Object::new()
             .with("rows", Value::array(rows))

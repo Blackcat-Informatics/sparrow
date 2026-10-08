@@ -370,6 +370,7 @@ struct QueryLimits {
   textMembershipBytes @14 :OptionalLimit; queryTextBytes @15 :OptionalLimit;
   queryTerms @16 :OptionalLimit; fieldConstraints @17 :OptionalLimit;
   compiledFieldBytes @18 :OptionalLimit; queryPathBytes @19 :OptionalLimit;
+  keyAggregationBytes @20 :OptionalLimit;
 }
 struct QueryCapture {
   page @0 :CatalogReadReceipt; profileIds @1 :List(QueryProfile);

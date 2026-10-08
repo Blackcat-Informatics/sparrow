@@ -2682,7 +2682,7 @@ names = ['^standalone_text_ranker$']
 [[job]]
 id = "native-json-result-capture"
 summary = "One persisted native JSON fact matcher serves direct reads and complete key/value captures; key counts precede paging and exhaustion refuses a successful prefix."
-home = "sparrow_core::storage::Store::json_query_capture"
+home = "sparrow_core::storage::Store::json_query_stage"
 entry_points = ["sparrow_core::storage::Store::json_query", "sparrow_core::storage::Store::json_read", "sparrow_core::query::JsonQuery::capacity"]
 spec = "docs/interfaces.md: schema 30 key/value pagination."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
@@ -2692,6 +2692,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^paged_json_matcher$']
+
+[[job]]
+id = "wide-native-jsonl-fixture"
+summary = "One dev-only generator uses the native JSON codec for wide-path key/value paging fixtures and exports the exact leaf paths."
+home = "sparrow_test_support::wide_jsonl_keys"
+entry_points = []
+spec = "docs/query-streaming.md: JSON key/value disk staging qualification."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(generate_wide_jsonl_again|wide_jsonl_codec)$']
 
 [[job]]
 id = "shared-query-result-lease"
@@ -3302,9 +3316,9 @@ names = ['^(decode_tail_byte_reference|decode_generation_read_reference)$']
 
 [[job]]
 id = "anonymous-record-row-staging"
-summary = "One anonymous file owner stages chronological, source-time and native ranked record rows with store disk admission, bounded offsets and allocation release; no query pathname survives a crash."
+summary = "One anonymous file owner stages chronological, source-time, native ranked record and JSON key/value rows with store disk admission, bounded offsets and allocation release; no query pathname survives a crash."
 home = "sparrow_core::storage::record_spool::Builder::push"
-entry_points = ["sparrow_core::storage::text_index::Store::records_query_stage", "sparrow_core::storage::record_read::Store::query_read"]
+entry_points = ["sparrow_core::storage::text_index::Store::records_query_stage", "sparrow_core::storage::Store::json_query_stage", "sparrow_core::storage::record_read::Store::query_read"]
 spec = "docs/query-streaming.md: bounded immutable disk staging."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/record_spool.rs"]
 bench = []
