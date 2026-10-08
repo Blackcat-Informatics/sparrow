@@ -4302,6 +4302,41 @@ The existing core and RPC result-family scenarios now exercise explicit release,
 repeat release, foreign-store rejection and continuation refusal after release.
 The core scenario also checks twenty successive captures and releases at one
 clock value without raising budgets. SDK certification checks exact receipt
-identity and both release outcomes. Deployment and disk qualification for this
-new schema are recorded below once performed; the earlier measurements remain
-schema 41 evidence.
+identity and both release outcomes. The earlier measurements remain schema 41
+evidence; the schema 42 follow-up is recorded separately.
+
+Signed source `b53f163` passed the normal full hook: formatting, release Clippy
+with warnings denied, 140 storage scenarios, 51 RPC scenarios, 17 SDK tests,
+remaining workspace tests, seeded census tests and 213 ownership rules with no
+distinct exceptions. Logs are `/tmp/sparrow-result-release-check.log` and
+`/tmp/sparrow-result-release-commit.log`. The explicit all-bin/example rebuild
+after the hook is `/tmp/sparrow-result-release-bins.log`.
+
+The installed daemon is
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema42-b53f163`, SHA-256
+`23b585c7ad931842f9b742f97801de6074291e050d0d0faad6e75bbc970c2dd6`.
+Its sole capability is `cap_net_bind_service=ep`. The stable CLI selects
+`sparrow-schema42-b53f163`, SHA-256
+`44e530ac5966c70a5112191775ffe9f71ef2c2f64ae1486a39e9e23bd0007b7c`.
+Matching events, bytes and handoff SDK examples are installed beside them;
+their image hashes are in the live evidence manifest. All installed bytes match
+the explicitly selected release artifacts.
+
+Evidence is `/tmp/sparrow-result-release-live.8o4x3zos`. The persistent unit
+stopped PID 1710023 through SIGINT; its socket disappeared before a closed-store
+snapshot and stable alias replacement. The new owner is PID 2062025, serving
+schema 42 at `0.0.0.0:518` and the existing private Unix socket. Store identity
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37, 212 records and existing
+watches are preserved. TCP and Unix live tests verify exact cursor replay,
+wrong-store and cursor-as-snapshot rejection, CLI/MCP release, true then false
+receipts, `RESULT_EXPIRED` after release, and immediate return to zero handles
+and bytes. Pins and record counts stay unchanged. The schema 41 CLI refuses
+discovery against schema 42 as required.
+
+Saved public handoff retries through CLI/MCP/SDK preserve original receipt,
+92-byte generation contents, clocks, checkpoints and the replacement file.
+No new intake or producer mutation was needed. The new closed snapshot has not
+separately been restored; the earlier restoration qualification remains above.
+The [disk follow-up](performance-baseline.md#explicit-release-follow-up) shows
+ten successful source and temporal traversals each without retained-lease
+pressure; the broad capture ceiling and full architecture gaps remain unmet.

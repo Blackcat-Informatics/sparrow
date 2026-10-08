@@ -130,8 +130,8 @@ Completed traversal retains earlier cursors for replay until expiry. Single-page
 queries publish no retained continuation handle and do not have that throttle.
 These are genuine operational limits, not incomplete answers relabeled as passes.
 
-The next query work needs an explicit shared lease-release operation and a
-qualified bounded strategy for broad chronological captures. It must preserve
+The baseline identified a need for an explicit shared lease-release operation
+and a qualified bounded strategy for broad chronological captures. They must preserve
 immutable replay until release/expiry and refuse storage errors without a
 successful prefix. Raising constants to fit this experiment would not resolve
 the required workload behavior.
@@ -152,8 +152,40 @@ Do not rerun the fresh-store driver against its existing exclusive copies/store.
 The matrix can rerun on a closed fixture; it explicitly starts/stops only its
 isolated owner, never `sparrow.service`.
 
-The live server remains PID 1710023, serving schema 41 on `0.0.0.0:518` with
-212 records. It was not stopped, reconfigured or used for these sample imports.
+During the initial baseline, the live server remained PID 1710023, serving
+schema 41 on `0.0.0.0:518` with 212 records. It was not stopped, reconfigured or
+used for those sample imports. Subsequent schema 42 adoption is recorded in
+[Development runtime](development-runtime.md).
+
+## Explicit-release follow-up
+
+Signed source `b53f163` implements explicit result release without changing any
+capture, aggregate byte, handle or expiry limit. The same closed 7,058-record
+Btrfs fixture was reopened using installed schema 42 daemon and CLI images from
+that source. Each family had an independent owner, one warmup and ten sequential
+trials. Successful complete traversal was followed by `result-release` using
+the first page's snapshot identity. All multi-page release receipts reported
+`released=true`. The fixture remains format 35; no new import was performed.
+
+| Query | Successful trials / 10 | Complete rows / pages | Successful p50 ms | Successful p95 ms | Refusal |
+| --- | ---: | ---: | ---: | ---: | --- |
+| All records | 0 | — | — | — | 2 MiB chronological capture ceiling |
+| Correction source | 10 | 286 / 2 | 30.42 | 31.23 | None |
+| First-pass receipt interval | 10 | 3,529 / 24 | 62.68 | 67.59 | None |
+
+These timings include CLI startup and complete pagination; the separate release
+round trip is recorded as `seconds_with_release`, outside the table timings.
+The same inclusive, success-only p95 method applies. This small sequential
+experiment establishes removal of retained-lease pressure for these scopes,
+not a throughput improvement or concurrent-load qualification. Each family's
+final status reports zero retained record handles and bytes, with all 7,058
+records present. The broad capture refusal remains actionable work.
+
+Evidence in the same disk directory is `schema42-release-matrix.py`,
+`schema42-release-matrix.log`, `schema42-release-matrix-report.json` and
+`schema42-release-*-daemon.log`. The driver uses immutable installed images
+`sparrowd-schema42-b53f163` and `sparrow-schema42-b53f163`, and verifies that
+the production unit remains PID 2062025 throughout this separate qualification.
 
 Full performance acceptance remains unmet: complete corpus census and size/
 repetition distributions, full JSON/Markdown/malformed/opaque input mix,
