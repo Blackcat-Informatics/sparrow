@@ -32,8 +32,30 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 31; the schema sections
+The current source implements schema 32; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 32 frozen query capture provenance
+
+Record, standalone text, key and value receipts now carry typed capture
+identity, native role-tagged profiles and effective host phase ceilings.
+The core freezes evidence alongside native result metadata and the shared wire
+receipt owner encodes it once for direct, nested text and cursor-only replies.
+One agent adapter augments receipts while preserving their original certainty
+and coverage; pagination remains separate. Unused phases and native governor
+evidence are explicitly absent. Host admission is identified independently of
+native semantic profiles. Shared limit constants also enforce the reported caps.
+
+The full source gate passes release Clippy with warnings denied, 121 storage
+scenarios, 37 RPC/daemon scenarios, seeded census self-tests and the pinned
+cross-workspace gate (168 ledger jobs, zero distinct exceptions). New core
+evidence checks native profile identity, applicable limits and frozen evidence
+after ingestion; the RPC scenario checks all four paged query receipts through
+CLI, MCP and cursor-only continuation.
+
+Source validation and running daemon qualification remain separate. Native
+certified SPARQL receipts and context capture provenance are still unfinished;
+the following schema sections preserve earlier runtime evidence.
 
 ## Schema 31 cursor-only result continuation
 

@@ -6,6 +6,8 @@
 use super::*;
 use purrdf::text::{FieldInput, PreparedCorpus, RankingProfile};
 
+pub(super) const MATCH_MEMBERSHIP_BYTES: usize = 64 * 1024 * 1024;
+
 fn term_key(kind: &str, term: &str, id: &str) -> String {
     format!("text-{kind}:{}:{id}", hex::encode(term.as_bytes()))
 }
@@ -230,7 +232,7 @@ impl Store {
                     capture_bytes += json::write_compact(&row).len();
                     if capture_bytes
                         > if query.event_interval.is_some() && !capture {
-                            64 * 1024 * 1024
+                            MATCH_MEMBERSHIP_BYTES
                         } else {
                             2 * 1024 * 1024
                         }
@@ -291,7 +293,7 @@ impl Store {
                             .sum::<usize>()
                             + 1024,
                     );
-                if capture_bytes > 64 * 1024 * 1024 {
+                if capture_bytes > MATCH_MEMBERSHIP_BYTES {
                     return Err(Error::new(
                         "RESOURCE_LIMIT",
                         "record membership capture exceeds 64 MiB; narrow scope",

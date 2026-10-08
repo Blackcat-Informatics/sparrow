@@ -3,6 +3,10 @@
 
 //! Bounded concrete JSON occurrence queries over stored native facts.
 
+pub(crate) const RECORD_QUERY_FIELDS_MAX: usize = 32;
+pub(crate) const RECORD_QUERY_TEXT_BYTES: usize = 65536;
+pub(crate) const RECORD_QUERY_FIELD_BYTES: usize = 256 * 1024;
+
 /// Explicit scope shared by JSON discovery operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryScope {
@@ -321,7 +325,12 @@ impl RecordQuery {
                 "require an increasing half-open event-time interval",
             ));
         }
-        if self.fields.len() > 32 || self.text.as_ref().is_some_and(|text| text.len() > 65536) {
+        if self.fields.len() > RECORD_QUERY_FIELDS_MAX
+            || self
+                .text
+                .as_ref()
+                .is_some_and(|text| text.len() > RECORD_QUERY_TEXT_BYTES)
+        {
             return Err(crate::Error::new(
                 "RESOURCE_LIMIT",
                 "record query permits at most 32 field constraints and 64 KiB text",
@@ -354,7 +363,7 @@ impl RecordQuery {
                 bytes = bytes.saturating_add(value.len());
             }
         }
-        if bytes > 256 * 1024 {
+        if bytes > RECORD_QUERY_FIELD_BYTES {
             return Err(crate::Error::new(
                 "RESOURCE_LIMIT",
                 "field query exceeds 256 KiB compiled input",

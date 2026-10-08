@@ -246,7 +246,7 @@ fn records_page(
     value: &Value,
 ) -> capnp::Result<()> {
     catalog_receipt(out.reborrow().init_page(), page);
-    receipt(out.reborrow().init_receipt(), value)?;
+    receipt(out.reborrow().init_receipt(), value, Some(page))?;
     out.set_field_visits(number(value, "field_visits")?);
     count(
         out.reborrow().init_qualified_records(),
@@ -268,7 +268,7 @@ fn records_page(
     target.set_outside_interval(number(coverage, "outside_interval")?);
     target.set_membership_complete(field::<bool>(coverage, "membership_complete")?);
     if value.get("ranking").is_some() {
-        text_results(out.reborrow().init_text().init_value(), value)?;
+        text_results(out.reborrow().init_text().init_value(), value, page)?;
     }
     let source = rows(value)?;
     let mut targets = out.init_rows(source.len() as u32);
@@ -329,7 +329,7 @@ fn text_page(
     value: &Value,
 ) -> capnp::Result<()> {
     catalog_receipt(out.reborrow().init_page(), page);
-    text_results(out.init_result(), value)?;
+    text_results(out.init_result(), value, page)?;
     Ok(())
 }
 
@@ -474,7 +474,7 @@ fn keys_page(
     value: &Value,
 ) -> capnp::Result<()> {
     catalog_receipt(out.reborrow().init_page(), page);
-    receipt(out.reborrow().init_receipt(), value)?;
+    receipt(out.reborrow().init_receipt(), value, Some(page))?;
     let source = rows(value)?;
     let mut target = out.init_rows(source.len() as u32);
     for (index, row) in source.iter().enumerate() {
@@ -493,7 +493,7 @@ fn values_page(
     value: &Value,
 ) -> capnp::Result<()> {
     catalog_receipt(out.reborrow().init_page(), page);
-    receipt(out.reborrow().init_receipt(), value)?;
+    receipt(out.reborrow().init_receipt(), value, Some(page))?;
     let source = rows(value)?;
     let mut target = out.init_rows(source.len() as u32);
     for (index, row) in source.iter().enumerate() {
@@ -981,7 +981,88 @@ fn diagnostic_coverage(
     Ok(())
 }
 
-fn receipt(mut out: wire::receipt::Builder<'_>, value: &Value) -> capnp::Result<()> {
+fn query_capture(
+    mut out: wire::query_capture::Builder<'_>,
+    page: &sparrow_core::RecordReadPage,
+    result: &Value,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_page(), page);
+    let evidence = result
+        .get("query_evidence")
+        .ok_or_else(|| capnp::Error::failed("missing frozen query evidence".into()))?;
+    let profiles = evidence
+        .get("profile_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| capnp::Error::failed("missing frozen profiles".into()))?;
+    let mut targets = out.reborrow().init_profile_ids(profiles.len() as u32);
+    for (i, profile) in profiles.iter().enumerate() {
+        let mut target = targets.reborrow().get(i as u32);
+        target.set_role(match field::<String>(profile, "role")?.as_str() {
+            "json_projection" => wire::QueryProfileRole::JsonProjection,
+            "host_admission" => wire::QueryProfileRole::HostAdmission,
+            "text_analyzer" => wire::QueryProfileRole::TextAnalyzer,
+            "text_ranking" => wire::QueryProfileRole::TextRanking,
+            "text_corpus" => wire::QueryProfileRole::TextCorpus,
+            _ => return Err(capnp::Error::failed("invalid captured profile role".into())),
+        });
+        target.set_id(field::<String>(profile, "id")?);
+    }
+    // These query paths do not invoke a native governor. Preserve explicit absence.
+    if !evidence.get("native_governor").is_some_and(Value::is_null) {
+        return Err(capnp::Error::failed(
+            "unexpected native governor evidence".into(),
+        ));
+    }
+    let limits = evidence
+        .get("limits")
+        .ok_or_else(|| capnp::Error::failed("missing captured query limits".into()))?;
+    let mut target = out.init_limits();
+    target.set_candidate_visits(field::<u64>(limits, "candidate_visits")?);
+    target.set_membership_member_visits(field::<u64>(limits, "membership_member_visits")?);
+    target.set_membership_record_visits(field::<u64>(limits, "membership_record_visits")?);
+    target.set_capture_items(field::<u64>(limits, "capture_items")?);
+    target.set_capture_bytes(field::<u64>(limits, "capture_bytes")?);
+    target.set_row_bytes(field::<u64>(limits, "row_bytes")?);
+    target.set_metadata_bytes(field::<u64>(limits, "metadata_bytes")?);
+    target.set_page_bytes(field::<u64>(limits, "page_bytes")?);
+    target.set_result_handles(field::<u64>(limits, "result_handles")?);
+    target.set_result_bytes(field::<u64>(limits, "result_bytes")?);
+    target.set_lease_ms(field::<u64>(limits, "lease_ms")?);
+    for name in [
+        "json_value_visits",
+        "field_visits",
+        "posting_visits",
+        "text_membership_bytes",
+        "query_text_bytes",
+        "query_terms",
+        "field_constraints",
+        "compiled_field_bytes",
+    ] {
+        let mut limit = match name {
+            "json_value_visits" => target.reborrow().init_json_value_visits(),
+            "field_visits" => target.reborrow().init_field_visits(),
+            "posting_visits" => target.reborrow().init_posting_visits(),
+            "text_membership_bytes" => target.reborrow().init_text_membership_bytes(),
+            "query_text_bytes" => target.reborrow().init_query_text_bytes(),
+            "query_terms" => target.reborrow().init_query_terms(),
+            "field_constraints" => target.reborrow().init_field_constraints(),
+            "compiled_field_bytes" => target.reborrow().init_compiled_field_bytes(),
+            _ => return Err(capnp::Error::failed("invalid query budget name".into())),
+        };
+        if limits.get(name).is_some_and(Value::is_null) {
+            limit.set_absent(());
+        } else {
+            limit.set_value(field::<u64>(limits, name)?);
+        }
+    }
+    Ok(())
+}
+
+fn receipt(
+    mut out: wire::receipt::Builder<'_>,
+    value: &Value,
+    page: Option<&sparrow_core::RecordReadPage>,
+) -> capnp::Result<()> {
     out.set_store_id(field::<String>(value, "store_id")?);
     out.reborrow().init_membership_at().set_unix_millis(
         sparrow_core::parse_instant(&field::<String>(value, "membership_at")?)
@@ -1000,7 +1081,10 @@ fn receipt(mut out: wire::receipt::Builder<'_>, value: &Value) -> capnp::Result<
     let coverage = value
         .get("coverage")
         .ok_or_else(|| capnp::Error::failed("missing query coverage".into()))?;
-    self::coverage(out.init_coverage(), coverage)?;
+    self::coverage(out.reborrow().init_coverage(), coverage)?;
+    if let Some(page) = page {
+        query_capture(out.init_capture().init_value(), page, value)?;
+    }
     Ok(())
 }
 
@@ -1012,8 +1096,12 @@ fn rows(value: &Value) -> capnp::Result<&[Value]> {
         .ok_or_else(|| capnp::Error::failed("missing stored query rows".into()))
 }
 
-fn text_results(mut out: wire::text_results::Builder<'_>, value: &Value) -> capnp::Result<()> {
-    receipt(out.reborrow().init_receipt(), value)?;
+fn text_results(
+    mut out: wire::text_results::Builder<'_>,
+    value: &Value,
+    page: &sparrow_core::RecordReadPage,
+) -> capnp::Result<()> {
+    receipt(out.reborrow().init_receipt(), value, Some(page))?;
     let ranking = value
         .get("ranking")
         .ok_or_else(|| capnp::Error::failed("missing text ranking".into()))?;

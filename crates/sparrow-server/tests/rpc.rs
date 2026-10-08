@@ -6569,6 +6569,33 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 let expected = cli(&socket, &repeat);
                 let resumed = cli(&socket, &["result-next", id, cursor]);
                 assert_eq!(resumed, expected, "{}", args[0]);
+                if index < 4 {
+                    let receipt = &resumed["receipt"];
+                    assert_eq!(receipt["snapshot_id"], resumed["page"]["snapshot_id"]);
+                    assert_eq!(receipt["as_of"], resumed["page"]["as_of"]);
+                    assert_eq!(receipt["execution_status"].as_str(), Some("complete"));
+                    assert!(
+                        receipt["stop_reason"].is_null() && receipt["native_governor"].is_null()
+                    );
+                    assert_eq!(receipt["limits"]["page_size"].as_u64(), Some(1));
+                    assert_eq!(receipt["limits"]["capture_bytes"].as_str(), Some("2097152"));
+                    assert_eq!(receipt["limits"]["lease_ms"].as_str(), Some("60000"));
+                    assert_eq!(
+                        receipt["profile_ids"].as_array().unwrap().len(),
+                        if index == 1 { 5 } else { 2 }
+                    );
+                    if index >= 2 {
+                        assert_eq!(
+                            receipt["limits"]["json_value_visits"].as_str(),
+                            Some("10000")
+                        );
+                        assert!(receipt["limits"]["field_visits"].is_null());
+                    } else if index == 1 {
+                        assert_eq!(receipt["limits"]["posting_visits"].as_str(), Some("10000"));
+                    } else {
+                        assert_eq!(receipt["limits"]["field_constraints"].as_str(), Some("32"));
+                    }
+                }
                 assert_eq!(
                     resumed["operation"].as_str(),
                     Some(

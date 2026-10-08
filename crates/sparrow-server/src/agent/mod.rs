@@ -15,6 +15,7 @@ mod error;
 mod ingest;
 mod json;
 mod pin;
+mod query_receipt;
 mod rdf;
 mod read;
 mod records;
@@ -580,7 +581,7 @@ fn render_count(value: wire::count::Reader<'_>) -> Result<Value> {
 
 fn receipt(value: wire::receipt::Reader<'_>) -> Result<Value> {
     let coverage = value.get_coverage()?;
-    Ok(Object::new()
+    let out = Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("membership_at", instant(value.get_membership_at()?)?)
         .with(
@@ -597,8 +598,13 @@ fn receipt(value: wire::receipt::Reader<'_>) -> Result<Value> {
                 wire::Certainty::Incomplete => "incomplete",
             },
         )
-        .with("coverage", render_coverage(coverage)?)
-        .into())
+        .with("coverage", render_coverage(coverage)?);
+    match value.get_capture()?.which()? {
+        wire::optional_query_capture::Absent(()) => Ok(out.into()),
+        wire::optional_query_capture::Value(capture) => {
+            Ok(query_receipt::apply(out, capture?)?.into())
+        }
+    }
 }
 
 fn render_membership_coverage(

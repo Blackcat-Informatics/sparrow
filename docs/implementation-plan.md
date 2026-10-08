@@ -28,8 +28,10 @@ and native ranked text, now use immutable result pages with frozen receipts and
 ranking corpus evidence. Standalone text search shares those captures, native
 ranking, operation-bound cursors and aggregate handle admission. Key/value discovery now shares those leases and captures complete native occurrence
 rows or key counts before paging. Cursor-only result_next resumes all existing typed page families through their
-shared lease and canonical renderers. Complete scope receipts and corpus-scale
-indexed selection remain required.
+shared lease and canonical renderers. Existing paged query receipts now freeze
+capture identity, native profiles and effective host admission ceilings while
+preserving original coverage and certainty. Native certified governor receipts,
+context provenance and corpus-scale indexed selection remain required.
 The standalone producer client and schema-11 typed event batch operation are
 present. Native event JSONL enters the same occurrence/field/text/time indexes;
 the bounded producer queue now reconnects with immutable pending batches and

@@ -81,6 +81,133 @@ pub struct RecordPageBody {
     rows: Vec<Vec<u8>>,
 }
 
+/// Host-owned query admission profile; native semantic profiles remain separate.
+pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/1";
+
+fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
+    use purrdf_lex::json::Object;
+    let mut profiles = vec![
+        Value::from(
+            Object::new()
+                .with("role", "json_projection")
+                .with("id", crate::projection::json_profile()?.identity().to_hex()),
+        ),
+        Value::from(
+            Object::new()
+                .with("role", "host_admission")
+                .with("id", QUERY_CAPTURE_PROFILE),
+        ),
+    ];
+    if let Some(ranking) = result.get("ranking") {
+        for (role, field) in [
+            ("text_analyzer", "analyzer"),
+            ("text_ranking", "profile"),
+            ("text_corpus", "corpus_profile"),
+        ] {
+            profiles.push(
+                Object::new()
+                    .with("role", role)
+                    .with("id", super::read_field::<String>(ranking, field)?)
+                    .into(),
+            );
+        }
+    }
+    let (json, fields, postings) = match selector {
+        Selector::Json(_) => (true, false, false),
+        Selector::Records(q) => (false, !q.query.fields.is_empty(), q.query.text.is_some()),
+    };
+    let budget = selector.scope().scan_budget as u64;
+    Ok(Object::new()
+        .with("profile_ids", Value::array(profiles))
+        .with("native_governor", Value::Null)
+        .with(
+            "limits",
+            Object::new()
+                .with("candidate_visits", budget)
+                .with(
+                    "json_value_visits",
+                    if json {
+                        Value::from(budget)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "field_visits",
+                    if fields {
+                        Value::from(budget)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "posting_visits",
+                    if postings {
+                        Value::from(budget)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "text_membership_bytes",
+                    if postings {
+                        Value::from(super::text_index::MATCH_MEMBERSHIP_BYTES as u64)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "query_text_bytes",
+                    if postings {
+                        Value::from(crate::query::RECORD_QUERY_TEXT_BYTES as u64)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "query_terms",
+                    if postings {
+                        Value::from(purrdf::text::QUERY_TERMS_MAX as u64)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "field_constraints",
+                    if fields {
+                        Value::from(crate::query::RECORD_QUERY_FIELDS_MAX as u64)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "compiled_field_bytes",
+                    if fields {
+                        Value::from(crate::query::RECORD_QUERY_FIELD_BYTES as u64)
+                    } else {
+                        Value::Null
+                    },
+                )
+                .with(
+                    "membership_member_visits",
+                    super::query_membership::MAX_SELECTION_VISITS as u64,
+                )
+                .with(
+                    "membership_record_visits",
+                    super::query_membership::MAX_SELECTION_VISITS as u64,
+                )
+                .with("capture_items", catalog_lease::MAX_ITEMS as u64)
+                .with("capture_bytes", catalog_lease::CAPTURE_BYTES as u64)
+                .with("row_bytes", ROW_BYTES as u64)
+                .with("metadata_bytes", METADATA_BYTES as u64)
+                .with("page_bytes", catalog_lease::PAGE_BYTES as u64)
+                .with("result_handles", catalog_lease::MAX_HANDLES as u64)
+                .with("result_bytes", catalog_lease::HANDLE_BYTES as u64)
+                .with("lease_ms", catalog_lease::LEASE_MS),
+        )
+        .into())
+}
+
 impl RecordPageBody {
     fn capture(mut result: Value) -> Result<Self, Error> {
         let object = result
@@ -239,10 +366,15 @@ impl Store {
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "query read deadline overflow"))?;
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
-        let value = match &selector {
+        let mut value = match &selector {
             Selector::Records(q) => self.records_query_capture(&q.scope, &q.query, now, true)?,
             Selector::Json(q) => self.json_query_capture(&q.scope, &q.query, now, true)?,
         };
+        let evidence = query_evidence(&selector, &value)?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query result is not an object"))?
+            .insert("query_evidence", evidence);
         let store_id = super::read_field::<String>(&value, "store_id")?;
         let scanned = usize::try_from(super::integer(&value["coverage"], "visited")?)
             .map_err(|_| Error::new("STORAGE_FAILURE", "query capture scan count overflow"))?;

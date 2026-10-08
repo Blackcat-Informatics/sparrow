@@ -9083,3 +9083,119 @@ fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_o
         "RESULT_EXPIRED"
     );
 }
+
+#[test]
+fn captured_query_evidence_freezes_native_profiles_and_applicable_admission_limits() {
+    use sparrow_core::{
+        FieldConstraint, JsonPredicate, JsonQuery, JsonRead, RecordOperation, RecordQuery,
+        RecordRead,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest(
+            "receipt-profile-input",
+            "pages",
+            "jsonl",
+            br#"{"message":"needle a"}
+{"message":"needle b"}
+"#,
+            1,
+        )
+        .unwrap();
+    let scope = record_page_scope("pages", 1);
+    let mut json = JsonRead {
+        scope: scope.clone(),
+        query: JsonQuery::Keys,
+        cursor: None,
+    };
+    let first = store.json_read(&json, 2).unwrap();
+    let evidence = first.body.result().unwrap()["query_evidence"].clone();
+    let native = sparrow_core::json_projection_profile()
+        .unwrap()
+        .identity()
+        .to_hex();
+    assert_eq!(
+        evidence["profile_ids"][0]["id"].as_str(),
+        Some(native.as_str())
+    );
+    assert_eq!(
+        evidence["profile_ids"][1]["id"].as_str(),
+        Some(sparrow_core::QUERY_CAPTURE_PROFILE)
+    );
+    assert_eq!(evidence["profile_ids"].as_array().unwrap().len(), 2);
+    assert!(evidence["native_governor"].is_null());
+    assert_eq!(
+        evidence["limits"]["json_value_visits"].as_u64(),
+        Some(scope.scan_budget as u64)
+    );
+    assert!(
+        evidence["limits"]["field_visits"].is_null()
+            && evidence["limits"]["posting_visits"].is_null()
+    );
+    assert_eq!(
+        evidence["limits"]["capture_bytes"].as_u64(),
+        Some(2 * 1024 * 1024)
+    );
+    json.cursor = first.next_cursor.clone();
+    store
+        .ingest(
+            "receipt-profile-later",
+            "pages",
+            "json",
+            br#"{"later":true}"#,
+            3,
+        )
+        .unwrap();
+    assert_eq!(
+        store.json_read(&json, 4).unwrap().body.result().unwrap()["query_evidence"],
+        evidence
+    );
+    let record = RecordRead {
+        scope,
+        operation: RecordOperation::Records,
+        query: RecordQuery {
+            text: Some("needle".into()),
+            fields: vec![FieldConstraint {
+                predicate: JsonPredicate {
+                    path: Some("/message".into()),
+                    kind: Some("string".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let result = store
+        .records_read(&record, 4)
+        .unwrap()
+        .body
+        .result()
+        .unwrap();
+    let context = &result["query_evidence"];
+    assert_eq!(context["profile_ids"].as_array().unwrap().len(), 5);
+    for (i, key) in [(2, "analyzer"), (3, "profile"), (4, "corpus_profile")] {
+        assert_eq!(context["profile_ids"][i]["id"], result["ranking"][key]);
+    }
+    assert!(context["limits"]["json_value_visits"].is_null());
+    assert_eq!(
+        context["limits"]["field_visits"].as_u64(),
+        Some(record.scope.scan_budget as u64)
+    );
+    assert_eq!(
+        context["limits"]["posting_visits"].as_u64(),
+        Some(record.scope.scan_budget as u64)
+    );
+    assert_eq!(context["limits"]["field_constraints"].as_u64(), Some(32));
+    assert_eq!(context["limits"]["query_text_bytes"].as_u64(), Some(65536));
+    assert_eq!(
+        context["limits"]["query_terms"].as_u64(),
+        Some(purrdf::text::QUERY_TERMS_MAX as u64)
+    );
+    assert_eq!(
+        context["limits"]["text_membership_bytes"].as_u64(),
+        Some(64 * 1024 * 1024)
+    );
+}

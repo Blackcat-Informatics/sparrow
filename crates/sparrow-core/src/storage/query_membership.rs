@@ -8,7 +8,7 @@ use crate::{QueryScope, QuerySelection};
 use rocksdb::IteratorMode;
 use std::collections::{BTreeMap, BTreeSet};
 
-const MAX_SELECTION_VISITS: usize = 100_000;
+pub(super) const MAX_SELECTION_VISITS: usize = 100_000;
 
 /// Resolved record and whole-artifact occurrence membership, including recordless artifacts.
 #[derive(Default)]

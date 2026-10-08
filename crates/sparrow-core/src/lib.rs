@@ -47,7 +47,7 @@ pub use storage::rdf_view::{
     RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
 };
 pub use storage::record_read::{
-    JsonRead, RecordOperation, RecordPageBody, RecordRead, RecordReadPage,
+    JsonRead, QUERY_CAPTURE_PROFILE, RecordOperation, RecordPageBody, RecordRead, RecordReadPage,
 };
 pub use storage::result_read::ResultPage;
 pub use storage::source_read::{

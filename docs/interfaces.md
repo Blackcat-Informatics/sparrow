@@ -309,7 +309,7 @@ predicates otherwise agree.
 Continuations replay captured rows after pin mutation/release and evidence
 retirement; fresh reads revalidate current evidence. A changed query refuses with
 `CONFLICT`, an invalid page boundary with `INVALID_ARGUMENT`, and expired, unknown
-or previous-owner handles with `RESULT_EXPIRED`. Current schema 31 is required;
+or previous-owner handles with `RESULT_EXPIRED`. Current schema 32 is required;
 storage formats remain unchanged. `scanned` records candidate visits, not all I/O:
 reference expansion, field visits and posting visits retain their independent
 documented bounds and original coverage evidence.
@@ -333,6 +333,41 @@ creates another handle. Foreign stores refuse STORE_MISMATCH; malformed/non-page
 positions refuse INVALID_ARGUMENT; expired, unknown and previous-owner handles
 refuse RESULT_EXPIRED. These are typed failures with no successful prefix.
 Schema discovery refuses older daemons before requesting continuation.
+
+
+### Frozen query capture provenance
+
+Schema 32 extends Receipt with an optional typed QueryCapture for successful
+record, standalone text, key and value result pages, including cursor-only
+continuations. It binds the original CatalogReadReceipt, role-tagged native
+profile identities, explicit native governor absence and typed QueryLimits.
+The native JSON projection fingerprint comes from the same public profile owner
+as ingestion. Analyzer, ranking and corpus identities come from the captured
+native ranking result; they are absent when text ranking did not run.
+The separately identified host admission profile owns Sparrow's phase ceilings.
+
+CLI/MCP semantic receipts include snapshot_id, as_of, absolute lease deadline,
+execution_status, profile_ids, native_governor, limits and stop_reason. The
+original execution, certainty and coverage remain unchanged. Inactive phase
+budgets are null, rather than fabricated zero. Limits include candidate,
+native JSON occurrence, field and posting visits; independent membership member
+and record visits; text membership, text input/terms and compiled field admission;
+and result item, row, metadata, byte, page, registry and lease ceilings.
+Numeric UInt64 ceilings use exact decimal strings; requested page_size remains
+a bounded integer. These are phase-specific ceilings, not an all-I/O or RSS claim.
+
+Semantic receipts remain frozen across pages; page position and cursor stay in
+the existing separate page object. QueryCapture reuses the typed catalog page
+receipt on the wire. Capture evidence is admitted with result metadata and
+decoded by PurRDF's native JSON codec. Retention, pin changes and profile
+declarations do not recompute it. A successful capture has complete execution
+and null stop_reason; capacity/scan exhaustion refuses before a page is published.
+
+These operations do not invoke a native query governor, and native_governor is
+explicitly absent. Existing incomplete index/scope certainty is preserved;
+it is not relabeled as a native certified partial answer. The wider receipt
+contract, native governor certification, context capture provenance and remaining
+query surfaces remain first-version requirements.
 
 
 SPARQL additionally selects graph layers `metadata`, `diagnostic`, and `content`,
@@ -585,7 +620,7 @@ decoding, typed coverage encoding and rendering.
 Cursors bind the original membership, selector and limits. Continuation serves
 the immutable capture after pin release, collection changes or evidence retirement;
 fresh reads revalidate current evidence. No read renews protection. Current
-discovery schema 31 is required; old clients/daemons are explicitly refused.
+discovery schema 32 is required; old clients/daemons are explicitly refused.
 Storage formats and retained evidence encodings are unchanged.
 
 Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`

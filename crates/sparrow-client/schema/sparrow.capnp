@@ -277,9 +277,28 @@ struct DiagnosticCoverage {
   evaluated @0 :UInt64; matched @1 :UInt64; excluded @2 :UInt64;
   unknown @3 :UInt64; membershipComplete @4 :Bool;
 }
+struct OptionalLimit { union { absent @0 :Void; value @1 :UInt64; } }
+enum QueryProfileRole { jsonProjection @0; hostAdmission @1; textAnalyzer @2; textRanking @3; textCorpus @4; }
+struct QueryProfile { role @0 :QueryProfileRole; id @1 :Text; }
+struct QueryLimits {
+  candidateVisits @0 :UInt64; jsonValueVisits @1 :OptionalLimit;
+  fieldVisits @2 :OptionalLimit; postingVisits @3 :OptionalLimit;
+  membershipMemberVisits @4 :UInt64; membershipRecordVisits @5 :UInt64;
+  captureItems @6 :UInt64; captureBytes @7 :UInt64; rowBytes @8 :UInt64;
+  metadataBytes @9 :UInt64; pageBytes @10 :UInt64; resultHandles @11 :UInt64;
+  resultBytes @12 :UInt64; leaseMs @13 :UInt64;
+  textMembershipBytes @14 :OptionalLimit; queryTextBytes @15 :OptionalLimit;
+  queryTerms @16 :OptionalLimit; fieldConstraints @17 :OptionalLimit;
+  compiledFieldBytes @18 :OptionalLimit;
+}
+struct QueryCapture {
+  page @0 :CatalogReadReceipt; profileIds @1 :List(QueryProfile);
+  nativeGovernor @2 :OptionalText; limits @3 :QueryLimits;
+}
+struct OptionalQueryCapture { union { absent @0 :Void; value @1 :QueryCapture; } }
 struct Receipt {
   storeId @0 :Text; membershipAt @1 :Instant; execution @2 :Execution;
-  certainty @3 :Certainty; coverage @4 :Coverage;
+  certainty @3 :Certainty; coverage @4 :Coverage; capture @5 :OptionalQueryCapture;
 }
 struct Key { path @0 :Text; kind @1 :JsonKind; occurrences @2 :UInt64; records @3 :UInt64; }
 struct Keys { receipt @0 :Receipt; rows @1 :List(Key); page @2 :CatalogReadReceipt; }

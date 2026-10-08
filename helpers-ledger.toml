@@ -2524,3 +2524,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = []
+
+[[job]]
+id = "frozen-query-capture-provenance"
+summary = "One capture owner freezes native JSON/text profile identities and actual host phase ceilings; original certainty and coverage are preserved without inventing native governor evidence."
+home = "sparrow_core::storage::record_read::query_evidence"
+entry_points = ["sparrow_server::rpc::query_capture", "sparrow_server::agent::query_receipt::apply", "sparrow_server::agent::query_receipt::limit"]
+spec = "docs/interfaces.md: schema 32 query capture provenance."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^invent_query_governor_certificate$']
