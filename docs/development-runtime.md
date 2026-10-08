@@ -65,6 +65,23 @@ was refused by the schema 24 CLI for status, keys and artifact listing with
 SIGINT and removed its socket. No HTTP transport, runtime dependency, store
 format or PurRDF pin changed. Full architecture acceptance remains unmet.
 
+Verified development adoption on 2026-10-07: signed functional commit `8cd62a0`
+passed the additive pre-commit gate. The owned schema 23 unit stopped cleanly on
+SIGINT and removed its socket; the same unit/config/store reopened under schema
+24 (observed PID 984327). Store identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`, with 195 live
+records and no pending writes. Directory/socket permissions remain 0700/0600.
+
+Live evidence in `/tmp/sparrow-artifact-wire-live.thqjmlxm` verifies two immutable
+artifact pages for `acceptance-diagnostic-20261007`, CLI/MCP equal continuation,
+typed receipt-time selection, exact retained counts (three records), original
+104/240-byte lengths and explicit scoped refusals. Typed status reports the one
+retained catalog handle and its eight-handle ceiling. Existing default/strict
+diagnostic coverage and text/context paths remain passing. Stable artifact,
+descriptor and handoff retries preserve their identities and exact 104/82/87
+bytes; the handoff producer replacement remains preserved. Full architecture
+acceptance, further artifact scopes and source discovery remain unfinished.
+
 ## Schema 23 bounded typed discovery
 
 `discover` carries typed store/schema/profile identities, upload/event ceilings
