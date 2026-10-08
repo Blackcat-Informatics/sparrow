@@ -1015,6 +1015,8 @@ generations and terminal metadata expiry change fresh reads, while continuation
 retains captured IDs. A captured reference is not a pin or a promise that a
 later checkpoint lookup will still succeed. Store formats are unchanged and
 older discovery schemas refuse instead of silently omitting the added field.
+`page_size` is an item ceiling: response byte limits may require continuation
+before that many rows. Follow `next_cursor` to complete the captured inventory.
 Syslog stream discovery remains unfinished.
 
 ### Structured producer sequence windows (schema 35)

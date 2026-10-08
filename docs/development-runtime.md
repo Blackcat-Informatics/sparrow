@@ -2,12 +2,58 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 45 and store format 37. The stable installed
+private Unix socket. It uses schema 46 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`dba5804`; see [syslog child task teardown](#syslog-child-task-teardown) for
+`ebea75a`; see [tail generation discovery](#tail-generation-discovery) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Tail generation discovery
+
+Signed source `ebea75a` adds sorted `tail_generation_ids` to the existing source
+capture. Active and unexpired terminal checkpoints are grouped by their exact
+intake key, including empty generations with zero records. The native tail
+registry decoder remains the identity/validation owner. Registry bytes and
+entries use the shared catalog scan admission; references use fallible exact
+reservation and actual source capture/lease capacity accounting. Missing or
+corrupt required metadata refuses rather than disappearing from discovery.
+Continuation freezes the original IDs, without retaining bytes or extending
+checkpoint metadata lifetime. Fresh reads exclude terminal rows at their exact
+metadata deadline. Existing typed checkpoint lookup supplies offsets, original
+declarations, completion and gaps.
+
+Wire schema 46 adds `SourceSummary.tailGenerationIds @10`; source query schema
+validation and adapter discovery refuse old queries. CLI and MCP share the
+canonical renderer. Storage format is unchanged. The full release gate and
+normal signed source hook pass 149 storage scenarios, 58 RPC scenarios, all
+remaining workspace tests, seeded census self-tests and 229 pinned ownership
+jobs with no distinct exceptions. New/expanded scenarios cover empty inputs,
+terminal expiry, a generation added after capture, exact source selection,
+restart, scan refusal, corrupt registry refusal and typed/TCP/CLI/MCP discovery
+through source continuations. Five source storage scenarios and the expanded
+generation RPC scenario also pass on Btrfs; source and logs are retained at
+`~/.local/state/sparrow/tail-discovery-qualification-crgemz5t`.
+
+The selected runtime build follows the source hook. Frozen images are
+`~/.local/state/sparrow/tail-discovery-images-5du4trjg`. The closed copied corpus
+at `~/.local/state/sparrow/json-pages-qualification-cuykzn6s` preserves all 7,058
+record rows, source/temporal/text results, native scores, groups, 51 keys and
+286 value occurrences against predecessor evidence, with zero result leases.
+
+Public adoption evidence is `/tmp/sparrow-tail-discovery-live.aoq9whkm`. The
+predecessor closes gracefully before a closed-store backup and immutable alias
+replacement. The enabled unit now runs PID 406435 on `0.0.0.0:518` and the
+existing Unix socket, with schema 46, format 37 and the same store identity and
+212 records. All five development generations resolve through source discovery
+and exact checkpoint lookup over TCP/Unix/CLI/MCP. The complete 21-source
+inventory matches across continuations. The initial live driver incorrectly
+treated its default byte-bounded 15-row page as the whole baseline; the corrected
+driver traverses and releases every capture. Old schema-45 source queries refuse.
+Saved finish/handoff retries, grouped and JSON pagination, native field/time/text
+witnesses and idle-peer admission also pass. Final status has zero pins/read
+leases and healthy watches/durability. Syslog stream discovery, governed stored
+SPARQL, correlation/explanations and full operational acceptance remain unfinished.
 
 ## Syslog child task teardown
 
