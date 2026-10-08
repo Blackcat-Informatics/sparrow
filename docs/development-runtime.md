@@ -63,8 +63,8 @@ The storage fence advances basic/consumption/watch/handoff formats to 13/14/15/1
 Legacy 9/10/11/12 retain their completed recordless index and store identity while
 durably advancing before serving. Historical absent diagnostic snapshots remain
 unprofiled; later mappings do not rewrite them. Legacy stores with unfenced
-diagnostic registry state refuse startup. The development unit still runs schema
-20/format 12 until the verified source is adopted below. Full governed SPARQL,
+diagnostic registry state refuse startup. Before adoption below the development
+unit ran schema 20/format 12. Full governed SPARQL,
 graph-layer selection/correlation, tailing/syslog, physical reclamation and the
 remaining full architecture qualification are still unfinished.
 
@@ -87,6 +87,26 @@ identity and recovered the identical mapping and durable artifact retry receipt.
 Both owned current processes shut down with SIGINT, exit 0 and socket cleanup.
 Evidence is under `/tmp/sparrow-diagnostic-writer-fence.lbr4q7qy`. This verifies
 writer refusal and reopen, not full architecture acceptance.
+
+The owned development unit adopted signed commit `5f429a6` after SIGINT shutdown,
+MainPID 0, successful unit result and socket cleanup. PID 802658 now serves schema
+21/format 16 at the existing private socket, directory 0700/socket 0600, and store
+`store:46c88e949ccec658600b66c7becd5bb7`. Historical descriptor evidence remains
+explicitly unprofiled. A new synthetic source defined five mappings before
+publishing two JSONL records as `artifact:a35c460d343822b6ef25bd68cb5be04f`.
+Combined service/severity/trace filters returned exactly
+`record:2b5f999b12f0d4e25a74fe850d832114` through CLI and MCP; native text retrieval
+returned the same occurrence and RDF inspection reported 40 diagnostic rows.
+The complete 240-byte export matched the input including its escape and CRLF.
+Idempotent mapping/ingestion retries preserved their identities. Status reported
+194 live records, no durability backlog and the same watch authority.
+
+Original descriptor and immutable handoff retries also retained their artifact
+identities. Independent byte comparisons verified all 82 descriptor bytes, all
+87 handoff bytes and the preserved replacement producer file. Outputs are under
+`/tmp/sparrow-diagnostic-live.nvzlvt27`. This qualifies the owned transient
+development deployment; permanent packaging, full architecture acceptance and
+the remaining features listed above are unfinished.
 
 ## Schema 20 source alternatives
 
