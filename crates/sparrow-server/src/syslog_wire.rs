@@ -18,77 +18,83 @@ const HEADERS: &[(wire::SyslogHeader, &str)] = &[
 pub(crate) fn listeners(
     value: capnp::struct_list::Reader<'_, wire::syslog_listener_status::Owned>,
 ) -> crate::agent::AgentResult<Value> {
-    let mut rows = Vec::new();
-    for listener in value {
-        let framing = match listener.get_framing()?.which()? {
-            wire::optional_syslog_framing::Absent(()) => Value::Null,
-            wire::optional_syslog_framing::Value(value) => Value::from(match value? {
-                wire::SyslogFraming::OctetCounting => "octet_counting",
-                wire::SyslogFraming::Lf => "lf",
-                wire::SyslogFraming::CrLf => "cr_lf",
-            }),
-        };
-        let failure = match listener.get_failure()?.which()? {
-            wire::optional_text::Absent(()) => Value::Null,
-            wire::optional_text::Value(value) => Value::from(value?.to_str()?),
-        };
-        rows.push(Value::from(
-            Object::new()
-                .with("id", listener.get_id()?.to_str()?)
-                .with("source", listener.get_source()?.to_str()?)
-                .with("address", listener.get_address()?.to_str()?)
-                .with(
-                    "transport",
-                    match listener.get_transport()? {
-                        wire::SyslogTransport::Tcp => "tcp",
-                        wire::SyslogTransport::Udp => "udp",
-                    },
-                )
-                .with("framing", framing)
-                .with(
-                    "max_message_bytes",
-                    u64::from(listener.get_max_message_bytes()),
-                )
-                .with("max_connections", u64::from(listener.get_max_connections()))
-                .with("read_timeout_ms", u64::from(listener.get_read_timeout_ms()))
-                .with(
-                    "active_connections",
-                    u64::from(listener.get_active_connections()),
-                )
-                .with(
-                    "accepted_messages",
-                    listener.get_accepted_messages().to_string(),
-                )
-                .with(
-                    "interpretation_failures",
-                    listener.get_interpretation_failures().to_string(),
-                )
-                .with(
-                    "refused_messages",
-                    listener.get_refused_messages().to_string(),
-                )
-                .with(
-                    "truncated_datagrams",
-                    listener.get_truncated_datagrams().to_string(),
-                )
-                .with(
-                    "framing_failures",
-                    listener.get_framing_failures().to_string(),
-                )
-                .with(
-                    "rejected_connections",
-                    listener.get_rejected_connections().to_string(),
-                )
-                .with(
-                    "timed_out_connections",
-                    listener.get_timed_out_connections().to_string(),
-                )
-                .with("continuity_unknown", listener.get_continuity_unknown())
-                .with("kernel_drops_unknown", listener.get_kernel_drops_unknown())
-                .with("failure", failure),
-        ));
-    }
-    Ok(rows.into())
+    value
+        .iter()
+        .map(listener)
+        .collect::<crate::agent::AgentResult<Vec<_>>>()
+        .map(Into::into)
+}
+
+pub(crate) fn listener(
+    listener: wire::syslog_listener_status::Reader<'_>,
+) -> crate::agent::AgentResult<Value> {
+    let framing = match listener.get_framing()?.which()? {
+        wire::optional_syslog_framing::Absent(()) => Value::Null,
+        wire::optional_syslog_framing::Value(value) => Value::from(match value? {
+            wire::SyslogFraming::OctetCounting => "octet_counting",
+            wire::SyslogFraming::Lf => "lf",
+            wire::SyslogFraming::CrLf => "cr_lf",
+        }),
+    };
+    let failure = match listener.get_failure()?.which()? {
+        wire::optional_text::Absent(()) => Value::Null,
+        wire::optional_text::Value(value) => Value::from(value?.to_str()?),
+    };
+    Ok(Value::from(
+        Object::new()
+            .with("id", listener.get_id()?.to_str()?)
+            .with("source", listener.get_source()?.to_str()?)
+            .with("address", listener.get_address()?.to_str()?)
+            .with(
+                "transport",
+                match listener.get_transport()? {
+                    wire::SyslogTransport::Tcp => "tcp",
+                    wire::SyslogTransport::Udp => "udp",
+                },
+            )
+            .with("framing", framing)
+            .with(
+                "max_message_bytes",
+                u64::from(listener.get_max_message_bytes()),
+            )
+            .with("max_connections", u64::from(listener.get_max_connections()))
+            .with("read_timeout_ms", u64::from(listener.get_read_timeout_ms()))
+            .with(
+                "active_connections",
+                u64::from(listener.get_active_connections()),
+            )
+            .with(
+                "accepted_messages",
+                listener.get_accepted_messages().to_string(),
+            )
+            .with(
+                "interpretation_failures",
+                listener.get_interpretation_failures().to_string(),
+            )
+            .with(
+                "refused_messages",
+                listener.get_refused_messages().to_string(),
+            )
+            .with(
+                "truncated_datagrams",
+                listener.get_truncated_datagrams().to_string(),
+            )
+            .with(
+                "framing_failures",
+                listener.get_framing_failures().to_string(),
+            )
+            .with(
+                "rejected_connections",
+                listener.get_rejected_connections().to_string(),
+            )
+            .with(
+                "timed_out_connections",
+                listener.get_timed_out_connections().to_string(),
+            )
+            .with("continuity_unknown", listener.get_continuity_unknown())
+            .with("kernel_drops_unknown", listener.get_kernel_drops_unknown())
+            .with("failure", failure),
+    ))
 }
 
 pub(crate) fn snapshot(

@@ -60,6 +60,7 @@ struct SourceSummary {
   continuityUnknown @7 :Bool; watches @8 :List(SourceWatchInfo);
   producerStreamIds @9 :List(Text);
   tailGenerationIds @10 :List(Text);
+  syslogListenerIds @11 :List(Text);
 }
 struct SourceListQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;
@@ -128,6 +129,7 @@ struct SyslogListenerStatus {
   rejectedConnections @14 :UInt64; timedOutConnections @15 :UInt64;
   continuityUnknown @16 :Bool; kernelDropsUnknown @17 :Bool; failure @18 :OptionalText;
 }
+struct SyslogListenerQuery { storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :Text; id @3 :Text; }
 struct ProducerPosition { streamId @0 :Text; sequence @1 :UInt64; }
 struct OptionalProducerPosition { union { absent @0 :Void; value @1 :ProducerPosition; } }
 struct ProducerGap { first @0 :UInt64; last @1 :UInt64; }
@@ -585,4 +587,5 @@ interface Sparrow {
   tailFinish @40 (request :TailFinishIntent) -> (result :Result(TailGeneration));
   tailFinishGet @41 (request :TailFinishIntent) -> (result :Result(TailGeneration));
   resultRelease @42 (query :ResultReleaseQuery) -> (result :Result(ResultReleased));
+  syslogListenerGet @43 (query :SyslogListenerQuery) -> (result :Result(SyslogListenerStatus));
 }

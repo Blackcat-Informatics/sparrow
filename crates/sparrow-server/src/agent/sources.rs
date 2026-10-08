@@ -74,6 +74,13 @@ pub(super) fn render(page: wire::source_list_page::Reader<'_>) -> Result<Value> 
         rows.push(Value::from(
             Object::new()
                 .with(
+                    "syslog_listener_ids",
+                    row.get_syslog_listener_ids()?
+                        .iter()
+                        .map(|id| Ok(id?.to_str()?.to_owned()))
+                        .collect::<Result<Vec<_>>>()?,
+                )
+                .with(
                     "tail_generation_ids",
                     row.get_tail_generation_ids()?
                         .iter()

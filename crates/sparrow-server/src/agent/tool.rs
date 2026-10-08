@@ -84,6 +84,11 @@ impl Operation {
                     store: fields.required("store_id")?,
                     id: fields.required("generation_id")?,
                 })),
+                "syslog_listener_get" => Self::Query(Command::Syslog(super::syslog::Input {
+                    store: fields.required("store_id")?,
+                    source: fields.required("source")?,
+                    id: fields.required("listener_id")?,
+                })),
                 "producer_stream_get" => Self::Query(Command::Producer(super::producer::Input {
                     store: fields.required("store_id")?,
                     id: fields.required("stream_id")?,

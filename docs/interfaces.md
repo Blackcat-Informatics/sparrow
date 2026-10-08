@@ -1017,7 +1017,36 @@ later checkpoint lookup will still succeed. Store formats are unchanged and
 older discovery schemas refuse instead of silently omitting the added field.
 `page_size` is an item ceiling: response byte limits may require continuation
 before that many rows. Follow `next_cursor` to complete the captured inventory.
-Syslog stream discovery remains unfinished.
+Schema 47 adds sorted `syslog_listener_ids` for currently configured syslog
+listeners under each exact source key, including listeners that have accepted
+no packets. Multiple listeners may share a source. The runtime registry owns
+these bindings; callers cannot supply them. Listener declarations count against
+the source scan and capture admission, and duplicate listener identities or
+invalid declarations refuse before publication. Continuation freezes the
+original references; fresh reads reflect the current configuration. Removing a
+listener does not erase retained packet sources, but removes its binding from
+fresh reads. No listener reference is a pin or a durable stream checkpoint.
+
+Resolve each reference with typed `syslogListenerGet`, CLI
+`syslog-listener STORE_ID SOURCE LISTENER_ID`, or closed read-only MCP tool
+`syslog_listener_get` with `store_id`, `source` and `listener_id`. The exact
+store and source are required: a matching listener ID under another source
+cannot satisfy the query. Older schemas refuse with `UNSUPPORTED`; a different
+store refuses with `STORE_MISMATCH`; an absent or rebound listener refuses with
+`NOT_FOUND`. Current source labels are 1..512 bytes and listener IDs 1..128 bytes.
+The runtime registry has at most four entries and is read through its existing
+fallible snapshot owner. Registry failures remain `STORAGE_FAILURE`.
+
+The reply uses the existing typed `SyslogListenerStatus`: configured listener
+ID, exact source, actual binding, transport/framing, payload/connection/time
+bounds, active connections, observed accepted/refused/malformed/truncated counts,
+connection refusals/timeouts and explicit failure. The canonical CLI/MCP listener
+renderer is also used by status. CLI/MCP wrap it with `store_id`, operation
+`syslog_listener_get` and `listener`. This lookup reads current runtime
+observations, not the source capture's historical counters. Counters reset on
+restart; continuity remains unknown, and UDP kernel/network loss remains
+unknown. Durable syslog observation windows, per-record receiver positions and
+their gap/correlation contracts remain unfinished.
 
 ### Structured producer sequence windows (schema 35)
 

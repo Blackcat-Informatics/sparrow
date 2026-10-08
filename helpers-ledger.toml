@@ -2512,10 +2512,10 @@ names = ['^(encode_discovery_durability|encode_status_durability)$']
 
 [[job]]
 id = "source-catalog-discovery"
-summary = "Discover exact intake keys, retained occurrences, durable mappings, producer windows, active/recent tail generation checkpoints and runtime-owned watch declarations through one immutable metadata capture."
+summary = "Discover exact intake keys, retained occurrences, durable mappings, producer windows, active/recent tail generation checkpoints and runtime-owned watch/syslog listener declarations through one immutable metadata capture."
 home = "sparrow_core::Store::source_read"
 entry_points = ["sparrow_server::rpc::Rpc::sources_list", "sparrow_server::agent::sources::Input::execute"]
-spec = "docs/interfaces.md: source discovery, schema 46 tail generation IDs and explicit unknown producer continuity."
+spec = "docs/interfaces.md: source discovery, schema 47 syslog listener IDs and explicit unknown producer continuity."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true
@@ -2940,6 +2940,48 @@ summary = "CLI and MCP record/context summaries share one generated syslog evide
 home = "sparrow_server::syslog_wire::render"
 entry_points = ["sparrow_server::agent::context::render_record"]
 spec = "docs/interfaces.md: syslog packet interpretation."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "syslog-source-bindings"
+summary = "The runtime syslog registry supplies exact configured source/listener pairs to the shared source capture, including listeners before their first packet."
+home = "sparrow_server::syslog_listener::SyslogRegistry::sources"
+entry_points = ["sparrow_server::rpc::Rpc::sources_list"]
+spec = "docs/interfaces.md: schema 47 runtime syslog listener discovery."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "syslog-listener-lookup"
+summary = "One generated RPC resolves a bounded current listener under its exact store and source, preserving schema refusal and runtime registry failures."
+home = "sparrow_server::rpc::Rpc::syslog_listener_get"
+entry_points = ["sparrow_server::agent::syslog::Input::execute"]
+spec = "docs/interfaces.md: schema 47 syslogListenerGet, CLI and MCP."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "syslog-listener-rendering"
+summary = "Status, CLI listener lookup and MCP listener lookup share one generated listener status renderer; process-scoped counters and unknown loss remain explicit."
+home = "sparrow_server::syslog_wire::listener"
+entry_points = ["sparrow_server::syslog_wire::listeners", "sparrow_server::agent::syslog::Input::execute"]
+spec = "docs/interfaces.md: schema 47 current syslog listener observations."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true

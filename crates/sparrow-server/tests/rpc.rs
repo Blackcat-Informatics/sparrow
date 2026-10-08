@@ -1218,6 +1218,8 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         assert_eq!(text.matches("max_concurrent_requests = 4").count(), 1);
         text = text.replace("max_concurrent_requests = 4", "max_concurrent_requests = 5");
         std::fs::write(&config, text).unwrap();
+        let (rpc_address, reservation) = configure_tcp_listener(&config);
+        drop(reservation);
         for (id, transport, framing) in [("octets", "tcp", Some("octet_counting")), ("datagrams", "udp", None), ("lf", "tcp", Some("lf")), ("crlf", "tcp", Some("cr_lf"))] {
             append_syslog_config(&config, id, "127.0.0.1:0", &format!("syslog-{id}"), transport, framing);
         }
@@ -1227,6 +1229,59 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
         let listeners = status.get_syslog_listeners().unwrap();
         assert_eq!(listeners.len(), 4);
+        let tcp = sparrow_client::Client::connect_tcp(rpc_address).await.unwrap();
+        let endpoint = format!("tcp://{rpc_address}");
+        let store_id = client.discovery().store_id.clone();
+        let first = cli(&endpoint, &["sources", &store_id, "--page-size", "1"]);
+        let mut discovered = first["rows"].as_array().unwrap().clone();
+        let snapshot = first["snapshot_id"].as_str().unwrap().to_owned();
+        let mut cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let mut mcp = Mcp::start(&socket);
+        mcp.initialize(1).await;
+        loop {
+            let page = mcp.tool(2, "result_next", purrdf_lex::json::Object::new().with("store_id", store_id.clone()).with("cursor", cursor.clone()).into()).await;
+            assert_eq!(page["isError"].as_bool(), Some(false));
+            let page = &page["structuredContent"];
+            discovered.extend(page["rows"].as_array().unwrap().iter().cloned());
+            if page["next_cursor"].is_null() { break; }
+            cursor = page["next_cursor"].as_str().unwrap().to_owned();
+        }
+        assert_eq!(discovered.len(), 4);
+        assert!(cli(&socket, &["result-release", &store_id, &snapshot])["released"].as_bool().unwrap());
+        for row in &discovered {
+            let source = row["source_id"].as_str().unwrap();
+            let ids = row["syslog_listener_ids"].as_array().unwrap();
+            assert_eq!(ids.len(), 1);
+            let id = ids[0].as_str().unwrap();
+            assert_eq!(row["retained_records"].as_str(), Some("0"));
+            let cli_listener = cli(&endpoint, &["syslog-listener", &store_id, source, id]);
+            let mcp_listener = mcp.tool(3, "syslog_listener_get", purrdf_lex::json::Object::new().with("store_id", store_id.clone()).with("source", source).with("listener_id", id).into()).await;
+            assert_eq!(mcp_listener["isError"].as_bool(), Some(false));
+            assert_eq!(cli_listener, mcp_listener["structuredContent"]);
+            assert_eq!(cli_listener["listener"]["accepted_messages"].as_str(), Some("0"));
+            assert_eq!(cli_listener["listener"]["continuity_unknown"].as_bool(), Some(true));
+            let mut request = tcp.capability().syslog_listener_get_request();
+            let mut query = request.get().init_query();
+            query.set_store_id(&store_id);query.set_source(source);query.set_id(id);query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+            let response = request.send().promise.await.unwrap();
+            let native = rpc_ok(response.get().unwrap().get_result().unwrap());
+            assert_eq!(native.get_id().unwrap().to_str().unwrap(), id);
+            assert_eq!(native.get_address().unwrap().to_str().unwrap(), cli_listener["listener"]["address"].as_str().unwrap());
+        }
+        for (store, source, id, schema, code) in [
+            (store_id.as_str(), "syslog-octets", "octets", sparrow_client::SCHEMA_VERSION - 1, "UNSUPPORTED"),
+            ("store:other", "syslog-octets", "octets", sparrow_client::SCHEMA_VERSION, "STORE_MISMATCH"),
+            (store_id.as_str(), "different-source", "octets", sparrow_client::SCHEMA_VERSION, "NOT_FOUND"),
+            (store_id.as_str(), "syslog-octets", "missing", sparrow_client::SCHEMA_VERSION, "NOT_FOUND"),
+            (store_id.as_str(), "syslog-octets", "", sparrow_client::SCHEMA_VERSION, "INVALID_ARGUMENT"),
+        ] {
+            let mut request = tcp.capability().syslog_listener_get_request();let mut query = request.get().init_query();
+            query.set_store_id(store);query.set_source(source);query.set_id(id);query.set_schema_version(schema);
+            let response = request.send().promise.await.unwrap();
+            let wire::result::Error(error) = response.get().unwrap().get_result().unwrap().which().unwrap() else { panic!("invalid listener read accepted") };
+            assert_eq!(error.unwrap().get_code().unwrap().to_str().unwrap(), code);
+        }
+        mcp.close(true).await;
         let addresses: Vec<std::net::SocketAddr> = listeners.iter().map(|listener| {
             assert_eq!(listener.get_accepted_messages(), 0);
             assert!(listener.get_continuity_unknown());
@@ -1277,7 +1332,11 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
             if listener.get_rejected_connections() == 1 && listener.get_timed_out_connections() == 1 && listener.get_active_connections() == 0 { break; }
             assert!(Instant::now() < deadline); tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        drop(idle); drop(excess); drop(client); drop(daemon);
+        let observed = cli(&endpoint, &["syslog-listener", &store_id, "syslog-octets", "octets"]);
+        assert_eq!(observed["listener"]["accepted_messages"].as_str(), Some("4"));
+        assert_eq!(observed["listener"]["interpretation_failures"].as_str(), Some("1"));
+        assert_eq!(observed["listener"]["framing_failures"].as_str(), Some("1"));
+        drop(idle); drop(excess); drop(tcp); drop(client); drop(daemon);
         let store = sparrow_server::ServerConfig::read(&config).unwrap().open_store().unwrap();
         let now = sparrow_server::now().unwrap();
         let rows: Vec<_> = store.records(now).unwrap().into_iter().filter(|row| row.source == "syslog-octets").collect();
@@ -6677,13 +6736,14 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 31);
+    assert_eq!(definitions.len(), 32);
     for (name, read_only) in [
         ("file_finish", false),
         ("file_finish_get", true),
         ("watch_handoff", false),
         ("watch_handoff_get", true),
         ("result_release", false),
+        ("syslog_listener_get", true),
     ] {
         assert_eq!(
             definitions

@@ -58,6 +58,15 @@ pub struct SourceWatchInfo {
     /// Whether new admission is enabled.
     pub enabled: bool,
 }
+
+/// Runtime-owned syslog binding; listener counters are process scoped, not durable continuity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceSyslogBinding {
+    /// Exact configured intake key.
+    pub source: String,
+    /// Configured listener identity, resolved with the same source and store.
+    pub listener_id: String,
+}
 impl Default for SourceRead {
     fn default() -> Self {
         Self {
@@ -94,6 +103,8 @@ pub struct SourceSummary {
     pub producer_stream_ids: Vec<String>,
     /// Unexpired or active descriptor-owned generation checkpoints, including empty inputs.
     pub tail_generation_ids: Vec<String>,
+    /// Configured syslog listeners, including those with no retained packets.
+    pub syslog_listener_ids: Vec<String>,
 }
 
 /// The native occurrence metadata IRI for an exact intake key.
@@ -117,16 +128,19 @@ impl SourceSummary {
             watches: Vec::new(),
             producer_stream_ids: Vec::new(),
             tail_generation_ids: Vec::new(),
+            syslog_listener_ids: Vec::new(),
         }
     }
     fn capacity(&self) -> usize {
         512 + self.source_id.capacity() * 2
             + self.producer_stream_ids.capacity() * std::mem::size_of::<String>()
             + self.tail_generation_ids.capacity() * std::mem::size_of::<String>()
+            + self.syslog_listener_ids.capacity() * std::mem::size_of::<String>()
             + self
                 .producer_stream_ids
                 .iter()
                 .chain(self.tail_generation_ids.iter())
+                .chain(self.syslog_listener_ids.iter())
                 .map(String::capacity)
                 .sum::<usize>()
             + self.rdf_iri.capacity()
@@ -203,25 +217,34 @@ impl Store {
         now: u64,
         configured: &[SourceWatchBinding],
     ) -> Result<SourceReadPage, Error> {
-        self.source_read_with_intakes(query, now, configured, &[])
+        self.source_read_with_syslog(query, now, configured, &[])
     }
 
-    /// Include bounded configured intake labels without inventing watch or producer authority.
-    pub fn source_read_with_intakes(
+    /// Include runtime-owned syslog bindings without inventing producer continuity.
+    pub fn source_read_with_syslog(
         &self,
         query: &SourceRead,
         now: u64,
         configured: &[SourceWatchBinding],
-        intakes: &[String],
+        intakes: &[SourceSyslogBinding],
     ) -> Result<SourceReadPage, Error> {
         if intakes.len() > 4
+            || intakes.iter().any(|binding| {
+                binding.source.is_empty()
+                    || binding.source.len() > 512
+                    || binding.listener_id.is_empty()
+                    || binding.listener_id.len() > 128
+            })
             || intakes
                 .iter()
-                .any(|source| source.is_empty() || source.len() > 512)
+                .map(|binding| &binding.listener_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != intakes.len()
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "configured intake discovery requires at most four bounded source labels",
+                "syslog discovery requires at most four unique listener IDs (1..128 bytes) and exact source labels (1..512 bytes)",
             ));
         }
         if !(1..=1000).contains(&query.page_size)
@@ -292,15 +315,39 @@ impl Store {
             remaining: &mut remaining,
         };
         let mut watch_ids = std::collections::BTreeSet::new();
-        for source in intakes {
-            admission.entry(0)?;
+        for binding in intakes {
+            admission.entry(binding.source.len() + binding.listener_id.len())?;
             if query
                 .selector
                 .source
                 .as_ref()
-                .is_none_or(|wanted| wanted == source)
+                .is_none_or(|wanted| wanted == &binding.source)
             {
-                admit_source(&mut rows, source, &mut capacity)?;
+                let row = admit_source(&mut rows, &binding.source, &mut capacity)?;
+                let planned = binding.listener_id.len() + std::mem::size_of::<String>();
+                if capacity + planned > CAPTURE_BYTES {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "syslog listener references exceed source capture capacity",
+                    ));
+                }
+                let before = row.capacity();
+                row.syslog_listener_ids
+                    .try_reserve_exact(1)
+                    .map_err(|error| {
+                        Error::new(
+                            "RESOURCE_LIMIT",
+                            format!("syslog listener reference allocation refused: {error}"),
+                        )
+                    })?;
+                row.syslog_listener_ids.push(binding.listener_id.clone());
+                capacity += row.capacity() - before;
+                if capacity > CAPTURE_BYTES {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "allocated syslog listener references exceed source capture capacity",
+                    ));
+                }
             }
         }
         admission.entry(
@@ -464,6 +511,7 @@ impl Store {
         }
         for row in rows.values_mut() {
             row.tail_generation_ids.sort();
+            row.syslog_listener_ids.sort();
             row.watches.sort_by(|a, b| a.watch_id.cmp(&b.watch_id));
         }
         let snapshot = catalog_lease::Snapshot {

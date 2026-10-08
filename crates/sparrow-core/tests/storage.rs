@@ -8120,6 +8120,119 @@ fn artifact_selection_seeks_members_without_reading_unrelated_corrupt_catalog_en
 }
 
 #[test]
+fn source_discovery_freezes_bounded_syslog_bindings_without_inventing_continuity() {
+    use sparrow_core::{SourceRead, SourceSelector, SourceSyslogBinding};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bindings = [
+        SourceSyslogBinding {
+            source: "a".into(),
+            listener_id: "udp".into(),
+        },
+        SourceSyslogBinding {
+            source: "a".into(),
+            listener_id: "tcp".into(),
+        },
+        SourceSyslogBinding {
+            source: "z".into(),
+            listener_id: "idle".into(),
+        },
+    ];
+    let mut query = SourceRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store
+        .source_read_with_syslog(&query, 1, &[], &bindings)
+        .unwrap();
+    assert_eq!(first.total_items, 2);
+    let row = &first.body.sources[0];
+    assert_eq!(row.source_id, "a");
+    assert_eq!(row.syslog_listener_ids, ["tcp", "udp"]);
+    assert_eq!(row.retained_records, 0);
+    assert!(row.continuity_unknown);
+    query.cursor = first.next_cursor.clone();
+    let captured = store.source_read_with_syslog(&query, 2, &[], &[]).unwrap();
+    assert_eq!(captured.body.sources[0].source_id, "z");
+    assert_eq!(captured.body.sources[0].syslog_listener_ids, ["idle"]);
+    assert!(
+        store
+            .result_release(&first.store_id, &first.snapshot_id, 2)
+            .unwrap()
+    );
+    query.cursor = None;
+    assert_eq!(
+        store
+            .source_read_with_syslog(&query, 2, &[], &[])
+            .unwrap()
+            .total_items,
+        0
+    );
+    query.selector = SourceSelector {
+        source: Some("a".into()),
+    };
+    query.page_size = 100;
+    let exact = store
+        .source_read_with_syslog(&query, 2, &[], &bindings)
+        .unwrap();
+    assert_eq!(exact.total_items, 1);
+    assert_eq!(exact.body.sources[0].syslog_listener_ids, ["tcp", "udp"]);
+    for invalid in [
+        vec![bindings[0].clone(), bindings[0].clone()],
+        vec![SourceSyslogBinding {
+            source: String::new(),
+            listener_id: "bad".into(),
+        }],
+        vec![SourceSyslogBinding {
+            source: "a".into(),
+            listener_id: "x".repeat(129),
+        }],
+        (0..5)
+            .map(|n| SourceSyslogBinding {
+                source: "a".into(),
+                listener_id: n.to_string(),
+            })
+            .collect(),
+    ] {
+        assert_eq!(
+            store
+                .source_read_with_syslog(&query, 2, &[], &invalid)
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    query.scan_budget = 1;
+    assert_eq!(
+        store
+            .source_read_with_syslog(&query, 2, &[], &bindings)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(2).unwrap()["source_read_handles"].as_str(),
+        Some("0")
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .source_read(&SourceRead::default(), 3, &[])
+            .unwrap()
+            .total_items,
+        0
+    );
+    assert_eq!(
+        store
+            .source_read_with_syslog(&SourceRead::default(), 3, &[], &bindings)
+            .unwrap()
+            .total_items,
+        2
+    );
+}
+
+#[test]
 fn source_catalog_admission_is_shared_and_keeps_exact_keys_and_sorted_watch_revisions() {
     use sparrow_core::{SourceRead, SourceWatchBinding};
     let dir = tempfile::tempdir().unwrap();

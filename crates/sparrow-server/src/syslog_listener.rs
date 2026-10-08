@@ -146,11 +146,14 @@ impl SyslogRegistry {
             .map(Metrics::snapshot)
             .collect()
     }
-    pub(crate) fn sources(&self) -> io::Result<Vec<String>> {
+    pub(crate) fn sources(&self) -> io::Result<Vec<sparrow_core::SourceSyslogBinding>> {
         Ok(self
             .snapshot()?
             .into_iter()
-            .map(|status| status.definition.source)
+            .map(|status| sparrow_core::SourceSyslogBinding {
+                source: status.definition.source,
+                listener_id: status.definition.id,
+            })
             .collect())
     }
 }

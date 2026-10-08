@@ -539,6 +539,12 @@ fn sources_page(
         for (index, id) in summary.tail_generation_ids.iter().enumerate() {
             generations.set(index as u32, id);
         }
+        let mut listeners = row
+            .reborrow()
+            .init_syslog_listener_ids(summary.syslog_listener_ids.len() as u32);
+        for (index, id) in summary.syslog_listener_ids.iter().enumerate() {
+            listeners.set(index as u32, id);
+        }
         let mut watches = row.init_watches(summary.watches.len() as u32);
         for (index, binding) in summary.watches.iter().enumerate() {
             let mut watch = watches.reborrow().get(index as u32);
@@ -2674,6 +2680,60 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn syslog_listener_get(
+        self: Rc<Self>,
+        params: wire::sparrow::SyslogListenerGetParams,
+        mut results: wire::sparrow::SyslogListenerGetResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(query.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "syslog listener reads require the current discovered schema",
+                ),
+            );
+            return Ok(());
+        }
+        let source = query.get_source()?;
+        let id = query.get_id()?;
+        if source.is_empty() || source.len() > 512 || id.is_empty() || id.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid(
+                    "syslog listener requires source 1..512 bytes and listener ID 1..128 bytes",
+                ),
+            );
+            return Ok(());
+        }
+        let source = source.to_str()?;
+        let id = id.to_str()?;
+        match self.syslog.snapshot() {
+            Err(error) => failure(
+                results.get().init_result(),
+                Error::new("STORAGE_FAILURE", error.to_string()),
+            ),
+            Ok(listeners) => match listeners.into_iter().find(|listener| {
+                listener.definition.source == source && listener.definition.id == id
+            }) {
+                Some(listener) => listener.encode(results.get().init_result().init_ok()),
+                None => failure(
+                    results.get().init_result(),
+                    Error::new(
+                        "NOT_FOUND",
+                        "syslog listener is not currently configured under that exact source",
+                    ),
+                ),
+            },
+        }
+        Ok(())
+    }
+
     async fn producer_stream_get(
         self: Rc<Self>,
         params: wire::sparrow::ProducerStreamGetParams,
@@ -2810,7 +2870,7 @@ impl wire::sparrow::Server for Rpc {
                     .syslog
                     .sources()
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                move |store, now| store.source_read_with_intakes(&query, now, &configured, &intakes)
+                move |store, now| store.source_read_with_syslog(&query, now, &configured, &intakes)
             })
             .await
         {

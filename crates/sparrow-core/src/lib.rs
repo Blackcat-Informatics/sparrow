@@ -57,8 +57,8 @@ pub use storage::record_read::{
 };
 pub use storage::result_read::ResultPage;
 pub use storage::source_read::{
-    SourcePageBody, SourceRead, SourceReadPage, SourceSelector, SourceSummary, SourceWatchBinding,
-    SourceWatchInfo,
+    SourcePageBody, SourceRead, SourceReadPage, SourceSelector, SourceSummary, SourceSyslogBinding,
+    SourceWatchBinding, SourceWatchInfo,
 };
 pub use storage::source_time::{EventTime, SourceTimeProfile, TimeRepresentation};
 pub use storage::syslog::{

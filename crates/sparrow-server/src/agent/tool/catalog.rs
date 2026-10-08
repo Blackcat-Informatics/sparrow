@@ -31,6 +31,10 @@ const TOOLS: &[(&str, &str)] = &[
         "Read a durable file-generation checkpoint and original raw path/namespace declaration; accepted prefixes do not certify whole-file capture or producer continuity.",
     ),
     (
+        "syslog_listener_get",
+        "Read a currently configured syslog listener under its exact store/source: framing, bounds, binding and process-scoped observed counters. Continuity and UDP kernel loss remain unknown; counters reset on restart.",
+    ),
+    (
         "producer_stream_get",
         "Read a finite accepted producer window, exact aggregate unobserved positions and bounded recent gaps; prefix and trailing continuity remain unknown.",
     ),
@@ -40,7 +44,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "sources_list",
-        "Page an immutable capture of exact intake keys, retained occurrence counts, mapping IDs, producer windows, file-generation checkpoint IDs and configured watch bindings; continuity remains explicitly unknown.",
+        "Page an immutable capture of exact intake keys, retained occurrence counts, mapping IDs, producer windows, file-generation checkpoint IDs and configured watch/syslog listener bindings; continuity remains explicitly unknown.",
     ),
     (
         "artifacts_list",
@@ -215,6 +219,13 @@ pub(crate) fn definitions() -> Value {
                 .with("store_id", string())
                 .with("generation_id", string());
             required.extend(["store_id", "generation_id"]);
+        }
+        if *name == "syslog_listener_get" {
+            properties = properties
+                .with("store_id", string())
+                .with("source", string())
+                .with("listener_id", string());
+            required.extend(["store_id", "source", "listener_id"]);
         }
         if *name == "producer_stream_get" {
             properties = properties
