@@ -14,6 +14,8 @@ pub struct QueryScope {
     pub sources: Option<QueryAlternatives>,
     /// AND across explicit diagnostic dimensions, OR within each admitted array.
     pub diagnostics: std::collections::BTreeMap<crate::DiagnosticDimension, QueryAlternatives>,
+    /// Refuse incomplete diagnostic or applicable query-index coverage.
+    pub require_complete_index: bool,
     /// Inclusive server acceptance time, in Unix milliseconds.
     pub received_from: u64,
     /// Exclusive server acceptance time, in Unix milliseconds.

@@ -8,6 +8,271 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures() {
+    use sparrow_core::{
+        DiagnosticDimension as D, JsonQuery, QueryAlternatives, QueryScope, QuerySelection,
+        RecordQuery,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_diagnostic_profile(
+            "producer",
+            [(D::Service, "/svc".into()), (D::Host, "/host".into())].into(),
+        )
+        .unwrap();
+    let artifact = store
+        .ingest(
+            "partial-mapped",
+            "producer",
+            "jsonl",
+            concat!(
+                "{\"svc\":\"worker\",\"host\":\"h1\",\"message\":\"needle\"}\n",
+                "{\"svc\":\"worker\",\"host\":7,\"message\":\"needle\"}\n",
+                "{\"host\":\"h1\",\"message\":\"needle\"}\n",
+                "{\"svc\":\"other\",\"host\":7,\"message\":\"needle\"}\n",
+                "{\"svc\":\"worker\",\"svc\":\"worker\",\"host\":\"h1\",\"message\":\"needle\"}\n"
+            )
+            .as_bytes(),
+            1,
+        )
+        .unwrap();
+    let legacy = store
+        .ingest(
+            "partial-unprofiled",
+            "legacy",
+            "json",
+            br#"{"svc":"worker","host":"h1","message":"needle"}"#,
+            2,
+        )
+        .unwrap();
+    let mut scope = QueryScope {
+        selection: QuerySelection::Live,
+        source: None,
+        sources: None,
+        diagnostics: [
+            (
+                D::Service,
+                QueryAlternatives::new(vec!["worker".into()]).unwrap(),
+            ),
+            (D::Host, QueryAlternatives::new(vec!["h1".into()]).unwrap()),
+        ]
+        .into(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 10,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    for result in [
+        store.json_query(&scope, &JsonQuery::Keys, 3).unwrap(),
+        store
+            .json_query(
+                &scope,
+                &JsonQuery::Values {
+                    path: Some("/message".into()),
+                    kind: None,
+                    lexical: None,
+                    decoded: None,
+                },
+                3,
+            )
+            .unwrap(),
+        store.text_query(&scope, "needle", 3).unwrap(),
+        store
+            .records_query(&scope, &RecordQuery::default(), 3)
+            .unwrap(),
+        store
+            .records_query(
+                &scope,
+                &RecordQuery {
+                    text: Some("needle".into()),
+                    ..Default::default()
+                },
+                3,
+            )
+            .unwrap(),
+    ] {
+        assert!(result["coverage"]["eligible_records"].is_null());
+        assert_eq!(
+            result["coverage"]["known_eligible_records"].as_str(),
+            Some("1")
+        );
+        assert_eq!(
+            result["coverage"]["diagnostic_scope"]["unknown"].as_str(),
+            Some("4")
+        );
+        assert_eq!(
+            result["coverage"]["diagnostic_scope"]["excluded"].as_str(),
+            Some("1")
+        );
+        assert_eq!(result["certainty"].as_str(), Some("incomplete"));
+        if result.get("ranking").is_some() {
+            assert_eq!(
+                result["ranking"]["membership_complete"].as_bool(),
+                Some(false)
+            );
+        }
+        for row in result["rows"].as_array().unwrap() {
+            if let Some(id) = row.get("record_id") {
+                assert_eq!(id.as_str(), Some(artifact.record_ids[0].as_str()));
+            }
+        }
+    }
+    let context = store
+        .records_context(&artifact.record_ids[0], &scope, 10, 10, 3)
+        .unwrap();
+    assert_eq!(context.diagnostics.unknown, 3);
+    assert_eq!(context.diagnostics.excluded, 1);
+    assert!(!context.diagnostics.complete(false));
+    assert!(context.before.records.is_empty() && context.after.records.is_empty());
+    assert_eq!(
+        store
+            .records_context(&legacy.record_ids[0], &scope, 0, 0, 3)
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    scope.require_complete_index = true;
+    assert_eq!(
+        store
+            .json_query(&scope, &JsonQuery::Keys, 3)
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    assert_eq!(
+        store.text_query(&scope, "needle", 3).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 3)
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    assert_eq!(
+        store
+            .records_context(&artifact.record_ids[0], &scope, 10, 10, 3)
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    scope.require_complete_index = false;
+    assert_eq!(
+        store
+            .records_query(
+                &scope,
+                &RecordQuery {
+                    require_complete_index: true,
+                    ..Default::default()
+                },
+                3
+            )
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    // A certainly excluded record does not contaminate scope with its unknown host.
+    scope.selection = QuerySelection::Evidence(vec![artifact.record_ids[3].clone()]);
+    scope.require_complete_index = true;
+    let excluded = store
+        .records_query(&scope, &RecordQuery::default(), 3)
+        .unwrap();
+    assert_eq!(excluded["coverage"]["eligible_records"].as_str(), Some("0"));
+    assert_eq!(
+        excluded["coverage"]["diagnostic_scope"]["unknown"].as_str(),
+        Some("0")
+    );
+    scope.require_complete_index = false;
+    let pin = store
+        .pin(
+            "partial-pin",
+            "diagnostic-case",
+            std::slice::from_ref(&artifact.id),
+            40,
+            3,
+        )
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    scope.selection = QuerySelection::Pin {
+        id: pin.id,
+        expected_revision: None,
+    };
+    let result = store
+        .records_query(&scope, &RecordQuery::default(), 31 * DAY)
+        .unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["coverage"]["diagnostic_scope"]["unknown"].as_str(),
+        Some("3")
+    );
+    assert!(result["coverage"]["eligible_records"].is_null());
+    scope.diagnostics.clear();
+    scope.limit = 1;
+    let limited_rows = store
+        .records_query(&scope, &RecordQuery::default(), 31 * DAY)
+        .unwrap();
+    assert_eq!(limited_rows["execution"].as_str(), Some("limited"));
+    assert_eq!(
+        limited_rows["coverage"]["eligible_records"].as_str(),
+        Some("5")
+    );
+    assert_eq!(limited_rows["qualified_records"].as_str(), Some("5"));
+    scope.scan_budget = 1;
+    let limited_scan = store
+        .records_query(&scope, &RecordQuery::default(), 31 * DAY)
+        .unwrap();
+    assert!(limited_scan["coverage"]["eligible_records"].is_null());
+    assert!(limited_scan["qualified_records"].is_null());
+    // Unknown membership never conceals a broken immutable profile binding.
+    drop(store);
+    let db = catalog_db(dir.path());
+    let (key, _) = db
+        .prefix_iterator("source-diagnostic:")
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(key.starts_with(b"source-diagnostic:"));
+    db.delete(key).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    scope.scan_budget = 1000;
+    scope.limit = 100;
+    assert_eq!(
+        store
+            .json_query(&scope, &JsonQuery::Keys, 31 * DAY)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store
+            .text_query(&scope, "needle", 31 * DAY)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 31 * DAY)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store
+            .records_context(&artifact.record_ids[0], &scope, 10, 10, 31 * DAY)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+}
+
+#[test]
 fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() {
     use sparrow_core::{
         DiagnosticDimension as D, DiagnosticValue as V, JsonQuery, QueryAlternatives, QueryScope,
@@ -114,6 +379,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() 
             ),
         ]
         .into(),
+        require_complete_index: true,
         received_from: 1,
         received_before: 2,
         limit: 100,
@@ -228,8 +494,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() 
         "EVIDENCE_UNAVAILABLE"
     );
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     assert!(
         db.get(format!("rdf:graph:diagnostic:{}", record.id))
             .unwrap()
@@ -293,8 +558,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         let store = Store::open(dir.path(), config()).unwrap();
         let id = store.store_id().unwrap();
         drop(store);
-        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        let db = catalog_db(dir.path());
         db.put("store_format", format!("sparrow.store/{version}"))
             .unwrap();
         if version >= 11 {
@@ -351,6 +615,7 @@ fn source_alternatives_intersect_membership_time_and_context_without_duplicates(
             QueryAlternatives::new(vec!["alpha".into(), "beta".into(), "alpha".into()]).unwrap(),
         ),
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 100,
         limit: 100,
@@ -583,8 +848,7 @@ fn streaming_catalog_refuses_identity_corruption_and_never_returns_partial_rows(
             _ => pin.id.clone(),
         };
         drop(store);
-        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        let db = catalog_db(dir.path());
         let mut value =
             json::read_slice(&db.get(&key).unwrap().unwrap(), json::Limits::DEFAULT).unwrap();
         *value.get_mut("id").unwrap() = json::Value::from(format!("{kind}:different"));
@@ -757,8 +1021,7 @@ fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() 
     );
     assert_eq!(store.artifact(&first.id).unwrap().id, first.id);
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     let key = "empty-time:00000000000000000002:artifact:missing";
     db.put(key, b"artifact:missing").unwrap();
     drop(db);
@@ -792,8 +1055,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
                 .unwrap();
         }
         drop(store);
-        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        let db = catalog_db(dir.path());
         db.delete("recordless-index-upgrade").unwrap();
         db.delete(format!("empty-time:{:020}:{}", empty.received_at, empty.id))
             .unwrap();
@@ -1509,6 +1771,7 @@ fn eviction_preserves_record_pins_shared_projections_and_durable_retry_identity(
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: u64::MAX,
         limit: 100,
@@ -2185,8 +2448,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
         Some(reserved.clone())
     );
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     db.delete(format!("consumption:{}", reserved.import_id))
         .unwrap();
     drop(db);
@@ -2376,8 +2638,7 @@ fn consumption_missing_publication_receipt_is_a_hard_failure_without_republicati
         store.expire(3 * DAY).unwrap();
     }
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     db.delete(format!("request:import-publication:{}", journal.import_id))
         .unwrap();
     drop(db);
@@ -2448,6 +2709,7 @@ fn query_selection_intersects_filters_deduplicates_and_seeks_selected_evidence()
         source: Some("source".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 100,
         limit: 10,
@@ -2545,6 +2807,7 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: now + 1,
         limit: 10,
@@ -3002,6 +3265,7 @@ fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_by
         source: Some("oversized".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 10,
         limit: 100,
@@ -3149,6 +3413,7 @@ fn oversized_documents_keep_bytes_with_declared_projection_limits_or_nonapplicab
             source: Some("oversized".into()),
             sources: None,
             diagnostics: Default::default(),
+            require_complete_index: false,
             received_from: 0,
             received_before: 10,
             limit: 10,
@@ -3197,8 +3462,7 @@ fn oversized_raw_record_refuses_missing_normalized_bytes_without_publishing() {
         store.import_prepare_record(&manifest.id, 1, 1).unwrap();
     }
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     let digest = purrdf_hash::hex::encode(
         purrdf_hash::blake3::hash(&input[3..3 + sparrow_core::IMPORT_CHUNK_BYTES]).as_bytes(),
     );
@@ -3557,8 +3821,7 @@ fn import_publication_refuses_missing_prepared_payload_without_publishing_a_pref
     store.import_prepare_layout(&journal.id, 0).unwrap();
     let progress = store.import_prepare_record(&journal.id, 0, 0).unwrap();
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     db.delete_cf(
         db.cf_handle("payload").unwrap(),
         digest.strip_prefix("blake3:").unwrap(),
@@ -3718,6 +3981,7 @@ fn native_import_publishes_files_above_buffered_limit_without_a_whole_file_batch
         source: Some("copy".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 10,
         limit: 10,
@@ -4044,8 +4308,7 @@ fn broken_staging_layouts_refuse_reads_and_remain_reclaimable() {
     drop(store);
     let key = format!("import-layout:{}:{:020}", journal.id, 0);
     for remove in [false, true] {
-        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        let db = catalog_db(dir.path());
         if remove {
             db.delete(&key).unwrap();
         } else {
@@ -4694,8 +4957,7 @@ fn malformed_pin_catalog_refuses_complete_captures() {
         .pin("valid-pin", "valid", &artifact.record_ids, 40, 0)
         .unwrap();
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     let bytes = db.get(&pin.id).unwrap().unwrap();
     let changed = std::str::from_utf8(&bytes)
         .unwrap()
@@ -5184,8 +5446,7 @@ fn rdf_read_controls_and_selected_catalog_identity_are_verified() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
         drop(store);
-        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        let db = catalog_db(dir.path());
         db.delete(key).unwrap();
         drop(db);
         assert_eq!(
@@ -5202,8 +5463,7 @@ fn rdf_read_controls_and_selected_catalog_identity_are_verified() {
         .ingest("rdf-identity-b", "b", "log", b"two", 0)
         .unwrap();
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     let bytes = db.get(&first.record_ids[0]).unwrap().unwrap();
     let changed = std::str::from_utf8(&bytes)
         .unwrap()
@@ -5262,8 +5522,7 @@ fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
         .unwrap()
         .rdf_projection_id;
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     let manifest = purrdf_lex::json::read(
         std::str::from_utf8(&db.get(format!("rdf:graph:{projection}")).unwrap().unwrap()).unwrap(),
     )
@@ -5369,8 +5628,7 @@ fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
     );
     store.expire(32 * DAY).unwrap();
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     for prefix in [
         "rdf:q:",
         "rdf:term:",
@@ -5460,8 +5718,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
         (Some(b"different-profile".as_slice()), "UNSUPPORTED"),
         (None, "STORAGE_FAILURE"),
     ] {
-        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        let db = catalog_db(dir.path());
         match replacement {
             Some(value) => db.put("rdf_profile", value).unwrap(),
             None => db.delete("rdf_profile").unwrap(),
@@ -5501,6 +5758,7 @@ fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers()
         source: Some("context".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 10,
         received_before: 13,
         limit: 100,
@@ -5595,6 +5853,7 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 3,
         limit: 100,
@@ -5604,8 +5863,7 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
     let anchor_key = format!("time:{:020}:{}", 1, anchor.record_ids[0]);
     drop(store);
     // Corrupt only this test-owned store, while its production owner is closed.
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     db.put(&neighbor_key, b"record:missing").unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -5628,8 +5886,7 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
         "STORAGE_FAILURE"
     );
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     db.delete(&anchor_key).unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -5678,6 +5935,7 @@ fn context_keeps_record_pins_and_exposes_observed_retirement_gaps() {
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: now + 1,
         limit: 100,
@@ -5729,6 +5987,7 @@ fn persisted_text_ranking_spans_scope_and_record_pins_survive_reopen() {
         source: Some("logs".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 2,
         limit: 100,
@@ -5806,6 +6065,7 @@ fn decoded_text_uses_scalar_evidence_and_failed_coverage_is_visible() {
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 1,
         limit: 100,
@@ -5848,6 +6108,13 @@ fn standard_text_lexicons_are_required() {
             .code,
         "INVALID_ARGUMENT"
     );
+}
+
+// Open all declared families when adversarial fixtures inspect or mutate a closed store.
+fn catalog_db(path: &std::path::Path) -> rocksdb::DB {
+    let options = rocksdb::Options::default();
+    let columns = rocksdb::DB::list_cf(&options, path).unwrap();
+    rocksdb::DB::open_cf(&options, path, columns).unwrap()
 }
 
 fn config() -> Config {
@@ -5944,6 +6211,7 @@ fn native_json_discovery_preserves_duplicates_lexical_values_and_time_scope() {
         source: Some("alpha".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 100,
         received_before: 200,
         limit: 100,
@@ -6010,6 +6278,7 @@ fn projection_failure_is_visible_without_discarding_raw_evidence() {
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 200,
         limit: 100,
@@ -6072,6 +6341,7 @@ fn query_budget_and_row_limit_do_not_claim_complete_coverage() {
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 200,
         limit: 1,
@@ -6352,6 +6622,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
         source: Some("logs".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 10,
         received_before: 11,
         limit: 100,
@@ -6415,6 +6686,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
         source: Some("parents".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 20,
         received_before: 21,
         ..scope
@@ -6461,6 +6733,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
         source: Some("nested".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 30,
         received_before: 31,
         ..scope
@@ -6502,6 +6775,7 @@ fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
         source: Some("test".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 1,
         received_before: 4,
         limit: 100,
@@ -6721,6 +6995,7 @@ fn event_intervals_exclude_unknowns_sort_source_time_and_keep_retention_on_accep
         source: Some("events".into()),
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 100,
         limit: 1,
@@ -6850,8 +7125,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
         .ingest("known", "known", "json", br#"{"t":1000}"#, 0)
         .unwrap();
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     let mut raw = json::read_slice(
         &db.get(&legacy.record_ids[0]).unwrap().unwrap(),
         Limits::default(),
@@ -6880,6 +7154,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
         source: None,
         sources: None,
         diagnostics: Default::default(),
+        require_complete_index: false,
         received_from: 0,
         received_before: 1,
         limit: 100,
@@ -6897,8 +7172,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
         "STORAGE_FAILURE"
     );
     drop(store);
-    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
-    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    let db = catalog_db(dir.path());
     let mut raw = json::read_slice(&saved, Limits::default()).unwrap();
     raw.as_object_mut().unwrap().insert("path", "/different");
     db.put(&profile_key, json::write_compact(&raw)).unwrap();

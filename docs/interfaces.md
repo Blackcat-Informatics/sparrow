@@ -194,12 +194,27 @@ records, and staged preparation captures profile presence or absence once before
 any record; later definitions cannot split an import's interpretation.
 
 All five query surfaces filter captured evidence before qualification/ranking;
-context applies the same predicate to anchor and same-source neighbors. A mapped
-filter encountering an unknown or unprofiled selected record refuses the whole
-read with `INDEX_NOT_READY`, without successful rows. This conservative exact
-mode does not implement the planned partial diagnostic-scope coverage/counts-
-unknown response; callers can narrow source, membership and receipt time.
-Membership references are still validated before filtering.
+context applies the same predicate to anchor and same-source neighbors.
+Schema 22 returns proven matches by default and reports uncertain scope membership
+separately. A known mismatch excludes a record even when another dimension is
+unknown. Otherwise, unknown/unprofiled evidence contributes to
+`coverage.diagnostic_scope.unknown`, never to proven match rows. The receipt
+reports evaluated/matched/excluded/unknown visited units and whether membership
+is complete. Eligible and qualified totals are `null` when scope membership or
+traversal prevents exact counts; `known_eligible_records` and
+`known_qualified_records` expose covered lower bounds. Key presence/occurrence
+counts cover proven membership and are lower bounds when coverage is incomplete.
+Rankings identify their covered corpus and report incomplete membership; scores
+do not certify ranking over unknown records. An output row limit alone does not
+erase totals obtained from a complete membership scan.
+
+Every surface accepts `require_complete_index=true` (CLI
+`--require-complete-index true`). Unknown diagnostic membership then refuses
+with `INDEX_NOT_READY`, without successful rows; JSON discovery also refuses
+unavailable applicable projections. Context anchors must be proven members even
+in default mode; uncertain neighbors remain visible in coverage. Operational
+storage failures always refuse with no successful prefix. Membership references
+are validated before filtering, and all existing scan/response ceilings remain.
 
 `Record.diagnostics` and chronological or ranked combined-query rows use a typed snapshot
 with a profile reference and per-dimension known/unknown union. The generated
@@ -217,8 +232,12 @@ watch-registry and handoff states. Existing 9/10/11/12 stores durably advance to
 the corresponding state before serving, retaining their completed recordless
 index and store identity. Earlier recordless upgrades also preserve their
 consumption/watch/handoff authority. Absent historical diagnostic fields remain
-unprofiled. The current adapters require schema 21 discovery for mapped operations
-and filtered reads.
+unprofiled. Schema 22 changes query counts to the typed `Count.known`/`unknown`
+union and adds scope coverage. Every query request carries `Scope.schemaVersion`;
+older/absent versions refuse with `UNSUPPORTED` before the changed reply is encoded.
+CLI/MCP perform current discovery before every query, so older endpoints cannot
+silently omit scope coverage or interpret unknown counts as zero. Storage remains
+at formats 13/14/15/16 because this changes reads rather than persisted evidence.
 
 The generated contract uses `Scope.sourceIds :OptionalSourceIds`, with distinct
 absent and present-list states. CLI scope files and MCP use the same native JSON

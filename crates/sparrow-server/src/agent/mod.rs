@@ -31,8 +31,8 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
-    " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
+    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
+    " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N] [--require-complete-index true|false];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
     "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp"
 );
@@ -79,6 +79,7 @@ pub(super) struct Options {
     kind: Option<wire::JsonKind>,
     lexical: Option<String>,
     decoded: Option<String>,
+    require_complete_index: bool,
 }
 
 fn invalid(message: impl Into<String>) -> AgentError {
@@ -124,6 +125,7 @@ impl Default for Options {
             kind: None,
             lexical: None,
             decoded: None,
+            require_complete_index: false,
         }
     }
 }
@@ -273,7 +275,6 @@ impl Command {
         let mut event_from = None;
         let mut event_before = None;
         let mut record_fields = Vec::new();
-        let mut require_complete = false;
         let mut options = Options::default();
         let context = args[0] == "context";
         if context && args.len() < 3 {
@@ -302,8 +303,8 @@ impl Command {
                 "--event-before" if records => event_before = Some(value.clone()),
                 "--text" if records => records_text = Some(value.clone()),
                 "--where-file" if records => record_fields = records::read_fields(value)?,
-                "--require-complete-index" if records => {
-                    require_complete = value
+                "--require-complete-index" => {
+                    options.require_complete_index = value
                         .parse()
                         .map_err(|_| invalid("require-complete-index requires true or false"))?
                 }
@@ -359,7 +360,6 @@ impl Command {
                 text: records_text,
                 event_interval: records::interval(event_from, event_before)?,
                 fields: record_fields,
-                require_complete,
             }));
         }
         if context {
@@ -511,6 +511,7 @@ impl Command {
 }
 
 fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) -> Result<()> {
+    scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
     optional(scope.reborrow().init_source(), &options.source);
     scope
         .reborrow()
@@ -522,6 +523,7 @@ fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) -> Result<
         .set_unix_millis(options.before);
     scope.set_limit(options.limit);
     scope.set_scan_budget(options.scan_budget);
+    scope.set_require_complete_index(options.require_complete_index);
     options.selection.encode(scope)
 }
 
@@ -561,8 +563,17 @@ fn kind_name(kind: wire::JsonKind) -> &'static str {
     }
 }
 
+fn render_count(value: wire::count::Reader<'_>) -> Result<Value> {
+    Ok(match value.which()? {
+        wire::count::Unknown(()) => Value::Null,
+        wire::count::Known(value) => Value::from(value.to_string()),
+    })
+}
+
 fn receipt(value: wire::receipt::Reader<'_>) -> Result<Value> {
     let coverage = value.get_coverage()?;
+    let count = render_count(coverage.get_eligible_records()?)?;
+    let diagnostic = coverage.get_diagnostic_scope()?;
     Ok(Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("membership_at", instant(value.get_membership_at()?)?)
@@ -584,9 +595,19 @@ fn receipt(value: wire::receipt::Reader<'_>) -> Result<Value> {
             "coverage",
             Object::new()
                 .with("visited", coverage.get_visited().to_string())
+                .with("eligible_records", count)
                 .with(
-                    "eligible_records",
-                    coverage.get_eligible_records().to_string(),
+                    "known_eligible_records",
+                    coverage.get_known_eligible_records().to_string(),
+                )
+                .with(
+                    "diagnostic_scope",
+                    Object::new()
+                        .with("evaluated", diagnostic.get_evaluated().to_string())
+                        .with("matched", diagnostic.get_matched().to_string())
+                        .with("excluded", diagnostic.get_excluded().to_string())
+                        .with("unknown", diagnostic.get_unknown().to_string())
+                        .with("membership_complete", diagnostic.get_membership_complete()),
                 )
                 .with(
                     "failed_json_records",

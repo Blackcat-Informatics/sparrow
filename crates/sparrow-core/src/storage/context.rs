@@ -28,6 +28,8 @@ pub struct ContextSide {
     pub visited: u64,
     /// Observed expired/evicted entries from the anchor's source.
     pub retired: u64,
+    /// Diagnostic membership evaluated in this direction.
+    pub diagnostics: super::diagnostic::DiagnosticCoverage,
     /// Explicit reason that this scan ended.
     pub frontier: ContextFrontier,
 }
@@ -41,6 +43,8 @@ pub struct Context {
     pub membership_at: u64,
     /// The retained requested record.
     pub anchor: Record,
+    /// Diagnostic membership of the anchor and both disjoint directions.
+    pub diagnostics: super::diagnostic::DiagnosticCoverage,
     /// Earlier retained records from the same source in the selected interval.
     pub before: ContextSide,
     /// Later retained records from the same source in the selected interval.
@@ -78,13 +82,14 @@ impl Store {
                 "context anchor expired or was evicted",
             ));
         }
+        let mut diagnostics = super::diagnostic::DiagnosticCoverage::default();
         if membership
             .as_ref()
             .is_some_and(|members| !members.contains_key(id))
             || anchor.received_at < scope.received_from
             || anchor.received_at >= scope.received_before
             || !scope.matches_source(&anchor.source)
-            || !writer.matches_diagnostic_scope(scope, &anchor)?
+            || !writer.matches_diagnostic_scope(scope, &anchor, &mut diagnostics, true)?
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
@@ -116,10 +121,13 @@ impl Store {
             &protected,
             membership.as_ref(),
         )?;
+        diagnostics.merge(earlier.diagnostics);
+        diagnostics.merge(later.diagnostics);
         Ok(Context {
             store_id: writer.id.clone(),
             membership_at: now,
             anchor,
+            diagnostics,
             before: earlier,
             after: later,
         })
@@ -140,6 +148,7 @@ fn scan_context_neighbors(
         records: Vec::new(),
         visited: 0,
         retired: 0,
+        diagnostics: super::diagnostic::DiagnosticCoverage::default(),
         frontier: ContextFrontier::ScopeBoundary,
     };
     if count == 0 {
@@ -178,7 +187,12 @@ fn scan_context_neighbors(
             result.retired += 1;
             continue;
         }
-        if !writer.matches_diagnostic_scope(scope, &record)? {
+        if !writer.matches_diagnostic_scope(
+            scope,
+            &record,
+            &mut result.diagnostics,
+            scope.require_complete_index,
+        )? {
             continue;
         }
         result.records.push(record);

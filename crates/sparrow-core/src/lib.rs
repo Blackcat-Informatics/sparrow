@@ -21,7 +21,7 @@ pub use storage::consumption::{
 };
 pub use storage::context::{Context, ContextFrontier, ContextSide};
 pub use storage::diagnostic::{
-    DiagnosticDimension, DiagnosticProfile, DiagnosticSnapshot, DiagnosticValue,
+    DiagnosticCoverage, DiagnosticDimension, DiagnosticProfile, DiagnosticSnapshot, DiagnosticValue,
 };
 pub use storage::durability::{
     DEFAULT_FLUSH_INTERVAL_MS, Durability, DurabilityStatus, DurabilityWatermark,

@@ -123,9 +123,7 @@ pub(super) fn decode(value: &Value) -> std::result::Result<Input, DecodeError> {
 
 impl Input {
     pub(super) async fn require_supported(&self, client: &wire::sparrow::Client) -> Result<()> {
-        if self.sources.is_some() || !self.diagnostics.is_empty() {
-            sparrow_client::Discovery::fetch(client).await?;
-        }
+        sparrow_client::Discovery::fetch(client).await?;
         Ok(())
     }
 

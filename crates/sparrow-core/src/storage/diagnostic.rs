@@ -470,35 +470,104 @@ pub(super) fn rdf(record: &Record) -> Result<std::sync::Arc<purrdf::RdfDataset>,
         .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))
 }
 
+/// Diagnostic membership evidence over the visited live source/time selection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiagnosticCoverage {
+    /// Records whose diagnostic scope was evaluated.
+    pub evaluated: u64,
+    /// Records certainly in diagnostic scope.
+    pub matched: u64,
+    /// Records certainly excluded by a known dimension.
+    pub excluded: u64,
+    /// Records whose scope membership cannot be decided.
+    pub unknown: u64,
+}
+
+impl DiagnosticCoverage {
+    /// Combine disjoint context directions with the anchor.
+    pub fn merge(&mut self, other: Self) {
+        self.evaluated += other.evaluated;
+        self.matched += other.matched;
+        self.excluded += other.excluded;
+        self.unknown += other.unknown;
+    }
+
+    /// A completed traversal still has uncertain membership when mappings are unknown.
+    pub fn complete(self, limited: bool) -> bool {
+        !limited && self.unknown == 0
+    }
+
+    /// Preserve unknown totals while exposing covered lower bounds separately.
+    pub fn count(self, value: u64, limited: bool) -> Value {
+        if self.complete(limited) {
+            Value::from(value.to_string())
+        } else {
+            Value::Null
+        }
+    }
+
+    /// One native JSON coverage codec shared by every query surface.
+    pub fn encode(self, visited: u64, eligible: u64, failures: [u64; 3], limited: bool) -> Value {
+        Object::new()
+            .with("visited", visited.to_string())
+            .with("eligible_records", self.count(eligible, limited))
+            .with("known_eligible_records", eligible.to_string())
+            .with("failed_json_records", failures[0].to_string())
+            .with("non_json_records", failures[1].to_string())
+            .with("decoding_failures", failures[2].to_string())
+            .with(
+                "diagnostic_scope",
+                Object::new()
+                    .with("evaluated", self.evaluated.to_string())
+                    .with("matched", self.matched.to_string())
+                    .with("excluded", self.excluded.to_string())
+                    .with("unknown", self.unknown.to_string())
+                    .with("membership_complete", self.complete(limited)),
+            )
+            .into()
+    }
+}
+
 impl Writer {
     pub(super) fn matches_diagnostic_scope(
         &self,
         scope: &crate::QueryScope,
         record: &Record,
+        coverage: &mut DiagnosticCoverage,
+        strict: bool,
     ) -> Result<bool, Error> {
-        if scope.diagnostics.is_empty() {
-            return Ok(true);
-        }
         self.validate_diagnostic_record(record)?;
+        coverage.evaluated += 1;
         let mut matched = true;
+        let mut unknown = None;
         for (dimension, alternatives) in &scope.diagnostics {
             match record.diagnostics.fields.get(dimension) {
                 Some(DiagnosticValue::Known { value, .. }) => {
                     matched &= alternatives.ids().iter().any(|wanted| wanted == value)
                 }
-                _ => {
-                    return Err(Error::new(
-                        "INDEX_NOT_READY",
-                        format!(
-                            "{} diagnostic scope cannot be certified for record {}; define an explicit source mapping before ingestion and inspect its captured diagnostics",
-                            dimension.name(),
-                            record.id
-                        ),
-                    ));
-                }
+                _ => unknown = Some(dimension),
             }
         }
-        Ok(matched)
+        if !matched {
+            coverage.excluded += 1;
+            return Ok(false);
+        }
+        if let Some(dimension) = unknown {
+            if strict {
+                return Err(Error::new(
+                    "INDEX_NOT_READY",
+                    format!(
+                        "{} diagnostic scope cannot be certified for record {}; inspect its captured diagnostics or narrow scope",
+                        dimension.name(),
+                        record.id
+                    ),
+                ));
+            }
+            coverage.unknown += 1;
+            return Ok(false);
+        }
+        coverage.matched += 1;
+        Ok(true)
     }
 
     pub(super) fn diagnostic_profile(

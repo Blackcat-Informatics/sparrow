@@ -135,6 +135,10 @@ pub(crate) fn definitions() -> Value {
             }
             properties = properties
                 .with("scope", super::super::selection::schema())
+                .with(
+                    "require_complete_index",
+                    Object::new().with("type", "boolean"),
+                )
                 .with("limit", integer(1000))
                 .with("scan_budget", integer(100000));
         }
@@ -204,10 +208,6 @@ pub(crate) fn definitions() -> Value {
                 .with(
                     "text",
                     Object::new().with("type", Value::array(["string", "null"])),
-                )
-                .with(
-                    "require_complete_index",
-                    Object::new().with("type", "boolean"),
                 )
                 .with(
                     "fields",

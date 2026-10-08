@@ -2064,7 +2064,7 @@ names = ['^(capture_buffered_diagnostics|capture_staged_diagnostics)$']
 
 [[job]]
 id = "diagnostic-scope-predicate"
-summary = "All query surfaces intersect captured diagnostic alternatives and refuse uncertifiable membership."
+summary = "All query surfaces share certain match/exclusion and unknown diagnostic membership, with strict refusal when requested."
 home = "sparrow_core::storage::Writer::matches_diagnostic_scope"
 entry_points = []
 spec = "docs/interfaces.md: schema 21 diagnostic filters."
@@ -2145,3 +2145,45 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(legacy_recordless_target|legacy_diagnostic_target)$']
+
+[[job]]
+id = "diagnostic-scope-coverage"
+summary = "One coverage owner merges visited diagnostic membership and preserves unknown totals with explicit covered lower bounds."
+home = "sparrow_core::storage::diagnostic::DiagnosticCoverage::encode"
+entry_points = ["sparrow_core::storage::diagnostic::DiagnosticCoverage::count", "sparrow_core::storage::diagnostic::DiagnosticCoverage::merge"]
+spec = "docs/interfaces.md: schema 22 diagnostic scope coverage."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(json_scope_coverage|text_scope_coverage|context_scope_coverage)$']
+
+[[job]]
+id = "typed-scope-count"
+summary = "Eligible and qualified totals share one typed known/unknown count codec in RPC and agent adapters."
+home = "sparrow_server::rpc::count"
+entry_points = ["sparrow_server::agent::render_count", "sparrow_server::rpc::coverage"]
+spec = "docs/interfaces.md: schema 22 Count union and read receipts."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_eligible_count|encode_qualified_count|render_eligible_count|render_qualified_count)$']
+
+[[job]]
+id = "storage-test-catalog-open"
+summary = "One dev-only owner opens every declared native RocksDB family for closed-store corruption and identity fixtures."
+home = "sparrow_core::test_crate::storage::catalog_db"
+entry_points = []
+spec = "AGENTS.md: shared test scaffolding and one local helper implementation."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(open_corrupt_time_db|open_corrupt_diagnostic_db|open_test_catalog_again)$']

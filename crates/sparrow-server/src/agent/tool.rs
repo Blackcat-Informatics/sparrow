@@ -134,6 +134,11 @@ impl Operation {
                         options.decoded = fields.optional("decoded")?;
                     }
                     options.validate().map_err(DecodeError::custom)?;
+                    options.require_complete_index = fields
+                        .raw("require_complete_index")?
+                        .map(bool::from_json)
+                        .transpose()?
+                        .unwrap_or(false);
                     if name == "records_search" {
                         let input = super::records::Input {
                             event_interval: super::records::interval(
@@ -147,11 +152,6 @@ impl Operation {
                                 .map(super::records::decode_fields)
                                 .transpose()?
                                 .unwrap_or_default(),
-                            require_complete: fields
-                                .raw("require_complete_index")?
-                                .map(bool::from_json)
-                                .transpose()?
-                                .unwrap_or(false),
                             options,
                         };
                         fields.deny_unknown()?;

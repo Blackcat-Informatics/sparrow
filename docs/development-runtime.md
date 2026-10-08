@@ -32,8 +32,57 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 21; the schema sections
+The current source implements schema 22; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 22 diagnostic scope coverage
+
+The shared diagnostic membership owner distinguishes certain matches, certain
+exclusions and unknown membership. Default JSON/text/record/context reads return
+proven evidence and coverage over visited live source/time members. A known
+dimension mismatch proves exclusion despite another unavailable dimension.
+Otherwise missing, ambiguous or unprofiled dimensions contribute to unknown
+membership. Context anchors remain strict; neighbors share default/strict policy.
+
+Eligible and qualified totals use a typed known/unknown union; agent renderers
+preserve unknown as `null` and expose known lower bounds separately. One core
+codec serves all coverage receipts, including both context directions. Incomplete
+membership is also propagated into event/text corpus coverage. Key counts and
+scores describe the covered membership, not unknown records. Complete membership
+scans retain exact totals when only output rows are limited.
+
+`require_complete_index` is accepted across all CLI/MCP query surfaces. Applicable
+JSON projection failure or undecidable diagnostic membership refuses strict
+reads with `INDEX_NOT_READY`; genuine storage failures remain hard errors in
+either mode. Existing record-query strict controls feed the same core policy.
+No new parser, scoring law, or persisted evidence representation is introduced.
+
+Queries now declare `Scope.schemaVersion`; the daemon refuses older/absent
+versions before encoding changed count fields. Every agent query first checks
+native discovery. The extra discovery still scans status; bounded handshake and
+full query leases/snapshots/pagination remain unfinished. The development unit
+still runs schema 21 pending source qualification and adoption below.
+
+Local qualification on 2026-10-07: `make check` passed formatting, release Clippy
+with warnings denied, all workspace release tests (94 storage and 27 RPC/daemon/
+MCP scenarios), seeded census self-tests and the pinned cross-workspace gate.
+All 143 ownership jobs hold with no distinct exceptions. Core scenarios exercise
+known mismatches with another unknown dimension, default proven rows and unknown
+totals across JSON/text/combined/context reads, strict refusal, uncertain context
+anchors, pin retention/reopen, complete totals with an output row limit,
+incomplete traversal totals and missing captured-profile storage failures.
+All five query surfaces exercise identical CLI/MCP coverage and strict refusal.
+Generated requests with absent or schema-21 version declarations refuse before
+query execution. Native column-family corruption fixtures share one dev-only
+open helper instead of repeating the storage setup.
+
+An independently archived schema-21 CLI (SHA-256
+`1ee26e7eb898513eeab8cd3cb896a9361610628d510843b89e6a049baa93dea6`)
+refused unfiltered key/text reads and a filtered key read against a private
+schema-22 daemon: `UNSUPPORTED`, exit 1 and zero stdout bytes. The current CLI
+returned one proven member, one unknown member, a null eligible total and a
+known lower bound of one. The owned daemon shut down with SIGINT, exit 0 and
+socket cleanup. Evidence is under `/tmp/sparrow-coverage-compat.btajhgee`.
 
 ## Schema 21 diagnostic mappings and filters
 

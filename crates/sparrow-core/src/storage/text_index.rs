@@ -95,6 +95,8 @@ impl Store {
     ) -> Result<Value, Error> {
         scope.validate()?;
         query.validate()?;
+        let strict = scope.require_complete_index || query.require_complete_index;
+        let mut diagnostics = super::diagnostic::DiagnosticCoverage::default();
         let writer = self.lock()?;
         let mut terms = match &query.text {
             Some(input) => writer
@@ -147,7 +149,7 @@ impl Store {
             visited += 1;
             if !writer.live_record(&record, now, &protected)
                 || !scope.matches_source(&record.source)
-                || !writer.matches_diagnostic_scope(scope, &record)?
+                || !writer.matches_diagnostic_scope(scope, &record, &mut diagnostics, strict)?
             {
                 continue;
             }
@@ -157,7 +159,7 @@ impl Store {
                 event_unknown += 1;
             }
             if let Some(interval) = query.event_interval {
-                if query.require_complete_index
+                if strict
                     && matches!(&record.event_time, crate::EventTime::Unknown { reason, .. } if reason == "projection_failed")
                 {
                     return Err(Error::new(
@@ -179,7 +181,7 @@ impl Store {
                 &query.fields,
                 &mut field_coverage,
                 scope.scan_budget,
-                query.require_complete_index,
+                strict,
             )?
             else {
                 continue;
@@ -234,7 +236,7 @@ impl Store {
             match state.as_str() {
                 "failed" | "incomplete" => {
                     failed += 1;
-                    if query.require_complete_index {
+                    if strict {
                         return Err(Error::new(
                             "INDEX_NOT_READY",
                             "selected text projection unavailable",
@@ -272,11 +274,12 @@ impl Store {
                 documents.insert(id.to_owned(), (record, length));
             }
         }
+        let membership_limited = limited;
         let event_coverage = Object::new()
             .with("evaluated", event_evaluated.to_string())
             .with("unknown", event_unknown.to_string())
             .with("outside_interval", event_outside.to_string())
-            .with("membership_complete", !limited);
+            .with("membership_complete", diagnostics.complete(limited));
         if query.text.is_none() {
             limited |= qualified > scope.limit;
             chronological.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -297,7 +300,9 @@ impl Store {
                 .with("execution", if limited { "limited" } else { "complete" })
                 .with(
                     "certainty",
-                    if limited || field_coverage.failed > 0 || field_coverage.decoding_failures > 0
+                    if !diagnostics.complete(limited)
+                        || field_coverage.failed > 0
+                        || field_coverage.decoding_failures > 0
                     {
                         "incomplete"
                     } else {
@@ -306,26 +311,37 @@ impl Store {
                 )
                 .with(
                     "coverage",
-                    Object::new()
-                        .with("visited", visited.to_string())
-                        .with("eligible_records", eligible.to_string())
-                        .with("failed_json_records", field_coverage.failed.to_string())
-                        .with(
-                            "non_json_records",
-                            field_coverage.not_applicable.to_string(),
-                        )
-                        .with(
-                            "decoding_failures",
-                            field_coverage.decoding_failures.to_string(),
-                        ),
+                    diagnostics.encode(
+                        visited as u64,
+                        eligible,
+                        [
+                            field_coverage.failed,
+                            field_coverage.not_applicable,
+                            field_coverage.decoding_failures,
+                        ],
+                        membership_limited,
+                    ),
                 )
                 .with("field_visits", field_coverage.visits.to_string())
-                .with("qualified_records", qualified.to_string())
+                .with(
+                    "qualified_records",
+                    diagnostics.count(
+                        qualified as u64,
+                        membership_limited
+                            || field_coverage.failed > 0
+                            || field_coverage.decoding_failures > 0,
+                    ),
+                )
+                .with("known_qualified_records", qualified.to_string())
                 .with("event_coverage", event_coverage)
                 .with("rows", Value::array(selected_rows))
                 .into());
         }
-        let membership_complete = !limited;
+        let membership_complete = diagnostics.complete(limited)
+            && failed == 0
+            && not_applicable == 0
+            && field_coverage.failed == 0
+            && field_coverage.decoding_failures == 0;
         let mut corpus_identity = Vec::new();
         for part in [
             writer.id.as_bytes(),
@@ -478,7 +494,7 @@ impl Store {
             .with("execution", if limited { "limited" } else { "complete" })
             .with(
                 "certainty",
-                if limited
+                if !diagnostics.complete(limited)
                     || failed > 0
                     || not_applicable > 0
                     || field_coverage.failed > 0
@@ -491,18 +507,16 @@ impl Store {
             )
             .with(
                 "coverage",
-                Object::new()
-                    .with("visited", visited.to_string())
-                    .with("eligible_records", eligible.to_string())
-                    .with("failed_json_records", field_coverage.failed.to_string())
-                    .with(
-                        "non_json_records",
-                        field_coverage.not_applicable.to_string(),
-                    )
-                    .with(
-                        "decoding_failures",
-                        field_coverage.decoding_failures.to_string(),
-                    ),
+                diagnostics.encode(
+                    visited as u64,
+                    eligible,
+                    [
+                        field_coverage.failed,
+                        field_coverage.not_applicable,
+                        field_coverage.decoding_failures,
+                    ],
+                    membership_limited,
+                ),
             )
             .with(
                 "text_coverage",
@@ -528,7 +542,16 @@ impl Store {
             )
             .with("time_basis", time_basis)
             .with("field_visits", field_coverage.visits.to_string())
-            .with("qualified_records", qualified.to_string())
+            .with(
+                "qualified_records",
+                diagnostics.count(
+                    qualified as u64,
+                    membership_limited
+                        || field_coverage.failed > 0
+                        || field_coverage.decoding_failures > 0,
+                ),
+            )
+            .with("known_qualified_records", qualified.to_string())
             .with("event_coverage", event_coverage)
             .with("rows", Value::array(rows))
             .into())

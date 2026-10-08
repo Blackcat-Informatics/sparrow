@@ -16,7 +16,6 @@ pub(crate) struct Input {
     pub options: Options,
     pub text: Option<String>,
     pub fields: Vec<sparrow_core::FieldConstraint>,
-    pub require_complete: bool,
     pub event_interval: Option<sparrow_core::EventInterval>,
 }
 
@@ -111,7 +110,7 @@ impl Input {
         let mut input = call.get().init_query();
         fill_scope(input.reborrow().init_scope(), &self.options)?;
         optional(input.reborrow().init_text(), &self.text);
-        input.set_require_complete_index(self.require_complete);
+        input.set_require_complete_index(self.options.require_complete_index);
         if let Some(interval) = self.event_interval {
             let mut interval_out = input.reborrow().init_event_interval().init_value();
             interval_out
@@ -223,7 +222,11 @@ impl Input {
             .with("field_visits", found.get_field_visits().to_string())
             .with(
                 "qualified_records",
-                found.get_qualified_records().to_string(),
+                super::render_count(found.get_qualified_records()?)?,
+            )
+            .with(
+                "known_qualified_records",
+                found.get_known_qualified_records().to_string(),
             )
             .with("rows", Value::array(rows))
             .with("text", text)

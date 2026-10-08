@@ -8,6 +8,7 @@ inspect, correlate, and query as a semantic graph.
 CLI with resumable typed file imports and bounded oversized-record preparation,
 stdio MCP, JSON field discovery, immutable JSON source-time and diagnostic profiles,
 mapped service/host/severity/trace/span filters,
+explicit partial diagnostic scope coverage with typed unknown totals,
 explicit event-time intervals, artifact/record/pin query scopes, combined same-record field/text searches,
 persistent native full-text retrieval, bounded
 record context, durable stable-ID pin renewal and paginated pin discovery,
@@ -15,7 +16,7 @@ persistent native JSON/Markdown RDF dictionaries and six-way
 quad indexes, a standalone typed producer client with bounded delivery and a
 composable tracing layer, bounded buffered/durable ingestion with session-scoped
 WAL flush controls, and helper-census tooling are implemented. Stored-view SPARQL,
-ingestion watchers/syslog and
+active tailing/syslog and
 full architecture acceptance
 remain unfinished. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.

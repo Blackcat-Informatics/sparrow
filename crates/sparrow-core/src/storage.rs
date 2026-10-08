@@ -1155,6 +1155,7 @@ impl Store {
         let mut failed = 0_u64;
         let mut not_applicable = 0_u64;
         let mut decoding_failures = 0_u64;
+        let mut diagnostics = diagnostic::DiagnosticCoverage::default();
         let mut limited = false;
         let mut rows = Vec::new();
         let mut keys = BTreeMap::<(String, String), (u64, u64, String)>::new();
@@ -1172,7 +1173,12 @@ impl Store {
             visited += 1;
             if !writer.live_record(&record, now, &protected)
                 || !scope.matches_source(&record.source)
-                || !writer.matches_diagnostic_scope(scope, &record)?
+                || !writer.matches_diagnostic_scope(
+                    scope,
+                    &record,
+                    &mut diagnostics,
+                    scope.require_complete_index,
+                )?
             {
                 continue;
             }
@@ -1188,6 +1194,12 @@ impl Store {
             let facts = parse(&bytes)?;
             if read_field::<String>(&facts, "state")? != "complete" {
                 failed += 1;
+                if scope.require_complete_index {
+                    return Err(Error::new(
+                        "INDEX_NOT_READY",
+                        "selected JSON projection unavailable",
+                    ));
+                }
                 continue;
             }
             decoding_failures += integer(&facts, "decoding_failures")?;
@@ -1278,7 +1290,7 @@ impl Store {
             .with("execution", if limited { "limited" } else { "complete" })
             .with(
                 "certainty",
-                if limited || failed > 0 || decoding_failures > 0 {
+                if !diagnostics.complete(limited) || failed > 0 || decoding_failures > 0 {
                     "incomplete"
                 } else {
                     "exact"
@@ -1286,13 +1298,11 @@ impl Store {
             )
             .with(
                 "coverage",
-                Value::from(
-                    Object::new()
-                        .with("visited", visited.to_string())
-                        .with("eligible_records", eligible.to_string())
-                        .with("failed_json_records", failed.to_string())
-                        .with("non_json_records", not_applicable.to_string())
-                        .with("decoding_failures", decoding_failures.to_string()),
+                diagnostics.encode(
+                    visited as u64,
+                    eligible,
+                    [failed, not_applicable, decoding_failures],
+                    limited,
                 ),
             )
             .into())

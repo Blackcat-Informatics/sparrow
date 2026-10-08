@@ -464,6 +464,16 @@ fn optional(value: wire::optional_text::Reader<'_>) -> capnp::Result<Option<Stri
 }
 
 fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<QueryScope, Error>> {
+    if value.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+        return Ok(Err(Error {
+            code: "UNSUPPORTED",
+            message: format!(
+                "query schema {} is unsupported; require schema {} and current discovery",
+                value.get_schema_version(),
+                sparrow_client::SCHEMA_VERSION
+            ),
+        }));
+    }
     let source = optional(value.get_source()?)?;
     let filters = value.get_diagnostics()?;
     if filters.len() > 5 {
@@ -552,6 +562,7 @@ fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<Quer
         source,
         sources,
         diagnostics,
+        require_complete_index: value.get_require_complete_index(),
         received_from,
         received_before,
         limit: value.get_limit() as usize,
@@ -574,6 +585,42 @@ fn number(value: &Value, name: &'static str) -> capnp::Result<u64> {
         .map_err(|e| capnp::Error::failed(format!("stored count {name}: {e}")))
 }
 
+fn count(
+    mut out: wire::count::Builder<'_>,
+    value: &Value,
+    name: &'static str,
+) -> capnp::Result<()> {
+    match value.get(name) {
+        Some(Value::Null) => out.set_unknown(()),
+        Some(_) => out.set_known(number(value, name)?),
+        None => return Err(capnp::Error::failed(format!("missing count {name}"))),
+    }
+    Ok(())
+}
+
+fn coverage(mut target: wire::coverage::Builder<'_>, coverage: &Value) -> capnp::Result<()> {
+    target.set_visited(number(coverage, "visited")?);
+    count(
+        target.reborrow().init_eligible_records(),
+        coverage,
+        "eligible_records",
+    )?;
+    target.set_known_eligible_records(number(coverage, "known_eligible_records")?);
+    target.set_failed_json_records(number(coverage, "failed_json_records")?);
+    target.set_non_json_records(number(coverage, "non_json_records")?);
+    target.set_decoding_failures(number(coverage, "decoding_failures")?);
+    let scope = coverage
+        .get("diagnostic_scope")
+        .ok_or_else(|| capnp::Error::failed("missing diagnostic coverage".into()))?;
+    let mut out = target.init_diagnostic_scope();
+    out.set_evaluated(number(scope, "evaluated")?);
+    out.set_matched(number(scope, "matched")?);
+    out.set_excluded(number(scope, "excluded")?);
+    out.set_unknown(number(scope, "unknown")?);
+    out.set_membership_complete(field::<bool>(scope, "membership_complete")?);
+    Ok(())
+}
+
 fn receipt(mut out: wire::receipt::Builder<'_>, value: &Value) -> capnp::Result<()> {
     out.set_store_id(field::<String>(value, "store_id")?);
     out.reborrow().init_membership_at().set_unix_millis(
@@ -593,12 +640,7 @@ fn receipt(mut out: wire::receipt::Builder<'_>, value: &Value) -> capnp::Result<
     let coverage = value
         .get("coverage")
         .ok_or_else(|| capnp::Error::failed("missing query coverage".into()))?;
-    let mut target = out.init_coverage();
-    target.set_visited(number(coverage, "visited")?);
-    target.set_eligible_records(number(coverage, "eligible_records")?);
-    target.set_failed_json_records(number(coverage, "failed_json_records")?);
-    target.set_non_json_records(number(coverage, "non_json_records")?);
-    target.set_decoding_failures(number(coverage, "decoding_failures")?);
+    self::coverage(out.init_coverage(), coverage)?;
     Ok(())
 }
 
@@ -1265,16 +1307,20 @@ impl wire::sparrow::Server for Rpc {
                 } else {
                     wire::Execution::Complete
                 });
-                receipt.set_certainty(if limited {
+                receipt.set_certainty(if !value.diagnostics.complete(limited) {
                     wire::Certainty::Incomplete
                 } else {
                     wire::Certainty::Exact
                 });
-                let mut coverage = receipt.init_coverage();
-                coverage.set_visited(1 + value.before.visited + value.after.visited);
-                coverage.set_eligible_records(
-                    (1 + value.before.records.len() + value.after.records.len()) as u64,
-                );
+                coverage(
+                    receipt.init_coverage(),
+                    &value.diagnostics.encode(
+                        1 + value.before.visited + value.after.visited,
+                        (1 + value.before.records.len() + value.after.records.len()) as u64,
+                        [0; 3],
+                        limited,
+                    ),
+                )?;
                 record(out.reborrow().init_anchor(), value.anchor, &value.store_id)?;
                 context_side(out.reborrow().init_before(), value.before, &value.store_id)?;
                 context_side(out.init_after(), value.after, &value.store_id)?;
@@ -1449,7 +1495,12 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 receipt(out.reborrow().init_receipt(), &value)?;
                 out.set_field_visits(number(&value, "field_visits")?);
-                out.set_qualified_records(number(&value, "qualified_records")?);
+                count(
+                    out.reborrow().init_qualified_records(),
+                    &value,
+                    "qualified_records",
+                )?;
+                out.set_known_qualified_records(number(&value, "known_qualified_records")?);
                 out.set_time_basis(match field::<String>(&value, "time_basis")?.as_str() {
                     "received_at" => wire::TimeBasis::ReceivedAt,
                     "event_time" => wire::TimeBasis::EventTime,

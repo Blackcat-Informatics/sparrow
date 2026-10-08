@@ -201,6 +201,8 @@ struct Scope {
   selection @5 :QuerySelection;
   sourceIds @6 :OptionalSourceIds;
   diagnostics @7 :List(DiagnosticFilter);
+  requireCompleteIndex @8 :Bool;
+  schemaVersion @9 :UInt32;
 }
 struct OptionalSourceIds { union { absent @0 :Void; value @1 :List(Text); } }
 struct PinScope { storeId @0 :Text; id @1 :Text; expectedRevision @2 :OptionalRevision; }
@@ -212,8 +214,14 @@ struct ValueQuery {
 enum Execution { complete @0; limited @1; }
 enum Certainty { exact @0; incomplete @1; }
 struct Coverage {
-  visited @0 :UInt64; eligibleRecords @1 :UInt64; failedJsonRecords @2 :UInt64;
+  visited @0 :UInt64; eligibleRecords @1 :Count; failedJsonRecords @2 :UInt64;
   nonJsonRecords @3 :UInt64; decodingFailures @4 :UInt64;
+  knownEligibleRecords @5 :UInt64; diagnosticScope @6 :DiagnosticCoverage;
+}
+struct Count { union { unknown @0 :Void; known @1 :UInt64; } }
+struct DiagnosticCoverage {
+  evaluated @0 :UInt64; matched @1 :UInt64; excluded @2 :UInt64;
+  unknown @3 :UInt64; membershipComplete @4 :Bool;
 }
 struct Receipt {
   storeId @0 :Text; membershipAt @1 :Instant; execution @2 :Execution;
@@ -314,8 +322,9 @@ struct RecordMatch {
 struct OptionalTextResults { union { absent @0 :Void; value @1 :TextResults; } }
 struct RecordsResults {
   receipt @0 :Receipt; rows @1 :List(RecordMatch); text @2 :OptionalTextResults;
-  fieldVisits @3 :UInt64; qualifiedRecords @4 :UInt64;
+  fieldVisits @3 :UInt64; qualifiedRecords @4 :Count;
   timeBasis @5 :TimeBasis; eventCoverage @6 :EventCoverage;
+  knownQualifiedRecords @7 :UInt64;
 }
 # Private upload progress is distinct from accepted evidence.
 struct ImportRef { storeId @0 :Text; id @1 :Text; }

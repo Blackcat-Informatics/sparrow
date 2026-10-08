@@ -50,6 +50,16 @@ async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
             }
         }
         let rdf=cli(&socket,&["rdf",&store,&artifact.record_ids[0]]);assert_eq!(rdf["diagnostic_primary_rows"].as_str(),Some("16"));
+        for version in [0,21] {
+            let mut rejected=client.capability().keys_list_request();
+            let mut scope=rejected.get().init_scope();scope.set_schema_version(version);
+            scope.init_received_before().set_unix_millis(u64::MAX);
+            let reply=rejected.send().promise.await.unwrap();
+            match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+                wire::result::Error(error)=>assert_eq!(error.unwrap().get_code().unwrap().to_str().unwrap(),"UNSUPPORTED"),
+                wire::result::Ok(_)=>panic!("obsolete query schema was accepted"),
+            }
+        }
         let mut call=client.capability().record_get_request();let mut input=call.get().init_record();input.set_store_id(&store);input.set_id(&artifact.record_ids[0]);
         let reply=call.send().promise.await.unwrap();let evidence=rpc_ok(reply.get().unwrap().get_result().unwrap()).get_diagnostics().unwrap();
         assert_eq!(evidence.get_fields().unwrap().len(),2);
@@ -62,7 +72,32 @@ async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
         client.ingest("diag-unprofiled","unprofiled",wire::Format::Json,br#"{"svc":"worker"}"#).await.unwrap();
         let uncertain=mcp.tool(request_id,"records_search",Object::new().with("scope",Object::new().with("kind","live")
             .with("filter",Object::new().with("service",vec!["worker"]))).into()).await;request_id+=1;
-        assert_eq!(uncertain["structuredContent"]["error"]["code"].as_str(),Some("INDEX_NOT_READY"));
+        assert_eq!(uncertain["structuredContent"]["receipt"]["coverage"]["diagnostic_scope"]["unknown"].as_str(),Some("1"));
+        assert!(uncertain["structuredContent"]["receipt"]["coverage"]["eligible_records"].is_null());
+        client.ingest("diag-missing","producer",wire::Format::Json,br#"{"svc":"worker","message":"needle"}"#).await.unwrap();
+        let partial_scope:Value=Object::new().with("kind","live").with("filter",Object::new().with("service",vec!["worker"])
+            .with("severity",vec!["ERROR","WARN"])).into();
+        std::fs::write(&scope_file,purrdf_lex::json::write_compact(&partial_scope)).unwrap();
+        for (tool,command) in [("keys_list","keys"),("values_search","values"),("text_search","text"),("records_search","records"),("records_context","context")] {
+            let mut input=Object::new().with("scope",partial_scope.clone());let mut args=vec![command];
+            if tool=="text_search" {input=input.with("text","needle");args.push("needle");}
+            if tool=="values_search" {input=input.with("path","/message");args.extend(["--path","/message"]);}
+            if tool=="records_context" {input=input.with("store_id",store.clone()).with("id",anchor.clone());args.extend([store.as_str(),anchor.as_str()]);}
+            args.extend(["--scope-file",scope_file.to_str().unwrap()]);
+            let cli_result=cli(&socket,&args);
+            let partial=mcp.tool(request_id,tool,input.clone().into()).await;request_id+=1;
+            assert_eq!(partial["isError"].as_bool(),Some(false));
+            assert_eq!(partial["structuredContent"]["receipt"]["coverage"],cli_result["receipt"]["coverage"]);
+            let coverage=&cli_result["receipt"]["coverage"];
+            assert!(coverage["eligible_records"].is_null());
+            assert_eq!(coverage["diagnostic_scope"]["unknown"].as_str(),Some(if tool=="records_context" {"1"} else {"2"}));
+            assert_eq!(cli_result["receipt"]["certainty"].as_str(),Some("incomplete"));
+            let strict=mcp.tool(request_id,tool,input.with("require_complete_index",true).into()).await;request_id+=1;
+            assert_eq!(strict["structuredContent"]["error"]["code"].as_str(),Some("INDEX_NOT_READY"));
+            args.extend(["--require-complete-index","true"]);
+            let refused=Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args(&args).output().unwrap();
+            assert!(!refused.status.success() && refused.stdout.is_empty());
+        }
         for filter in [Object::new(),Object::new().with("service",Vec::<String>::new()),Object::new().with("severity",vec![""]),Object::new().with("guess_field",vec!["worker"])] {
             let invalid=mcp.tool(request_id,"keys_list",Object::new().with("scope",Object::new().with("kind","live").with("filter",filter)).into()).await;request_id+=1;
             assert_eq!(invalid["structuredContent"]["error"]["code"].as_str(),Some("INVALID_ARGUMENT"));
@@ -196,6 +231,7 @@ async fn source_arrays_are_shared_by_generated_cli_and_mcp_queries() {
             for names in [vec!["alpha", "beta"], vec![], vec![""]] {
                 let mut call = client.capability().keys_list_request();
                 let mut scope = call.get().init_scope();
+                scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 scope
                     .reborrow()
                     .init_received_before()
@@ -215,16 +251,19 @@ async fn source_arrays_are_shared_by_generated_cli_and_mcp_queries() {
                 {
                     wire::result::Ok(value) => {
                         assert!(!names.is_empty());
-                        assert_eq!(
+                        assert!(matches!(
                             value
                                 .unwrap()
                                 .get_receipt()
                                 .unwrap()
                                 .get_coverage()
                                 .unwrap()
-                                .get_eligible_records(),
-                            2
-                        );
+                                .get_eligible_records()
+                                .unwrap()
+                                .which()
+                                .unwrap(),
+                            wire::count::Known(2)
+                        ));
                     }
                     wire::result::Error(error) => {
                         assert!(names.is_empty() || names == [""]);
@@ -1163,6 +1202,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 query.reborrow().init_path().set_value("/message");
                 query.reborrow().init_decoded().set_value(message);
                 let mut scope = query.init_scope();
+                scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 scope
                     .reborrow()
                     .init_source()
@@ -1919,6 +1959,7 @@ async fn query_selection_is_shared_by_typed_cli_and_mcp_surfaces() {
             // Direct generated requests must preserve typed domain errors, not transport exceptions.
             let mut request = client.capability().keys_list_request();
             let mut scope = request.get().init_scope();
+            scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
             scope
                 .reborrow()
                 .init_received_before()
@@ -3360,6 +3401,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     }
     let mut request = client.keys_list_request();
     let mut scope = request.get().init_scope();
+    scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
     scope.reborrow().init_source().set_value("synthetic-rpc");
     scope
         .reborrow()
@@ -3494,10 +3536,9 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     let mut query = request.get().init_query();
     query.reborrow().init_path().set_value("/message");
     query.reborrow().init_decoded().set_value("hello world");
-    query
-        .init_scope()
-        .init_received_before()
-        .set_unix_millis(u64::MAX);
+    let mut scope = query.init_scope();
+    scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
+    scope.init_received_before().set_unix_millis(u64::MAX);
     let response = request.send().promise.await.unwrap();
     let values = match response
         .get()
