@@ -531,11 +531,15 @@ fn values_page(
     Ok(())
 }
 
-fn query_cursor(value: wire::optional_text::Reader<'_>) -> Result<Option<String>, Error> {
+fn query_text(
+    value: wire::optional_text::Reader<'_>,
+    maximum: usize,
+    message: &str,
+) -> Result<Option<String>, Error> {
     if let wire::optional_text::Value(text) = value.which().map_err(invalid)?
-        && text.map_err(invalid)?.len() > 160
+        && text.map_err(invalid)?.len() > maximum
     {
-        return Err(invalid("query cursor exceeds 160 bytes"));
+        return Err(invalid(message));
     }
     optional(value).map_err(invalid)
 }
@@ -1049,6 +1053,7 @@ fn query_capture(
     target.set_lease_ms(field::<u64>(limits, "lease_ms")?);
     for name in [
         "json_value_visits",
+        "query_path_bytes",
         "field_visits",
         "posting_visits",
         "text_membership_bytes",
@@ -1059,6 +1064,7 @@ fn query_capture(
     ] {
         let mut limit = match name {
             "json_value_visits" => target.reborrow().init_json_value_visits(),
+            "query_path_bytes" => target.reborrow().init_query_path_bytes(),
             "field_visits" => target.reborrow().init_field_visits(),
             "posting_visits" => target.reborrow().init_posting_visits(),
             "text_membership_bytes" => target.reborrow().init_text_membership_bytes(),
@@ -1953,7 +1959,7 @@ impl wire::sparrow::Server for Rpc {
             fields,
             require_complete_index: input.get_require_complete_index(),
         };
-        let cursor = query_cursor(input.get_cursor()?);
+        let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
         match self
             .work(move |store, now| {
                 let page = store.records_read(
@@ -1996,7 +2002,7 @@ impl wire::sparrow::Server for Rpc {
             text: Some(input.get_text()?.to_str()?.to_owned()),
             ..Default::default()
         };
-        let cursor = query_cursor(input.get_cursor()?);
+        let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
         match self
             .work(move |store, now| {
                 let page = store.records_read(
@@ -2725,13 +2731,18 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let input = params.get()?;
         let scope = scope(input.get_scope()?, &self)?;
-        let cursor = query_cursor(input.get_cursor()?);
+        let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
+        let path = query_text(
+            input.get_path()?,
+            sparrow_core::JSON_QUERY_PATH_BYTES,
+            "JSON query path exceeds 65536 UTF-8 bytes",
+        );
         match self
             .work(move |store, now| {
                 store.json_read(
                     &sparrow_core::JsonRead {
                         scope: scope?,
-                        query: JsonQuery::Keys,
+                        query: JsonQuery::Keys { path: path? },
                         cursor: cursor?,
                     },
                     now,
@@ -2758,19 +2769,26 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let input = params.get()?.get_query()?;
         let scope = scope(input.get_scope()?, &self)?;
-        let cursor = query_cursor(input.get_cursor()?);
-        let query = JsonQuery::Values {
-            path: optional(input.get_path()?)?,
-            kind: optional_kind(input.get_kind()?)?,
-            lexical: optional(input.get_lexical()?)?,
-            decoded: optional(input.get_decoded()?)?,
-        };
+        let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
+        let path = query_text(
+            input.get_path()?,
+            sparrow_core::JSON_QUERY_PATH_BYTES,
+            "JSON query path exceeds 65536 UTF-8 bytes",
+        );
+        let kind = optional_kind(input.get_kind()?)?;
+        let lexical = optional(input.get_lexical()?)?;
+        let decoded = optional(input.get_decoded()?)?;
         match self
             .work(move |store, now| {
                 store.json_read(
                     &sparrow_core::JsonRead {
                         scope: scope?,
-                        query,
+                        query: JsonQuery::Values {
+                            path: path?,
+                            kind,
+                            lexical,
+                            decoded,
+                        },
                         cursor: cursor?,
                     },
                     now,

@@ -260,6 +260,34 @@ source-time and native ranked-text forms. Schema 29 routes standalone text searc
 through that same capture. Schema 30 routes native key/value discovery through the same result lease and
 bounded native JSON page body. Complete scope receipt fields remain unfinished.
 
+### Exact JSON key path restriction
+
+Schema 34 adds OptionalText path to keysList. CLI `keys --path POINTER` and
+MCP keys_list.path restrict discovery to that exact native RFC 6901 path.
+Absent or null selects every observed path; the empty string explicitly selects
+the document root. `/` selects an empty member name. Escaped names retain their
+native spelling: `/a~1b` addresses a member named `a/b`, `/m~0n` addresses `m~n`,
+and `/a~01b` addresses `a~1b`. There is no implicit subtree, prefix or wildcard
+match. Field/value predicate syntax uses the same public PurRDF pointer parser.
+Invalid pointer syntax refuses INVALID_ARGUMENT rather than appearing as no hits.
+
+Keys and values share the existing occurrence predicate and one typed input
+admission owner. JSON query paths admit at most 65,536 UTF-8 bytes before the
+server allocates an owned spelling. The core enforces the same limit for direct
+JSON discovery calls. The updated host capture profile is
+sparrow-query-capture/2; QueryLimits.queryPathBytes reports that ceiling for
+JSON captures and explicit absence for other query phases. Stored evidence,
+native projection identities and storage formats are unchanged.
+
+Key counts still aggregate all matching native occurrences across the selected
+membership before pagination. Duplicate members contribute to occurrence counts;
+each containing record contributes once per path/kind to record presence.
+Scope coverage continues to describe selected records independently of the path
+restriction. Captured selectors retain the exact optional path, including root
+versus absence. Changing it on an original continuation refuses CONFLICT;
+result_next resumes the original frozen selection without repeating the path.
+Later ingestion, pin changes and evidence retirement do not recompute counts.
+
 ### Record, text and JSON result pagination
 
 Typed `RecordQuery.cursor`, CLI `records --cursor CURSOR --page-size N`, and MCP
@@ -309,7 +337,7 @@ predicates otherwise agree.
 Continuations replay captured rows after pin mutation/release and evidence
 retirement; fresh reads revalidate current evidence. A changed query refuses with
 `CONFLICT`, an invalid page boundary with `INVALID_ARGUMENT`, and expired, unknown
-or previous-owner handles with `RESULT_EXPIRED`. Current schema 33 is required;
+or previous-owner handles with `RESULT_EXPIRED`. Current schema 34 is required;
 storage formats remain unchanged. `scanned` records candidate visits, not all I/O:
 reference expansion, field visits and posting visits retain their independent
 documented bounds and original coverage evidence.
@@ -654,7 +682,7 @@ decoding, typed coverage encoding and rendering.
 Cursors bind the original membership, selector and limits. Continuation serves
 the immutable capture after pin release, collection changes or evidence retirement;
 fresh reads revalidate current evidence. No read renews protection. Current
-discovery schema 33 is required; old clients/daemons are explicitly refused.
+discovery schema 34 is required; old clients/daemons are explicitly refused.
 Storage formats and retained evidence encodings are unchanged.
 
 Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`

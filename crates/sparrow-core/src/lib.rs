@@ -12,8 +12,8 @@ mod text;
 pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
 pub use query::{
-    EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryAlternatives, QueryScope,
-    QuerySelection, RecordQuery,
+    EventInterval, FieldConstraint, JSON_QUERY_PATH_BYTES, JsonPredicate, JsonQuery,
+    QueryAlternatives, QueryScope, QuerySelection, RecordQuery,
 };
 pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,

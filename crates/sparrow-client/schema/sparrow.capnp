@@ -289,7 +289,7 @@ struct QueryLimits {
   resultBytes @12 :UInt64; leaseMs @13 :UInt64;
   textMembershipBytes @14 :OptionalLimit; queryTextBytes @15 :OptionalLimit;
   queryTerms @16 :OptionalLimit; fieldConstraints @17 :OptionalLimit;
-  compiledFieldBytes @18 :OptionalLimit;
+  compiledFieldBytes @18 :OptionalLimit; queryPathBytes @19 :OptionalLimit;
 }
 struct QueryCapture {
   page @0 :CatalogReadReceipt; profileIds @1 :List(QueryProfile);
@@ -461,7 +461,7 @@ interface Sparrow {
   bytesRead @4 (request :ReadBytes) -> (result :Result(Bytes));
   pin @5 (request :PinRequest) -> (result :Result(Pin));
   pinRelease @6 (request :Release) -> (result :Result(Released));
-  keysList @7 (scope :Scope, cursor :OptionalText) -> (result :Result(Keys));
+  keysList @7 (scope :Scope, cursor :OptionalText, path :OptionalText) -> (result :Result(Keys));
   valuesSearch @8 (query :ValueQuery) -> (result :Result(Values));
   textSearch @9 (query :TextQuery) -> (result :Result(TextSearchPage));
   recordsContext @10 (query :ContextQuery) -> (result :Result(Context));

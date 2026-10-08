@@ -374,7 +374,7 @@ impl Command {
                         .parse()
                         .map_err(|_| invalid("--scan-budget requires an unsigned integer"))?
                 }
-                "--path" if values => options.path = Some(value.clone()),
+                "--path" if values || args[0] == "keys" => options.path = Some(value.clone()),
                 "--kind" if values => {
                     options.kind = Some(parse_kind(value).map_err(|e| invalid(e.to_string()))?)
                 }
@@ -508,6 +508,7 @@ impl Command {
             let mut request = client.keys_list_request();
             fill_scope(request.get().init_scope(), options)?;
             optional(request.get().init_cursor(), &options.cursor);
+            optional(request.get().init_path(), &options.path);
             let response = request.send().promise.await?;
             let result = response.get()?.get_result()?;
             let found = match result.which()? {

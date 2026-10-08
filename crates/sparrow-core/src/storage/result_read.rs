@@ -48,7 +48,7 @@ impl Store {
                         crate::RecordOperation::Text => ResultPage::Text(page),
                     },
                     record_read::Selector::Json(query) => match query.query {
-                        crate::JsonQuery::Keys => ResultPage::Keys(page),
+                        crate::JsonQuery::Keys { .. } => ResultPage::Keys(page),
                         crate::JsonQuery::Values { .. } => ResultPage::Values(page),
                     },
                 });

@@ -116,7 +116,9 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
         scan_budget: 1000,
     };
     for result in [
-        store.json_query(&scope, &JsonQuery::Keys, 3).unwrap(),
+        store
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 3)
+            .unwrap(),
         store
             .json_query(
                 &scope,
@@ -187,7 +189,7 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
     scope.require_complete_index = true;
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, 3)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 3)
             .unwrap_err()
             .code,
         "INDEX_NOT_READY"
@@ -295,7 +297,7 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
     scope.limit = 100;
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, 31 * DAY)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 31 * DAY)
             .unwrap_err()
             .code,
         "STORAGE_FAILURE"
@@ -453,7 +455,9 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() 
         2
     );
     assert_eq!(
-        store.json_query(&scope, &JsonQuery::Keys, 2).unwrap()["coverage"]["eligible_records"]
+        store
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 2)
+            .unwrap()["coverage"]["eligible_records"]
             .as_str(),
         Some("2")
     );
@@ -482,7 +486,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() 
     scope.received_from = 0;
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, 2)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 2)
             .unwrap_err()
             .code,
         "INDEX_NOT_READY"
@@ -699,7 +703,9 @@ fn source_alternatives_intersect_membership_time_and_context_without_duplicates(
                 .len(),
             3
         );
-        let keys = store.json_query(&scope, &JsonQuery::Keys, 50).unwrap();
+        let keys = store
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 50)
+            .unwrap();
         assert_eq!(keys["coverage"]["eligible_records"].as_str(), Some("3"));
         assert!(
             keys["rows"]
@@ -790,7 +796,7 @@ fn source_alternatives_intersect_membership_time_and_context_without_duplicates(
     scope.selection = QuerySelection::Evidence(vec![artifacts[3].id.clone()]);
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, 31 * DAY)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 31 * DAY)
             .unwrap_err()
             .code,
         "EVIDENCE_UNAVAILABLE"
@@ -1836,7 +1842,9 @@ fn eviction_preserves_record_pins_shared_projections_and_durable_retry_identity(
         3
     );
     assert_eq!(
-        store.json_query(&scope, &JsonQuery::Keys, 4).unwrap()["coverage"]["eligible_records"]
+        store
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 4)
+            .unwrap()["coverage"]["eligible_records"]
             .as_str(),
         Some("3")
     );
@@ -2776,7 +2784,9 @@ fn query_selection_intersects_filters_deduplicates_and_seeks_selected_evidence()
             .iter()
             .any(|id| row["record_id"].as_str() == Some(id.as_str()))
     }));
-    let keys = store.json_query(&scope, &JsonQuery::Keys, 40).unwrap();
+    let keys = store
+        .json_query(&scope, &JsonQuery::Keys { path: None }, 40)
+        .unwrap();
     assert_eq!(keys["coverage"]["eligible_records"].as_str(), Some("2"));
     let text = store.text_query(&scope, "needle", 40).unwrap();
     assert_eq!(text["rows"].as_array().unwrap().len(), 2);
@@ -2814,7 +2824,7 @@ fn query_selection_intersects_filters_deduplicates_and_seeks_selected_evidence()
     scope.selection = QuerySelection::Evidence(vec!["record:missing".into()]);
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, 40)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 40)
             .unwrap_err()
             .code,
         "NOT_FOUND"
@@ -2864,12 +2874,14 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
         limit: 10,
         scan_budget: 100,
     };
-    let keys = store.json_query(&scope, &JsonQuery::Keys, now).unwrap();
+    let keys = store
+        .json_query(&scope, &JsonQuery::Keys { path: None }, now)
+        .unwrap();
     assert_eq!(keys["coverage"]["eligible_records"].as_str(), Some("1"));
     scope.selection = QuerySelection::Evidence(vec![artifact.id.clone()]);
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, now)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, now)
             .unwrap_err()
             .code,
         "EVIDENCE_UNAVAILABLE"
@@ -2877,14 +2889,16 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
     store.expire(now).unwrap();
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, now)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, now)
             .unwrap_err()
             .code,
         "NOT_FOUND"
     );
     scope.selection = QuerySelection::Evidence(vec![artifact.record_ids[0].clone()]);
     assert_eq!(
-        store.json_query(&scope, &JsonQuery::Keys, now).unwrap()["coverage"]["eligible_records"]
+        store
+            .json_query(&scope, &JsonQuery::Keys { path: None }, now)
+            .unwrap()["coverage"]["eligible_records"]
             .as_str(),
         Some("1")
     );
@@ -2894,7 +2908,7 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
     };
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, now)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, now)
             .unwrap_err()
             .code,
         "CONFLICT"
@@ -2905,7 +2919,7 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
     };
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, 61 * DAY)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 61 * DAY)
             .unwrap_err()
             .code,
         "PIN_NOT_ACTIVE"
@@ -2920,7 +2934,7 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
     assert_ne!(replacement.id, pin.id);
     assert_eq!(
         store
-            .json_query(&scope, &JsonQuery::Keys, now)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, now)
             .unwrap_err()
             .code,
         "NOT_FOUND"
@@ -3323,7 +3337,7 @@ fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_by
         scan_budget: 100,
     };
     let keys = store
-        .json_query(&scope, &sparrow_core::JsonQuery::Keys, 3)
+        .json_query(&scope, &sparrow_core::JsonQuery::Keys { path: None }, 3)
         .unwrap();
     assert_eq!(keys["coverage"]["failed_json_records"].as_str(), Some("1"));
     let text = store.text_query(&scope, "marker", 3).unwrap();
@@ -7217,7 +7231,9 @@ fn native_json_discovery_preserves_duplicates_lexical_values_and_time_scope() {
         limit: 100,
         scan_budget: 1000,
     };
-    let keys = store.json_query(&scope, &JsonQuery::Keys, 201).unwrap();
+    let keys = store
+        .json_query(&scope, &JsonQuery::Keys { path: None }, 201)
+        .unwrap();
     let rows = keys.get("rows").unwrap().as_array().unwrap();
     let x = rows
         .iter()
@@ -7284,7 +7300,9 @@ fn projection_failure_is_visible_without_discarding_raw_evidence() {
         limit: 100,
         scan_budget: 1000,
     };
-    let result = store.json_query(&scope, &JsonQuery::Keys, 101).unwrap();
+    let result = store
+        .json_query(&scope, &JsonQuery::Keys { path: None }, 101)
+        .unwrap();
     assert_eq!(
         result.get("certainty").unwrap().as_str(),
         Some("incomplete")
@@ -7303,7 +7321,7 @@ fn projection_failure_is_visible_without_discarding_raw_evidence() {
         .unwrap();
     store.expire(100 + 30 * DAY).unwrap();
     let retained = store
-        .json_query(&scope, &JsonQuery::Keys, 100 + 30 * DAY)
+        .json_query(&scope, &JsonQuery::Keys { path: None }, 100 + 30 * DAY)
         .unwrap();
     assert_eq!(
         retained
@@ -7318,7 +7336,7 @@ fn projection_failure_is_visible_without_discarding_raw_evidence() {
     store.expire(100 + 30 * DAY).unwrap();
     assert!(
         store
-            .json_query(&scope, &JsonQuery::Keys, 100 + 30 * DAY)
+            .json_query(&scope, &JsonQuery::Keys { path: None }, 100 + 30 * DAY)
             .unwrap()
             .get("rows")
             .unwrap()
@@ -8820,7 +8838,7 @@ fn json_pages_capture_complete_counts_occurrences_and_frozen_receipts() {
         .unwrap();
     let mut query = JsonRead {
         scope: record_page_scope("pages", 113),
-        query: JsonQuery::Keys,
+        query: JsonQuery::Keys { path: None },
         cursor: None,
     };
     let first = store.json_read(&query, 2).unwrap();
@@ -8913,7 +8931,7 @@ fn json_capture_counts_duplicate_keys_and_shares_query_handle_admission() {
         .unwrap();
     let query = JsonRead {
         scope: record_page_scope("pages", 1),
-        query: JsonQuery::Keys,
+        query: JsonQuery::Keys { path: None },
         cursor: None,
     };
     let first = store.json_read(&query, 2).unwrap();
@@ -9057,7 +9075,7 @@ fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_o
         ));
     }
     for query in [
-        JsonQuery::Keys,
+        JsonQuery::Keys { path: None },
         JsonQuery::Values {
             path: Some("/message".into()),
             kind: None,
@@ -9075,7 +9093,7 @@ fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_o
         let expected = store.json_read(&read, 3).unwrap();
         cases.push((
             read.cursor.unwrap(),
-            if matches!(read.query, JsonQuery::Keys) {
+            if matches!(read.query, JsonQuery::Keys { .. }) {
                 ResultPage::Keys(expected)
             } else {
                 ResultPage::Values(expected)
@@ -9206,7 +9224,7 @@ fn captured_query_evidence_freezes_native_profiles_and_applicable_admission_limi
     let scope = record_page_scope("pages", 1);
     let mut json = JsonRead {
         scope: scope.clone(),
-        query: JsonQuery::Keys,
+        query: JsonQuery::Keys { path: None },
         cursor: None,
     };
     let first = store.json_read(&json, 2).unwrap();
@@ -9297,5 +9315,229 @@ fn captured_query_evidence_freezes_native_profiles_and_applicable_admission_limi
     assert_eq!(
         context["limits"]["text_membership_bytes"].as_u64(),
         Some(64 * 1024 * 1024)
+    );
+}
+
+#[test]
+fn exact_key_paths_preserve_native_duplicates_kinds_roots_and_frozen_counts() {
+    use sparrow_core::{JsonQuery, JsonRead, QueryScope};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.ingest("key-paths", "keys", "jsonl", br#"{"a/b":1,"a/b":2,"a/b":"one","m~n":true,"":null,"nested":{"a/b":4},"arr":[{"a/b":5}]}
+{"a/b":null,"a/b":"two","m~n":false}
+"#, 1).unwrap();
+    let scope = QueryScope {
+        selection: Default::default(),
+        source: Some("keys".into()),
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 10,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    let result = store
+        .json_query(
+            &scope,
+            &JsonQuery::Keys {
+                path: Some("/a~1b".into()),
+            },
+            2,
+        )
+        .unwrap();
+    let rows = result["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(row["path"].as_str(), Some("/a~1b"));
+    }
+    assert_eq!(rows[0]["kind"].as_str(), Some("null"));
+    assert_eq!(rows[0]["occurrences"].as_str(), Some("1"));
+    assert_eq!(rows[1]["kind"].as_str(), Some("number"));
+    assert_eq!(rows[1]["occurrences"].as_str(), Some("2"));
+    assert_eq!(rows[1]["records"].as_str(), Some("1"));
+    assert_eq!(rows[2]["kind"].as_str(), Some("string"));
+    assert_eq!(rows[2]["occurrences"].as_str(), Some("2"));
+    assert_eq!(rows[2]["records"].as_str(), Some("2"));
+    assert_eq!(result["coverage"]["eligible_records"].as_str(), Some("2"));
+    for (path, kinds) in [
+        ("", vec!["object"]),
+        ("/", vec!["null"]),
+        ("/m~0n", vec!["false", "true"]),
+        ("/nested", vec!["object"]),
+        ("/nested/a~1b", vec!["number"]),
+    ] {
+        let found = store
+            .json_query(
+                &scope,
+                &JsonQuery::Keys {
+                    path: Some(path.into()),
+                },
+                2,
+            )
+            .unwrap();
+        let rows = found["rows"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        assert!(rows.iter().all(|row| row["path"].as_str() == Some(path)));
+    }
+    let mut read = JsonRead {
+        scope: QueryScope {
+            limit: 1,
+            ..scope.clone()
+        },
+        query: JsonQuery::Keys {
+            path: Some("/a~1b".into()),
+        },
+        cursor: None,
+    };
+    let first = store.json_read(&read, 2).unwrap();
+    assert_eq!(first.total_items, 3);
+    let evidence = first.body.result().unwrap()["query_evidence"].clone();
+    assert_eq!(
+        evidence["limits"]["query_path_bytes"].as_u64(),
+        Some(sparrow_core::JSON_QUERY_PATH_BYTES as u64)
+    );
+    store
+        .ingest(
+            "key-paths-later",
+            "keys",
+            "jsonl",
+            b"{\"a/b\":3,\"a/b\":null}\n",
+            3,
+        )
+        .unwrap();
+    read.cursor = first.next_cursor.clone();
+    for path in [None, Some("".into()), Some("/m~0n".into())] {
+        let changed = JsonRead {
+            query: JsonQuery::Keys { path },
+            ..read.clone()
+        };
+        assert_eq!(store.json_read(&changed, 4).unwrap_err().code, "CONFLICT");
+    }
+    let second = store.json_read(&read, 4).unwrap();
+    assert_eq!(second.body.result().unwrap()["rows"][0], rows[1]);
+    assert_eq!(second.body.result().unwrap()["query_evidence"], evidence);
+    read.cursor = second.next_cursor;
+    let third = store.json_read(&read, 4).unwrap();
+    assert_eq!(third.body.result().unwrap()["rows"][0], rows[2]);
+    let generic = store
+        .result_next(&first.store_id, read.cursor.as_ref().unwrap(), 4)
+        .unwrap();
+    assert!(matches!(generic, sparrow_core::ResultPage::Keys(_)));
+    let fresh = store
+        .json_query(
+            &scope,
+            &JsonQuery::Keys {
+                path: Some("/a~1b".into()),
+            },
+            4,
+        )
+        .unwrap();
+    assert_eq!(fresh["rows"][0]["occurrences"].as_str(), Some("2"));
+    assert_eq!(fresh["rows"][1]["occurrences"].as_str(), Some("3"));
+}
+
+#[test]
+fn json_paths_use_native_pointer_syntax_and_bounded_admission_before_capture() {
+    use sparrow_core::{JsonQuery, JsonRead, QueryScope};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("native-paths", "keys", "json", br#"{"a~1b":1,"a/b":2}"#, 1)
+        .unwrap();
+    let scope = QueryScope {
+        selection: Default::default(),
+        source: None,
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 10,
+        limit: 100,
+        scan_budget: 100,
+    };
+    for path in ["not/a/pointer", "/a~2b", "/a~", "/~"] {
+        for query in [
+            JsonQuery::Keys {
+                path: Some(path.into()),
+            },
+            JsonQuery::Values {
+                path: Some(path.into()),
+                kind: None,
+                lexical: None,
+                decoded: None,
+            },
+        ] {
+            assert_eq!(
+                store
+                    .json_read(
+                        &JsonRead {
+                            scope: scope.clone(),
+                            query,
+                            cursor: None
+                        },
+                        2
+                    )
+                    .unwrap_err()
+                    .code,
+                "INVALID_ARGUMENT"
+            );
+        }
+    }
+    let escaped = store
+        .json_query(
+            &scope,
+            &JsonQuery::Keys {
+                path: Some("/a~01b".into()),
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(escaped["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(escaped["rows"][0]["path"].as_str(), Some("/a~01b"));
+    let boundary = format!("/{}", "x".repeat(sparrow_core::JSON_QUERY_PATH_BYTES - 1));
+    assert!(
+        store
+            .json_read(
+                &JsonRead {
+                    scope: scope.clone(),
+                    query: JsonQuery::Keys {
+                        path: Some(boundary.clone())
+                    },
+                    cursor: None
+                },
+                2
+            )
+            .unwrap()
+            .body
+            .result()
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let huge = format!("{boundary}x");
+    assert_eq!(
+        store
+            .json_read(
+                &JsonRead {
+                    scope,
+                    query: JsonQuery::Keys { path: Some(huge) },
+                    cursor: None
+                },
+                2
+            )
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        store.status(2).unwrap()["record_read_handles"].as_str(),
+        Some("0")
     );
 }

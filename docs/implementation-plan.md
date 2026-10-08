@@ -32,6 +32,9 @@ shared lease and canonical renderers. Existing paged query receipts now freeze
 capture identity, native profiles and effective host admission ceilings while
 preserving original coverage and certainty. Native certified governor receipts,
 full scope receipts and corpus-scale indexed selection remain required.
+Key discovery now supports exact native RFC 6901 path restriction through the
+same occurrence matcher, typed client, CLI and MCP; paths and complete counts
+remain frozen across continuations.
 Context now reports single-capture identity and effective directional, catalog
 and response admission; byte exhaustion refuses without a successful prefix.
 The standalone producer client and schema-11 typed event batch operation are

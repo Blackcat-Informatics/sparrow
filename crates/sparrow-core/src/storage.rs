@@ -1218,10 +1218,8 @@ impl Store {
             scope.limit
         };
         scope.validate()?;
-        let predicate = query.predicate();
-        if let Some(predicate) = &predicate {
-            predicate.validate()?;
-        }
+        let predicate = query.predicate()?;
+        predicate.validate()?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         let mut visited = 0_usize;
@@ -1287,10 +1285,13 @@ impl Store {
                     break;
                 }
                 value_visits += 1;
+                if !predicate.matches(fact)? {
+                    continue;
+                }
                 let path: String = read_field(fact, "path")?;
                 let kind: String = read_field(fact, "kind")?;
                 match query {
-                    crate::JsonQuery::Keys => {
+                    crate::JsonQuery::Keys { .. } => {
                         if capture && !keys.contains_key(&(path.clone(), kind.clone())) {
                             key_bytes = key_bytes
                                 .saturating_add(path.len() + kind.len() + record.id.len() + 256);
@@ -1309,15 +1310,6 @@ impl Store {
                         }
                     }
                     crate::JsonQuery::Values { .. } => {
-                        if !predicate
-                            .as_ref()
-                            .ok_or_else(|| {
-                                Error::new("STORAGE_FAILURE", "value predicate missing")
-                            })?
-                            .matches(fact)?
-                        {
-                            continue;
-                        }
                         if rows.len() == row_limit {
                             limited = true;
                             break;
@@ -1361,7 +1353,7 @@ impl Store {
                 "JSON capture exhausted scan, occurrence, row or byte admission; narrow scope; no page published",
             ));
         }
-        if matches!(query, crate::JsonQuery::Keys) {
+        if matches!(query, crate::JsonQuery::Keys { .. }) {
             limited |= keys.len() > row_limit;
             rows = keys
                 .into_iter()

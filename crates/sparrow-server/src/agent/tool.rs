@@ -205,8 +205,10 @@ impl Operation {
                         .map(u32::from_json)
                         .transpose()?
                         .unwrap_or(options.scan_budget);
-                    if name == "values_search" {
+                    if ["keys_list", "values_search"].contains(&name) {
                         options.path = fields.optional("path")?;
+                    }
+                    if name == "values_search" {
                         let kind: Option<String> = fields.optional("kind")?;
                         options.kind = kind.as_deref().map(parse_kind).transpose()?;
                         options.lexical = fields.optional("lexical")?;

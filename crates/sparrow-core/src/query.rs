@@ -3,6 +3,9 @@
 
 //! Bounded concrete JSON occurrence queries over stored native facts.
 
+/// Maximum UTF-8 path bytes admitted by JSON key/value discovery.
+pub const JSON_QUERY_PATH_BYTES: usize = 64 * 1024;
+
 pub(crate) const RECORD_QUERY_FIELDS_MAX: usize = 32;
 pub(crate) const RECORD_QUERY_TEXT_BYTES: usize = 65536;
 pub(crate) const RECORD_QUERY_FIELD_BYTES: usize = 256 * 1024;
@@ -157,7 +160,10 @@ impl QueryScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JsonQuery {
     /// Aggregate concrete RFC 6901 pointers and native kinds.
-    Keys,
+    Keys {
+        /// Exact RFC 6901 path, or every observed path when absent.
+        path: Option<String>,
+    },
     /// Select scalar occurrences; omitted predicates admit every occurrence.
     Values {
         /// Exact RFC 6901 pointer; duplicate members remain separate occurrences.
@@ -186,6 +192,16 @@ pub struct JsonPredicate {
 
 impl JsonPredicate {
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        if self
+            .path
+            .as_deref()
+            .is_some_and(|path| purrdf_lex::json_pointer::tokens(path).is_none())
+        {
+            return Err(crate::Error::new(
+                "INVALID_ARGUMENT",
+                "path requires an exact RFC 6901 pointer; use the empty string for the root",
+            ));
+        }
         if self.kind.as_deref().is_some_and(|kind| {
             ![
                 "string", "number", "true", "false", "null", "array", "object",
@@ -228,7 +244,7 @@ impl JsonPredicate {
 impl JsonQuery {
     pub(crate) fn capacity(&self) -> usize {
         match self {
-            Self::Keys => 0,
+            Self::Keys { path } => path.as_ref().map_or(0, String::capacity),
             Self::Values {
                 path,
                 kind,
@@ -242,21 +258,36 @@ impl JsonQuery {
         }
     }
 
-    pub(crate) fn predicate(&self) -> Option<JsonPredicate> {
-        match self {
-            Self::Keys => None,
+    pub(crate) fn predicate(&self) -> Result<JsonPredicate, crate::Error> {
+        let path = match self {
+            Self::Keys { path } | Self::Values { path, .. } => path,
+        };
+        if path
+            .as_ref()
+            .is_some_and(|path| path.len() > JSON_QUERY_PATH_BYTES)
+        {
+            return Err(crate::Error::new(
+                "INVALID_ARGUMENT",
+                "JSON query path exceeds 65536 UTF-8 bytes",
+            ));
+        }
+        Ok(match self {
+            Self::Keys { path } => JsonPredicate {
+                path: path.clone(),
+                ..Default::default()
+            },
             Self::Values {
                 path,
                 kind,
                 lexical,
                 decoded,
-            } => Some(JsonPredicate {
+            } => JsonPredicate {
                 path: path.clone(),
                 kind: kind.clone(),
                 lexical: lexical.clone(),
                 decoded: decoded.clone(),
-            }),
-        }
+            },
+        })
     }
 }
 

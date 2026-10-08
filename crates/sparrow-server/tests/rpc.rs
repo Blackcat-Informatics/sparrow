@@ -6911,3 +6911,206 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn key_paths_share_native_counts_cursor_binding_and_typed_cli_mcp_admission() {
+    use purrdf_lex::json::Object;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            client
+                .ingest(
+                    "wire-key-paths",
+                    "key-paths",
+                    wire::Format::Jsonl,
+                    br#"{"a/b":1,"a/b":2,"a/b":"one","m~n":true,"":null}
+{"a/b":null,"a/b":"two","m~n":false}
+"#,
+                )
+                .await
+                .unwrap();
+            let mut request = client.capability().keys_list_request();
+            request.get().init_path().set_value("/a~1b");
+            let mut scope = request.get().init_scope();
+            scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
+            scope.set_limit(1);
+            scope.set_scan_budget(1000);
+            scope.init_received_before().set_unix_millis(u64::MAX);
+            let response = request.send().promise.await.unwrap();
+            let typed = rpc_ok(response.get().unwrap().get_result().unwrap());
+            assert_eq!(typed.get_page().unwrap().get_total_items(), 3);
+            assert_eq!(
+                typed
+                    .get_rows()
+                    .unwrap()
+                    .get(0)
+                    .get_path()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "/a~1b"
+            );
+            let capture = match typed
+                .get_receipt()
+                .unwrap()
+                .get_capture()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::optional_query_capture::Value(value) => value.unwrap(),
+                _ => panic!("missing key capture"),
+            };
+            assert!(matches!(
+                capture
+                    .get_limits()
+                    .unwrap()
+                    .get_query_path_bytes()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                wire::optional_limit::Value(65536)
+            ));
+            let first = cli(
+                &socket,
+                &[
+                    "keys",
+                    "--source",
+                    "key-paths",
+                    "--path",
+                    "/a~1b",
+                    "--page-size",
+                    "1",
+                ],
+            );
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let same = mcp
+                .tool(
+                    2,
+                    "keys_list",
+                    Object::new()
+                        .with("source", "key-paths")
+                        .with("path", "/a~1b")
+                        .with("page_size", 1_u32)
+                        .into(),
+                )
+                .await;
+            assert_eq!(same["isError"].as_bool(), Some(false));
+            assert_eq!(same["structuredContent"]["rows"], first["rows"]);
+            assert_eq!(first["page"]["total_items"].as_str(), Some("3"));
+            assert_eq!(
+                first["receipt"]["limits"]["query_path_bytes"].as_str(),
+                Some("65536")
+            );
+            client
+                .ingest(
+                    "wire-key-paths-later",
+                    "key-paths",
+                    wire::Format::Jsonl,
+                    b"{\"a/b\":3,\"a/b\":null}\n",
+                )
+                .await
+                .unwrap();
+            let cursor = first["page"]["next_cursor"].as_str().unwrap();
+            let continued = cli(
+                &socket,
+                &[
+                    "keys",
+                    "--source",
+                    "key-paths",
+                    "--path",
+                    "/a~1b",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    cursor,
+                ],
+            );
+            let generic = cli(&socket, &["result-next", &store, cursor]);
+            let replay = mcp
+                .tool(
+                    3,
+                    "result_next",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert_eq!(generic, continued);
+            assert_eq!(replay["structuredContent"], continued);
+            assert_eq!(continued["receipt"], first["receipt"]);
+            assert_eq!(continued["rows"][0]["kind"].as_str(), Some("number"));
+            assert_eq!(continued["rows"][0]["occurrences"].as_str(), Some("2"));
+            assert_eq!(continued["rows"][0]["records"].as_str(), Some("1"));
+            let changed = mcp
+                .tool(
+                    4,
+                    "keys_list",
+                    Object::new()
+                        .with("source", "key-paths")
+                        .with("path", "")
+                        .with("page_size", 1_u32)
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert_eq!(changed["isError"].as_bool(), Some(true));
+            assert_eq!(
+                changed["structuredContent"]["error"]["code"].as_str(),
+                Some("CONFLICT")
+            );
+            let root = cli(&socket, &["keys", "--source", "key-paths", "--path", ""]);
+            assert_eq!(root["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(root["rows"][0]["path"].as_str(), Some(""));
+            assert_eq!(root["rows"][0]["occurrences"].as_str(), Some("3"));
+            let fresh = cli(
+                &socket,
+                &["keys", "--source", "key-paths", "--path", "/a~1b"],
+            );
+            assert_eq!(fresh["rows"][0]["occurrences"].as_str(), Some("2"));
+            assert_eq!(fresh["rows"][1]["occurrences"].as_str(), Some("3"));
+            let escaped = cli(
+                &socket,
+                &["keys", "--source", "key-paths", "--path", "/m~0n"],
+            );
+            assert_eq!(escaped["rows"].as_array().unwrap().len(), 2);
+            for (index, path) in [
+                "bad",
+                "/a~2b",
+                &format!("/{}", "x".repeat(sparrow_core::JSON_QUERY_PATH_BYTES)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let refused = mcp
+                    .tool(
+                        10 + index as u64,
+                        "keys_list",
+                        Object::new().with("path", path).into(),
+                    )
+                    .await;
+                assert_eq!(refused["isError"].as_bool(), Some(true));
+                assert_eq!(
+                    refused["structuredContent"]["error"]["code"].as_str(),
+                    Some("INVALID_ARGUMENT")
+                );
+                assert!(refused["structuredContent"].get("rows").is_none());
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(["keys", "--path", path])
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success() && output.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("INVALID_ARGUMENT"));
+            }
+        })
+        .await;
+}

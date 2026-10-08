@@ -60,7 +60,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "keys_list",
-        "Discover JSON pointers and kinds in an acceptance-time scope, preserving duplicate occurrences and coverage.",
+        "Discover JSON pointers and kinds in an acceptance-time scope, optionally at one exact RFC 6901 path; preserve duplicate occurrences, record presence and coverage.",
     ),
     (
         "values_search",
@@ -197,6 +197,14 @@ pub(crate) fn definitions() -> Value {
             properties = properties.with("page_size", integer(1000)).with(
                 "cursor",
                 Object::new().with("type", Value::array(["string", "null"])),
+            );
+        }
+        if *name == "keys_list" {
+            properties = properties.with(
+                "path",
+                Object::new()
+                    .with("type", Value::array(["string", "null"]))
+                    .with("maxLength", sparrow_core::JSON_QUERY_PATH_BYTES as u64),
             );
         }
         if *name == "values_search" {

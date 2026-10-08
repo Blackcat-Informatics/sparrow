@@ -82,7 +82,7 @@ pub struct RecordPageBody {
 }
 
 /// Host-owned query admission profile; native semantic profiles remain separate.
-pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/1";
+pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/2";
 
 fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
     use purrdf_lex::json::Object;
@@ -124,6 +124,14 @@ fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
             "limits",
             Object::new()
                 .with("candidate_visits", budget)
+                .with(
+                    "query_path_bytes",
+                    if json {
+                        Value::from(crate::JSON_QUERY_PATH_BYTES as u64)
+                    } else {
+                        Value::Null
+                    },
+                )
                 .with(
                     "json_value_visits",
                     if json {
@@ -337,9 +345,7 @@ impl Store {
     /// Capture complete native JSON discovery through the shared bounded lease owner.
     pub fn json_read(&self, query: &JsonRead, now: u64) -> Result<RecordReadPage, Error> {
         query.scope.validate()?;
-        if let Some(predicate) = query.query.predicate() {
-            predicate.validate()?;
-        }
+        query.query.predicate()?.validate()?;
         self.query_read(Selector::Json(query.clone()), now)
     }
 

@@ -56,6 +56,7 @@ pub(super) fn apply(out: Object, capture: wire::query_capture::Reader<'_>) -> Re
                     limits.get_candidate_visits().to_string(),
                 )
                 .with("json_value_visits", limit(limits.get_json_value_visits()?)?)
+                .with("query_path_bytes", limit(limits.get_query_path_bytes()?)?)
                 .with("field_visits", limit(limits.get_field_visits()?)?)
                 .with("posting_visits", limit(limits.get_posting_visits()?)?)
                 .with(

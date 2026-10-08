@@ -32,8 +32,32 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 33; the schema sections
+The current source implements schema 34; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 34 exact key path discovery
+
+Key discovery accepts an optional exact native RFC 6901 path in the core,
+typed RPC, CLI and MCP. Root and absent paths remain distinct. Escaped member
+names, duplicate occurrences, kinds and record-presence counts retain native
+semantics. The existing occurrence predicate now serves both key and value
+selection. Native pointer syntax validation is adopted from PurRDF. Typed JSON
+paths and query cursors share one bounded decoder before allocation; the core
+also enforces the JSON path byte ceiling. Captured path selectors and counts
+remain frozen across original and cursor-only continuation.
+
+The host query admission profile advances to sparrow-query-capture/2 and reports
+query_path_bytes for JSON captures. Other phases report explicit absence.
+The full source gate passes release Clippy with warnings denied, 125 storage
+scenarios, 39 RPC/daemon scenarios, seeded census self-tests and the pinned
+cross-workspace gate (171 ledger jobs, zero distinct exceptions). New core
+scenarios compare exact paths, duplicate/kind presence counts, root/empty-member
+spelling, native escape syntax, byte admission and frozen counts after ingestion.
+The new RPC scenario verifies generated capture limits, CLI/MCP agreement,
+path-bound continuations, cursor-only replay and refusals without rows.
+
+Owned daemon qualification remains separate from these source checks; full
+architecture acceptance remains unmet.
 
 ## Schema 33 bounded single context capture
 

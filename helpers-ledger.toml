@@ -1244,7 +1244,7 @@ names = ['^markdown_to_rdf$']
 id = "json-occurrence-predicate"
 summary = "Intersect exact native path/kind/lexical/decoded criteria on one retained occurrence."
 home = "sparrow_core::JsonPredicate::matches"
-entry_points = []
+entry_points = ["sparrow_core::query::JsonPredicate::validate"]
 spec = "docs/development-runtime.md: combined record qualification and original native field evidence."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2470,9 +2470,9 @@ fingerprints = []
 names = []
 
 [[job]]
-id = "query-cursor-admission"
-summary = "All paged query RPC adapters admit a bounded typed cursor before allocating its owned spelling."
-home = "sparrow_server::rpc::query_cursor"
+id = "query-text-admission"
+summary = "Paged query RPC adapters admit typed cursors and JSON paths through one byte-bound decoder before allocating their owned spelling."
+home = "sparrow_server::rpc::query_text"
 entry_points = ["sparrow_server::rpc::Rpc::records_search", "sparrow_server::rpc::Rpc::text_search", "sparrow_server::rpc::Rpc::keys_list", "sparrow_server::rpc::Rpc::values_search"]
 spec = "docs/interfaces.md: operation-bound query cursors."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
@@ -2568,3 +2568,18 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(context_row_bytes|record_page_row_bytes)$']
+
+[[job]]
+id = "native-json-pointer-validation"
+summary = "Validate concrete key/value and field pointers through the public native RFC 6901 token parser."
+home = "purrdf:purrdf_lex::json_pointer::tokens"
+entry_points = []
+spec = "docs/interfaces.md: exact key path restriction and native JSON pointer syntax."
+vectors = []
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_json_query_pointer|unescape_json_query_pointer)$']
