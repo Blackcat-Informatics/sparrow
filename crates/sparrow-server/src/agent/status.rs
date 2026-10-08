@@ -212,6 +212,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         );
     let output = output
         .with(
+            "syslog_listeners",
+            crate::syslog_wire::listeners(value.get_syslog_listeners()?)?,
+        )
+        .with(
             "producer_limits",
             Object::new()
                 .with(

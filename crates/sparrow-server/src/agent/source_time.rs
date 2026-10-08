@@ -107,6 +107,10 @@ pub(super) fn event(value: wire::event_time::Reader<'_>) -> Result<Value> {
                         wire::UnknownTimeReason::AmbiguousField => "ambiguous_field",
                         wire::UnknownTimeReason::WrongKind => "wrong_kind",
                         wire::UnknownTimeReason::InvalidInstant => "invalid_instant",
+                        wire::UnknownTimeReason::SyslogMalformed => "syslog_malformed",
+                        wire::UnknownTimeReason::SyslogLegacyTime => "syslog_legacy_time",
+                        wire::UnknownTimeReason::SyslogNilTime => "syslog_nil_time",
+                        wire::UnknownTimeReason::SyslogSubmillisecond => "syslog_submillisecond",
                     },
                 )
                 .into())

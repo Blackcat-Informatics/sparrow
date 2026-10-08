@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Send one declared typed event; repeating identical arguments reuses its receipt.
+//! Send one declared typed event over Unix or TCP; exact retries reuse its receipt.
 
 use sparrow_client::{
     Client, Durability, EventBatch, EventField, EventKind, EventLevel, FieldValue, ProducerEvent,
@@ -55,7 +55,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
-            let client = Client::connect(std::path::Path::new(&args[0])).await?;
+            let client = match args[0].strip_prefix("tcp://") {
+                Some(address) => {
+                    Client::connect_tcp(address.parse().map_err(|_| {
+                        sparrow_client::Error::InvalidArgument(
+                            "TCP endpoint requires a numeric IP address and port",
+                        )
+                    })?)
+                    .await?
+                }
+                None => Client::connect(std::path::Path::new(&args[0])).await?,
+            };
             let receipt = client.events_with_durability(&batch, durability).await?;
             println!(
                 "{} {:?} records={} bytes={}",

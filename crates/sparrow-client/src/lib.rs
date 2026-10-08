@@ -26,7 +26,7 @@ pub mod sparrow_capnp {
 }
 
 mod transport;
-pub use transport::{Connection, connect};
+pub use transport::{Connection, connect, connect_tcp};
 mod error;
 pub use error::Error;
 mod receipt;
@@ -50,7 +50,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 35;
+pub const SCHEMA_VERSION: u32 = 36;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -86,8 +86,9 @@ pub fn parse_format(value: &str) -> capnp::Result<Format> {
         "json" => Ok(Format::Json),
         "markdown" => Ok(Format::Markdown),
         "opaque" => Ok(Format::Opaque),
+        "syslog" => Ok(Format::Syslog),
         _ => Err(capnp::Error::failed(
-            "format requires jsonl, log, json, markdown or opaque".into(),
+            "format requires jsonl, log, json, markdown, opaque or syslog".into(),
         )),
     }
 }
@@ -100,6 +101,7 @@ pub fn format_label(value: Format) -> &'static str {
         Format::Json => "json",
         Format::Markdown => "markdown",
         Format::Opaque => "opaque",
+        Format::Syslog => "syslog",
     }
 }
 
@@ -144,6 +146,16 @@ impl Client {
     /// Connect and verify discovery before allowing producer mutations.
     pub async fn connect(socket: &std::path::Path) -> Result<Self, Error> {
         let connection = transport::connect_typed(socket).await?;
+        Self::from_connection(connection).await
+    }
+
+    /// Connect to public Cap'n Proto TCP and verify the same typed discovery contract.
+    pub async fn connect_tcp(address: std::net::SocketAddr) -> Result<Self, Error> {
+        let connection = transport::connect_tcp(address).await?;
+        Self::from_connection(connection).await
+    }
+
+    async fn from_connection(connection: Connection) -> Result<Self, Error> {
         let discovery = Discovery::fetch(&connection.client).await?;
         Ok(Self {
             connection,

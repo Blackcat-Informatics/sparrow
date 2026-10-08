@@ -6,6 +6,8 @@
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
 mod config;
 mod diagnostics;
+pub mod syslog_listener;
+mod syslog_wire;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;
@@ -13,7 +15,7 @@ mod pressure;
 mod transport;
 mod watch_admin;
 pub mod watches;
-pub use transport::serve_connection;
+pub use transport::{admit_connection, serve_connection};
 pub use watch_admin::WatchController;
 
 mod rpc;

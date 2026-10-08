@@ -13,6 +13,178 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let reservation = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!("rpc_tcp_address = \"0.0.0.0:{port}\"\n"));
+            std::fs::write(&config, text).unwrap();
+            drop(reservation);
+            let daemon = start(&config, &socket).await;
+            let tcp = sparrow_client::Client::connect_tcp(([127, 0, 0, 1], port).into())
+                .await
+                .unwrap();
+            let unix = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert_eq!(tcp.discovery().store_id, unix.discovery().store_id);
+            let receipt = tcp
+                .ingest(
+                    "tcp-retry",
+                    "public-tcp",
+                    wire::Format::Jsonl,
+                    b"{\"message\":\"typed public TCP\"}\n",
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.durability, wire::Durability::Durable);
+            assert_eq!(
+                unix.ingest(
+                    "tcp-retry",
+                    "public-tcp",
+                    wire::Format::Jsonl,
+                    b"{\"message\":\"typed public TCP\"}\n"
+                )
+                .await
+                .unwrap(),
+                receipt
+            );
+            assert_eq!(unix.artifact(&receipt.id).await.unwrap(), receipt);
+            assert_eq!(
+                rpc_ok(
+                    tcp.capability()
+                        .status_request()
+                        .send()
+                        .promise
+                        .await
+                        .unwrap()
+                        .get()
+                        .unwrap()
+                        .get_result()
+                        .unwrap()
+                )
+                .get_live_records(),
+                1
+            );
+            drop(tcp);
+            drop(unix);
+            drop(daemon);
+            std::fs::remove_file(&socket).unwrap();
+            let daemon = start(&config, &socket).await;
+            let tcp = sparrow_client::Client::connect_tcp(([127, 0, 0, 1], port).into())
+                .await
+                .unwrap();
+            assert_eq!(
+                tcp.ingest(
+                    "tcp-retry",
+                    "public-tcp",
+                    wire::Format::Jsonl,
+                    b"{\"message\":\"typed public TCP\"}\n"
+                )
+                .await
+                .unwrap(),
+                receipt
+            );
+            drop(tcp);
+            drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_failures() {
+    use tokio::io::AsyncWriteExt;
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        for (id, transport, framing) in [("octets", "tcp", Some("octet_counting")), ("datagrams", "udp", None), ("lf", "tcp", Some("lf")), ("crlf", "tcp", Some("cr_lf"))] {
+            text.push_str(&format!("\n[[syslog]]\nid = \"{id}\"\naddress = \"127.0.0.1:0\"\nsource = \"syslog-{id}\"\ntransport = \"{transport}\"\nmax_message_bytes = 480\nmax_connections = 1\nread_timeout_ms = 1000\n"));
+            if let Some(framing) = framing { text.push_str(&format!("framing = \"{framing}\"\n")); }
+        }
+        std::fs::write(&config, text).unwrap();
+        let daemon = start(&config, &socket).await;
+        let client = sparrow_client::Client::connect(&socket).await.unwrap();
+        let response = client.capability().status_request().send().promise.await.unwrap();
+        let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+        let listeners = status.get_syslog_listeners().unwrap();
+        assert_eq!(listeners.len(), 4);
+        let addresses: Vec<std::net::SocketAddr> = listeners.iter().map(|listener| {
+            assert_eq!(listener.get_accepted_messages(), 0);
+            assert!(listener.get_continuity_unknown());
+            assert_eq!(listener.get_kernel_drops_unknown(), listener.get_transport().unwrap() == wire::SyslogTransport::Udp);
+            listener.get_address().unwrap().to_str().unwrap().parse().unwrap()
+        }).collect();
+        let modern = b"<34>1 2026-10-08T06:25:00.123Z host app 123 ID [id@32473 p=\"x\\]y\" p=\"\\q\"] needle\nnext";
+        let mut octets = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        for message in [modern.as_slice(), modern.as_slice(), b"<13>Oct  8 06:25:00 host daemon[123]: legacy needle", b"<999>bad needle"] {
+            octets.write_all(format!("{} ", message.len()).as_bytes()).await.unwrap();
+            for part in message.chunks(3) { octets.write_all(part).await.unwrap(); }
+        }
+        octets.write_all(b"9 short").await.unwrap(); octets.shutdown().await.unwrap();
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(modern, addresses[1]).await.unwrap();
+        udp.send_to(&vec![b'x';481], addresses[1]).await.unwrap();
+        let mut lf = tokio::net::TcpStream::connect(addresses[2]).await.unwrap();
+        lf.write_all(b"<13>1 - host app - - - lf needle\r\n").await.unwrap(); lf.shutdown().await.unwrap();
+        let mut crlf = tokio::net::TcpStream::connect(addresses[3]).await.unwrap();
+        crlf.write_all(b"<13>1 - host app - - - crlf\nneedle\r\n").await.unwrap(); crlf.shutdown().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client.capability().status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let listeners = status.get_syslog_listeners().unwrap();
+            if listeners.get(0).get_accepted_messages() == 4 && listeners.get(0).get_framing_failures() == 1
+                && listeners.get(1).get_accepted_messages() == 1 && listeners.get(1).get_truncated_datagrams() == 1
+                && listeners.get(2).get_accepted_messages() == 1 && listeners.get(3).get_accepted_messages() == 1 {
+                assert_eq!(listeners.get(0).get_interpretation_failures(), 1);
+                assert_eq!(status.get_live_records(), 7);
+                break;
+            }
+            assert!(Instant::now() < deadline, "syslog publication did not reach expected counters");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let idle = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let response = client.capability().status_request().send().promise.await.unwrap();
+            let listener = rpc_ok(response.get().unwrap().get_result().unwrap()).get_syslog_listeners().unwrap().get(0);
+            if listener.get_active_connections() == 1 { break; }
+            assert!(Instant::now() < deadline); tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let excess = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        loop {
+            let response = client.capability().status_request().send().promise.await.unwrap();
+            let listener = rpc_ok(response.get().unwrap().get_result().unwrap()).get_syslog_listeners().unwrap().get(0);
+            if listener.get_rejected_connections() == 1 && listener.get_timed_out_connections() == 1 && listener.get_active_connections() == 0 { break; }
+            assert!(Instant::now() < deadline); tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(idle); drop(excess); drop(client); drop(daemon);
+        let store = sparrow_server::ServerConfig::read(&config).unwrap().open_store().unwrap();
+        let now = sparrow_server::now().unwrap();
+        let rows: Vec<_> = store.records(now).unwrap().into_iter().filter(|row| row.source == "syslog-octets").collect();
+        assert_eq!(rows.len(), 4);
+        for record in rows {
+            let bytes = store.bytes(&record.artifact_id, record.byte_start, (record.byte_end-record.byte_start) as usize, now).unwrap();
+            let snapshot = record.syslog.unwrap();
+            if bytes == modern { assert_eq!(snapshot.structured_data[0].parameters.len(), 2); }
+            else if bytes.starts_with(b"<999>") { assert!(snapshot.diagnostic.is_some()); }
+            else { assert_eq!(bytes, b"<13>Oct  8 06:25:00 host daemon[123]: legacy needle"); }
+        }
+        for (source, expected) in [("syslog-lf", b"<13>1 - host app - - - lf needle\r".as_slice()), ("syslog-crlf", b"<13>1 - host app - - - crlf\nneedle")] {
+            let rows: Vec<_> = store.records(now).unwrap().into_iter().filter(|row| row.source == source).collect(); assert_eq!(rows.len(), 1);
+            assert_eq!(store.bytes(&rows[0].artifact_id, 0, expected.len(), now).unwrap(), expected);
+        }
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new()
@@ -1403,7 +1575,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/20");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/24");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -1620,7 +1792,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/19")
+                Some("sparrow.store/23")
             );
         })
         .await;
@@ -1984,7 +2156,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/19"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/23"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,

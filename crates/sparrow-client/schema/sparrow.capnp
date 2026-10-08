@@ -7,7 +7,7 @@ struct Failure { code @0 :Text; message @1 :Text; retryable @2 :Bool; }
 struct Result(T) { union { ok @0 :T; error @1 :Failure; } }
 struct OptionalText { union { absent @0 :Void; value @1 :Text; } }
 struct Evidence { storeId @0 :Text; union { artifact @1 :Text; record @2 :Text; } }
-enum Format { jsonl @0; log @1; json @2; markdown @3; opaque @4; }
+enum Format { jsonl @0; log @1; json @2; markdown @3; opaque @4; syslog @5; }
 enum Durability { buffered @0; durable @1; }
 struct DurabilityWatermark { storeId @0 :Text; sessionId @1 :Text; sequence @2 :UInt64; }
 struct OptionalDurabilityWatermark { union { absent @0 :Void; value @1 :DurabilityWatermark; } }
@@ -73,6 +73,29 @@ struct Record {
   eventTime @8 :EventTime;
   diagnostics @9 :DiagnosticSnapshot;
   producer @10 :OptionalProducerPosition;
+  syslog @11 :OptionalSyslogSnapshot;
+}
+enum SyslogDialect { rfc5424 @0; rfc3164 @1; }
+enum SyslogHeader { timestamp @0; host @1; app @2; procid @3; msgid @4; tag @5; }
+struct SyslogField { kind @0 :SyslogHeader; value @1 :Text; sourceStart @2 :UInt64; sourceEnd @3 :UInt64; }
+struct SyslogParameter { name @0 :Text; valueStart @1 :UInt64; valueEnd @2 :UInt64; }
+struct SyslogElement { id @0 :Text; sourceStart @1 :UInt64; sourceEnd @2 :UInt64; parameters @3 :List(SyslogParameter); }
+struct ParsedSyslog {
+  dialect @0 :SyslogDialect; priority @1 :UInt16; priorityStart @2 :UInt64; priorityEnd @3 :UInt64;
+  fields @4 :List(SyslogField); structuredData @5 :List(SyslogElement); messageStart @6 :UInt64;
+}
+struct SyslogSnapshot { profileId @0 :Text; union { parsed @1 :ParsedSyslog; failed @2 :Text; } }
+struct OptionalSyslogSnapshot { union { absent @0 :Void; value @1 :SyslogSnapshot; } }
+enum SyslogTransport { tcp @0; udp @1; }
+enum SyslogFraming { octetCounting @0; lf @1; crLf @2; }
+struct OptionalSyslogFraming { union { absent @0 :Void; value @1 :SyslogFraming; } }
+struct SyslogListenerStatus {
+  id @0 :Text; source @1 :Text; address @2 :Text; transport @3 :SyslogTransport;
+  framing @4 :OptionalSyslogFraming; maxMessageBytes @5 :UInt32; maxConnections @6 :UInt32; readTimeoutMs @7 :UInt32;
+  activeConnections @8 :UInt32; acceptedMessages @9 :UInt64; interpretationFailures @10 :UInt64;
+  refusedMessages @11 :UInt64; truncatedDatagrams @12 :UInt64; framingFailures @13 :UInt64;
+  rejectedConnections @14 :UInt64; timedOutConnections @15 :UInt64;
+  continuityUnknown @16 :Bool; kernelDropsUnknown @17 :Bool; failure @18 :OptionalText;
 }
 struct ProducerPosition { streamId @0 :Text; sequence @1 :UInt64; }
 struct OptionalProducerPosition { union { absent @0 :Void; value @1 :ProducerPosition; } }
@@ -102,6 +125,7 @@ enum TimeRepresentation { rfc3339 @0; unixMillis @1; unixSeconds @2; }
 enum UnknownTimeReason {
   legacyUnprofiled @0; noProfile @1; notJson @2; projectionFailed @3;
   missingField @4; ambiguousField @5; wrongKind @6; invalidInstant @7;
+  syslogMalformed @8; syslogLegacyTime @9; syslogNilTime @10; syslogSubmillisecond @11;
 }
 struct KnownEventTime {
   instant @0 :Instant; profileId @1 :Text; occurrence @2 :UInt64;
@@ -152,6 +176,7 @@ struct Status {
   maxRecordReadHandles @39 :UInt64; maxRecordReadBytes @40 :UInt64;
   recordReadLeaseMs @41 :UInt64;
   producerLimits @42 :ProducerLimits;
+  syslogListeners @43 :List(SyslogListenerStatus);
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.

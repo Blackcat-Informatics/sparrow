@@ -5,12 +5,15 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-/// Serve one owned Unix stream through the shared generated capability.
+/// Serve one owned byte stream through the shared generated capability.
 /// Run within a Tokio LocalSet. The caller owns connection admission and its lease.
-pub async fn serve_connection(
-    stream: tokio::net::UnixStream,
+pub async fn serve_connection<S>(
+    stream: S,
     client: crate::sparrow_capnp::sparrow::Client,
-) -> capnp::Result<()> {
+) -> capnp::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
     let (reader, writer) = stream.compat().split();
     let network = twoparty::VatNetwork::new(
         reader,
@@ -22,4 +25,30 @@ pub async fn serve_connection(
         },
     );
     RpcSystem::new(Box::new(network), Some(client.client)).await
+}
+
+/// Apply the same connection ceiling and lease to Unix and public TCP streams.
+pub fn admit_connection<S>(
+    stream: S,
+    client: crate::sparrow_capnp::sparrow::Client,
+    connections: std::sync::Arc<tokio::sync::Semaphore>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    let Ok(permit) = connections.try_acquire_owned() else {
+        return;
+    };
+    tokio::task::spawn_local(async move {
+        let _permit = permit;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            serve_connection(stream, client),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("sparrowd: RPC connection failed: {error}"),
+            Err(_) => eprintln!("sparrowd: RPC connection lease expired"),
+        }
+    });
 }

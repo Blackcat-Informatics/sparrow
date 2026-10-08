@@ -34,7 +34,7 @@ they do not specify their generated wire grammar.
 | Completed-file quiet interval | 30 seconds, configurable per watch; observed reopen/write activity postpones consumption. |
 | Pin duration | Required on every create/add/renew operation; no permanent or implicit pin. |
 | Disk capacity | An explicit deployment budget and maintenance reserve are required. |
-| Read binding | Private Unix-domain socket: directory mode 0700, socket mode 0600. Remote transport requires a separately authorized authenticated deployment. |
+| RPC binding | Private Unix-domain socket: directory mode 0700, socket mode 0600; public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08, without an ingestion authentication requirement. |
 | Pagination | Default 200 items, maximum 1,000, additionally limited by serialized response bytes. |
 | Structured response budget | Default 256 KiB, configurable under a server maximum. |
 | Byte-read chunk | Default 64 KiB; maximum 1 MiB per call. |
@@ -597,6 +597,44 @@ force. Names can be reused after expiry/release with a fresh ID. Pinning for ten
 days does not shorten a record that would ordinarily remain for another twenty.
 
 ## 5. Cap'n Proto ingestion, queries, and administration
+
+### Public TCP and syslog packet interpretation
+
+`rpc_tcp_address` explicitly enables the same generated Cap'n Proto service as
+the Unix socket. Development binds `0.0.0.0:518` without authentication, as
+requested on 2026-10-08. Both listeners share connection and operation ceilings
+and the 60-second connection lease. The public listener exposes the same full
+capability, including queries and administration. Rust clients use
+`Client::connect_tcp(SocketAddr)` and the same discovery and durable retry checks.
+The existing CLI and stdio MCP continue using the Unix socket.
+
+Explicit `[[syslog]]` entries select TCP or UDP, source, loopback address,
+maximum message bytes (480..65536), maximum connections (TCP 1..16; UDP 1),
+and complete-frame timeout (1..60000 ms). TCP additionally requires a framing
+law: `octet_counting`, `lf`, or `cr_lf`. The framing trailer is excluded from
+the original packet; LF framing preserves a preceding CR. No framing guesses
+or truncated-prefix publications are allowed. At most four listeners exist.
+
+Each accepted packet is one exact-byte `syslog` record, including embedded
+newlines. Its immutable profile records parsed RFC 5424 or RFC 3164 headers,
+PRI, ordered structured-data elements (maximum 32) and parameter occurrences
+(maximum 128). Parameter values expose original encoded byte spans inside
+quotes, preserving repeated names and escapes. Header host/app or legacy TAG
+populate diagnostic host/service. Diagnostic severity is decimal PRI modulo 8
+with the original PRI digit span; it is a protocol derivation. Millisecond-exact
+modern timestamps populate event time through the native RFC3339 parser.
+NIL timestamps, finer precision and year/zone-free legacy timestamps remain
+explicitly unknown. Failed interpretation preserves raw acceptance and one
+diagnostic without claiming successfully parsed header or parameter evidence.
+
+Status exposes configured and actual listener bindings, bounds, active TCP
+connections and observed successful publications, interpretation failures,
+refusals, oversized datagrams, framing failures, connection refusals and timeouts.
+Counters are process-lifetime evidence and reset on restart. Successful counts
+follow durable store publication, but syslog provides no typed sender receipt.
+TCP sends therefore do not prove publication; UDP kernel/network loss remains
+unknown. Identical newly received packets are independent occurrences sharing
+payload storage. Sources include configured listeners before their first packet.
 
 The daemon contract is `crates/sparrow-client/schema/sparrow.capnp`. Generated
 client/server types carry requests, binary payloads, instants, counts,

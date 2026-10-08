@@ -200,7 +200,39 @@ impl<'a> RecordBatch<'a> {
             record_chunks.push(digest.clone());
             self.chunks.push(digest);
         }
+        let syslog = (format == "syslog")
+            .then(|| {
+                super::syslog::capture(
+                    bytes.ok_or_else(|| {
+                        Error::new(
+                            "RESOURCE_LIMIT",
+                            "syslog packets require bounded materialized bytes",
+                        )
+                    })?,
+                    start,
+                )
+            })
+            .transpose()?;
+        let event_time = match &syslog {
+            Some(snapshot) => snapshot.event_time(),
+            None => source_time::capture(
+                source_time_profile.as_ref(),
+                self.projections.get(&projection_id).map(|(facts, _)| facts),
+                start,
+                end,
+            )?,
+        };
+        let diagnostics = match &syslog {
+            Some(snapshot) => snapshot.diagnostics(),
+            None => super::diagnostic::capture(
+                input.diagnostic_profile,
+                self.projections.get(&projection_id).map(|(facts, _)| facts),
+                start,
+                end,
+            )?,
+        };
         let record = Record {
+            syslog,
             producer: input.producer,
             id: input.id,
             artifact_id: input.artifact_id.to_owned(),
@@ -210,19 +242,9 @@ impl<'a> RecordBatch<'a> {
             byte_start: start,
             byte_end: end,
             projection_id: projection_id.clone(),
-            event_time: source_time::capture(
-                source_time_profile.as_ref(),
-                self.projections.get(&projection_id).map(|(facts, _)| facts),
-                start,
-                end,
-            )?,
+            event_time,
             rdf_projection_id,
-            diagnostics: super::diagnostic::capture(
-                input.diagnostic_profile,
-                self.projections.get(&projection_id).map(|(facts, _)| facts),
-                start,
-                end,
-            )?,
+            diagnostics,
             chunks: record_chunks,
             evicted: false,
         };

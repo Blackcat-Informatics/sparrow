@@ -4,6 +4,7 @@
 # Development store and owned synthetic intake only. No live producer directories.
 # Consume entries seed a missing catalog; use typed watch administration afterward.
 socket_path = "/home/paudley/.local/state/sparrow/development-v5/rpc.sock"
+rpc_tcp_address = "0.0.0.0:518"
 data_dir = "/home/paudley/.local/state/sparrow/development-v5"
 disk_budget = 536870912
 maintenance_reserve = 67108864

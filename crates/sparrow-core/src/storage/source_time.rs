@@ -114,7 +114,7 @@ pub enum EventTime {
         millis: u64,
         /// Immutable mapping identity at ingestion.
         profile_id: String,
-        /// Native ordered JSON occurrence identity.
+        /// Ordered field occurrence within the declared interpretation profile.
         occurrence: u64,
         /// Original artifact span start.
         source_start: u64,
@@ -196,6 +196,10 @@ impl EventTime {
                     "ambiguous_field",
                     "wrong_kind",
                     "invalid_instant",
+                    "syslog_malformed",
+                    "syslog_legacy_time",
+                    "syslog_nil_time",
+                    "syslog_submillisecond",
                 ]
                 .contains(&reason.as_str())
                 {
@@ -234,6 +238,9 @@ impl EventTime {
 }
 
 fn validate_profile_id(id: &str) -> Result<(), Error> {
+    if id == super::syslog::syslog_profile_id() {
+        return Ok(());
+    }
     if id
         .strip_prefix("time-profile:")
         .and_then(purrdf_hash::hex::decode_32_canonical)
@@ -295,6 +302,9 @@ impl Writer {
 
     pub(super) fn validate_event_record(&self, record: &Record) -> Result<(), Error> {
         self.validate_diagnostic_record(record)?;
+        if let Some(snapshot) = &record.syslog {
+            return snapshot.validate_record(record);
+        }
         let profile_id = match &record.event_time {
             EventTime::Known { profile_id, .. } => Some(profile_id),
             EventTime::Unknown { profile_id, .. } => profile_id.as_ref(),

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! One database owner, serving typed Cap'n Proto RPC over a private Unix socket.
+//! One database owner, serving typed Cap'n Proto RPC over Unix and configured TCP sockets.
 
 use sparrow_server::{Rpc, ServerConfig, sparrow_capnp::sparrow};
 use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
@@ -14,6 +14,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: sparrowd --config FILE.toml".into());
     }
     let config = ServerConfig::read(Path::new(&args[1]))?;
+    // Refuse an unavailable public port before opening/migrating the store or Unix endpoint.
+    let tcp_listener = match config.rpc_tcp_address {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
+    if let Some(listener) = &tcp_listener {
+        eprintln!("sparrowd: capnp_tcp={}", listener.local_addr()?);
+    }
     let store = config.open_store()?;
     let watches = sparrow_server::watches::WatchRegistry::default();
     let mut consumer = Some(sparrow_server::watches::ConsumeWorker::start(
@@ -22,18 +30,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.socket_path.clone(),
         watches.clone(),
     )?);
-    // Refuse an existing socket rather than unlink another listener's endpoint.
+    // Validate the watch catalog before publishing an endpoint, and refuse an existing socket.
     let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
     std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let connections = Arc::new(Semaphore::new(config.max_concurrent_requests));
+    let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
+    let mut syslog = if config.syslog.is_empty() {
+        None
+    } else {
+        Some(
+            sparrow_server::syslog_listener::SyslogWorker::start(
+                store.clone(),
+                &config.syslog,
+                operations.clone(),
+                syslog_registry.clone(),
+            )
+            .await?,
+        )
+    };
     let mut rpc = Rpc::new(
         store.clone(),
         operations,
         config.max_artifact_bytes,
         config.max_pin_members,
     )
-    .with_watches(watches);
+    .with_watches(watches)
+    .with_syslog(syslog_registry);
     if config.max_concurrent_requests >= 2 {
         rpc = rpc.with_watch_controller(
             consumer
@@ -64,10 +87,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => { signal?; break; }
-                _ = consumer_health.tick(), if consumer.is_some() => {
+                _ = consumer_health.tick(), if consumer.is_some() || syslog.is_some() => {
                     if consumer.as_ref().is_some_and(sparrow_server::watches::ConsumeWorker::is_finished) {
                         consumer.take().expect("worker checked above").shutdown().await?;
                         return Err("completed-consumption worker terminated unexpectedly".into());
+                    }
+                    if syslog.as_ref().is_some_and(sparrow_server::syslog_listener::SyslogWorker::is_finished) {
+                        syslog.take().expect("worker checked above").shutdown().await?;
+                        return Err("syslog intake worker terminated unexpectedly".into());
                     }
                 }
                 _ = synchronize.tick() => {
@@ -92,22 +119,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
-                    let Ok(permit) = connections.clone().try_acquire_owned() else { drop(stream); continue; };
-                    let system = sparrow_server::serve_connection(stream, client.clone());
-                    tokio::task::spawn_local(async move {
-                        let _permit = permit;
-                        match tokio::time::timeout(std::time::Duration::from_secs(60), system).await {
-                            Ok(Ok(())) => {},
-                            Ok(Err(e)) => eprintln!("sparrowd: RPC connection failed: {e}"),
-                            Err(_) => eprintln!("sparrowd: RPC connection lease expired"),
-                        }
-                    });
+                    sparrow_server::admit_connection(stream, client.clone(), connections.clone());
+                }
+                accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if tcp_listener.is_some() => {
+                    let (stream, _) = accepted?;
+                    stream.set_nodelay(true)?;
+                    sparrow_server::admit_connection(stream, client.clone(), connections.clone());
                 }
             }
         }
         Ok::<(), Box<dyn std::error::Error>>(())
         }.await;
         if let Some(worker) = consumer.take() { worker.shutdown().await?; }
+        if let Some(worker) = syslog.take() { worker.shutdown().await?; }
         serving
     }).await;
     store.flush()?;

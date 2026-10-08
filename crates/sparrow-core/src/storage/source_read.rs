@@ -198,6 +198,27 @@ impl Store {
         now: u64,
         configured: &[SourceWatchBinding],
     ) -> Result<SourceReadPage, Error> {
+        self.source_read_with_intakes(query, now, configured, &[])
+    }
+
+    /// Include bounded configured intake labels without inventing watch or producer authority.
+    pub fn source_read_with_intakes(
+        &self,
+        query: &SourceRead,
+        now: u64,
+        configured: &[SourceWatchBinding],
+        intakes: &[String],
+    ) -> Result<SourceReadPage, Error> {
+        if intakes.len() > 4
+            || intakes
+                .iter()
+                .any(|source| source.is_empty() || source.len() > 512)
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "configured intake discovery requires at most four bounded source labels",
+            ));
+        }
         if !(1..=1000).contains(&query.page_size)
             || !(1..=100000).contains(&query.scan_budget)
             || query
@@ -266,6 +287,17 @@ impl Store {
             remaining: &mut remaining,
         };
         let mut watch_ids = std::collections::BTreeSet::new();
+        for source in intakes {
+            admission.entry(0)?;
+            if query
+                .selector
+                .source
+                .as_ref()
+                .is_none_or(|wanted| wanted == source)
+            {
+                admit_source(&mut rows, source, &mut capacity)?;
+            }
+        }
         admission.entry(
             writer
                 .db

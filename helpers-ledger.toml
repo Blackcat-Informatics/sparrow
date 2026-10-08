@@ -1946,7 +1946,7 @@ names = ['^(bind_reconnected_logger_store|bind_reconnected_client_store)$']
 
 [[job]]
 id = "typed-server-connection"
-summary = "Construct the bounded generated server connection once for the production daemon and adversarial real-daemon relay fixtures."
+summary = "Construct the bounded generated server connection once for Unix and public TCP production listeners and adversarial real-daemon relay fixtures."
 home = "sparrow_server::transport::serve_connection"
 entry_points = []
 spec = "docs/development-runtime.md: shared typed connection and deterministic lost-reply qualification."
@@ -2604,6 +2604,90 @@ summary = "CLI and MCP producer stream reads share the generated contract and on
 home = "sparrow_server::agent::producer::Input::execute"
 entry_points = ["sparrow_server::agent::Command::execute"]
 spec = "docs/interfaces.md: producer_stream_get and producer-stream."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "syslog-protocol-capture"
+summary = "Interpret a bounded syslog packet once, preserving raw header and ordered encoded parameter spans; native PurRDF owns RFC3339 decoding."
+home = "sparrow_core::storage::syslog::capture"
+entry_points = ["sparrow_core::storage::ingest::RecordBatch::record"]
+spec = "docs/interfaces.md: syslog packet interpretation."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_syslog_in_rpc|parse_syslog_in_listener)$']
+
+[[job]]
+id = "syslog-frame-boundary"
+summary = "One bounded TCP frame reader implements explicitly configured octet counting, LF and CRLF without autodetection."
+home = "sparrow_server::syslog_listener::read_frame"
+entry_points = ["sparrow_server::syslog_listener::receive_tcp"]
+spec = "docs/interfaces.md: syslog listener framing."
+vectors = ["crates/sparrow-server/src/syslog_listener.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(guess_syslog_framing|parse_syslog_tcp_frame)$']
+
+[[job]]
+id = "syslog-shared-publication"
+summary = "TCP and UDP packets enter the existing ingestion owner and count successful durable publications through one path."
+home = "sparrow_server::syslog_listener::publish"
+entry_points = ["sparrow_server::syslog_listener::listen", "sparrow_server::syslog_listener::receive_tcp"]
+spec = "docs/interfaces.md: syslog listener delivery evidence."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "typed-connection-admission"
+summary = "Unix and public TCP share one connection ceiling, lease and typed service owner."
+home = "sparrow_server::transport::admit_connection"
+entry_points = []
+spec = "docs/interfaces.md: public Capn Proto RPC."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "typed-client-stream-bootstrap"
+summary = "Unix and TCP clients share the generated VatNetwork and bounded ReaderOptions constructor."
+home = "sparrow_client::transport::from_stream"
+entry_points = ["sparrow_client::transport::connect_typed", "sparrow_client::transport::connect_tcp"]
+spec = "docs/interfaces.md: public Capn Proto RPC."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "syslog-agent-record-rendering"
+summary = "CLI and MCP record/context summaries share one generated syslog evidence renderer."
+home = "sparrow_server::syslog_wire::render"
+entry_points = ["sparrow_server::agent::context::render_record"]
+spec = "docs/interfaces.md: syslog packet interpretation."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true

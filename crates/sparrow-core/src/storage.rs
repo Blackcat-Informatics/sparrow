@@ -40,10 +40,11 @@ pub(crate) mod result_read;
 mod retire;
 pub(crate) mod source_read;
 pub(crate) mod source_time;
+pub(crate) mod syslog;
 mod text_index;
 pub(crate) mod watch_registry;
 
-const FORMAT: &[u8] = b"sparrow.store/17";
+const FORMAT: &[u8] = b"sparrow.store/21";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -92,10 +93,10 @@ fn validate_ingest_labels(request_id: &str, source: &str, format: &str) -> Resul
             "request_id and source must be bounded nonempty strings",
         ));
     }
-    if !["jsonl", "log", "json", "markdown", "opaque"].contains(&format) {
+    if !["jsonl", "log", "json", "markdown", "opaque", "syslog"].contains(&format) {
         return Err(Error::new(
             "INVALID_ARGUMENT",
-            "format must be jsonl, log, json, markdown, or opaque",
+            "format must be jsonl, log, json, markdown, opaque, or syslog",
         ));
     }
     Ok(())
@@ -255,6 +256,8 @@ pub struct Record {
     pub diagnostics: diagnostic::DiagnosticSnapshot,
     /// Immutable accepted position in a producer sequence window, when declared.
     pub producer: Option<producer_stream::ProducerPosition>,
+    /// Immutable syslog packet interpretation; raw bytes remain authoritative.
+    pub syslog: Option<syslog::SyslogSnapshot>,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -480,6 +483,7 @@ impl Catalog for Record {
             .with("event_time", self.event_time.encode())
             .with("diagnostics", self.diagnostics.encode())
             .with("producer", self.producer.as_ref().map(Catalog::encode))
+            .with("syslog", self.syslog.as_ref().map(Catalog::encode))
             .with("chunks", self.chunks.clone())
             .with("evicted", self.evicted)
             .into()
@@ -518,6 +522,11 @@ impl Catalog for Record {
                 .map(producer_stream::ProducerPosition::decode)
                 .transpose()?,
             chunks: read_field::<Vec<String>>(v, "chunks")?,
+            syslog: v
+                .get("syslog")
+                .filter(|value| !value.is_null())
+                .map(syslog::SyslogSnapshot::decode)
+                .transpose()?,
             evicted: read_field(v, "evicted")?,
         };
         if let source_time::EventTime::Known {
@@ -533,6 +542,9 @@ impl Catalog for Record {
                 "STORAGE_FAILURE",
                 "source time evidence outside record",
             ));
+        }
+        if let Some(snapshot) = &record.syslog {
+            snapshot.validate_record(&record)?;
         }
         Ok(record)
     }

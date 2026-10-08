@@ -9,6 +9,246 @@ use sparrow_test_support::catalog_db;
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn syslog_packets_keep_exact_bytes_native_time_diagnostics_and_encoded_parameter_occurrences() {
+    use sparrow_core::{EventTime, SyslogDialect};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let modern =
+        br#"<34>1 2026-10-08T06:25:00.123+01:00 host app 123 ID [id@32473 p="x\]y" p="\q"] needle
+next"#;
+    let a = store
+        .ingest("syslog-modern", "syslog", "syslog", modern, 1)
+        .unwrap();
+    assert_eq!(a.record_ids.len(), 1); // Embedded newlines do not split protocol messages.
+    let record = store.record(&a.record_ids[0]).unwrap();
+    let snapshot = record.syslog.as_ref().unwrap();
+    assert_eq!(snapshot.dialect, Some(SyslogDialect::Rfc5424));
+    assert_eq!(snapshot.priority, Some(34));
+    assert_eq!(snapshot.structured_data.len(), 1);
+    let parameters = &snapshot.structured_data[0].parameters;
+    assert_eq!(parameters.len(), 2);
+    assert_eq!(parameters[0].name, parameters[1].name);
+    assert_eq!(
+        &modern[parameters[0].value_start as usize..parameters[0].value_end as usize],
+        br"x\]y"
+    );
+    assert_eq!(
+        &modern[parameters[1].value_start as usize..parameters[1].value_end as usize],
+        br"\q"
+    );
+    assert!(
+        matches!(&record.event_time, EventTime::Known { millis, source_start, source_end, .. }
+        if *millis == sparrow_core::parse_instant("2026-10-08T05:25:00.123Z").unwrap() && &modern[*source_start as usize..*source_end as usize] == b"2026-10-08T06:25:00.123+01:00")
+    );
+    let repeat = store
+        .ingest("syslog-repeat", "syslog", "syslog", modern, 2)
+        .unwrap();
+    assert_ne!(a.id, repeat.id);
+    assert_eq!(a.payload_id, repeat.payload_id);
+    let legacy = b"<13>Oct  8 06:25:00 host daemon[123]: legacy needle";
+    let b = store
+        .ingest("syslog-legacy", "syslog", "syslog", legacy, 3)
+        .unwrap();
+    assert!(
+        matches!(store.record(&b.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, .. } if reason == "syslog_legacy_time")
+    );
+    let sub = store
+        .ingest(
+            "syslog-submillisecond",
+            "syslog",
+            "syslog",
+            b"<13>1 2026-10-08T06:25:00.123456Z - - - - - needle",
+            4,
+        )
+        .unwrap();
+    assert!(
+        matches!(store.record(&sub.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, .. } if reason == "syslog_submillisecond")
+    );
+    let scope = sparrow_core::QueryScope {
+        selection: sparrow_core::QuerySelection::Live,
+        sources: None,
+        source: Some("syslog".into()),
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 100,
+        limit: 100,
+        scan_budget: 10_000,
+    };
+    let result = store
+        .records_query(
+            &scope,
+            &sparrow_core::RecordQuery {
+                event_interval: Some(sparrow_core::EventInterval {
+                    from: sparrow_core::parse_instant("2026-10-08T05:25:00.123Z").unwrap(),
+                    before: sparrow_core::parse_instant("2026-10-08T05:25:00.124Z").unwrap(),
+                }),
+                ..Default::default()
+            },
+            5,
+        )
+        .unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        store.text_query(&scope, "needle", 5).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let pin = store
+        .pin("syslog-pin", "syslog", &[a.record_ids[0].clone()], 40, 5)
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .ingest("syslog-modern", "syslog", "syslog", modern, 6)
+            .unwrap()
+            .id,
+        a.id
+    );
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store.record(&a.record_ids[0]).unwrap().syslog,
+        record.syslog
+    );
+    assert_eq!(
+        store
+            .bytes(&a.record_ids[0], 0, modern.len(), 31 * DAY)
+            .unwrap(),
+        modern
+    );
+    store
+        .release_retry("syslog-release", &pin.id, 31 * DAY)
+        .unwrap();
+}
+
+#[test]
+fn malformed_syslog_preserves_raw_evidence_and_reports_admission_without_inventing_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for (index, bytes) in [
+        b"<999>bad".as_slice(),
+        b"<01>1 - - - - - -",
+        b"<34>2 - - - - - -",
+        b"<34>1 2026-10-08T06:25:60Z - - - - -",
+        b"<34>1 - - - - - [x p=\"bad]\"]",
+        b"<34>1 - - - - - [x][x]",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = store
+            .ingest(&format!("bad-syslog-{index}"), "syslog", "syslog", bytes, 1)
+            .unwrap();
+        let record = store.record(&a.record_ids[0]).unwrap();
+        let snapshot = record.syslog.unwrap();
+        assert!(snapshot.diagnostic.is_some(), "{bytes:?}");
+        assert!(snapshot.fields.is_empty());
+        assert!(snapshot.priority.is_none());
+        assert_eq!(store.bytes(&a.id, 0, bytes.len(), 2).unwrap(), bytes);
+        assert!(
+            matches!(record.event_time, sparrow_core::EventTime::Unknown { ref reason, .. } if reason == "syslog_malformed")
+        );
+    }
+    let before = store.status(2).unwrap()["live_records"].clone();
+    assert_eq!(
+        store
+            .ingest(
+                "oversized-syslog",
+                "syslog",
+                "syslog",
+                &vec![b'x'; sparrow_core::SYSLOG_MESSAGE_BYTES + 1],
+                2
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(store.status(2).unwrap()["live_records"], before);
+    let packet = format!(
+        "<13>1 - - - - - [x{}]",
+        " p=\"v\"".repeat(sparrow_core::SYSLOG_PARAMETERS + 1)
+    );
+    let a = store
+        .ingest(
+            "syslog-parameters-limit",
+            "syslog",
+            "syslog",
+            packet.as_bytes(),
+            2,
+        )
+        .unwrap();
+    assert!(
+        store
+            .record(&a.record_ids[0])
+            .unwrap()
+            .syslog
+            .unwrap()
+            .diagnostic
+            .unwrap()
+            .contains("admission")
+    );
+}
+
+#[test]
+fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() {
+    use sparrow_core::{Durability, ProducerBatch};
+    for (legacy, current, watch) in [
+        (17, 21, false),
+        (18, 22, false),
+        (19, 23, true),
+        (20, 24, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let a = store
+            .ingest_producer(
+                "old-producer",
+                "producer",
+                b"{}\n{}\n",
+                &ProducerBatch {
+                    instance: [3; 16],
+                    sequences: vec![1, 4],
+                },
+                1,
+                Durability::Durable,
+            )
+            .unwrap();
+        let id = store
+            .record(&a.record_ids[0])
+            .unwrap()
+            .producer
+            .unwrap()
+            .stream_id;
+        if watch {
+            store.watch_registry_replace(None, b"preserved").unwrap();
+        }
+        drop(store);
+        let db = catalog_db(dir.path()).unwrap();
+        db.put("store_format", format!("sparrow.store/{legacy}"))
+            .unwrap();
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store.status(2).unwrap()["store_format"].as_str(),
+            Some(format!("sparrow.store/{current}").as_str())
+        );
+        let state = store.producer_stream(&id, 2).unwrap();
+        assert_eq!(state.accepted_events, 2);
+        assert_eq!(state.unobserved_sequences, 2);
+        assert!(store.record(&a.record_ids[0]).unwrap().syslog.is_none());
+        if watch {
+            assert_eq!(
+                store.watch_registry().unwrap().as_deref(),
+                Some(b"preserved".as_slice())
+            );
+        }
+    }
+}
+
+#[test]
 fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
     use sparrow_core::{Durability, ProducerBatch, ProducerGap};
     let dir = tempfile::tempdir().unwrap();
@@ -297,10 +537,10 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
 fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_annotation() {
     use sparrow_core::DiagnosticDimension;
     for (legacy, current, watch) in [
-        (13, 17, false),
-        (14, 18, false),
-        (15, 19, true),
-        (16, 20, true),
+        (13, 21, false),
+        (14, 22, false),
+        (15, 23, true),
+        (16, 24, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
@@ -973,7 +1213,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 8).as_str())
+            Some(format!("sparrow.store/{}", version + 12).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -1445,7 +1685,7 @@ fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() 
 #[test]
 fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity() {
     use sparrow_core::EvictionLimits;
-    for (legacy, current, watch) in [(5, 17, false), (6, 18, false), (7, 19, true), (8, 20, true)] {
+    for (legacy, current, watch) in [(5, 21, false), (6, 22, false), (7, 23, true), (8, 24, true)] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
         let identity = store.store_id().unwrap();
@@ -2431,7 +2671,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/19")
+        Some("sparrow.store/23")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -2446,7 +2686,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/19")
+        Some("sparrow.store/23")
     );
 }
 
@@ -2503,7 +2743,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/17")
+        Some("sparrow.store/21")
     );
     let digest = format!(
         "blake3:{}",
@@ -2528,7 +2768,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/18")
+        Some("sparrow.store/22")
     );
     assert_eq!(
         store
@@ -2562,7 +2802,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/20")
+        Some("sparrow.store/24")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     store
@@ -2570,7 +2810,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/20")
+        Some("sparrow.store/24")
     );
     assert_eq!(
         store
@@ -2797,7 +3037,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/19")
+        Some("sparrow.store/23")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -6975,7 +7215,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/17")
+        Some("sparrow.store/21")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]

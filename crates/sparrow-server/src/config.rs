@@ -16,6 +16,12 @@ pub(crate) const MAX_CONSUME_ROOTS: usize = 8;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Optional public Cap'n Proto TCP binding, without authentication.
+    #[serde(default)]
+    pub rpc_tcp_address: Option<std::net::SocketAddr>,
+    /// Explicit syslog intake listeners; none are opened by default.
+    #[serde(default)]
+    pub syslog: Vec<crate::syslog_listener::SyslogListener>,
     /// Explicit finished-file consumption authority. Empty by default.
     #[serde(default)]
     pub consume: Vec<ConsumeWatch>,
@@ -103,6 +109,7 @@ impl ServerConfig {
             return Err("consume requires at least two RPC connections".into());
         }
         ConsumeWatch::validate_fields(&config.consume)?;
+        crate::syslog_listener::validate(&config.syslog)?;
         Ok(config)
     }
 

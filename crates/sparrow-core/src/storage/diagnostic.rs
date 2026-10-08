@@ -202,9 +202,11 @@ impl DiagnosticSnapshot {
     pub(super) fn decode(value: &Value, start: u64, end: u64) -> Result<Self, Error> {
         let profile_id: Option<String> = read_field(value, "profile_id")?;
         if profile_id.as_ref().is_some_and(|id| {
-            id.strip_prefix("diagnostic-profile:")
-                .and_then(purrdf_hash::hex::decode_32_canonical)
-                .is_none()
+            id != &super::syslog::syslog_profile_id()
+                && id
+                    .strip_prefix("diagnostic-profile:")
+                    .and_then(purrdf_hash::hex::decode_32_canonical)
+                    .is_none()
         }) {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -588,6 +590,9 @@ impl Writer {
     }
 
     pub(super) fn validate_diagnostic_record(&self, record: &Record) -> Result<(), Error> {
+        if let Some(snapshot) = &record.syslog {
+            return snapshot.validate_record(record);
+        }
         if let Some(id) = &record.diagnostics.profile_id {
             let profile = self.diagnostic_profile(&record.source)?.ok_or_else(|| {
                 Error::new("STORAGE_FAILURE", "captured diagnostic profile missing")
@@ -658,15 +663,8 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
         .and_then(super::recordless::legacy_format)
         .filter(|legacy| !legacy.needs_recordless_index)
     {
-        if !matches!(
-            db.get("store_format")?.as_deref(),
-            Some(
-                b"sparrow.store/13"
-                    | b"sparrow.store/14"
-                    | b"sparrow.store/15"
-                    | b"sparrow.store/16"
-            )
-        ) && let Some(row) = db.prefix_iterator("source-diagnostic:").next()
+        if !legacy.diagnostic_mappings
+            && let Some(row) = db.prefix_iterator("source-diagnostic:").next()
             && row?.0.starts_with(b"source-diagnostic:")
         {
             return Err(Error::new(
@@ -674,15 +672,17 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
                 "legacy store has unfenced diagnostic mappings",
             ));
         }
-        if db.get(super::producer_stream::KEY)?.is_some() {
+        if db.get(super::producer_stream::KEY)?.is_some() != legacy.producer_registry {
             return Err(Error::new(
                 "STORAGE_FAILURE",
-                "legacy store has unfenced producer stream registry",
+                "legacy producer registry presence contradicts its writer fence",
             ));
         }
         let mut batch = WriteBatch::default();
         batch.put("store_format", legacy.target);
-        batch.put(super::producer_stream::KEY, b"[]");
+        if !legacy.producer_registry {
+            batch.put(super::producer_stream::KEY, b"[]");
+        }
         let mut options = WriteOptions::default();
         options.set_sync(true);
         options.disable_wal(false);

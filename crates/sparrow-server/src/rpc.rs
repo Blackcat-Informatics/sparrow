@@ -68,6 +68,7 @@ pub fn now() -> Result<u64, Error> {
 
 /// Shared storage owner exposed through the generated RPC capability.
 pub struct Rpc {
+    syslog: crate::syslog_listener::SyslogRegistry,
     store: Store,
     requests: Arc<Semaphore>,
     max_artifact_bytes: usize,
@@ -85,6 +86,7 @@ impl Rpc {
         max_pin_members: usize,
     ) -> Self {
         Self {
+            syslog: crate::syslog_listener::SyslogRegistry::default(),
             store,
             requests,
             max_artifact_bytes,
@@ -97,6 +99,11 @@ impl Rpc {
     /// Attach the daemon's one bounded configured-watch snapshot owner.
     pub fn with_watches(mut self, watches: crate::watches::WatchRegistry) -> Self {
         self.watches = watches;
+        self
+    }
+    /// Attach the same finite syslog listener registry used by intake.
+    pub fn with_syslog(mut self, registry: crate::syslog_listener::SyslogRegistry) -> Self {
+        self.syslog = registry;
         self
     }
 
@@ -696,6 +703,7 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> cap
     out.set_byte_end(value.byte_end);
     event_time(out.reborrow().init_event_time(), &value.event_time)?;
     crate::diagnostics::snapshot(out.reborrow().init_diagnostics(), &value.diagnostics);
+    crate::syslog_wire::snapshot(out.reborrow().init_syslog(), value.syslog.as_ref())?;
     match value.producer {
         Some(position) => {
             let mut producer = out.init_producer().init_value();
@@ -761,6 +769,10 @@ fn event_time(
                 "wrong_kind" => wire::UnknownTimeReason::WrongKind,
                 "invalid_instant" => wire::UnknownTimeReason::InvalidInstant,
                 "legacy_unprofiled" => wire::UnknownTimeReason::LegacyUnprofiled,
+                "syslog_malformed" => wire::UnknownTimeReason::SyslogMalformed,
+                "syslog_legacy_time" => wire::UnknownTimeReason::SyslogLegacyTime,
+                "syslog_nil_time" => wire::UnknownTimeReason::SyslogNilTime,
+                "syslog_submillisecond" => wire::UnknownTimeReason::SyslogSubmillisecond,
                 _ => {
                     return Err(capnp::Error::failed(
                         "invalid stored source time diagnostic".into(),
@@ -2094,6 +2106,16 @@ impl wire::sparrow::Server for Rpc {
         _: wire::sparrow::StatusParams,
         mut results: wire::sparrow::StatusResults,
     ) -> capnp::Result<()> {
+        let syslog = match self.syslog.snapshot() {
+            Ok(value) => value,
+            Err(error) => {
+                failure(
+                    results.get().init_result(),
+                    Error::new("STORAGE_FAILURE", error.to_string()),
+                );
+                return Ok(());
+            }
+        };
         match self
             .work(|store, now| {
                 Ok((
@@ -2146,6 +2168,10 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                let mut syslog_rows = out.reborrow().init_syslog_listeners(syslog.len() as u32);
+                for (index, status) in syslog.iter().enumerate() {
+                    status.encode(syslog_rows.reborrow().get(index as u32));
+                }
                 out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
                 producer_limits(out.reborrow().init_producer_limits(), &value)?;
                 out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
@@ -2605,7 +2631,13 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| store.source_read(&query, now, &configured))
+            .work({
+                let intakes = self
+                    .syslog
+                    .sources()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                move |store, now| store.source_read_with_intakes(&query, now, &configured, &intakes)
+            })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),

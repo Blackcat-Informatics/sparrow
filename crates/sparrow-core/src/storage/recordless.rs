@@ -34,23 +34,42 @@ pub(super) fn publish(batch: &mut WriteBatch, artifact: &Artifact) -> Result<(),
 pub(super) struct LegacyFormat {
     pub target: &'static [u8],
     pub needs_recordless_index: bool,
+    pub diagnostic_mappings: bool,
+    pub producer_registry: bool,
 }
 
 /// Preserve consumption/watch/handoff authority through every admitted upgrade.
 pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
-    let target = match format {
-        b"sparrow.store/5" | b"sparrow.store/9" | b"sparrow.store/13" => super::FORMAT,
-        b"sparrow.store/6" | b"sparrow.store/10" | b"sparrow.store/14" => {
-            super::consumption::FORMAT
-        }
-        b"sparrow.store/7" | b"sparrow.store/11" | b"sparrow.store/15" => {
-            super::watch_registry::FORMAT
-        }
-        b"sparrow.store/8" | b"sparrow.store/12" | b"sparrow.store/16" => super::handoff::FORMAT,
-        _ => return None,
-    };
+    let target =
+        match format {
+            b"sparrow.store/5" | b"sparrow.store/9" | b"sparrow.store/13" | b"sparrow.store/17" => {
+                super::FORMAT
+            }
+            b"sparrow.store/6" | b"sparrow.store/10" | b"sparrow.store/14"
+            | b"sparrow.store/18" => super::consumption::FORMAT,
+            b"sparrow.store/7" | b"sparrow.store/11" | b"sparrow.store/15"
+            | b"sparrow.store/19" => super::watch_registry::FORMAT,
+            b"sparrow.store/8" | b"sparrow.store/12" | b"sparrow.store/16"
+            | b"sparrow.store/20" => super::handoff::FORMAT,
+            _ => return None,
+        };
     Some(LegacyFormat {
         target,
+        diagnostic_mappings: matches!(
+            format,
+            b"sparrow.store/13"
+                | b"sparrow.store/14"
+                | b"sparrow.store/15"
+                | b"sparrow.store/16"
+                | b"sparrow.store/17"
+                | b"sparrow.store/18"
+                | b"sparrow.store/19"
+                | b"sparrow.store/20"
+        ),
+        producer_registry: matches!(
+            format,
+            b"sparrow.store/17" | b"sparrow.store/18" | b"sparrow.store/19" | b"sparrow.store/20"
+        ),
         needs_recordless_index: matches!(
             format,
             b"sparrow.store/5" | b"sparrow.store/6" | b"sparrow.store/7" | b"sparrow.store/8"
@@ -67,6 +86,8 @@ pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
             | b"sparrow.store/12"
             | b"sparrow.store/15"
             | b"sparrow.store/16"
+            | b"sparrow.store/19"
+            | b"sparrow.store/20"
     ) || format == super::watch_registry::FORMAT
         || format == super::handoff::FORMAT
 }

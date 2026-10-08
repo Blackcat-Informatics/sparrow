@@ -33,6 +33,20 @@ pub async fn connect(socket: &Path) -> capnp::Result<Connection> {
 
 pub(crate) async fn connect_typed(socket: &Path) -> Result<Connection, crate::Error> {
     let stream = tokio::net::UnixStream::connect(socket).await?;
+    Ok(from_stream(stream))
+}
+
+/// Connect to a public typed TCP endpoint within a Tokio `LocalSet`.
+pub async fn connect_tcp(address: std::net::SocketAddr) -> Result<Connection, crate::Error> {
+    let stream = tokio::net::TcpStream::connect(address).await?;
+    stream.set_nodelay(true)?;
+    Ok(from_stream(stream))
+}
+
+fn from_stream<S>(stream: S) -> Connection
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
     let (reader, writer) = stream.compat().split();
     let network = twoparty::VatNetwork::new(
         reader,
@@ -46,5 +60,5 @@ pub(crate) async fn connect_typed(socket: &Path) -> Result<Connection, crate::Er
     let mut system = RpcSystem::new(Box::new(network), None);
     let client = system.bootstrap(rpc_twoparty_capnp::Side::Server);
     let task = tokio::task::spawn_local(system);
-    Ok(Connection { client, task })
+    Connection { client, task }
 }

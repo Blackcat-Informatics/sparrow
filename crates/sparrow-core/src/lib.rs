@@ -61,6 +61,10 @@ pub use storage::source_read::{
     SourceWatchInfo,
 };
 pub use storage::source_time::{EventTime, SourceTimeProfile, TimeRepresentation};
+pub use storage::syslog::{
+    SYSLOG_ELEMENTS, SYSLOG_MESSAGE_BYTES, SYSLOG_PARAMETERS, SyslogDialect, SyslogElement,
+    SyslogField, SyslogParameter, SyslogSnapshot, syslog_profile_id,
+};
 pub use storage::watch_registry::MAX_WATCH_REGISTRY_BYTES;
 pub use storage::{Artifact, Config, Error, Pin, Record, Store};
 pub use text::resolve_text_analyzer;
