@@ -4,10 +4,65 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 47 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`40b0e6c`; see [stored RDF graph layers](#stored-rdf-graph-layers) for
+`d4b9aaf`; see [cooperative capture cancellation](#cooperative-capture-cancellation) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Cooperative capture cancellation
+
+Signed source `d4b9aaf` binds record/text/key/value capture workers to independent
+RPC and production connection lifetimes. The shared native capture owner checks
+that lifetime during candidate, fact, posting, corpus/scoring and staging work.
+Disconnection, failure, connection lease expiry or serving task teardown signals
+children without changing mutation delivery behavior. Concurrency admission stays
+with the blocking worker until it exits. A reply guard releases completed captures
+abandoned before rendering. Successfully rendered cursors retain their ordinary
+lease for retry/reconnect. No schema, store format, PurRDF pin or dependency changed.
+
+The worker scenario covers request cancellation and explicit connection teardown
+both before capture and after publication, abandoned returned replies, successful
+reply ownership and preservation of admitted mutation work. The complete source
+gate passed 151 storage tests, 58 RPC tests, the remaining workspace tests, seeded
+census tests and the pinned cross gate: 234 ledger jobs, zero distinct exceptions.
+
+Selected executables were rebuilt after the gate and frozen with exact source
+and image hashes at `~/.local/state/sparrow/query-cancel-images-5v_tgs7_`. Separate
+closed 7,058-record Btrfs copies at `query-cancel-unix-jo5yhpwe` and
+`query-cancel-tcp-5rxj6oiy` each interrupt twelve owned clients during observed
+partially written anonymous captures. No status or explicit release call runs
+during cleanup observation. Every staging file disappears within the private
+two-second qualification bound; maximum sampled cleanup upper observations were
+1.165 ms for Unix and 1.216 ms for TCP. These include client kill/wait and sampling,
+not an exact server checkpoint timestamp or production latency guarantee. Each
+subsequent status has zero read handles/bytes and pins. Fresh and reopened captures
+preserve all 7,058 initial rows over 48 pages, store identity and clean closure;
+the public owner is unchanged during both private runs.
+
+An earlier RPC-only cancellation candidate passed its local race scenario but
+failed actual disconnect qualification at `query-cancel-unix-benzoewj`: this
+Cap'n Proto path retained the server call after peer exit. The final implementation
+adds explicit connection ownership, rather than assuming that dropping a remote
+promise stops the blocking worker. Earlier corrected uncommitted-image runs at
+`query-cancel-unix-4pn_57ek` and `query-cancel-tcp-41e60ukv` also passed; the final
+qualification above uses the signed source's separately rebuilt frozen images.
+
+Public adoption evidence at `/tmp/sparrow-query-cancel-live.g_f6wz4r` contains the
+closed predecessor backup, saved-intent retries, complete source/generation
+inventory, grouped and JSON queries, field/time witnesses, native text scores,
+MCP declarations/refusals, installed image/alias hashes and unit/listener readback.
+The enabled unit is active at PID 708683 on `0.0.0.0:518`, LAN
+`192.168.2.4:518`, and the existing Unix socket. Store
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37 and 212 records are unchanged,
+with zero pins/read leases and healthy watches/durability. No new public intake
+or retirement was performed.
+
+Individual native calls, sorts and mutex waits finish before the next host
+checkpoint. Explicit cancellation-message propagation through every adapter,
+production tail-latency/resource bounds and sustained burst qualification remain
+unfinished. Complete governed SPARQL/correlation/explanations, durable receiver
+windows, production volume/quota qualification, forced physical reclamation and
+reboot acceptance also remain unfinished.
 
 ## Stored RDF graph layers
 
