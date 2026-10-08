@@ -2,12 +2,77 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 44 and store format 37. The stable installed
+private Unix socket. It uses schema 45 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`6176223`; see [disk-backed record query adoption](#disk-backed-record-query-adoption) for
+`74e0935`; see [disk-backed JSON query adoption](#disk-backed-json-query-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Disk-backed JSON query adoption
+
+Signed source `74e0935` routes complete key/value captures through the same
+anonymous-file staging owner as record and ranked-text pages. Values stage each
+native occurrence directly. Keys finish their native occurrence/presence counts
+in a separately bounded 32 MiB working map before staging sorted rows. The host
+profile is `sparrow-query-capture/4`; typed receipts advertise maximum 64 MiB
+disk capture, subject to store admission, and `keyAggregationBytes` is present
+only for key queries. Resident offsets, page limits, deadlines and explicit
+release keep their previous bounds. PurRDF projection/matching semantics, the
+runtime/census pin and storage format remain unchanged.
+
+The full release gate and normal signed source hook passed release Clippy with
+warnings denied, 11 core unit tests, 144 storage scenarios, 53 RPC scenarios,
+17 SDK tests, remaining workspace tests, seeded census self-tests and all
+224 pinned helper jobs with zero distinct exceptions. One shared dev-only
+native-codec fixture supplies both large tests. The core scenario captures
+5,002 keys and 5,002 values, each exceeding the earlier 2 MiB result-body limit,
+verifies duplicate occurrence versus record-presence counts and original byte
+spans, then replays after pin release and evidence retirement. The RPC scenario
+traverses 5,001 keys and 5,000 values over TCP and Unix with identical CLI/MCP
+continuations and typed admission evidence. Its additional Btrfs run passed at
+`~/.local/state/sparrow/json-pages-btrfs.kQY5Pme1`, with a retained qualification
+log. Development corrected an unnecessary fixture clone and a source-line-order
+test assumption: values retain receipt-time/record-ID, then native occurrence
+order. No hook or duplicate detector was bypassed.
+
+The explicit selected runtime build followed the source hook. Frozen images are
+`~/.local/state/sparrow/json-pages-images-1cqdfhu3`. Disk qualification is
+`~/.local/state/sparrow/json-pages-qualification-3a5isfbq`, cloned from the closed
+7,058-record corpus. Complete ordinary/grouped record traversals still return
+7,058 rows over 48 pages, exactly matching the original ingestion receipts.
+Source, temporal and native ranked text rows/scores/group counts match their
+predecessors. The 51 keys and 286 `/component` value occurrences exactly match
+the schema-44 baseline at
+`~/.local/state/sparrow/json-pages-qualification-if2701y3`, including native
+counts and value witnesses. Every lease was released; both private owners closed
+gracefully. These checks establish paging correctness on these corpora, not
+sustained production-volume or capture-concurrency performance.
+
+Public adoption evidence is `/tmp/sparrow-json-pages-live.5eh9syat`. The old
+daemon stopped gracefully and its closed store was copied before alias replacement.
+The enabled persistent unit started as PID 3710984 with
+`~/.local/libexec/sparrow/sparrowd-schema45-74e0935`, SHA-256
+`df0f40cd4f835468111ac5b0b0e2a3a304d76ab7a40c3db4c454f8114b69fe56`.
+The stable CLI selects `sparrow-schema45-74e0935`, SHA-256
+`39031f80027a5b8acc7614b060aee7bbf05db62042c41220d97503fd65dfa79f`.
+All five installed image hashes match frozen qualification. The daemon retains
+`cap_net_bind_service=ep`, and `0.0.0.0:518` was verified listening.
+
+TCP/Unix key/value continuations match their CLI/MCP output and schema-44 live
+baseline (four keys, twenty value occurrences). Grouped record counts/indices,
+release/conflict/empty captures, saved source/time/field witnesses and global text
+scores passed. Six idle MCP peers plus CLI status remain usable with four storage
+permits. Schema-44 status refuses explicitly during client discovery; schema-42
+refusal also remains checked. Saved finish/handoff intent retries preserve the
+original receipt, bytes and replacement without importing new evidence. Final
+status retains store `store:46c88e949ccec658600b66c7becd5bb7`, 212 live records,
+format 37, zero pins/result leases, healthy watches and no pending claims.
+
+Full governed stored SPARQL, bounded physical reclamation, capture concurrency,
+production-volume acceptance and automatic stale Unix socket recovery remain
+unfinished. Reboot acceptance was not run. Historical evidence below remains
+bound to its original source and runtime identities.
 
 ## Disk-backed record query adoption
 
