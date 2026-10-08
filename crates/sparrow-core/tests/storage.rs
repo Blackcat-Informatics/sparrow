@@ -5759,6 +5759,280 @@ fn artifact_handles_are_bounded_shared_by_clones_and_preserve_full_source_labels
 }
 
 #[test]
+fn source_catalog_admission_is_shared_and_keeps_exact_keys_and_sorted_watch_revisions() {
+    use sparrow_core::{SourceRead, SourceWatchBinding};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let source = "\n".repeat(512);
+    store
+        .ingest("source-admit", &source, "json", b"{}", 0)
+        .unwrap();
+    let configured = [
+        SourceWatchBinding {
+            source: source.clone(),
+            watch_id: "z".into(),
+            revision: 2,
+            enabled: true,
+        },
+        SourceWatchBinding {
+            source: source.clone(),
+            watch_id: "a".into(),
+            revision: 9,
+            enabled: false,
+        },
+        SourceWatchBinding {
+            source: "idle".into(),
+            watch_id: "idle".into(),
+            revision: 1,
+            enabled: true,
+        },
+    ];
+    let mut query = SourceRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let captured = (0..8)
+        .map(|_| store.clone().source_read(&query, 1, &configured).unwrap())
+        .collect::<Vec<_>>();
+    let row = &captured[0].body.sources[0];
+    assert_eq!(row.source_id, source);
+    assert_eq!(
+        row.watches
+            .iter()
+            .map(|w| (w.watch_id.as_str(), w.revision, w.enabled))
+            .collect::<Vec<_>>(),
+        [("a", 9, false), ("z", 2, true)]
+    );
+    assert_eq!(
+        store
+            .clone()
+            .source_read(&query, 1, &configured)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(1).unwrap()["source_read_handles"].as_str(),
+        Some("8")
+    );
+    query.cursor = captured[0].next_cursor.clone();
+    let continuation = store.source_read(&query, 2, &[]).unwrap();
+    assert_eq!(continuation.body.sources[0].source_id, "idle");
+    assert_eq!(continuation.body.sources[0].watches[0].revision, 1);
+    store.expire(60_001).unwrap();
+    assert_eq!(
+        store.source_read(&query, 60_001, &[]).unwrap_err().code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store.status(60_001).unwrap()["source_read_handles"].as_str(),
+        Some("0")
+    );
+    query.cursor = None;
+    let fresh = store.source_read(&query, 60_001, &configured).unwrap();
+    assert_eq!(fresh.total_items, 2);
+    assert_ne!(fresh.snapshot_id, captured[0].snapshot_id);
+}
+
+#[test]
+fn source_discovery_counts_occurrences_mappings_and_idle_watch_bindings_in_one_capture() {
+    use purrdf::DatasetView;
+    use sparrow_core::{
+        DiagnosticDimension, SourceRead, SourceSelector, SourceWatchBinding, TimeRepresentation,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let time = store
+        .define_time_profile("a", "/t", TimeRepresentation::UnixMillis)
+        .unwrap();
+    let diagnostic = store
+        .define_diagnostic_profile(
+            "declared",
+            [(DiagnosticDimension::Service, "/svc".into())].into(),
+        )
+        .unwrap();
+    let artifact = store
+        .ingest("source-count-a", "a", "jsonl", b"{}\n{}\n", 0)
+        .unwrap();
+    store
+        .ingest("source-count-a2", "a", "jsonl", b"{}\n{}\n", 0)
+        .unwrap();
+    store
+        .ingest("source-count-b", "b", "json", b"{}", 0)
+        .unwrap();
+    let configured = [SourceWatchBinding {
+        source: "idle".into(),
+        watch_id: "completed".into(),
+        revision: 7,
+        enabled: false,
+    }];
+    let mut query = SourceRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.source_read(&query, 1, &configured).unwrap();
+    assert_eq!(first.total_items, 4);
+    let a = &first.body.sources[0];
+    assert_eq!(a.source_id, "a");
+    assert_eq!(a.complete_artifacts, 2);
+    assert_eq!(a.retained_records, 4);
+    assert_eq!(a.time_profile_id.as_deref(), Some(time.id.as_str()));
+    assert!(a.continuity_unknown);
+    let scope = sparrow_core::QueryScope {
+        sources: Some(sparrow_core::QueryAlternatives::new(vec![a.source_id.clone()]).unwrap()),
+        selection: sparrow_core::QuerySelection::Live,
+        source: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 100,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    let records = store
+        .records_query(&scope, &sparrow_core::RecordQuery::default(), 1)
+        .unwrap();
+    assert_eq!(
+        records["rows"].as_array().unwrap().len(),
+        a.retained_records
+    );
+    store
+        .with_rdf_records(&artifact.record_ids, 1, Default::default(), |view| {
+            assert!(
+                view.term_id_by_value(&purrdf::TermValue::iri(a.rdf_iri.clone()))
+                    .unwrap()
+                    .is_some()
+            );
+        })
+        .unwrap();
+    store
+        .ingest("source-count-after", "after", "json", b"{}", 1)
+        .unwrap();
+    let mut all = first.body.sources.clone();
+    query.cursor = first.next_cursor;
+    while query.cursor.is_some() {
+        let page = store.source_read(&query, 2, &[]).unwrap();
+        assert_eq!(page.snapshot_id, first.snapshot_id);
+        assert_eq!(page.total_items, 4);
+        all.extend(page.body.sources);
+        query.cursor = page.next_cursor;
+    }
+    assert_eq!(
+        all.iter().map(|s| s.source_id.as_str()).collect::<Vec<_>>(),
+        ["a", "b", "declared", "idle"]
+    );
+    assert_eq!(all[2].retained_records, 0);
+    assert_eq!(
+        all[2].diagnostic_profile_id.as_deref(),
+        Some(diagnostic.id.as_str())
+    );
+    assert_eq!(all[3].watches[0].watch_id, "completed");
+    assert_eq!(all[3].watches[0].revision, 7);
+    assert!(!all[3].watches[0].enabled);
+    let selected = SourceRead {
+        selector: SourceSelector {
+            source: Some("declared".into()),
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        store
+            .source_read(&selected, 2, &configured)
+            .unwrap()
+            .total_items,
+        1
+    );
+}
+
+#[test]
+fn source_discovery_preserves_fragments_and_frozen_pages_without_renewing_protection() {
+    use sparrow_core::{SourceRead, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_time_profile("declared", "/t", TimeRepresentation::UnixMillis)
+        .unwrap();
+    let old = store
+        .ingest("source-fragment", "old", "jsonl", b"{}\n{}\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("source-pin", "fragment", &old.record_ids[..1], 40, 0)
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    let mut query = SourceRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.source_read(&query, 31 * DAY, &[]).unwrap();
+    assert_eq!(first.total_items, 2);
+    assert_eq!(first.body.sources[0].source_id, "declared");
+    query.cursor = first.next_cursor.clone();
+    let fragment = store.source_read(&query, 31 * DAY, &[]).unwrap();
+    assert_eq!(fragment.body.sources[0].complete_artifacts, 0);
+    assert_eq!(fragment.body.sources[0].fragment_parents, 1);
+    assert_eq!(fragment.body.sources[0].retained_records, 1);
+    store.release(&pin.id).unwrap();
+    store.expire(31 * DAY + 1).unwrap();
+    assert_eq!(
+        store.source_read(&query, 31 * DAY + 2, &[]).unwrap(),
+        fragment
+    );
+    assert_eq!(
+        store
+            .source_read(&SourceRead::default(), 31 * DAY + 2, &[])
+            .unwrap()
+            .total_items,
+        1
+    );
+    assert_eq!(
+        store
+            .source_read(&query, first.lease_expires_at, &[])
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store.status(first.lease_expires_at).unwrap()["source_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn source_discovery_refuses_corrupt_declarations_and_budget_without_a_prefix() {
+    use sparrow_core::{SourceRead, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_time_profile("declared", "/t", TimeRepresentation::UnixMillis)
+        .unwrap();
+    let tiny = SourceRead {
+        scan_budget: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        store.source_read(&tiny, 1, &[]).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(1).unwrap()["source_read_handles"].as_str(),
+        Some("0")
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("source-time:corrupt", b"{invalid").unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .source_read(&SourceRead::default(), 1, &[])
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert!(store.properties().is_ok());
+}
+
+#[test]
 fn stored_rdf_reads_refuse_exhaustion_and_failed_projection_without_prefixes() {
     use purrdf::DatasetView;
     let dir = tempfile::tempdir().unwrap();

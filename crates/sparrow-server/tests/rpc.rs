@@ -13,6 +13,210 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_shared_agents() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let root = dir.path().join("finished");
+            std::fs::create_dir(&root).unwrap();
+            append_consume_config(&config, &root, 30_000, 16, 16);
+            let owner = sparrow_server::ServerConfig::read(&config)
+                .unwrap()
+                .open_store()
+                .unwrap();
+            let declared = owner
+                .define_time_profile(
+                    "z-declared",
+                    "/t",
+                    sparrow_core::TimeRepresentation::UnixMillis,
+                )
+                .unwrap();
+            let diagnostic = owner
+                .define_diagnostic_profile(
+                    "a-source",
+                    [(sparrow_core::DiagnosticDimension::Service, "/svc".into())].into(),
+                )
+                .unwrap();
+            drop(owner);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            watch_until(client.capability(), |watch| {
+                watch.get_coverage().unwrap() == wire::WatchCoverage::Covered
+            })
+            .await;
+            for request in ["source-wire-a", "source-wire-b"] {
+                client
+                    .ingest(request, "a-source", wire::Format::Jsonl, b"{}\n{}\n")
+                    .await
+                    .unwrap();
+            }
+            let first = cli(&socket, &["sources", &store, "--page-size", "1"]);
+            assert_eq!(first["total_items"].as_str(), Some("3"));
+            let source = &first["rows"][0];
+            assert_eq!(source["source_id"].as_str(), Some("a-source"));
+            assert_eq!(source["complete_artifacts"].as_str(), Some("2"));
+            assert_eq!(source["fragment_parents"].as_str(), Some("0"));
+            assert_eq!(source["retained_records"].as_str(), Some("4"));
+            assert_eq!(
+                source["diagnostic_profile_id"].as_str(),
+                Some(diagnostic.id.as_str())
+            );
+            assert_eq!(source["time_profile_id"], Value::Null);
+            assert_eq!(source["continuity_unknown"].as_bool(), Some(true));
+            assert!(
+                source["rdf_iri"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("urn:sparrow:source:")
+            );
+            let artifacts = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--source",
+                    source["source_id"].as_str().unwrap(),
+                ],
+            );
+            assert_eq!(artifacts["total_items"].as_str(), Some("2"));
+            client
+                .ingest("source-wire-later", "b-later", wire::Format::Jsonl, b"{}\n")
+                .await
+                .unwrap();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let mut cursor = first["next_cursor"].as_str().unwrap().to_owned();
+            let mut captured = Vec::new();
+            for id in 2..=3 {
+                let page = cli(
+                    &socket,
+                    &["sources", &store, "--page-size", "1", "--cursor", &cursor],
+                );
+                let response = mcp
+                    .tool(
+                        id,
+                        "sources_list",
+                        Object::new()
+                            .with("store_id", store.clone())
+                            .with("page_size", 1_u64)
+                            .with("cursor", cursor.clone())
+                            .into(),
+                    )
+                    .await;
+                assert_eq!(response["isError"].as_bool(), Some(false));
+                assert_eq!(response["structuredContent"], page);
+                assert_eq!(page["snapshot_id"], first["snapshot_id"]);
+                assert_eq!(page["total_items"].as_str(), Some("3"));
+                captured.push(page["rows"][0].clone());
+                if let Some(next) = page["next_cursor"].as_str() {
+                    cursor = next.to_owned();
+                } else {
+                    assert_eq!(id, 3);
+                }
+            }
+            assert_eq!(
+                captured[0]["source_id"].as_str(),
+                Some("consume-acceptance")
+            );
+            assert_eq!(captured[0]["retained_records"].as_str(), Some("0"));
+            assert_eq!(
+                captured[0]["watches"][0]["watch_id"].as_str(),
+                Some("completed")
+            );
+            assert_eq!(captured[0]["watches"][0]["revision"].as_str(), Some("1"));
+            assert_eq!(captured[0]["watches"][0]["enabled"].as_bool(), Some(true));
+            assert_eq!(captured[1]["source_id"].as_str(), Some("z-declared"));
+            assert_eq!(
+                captured[1]["time_profile_id"].as_str(),
+                Some(declared.id.as_str())
+            );
+            assert_eq!(captured[1]["complete_artifacts"].as_str(), Some("0"));
+            let fresh = cli(&socket, &["sources", &store]);
+            assert_eq!(fresh["total_items"].as_str(), Some("4"));
+            let filtered = mcp
+                .tool(
+                    4,
+                    "sources_list",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("source", "a-source")
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                filtered["structuredContent"]["total_items"].as_str(),
+                Some("1")
+            );
+            assert_eq!(filtered["structuredContent"]["rows"][0], *source);
+            for (args, code) in [
+                (vec!["sources", "foreign"], "STORE_MISMATCH"),
+                (
+                    vec!["sources", &store, "--scan-budget", "1"],
+                    "RESOURCE_LIMIT",
+                ),
+                (
+                    vec![
+                        "sources",
+                        &store,
+                        "--source",
+                        "changed",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        &cursor,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec!["sources", &store, "--cursor", "bogus"],
+                    "INVALID_ARGUMENT",
+                ),
+            ] {
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success() && output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(code),
+                    "{output:?}"
+                );
+            }
+            let mut request = client.capability().sources_list_request();
+            let mut query = request.get().init_query();
+            query.set_store_id(&store);
+            query.set_schema_version(24);
+            let response = request.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "UNSUPPORTED"
+                ),
+                wire::result::Ok(_) => panic!("obsolete source-list schema admitted"),
+            }
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["source_read_handles"].as_str(), Some("1"));
+            assert_eq!(status["max_source_read_handles"].as_str(), Some("8"));
+            assert_eq!(status["max_source_read_bytes"].as_str(), Some("8388608"));
+            assert_eq!(status["source_read_lease_ms"].as_str(), Some("60000"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new()
@@ -4130,7 +4334,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 22);
+    assert_eq!(definitions.len(), 23);
     assert_eq!(
         definitions
             .iter()

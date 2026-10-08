@@ -32,8 +32,51 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 24; the schema sections
+The current source implements schema 25; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 25 source discovery
+
+`sourcesList`, CLI `sources STORE_ID` and MCP `sources_list` use one source
+capture and one generated client/renderer. The exact intake key is `source_id`;
+its separate `rdf_iri` shares the native-hash formatter used by occurrence RDF
+publication. Retained complete artifacts, fragment parents and record occurrences
+are counted separately. Mapping-only and configured watch-only sources remain
+visible with zero retained input. Optional mapping IDs preserve absence;
+watch declarations come from the daemon's bounded watch owner. Continuations
+preserve captured definitions even after ingestion, evidence retirement or pin
+release. Producer continuity is explicitly unknown; stream generations and a
+full gap ledger remain unfinished.
+
+The artifact eligibility walker, catalog leases, receipt wire codec, receipt
+renderer and CLI catalog options each have one implementation. Source handles
+are shared across store clones, bounded to eight and 8 MiB, with a 2 MiB capture,
+256 KiB conservative page ceiling and an absolute 60-second lease. Capture scans
+pins/artifacts/records and declared profiles under one aggregate scan/time/byte
+admission. Typed status exposes source metadata handle use and ceilings.
+
+Focused core scenarios verify exact occurrence counts, native RDF identity and
+source scope matching, mapping-only and idle watch sources, fragment survival,
+frozen pages after pin release/retirement, corrupt declarations and scan refusal
+without a prefix. A real test daemon verifies generated wire replies, runtime
+watch ownership, CLI/MCP equal continuation, later-ingestion isolation, optional
+profile IDs and explicit store/schema/selector/budget refusals. The additional
+source admission scenario verifies the shared eight-handle ceiling, exact
+512-byte control-character intake keys, sorted watch revisions and lease expiry.
+
+Local qualification on 2026-10-07: `make check` passed formatting, release Clippy
+with warnings denied, all workspace release tests (104 storage and 30
+RPC/daemon/MCP scenarios), seeded census self-tests and the pinned cross-workspace
+gate. All 152 ownership jobs hold with zero distinct exceptions. Evidence is
+`/tmp/sparrow-source-wire-final-check-20261007.log`.
+
+Schema-24 compatibility evidence is
+`/tmp/sparrow-source-schema24-compat.hpcbmqzd`: the current client refused status,
+keys, sources and artifacts with `UNSUPPORTED`, exit 1 and zero stdout bytes
+against a private owned archived daemon. Its archive digest is
+`d2fa1260d05c84a67e0ea1fda0a11ec7851a82fdd75593f3045a4301090a50ff`;
+the child exited cleanly under SIGINT and removed its socket. There is no fallback
+to the old contract. Owned development runtime adoption remains to be qualified.
 
 ## Schema 24 typed artifact pages
 

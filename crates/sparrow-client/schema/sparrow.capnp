@@ -47,6 +47,18 @@ struct ArtifactListQuery {
   cursor @4 :OptionalText; pageSize @5 :UInt32 = 200; scanBudget @6 :UInt32 = 10000;
 }
 struct ArtifactListPage { receipt @0 :CatalogReadReceipt; rows @1 :List(ArtifactSummary); }
+struct SourceWatchInfo { watchId @0 :Text; revision @1 :UInt64; enabled @2 :Bool; }
+struct SourceSummary {
+  sourceId @0 :Text; rdfIri @1 :Text;
+  completeArtifacts @2 :UInt64; fragmentParents @3 :UInt64; retainedRecords @4 :UInt64;
+  timeProfileId @5 :OptionalText; diagnosticProfileId @6 :OptionalText;
+  continuityUnknown @7 :Bool; watches @8 :List(SourceWatchInfo);
+}
+struct SourceListQuery {
+  storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;
+  cursor @3 :OptionalText; pageSize @4 :UInt32 = 200; scanBudget @5 :UInt32 = 10000;
+}
+struct SourceListPage { receipt @0 :CatalogReadReceipt; rows @1 :List(SourceSummary); }
 struct RecordRef { storeId @0 :Text; id @1 :Text; }
 struct Record {
   storeId @0 :Text; id @1 :Text; artifactId @2 :Text; source @3 :Text;
@@ -111,6 +123,9 @@ struct Status {
   artifactReadHandles @27 :UInt64; artifactReadBytes @28 :UInt64;
   maxArtifactReadHandles @29 :UInt64; maxArtifactReadBytes @30 :UInt64;
   artifactReadLeaseMs @31 :UInt64;
+  sourceReadHandles @32 :UInt64; sourceReadBytes @33 :UInt64;
+  maxSourceReadHandles @34 :UInt64; maxSourceReadBytes @35 :UInt64;
+  sourceReadLeaseMs @36 :UInt64;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
@@ -424,4 +439,5 @@ interface Sparrow {
   diagnosticGet @33 (source :Text) -> (result :Result(OptionalDiagnosticProfile));
   discover @34 () -> (result :Result(Discovery));
   artifactsList @35 (query :ArtifactListQuery) -> (result :Result(ArtifactListPage));
+  sourcesList @36 (query :SourceListQuery) -> (result :Result(SourceListPage));
 }

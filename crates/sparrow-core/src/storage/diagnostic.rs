@@ -383,7 +383,7 @@ pub(super) fn capture(
     DiagnosticSnapshot::decode(&snapshot.encode(), start, end)
 }
 
-fn source_key(source: &str) -> String {
+pub(super) fn source_key(source: &str) -> String {
     format!(
         "source-diagnostic:{}",
         hex::encode(blake3::hash(source.as_bytes()).as_bytes())

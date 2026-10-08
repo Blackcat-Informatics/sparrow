@@ -23,8 +23,17 @@ impl Input {
             let value = fields
                 .next()
                 .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
+            if super::catalog::option(
+                flag,
+                value,
+                &mut query.selector.source,
+                &mut query.cursor,
+                &mut query.page_size,
+                &mut query.scan_budget,
+            )? {
+                continue;
+            }
             match flag.as_str() {
-                "--source" => query.selector.source = Some(value.clone()),
                 "--received-from" => {
                     query.selector.received_from =
                         sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?
@@ -32,17 +41,6 @@ impl Input {
                 "--received-before" => {
                     query.selector.received_before =
                         sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?
-                }
-                "--cursor" => query.cursor = Some(value.clone()),
-                "--page-size" => {
-                    query.page_size = value
-                        .parse()
-                        .map_err(|_| invalid("page-size requires an integer"))?
-                }
-                "--scan-budget" => {
-                    query.scan_budget = value
-                        .parse()
-                        .map_err(|_| invalid("scan-budget requires an integer"))?
                 }
                 _ => return Err(invalid(format!("unknown artifact list option: {flag}"))),
             }

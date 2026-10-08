@@ -34,3 +34,30 @@ pub(super) fn receipt(value: wire::catalog_read_receipt::Reader<'_>) -> Result<O
         )
         .with("stop_reason", Value::Null))
 }
+
+/// Parse the shared CLI options for bounded catalog captures.
+pub(super) fn option(
+    flag: &str,
+    value: &str,
+    source: &mut Option<String>,
+    cursor: &mut Option<String>,
+    page_size: &mut usize,
+    scan_budget: &mut usize,
+) -> Result<bool> {
+    match flag {
+        "--source" => *source = Some(value.to_owned()),
+        "--cursor" => *cursor = Some(value.to_owned()),
+        "--page-size" => {
+            *page_size = value
+                .parse()
+                .map_err(|_| super::invalid("page-size requires an integer"))?
+        }
+        "--scan-budget" => {
+            *scan_budget = value
+                .parse()
+                .map_err(|_| super::invalid("scan-budget requires an integer"))?
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}

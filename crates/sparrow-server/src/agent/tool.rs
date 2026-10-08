@@ -93,6 +93,25 @@ impl Operation {
                     id: fields.required("id")?,
                 }),
                 "capabilities" => Self::Capabilities,
+                "sources_list" => {
+                    let mut query = sparrow_core::SourceRead::default();
+                    query.selector.source = fields.optional("source")?;
+                    query.cursor = fields.optional("cursor")?;
+                    query.page_size = fields
+                        .raw("page_size")?
+                        .map(u32::from_json)
+                        .transpose()?
+                        .unwrap_or(200) as usize;
+                    query.scan_budget = fields
+                        .raw("scan_budget")?
+                        .map(u32::from_json)
+                        .transpose()?
+                        .unwrap_or(10000) as usize;
+                    Self::Query(Command::Sources(super::sources::Input {
+                        store: fields.required("store_id")?,
+                        query,
+                    }))
+                }
                 "artifacts_list" => {
                     let mut query = sparrow_core::ArtifactRead::default();
                     query.selector.source = fields.optional("source")?;

@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "sources_list",
+        "Page an immutable capture of exact intake keys, retained occurrence counts, declared mapping IDs and configured watch bindings; producer continuity remains explicitly unknown.",
+    ),
+    (
         "artifacts_list",
         "Page an immutable capture of eligible complete artifacts and surviving parent provenance; original receipt-time filters refuse reclaimed parents with unknown origin metadata.",
     ),
@@ -115,12 +119,17 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
-        if *name == "artifacts_list" {
+        if ["artifacts_list", "sources_list"].contains(name) {
             properties = properties
                 .with("store_id", string())
                 .with("page_size", integer(1000))
                 .with("scan_budget", integer(100000));
-            for field in ["source", "received_from", "received_before", "cursor"] {
+            let fields: &[&str] = if *name == "artifacts_list" {
+                &["source", "received_from", "received_before", "cursor"]
+            } else {
+                &["source", "cursor"]
+            };
+            for &field in fields {
                 properties = properties.with(
                     field,
                     Object::new().with("type", Value::array(["string", "null"])),

@@ -3,7 +3,7 @@
 
 //! Pin-aware artifact discovery, including parents known only through retained records.
 
-use super::{Artifact, Catalog, Error, Record, Store, catalog_lease, random_id};
+use super::{Artifact, Catalog, Error, Record, Store, Writer, catalog_lease, random_id};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -177,11 +177,56 @@ impl Store {
         let writer = self.lock()?;
         let mut scanned = 0;
         let mut remaining = SCAN_BYTES;
-        let protected = writer.protected_matching(
+        let artifacts = writer.artifact_capture(
+            &query.selector,
+            now,
+            started,
+            query.scan_budget,
+            &mut scanned,
+            &mut remaining,
+        )?;
+        let snapshot = catalog_lease::Snapshot {
+            bytes: 0,
+            id: random_id("artifact-read")?,
+            store_id: writer.id.clone(),
+            selector: query.selector.clone(),
+            as_of: now,
+            expires_at,
+            started,
+            page_size: query.page_size,
+            scan_budget: query.scan_budget,
+            scanned,
+            body: ArtifactPageBody { artifacts },
+        };
+        drop(writer);
+        reads.publish(snapshot, now, CAPTURE_BYTES, HANDLE_BYTES, MAX_HANDLES)
+    }
+
+    pub(super) fn artifact_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {
+        let mut reads = self
+            .artifact_reads
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
+        reads.purge(now);
+        Ok((reads.snapshots.len(), reads.capacity()))
+    }
+}
+
+impl Writer {
+    pub(super) fn artifact_capture(
+        &self,
+        selector: &ArtifactSelector,
+        now: u64,
+        started: Instant,
+        scan_budget: usize,
+        scanned: &mut usize,
+        remaining: &mut usize,
+    ) -> Result<Vec<ArtifactSummary>, Error> {
+        let protected = self.protected_matching(
             now,
             |_| true,
             || {
-                if scanned == query.scan_budget
+                if *scanned == scan_budget
                     || started.elapsed() >= Duration::from_millis(catalog_lease::LEASE_MS)
                 {
                     return Err(Error::new(
@@ -189,16 +234,16 @@ impl Store {
                         "artifact pin capture exhausted scan/time admission",
                     ));
                 }
-                scanned += 1;
+                *scanned += 1;
                 Ok(())
             },
             Some(ENTRY_BYTES),
-            Some(&mut remaining),
+            Some(remaining),
         )?;
         let mut rows = BTreeMap::<String, ArtifactSummary>::new();
         let mut capacity = 4096;
         for prefix in [b"artifact:".as_slice(), b"record:".as_slice()] {
-            let mut iterator = writer.db.raw_iterator();
+            let mut iterator = self.db.raw_iterator();
             iterator.seek(prefix);
             while iterator.valid() {
                 let key = iterator.key().ok_or_else(|| {
@@ -213,7 +258,7 @@ impl Store {
                         "artifact discovery iterator value missing",
                     )
                 })?;
-                if scanned == query.scan_budget
+                if *scanned == scan_budget
                     || bytes.len() > ENTRY_BYTES
                     || started.elapsed() >= Duration::from_millis(catalog_lease::LEASE_MS)
                 {
@@ -222,8 +267,8 @@ impl Store {
                         "artifact capture exhausted entry/scan/time admission; no result published",
                     ));
                 }
-                scanned += 1;
-                super::Writer::charge_catalog(&mut remaining, bytes.len())?;
+                *scanned += 1;
+                super::Writer::charge_catalog(remaining, bytes.len())?;
                 let value = super::parse(bytes)?;
                 let (summary, retained) = if prefix == b"artifact:" {
                     let artifact = Artifact::decode(&value)?;
@@ -235,7 +280,7 @@ impl Store {
                     }
                     super::validate_ingest_labels(&artifact.id, &artifact.source, &artifact.format)
                         .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
-                    let complete = writer.live_artifact(&artifact, now, &protected);
+                    let complete = self.live_artifact(&artifact, now, &protected);
                     (
                         ArtifactSummary {
                             id: artifact.id,
@@ -260,8 +305,8 @@ impl Store {
                             "artifact discovery record identity mismatch",
                         ));
                     }
-                    writer.validate_event_record(&record)?;
-                    if !writer.live_record(&record, now, &protected) {
+                    self.validate_event_record(&record)?;
+                    if !self.live_record(&record, now, &protected) {
                         iterator.next();
                         continue;
                     }
@@ -323,8 +368,7 @@ impl Store {
             if !summary.complete_bytes_available && summary.retained_records == 0 {
                 continue;
             }
-            if query
-                .selector
+            if selector
                 .source
                 .as_ref()
                 .is_some_and(|source| source != &summary.source)
@@ -341,14 +385,12 @@ impl Store {
                 crate::format_instant(origin.received_at)
                     .and_then(|_| crate::format_instant(origin.expires_at))
                     .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
-                if origin.received_at < query.selector.received_from
-                    || origin.received_at >= query.selector.received_before
+                if origin.received_at < selector.received_from
+                    || origin.received_at >= selector.received_before
                 {
                     continue;
                 }
-            } else if query.selector.received_from != 0
-                || query.selector.received_before != u64::MAX
-            {
+            } else if selector.received_from != 0 || selector.received_before != u64::MAX {
                 return Err(Error::new(
                     "INDEX_NOT_READY",
                     "original artifact receipt time is unknown after parent reclamation; omit the receipt filter or select retained records",
@@ -356,29 +398,6 @@ impl Store {
             }
             artifacts.push(summary);
         }
-        let snapshot = catalog_lease::Snapshot {
-            bytes: 0,
-            id: random_id("artifact-read")?,
-            store_id: writer.id.clone(),
-            selector: query.selector.clone(),
-            as_of: now,
-            expires_at,
-            started,
-            page_size: query.page_size,
-            scan_budget: query.scan_budget,
-            scanned,
-            body: ArtifactPageBody { artifacts },
-        };
-        drop(writer);
-        reads.publish(snapshot, now, CAPTURE_BYTES, HANDLE_BYTES, MAX_HANDLES)
-    }
-
-    pub(super) fn artifact_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {
-        let mut reads = self
-            .artifact_reads
-            .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
-        reads.purge(now);
-        Ok((reads.snapshots.len(), reads.capacity()))
+        Ok(artifacts)
     }
 }

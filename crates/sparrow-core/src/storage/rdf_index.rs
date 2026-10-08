@@ -572,12 +572,7 @@ pub(super) fn metadata(
         ),
         (
             format!("{NS}source"),
-            builder.intern_iri(&format!(
-                "urn:sparrow:source:{}",
-                purrdf_hash::hex::encode(
-                    purrdf_hash::blake3::hash(record.source.as_bytes()).as_bytes()
-                )
-            )),
+            builder.intern_iri(&super::source_read::source_iri(&record.source)),
         ),
         (
             format!("{NS}sourceName"),

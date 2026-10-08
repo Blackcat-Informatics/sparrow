@@ -88,7 +88,7 @@ impl SourceTimeProfile {
             .with("representation", self.representation.name())
             .into()
     }
-    fn decode(value: &Value) -> Result<Self, Error> {
+    pub(super) fn decode(value: &Value) -> Result<Self, Error> {
         let source = read_field::<String>(value, "source")?;
         let path = read_field::<String>(value, "path")?;
         let representation =
@@ -253,7 +253,7 @@ impl purrdf_lex::json::record::FromJson for EventTime {
     }
 }
 
-fn source_key(source: &str) -> String {
+pub(super) fn source_key(source: &str) -> String {
     format!(
         "source-time:{}",
         hex::encode(blake3::hash(source.as_bytes()).as_bytes())

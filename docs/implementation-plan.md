@@ -15,7 +15,11 @@ and verification are recorded in [Development runtime](development-runtime.md).
 Stable-ID pin renewal is implemented through the core, typed daemon, CLI and MCP,
 including durable retry receipts and optional revision guards. Pin discovery
 and member retrieval now use finite immutable catalog pages shared by the typed
-daemon, CLI and MCP. Broader live/pin/selection query pagination remains required.
+daemon, CLI and MCP. Artifact and source discovery share the catalog lease owner;
+source inventory includes exact intake keys, mapping IDs, retained occurrence
+counts and configured watch bindings. Producer continuity remains explicitly
+unknown while stream generations and gap tracking are unfinished.
+Broader live/pin/selection query pagination remains required.
 The standalone producer client and schema-11 typed event batch operation are
 present. Native event JSONL enters the same occurrence/field/text/time indexes;
 the bounded producer queue now reconnects with immutable pending batches and

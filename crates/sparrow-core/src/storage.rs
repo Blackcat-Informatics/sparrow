@@ -35,6 +35,7 @@ pub(crate) mod rdf_view;
 mod record_fields;
 mod recordless;
 mod retire;
+pub(crate) mod source_read;
 pub(crate) mod source_time;
 mod text_index;
 pub(crate) mod watch_registry;
@@ -308,6 +309,7 @@ pub struct Store {
     pin_reads: Arc<Mutex<pin_read::Reads>>,
     rdf_read: Arc<Mutex<()>>,
     artifact_reads: Arc<Mutex<artifact_read::Reads>>,
+    source_reads: Arc<Mutex<source_read::Reads>>,
 }
 
 struct Writer {
@@ -994,6 +996,7 @@ impl Store {
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
             rdf_read: Arc::new(Mutex::new(())),
             artifact_reads: Arc::new(Mutex::new(artifact_read::Reads::default())),
+            source_reads: Arc::new(Mutex::new(source_read::Reads::default())),
         })
     }
 
@@ -1663,6 +1666,7 @@ impl Store {
     pub fn status(&self, now: u64) -> Result<Value, Error> {
         let (pin_handles, pin_bytes) = self.pin_read_stats(now)?;
         let (artifact_handles, artifact_bytes) = self.artifact_read_stats(now)?;
+        let (source_handles, source_bytes) = self.source_read_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         let live = writer.count_catalog::<Record>("record:", |record| {
@@ -1671,6 +1675,17 @@ impl Store {
         let unique_chunks = writer.count_prefix("ref:")?;
         Ok(writer
             .properties()?
+            .with("source_read_handles", source_handles.to_string())
+            .with("source_read_bytes", source_bytes.to_string())
+            .with(
+                "max_source_read_handles",
+                catalog_lease::MAX_HANDLES.to_string(),
+            )
+            .with(
+                "max_source_read_bytes",
+                catalog_lease::HANDLE_BYTES.to_string(),
+            )
+            .with("source_read_lease_ms", catalog_lease::LEASE_MS.to_string())
             .with("pin_read_handles", pin_handles.to_string())
             .with("pin_read_bytes", pin_bytes.to_string())
             .with("max_pin_read_handles", pin_read::MAX_HANDLES.to_string())

@@ -1751,6 +1751,11 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_artifact_read_handles(number(&value, "max_artifact_read_handles")?);
                 out.set_max_artifact_read_bytes(number(&value, "max_artifact_read_bytes")?);
                 out.set_artifact_read_lease_ms(number(&value, "artifact_read_lease_ms")?);
+                out.set_source_read_handles(number(&value, "source_read_handles")?);
+                out.set_source_read_bytes(number(&value, "source_read_bytes")?);
+                out.set_max_source_read_handles(number(&value, "max_source_read_handles")?);
+                out.set_max_source_read_bytes(number(&value, "max_source_read_bytes")?);
+                out.set_source_read_lease_ms(number(&value, "source_read_lease_ms")?);
             }
         }
         Ok(())
@@ -2037,6 +2042,105 @@ impl wire::sparrow::Server for Rpc {
                             original.set_byte_length(origin.byte_length);
                             original.set_original_records(origin.original_records as u64);
                         }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn sources_list(
+        self: Rc<Self>,
+        params: wire::sparrow::SourcesListParams,
+        mut results: wire::sparrow::SourcesListResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(input.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        if input.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "source listing requires the current discovered schema",
+                ),
+            );
+            return Ok(());
+        }
+        for (value, maximum) in [(input.get_source()?, 512), (input.get_cursor()?, 160)] {
+            if let wire::optional_text::Value(value) = value.which()?
+                && value?.len() > maximum
+            {
+                failure(
+                    results.get().init_result(),
+                    invalid("source selector or cursor exceeds its admission bound"),
+                );
+                return Ok(());
+            }
+        }
+        let query = sparrow_core::SourceRead {
+            selector: sparrow_core::SourceSelector {
+                source: optional(input.get_source()?)?,
+            },
+            cursor: optional(input.get_cursor()?)?,
+            page_size: input.get_page_size() as usize,
+            scan_budget: input.get_scan_budget() as usize,
+        };
+        let configured = match self.watches.snapshot() {
+            Ok(watches) => watches
+                .into_iter()
+                .map(|watch| sparrow_core::SourceWatchBinding {
+                    source: watch.definition.source,
+                    watch_id: watch.id,
+                    revision: watch.revision,
+                    enabled: watch.enabled,
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                failure(
+                    results.get().init_result(),
+                    Error::new("STORAGE_FAILURE", error.to_string()),
+                );
+                return Ok(());
+            }
+        };
+        match self
+            .work(move |store, now| store.source_read(&query, now, &configured))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(page) => {
+                let mut out = results.get().init_result().init_ok();
+                catalog_receipt(out.reborrow().init_receipt(), &page);
+                let mut rows = out.init_rows(page.body.sources.len() as u32);
+                for (index, summary) in page.body.sources.iter().enumerate() {
+                    let mut row = rows.reborrow().get(index as u32);
+                    row.set_source_id(&summary.source_id);
+                    row.set_rdf_iri(&summary.rdf_iri);
+                    row.set_complete_artifacts(summary.complete_artifacts as u64);
+                    row.set_fragment_parents(summary.fragment_parents as u64);
+                    row.set_retained_records(summary.retained_records as u64);
+                    row.set_continuity_unknown(summary.continuity_unknown);
+                    sparrow_client::encode_optional(
+                        row.reborrow().init_time_profile_id(),
+                        summary.time_profile_id.as_deref(),
+                        |mut out, value| out.set_value(value),
+                        |mut out| out.set_absent(()),
+                    );
+                    sparrow_client::encode_optional(
+                        row.reborrow().init_diagnostic_profile_id(),
+                        summary.diagnostic_profile_id.as_deref(),
+                        |mut out, value| out.set_value(value),
+                        |mut out| out.set_absent(()),
+                    );
+                    let mut watches = row.init_watches(summary.watches.len() as u32);
+                    for (index, binding) in summary.watches.iter().enumerate() {
+                        let mut watch = watches.reborrow().get(index as u32);
+                        watch.set_watch_id(&binding.watch_id);
+                        watch.set_revision(binding.revision);
+                        watch.set_enabled(binding.enabled);
                     }
                 }
             }

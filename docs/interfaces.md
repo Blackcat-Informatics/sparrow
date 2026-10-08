@@ -244,7 +244,7 @@ absent and present-list states. CLI scope files and MCP use the same native JSON
 decoder and typed encoder. Before sending a filtered read, these adapters require
 current discovery through the native client; an older daemon is refused with
 `UNSUPPORTED` rather than silently ignoring the added wire field. This discovery
-check uses the existing status scan; it is not a bounded metadata-only handshake.
+check uses bounded `discover`; explicit operational `status` remains a catalog scan.
 
 Membership expansion permits at most 100,000 direct pin members and 100,000
 record visits, including overlaps, and retains only bounded IDs/timestamps.
@@ -455,6 +455,37 @@ Explicit `status` still reads catalog counts and physical usage, and queries
 still validate the evidence they read. Corrupt evidence must produce an
 actionable failure on those paths even when discovery succeeds. Status metadata
 must agree with discovery. This wire revision does not change storage formats.
+
+Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`
+and MCP `sources_list`. Its optional exact `source` intake key, `cursor`,
+`page_size` and `scan_budget` bind one immutable source capture. CLI uses
+`--source`, `--cursor`, `--page-size` and `--scan-budget`. Store and current
+schema are required on the wire; watch declarations come from the daemon's
+watch owner, never from RPC callers. Older schemas refuse with `UNSUPPORTED`.
+
+Each row carries `source_id`, the exact intake key already used by ingestion
+and `Scope.sourceIds`, and a separate `rdf_iri` matching native occurrence RDF
+metadata. Treat both as opaque; no normalization or label/ID guessing occurs.
+Complete artifact occurrences, unavailable parents with retained fragments and
+retained record occurrences have separate exact counts. Identical content does
+not collapse occurrences. Immutable time/diagnostic mapping IDs are optional;
+use their existing get operations for definitions. Declared mapping and
+configured watch sources remain discoverable with zero retained input.
+Watch IDs, revisions and enabled state are captured and sorted within each row.
+Producer stream continuity remains `continuity_unknown=true`; this catalog is
+not a stream generation or gap ledger. Those operations remain unfinished.
+
+Sources share artifact and pin catalog lease/cursor/receipt ownership. A capture
+uses at most 2 MiB, 10,000 source rows, 32 MiB scanned catalog bytes and the
+requested aggregate scan budget (including pins, artifacts, records, mappings
+and watch declarations). Native catalog entries are bounded before decoding.
+Pages have a conservative 256 KiB ceiling, at most 15 source rows per page.
+Eight handles and 8 MiB retained source metadata are shared across store clones,
+with absolute 60-second wall/monotonic expiry. Cursors bind selector and limits;
+new ingestion, declaration changes, evidence retirement or pin release do not
+change later pages or renew protection. All scan/capacity/corruption failures
+refuse without publishing a successful prefix. Typed status exposes source
+handle counts, retained bytes and ceilings. Storage formats remain unchanged.
 
 Schema 24 adds typed `artifactsList`, CLI `sparrow SOCKET artifacts STORE_ID`
 and MCP `artifacts_list`. The initial selector accepts an exact source label and

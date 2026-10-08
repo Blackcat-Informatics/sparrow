@@ -20,6 +20,7 @@ mod records;
 mod search;
 mod selection;
 mod source_time;
+mod sources;
 mod status;
 mod watch;
 pub use error::AgentError;
@@ -32,6 +33,7 @@ pub(super) const USAGE: &str = concat!(
     "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | flush STORE_ID SESSION_ID SEQUENCE",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
+    " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | artifacts STORE_ID [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
@@ -61,6 +63,7 @@ pub(super) enum Command {
     Renew(pin::Renewal),
     PinRead(pin::Read),
     Artifacts(artifacts::Input),
+    Sources(sources::Input),
     Rdf {
         store: String,
         id: String,
@@ -206,6 +209,9 @@ impl Command {
                 sequence: decimal_u64(&Value::from(args[3].clone()))
                     .map_err(|error| invalid(error.to_string()))?,
             }));
+        }
+        if args.first().is_some_and(|arg| arg == "sources") {
+            return Ok(Self::Sources(sources::Input::parse(&args[1..])?));
         }
         if args.first().is_some_and(|arg| arg == "artifacts") {
             return Ok(Self::Artifacts(artifacts::Input::parse(&args[1..])?));
@@ -422,6 +428,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Renew(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::Sources(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Artifacts(input) = self {

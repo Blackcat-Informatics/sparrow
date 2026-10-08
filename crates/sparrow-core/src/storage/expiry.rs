@@ -90,6 +90,7 @@ impl Store {
         self.import_reclaim(now)?;
         self.pin_read_stats(now)?;
         self.artifact_read_stats(now)?;
+        self.source_read_stats(now)?;
         self.lock()?.expire_bounded(now, limits)
     }
 
