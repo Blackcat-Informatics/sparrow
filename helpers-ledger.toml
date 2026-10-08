@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "offline-turnover-qualification"
+summary = "One offline qualifier coordinates simulated cohorts, independent deadline/pin expectations and native byte/RDF checks through existing production owners; it opens only a new explicitly configured store."
+home = "sparrow_server::example_crate::turnover::main"
+entry_points = []
+spec = "docs/performance-baseline.md: simulated turnover qualification."
+vectors = ["crates/sparrow-server/examples/turnover.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(turnover_expire_records|turnover_decode_json|turnover_project_rdf)$']
+
+[[job]]
 id = "rpc-connection-default"
 summary = "One daemon configuration default supplies independent finite transport admission for Unix and TCP."
 home = "sparrow_server::config::default_rpc_connections"

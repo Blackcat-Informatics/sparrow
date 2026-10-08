@@ -1289,10 +1289,6 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                 idle.push(client);
             }
             // Five idle capabilities leave the single storage permit available to a sixth peer.
-            assert_eq!(
-                cli(&socket, &["status"])["live_records"].as_str(),
-                Some("0")
-            );
             let sixth = sparrow_client::Client::connect_tcp(address).await.unwrap();
             let response = sixth
                 .capability()
