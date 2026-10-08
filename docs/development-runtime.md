@@ -4,10 +4,65 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 47 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`d4b9aaf`; see [cooperative capture cancellation](#cooperative-capture-cancellation) for
+`5bdc775`; see [MCP notification cancellation](#mcp-notification-cancellation) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## MCP notification cancellation
+
+Signed source `5bdc775` retains each cancelled MCP job's admission and request-ID
+slot until that job is actually retired. Notifications request abort without
+removing the pending slot early; both successful and aborted completions retire
+the slot through one owner. Thus outstanding jobs and pending IDs remain bounded
+by four during cancellation bursts. Aborted jobs emit no tool reply. Each tool
+already owns its own SDK connection; dropping it closes that transport and reaches
+the daemon's connection-scoped cancellation introduced by `d4b9aaf`. The stdio
+session and sibling tool connections remain available. No schema, store format,
+runtime dependency or PurRDF pin changed.
+
+The real-daemon scenario imports 8,000 occurrences of one native JSONL payload,
+observes anonymous capture allocation and sends actual notifications for record,
+value, text and key queries over Unix and TCP, using numeric and string IDs.
+Cancelled allocation disappears; ping/status continue in the same initialized
+stdio session, with zero query leases/bytes and unchanged records. A subsequent
+complete MCP traversal returns every original intake ID exactly once and releases
+its capture. The fixture's initial 128 MiB allowance refused corpus preparation
+with `STORAGE_PRESSURE`; its final private 1 GiB allowance uses the same storage
+guard and leaves production configuration unchanged. The full source gate passed
+151 storage tests, 59 RPC tests, all remaining workspace tests, seeded census tests
+and the pinned cross gate: 236 ledger jobs and zero distinct exceptions.
+
+Selected executables were built after that gate and frozen with exact source and
+SHA-256 evidence at `~/.local/state/sparrow/mcp-cancel-images-q3hhwgtj`. Independent
+closed 7,058-record Btrfs copies at `mcp-cancel-unix-l9gui3d9` and
+`mcp-cancel-tcp-yyl4fm_2` each perform twelve notification cancellations during
+observed partially written captures. The MCP process stays alive; each cancelled
+tool produces no reply while its subsequent ping and status succeed. No status
+or result-release call runs during allocation cleanup observation. Maximum cleanup
+upper observations were 1.263 ms for Unix and 1.288 ms for TCP, within the private
+two-second qualification bound. These include notification transmission and
+sampling; they are not exact checkpoint timestamps or a production guarantee.
+Every trial ends with zero read leases/bytes and pins. Fresh and reopened captures
+preserve the initial 7,058 rows over 48 pages and store identity, with clean closes.
+Both private runs leave the public owner unchanged.
+
+Public adoption evidence at `/tmp/sparrow-mcp-cancel-live.gz0m0r9k` retains the
+closed predecessor backup, saved-intent retries, full source/generation inventory,
+grouped/JSON/field/time/text comparisons, tool declarations/refusals, image/alias
+hashes and unit/listener readback. The enabled unit is active at PID 784520 on
+`0.0.0.0:518`, LAN `192.168.2.4:518`, and the existing Unix socket. Store
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37 and 212 records are unchanged,
+with zero pins/read leases and healthy watches/durability. No new public intake
+or retirement was performed.
+
+This qualifies explicit MCP notification propagation for the four capture
+families and their bounded adapter job lifetime. Direct Cap'n Proto promise
+cancellation, other read families, sustained production cancellation bursts and
+worst-case native-call/mutex/sort latency remain unfinished. Complete governed
+SPARQL/correlation/explanations, durable receiver windows, production volume/quota
+qualification, forced physical reclamation and reboot acceptance also remain
+unfinished.
 
 ## Cooperative capture cancellation
 
