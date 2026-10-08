@@ -4055,5 +4055,29 @@ schema or storage format changed. Focused evidence is
 `/tmp/sparrow-agent-tcp-focused.log`; repository and normal signed commit gates
 are `/tmp/sparrow-agent-tcp-check.log` and `/tmp/sparrow-agent-tcp-commit.log`.
 
-This client change has not yet been installed; the schema-41 daemon remains
-running without a lifecycle change. Full architecture acceptance remains unmet.
+The verified client from signed source `9406d95` is installed at
+`/home/paudley/.local/libexec/sparrow/sparrow-schema41-9406d95`, SHA-256
+`7f57ba0de3c036b8e542ddf956345ab1e5c913bbcb229d1686a1f291dcbab532`.
+It was explicitly rebuilt after the commit hook, installed with exclusive
+creation, and compared byte-for-byte with the selected release artifact.
+The build log is `/tmp/sparrow-agent-tcp-bins.log`.
+
+Live evidence is `/tmp/sparrow-agent-tcp-live.scuso56c`. Its `verify.py` uses the
+installed CLI and stdio MCP over `tcp://192.168.2.4:518`, reusing the saved
+schema-41 native retirement intent. Reads and exact admitted retries preserve
+the original receipt, 92 source bytes, terminal clocks and replacement file.
+Text, key, decoded-value, temporal and record rows agree between the installed
+CLI's LAN TCP and Unix endpoints. The temporal interval selects the two original
+retirement records; text and decoded-value searches each select one record.
+The store remains `store:46c88e949ccec658600b66c7becd5bb7`, schema 41,
+format 37, with 212 live records, no pins or read handles, and no watch failure.
+Daemon PID 1157669 and its installed image are unchanged; no restart or new
+source intake was needed. The full and signed-hook gates passed 139 storage
+scenarios, 51 RPC scenarios, 16 SDK tests, remaining workspace tests and census
+gates with 210 ownership jobs and no distinct exceptions.
+
+For remote agent access, run the installed client with the TCP endpoint followed
+by `mcp --stdio`, or a CLI command such as `status`. The daemon continues to bind
+`0.0.0.0:518`. Permanent service packaging and full architecture acceptance,
+including the documented upstream stored-view SPARQL integration gaps, remain
+unfinished.
