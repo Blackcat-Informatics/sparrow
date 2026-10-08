@@ -413,6 +413,18 @@ struct RawPreparation {
 struct OptionalRawPreparation { union { absent @0 :Void; value @1 :RawPreparation; } }
 struct ImportCanceled { import @0 :ImportRef; durability @1 :Durability = durable; }
 
+struct ResultNextQuery { storeId @0 :Text; schemaVersion @1 :UInt32; cursor @2 :Text; }
+struct ResultPage {
+  union {
+    records @0 :RecordsResults;
+    text @1 :TextSearchPage;
+    keys @2 :Keys;
+    values @3 :Values;
+    artifacts @4 :ArtifactListPage;
+    sources @5 :SourceListPage;
+    pins @6 :PinReadPage;
+  }
+}
 interface Sparrow {
   status @0 () -> (result :Result(Status));
   ingest @1 (request :Ingest) -> (result :Result(Artifact));
@@ -451,4 +463,5 @@ interface Sparrow {
   discover @34 () -> (result :Result(Discovery));
   artifactsList @35 (query :ArtifactListQuery) -> (result :Result(ArtifactListPage));
   sourcesList @36 (query :SourceListQuery) -> (result :Result(SourceListPage));
+  resultNext @37 (query :ResultNextQuery) -> (result :Result(ResultPage));
 }

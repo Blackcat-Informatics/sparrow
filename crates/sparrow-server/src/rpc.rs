@@ -240,6 +240,297 @@ fn json_kind(kind: &str) -> capnp::Result<wire::JsonKind> {
     }
 }
 
+fn records_page(
+    mut out: wire::records_results::Builder<'_>,
+    page: &sparrow_core::RecordReadPage,
+    value: &Value,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_page(), page);
+    receipt(out.reborrow().init_receipt(), value)?;
+    out.set_field_visits(number(value, "field_visits")?);
+    count(
+        out.reborrow().init_qualified_records(),
+        value,
+        "qualified_records",
+    )?;
+    out.set_known_qualified_records(number(value, "known_qualified_records")?);
+    out.set_time_basis(match field::<String>(value, "time_basis")?.as_str() {
+        "received_at" => wire::TimeBasis::ReceivedAt,
+        "event_time" => wire::TimeBasis::EventTime,
+        _ => return Err(capnp::Error::failed("invalid captured time basis".into())),
+    });
+    let coverage = value
+        .get("event_coverage")
+        .ok_or_else(|| capnp::Error::failed("missing event coverage".into()))?;
+    let mut target = out.reborrow().init_event_coverage();
+    target.set_evaluated(number(coverage, "evaluated")?);
+    target.set_unknown(number(coverage, "unknown")?);
+    target.set_outside_interval(number(coverage, "outside_interval")?);
+    target.set_membership_complete(field::<bool>(coverage, "membership_complete")?);
+    if value.get("ranking").is_some() {
+        text_results(out.reborrow().init_text().init_value(), value)?;
+    }
+    let source = rows(value)?;
+    let mut targets = out.init_rows(source.len() as u32);
+    for (index, row) in source.iter().enumerate() {
+        let mut target = targets.reborrow().get(index as u32);
+        target.set_record_id(field::<String>(row, "record_id")?);
+        target.set_artifact_id(field::<String>(row, "artifact_id")?);
+        target.set_source(field::<String>(row, "source")?);
+        target.reborrow().init_received_at().set_unix_millis(
+            sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?,
+        );
+        target.set_byte_start(number(row, "byte_start")?);
+        target.set_byte_end(number(row, "byte_end")?);
+        let event = row
+            .get("event_time")
+            .ok_or_else(|| capnp::Error::failed("missing captured event time".into()))?;
+        let event =
+            <sparrow_core::EventTime as purrdf_lex::json::record::FromJson>::from_json(event)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        event_time(target.reborrow().init_event_time(), &event)?;
+        crate::diagnostics::snapshot(
+            target.reborrow().init_diagnostics(),
+            &field::<sparrow_core::DiagnosticSnapshot>(row, "diagnostics")?,
+        );
+        let fields = row
+            .get("fields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| capnp::Error::failed("missing captured field witnesses".into()))?;
+        let mut targets = target.init_fields(fields.len() as u32);
+        for (index, field_value) in fields.iter().enumerate() {
+            let mut target = targets.reborrow().get(index as u32);
+            target.set_predicate_index(
+                u32::try_from(number(field_value, "predicate_index")?)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+            );
+            target.set_occurrence(number(field_value, "occurrence")?);
+            target.set_path(field::<String>(field_value, "path")?);
+            target.set_kind(json_kind(&field::<String>(field_value, "kind")?)?);
+            target.set_source_start(number(field_value, "source_start")?);
+            target.set_source_end(number(field_value, "source_end")?);
+            if let Some(label) = field_value.get("parent_binding").and_then(Value::as_str) {
+                target.reborrow().init_parent_binding().set_value(label);
+            }
+            if !field_value.get("bound_parent").is_some_and(Value::is_null) {
+                target
+                    .init_bound_parent()
+                    .set_value(number(field_value, "bound_parent")?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn text_page(
+    mut out: wire::text_search_page::Builder<'_>,
+    page: &sparrow_core::RecordReadPage,
+    value: &Value,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_page(), page);
+    text_results(out.init_result(), value)?;
+    Ok(())
+}
+
+fn artifacts_page(
+    mut out: wire::artifact_list_page::Builder<'_>,
+    page: &sparrow_core::ArtifactReadPage,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_receipt(), page);
+    let encoded = page.body.diagnostic_coverage.encode(
+        page.body.diagnostic_coverage.evaluated,
+        page.body.diagnostic_coverage.matched,
+        [0; 3],
+        false,
+    );
+    diagnostic_coverage(
+        out.reborrow().init_coverage(),
+        encoded
+            .get("diagnostic_scope")
+            .ok_or_else(|| capnp::Error::failed("missing artifact diagnostic coverage".into()))?,
+    )?;
+    count(
+        out.reborrow().init_matching_records(),
+        &encoded,
+        "eligible_records",
+    )?;
+    let mut rows = out.init_rows(page.body.artifacts.len() as u32);
+    for (index, summary) in page.body.artifacts.iter().enumerate() {
+        let mut row = rows.reborrow().get(index as u32);
+        row.set_id(&summary.id);
+        row.set_source(&summary.source);
+        row.set_complete_bytes_available(summary.complete_bytes_available);
+        row.set_retained_records(summary.retained_records as u64);
+        let encoded = summary.diagnostic_coverage.encode(
+            summary.diagnostic_coverage.evaluated,
+            summary.diagnostic_coverage.matched,
+            [0; 3],
+            false,
+        );
+        diagnostic_coverage(
+            row.reborrow().init_coverage(),
+            encoded
+                .get("diagnostic_scope")
+                .ok_or_else(|| capnp::Error::failed("missing artifact record coverage".into()))?,
+        )?;
+        count(
+            row.reborrow().init_matching_records(),
+            &encoded,
+            "eligible_records",
+        )?;
+        let mut original = row.init_origin();
+        match &summary.origin {
+            None => original.set_absent(()),
+            Some(origin) => {
+                let mut original = original.init_value();
+                original.set_format(stored_format(&origin.format)?);
+                original
+                    .reborrow()
+                    .init_received_at()
+                    .set_unix_millis(origin.received_at);
+                original
+                    .reborrow()
+                    .init_expires_at()
+                    .set_unix_millis(origin.expires_at);
+                original.set_byte_length(origin.byte_length);
+                original.set_original_records(origin.original_records as u64);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sources_page(
+    mut out: wire::source_list_page::Builder<'_>,
+    page: &sparrow_core::SourceReadPage,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_receipt(), page);
+    let mut rows = out.init_rows(page.body.sources.len() as u32);
+    for (index, summary) in page.body.sources.iter().enumerate() {
+        let mut row = rows.reborrow().get(index as u32);
+        row.set_source_id(&summary.source_id);
+        row.set_rdf_iri(&summary.rdf_iri);
+        row.set_complete_artifacts(summary.complete_artifacts as u64);
+        row.set_fragment_parents(summary.fragment_parents as u64);
+        row.set_retained_records(summary.retained_records as u64);
+        row.set_continuity_unknown(summary.continuity_unknown);
+        sparrow_client::encode_optional(
+            row.reborrow().init_time_profile_id(),
+            summary.time_profile_id.as_deref(),
+            |mut out, value| out.set_value(value),
+            |mut out| out.set_absent(()),
+        );
+        sparrow_client::encode_optional(
+            row.reborrow().init_diagnostic_profile_id(),
+            summary.diagnostic_profile_id.as_deref(),
+            |mut out, value| out.set_value(value),
+            |mut out| out.set_absent(()),
+        );
+        let mut watches = row.init_watches(summary.watches.len() as u32);
+        for (index, binding) in summary.watches.iter().enumerate() {
+            let mut watch = watches.reborrow().get(index as u32);
+            watch.set_watch_id(&binding.watch_id);
+            watch.set_revision(binding.revision);
+            watch.set_enabled(binding.enabled);
+        }
+    }
+    Ok(())
+}
+
+fn pins_page(
+    mut out: wire::pin_read_page::Builder<'_>,
+    page: &sparrow_core::PinReadPage,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_receipt(), page);
+    match &page.body {
+        PinPageBody::Collections(rows) => {
+            let mut list = out.init_collections(rows.len() as u32);
+            for (index, row) in rows.iter().enumerate() {
+                pin_summary(list.reborrow().get(index as u32), row);
+            }
+        }
+        PinPageBody::Members { pin, members } => {
+            let mut body = out.init_members();
+            pin_summary(body.reborrow().init_pin(), pin);
+            let mut list = body.init_members(members.len() as u32);
+            for (index, id) in members.iter().enumerate() {
+                let mut item = list.reborrow().get(index as u32);
+                item.set_store_id(&page.store_id);
+                if id.starts_with("artifact:") {
+                    item.set_artifact(id);
+                } else {
+                    item.set_record(id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn keys_page(
+    mut out: wire::keys::Builder<'_>,
+    page: &sparrow_core::RecordReadPage,
+    value: &Value,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_page(), page);
+    receipt(out.reborrow().init_receipt(), value)?;
+    let source = rows(value)?;
+    let mut target = out.init_rows(source.len() as u32);
+    for (index, row) in source.iter().enumerate() {
+        let mut target = target.reborrow().get(index as u32);
+        target.set_path(field::<String>(row, "path")?);
+        target.set_kind(json_kind(&field::<String>(row, "kind")?)?);
+        target.set_occurrences(number(row, "occurrences")?);
+        target.set_records(number(row, "records")?);
+    }
+    Ok(())
+}
+
+fn values_page(
+    mut out: wire::values::Builder<'_>,
+    page: &sparrow_core::RecordReadPage,
+    value: &Value,
+) -> capnp::Result<()> {
+    catalog_receipt(out.reborrow().init_page(), page);
+    receipt(out.reborrow().init_receipt(), value)?;
+    let source = rows(value)?;
+    let mut target = out.init_rows(source.len() as u32);
+    for (index, row) in source.iter().enumerate() {
+        let mut target = target.reborrow().get(index as u32);
+        target.set_record_id(field::<String>(row, "record_id")?);
+        target.set_artifact_id(field::<String>(row, "artifact_id")?);
+        target.set_source(field::<String>(row, "source")?);
+        target.reborrow().init_received_at().set_unix_millis(
+            sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?,
+        );
+        target.set_source_start(number(row, "source_start")?);
+        target.set_source_end(number(row, "source_end")?);
+        let fact = row
+            .get("value")
+            .ok_or_else(|| capnp::Error::failed("missing native JSON match".into()))?;
+        target.set_occurrence(number(fact, "occurrence")?);
+        target.set_path(field::<String>(fact, "path")?);
+        target.set_kind(json_kind(&field::<String>(fact, "kind")?)?);
+        let mut fields = JsonRecord::new(fact, "native JSON match")
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let lexical: Option<String> = fields
+            .optional("lexical")
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let decoded: Option<String> = fields
+            .optional("decoded")
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        if let Some(lexical) = lexical {
+            target.reborrow().init_lexical().set_value(&lexical);
+        }
+        if let Some(decoded) = decoded {
+            target.reborrow().init_decoded().set_value(&decoded);
+        }
+    }
+    Ok(())
+}
+
 fn query_cursor(value: wire::optional_text::Reader<'_>) -> Result<Option<String>, Error> {
     if let wire::optional_text::Value(text) = value.which().map_err(invalid)?
         && text.map_err(invalid)?.len() > 160
@@ -1554,7 +1845,6 @@ impl wire::sparrow::Server for Rpc {
             fields,
             require_complete_index: input.get_require_complete_index(),
         };
-        let has_text = query.text.is_some();
         let cursor = query_cursor(input.get_cursor()?);
         match self
             .work(move |store, now| {
@@ -1574,85 +1864,7 @@ impl wire::sparrow::Server for Rpc {
         {
             Err(error) => failure(results.get().init_result(), error),
             Ok((page, value)) => {
-                let mut out = results.get().init_result().init_ok();
-                catalog_receipt(out.reborrow().init_page(), &page);
-                receipt(out.reborrow().init_receipt(), &value)?;
-                out.set_field_visits(number(&value, "field_visits")?);
-                count(
-                    out.reborrow().init_qualified_records(),
-                    &value,
-                    "qualified_records",
-                )?;
-                out.set_known_qualified_records(number(&value, "known_qualified_records")?);
-                out.set_time_basis(match field::<String>(&value, "time_basis")?.as_str() {
-                    "received_at" => wire::TimeBasis::ReceivedAt,
-                    "event_time" => wire::TimeBasis::EventTime,
-                    _ => return Err(capnp::Error::failed("invalid captured time basis".into())),
-                });
-                let coverage = value
-                    .get("event_coverage")
-                    .ok_or_else(|| capnp::Error::failed("missing event coverage".into()))?;
-                let mut target = out.reborrow().init_event_coverage();
-                target.set_evaluated(number(coverage, "evaluated")?);
-                target.set_unknown(number(coverage, "unknown")?);
-                target.set_outside_interval(number(coverage, "outside_interval")?);
-                target.set_membership_complete(field::<bool>(coverage, "membership_complete")?);
-                if has_text {
-                    text_results(out.reborrow().init_text().init_value(), &value)?;
-                }
-                let source = rows(&value)?;
-                let mut targets = out.init_rows(source.len() as u32);
-                for (index, row) in source.iter().enumerate() {
-                    let mut target = targets.reborrow().get(index as u32);
-                    target.set_record_id(field::<String>(row, "record_id")?);
-                    target.set_artifact_id(field::<String>(row, "artifact_id")?);
-                    target.set_source(field::<String>(row, "source")?);
-                    target.reborrow().init_received_at().set_unix_millis(
-                        sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
-                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
-                    );
-                    target.set_byte_start(number(row, "byte_start")?);
-                    target.set_byte_end(number(row, "byte_end")?);
-                    let event = row.get("event_time").ok_or_else(|| {
-                        capnp::Error::failed("missing captured event time".into())
-                    })?;
-                    let event =
-                        <sparrow_core::EventTime as purrdf_lex::json::record::FromJson>::from_json(
-                            event,
-                        )
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    event_time(target.reborrow().init_event_time(), &event)?;
-                    crate::diagnostics::snapshot(
-                        target.reborrow().init_diagnostics(),
-                        &field::<sparrow_core::DiagnosticSnapshot>(row, "diagnostics")?,
-                    );
-                    let fields = row.get("fields").and_then(Value::as_array).ok_or_else(|| {
-                        capnp::Error::failed("missing captured field witnesses".into())
-                    })?;
-                    let mut targets = target.init_fields(fields.len() as u32);
-                    for (index, field_value) in fields.iter().enumerate() {
-                        let mut target = targets.reborrow().get(index as u32);
-                        target.set_predicate_index(
-                            u32::try_from(number(field_value, "predicate_index")?)
-                                .map_err(|e| capnp::Error::failed(e.to_string()))?,
-                        );
-                        target.set_occurrence(number(field_value, "occurrence")?);
-                        target.set_path(field::<String>(field_value, "path")?);
-                        target.set_kind(json_kind(&field::<String>(field_value, "kind")?)?);
-                        target.set_source_start(number(field_value, "source_start")?);
-                        target.set_source_end(number(field_value, "source_end")?);
-                        if let Some(label) =
-                            field_value.get("parent_binding").and_then(Value::as_str)
-                        {
-                            target.reborrow().init_parent_binding().set_value(label);
-                        }
-                        if !field_value.get("bound_parent").is_some_and(Value::is_null) {
-                            target
-                                .init_bound_parent()
-                                .set_value(number(field_value, "bound_parent")?);
-                        }
-                    }
-                }
+                records_page(results.get().init_result().init_ok(), &page, &value)?;
             }
         }
         Ok(())
@@ -1695,9 +1907,7 @@ impl wire::sparrow::Server for Rpc {
         {
             Err(error) => failure(results.get().init_result(), error),
             Ok((page, value)) => {
-                let mut out = results.get().init_result().init_ok();
-                catalog_receipt(out.reborrow().init_page(), &page);
-                text_results(out.init_result(), &value)?;
+                text_page(results.get().init_result().init_ok(), &page, &value)?;
             }
         }
         Ok(())
@@ -2108,68 +2318,7 @@ impl wire::sparrow::Server for Rpc {
         {
             Err(error) => failure(results.get().init_result(), error),
             Ok(page) => {
-                let mut out = results.get().init_result().init_ok();
-                catalog_receipt(out.reborrow().init_receipt(), &page);
-                let encoded = page.body.diagnostic_coverage.encode(
-                    page.body.diagnostic_coverage.evaluated,
-                    page.body.diagnostic_coverage.matched,
-                    [0; 3],
-                    false,
-                );
-                diagnostic_coverage(
-                    out.reborrow().init_coverage(),
-                    encoded.get("diagnostic_scope").ok_or_else(|| {
-                        capnp::Error::failed("missing artifact diagnostic coverage".into())
-                    })?,
-                )?;
-                count(
-                    out.reborrow().init_matching_records(),
-                    &encoded,
-                    "eligible_records",
-                )?;
-                let mut rows = out.init_rows(page.body.artifacts.len() as u32);
-                for (index, summary) in page.body.artifacts.iter().enumerate() {
-                    let mut row = rows.reborrow().get(index as u32);
-                    row.set_id(&summary.id);
-                    row.set_source(&summary.source);
-                    row.set_complete_bytes_available(summary.complete_bytes_available);
-                    row.set_retained_records(summary.retained_records as u64);
-                    let encoded = summary.diagnostic_coverage.encode(
-                        summary.diagnostic_coverage.evaluated,
-                        summary.diagnostic_coverage.matched,
-                        [0; 3],
-                        false,
-                    );
-                    diagnostic_coverage(
-                        row.reborrow().init_coverage(),
-                        encoded.get("diagnostic_scope").ok_or_else(|| {
-                            capnp::Error::failed("missing artifact record coverage".into())
-                        })?,
-                    )?;
-                    count(
-                        row.reborrow().init_matching_records(),
-                        &encoded,
-                        "eligible_records",
-                    )?;
-                    let mut original = row.init_origin();
-                    match &summary.origin {
-                        None => original.set_absent(()),
-                        Some(origin) => {
-                            let mut original = original.init_value();
-                            original.set_format(stored_format(&origin.format)?);
-                            original
-                                .reborrow()
-                                .init_received_at()
-                                .set_unix_millis(origin.received_at);
-                            original
-                                .reborrow()
-                                .init_expires_at()
-                                .set_unix_millis(origin.expires_at);
-                            original.set_byte_length(origin.byte_length);
-                            original.set_original_records(origin.original_records as u64);
-                        }
-                    }
-                }
+                artifacts_page(results.get().init_result().init_ok(), &page)?;
             }
         }
         Ok(())
@@ -2238,37 +2387,7 @@ impl wire::sparrow::Server for Rpc {
         {
             Err(error) => failure(results.get().init_result(), error),
             Ok(page) => {
-                let mut out = results.get().init_result().init_ok();
-                catalog_receipt(out.reborrow().init_receipt(), &page);
-                let mut rows = out.init_rows(page.body.sources.len() as u32);
-                for (index, summary) in page.body.sources.iter().enumerate() {
-                    let mut row = rows.reborrow().get(index as u32);
-                    row.set_source_id(&summary.source_id);
-                    row.set_rdf_iri(&summary.rdf_iri);
-                    row.set_complete_artifacts(summary.complete_artifacts as u64);
-                    row.set_fragment_parents(summary.fragment_parents as u64);
-                    row.set_retained_records(summary.retained_records as u64);
-                    row.set_continuity_unknown(summary.continuity_unknown);
-                    sparrow_client::encode_optional(
-                        row.reborrow().init_time_profile_id(),
-                        summary.time_profile_id.as_deref(),
-                        |mut out, value| out.set_value(value),
-                        |mut out| out.set_absent(()),
-                    );
-                    sparrow_client::encode_optional(
-                        row.reborrow().init_diagnostic_profile_id(),
-                        summary.diagnostic_profile_id.as_deref(),
-                        |mut out, value| out.set_value(value),
-                        |mut out| out.set_absent(()),
-                    );
-                    let mut watches = row.init_watches(summary.watches.len() as u32);
-                    for (index, binding) in summary.watches.iter().enumerate() {
-                        let mut watch = watches.reborrow().get(index as u32);
-                        watch.set_watch_id(&binding.watch_id);
-                        watch.set_revision(binding.revision);
-                        watch.set_enabled(binding.enabled);
-                    }
-                }
+                sources_page(results.get().init_result().init_ok(), &page)?;
             }
         }
         Ok(())
@@ -2327,30 +2446,7 @@ impl wire::sparrow::Server for Rpc {
         {
             Err(error) => failure(results.get().init_result(), error),
             Ok(page) => {
-                let mut out = results.get().init_result().init_ok();
-                catalog_receipt(out.reborrow().init_receipt(), &page);
-                match &page.body {
-                    PinPageBody::Collections(rows) => {
-                        let mut list = out.init_collections(rows.len() as u32);
-                        for (index, row) in rows.iter().enumerate() {
-                            pin_summary(list.reborrow().get(index as u32), row);
-                        }
-                    }
-                    PinPageBody::Members { pin, members } => {
-                        let mut body = out.init_members();
-                        pin_summary(body.reborrow().init_pin(), pin);
-                        let mut list = body.init_members(members.len() as u32);
-                        for (index, id) in members.iter().enumerate() {
-                            let mut item = list.reborrow().get(index as u32);
-                            item.set_store_id(&page.store_id);
-                            if id.starts_with("artifact:") {
-                                item.set_artifact(id);
-                            } else {
-                                item.set_record(id);
-                            }
-                        }
-                    }
-                }
+                pins_page(results.get().init_result().init_ok(), &page)?;
             }
         }
         Ok(())
@@ -2436,6 +2532,84 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn result_next(
+        self: Rc<Self>,
+        params: wire::sparrow::ResultNextParams,
+        mut results: wire::sparrow::ResultNextResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "result continuation requires the current schema",
+                ),
+            );
+            return Ok(());
+        }
+        if query.get_cursor()?.len() > 160 || query.get_store_id()?.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("result cursor/store identity exceeds admission"),
+            );
+            return Ok(());
+        }
+        let store_id = query.get_store_id()?.to_str()?.to_owned();
+        let cursor = query.get_cursor()?.to_str()?.to_owned();
+        match self
+            .work(move |store, now| store.result_next(&store_id, &cursor, now))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(page) => {
+                let out = results.get().init_result().init_ok();
+                match page {
+                    sparrow_core::ResultPage::Records(page) => records_page(
+                        out.init_records(),
+                        &page,
+                        &page
+                            .body
+                            .result()
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                    )?,
+                    sparrow_core::ResultPage::Text(page) => text_page(
+                        out.init_text(),
+                        &page,
+                        &page
+                            .body
+                            .result()
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                    )?,
+                    sparrow_core::ResultPage::Keys(page) => keys_page(
+                        out.init_keys(),
+                        &page,
+                        &page
+                            .body
+                            .result()
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                    )?,
+                    sparrow_core::ResultPage::Values(page) => values_page(
+                        out.init_values(),
+                        &page,
+                        &page
+                            .body
+                            .result()
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                    )?,
+                    sparrow_core::ResultPage::Artifacts(page) => {
+                        artifacts_page(out.init_artifacts(), &page)?
+                    }
+                    sparrow_core::ResultPage::Sources(page) => {
+                        sources_page(out.init_sources(), &page)?
+                    }
+                    sparrow_core::ResultPage::Pins(page) => pins_page(out.init_pins(), &page)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn keys_list(
         self: Rc<Self>,
         params: wire::sparrow::KeysListParams,
@@ -2462,18 +2636,7 @@ impl wire::sparrow::Server for Rpc {
                     .body
                     .result()
                     .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                let mut out = results.get().init_result().init_ok();
-                catalog_receipt(out.reborrow().init_page(), &page);
-                receipt(out.reborrow().init_receipt(), &value)?;
-                let source = rows(&value)?;
-                let mut target = out.init_rows(source.len() as u32);
-                for (index, row) in source.iter().enumerate() {
-                    let mut target = target.reborrow().get(index as u32);
-                    target.set_path(field::<String>(row, "path")?);
-                    target.set_kind(json_kind(&field::<String>(row, "kind")?)?);
-                    target.set_occurrences(number(row, "occurrences")?);
-                    target.set_records(number(row, "records")?);
-                }
+                keys_page(results.get().init_result().init_ok(), &page, &value)?;
             }
             Err(e) => failure(results.get().init_result(), e),
         }
@@ -2512,43 +2675,7 @@ impl wire::sparrow::Server for Rpc {
                     .body
                     .result()
                     .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                let mut out = results.get().init_result().init_ok();
-                catalog_receipt(out.reborrow().init_page(), &page);
-                receipt(out.reborrow().init_receipt(), &value)?;
-                let source = rows(&value)?;
-                let mut target = out.init_rows(source.len() as u32);
-                for (index, row) in source.iter().enumerate() {
-                    let mut target = target.reborrow().get(index as u32);
-                    target.set_record_id(field::<String>(row, "record_id")?);
-                    target.set_artifact_id(field::<String>(row, "artifact_id")?);
-                    target.set_source(field::<String>(row, "source")?);
-                    target.reborrow().init_received_at().set_unix_millis(
-                        sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
-                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
-                    );
-                    target.set_source_start(number(row, "source_start")?);
-                    target.set_source_end(number(row, "source_end")?);
-                    let fact = row
-                        .get("value")
-                        .ok_or_else(|| capnp::Error::failed("missing native JSON match".into()))?;
-                    target.set_occurrence(number(fact, "occurrence")?);
-                    target.set_path(field::<String>(fact, "path")?);
-                    target.set_kind(json_kind(&field::<String>(fact, "kind")?)?);
-                    let mut fields = JsonRecord::new(fact, "native JSON match")
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let lexical: Option<String> = fields
-                        .optional("lexical")
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let decoded: Option<String> = fields
-                        .optional("decoded")
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if let Some(lexical) = lexical {
-                        target.reborrow().init_lexical().set_value(&lexical);
-                    }
-                    if let Some(decoded) = decoded {
-                        target.reborrow().init_decoded().set_value(&decoded);
-                    }
-                }
+                values_page(results.get().init_result().init_ok(), &page, &value)?;
             }
             Err(e) => failure(results.get().init_result(), e),
         }

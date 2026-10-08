@@ -32,8 +32,35 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 30; the schema sections
+The current source implements schema 31; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 31 cursor-only result continuation
+
+The core, typed daemon, CLI and MCP now resume captured results without repeating
+selectors. ResultPage preserves each existing operation through a typed union;
+pin collections/members retain their nested union. All original operations and
+result_next use the same wire encoders and canonical agent renderers. Query
+replies include their operation identity. Continuation does not re-evaluate
+membership, pin names, watch configuration, native predicates or ranking.
+
+Cursor parsing and page-boundary/expiry staging are owned by the existing
+catalog lease module. Captured-selector inspection borrows the bounded stored
+selector rather than allocating another copy. Store mismatch, invalid positions
+and expired/unknown/previous-owner cursors refuse without successful rows. No new
+capture or retention protection is created and no absolute lease is renewed.
+
+The full source gate passes release Clippy with warnings denied, 120 storage
+scenarios, 37 RPC/daemon scenarios, seeded census self-tests and the pinned
+cross-workspace gate (167 ledger jobs, zero distinct exceptions). New scenarios
+compare original continuations with cursor-only CLI/MCP replies and typed wire
+union identity for all eight existing page shapes, including both pin variants.
+Core evidence also covers released-pin replay, foreign/unknown/previous-owner
+handles, malformed and variable byte-page positions, and fixed absolute expiry.
+The MCP catalog exposes 24 tools; result_next has a closed read-only input.
+
+Source qualification and runtime adoption are separate; the schema 30 section
+below preserves the preceding runtime evidence.
 
 ## Schema 30 JSON discovery result pages
 

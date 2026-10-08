@@ -20,7 +20,12 @@ pub(super) async fn execute(
         wire::result::Ok(found) => found?,
         wire::result::Error(error) => return Err(failure(error?)),
     };
+    page(found)
+}
+
+pub(super) fn page(found: wire::text_search_page::Reader<'_>) -> Result<Value> {
     Ok(render(found.get_result()?)?
+        .with("operation", "text_search")
         .with("page", super::catalog::page(found.get_page()?)?)
         .into())
 }

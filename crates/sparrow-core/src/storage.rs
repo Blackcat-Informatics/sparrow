@@ -35,6 +35,7 @@ pub(crate) mod rdf_view;
 mod record_fields;
 pub(crate) mod record_read;
 mod recordless;
+pub(crate) mod result_read;
 mod retire;
 pub(crate) mod source_read;
 pub(crate) mod source_time;

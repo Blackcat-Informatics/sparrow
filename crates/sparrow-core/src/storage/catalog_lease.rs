@@ -113,6 +113,28 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
     pub(super) fn alive(&self, now: u64) -> bool {
         now < self.expires_at && self.started.elapsed() < Duration::from_millis(LEASE_MS)
     }
+    fn resume(&self, start: usize, now: u64) -> Result<CatalogReadPage<B>, Error> {
+        if !self.alive(now) {
+            return Err(Error::new(
+                "RESULT_EXPIRED",
+                "catalog read lease ended before page staging",
+            ));
+        }
+        if start == 0 || start >= self.body.len() || !self.body.is_boundary(start, self.page_size) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "cursor is not a captured page boundary",
+            ));
+        }
+        let page = self.page(start);
+        if !self.alive(now) {
+            return Err(Error::new(
+                "RESULT_EXPIRED",
+                "catalog read lease ended during page staging",
+            ));
+        }
+        Ok(page)
+    }
     fn page(&self, start: usize) -> CatalogReadPage<B> {
         let end = self.body.page_end(start, self.page_size);
         CatalogReadPage {
@@ -128,6 +150,29 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
             scanned: self.scanned,
             body: self.body.page(start, end),
         }
+    }
+}
+
+pub(super) struct Cursor<'a> {
+    id: &'a str,
+    start: usize,
+}
+impl<'a> Cursor<'a> {
+    pub(super) fn parse(cursor: &'a str) -> Result<Self, Error> {
+        let (id, index) = cursor
+            .split_once('/')
+            .filter(|_| cursor.len() <= 160)
+            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "invalid catalog page cursor"))?;
+        if index.is_empty() || !index.as_bytes().iter().all(u8::is_ascii_digit) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "invalid catalog page position",
+            ));
+        }
+        let start: usize = index
+            .parse()
+            .map_err(|_| Error::new("INVALID_ARGUMENT", "invalid catalog page position"))?;
+        Ok(Self { id, start })
     }
 }
 
@@ -158,25 +203,8 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
         scan_budget: usize,
         now: u64,
     ) -> Result<CatalogReadPage<B>, Error> {
-        let (id, index) = cursor
-            .split_once('/')
-            .filter(|_| cursor.len() <= 160)
-            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "invalid catalog page cursor"))?;
-        if index.is_empty() || !index.as_bytes().iter().all(u8::is_ascii_digit) {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "invalid catalog page position",
-            ));
-        }
-        let start: usize = index
-            .parse()
-            .map_err(|_| Error::new("INVALID_ARGUMENT", "invalid catalog page position"))?;
-        let snapshot = self.snapshots.get(id).ok_or_else(|| {
-            Error::new(
-                "RESULT_EXPIRED",
-                "catalog read handle is expired, unknown, or from a previous store owner",
-            )
-        })?;
+        let cursor = Cursor::parse(cursor)?;
+        let snapshot = self.snapshot(&cursor)?;
         if &snapshot.selector != selector
             || snapshot.page_size != page_size
             || snapshot.scan_budget != scan_budget
@@ -186,23 +214,25 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
                 "cursor requires its original operation, selector and limits",
             ));
         }
-        if start == 0
-            || start >= snapshot.body.len()
-            || !snapshot.body.is_boundary(start, snapshot.page_size)
-        {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "cursor is not a captured page boundary",
-            ));
-        }
-        let page = snapshot.page(start);
-        if !snapshot.alive(now) {
-            return Err(Error::new(
+        snapshot.resume(cursor.start, now)
+    }
+    fn snapshot(&self, cursor: &Cursor<'_>) -> Result<&Snapshot<S, B>, Error> {
+        self.snapshots.get(cursor.id).ok_or_else(|| {
+            Error::new(
                 "RESULT_EXPIRED",
-                "catalog read lease ended during page staging",
-            ));
-        }
-        Ok(page)
+                "catalog read handle is expired, unknown, or from a previous store owner",
+            )
+        })
+    }
+    pub(super) fn resume_captured(
+        &self,
+        cursor: &Cursor<'_>,
+        now: u64,
+    ) -> Result<Option<(&S, CatalogReadPage<B>)>, Error> {
+        self.snapshots
+            .get(cursor.id)
+            .map(|snapshot| Ok((&snapshot.selector, snapshot.resume(cursor.start, now)?)))
+            .transpose()
     }
     pub(super) fn publish(
         &mut self,

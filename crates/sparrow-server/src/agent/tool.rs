@@ -88,6 +88,10 @@ impl Operation {
                         definition,
                     }))
                 }
+                "result_next" => Self::Query(Command::Result(super::result::Input {
+                    store: fields.required("store_id")?,
+                    cursor: fields.required("cursor")?,
+                })),
                 "rdf_inspect" => Self::Query(Command::Rdf {
                     store: fields.required("store_id")?,
                     id: fields.required("id")?,

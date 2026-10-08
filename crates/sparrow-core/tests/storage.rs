@@ -8535,6 +8535,13 @@ fn record_pages_admit_variable_byte_boundaries_and_refuse_without_publishing_pre
         .len();
     assert!(first_rows > 1 && first_rows < 20);
     assert_eq!(first.total_items, 20);
+    assert_eq!(
+        store
+            .result_next(&first.store_id, &format!("{}/1", first.snapshot_id), 2)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
     query.cursor = Some(format!("{}/1", first.snapshot_id));
     assert_eq!(
         store.records_read(&query, 2).unwrap_err().code,
@@ -8543,6 +8550,12 @@ fn record_pages_admit_variable_byte_boundaries_and_refuse_without_publishing_pre
     query.cursor = first.next_cursor.clone();
     let second = store.records_read(&query, 2).unwrap();
     assert_eq!(second.page_start, first_rows);
+    assert_eq!(
+        store
+            .result_next(&first.store_id, query.cursor.as_ref().unwrap(), 2)
+            .unwrap(),
+        sparrow_core::ResultPage::Records(second.clone())
+    );
     let mut fresh = query.clone();
     fresh.cursor = None;
     fresh.scope.scan_budget = 1;
@@ -8885,5 +8898,188 @@ fn json_pages_keep_released_pin_membership_after_native_projection_retirement() 
     assert_eq!(
         store.json_read(&query, 31 * DAY + 3).unwrap_err().code,
         "NOT_FOUND"
+    );
+}
+
+#[test]
+fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_or_foreign_handles()
+{
+    use sparrow_core::{
+        ArtifactRead, JsonQuery, JsonRead, QuerySelection, RecordOperation, RecordQuery,
+        RecordRead, ResultPage, SourceRead,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest(
+            "next-a",
+            "pages",
+            "jsonl",
+            br#"{"message":"needle a"}
+{"message":"needle b"}
+"#,
+            0,
+        )
+        .unwrap();
+    let b = store
+        .ingest("next-b", "other", "json", br#"{"message":"needle c"}"#, 1)
+        .unwrap();
+    let pin = store
+        .pin("next-pin-a", "first", &a.record_ids, 1, 2)
+        .unwrap();
+    store.pin("next-pin-b", "second", &[b.id], 1, 2).unwrap();
+    let scope = record_page_scope("pages", 1);
+    let id = store.properties().unwrap()["store_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut cases = Vec::new();
+    for operation in [RecordOperation::Records, RecordOperation::Text] {
+        let mut query = RecordRead {
+            operation,
+            scope: scope.clone(),
+            query: RecordQuery {
+                text: Some("needle".into()),
+                ..Default::default()
+            },
+            cursor: None,
+        };
+        let first = store.records_read(&query, 3).unwrap();
+        query.cursor = first.next_cursor.clone();
+        let expected = store.records_read(&query, 3).unwrap();
+        cases.push((
+            query.cursor.unwrap(),
+            if operation == RecordOperation::Records {
+                ResultPage::Records(expected)
+            } else {
+                ResultPage::Text(expected)
+            },
+        ));
+    }
+    for query in [
+        JsonQuery::Keys,
+        JsonQuery::Values {
+            path: Some("/message".into()),
+            kind: None,
+            lexical: None,
+            decoded: None,
+        },
+    ] {
+        let mut read = JsonRead {
+            scope: scope.clone(),
+            query,
+            cursor: None,
+        };
+        let first = store.json_read(&read, 3).unwrap();
+        read.cursor = first.next_cursor.clone();
+        let expected = store.json_read(&read, 3).unwrap();
+        cases.push((
+            read.cursor.unwrap(),
+            if matches!(read.query, JsonQuery::Keys) {
+                ResultPage::Keys(expected)
+            } else {
+                ResultPage::Values(expected)
+            },
+        ));
+    }
+    let mut artifacts = ArtifactRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.artifact_read(&artifacts, 3).unwrap();
+    artifacts.cursor = first.next_cursor.clone();
+    cases.push((
+        artifacts.cursor.clone().unwrap(),
+        ResultPage::Artifacts(store.artifact_read(&artifacts, 3).unwrap()),
+    ));
+    let mut sources = SourceRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.source_read(&sources, 3, &[]).unwrap();
+    sources.cursor = first.next_cursor.clone();
+    cases.push((
+        sources.cursor.clone().unwrap(),
+        ResultPage::Sources(store.source_read(&sources, 3, &[]).unwrap()),
+    ));
+    for selector in [PinSelector::Active, PinSelector::Id(pin.id.clone())] {
+        let mut read = PinRead {
+            selector,
+            page_size: 1,
+            ..Default::default()
+        };
+        let first = store.pin_read(&read, 3).unwrap();
+        read.cursor = first.next_cursor.clone();
+        cases.push((
+            read.cursor.clone().unwrap(),
+            ResultPage::Pins(store.pin_read(&read, 3).unwrap()),
+        ));
+    }
+    for (cursor, expected) in &cases {
+        assert_eq!(&store.result_next(&id, cursor, 4).unwrap(), expected);
+    }
+    // Captured selectors remain authoritative after the collection disappears.
+    let mut pinned = JsonRead {
+        scope: scope.clone(),
+        query: JsonQuery::Values {
+            path: Some("/message".into()),
+            kind: None,
+            lexical: None,
+            decoded: None,
+        },
+        cursor: None,
+    };
+    pinned.scope.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision),
+    };
+    let first = store.json_read(&pinned, 3).unwrap();
+    pinned.cursor = first.next_cursor.clone();
+    let expected = store.json_read(&pinned, 3).unwrap();
+    store.release_retry("next-release", &pin.id, 4).unwrap();
+    assert_eq!(
+        store
+            .result_next(&id, pinned.cursor.as_ref().unwrap(), 5)
+            .unwrap(),
+        ResultPage::Values(expected)
+    );
+    assert_eq!(
+        store
+            .result_next("store:foreign", &cases[0].0, 4)
+            .unwrap_err()
+            .code,
+        "STORE_MISMATCH"
+    );
+    let handle = cases[0].0.split_once('/').unwrap().0;
+    for cursor in [
+        format!("{handle}/0"),
+        format!("{handle}/999"),
+        format!("{handle}/+1"),
+        format!("{handle}/1/2"),
+        format!("{handle}/184467440737095516160"),
+    ] {
+        assert_eq!(
+            store.result_next(&id, &cursor, 4).unwrap_err().code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    assert_eq!(
+        store
+            .result_next(&id, "record-read:unknown/1", 4)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    for (cursor, _) in &cases {
+        assert_eq!(
+            store.result_next(&id, cursor, 60_003).unwrap_err().code,
+            "RESULT_EXPIRED"
+        );
+    }
+    drop(store);
+    let reopened = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        reopened.result_next(&id, &cases[0].0, 5).unwrap_err().code,
+        "RESULT_EXPIRED"
     );
 }

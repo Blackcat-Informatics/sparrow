@@ -5,7 +5,7 @@
 
 use super::{Result, failure, instant, invalid, wire};
 use purrdf_lex::json::{Object, Value};
-mod read;
+pub(super) mod read;
 pub(crate) use read::Read;
 
 pub(crate) struct Renewal {

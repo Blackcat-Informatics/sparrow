@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "result_next",
+        "Resume the captured operation, scope and limits from an immutable cursor; reading never renews its lease or evidence retention.",
+    ),
+    (
         "sources_list",
         "Page an immutable capture of exact intake keys, retained occurrence counts, declared mapping IDs and configured watch bindings; producer continuity remains explicitly unknown.",
     ),
@@ -119,6 +123,12 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
+        if *name == "result_next" {
+            properties = properties
+                .with("store_id", string())
+                .with("cursor", string());
+            required.extend(["store_id", "cursor"]);
+        }
         if ["artifacts_list", "sources_list"].contains(name) {
             properties = properties
                 .with("store_id", string())

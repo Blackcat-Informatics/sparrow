@@ -87,27 +87,31 @@ impl Read {
             wire::result::Ok(value) => value?,
             wire::result::Error(error) => return Err(failure(error?)),
         };
-        let receipt = page.get_receipt()?;
-        let mut out = super::super::catalog::receipt(receipt)?
-            .with("profile_ids", Value::array(["sparrow-pin-catalog-v1"]));
-        match page.which()? {
-            wire::pin_read_page::Collections(rows) => {
-                let rows = rows?.iter().map(summary).collect::<Result<Vec<_>>>()?;
-                out = out
-                    .with("operation", "pins_list")
-                    .with("rows", Value::array(rows));
-            }
-            wire::pin_read_page::Members(body) => {
-                let body = body?;
-                let members = super::member_ids(body.get_members()?)?;
-                out = out
-                    .with("operation", "pin_get")
-                    .with("pin", summary(body.get_pin()?)?)
-                    .with("members", members);
-            }
-        }
-        Ok(out.into())
+        render(page)
     }
+}
+
+pub(crate) fn render(page: wire::pin_read_page::Reader<'_>) -> Result<Value> {
+    let receipt = page.get_receipt()?;
+    let mut out = super::super::catalog::receipt(receipt)?
+        .with("profile_ids", Value::array(["sparrow-pin-catalog-v1"]));
+    match page.which()? {
+        wire::pin_read_page::Collections(rows) => {
+            let rows = rows?.iter().map(summary).collect::<Result<Vec<_>>>()?;
+            out = out
+                .with("operation", "pins_list")
+                .with("rows", Value::array(rows));
+        }
+        wire::pin_read_page::Members(body) => {
+            let body = body?;
+            let members = super::member_ids(body.get_members()?)?;
+            out = out
+                .with("operation", "pin_get")
+                .with("pin", summary(body.get_pin()?)?)
+                .with("members", members);
+        }
+    }
+    Ok(out.into())
 }
 
 fn summary(value: wire::pin_summary::Reader<'_>) -> Result<Value> {

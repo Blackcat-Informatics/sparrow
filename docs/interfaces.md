@@ -309,10 +309,31 @@ predicates otherwise agree.
 Continuations replay captured rows after pin mutation/release and evidence
 retirement; fresh reads revalidate current evidence. A changed query refuses with
 `CONFLICT`, an invalid page boundary with `INVALID_ARGUMENT`, and expired, unknown
-or previous-owner handles with `RESULT_EXPIRED`. Current schema 29 is required;
+or previous-owner handles with `RESULT_EXPIRED`. Current schema 31 is required;
 storage formats remain unchanged. `scanned` records candidate visits, not all I/O:
 reference expansion, field visits and posting visits retain their independent
 documented bounds and original coverage evidence.
+
+### Cursor-only continuation
+
+Schema 31 implements typed ResultNextQuery and resultNext. CLI
+result-next STORE_ID CURSOR and MCP result_next require only the original
+store identity and cursor. They resume the operation, selector, page size and
+scan ceilings stored in that capture; they accept no replacement predicates or
+limits. ResultPage is a typed union over record, standalone text, key, value,
+artifact, source and pin pages. Pin pages retain their collections/members union.
+
+Every branch uses the same wire encoder and agent renderer as its original
+operation. Query replies now explicitly identify their operation; continuation
+output is identical to replay through the original operation with its cursor.
+No membership, ranking corpus, source watch inventory or pin name is re-resolved.
+The shared lease owner parses the cursor and validates the original variable
+page boundary. Reading never renews a handle or evidence retention and never
+creates another handle. Foreign stores refuse STORE_MISMATCH; malformed/non-page
+positions refuse INVALID_ARGUMENT; expired, unknown and previous-owner handles
+refuse RESULT_EXPIRED. These are typed failures with no successful prefix.
+Schema discovery refuses older daemons before requesting continuation.
+
 
 SPARQL additionally selects graph layers `metadata`, `diagnostic`, and `content`,
 defaulting to all three. The default RDF graph is the set union of visible
@@ -377,7 +398,7 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 | `sparql_query` | Query, scope, graph layers, bindings, limits, coverage requirement | Typed native query result, result handle/page, and receipt. |
 | `sparql_explain` | Query and scope | Native plan/explanation with applicable limits and scope information. |
 | `correlate` | Scope and seed IDs or trace/span/source/time selector | Relationships and their supporting evidence; implemented through prepared queries/retrieval. |
-| `result_next` | Result cursor | Next page from the same leased result; an expired handle refuses continuation. |
+| `result_next` | Store ID, result cursor | Next page from the same leased result; an expired handle refuses continuation. |
 | `ingest_get` | Import/request ID | Raw acceptance/durability, projection states, source checkpoint, and deletion state. |
 | `pins_list` | Store ID, cursor, page size, scan budget | Active named collections and deadlines under one finite captured metadata lease. |
 | `pin_get` | Store ID, exactly one pin name or ID, cursor, page size, scan budget | Collection identity, deadline, revision, and captured members; continuations preserve the captured name resolution. |

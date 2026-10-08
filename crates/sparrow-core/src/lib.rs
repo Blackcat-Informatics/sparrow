@@ -49,6 +49,7 @@ pub use storage::rdf_view::{
 pub use storage::record_read::{
     JsonRead, RecordOperation, RecordPageBody, RecordRead, RecordReadPage,
 };
+pub use storage::result_read::ResultPage;
 pub use storage::source_read::{
     SourcePageBody, SourceRead, SourceReadPage, SourceSelector, SourceSummary, SourceWatchBinding,
     SourceWatchInfo,

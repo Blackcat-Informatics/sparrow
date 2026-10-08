@@ -147,92 +147,96 @@ impl Input {
         if (basis == wire::TimeBasis::EventTime) != self.event_interval.is_some() {
             return Err(super::AgentError { code: "UNSUPPORTED".into(), message: "daemon did not honor the requested time basis; use the matching schema-10 executable".into(), retryable: false });
         }
-        let text = match found.get_text()?.which()? {
-            wire::optional_text_results::Absent(()) => Value::Null,
-            wire::optional_text_results::Value(value) => Value::from(search::render(value?)?),
-        };
-        let rows = found
-            .get_rows()?
-            .iter()
-            .map(|row| {
-                let fields = row
-                    .get_fields()?
-                    .iter()
-                    .map(|field| {
-                        let parent = match field.get_bound_parent()?.which()? {
-                            wire::optional_occurrence::Absent(()) => Value::Null,
-                            wire::optional_occurrence::Value(value) => {
-                                Value::from(value.to_string())
-                            }
-                        };
-                        Ok(Object::new()
-                            .with("predicate_index", field.get_predicate_index().to_string())
-                            .with("occurrence", field.get_occurrence().to_string())
-                            .with("path", field.get_path()?.to_str()?)
-                            .with("kind", kind_name(field.get_kind()?))
-                            .with("source_start", field.get_source_start().to_string())
-                            .with("source_end", field.get_source_end().to_string())
-                            .with(
-                                "parent_binding",
-                                optional_value(field.get_parent_binding()?)?,
-                            )
-                            .with("bound_parent", parent)
-                            .into())
-                    })
-                    .collect::<Result<Vec<Value>>>()?;
-                Ok(Object::new()
-                    .with("record_id", row.get_record_id()?.to_str()?)
-                    .with("artifact_id", row.get_artifact_id()?.to_str()?)
-                    .with("source", row.get_source()?.to_str()?)
-                    .with("received_at", instant(row.get_received_at()?)?)
-                    .with("byte_start", row.get_byte_start().to_string())
-                    .with("byte_end", row.get_byte_end().to_string())
-                    .with(
-                        "diagnostics",
-                        crate::diagnostics::render_snapshot(row.get_diagnostics()?)?,
-                    )
-                    .with(
-                        "event_time",
-                        super::source_time::event(row.get_event_time()?)?,
-                    )
-                    .with("fields", Value::array(fields))
-                    .into())
-            })
-            .collect::<Result<Vec<Value>>>()?;
-        let coverage = found.get_event_coverage()?;
-        let page = super::catalog::page(found.get_page()?)?;
-        Ok(Object::new()
-            .with("page", page)
-            .with(
-                "event_coverage",
-                Object::new()
-                    .with("evaluated", coverage.get_evaluated().to_string())
-                    .with("unknown", coverage.get_unknown().to_string())
-                    .with(
-                        "outside_interval",
-                        coverage.get_outside_interval().to_string(),
-                    )
-                    .with("membership_complete", coverage.get_membership_complete()),
-            )
-            .with("receipt", receipt(found.get_receipt()?)?)
-            .with(
-                "time_basis",
-                match basis {
-                    wire::TimeBasis::ReceivedAt => "received_at",
-                    wire::TimeBasis::EventTime => "event_time",
-                },
-            )
-            .with("field_visits", found.get_field_visits().to_string())
-            .with(
-                "qualified_records",
-                super::render_count(found.get_qualified_records()?)?,
-            )
-            .with(
-                "known_qualified_records",
-                found.get_known_qualified_records().to_string(),
-            )
-            .with("rows", Value::array(rows))
-            .with("text", text)
-            .into())
+        render(found)
     }
+}
+
+pub(super) fn render(found: wire::records_results::Reader<'_>) -> Result<Value> {
+    let basis = found.get_time_basis()?;
+    let text = match found.get_text()?.which()? {
+        wire::optional_text_results::Absent(()) => Value::Null,
+        wire::optional_text_results::Value(value) => Value::from(search::render(value?)?),
+    };
+    let rows = found
+        .get_rows()?
+        .iter()
+        .map(|row| {
+            let fields = row
+                .get_fields()?
+                .iter()
+                .map(|field| {
+                    let parent = match field.get_bound_parent()?.which()? {
+                        wire::optional_occurrence::Absent(()) => Value::Null,
+                        wire::optional_occurrence::Value(value) => Value::from(value.to_string()),
+                    };
+                    Ok(Object::new()
+                        .with("operation", "records_search")
+                        .with("predicate_index", field.get_predicate_index().to_string())
+                        .with("occurrence", field.get_occurrence().to_string())
+                        .with("path", field.get_path()?.to_str()?)
+                        .with("kind", kind_name(field.get_kind()?))
+                        .with("source_start", field.get_source_start().to_string())
+                        .with("source_end", field.get_source_end().to_string())
+                        .with(
+                            "parent_binding",
+                            optional_value(field.get_parent_binding()?)?,
+                        )
+                        .with("bound_parent", parent)
+                        .into())
+                })
+                .collect::<Result<Vec<Value>>>()?;
+            Ok(Object::new()
+                .with("record_id", row.get_record_id()?.to_str()?)
+                .with("artifact_id", row.get_artifact_id()?.to_str()?)
+                .with("source", row.get_source()?.to_str()?)
+                .with("received_at", instant(row.get_received_at()?)?)
+                .with("byte_start", row.get_byte_start().to_string())
+                .with("byte_end", row.get_byte_end().to_string())
+                .with(
+                    "diagnostics",
+                    crate::diagnostics::render_snapshot(row.get_diagnostics()?)?,
+                )
+                .with(
+                    "event_time",
+                    super::source_time::event(row.get_event_time()?)?,
+                )
+                .with("fields", Value::array(fields))
+                .into())
+        })
+        .collect::<Result<Vec<Value>>>()?;
+    let coverage = found.get_event_coverage()?;
+    let page = super::catalog::page(found.get_page()?)?;
+    Ok(Object::new()
+        .with("page", page)
+        .with(
+            "event_coverage",
+            Object::new()
+                .with("evaluated", coverage.get_evaluated().to_string())
+                .with("unknown", coverage.get_unknown().to_string())
+                .with(
+                    "outside_interval",
+                    coverage.get_outside_interval().to_string(),
+                )
+                .with("membership_complete", coverage.get_membership_complete()),
+        )
+        .with("receipt", receipt(found.get_receipt()?)?)
+        .with(
+            "time_basis",
+            match basis {
+                wire::TimeBasis::ReceivedAt => "received_at",
+                wire::TimeBasis::EventTime => "event_time",
+            },
+        )
+        .with("field_visits", found.get_field_visits().to_string())
+        .with(
+            "qualified_records",
+            super::render_count(found.get_qualified_records()?)?,
+        )
+        .with(
+            "known_qualified_records",
+            found.get_known_qualified_records().to_string(),
+        )
+        .with("rows", Value::array(rows))
+        .with("text", text)
+        .into())
 }

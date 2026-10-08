@@ -988,7 +988,7 @@ names = ['^capture_pin_catalog$']
 id = "catalog-read-leases"
 summary = "One metadata lease owner serves immutable pin, artifact and source pages, cursor binding, capacity admission and absolute monotonic expiry."
 home = "sparrow_core::storage::catalog_lease::Reads::resume"
-entry_points = ["sparrow_core::storage::catalog_lease::Reads::publish", "sparrow_core::storage::catalog_lease::Snapshot::page"]
+entry_points = ["sparrow_core::storage::catalog_lease::Reads::publish", "sparrow_core::storage::catalog_lease::Snapshot::page", "sparrow_core::storage::catalog_lease::Snapshot::resume", "sparrow_core::storage::catalog_lease::Cursor::parse", "sparrow_core::storage::catalog_lease::Reads::snapshot", "sparrow_core::storage::catalog_lease::Reads::resume_captured"]
 spec = "docs/development-runtime.md: artifact discovery and shared catalog leases."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/pin_read.rs"]
 bench = []
@@ -2475,6 +2475,48 @@ summary = "All paged query RPC adapters admit a bounded typed cursor before allo
 home = "sparrow_server::rpc::query_cursor"
 entry_points = ["sparrow_server::rpc::Rpc::records_search", "sparrow_server::rpc::Rpc::text_search", "sparrow_server::rpc::Rpc::keys_list", "sparrow_server::rpc::Rpc::values_search"]
 spec = "docs/interfaces.md: operation-bound query cursors."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "captured-result-continuation"
+summary = "One store-bound cursor-only dispatcher resumes every existing leased result through the shared catalog owner without re-evaluation, lease renewal or new handles."
+home = "sparrow_core::storage::result_read::Store::result_next"
+entry_points = ["sparrow_server::rpc::Rpc::result_next", "sparrow_server::agent::result::Input::execute", "sparrow_server::agent::result::render"]
+spec = "docs/interfaces.md: schema 31 cursor-only continuation."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^parse_result_cursor$']
+
+[[job]]
+id = "captured-page-wire-rendering"
+summary = "Original query/catalog operations and cursor-only continuation share one encoder for each typed page family."
+home = "sparrow_server::rpc::records_page"
+entry_points = ["sparrow_server::rpc::text_page", "sparrow_server::rpc::keys_page", "sparrow_server::rpc::values_page", "sparrow_server::rpc::artifacts_page", "sparrow_server::rpc::sources_page", "sparrow_server::rpc::pins_page"]
+spec = "docs/interfaces.md: canonical result continuation."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "captured-page-agent-rendering"
+summary = "CLI and MCP continuation call the original operation's canonical page renderer; no parallel result shape or semantic decoder."
+home = "sparrow_server::agent::records::render"
+entry_points = ["sparrow_server::agent::search::page", "sparrow_server::agent::json::keys", "sparrow_server::agent::json::values", "sparrow_server::agent::artifacts::render", "sparrow_server::agent::sources::render", "sparrow_server::agent::pin::read::render"]
+spec = "docs/interfaces.md: canonical agent result pages."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true

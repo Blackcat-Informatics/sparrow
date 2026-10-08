@@ -13,10 +13,12 @@ mod diagnostic;
 mod durability;
 mod error;
 mod ingest;
+mod json;
 mod pin;
 mod rdf;
 mod read;
 mod records;
+mod result;
 mod search;
 mod selection;
 mod source_time;
@@ -36,7 +38,7 @@ pub(super) const USAGE: &str = concat!(
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values",
+    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N] [--require-complete-index true|false];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
     "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp"
@@ -53,6 +55,7 @@ pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<
 pub(super) enum Command {
     Flush(sparrow_client::DurabilityWatermark),
     Status,
+    Result(result::Input),
     Watch(watch::Input),
     SourceTime(source_time::Input),
     Diagnostic(diagnostic::Input),
@@ -175,6 +178,15 @@ fn parse_kind(
 
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
+        if args.first().is_some_and(|arg| arg == "result-next") {
+            if args.len() != 3 {
+                return Err(invalid("result-next requires STORE_ID CURSOR"));
+            }
+            return Ok(Self::Result(result::Input {
+                store: args[1].clone(),
+                cursor: args[2].clone(),
+            }));
+        }
         if args
             .first()
             .is_some_and(|arg| arg == "diagnostic-define" || arg == "diagnostic-get")
@@ -427,6 +439,9 @@ impl Command {
         if let Self::Flush(through) = self {
             return Ok(Some(durability::execute(client, through).await?));
         }
+        if let Self::Result(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
         if let Self::SourceTime(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
@@ -487,33 +502,7 @@ impl Command {
                 wire::result::Ok(value) => value?,
                 wire::result::Error(error) => return Err(failure(error?)),
             };
-            let rows = found
-                .get_rows()?
-                .iter()
-                .map(|row| {
-                    Ok(Value::from(
-                        Object::new()
-                            .with("record_id", row.get_record_id()?.to_str()?)
-                            .with("artifact_id", row.get_artifact_id()?.to_str()?)
-                            .with("source", row.get_source()?.to_str()?)
-                            .with("received_at", instant(row.get_received_at()?)?)
-                            .with("source_start", row.get_source_start().to_string())
-                            .with("source_end", row.get_source_end().to_string())
-                            .with("occurrence", row.get_occurrence().to_string())
-                            .with("path", row.get_path()?.to_str()?)
-                            .with("kind", kind_name(row.get_kind()?))
-                            .with("lexical", optional_value(row.get_lexical()?)?)
-                            .with("decoded", optional_value(row.get_decoded()?)?),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Some(
-                Object::new()
-                    .with("receipt", receipt(found.get_receipt()?)?)
-                    .with("page", catalog::page(found.get_page()?)?)
-                    .with("rows", Value::array(rows))
-                    .into(),
-            ))
+            Ok(Some(json::values(found)?))
         } else {
             let mut request = client.keys_list_request();
             fill_scope(request.get().init_scope(), options)?;
@@ -524,26 +513,7 @@ impl Command {
                 wire::result::Ok(value) => value?,
                 wire::result::Error(error) => return Err(failure(error?)),
             };
-            let rows = found
-                .get_rows()?
-                .iter()
-                .map(|row| {
-                    Ok(Value::from(
-                        Object::new()
-                            .with("path", row.get_path()?.to_str()?)
-                            .with("kind", kind_name(row.get_kind()?))
-                            .with("occurrences", row.get_occurrences().to_string())
-                            .with("records", row.get_records().to_string()),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Some(
-                Object::new()
-                    .with("receipt", receipt(found.get_receipt()?)?)
-                    .with("page", catalog::page(found.get_page()?)?)
-                    .with("rows", Value::array(rows))
-                    .into(),
-            ))
+            Ok(Some(json::keys(found)?))
         }
     }
 }

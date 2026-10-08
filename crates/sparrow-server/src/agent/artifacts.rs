@@ -106,70 +106,74 @@ impl Input {
             wire::result::Ok(value) => value?,
             wire::result::Error(error) => return Err(failure(error?)),
         };
-        let mut rows = Vec::new();
-        for row in page.get_rows()? {
-            let origin = match row.get_origin()?.which()? {
-                wire::optional_artifact_origin::Absent(()) => Value::Null,
-                wire::optional_artifact_origin::Value(value) => {
-                    let value = value?;
-                    Object::new()
-                        .with("format", sparrow_client::format_label(value.get_format()?))
-                        .with("received_at", instant(value.get_received_at()?)?)
-                        .with("expires_at", instant(value.get_expires_at()?)?)
-                        .with("byte_length", value.get_byte_length().to_string())
-                        .with("original_records", value.get_original_records().to_string())
-                        .into()
-                }
-            };
-            rows.push(Value::from(
-                Object::new()
-                    .with("artifact_id", row.get_id()?.to_str()?)
-                    .with("source", row.get_source()?.to_str()?)
-                    .with("origin", origin)
-                    .with(
-                        "complete_bytes_available",
-                        row.get_complete_bytes_available(),
-                    )
-                    .with("retained_records", row.get_retained_records().to_string())
-                    .with(
-                        "coverage",
-                        Value::from(super::render_membership_coverage(
-                            row.get_coverage()?,
-                            row.get_matching_records()?,
-                        )?),
-                    ),
-            ));
-        }
-        let coverage = page.get_coverage()?;
-        let complete = coverage.get_membership_complete();
-        Ok(super::catalog::receipt(page.get_receipt()?)?
-            .with(
-                "answer_certainty",
-                if complete { "exact" } else { "incomplete" },
-            )
-            .with(
-                "known_matching_artifacts",
-                page.get_receipt()?.get_total_items().to_string(),
-            )
-            .with(
-                "matching_artifacts",
-                if complete {
-                    Value::from(page.get_receipt()?.get_total_items().to_string())
-                } else {
-                    Value::Null
-                },
-            )
-            .with(
-                "coverage",
-                Value::from(
-                    super::render_membership_coverage(coverage, page.get_matching_records()?)?
-                        .with("catalog_complete", true)
-                        .with("scanned", page.get_receipt()?.get_scanned().to_string()),
-                ),
-            )
-            .with("operation", "artifacts_list")
-            .with("rows", Value::array(rows))
-            .with("profile_ids", Value::array(["sparrow-artifact-catalog-v2"]))
-            .into())
+        render(page)
     }
+}
+
+pub(super) fn render(page: wire::artifact_list_page::Reader<'_>) -> Result<Value> {
+    let mut rows = Vec::new();
+    for row in page.get_rows()? {
+        let origin = match row.get_origin()?.which()? {
+            wire::optional_artifact_origin::Absent(()) => Value::Null,
+            wire::optional_artifact_origin::Value(value) => {
+                let value = value?;
+                Object::new()
+                    .with("format", sparrow_client::format_label(value.get_format()?))
+                    .with("received_at", instant(value.get_received_at()?)?)
+                    .with("expires_at", instant(value.get_expires_at()?)?)
+                    .with("byte_length", value.get_byte_length().to_string())
+                    .with("original_records", value.get_original_records().to_string())
+                    .into()
+            }
+        };
+        rows.push(Value::from(
+            Object::new()
+                .with("artifact_id", row.get_id()?.to_str()?)
+                .with("source", row.get_source()?.to_str()?)
+                .with("origin", origin)
+                .with(
+                    "complete_bytes_available",
+                    row.get_complete_bytes_available(),
+                )
+                .with("retained_records", row.get_retained_records().to_string())
+                .with(
+                    "coverage",
+                    Value::from(super::render_membership_coverage(
+                        row.get_coverage()?,
+                        row.get_matching_records()?,
+                    )?),
+                ),
+        ));
+    }
+    let coverage = page.get_coverage()?;
+    let complete = coverage.get_membership_complete();
+    Ok(super::catalog::receipt(page.get_receipt()?)?
+        .with(
+            "answer_certainty",
+            if complete { "exact" } else { "incomplete" },
+        )
+        .with(
+            "known_matching_artifacts",
+            page.get_receipt()?.get_total_items().to_string(),
+        )
+        .with(
+            "matching_artifacts",
+            if complete {
+                Value::from(page.get_receipt()?.get_total_items().to_string())
+            } else {
+                Value::Null
+            },
+        )
+        .with(
+            "coverage",
+            Value::from(
+                super::render_membership_coverage(coverage, page.get_matching_records()?)?
+                    .with("catalog_complete", true)
+                    .with("scanned", page.get_receipt()?.get_scanned().to_string()),
+            ),
+        )
+        .with("operation", "artifacts_list")
+        .with("rows", Value::array(rows))
+        .with("profile_ids", Value::array(["sparrow-artifact-catalog-v2"]))
+        .into())
 }

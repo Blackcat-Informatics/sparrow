@@ -55,43 +55,47 @@ impl Input {
             wire::result::Ok(value) => value?,
             wire::result::Error(error) => return Err(failure(error?)),
         };
-        let mut rows = Vec::new();
-        for row in page.get_rows()? {
-            let mut watches = Vec::new();
-            for watch in row.get_watches()? {
-                watches.push(Value::from(
-                    Object::new()
-                        .with("watch_id", watch.get_watch_id()?.to_str()?)
-                        .with("revision", watch.get_revision().to_string())
-                        .with("enabled", watch.get_enabled()),
-                ));
-            }
-            rows.push(Value::from(
+        render(page)
+    }
+}
+
+pub(super) fn render(page: wire::source_list_page::Reader<'_>) -> Result<Value> {
+    let mut rows = Vec::new();
+    for row in page.get_rows()? {
+        let mut watches = Vec::new();
+        for watch in row.get_watches()? {
+            watches.push(Value::from(
                 Object::new()
-                    .with("source_id", row.get_source_id()?.to_str()?)
-                    .with("rdf_iri", row.get_rdf_iri()?.to_str()?)
-                    .with(
-                        "complete_artifacts",
-                        row.get_complete_artifacts().to_string(),
-                    )
-                    .with("fragment_parents", row.get_fragment_parents().to_string())
-                    .with("retained_records", row.get_retained_records().to_string())
-                    .with(
-                        "time_profile_id",
-                        optional_value(row.get_time_profile_id()?)?,
-                    )
-                    .with(
-                        "diagnostic_profile_id",
-                        optional_value(row.get_diagnostic_profile_id()?)?,
-                    )
-                    .with("continuity_unknown", row.get_continuity_unknown())
-                    .with("watches", Value::array(watches)),
+                    .with("watch_id", watch.get_watch_id()?.to_str()?)
+                    .with("revision", watch.get_revision().to_string())
+                    .with("enabled", watch.get_enabled()),
             ));
         }
-        Ok(super::catalog::receipt(page.get_receipt()?)?
-            .with("operation", "sources_list")
-            .with("rows", Value::array(rows))
-            .with("profile_ids", Value::array(["sparrow-source-catalog-v1"]))
-            .into())
+        rows.push(Value::from(
+            Object::new()
+                .with("source_id", row.get_source_id()?.to_str()?)
+                .with("rdf_iri", row.get_rdf_iri()?.to_str()?)
+                .with(
+                    "complete_artifacts",
+                    row.get_complete_artifacts().to_string(),
+                )
+                .with("fragment_parents", row.get_fragment_parents().to_string())
+                .with("retained_records", row.get_retained_records().to_string())
+                .with(
+                    "time_profile_id",
+                    optional_value(row.get_time_profile_id()?)?,
+                )
+                .with(
+                    "diagnostic_profile_id",
+                    optional_value(row.get_diagnostic_profile_id()?)?,
+                )
+                .with("continuity_unknown", row.get_continuity_unknown())
+                .with("watches", Value::array(watches)),
+        ));
     }
+    Ok(super::catalog::receipt(page.get_receipt()?)?
+        .with("operation", "sources_list")
+        .with("rows", Value::array(rows))
+        .with("profile_ids", Value::array(["sparrow-source-catalog-v1"]))
+        .into())
 }

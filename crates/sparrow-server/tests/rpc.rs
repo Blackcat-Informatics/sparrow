@@ -4588,7 +4588,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 23);
+    assert_eq!(definitions.len(), 24);
     assert_eq!(
         definitions
             .iter()
@@ -6447,6 +6447,195 @@ async fn json_pages_replay_cli_mcp_counts_and_occurrences_and_bind_operations() 
             }
             let status = cli(&socket, &["status"]);
             assert_eq!(status["record_read_handles"].as_str(), Some("2"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let a = client
+                .ingest(
+                    "next-wire-a",
+                    "next-source",
+                    wire::Format::Jsonl,
+                    br#"{"message":"needle a"}
+{"message":"needle b"}
+"#,
+                )
+                .await
+                .unwrap();
+            let b = client
+                .ingest(
+                    "next-wire-b",
+                    "other",
+                    wire::Format::Json,
+                    br#"{"message":"needle c"}"#,
+                )
+                .await
+                .unwrap();
+            let id = a.store_id.as_str();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let pin = mcp
+                .tool(
+                    2,
+                    "pin",
+                    Object::new()
+                        .with("request_id", "next-wire-pin-a")
+                        .with("name", "next-first")
+                        .with("store_id", id)
+                        .with("days", 1_u32)
+                        .with("targets", Value::array([a.id.as_str(), b.id.as_str()]))
+                        .into(),
+                )
+                .await;
+            let pin_id = pin["structuredContent"]["pin_id"].as_str().unwrap();
+            let second_pin = mcp
+                .tool(
+                    3,
+                    "pin",
+                    Object::new()
+                        .with("request_id", "next-wire-pin-b")
+                        .with("name", "next-second")
+                        .with("store_id", id)
+                        .with("days", 1_u32)
+                        .with("targets", Value::array([b.id.as_str()]))
+                        .into(),
+                )
+                .await;
+            assert!(!second_pin["isError"].as_bool().unwrap());
+            let commands = [
+                vec!["records", "--source", "next-source", "--page-size", "1"],
+                vec![
+                    "text",
+                    "needle",
+                    "--source",
+                    "next-source",
+                    "--page-size",
+                    "1",
+                ],
+                vec!["keys", "--source", "next-source", "--page-size", "1"],
+                vec![
+                    "values",
+                    "--source",
+                    "next-source",
+                    "--path",
+                    "/message",
+                    "--page-size",
+                    "1",
+                ],
+                vec!["artifacts", id, "--page-size", "1"],
+                vec!["sources", id, "--page-size", "1"],
+                vec!["pins", id, "--page-size", "1"],
+                vec!["pin-get", id, "--id", pin_id, "--page-size", "1"],
+            ];
+            for (index, args) in commands.into_iter().enumerate() {
+                let first = cli(&socket, &args);
+                let cursor = if index < 4 {
+                    first["page"]["next_cursor"].as_str()
+                } else {
+                    first["next_cursor"].as_str()
+                }
+                .unwrap();
+                let mut repeat = args.clone();
+                repeat.extend(["--cursor", cursor]);
+                let expected = cli(&socket, &repeat);
+                let resumed = cli(&socket, &["result-next", id, cursor]);
+                assert_eq!(resumed, expected, "{}", args[0]);
+                let replay = mcp
+                    .tool(
+                        index as u64 + 4,
+                        "result_next",
+                        Object::new()
+                            .with("store_id", id)
+                            .with("cursor", cursor)
+                            .into(),
+                    )
+                    .await;
+                assert!(!replay["isError"].as_bool().unwrap());
+                assert_eq!(replay["structuredContent"], expected);
+                let mut call = client.capability().result_next_request();
+                let mut query = call.get().init_query();
+                query.set_store_id(id);
+                query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                query.set_cursor(cursor);
+                let response = call.send().promise.await.unwrap();
+                let page = match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
+                    wire::result::Ok(page) => page.unwrap(),
+                    wire::result::Error(error) => panic!("{:?}", error.unwrap().get_code()),
+                };
+                let kind = match page.which().unwrap() {
+                    wire::result_page::Records(_) => "records",
+                    wire::result_page::Text(_) => "text",
+                    wire::result_page::Keys(_) => "keys",
+                    wire::result_page::Values(_) => "values",
+                    wire::result_page::Artifacts(_) => "artifacts",
+                    wire::result_page::Sources(_) => "sources",
+                    wire::result_page::Pins(_) => args[0],
+                };
+                assert_eq!(kind, args[0]);
+            }
+            for (store, cursor, code) in [
+                ("store:foreign", "record-read:unknown/1", "STORE_MISMATCH"),
+                (id, "not-a-cursor", "INVALID_ARGUMENT"),
+                (id, "record-read:unknown/1", "RESULT_EXPIRED"),
+            ] {
+                let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(["result-next", store, cursor])
+                    .output()
+                    .unwrap();
+                assert!(!out.status.success() && out.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&out.stderr).contains(code));
+            }
+            let rejected = mcp
+                .tool(
+                    30,
+                    "result_next",
+                    Object::new()
+                        .with("store_id", id)
+                        .with("cursor", "record-read:unknown/1")
+                        .with("page_size", 1_u32)
+                        .into(),
+                )
+                .await;
+            assert!(rejected["isError"].as_bool().unwrap());
+            let mut call = client.capability().result_next_request();
+            let mut query = call.get().init_query();
+            query.set_store_id(id);
+            query.set_schema_version(30);
+            query.set_cursor("record-read:unknown/1");
+            let response = call.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "UNSUPPORTED"
+                ),
+                wire::result::Ok(_) => panic!("obsolete continuation schema admitted"),
+            }
         })
         .await;
 }
