@@ -4,8 +4,59 @@
 //! Persistent lifetime scenarios using temporary stores and injected UTC instants.
 
 use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
+use sparrow_test_support::catalog_db;
 
 const DAY: u64 = 86_400_000;
+
+#[test]
+fn admission_properties_share_status_metadata_without_evidence_catalog_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest(
+            "properties-input",
+            "producer",
+            "json",
+            br#"{"message":"needle"}"#,
+            1,
+        )
+        .unwrap();
+    let properties = store.properties().unwrap();
+    let status = store.status(2).unwrap();
+    for key in [
+        "store_id",
+        "store_format",
+        "rdf_profile",
+        "text_analyzer",
+        "text_profile",
+        "retry_window_seconds",
+        "disk_budget",
+        "maintenance_reserve",
+        "max_artifact_bytes",
+        "max_records_per_artifact",
+        "max_pin_members",
+    ] {
+        assert_eq!(properties[key], status[key], "{key}");
+    }
+    for measured in [
+        "live_records",
+        "active_pins",
+        "physical_bytes",
+        "unique_payload_chunks",
+        "unique_json_projections",
+    ] {
+        assert!(properties.get(measured).is_none());
+    }
+    assert!(purrdf_lex::json::write_compact(&properties).len() < 4096);
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("record:corrupt-properties-test", b"{invalid")
+        .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.properties().unwrap(), properties);
+    assert_eq!(store.status(2).unwrap_err().code, "STORAGE_FAILURE");
+}
 
 #[test]
 fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures() {
@@ -230,7 +281,7 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
     assert!(limited_scan["qualified_records"].is_null());
     // Unknown membership never conceals a broken immutable profile binding.
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let (key, _) = db
         .prefix_iterator("source-diagnostic:")
         .next()
@@ -494,7 +545,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() 
         "EVIDENCE_UNAVAILABLE"
     );
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     assert!(
         db.get(format!("rdf:graph:diagnostic:{}", record.id))
             .unwrap()
@@ -558,7 +609,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         let store = Store::open(dir.path(), config()).unwrap();
         let id = store.store_id().unwrap();
         drop(store);
-        let db = catalog_db(dir.path());
+        let db = catalog_db(dir.path()).unwrap();
         db.put("store_format", format!("sparrow.store/{version}"))
             .unwrap();
         if version >= 11 {
@@ -848,7 +899,7 @@ fn streaming_catalog_refuses_identity_corruption_and_never_returns_partial_rows(
             _ => pin.id.clone(),
         };
         drop(store);
-        let db = catalog_db(dir.path());
+        let db = catalog_db(dir.path()).unwrap();
         let mut value =
             json::read_slice(&db.get(&key).unwrap().unwrap(), json::Limits::DEFAULT).unwrap();
         *value.get_mut("id").unwrap() = json::Value::from(format!("{kind}:different"));
@@ -1021,7 +1072,7 @@ fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() 
     );
     assert_eq!(store.artifact(&first.id).unwrap().id, first.id);
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let key = "empty-time:00000000000000000002:artifact:missing";
     db.put(key, b"artifact:missing").unwrap();
     drop(db);
@@ -1055,7 +1106,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
                 .unwrap();
         }
         drop(store);
-        let db = catalog_db(dir.path());
+        let db = catalog_db(dir.path()).unwrap();
         db.delete("recordless-index-upgrade").unwrap();
         db.delete(format!("empty-time:{:020}:{}", empty.received_at, empty.id))
             .unwrap();
@@ -2448,7 +2499,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
         Some(reserved.clone())
     );
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     db.delete(format!("consumption:{}", reserved.import_id))
         .unwrap();
     drop(db);
@@ -2638,7 +2689,7 @@ fn consumption_missing_publication_receipt_is_a_hard_failure_without_republicati
         store.expire(3 * DAY).unwrap();
     }
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     db.delete(format!("request:import-publication:{}", journal.import_id))
         .unwrap();
     drop(db);
@@ -3462,7 +3513,7 @@ fn oversized_raw_record_refuses_missing_normalized_bytes_without_publishing() {
         store.import_prepare_record(&manifest.id, 1, 1).unwrap();
     }
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let digest = purrdf_hash::hex::encode(
         purrdf_hash::blake3::hash(&input[3..3 + sparrow_core::IMPORT_CHUNK_BYTES]).as_bytes(),
     );
@@ -3821,7 +3872,7 @@ fn import_publication_refuses_missing_prepared_payload_without_publishing_a_pref
     store.import_prepare_layout(&journal.id, 0).unwrap();
     let progress = store.import_prepare_record(&journal.id, 0, 0).unwrap();
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     db.delete_cf(
         db.cf_handle("payload").unwrap(),
         digest.strip_prefix("blake3:").unwrap(),
@@ -4308,7 +4359,7 @@ fn broken_staging_layouts_refuse_reads_and_remain_reclaimable() {
     drop(store);
     let key = format!("import-layout:{}:{:020}", journal.id, 0);
     for remove in [false, true] {
-        let db = catalog_db(dir.path());
+        let db = catalog_db(dir.path()).unwrap();
         if remove {
             db.delete(&key).unwrap();
         } else {
@@ -4957,7 +5008,7 @@ fn malformed_pin_catalog_refuses_complete_captures() {
         .pin("valid-pin", "valid", &artifact.record_ids, 40, 0)
         .unwrap();
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let bytes = db.get(&pin.id).unwrap().unwrap();
     let changed = std::str::from_utf8(&bytes)
         .unwrap()
@@ -5446,7 +5497,7 @@ fn rdf_read_controls_and_selected_catalog_identity_are_verified() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
         drop(store);
-        let db = catalog_db(dir.path());
+        let db = catalog_db(dir.path()).unwrap();
         db.delete(key).unwrap();
         drop(db);
         assert_eq!(
@@ -5463,7 +5514,7 @@ fn rdf_read_controls_and_selected_catalog_identity_are_verified() {
         .ingest("rdf-identity-b", "b", "log", b"two", 0)
         .unwrap();
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let bytes = db.get(&first.record_ids[0]).unwrap().unwrap();
     let changed = std::str::from_utf8(&bytes)
         .unwrap()
@@ -5522,7 +5573,7 @@ fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
         .unwrap()
         .rdf_projection_id;
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let manifest = purrdf_lex::json::read(
         std::str::from_utf8(&db.get(format!("rdf:graph:{projection}")).unwrap().unwrap()).unwrap(),
     )
@@ -5628,7 +5679,7 @@ fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
     );
     store.expire(32 * DAY).unwrap();
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     for prefix in [
         "rdf:q:",
         "rdf:term:",
@@ -5718,7 +5769,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
         (Some(b"different-profile".as_slice()), "UNSUPPORTED"),
         (None, "STORAGE_FAILURE"),
     ] {
-        let db = catalog_db(dir.path());
+        let db = catalog_db(dir.path()).unwrap();
         match replacement {
             Some(value) => db.put("rdf_profile", value).unwrap(),
             None => db.delete("rdf_profile").unwrap(),
@@ -5863,7 +5914,7 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
     let anchor_key = format!("time:{:020}:{}", 1, anchor.record_ids[0]);
     drop(store);
     // Corrupt only this test-owned store, while its production owner is closed.
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     db.put(&neighbor_key, b"record:missing").unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -5886,7 +5937,7 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
         "STORAGE_FAILURE"
     );
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     db.delete(&anchor_key).unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -6108,13 +6159,6 @@ fn standard_text_lexicons_are_required() {
             .code,
         "INVALID_ARGUMENT"
     );
-}
-
-// Open all declared families when adversarial fixtures inspect or mutate a closed store.
-fn catalog_db(path: &std::path::Path) -> rocksdb::DB {
-    let options = rocksdb::Options::default();
-    let columns = rocksdb::DB::list_cf(&options, path).unwrap();
-    rocksdb::DB::open_cf(&options, path, columns).unwrap()
 }
 
 fn config() -> Config {
@@ -7125,7 +7169,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
         .ingest("known", "known", "json", br#"{"t":1000}"#, 0)
         .unwrap();
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let mut raw = json::read_slice(
         &db.get(&legacy.record_ids[0]).unwrap().unwrap(),
         Limits::default(),
@@ -7172,7 +7216,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
         "STORAGE_FAILURE"
     );
     drop(store);
-    let db = catalog_db(dir.path());
+    let db = catalog_db(dir.path()).unwrap();
     let mut raw = json::read_slice(&saved, Limits::default()).unwrap();
     raw.as_object_mut().unwrap().insert("path", "/different");
     db.put(&profile_key, json::write_compact(&raw)).unwrap();

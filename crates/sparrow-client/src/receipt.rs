@@ -36,7 +36,7 @@ pub struct Discovery {
 
 impl Discovery {
     /// Decode and enforce the current typed discovery contract.
-    pub fn decode(value: wire::status::Reader<'_>) -> Result<Self, Error> {
+    pub fn decode(value: wire::discovery::Reader<'_>) -> Result<Self, Error> {
         let durability = value.get_durability_status()?;
         let discovery = Self {
             durability_session: durability.get_session_id()?.to_str()?.to_owned(),
@@ -79,7 +79,18 @@ impl Discovery {
 
     /// Request and validate discovery on a generated capability.
     pub async fn fetch(client: &wire::sparrow::Client) -> Result<Self, Error> {
-        let response = client.status_request().send().promise.await?;
+        let response = client
+            .discover_request()
+            .send()
+            .promise
+            .await
+            .map_err(|error| {
+                if error.kind == capnp::ErrorKind::Unimplemented {
+                    Error::Unsupported("requires typed discovery; use a matching daemon executable")
+                } else {
+                    Error::from(error)
+                }
+            })?;
         match response.get()?.get_result()?.which()? {
             wire::result::Ok(value) => Self::decode(value?),
             wire::result::Error(error) => Err(Error::domain(error?)),
@@ -416,14 +427,20 @@ mod tests {
 
     #[test]
     fn discovery_refuses_old_schema_or_missing_profile_identity() {
-        for (version, rdf) in [(11, "rdf"), (crate::SCHEMA_VERSION, "")] {
+        for (version, rdf) in [
+            (22, "rdf"),
+            (crate::SCHEMA_VERSION, ""),
+            (crate::SCHEMA_VERSION, "rdf"),
+        ] {
             let mut message = capnp::message::Builder::new_default();
-            let mut status = message.init_root::<super::wire::status::Builder<'_>>();
+            let mut status = message.init_root::<super::wire::discovery::Builder<'_>>();
             status.set_schema_version(version);
             status.set_store_id("store:test");
             status.set_text_analyzer("analyzer");
             status.set_text_profile("text");
             status.set_rdf_profile(rdf);
+            status.set_max_artifact_bytes(1024);
+            status.set_max_records_per_artifact(100);
             status.set_max_event_batch_bytes(crate::MAX_EVENT_BATCH_BYTES as u32);
             status.set_max_event_batch_events(crate::MAX_EVENT_BATCH_EVENTS as u32);
             let mut durability = status.reborrow().init_durability_status();
@@ -431,10 +448,14 @@ mod tests {
             durability.set_max_pending_writes(256);
             durability.set_max_pending_bytes(64 * 1024 * 1024);
             durability.set_flush_interval_ms(2000);
-            assert!(matches!(
-                super::Discovery::decode(status.into_reader()),
-                Err(super::Error::Unsupported(_))
-            ));
+            let decoded = super::Discovery::decode(status.into_reader());
+            if version == crate::SCHEMA_VERSION && !rdf.is_empty() {
+                let value = decoded.unwrap();
+                assert_eq!(value.store_id, "store:test");
+                assert_eq!(value.durability_session, "session:test");
+            } else {
+                assert!(matches!(decoded, Err(super::Error::Unsupported(_))));
+            }
         }
     }
 }

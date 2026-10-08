@@ -32,8 +32,35 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 22; the schema sections
+The current source implements schema 23; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 23 bounded typed discovery
+
+`discover` carries typed store/schema/profile identities, upload/event ceilings
+and bounded durability state. SDK connections and agent query admission use it
+instead of scanning operational status. Discovery work does not grow with the
+retained evidence catalog; lock contention can still delay it. Explicit status
+retains measured catalog and physical usage. Discovery is not a health check:
+corrupt evidence still fails status and affected queries with `STORAGE_FAILURE`.
+The wire change leaves store formats unchanged.
+
+Local qualification on 2026-10-07: `make check` passed formatting, release
+Clippy with warnings denied, workspace release tests (95 storage and 28
+RPC/daemon/MCP scenarios), census self-tests and the pinned cross-workspace
+gate. All 145 ownership jobs hold, with no distinct exceptions. The shared
+native catalog corruption fixture lives in one dev-only test support crate;
+both dependency edges are dev-only. Store properties and status share their
+immutable metadata owner; status and discovery share the durability wire codec.
+
+A private schema 22 daemon was captured from the owned development process
+before adoption (SHA256
+`3108104465a2ffa04a67b7c7f3446f0780bca3183623f1182700bae1215ab909`).
+The current CLI refused `status`, `keys` and `records` with `UNSUPPORTED`,
+exit 1 and zero stdout bytes, without falling back to status. Evidence is in
+`/tmp/sparrow-discovery-compat.2_glnuku`; the private child exited cleanly on
+SIGINT and removed its socket. Full query leases/snapshots/pagination remain
+unfinished.
 
 ## Schema 22 diagnostic scope coverage
 
@@ -59,8 +86,8 @@ No new parser, scoring law, or persisted evidence representation is introduced.
 
 Queries now declare `Scope.schemaVersion`; the daemon refuses older/absent
 versions before encoding changed count fields. Every agent query first checks
-native discovery. The extra discovery still scans status; bounded handshake and
-full query leases/snapshots/pagination remain unfinished. Before the verified
+native discovery. At schema 22 that discovery still scanned status; schema 23
+replaces that admission path above. Before the verified
 adoption below the development unit ran schema 21.
 
 Local qualification on 2026-10-07: `make check` passed formatting, release Clippy

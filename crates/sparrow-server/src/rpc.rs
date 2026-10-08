@@ -16,6 +16,28 @@ fn invalid(error: impl std::fmt::Display) -> Error {
     Error::new("INVALID_ARGUMENT", error.to_string())
 }
 
+fn encode_durability(
+    mut state: wire::durability_status::Builder<'_>,
+    durability: &sparrow_core::DurabilityStatus,
+) {
+    state.set_session_id(&durability.session_id);
+    state.set_accepted_through(durability.accepted_through);
+    state.set_durable_through(durability.durable_through);
+    state.set_pending_writes(durability.pending_writes as u32);
+    state.set_pending_bytes(durability.pending_bytes as u64);
+    state.set_oldest_pending_ms(durability.oldest_pending_ms);
+    state.set_max_pending_writes(sparrow_core::MAX_BUFFERED_WRITES as u32);
+    state.set_max_pending_bytes(sparrow_core::MAX_BUFFERED_BYTES as u64);
+    state.set_flush_interval_ms(durability.flush_interval_ms);
+    state.set_flush_lag_ms(durability.flush_lag_ms);
+    sparrow_client::encode_optional(
+        state.init_failure(),
+        durability.failure.as_deref(),
+        |mut out, value| out.set_value(value),
+        |mut out| out.set_absent(()),
+    );
+}
+
 /// Read the server's millisecond acceptance clock.
 pub fn now() -> Result<u64, Error> {
     sparrow_client::unix_millis_now().map_err(invalid)
@@ -1596,6 +1618,33 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn discover(
+        self: Rc<Self>,
+        _: wire::sparrow::DiscoverParams,
+        mut results: wire::sparrow::DiscoverResults,
+    ) -> capnp::Result<()> {
+        match self
+            .work(|store, _| Ok((store.properties()?, store.durability_status()?)))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok((value, durability)) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(field::<String>(&value, "store_id")?);
+                out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                out.set_max_artifact_bytes(number(&value, "max_artifact_bytes")?);
+                out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
+                out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
+                out.set_text_profile(field::<String>(&value, "text_profile")?);
+                out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
+                out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
+                out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
+                encode_durability(out.init_durability_status(), &durability);
+            }
+        }
+        Ok(())
+    }
+
     async fn status(
         self: Rc<Self>,
         _: wire::sparrow::StatusParams,
@@ -1649,25 +1698,7 @@ impl wire::sparrow::Server for Rpc {
                         |mut out| out.set_absent(()),
                     );
                 }
-                {
-                    let mut state = out.reborrow().init_durability_status();
-                    state.set_session_id(&durability.session_id);
-                    state.set_accepted_through(durability.accepted_through);
-                    state.set_durable_through(durability.durable_through);
-                    state.set_pending_writes(durability.pending_writes as u32);
-                    state.set_pending_bytes(durability.pending_bytes as u64);
-                    state.set_oldest_pending_ms(durability.oldest_pending_ms);
-                    state.set_max_pending_writes(sparrow_core::MAX_BUFFERED_WRITES as u32);
-                    state.set_max_pending_bytes(sparrow_core::MAX_BUFFERED_BYTES as u64);
-                    state.set_flush_interval_ms(durability.flush_interval_ms);
-                    state.set_flush_lag_ms(durability.flush_lag_ms);
-                    sparrow_client::encode_optional(
-                        state.init_failure(),
-                        durability.failure,
-                        |mut out, value| out.set_value(&value),
-                        |mut out| out.set_absent(()),
-                    );
-                }
+                encode_durability(out.reborrow().init_durability_status(), &durability);
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);

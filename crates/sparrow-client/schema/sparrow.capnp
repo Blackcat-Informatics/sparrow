@@ -91,6 +91,15 @@ struct Status {
   pressureStatus @26 :PressureStatus;
 }
 
+# Constant-size compatibility and admission metadata; no evidence catalog counts.
+struct Discovery {
+  storeId @0 :Text; schemaVersion @1 :UInt32;
+  maxArtifactBytes @2 :UInt64; maxRecordsPerArtifact @3 :UInt64;
+  textAnalyzer @4 :Text; textProfile @5 :Text; rdfProfile @6 :Text;
+  maxEventBatchBytes @7 :UInt32; maxEventBatchEvents @8 :UInt32;
+  durabilityStatus @9 :DurabilityStatus;
+}
+
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; }
 enum EvictionFrontier { exhausted @0; unitLimit @1; scanBudget @2; payloadBudget @3; catalogBudget @4; }
 struct EvictionPass {
@@ -391,4 +400,5 @@ interface Sparrow {
   watchHandoffGet @31 (request :WatchHandoff) -> (result :Result(HandoffReceipt));
   diagnosticDefine @32 (definition :DiagnosticDefinition) -> (result :Result(DiagnosticProfile));
   diagnosticGet @33 (source :Text) -> (result :Result(OptionalDiagnosticProfile));
+  discover @34 () -> (result :Result(Discovery));
 }

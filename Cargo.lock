@@ -1273,6 +1273,7 @@ dependencies = [
  "purrdf-hash",
  "purrdf-lex",
  "rocksdb",
+ "sparrow-test-support",
  "tempfile",
 ]
 
@@ -1300,12 +1301,20 @@ dependencies = [
  "serde",
  "sparrow-client",
  "sparrow-core",
+ "sparrow-test-support",
  "tempfile",
  "tokio",
  "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sparrow-test-support"
+version = "0.1.0"
+dependencies = [
+ "rocksdb",
 ]
 
 [[package]]

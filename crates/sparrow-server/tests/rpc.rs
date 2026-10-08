@@ -13,6 +13,72 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn bounded_discovery_does_not_read_corrupt_evidence_or_disguise_status_failure() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let configuration = sparrow_server::ServerConfig::read(&config).unwrap();
+            let owner = configuration.open_store().unwrap();
+            let accepted = owner
+                .ingest(
+                    "discovery-corruption",
+                    "producer",
+                    "json",
+                    br#"{"message":"needle"}"#,
+                    sparrow_server::now().unwrap(),
+                )
+                .unwrap();
+            let properties = owner.properties().unwrap();
+            drop(owner);
+            let db = sparrow_test_support::catalog_db(&data).unwrap();
+            db.put(&accepted.record_ids[0], b"{invalid").unwrap();
+            drop(db);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let discovery = sparrow_client::Discovery::fetch(client.capability())
+                .await
+                .unwrap();
+            assert_eq!(discovery, client.discovery().clone());
+            assert_eq!(
+                Some(discovery.store_id.as_str()),
+                properties["store_id"].as_str()
+            );
+            let response = client
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "STORAGE_FAILURE"
+                ),
+                wire::result::Ok(_) => panic!("status concealed a corrupt evidence row"),
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args(["keys"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success() && output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("STORAGE_FAILURE"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new().run_until(async {
@@ -2103,6 +2169,15 @@ impl EventRelayState {
     }
 }
 impl wire::sparrow::Server for EventRelay {
+    async fn discover(
+        self: std::rc::Rc<Self>,
+        _: wire::sparrow::DiscoverParams,
+        mut results: wire::sparrow::DiscoverResults,
+    ) -> capnp::Result<()> {
+        let backend = self.0.backend.borrow().clone();
+        let response = backend.discover_request().send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)
+    }
     async fn ingest(
         self: std::rc::Rc<Self>,
         params: wire::sparrow::IngestParams,

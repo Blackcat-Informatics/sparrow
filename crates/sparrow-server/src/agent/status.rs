@@ -7,12 +7,32 @@ use purrdf_lex::json::{Object, Value};
 use wire::result;
 
 pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
+    let discovery = sparrow_client::Discovery::fetch(client).await?;
     let response = client.status_request().send().promise.await?;
     let value = match response.get()?.get_result()?.which()? {
         result::Ok(value) => value?,
         result::Error(error) => return Err(failure(error?)),
     };
-    sparrow_client::Discovery::decode(value)?;
+    if value.get_schema_version() != discovery.schema_version
+        || value.get_store_id()?.to_str()? != discovery.store_id
+        || value.get_durability_status()?.get_session_id()?.to_str()?
+            != discovery.durability_session
+        || value.get_max_artifact_bytes() != discovery.max_artifact_bytes
+        || value.get_max_records_per_artifact() != discovery.max_records_per_artifact
+        || value.get_text_analyzer()?.to_str()? != discovery.text_analyzer
+        || value.get_text_profile()?.to_str()? != discovery.text_profile
+        || value.get_rdf_profile()?.to_str()? != discovery.rdf_profile
+        || value.get_max_event_batch_bytes() != discovery.max_event_batch_bytes
+        || value.get_max_event_batch_events() != discovery.max_event_batch_events
+        || value.get_durability_status()?.get_max_pending_writes() != discovery.max_buffered_writes
+        || value.get_durability_status()?.get_max_pending_bytes() != discovery.max_buffered_bytes
+        || value.get_durability_status()?.get_flush_interval_ms() != discovery.flush_interval_ms
+    {
+        return Err(sparrow_client::Error::Protocol(
+            "status contradicts discovered identity, profiles or admission limits",
+        )
+        .into());
+    }
     let durability = value.get_durability_status()?;
     let state = Object::new()
         .with("session_id", durability.get_session_id()?.to_str()?)

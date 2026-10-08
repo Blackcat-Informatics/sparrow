@@ -434,13 +434,27 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `ingest`, `importBegin`/`importAppend`/`importGet`, `importSeal`/`importLayout`/`importPrepare`/`importPublish`/`importCancel` | Original bytes, occurrence identity and explicit durability. A partial stream cannot publish a complete artifact. |
 | `eventsIngest` | Bounded typed fields, independent event occurrences, producer instance/sequence identities, and stable batch retries. |
 | `flush` | Synchronization through a specified store/session/sequence watermark; typed stale-session and future-sequence refusal. |
-| `status` and planned capabilities operation | Operational status and supported profiles/limits. |
+| `discover`, `status` | Bounded compatibility/admission metadata, and separately measured operational status. |
 | `artifactGet`, `recordGet`, `bytesRead` | Store-scoped metadata and exact bounded ranges. |
 | `pin`, `pinRenew`, `pinRelease` | Durable all-or-nothing protection with stable retry identities; renewal optionally checks the current collection revision. |
 | `pinRead` | Typed active-list/name/ID selector, finite catalog capture and store-scoped continuation pages. |
 | `keysList`, `valuesSearch` and planned text/record/graph operations | Shared native semantics, typed results and query coverage. |
 | `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume administration; removal stops new admission while preserving existing claims. Tail administration remains unfinished. |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
+
+Schema 23 adds `discover`: store identity, schema version, native text/RDF profile
+identities, upload/event ceilings and bounded durability state. SDK connection,
+producer admission and CLI/MCP query admission use this typed operation rather
+than `status`. Its work is independent of the retained evidence catalog size;
+store-lock contention can still delay it. The pending durability ledger is
+bounded by the configured admission ceilings. Older daemons without this method
+are refused with `UNSUPPORTED`; there is no fallback to a catalog scan.
+
+Discovery establishes compatibility and admission limits, not store health.
+Explicit `status` still reads catalog counts and physical usage, and queries
+still validate the evidence they read. Corrupt evidence must produce an
+actionable failure on those paths even when discovery succeeds. Status metadata
+must agree with discovery. This wire revision does not change storage formats.
 
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity

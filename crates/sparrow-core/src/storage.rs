@@ -545,6 +545,43 @@ impl Catalog for Pin {
 }
 
 impl Writer {
+    fn properties(&self) -> Result<Object, Error> {
+        let format = self
+            .db
+            .get("store_format")?
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "store format missing"))?;
+        Ok(Object::new()
+            .with("store_id", self.id.clone())
+            .with(
+                "store_format",
+                std::str::from_utf8(&format)
+                    .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?,
+            )
+            .with("rdf_profile", rdf_index::profile_identity()?)
+            .with(
+                "text_analyzer",
+                hex::encode(&self.config.text_analyzer.fingerprint()),
+            )
+            .with("text_profile", crate::text::PROFILE)
+            .with("retry_window_seconds", (RETRY_WINDOW / 1000).to_string())
+            .with("disk_budget", self.config.disk_budget.to_string())
+            .with(
+                "max_artifact_bytes",
+                self.config.max_artifact_bytes.to_string(),
+            )
+            .with(
+                "max_records_per_artifact",
+                self.config.max_records.to_string(),
+            )
+            .with("max_pin_members", self.config.max_pin_members.to_string())
+            .with(
+                "maintenance_reserve",
+                self.config.maintenance_reserve.to_string(),
+            ))
+    }
+}
+
+impl Writer {
     fn payload_chunk(&self, digest: &str) -> Result<Vec<u8>, Error> {
         let cf = self
             .db
@@ -1610,6 +1647,12 @@ impl Store {
         Ok(())
     }
 
+    /// Read constant-size store and admission properties without scanning evidence.
+    /// Does not measure physical bytes or count records, pins, references or projections.
+    pub fn properties(&self) -> Result<Value, Error> {
+        Ok(self.lock()?.properties()?.into())
+    }
+
     /// Report measured database bytes and deduplicated live payload references.
     pub fn status(&self, now: u64) -> Result<Value, Error> {
         let (pin_handles, pin_bytes) = self.pin_read_stats(now)?;
@@ -1619,48 +1662,18 @@ impl Store {
             writer.live_record(record, now, &protected)
         })?;
         let unique_chunks = writer.count_prefix("ref:")?;
-        let format = writer
-            .db
-            .get("store_format")?
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "store format missing"))?;
-        Ok(Object::new()
+        Ok(writer
+            .properties()?
             .with("pin_read_handles", pin_handles.to_string())
             .with("pin_read_bytes", pin_bytes.to_string())
             .with("max_pin_read_handles", pin_read::MAX_HANDLES.to_string())
             .with("max_pin_read_bytes", pin_read::HANDLE_BYTES.to_string())
             .with("pin_read_lease_ms", pin_read::LEASE_MS.to_string())
-            .with("store_id", writer.id.clone())
-            .with(
-                "store_format",
-                std::str::from_utf8(&format)
-                    .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?,
-            )
-            .with("rdf_profile", rdf_index::profile_identity()?)
-            .with(
-                "text_analyzer",
-                hex::encode(&writer.config.text_analyzer.fingerprint()),
-            )
-            .with("text_profile", crate::text::PROFILE)
-            .with("retry_window_seconds", (RETRY_WINDOW / 1000).to_string())
             .with(
                 "unique_json_projections",
                 writer.count_prefix("projection-ref:")?.to_string(),
             )
             .with("physical_bytes", writer.physical_bytes()?.to_string())
-            .with("disk_budget", writer.config.disk_budget.to_string())
-            .with(
-                "max_artifact_bytes",
-                writer.config.max_artifact_bytes.to_string(),
-            )
-            .with(
-                "max_records_per_artifact",
-                writer.config.max_records.to_string(),
-            )
-            .with("max_pin_members", writer.config.max_pin_members.to_string())
-            .with(
-                "maintenance_reserve",
-                writer.config.maintenance_reserve.to_string(),
-            )
             .with("live_records", live.to_string())
             .with("unique_payload_chunks", unique_chunks.to_string())
             .with(

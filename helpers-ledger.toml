@@ -1567,7 +1567,7 @@ names = ['^(render_staging_progress|encode_upload_progress)$']
 
 [[job]]
 id = "typed-producer-discovery"
-summary = "Decode and validate the same typed daemon discovery before CLI and SDK mutations."
+summary = "Decode and validate the dedicated bounded typed daemon discovery before CLI/MCP queries and SDK mutations; never scan status for admission."
 home = "sparrow_client::receipt::Discovery::decode"
 entry_points = []
 spec = "docs/development-runtime.md: standalone typed Rust producer client."
@@ -2177,7 +2177,7 @@ names = ['^(encode_eligible_count|encode_qualified_count|render_eligible_count|r
 [[job]]
 id = "storage-test-catalog-open"
 summary = "One dev-only owner opens every declared native RocksDB family for closed-store corruption and identity fixtures."
-home = "sparrow_core::test_crate::storage::catalog_db"
+home = "sparrow_test_support::catalog_db"
 entry_points = []
 spec = "AGENTS.md: shared test scaffolding and one local helper implementation."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
@@ -2187,3 +2187,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(open_corrupt_time_db|open_corrupt_diagnostic_db|open_test_catalog_again)$']
+
+[[job]]
+id = "bounded-store-properties"
+summary = "One property owner serves compatibility discovery and full status without duplicating profile identities or admission limits."
+home = "sparrow_core::storage::Writer::properties"
+entry_points = ["sparrow_core::storage::Store::properties"]
+spec = "docs/interfaces.md: schema 23 bounded discovery."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(discovery_store_properties|status_store_properties)$']
+
+[[job]]
+id = "durability-status-wire"
+summary = "Full status and bounded discovery share one actual durability status wire codec."
+home = "sparrow_server::rpc::encode_durability"
+entry_points = []
+spec = "docs/interfaces.md: schema 23 bounded discovery and real durability state."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_discovery_durability|encode_status_durability)$']

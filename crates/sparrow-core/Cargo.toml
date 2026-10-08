@@ -18,6 +18,7 @@ purrdf-lex.workspace = true
 getrandom.workspace = true
 
 [dev-dependencies]
+sparrow-test-support = { path = "../sparrow-test-support" }
 tempfile = "3"
 
 [lints]

@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/sparrow-helper-census", "crates/sparrow-core", "crates/sparrow-client", "crates/sparrow-server"]
+members = ["crates/sparrow-helper-census", "crates/sparrow-core", "crates/sparrow-client", "crates/sparrow-server", "crates/sparrow-test-support"]
 
 [workspace.package]
 edition = "2024"
