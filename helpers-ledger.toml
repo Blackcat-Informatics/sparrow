@@ -3005,3 +3005,59 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(make_tail_range_key|publish_tail_range_index)$']
+
+[[job]]
+id = "retained-complete-file-reader"
+summary = "One serialized bounded generation byte-cover reader validates all retained ranges and original eligibility while reusing exact chunk range assembly."
+home = "sparrow_core::storage::tail_ranges::bytes"
+entry_points = ["sparrow_core::storage::Store::bytes"]
+spec = "docs/interfaces.md: schema 40 retained complete-file byte reads."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(assemble_tail_file_bytes|read_file_generation_bytes)$']
+
+[[job]]
+id = "exact-byte-request-certificate"
+summary = "One SDK byte request path and store/length certificate serve SDK, CLI and MCP exact-range reads, including typed file-generation targets."
+home = "sparrow_client::bytes::certify"
+entry_points = ["sparrow_client::bytes::read_bytes", "sparrow_client::Client::bytes", "sparrow_server::agent::read::fetch"]
+spec = "docs/interfaces.md: schema 40 retained complete-file byte reads."
+vectors = ["crates/sparrow-client/src/bytes.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(certify_agent_bytes|fetch_file_generation_bytes)$']
+
+[[job]]
+id = "concrete-evidence-wire-reference"
+summary = "One generated artifact/record reference encoder serves byte requests and concrete investigation target adapters."
+home = "sparrow_client::bytes::encode_evidence"
+entry_points = ["sparrow_server::agent::evidence"]
+spec = "docs/interfaces.md: store-scoped concrete evidence."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_agent_evidence|encode_byte_evidence)$']
+
+[[job]]
+id = "file-generation-query-reference"
+summary = "One current-schema store-scoped file generation reference decoder serves metadata and exact byte reads."
+home = "sparrow_server::rpc::Rpc::tail_reference"
+entry_points = ["sparrow_server::rpc::Rpc::tail_generation_get", "sparrow_server::rpc::Rpc::bytes_read"]
+spec = "docs/interfaces.md: schema 40 retained complete-file byte reads."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_tail_byte_reference|decode_generation_read_reference)$']

@@ -104,7 +104,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "bytes_read",
-        "Read at most 1 MiB of exact original bytes; offset is relative to the selected evidence.",
+        "Read at most 1 MiB of exact artifact/record bytes or a completed file-generation range; whole-file reads require the entire retained cover.",
     ),
     (
         "pin",

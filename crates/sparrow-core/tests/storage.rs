@@ -9,6 +9,239 @@ use sparrow_test_support::{catalog_db, remove_tail_range_index};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn completed_file_bytes_span_original_records_and_follow_full_cover_pin_eligibility() {
+    use sparrow_core::TailStart;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let generation = store
+        .tail_start(
+            &TailStart {
+                request_id: "download-start".into(),
+                watch: "tail".into(),
+                watch_revision: 1,
+                directories: CONSUMPTION_DIRECTORIES,
+                path: b"download.log".to_vec(),
+                source: "download-source".into(),
+                format: "log".into(),
+                device: 7,
+                inode: 42,
+            },
+            1,
+        )
+        .unwrap();
+    let mut original = vec![b'x'; 70_000];
+    original.extend_from_slice(b"\nsmall\r\n");
+    let prefix = store
+        .tail_append(&generation.id, 0, &original, false, 2)
+        .unwrap()
+        .artifact
+        .unwrap();
+    assert_eq!(
+        store.bytes(&generation.id, 0, 1, 3).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    let final_part = store
+        .tail_append(&generation.id, original.len() as u64, b"last", true, 3)
+        .unwrap()
+        .artifact
+        .unwrap();
+    original.extend_from_slice(b"last");
+    let before = store.record(&prefix.record_ids[0]).unwrap();
+    assert_eq!(
+        store.bytes(&generation.id, 0, original.len(), 4).unwrap(),
+        original
+    );
+    assert_eq!(
+        store.bytes(&generation.id, 69_999, 13, 4).unwrap(),
+        original[69_999..70_012]
+    );
+    assert!(
+        store
+            .bytes(&generation.id, original.len() as u64, 0, 4)
+            .unwrap()
+            .is_empty()
+    );
+    for (offset, length) in [(original.len() as u64, 1), (u64::MAX, 1)] {
+        assert_eq!(
+            store
+                .bytes(&generation.id, offset, length, 4)
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    assert_eq!(
+        store
+            .bytes(&generation.id, 0, 1024 * 1024 + 1, 4)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    let pin = store
+        .pin(
+            "download-pin",
+            "case",
+            &[prefix.id.clone(), final_part.record_ids[0].clone()],
+            40,
+            4,
+        )
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store
+            .bytes(&generation.id, 0, original.len(), 31 * DAY)
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        store.record(&before.id).unwrap().received_at,
+        before.received_at
+    );
+    assert_eq!(
+        store.record(&before.id).unwrap().expires_at,
+        before.expires_at
+    );
+    let survivor = store
+        .pin(
+            "download-last-pin",
+            "last-case",
+            &final_part.record_ids,
+            40,
+            31 * DAY,
+        )
+        .unwrap();
+    store.release(&pin.id).unwrap();
+    // Unretired but expired records must already refuse the complete-file read.
+    assert_eq!(
+        store
+            .bytes(&generation.id, 70_008, 4, 31 * DAY)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store
+            .bytes(&generation.id, 70_008, 4, 31 * DAY)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        store
+            .bytes(&final_part.record_ids[0], 0, 4, 31 * DAY)
+            .unwrap(),
+        b"last"
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .bytes(&generation.id, 70_008, 4, 31 * DAY)
+            .unwrap_err()
+            .code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        store
+            .bytes(&final_part.record_ids[0], 0, 4, 31 * DAY)
+            .unwrap(),
+        b"last"
+    );
+    store.release(&survivor.id).unwrap();
+}
+
+#[test]
+fn complete_file_reads_refuse_missing_and_foreign_range_members_without_returning_a_prefix() {
+    use sparrow_core::TailStart;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let start = TailStart {
+        request_id: "cover-first".into(),
+        watch: "tail".into(),
+        watch_revision: 1,
+        directories: CONSUMPTION_DIRECTORIES,
+        path: b"first.log".to_vec(),
+        source: "cover-source".into(),
+        format: "log".into(),
+        device: 7,
+        inode: 42,
+    };
+    let generation = store.tail_start(&start, 1).unwrap();
+    let records = store
+        .tail_append(&generation.id, 0, b"a\nb\n", true, 2)
+        .unwrap()
+        .artifact
+        .unwrap();
+    let mut other = start;
+    other.request_id = "cover-second".into();
+    other.inode = 43;
+    other.path = b"second.log".to_vec();
+    let foreign = store.tail_start(&other, 3).unwrap();
+    let foreign_record = store
+        .tail_append(&foreign.id, 0, b"z\n", true, 4)
+        .unwrap()
+        .artifact
+        .unwrap();
+    other.request_id = "cover-empty".into();
+    other.inode = 44;
+    other.path = b"empty.log".to_vec();
+    let empty = store.tail_start(&other, 5).unwrap();
+    store.tail_append(&empty.id, 0, b"", true, 6).unwrap();
+    assert!(store.bytes(&empty.id, 0, 0, 7).unwrap().is_empty());
+    assert_eq!(
+        store.bytes(&empty.id, 0, 1, 7).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        store.bytes(&empty.id, 0, 0, 31 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    drop(store);
+    let key = format!(
+        "tail-range:{}:{:020}:{}",
+        generation.id, 2, records.record_ids[1]
+    );
+    {
+        let db = catalog_db(dir.path()).unwrap();
+        db.put(&key, foreign_record.record_ids[0].as_bytes())
+            .unwrap();
+    }
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.bytes(&generation.id, 0, 1, 5).unwrap_err().code,
+        "STORAGE_FAILURE"
+    );
+    drop(store);
+    {
+        let db = catalog_db(dir.path()).unwrap();
+        db.delete(&key).unwrap();
+    }
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.bytes(&generation.id, 0, 1, 5).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        store.bytes(&records.record_ids[0], 0, 2, 5).unwrap(),
+        b"a\n"
+    );
+    drop(store);
+    {
+        let db = catalog_db(dir.path()).unwrap();
+        db.put(&key, records.record_ids[1].as_bytes()).unwrap();
+        db.put(&records.record_ids[1], vec![b'x'; 64 * 1024 + 1])
+            .unwrap();
+    }
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.bytes(&generation.id, 0, 1, 5).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+}
+
+#[test]
 fn retained_tail_ranges_follow_pins_and_upgrade_without_resurrecting_retired_bytes() {
     use sparrow_core::{ConsumptionGeneration, TailFinishIntent, TailStart};
     for legacy in 29..=32 {

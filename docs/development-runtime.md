@@ -32,7 +32,7 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 39; the schema sections
+The current source implements schema 40; the schema sections
 below retain their historical qualification evidence.
 
 ## Durable file-completion storage foundation
@@ -3777,3 +3777,27 @@ The focused scenario and final full hook passed. Evidence:
 `/tmp/sparrow-tail-range-commit-final.log`, and
 `/tmp/sparrow-tail-range-bins.log`. Complete retained-file assembly and
 completed-tail claim/deletion handoff still require implementation.
+
+
+## Schema 40 retained whole-file reads
+
+Source adds a typed file-generation branch to the existing byte RPC. SDK,
+CLI and MCP reuse one certified byte request/response path. The core serializes
+full-cover validation against pins and retirement, streams bounded range catalog
+rows, and uses the existing digest-checked chunk reader for requested bytes.
+It neither reads source paths nor reimports occurrences. Missing or ineligible
+cover refuses even a request for surviving final bytes; those records remain
+independently readable. Original acceptance and expiration clocks are preserved.
+
+Core scenarios cover multi-batch and cross-chunk exact reconstruction, CRLF and
+final unterminated bytes, full-cover pins followed by an independently pinned
+last record, expired but unretired prefixes, retired prefixes, reopen, empty-file
+expiry, foreign index membership and hard streaming-row admission. The actual
+TCP/Unix daemon scenario exercises SDK/CLI/MCP reads, store/schema refusal,
+completion retries, source replacement/removal and reopen. SDK receipt fixtures
+refuse foreign stores and both short and long replies. The interface document
+records exact finite admission ceilings and per-read eligibility semantics.
+
+Completed-tail claim/deletion handoff remains unfinished. The live adoption
+below will identify the installed functional build and its acceptance evidence;
+this source section alone is not deployment evidence.

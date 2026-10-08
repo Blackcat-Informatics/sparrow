@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::Result;
-use super::{evidence, failure, invalid, wire};
+use super::{invalid, wire};
 use purrdf_lex::json::{Object, Value};
 use std::{fs::OpenOptions, io::Write, path::PathBuf};
 
@@ -21,8 +21,13 @@ impl Input {
                 "usage: bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE",
             ));
         }
-        if !args[1].starts_with("artifact:") && !args[1].starts_with("record:") {
-            return Err(invalid("evidence ID requires artifact: or record: prefix"));
+        if !args[1].starts_with("artifact:")
+            && !args[1].starts_with("record:")
+            && !args[1].starts_with("file-generation:")
+        {
+            return Err(invalid(
+                "byte target requires artifact:, record:, or file-generation: prefix",
+            ));
         }
         let offset = args[2]
             .parse()
@@ -77,21 +82,7 @@ pub(super) async fn fetch(
     offset: u64,
     length: u32,
 ) -> Result<(String, Vec<u8>)> {
-    if length > 1048576 {
-        return Err(invalid("byte read limit is 1 MiB"));
-    }
-    let mut request = client.bytes_read_request();
-    let mut read = request.get().init_request();
-    read.set_offset(offset);
-    read.set_length(length);
-    evidence(read.init_evidence(), store, id)?;
-    let response = request.send().promise.await?;
-    let bytes = match response.get()?.get_result()?.which()? {
-        wire::result::Ok(bytes) => bytes?,
-        wire::result::Error(error) => return Err(failure(error?)),
-    };
-    Ok((
-        bytes.get_store_id()?.to_str()?.to_owned(),
-        bytes.get_data()?.to_vec(),
-    ))
+    sparrow_client::read_bytes(client, store, id, offset, length)
+        .await
+        .map_err(Into::into)
 }

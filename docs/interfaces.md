@@ -705,9 +705,9 @@ path. Inputs contain `store_id`, `request_id`, `generation_id`, decimal-string
 inputs; do not recapture replacement files. Generation reads also expose the
 original completion observation and clocks.
 
-Retained byte-cover assembly and completed-tail claim/deletion handoff remain
-unfinished. Completion grants no deletion authority and never reimports retired
-prefixes to manufacture a complete downloadable file.
+Schema 40 adds retained byte-cover reads as specified below. Completed-tail
+claim/deletion handoff remains unfinished. Completion grants no deletion authority
+and never reimports retired prefixes to manufacture a complete downloadable file.
 
 Schema 37 exposes `tailGenerationGet` as a finite metadata read guarded by the
 current schema and persistent store identity. CLI `file-generation STORE_ID
@@ -1305,3 +1305,38 @@ explicit versioning. Existing raw evidence must remain reconstructible through
 supported migrations. Transport adapters share contract fixtures for scope,
 pagination, pin receipts, certainty, and errors; CLI and MCP must produce the
 same domain result for the same snapshot and operation.
+
+### Schema 40 retained complete-file byte reads
+
+`ReadBytes` has a typed target union: its existing `evidence` branch is an
+artifact/record reference, and `fileGeneration` is a store-scoped
+`TailGenerationQuery` with the current discovered schema. The same `bytesRead`
+method, SDK `Client::bytes`, CLI `bytes`, and MCP `bytes_read` serve all targets.
+CLI/MCP accept `file-generation:` IDs; offsets are relative to the original file.
+Each response certifies the requested store and exact length through one SDK path.
+
+A generation target requires a complete, gap-free terminal checkpoint and its
+entire original contiguous byte cover to remain eligible under retention or
+explicit artifact/record pins. Checking only the requested subrange is insufficient.
+The serialized storage owner validates index/record identity, original declaration,
+ordered nonoverlapping positions, final offset and record count. It reuses the
+existing checked chunk reader and returns no successful prefix on refusal.
+Missing, expired or evicted cover gives `EVIDENCE_UNAVAILABLE`; contradictory
+catalog/index provenance gives `STORAGE_FAILURE`. Surviving records remain
+independently readable. An empty completed file supports an exact zero-length
+read until its terminal metadata deadline.
+
+The range ceiling remains 1 MiB with strict offset/length bounds. Cover admission
+has 100,000 pin/range visits, a 64 MiB streaming record catalog byte ceiling and
+64 KiB maximum record row. Pin decoding reuses the existing conservative capture
+charge with 64 MiB admission and 1 MiB maximum encoded pin row. Exceeding admission
+returns `RESOURCE_LIMIT`, never a partial cover certificate. Rows are decoded and
+discarded incrementally; only requested bytes are assembled. The read does not
+pin evidence, refresh clocks, create occurrences, or consult current source files.
+A multi-call download can lose eligibility between calls; retain explicit pins
+on the constituent artifacts/records when the investigation requires it.
+
+Generation metadata's `complete` still denotes the original terminal checkpoint,
+not current byte availability. A successful zero-length file read can probe full
+cover under the same admission. Completed-tail claim/deletion handoff remains
+unfinished; a readable generation grants no source-removal authority.

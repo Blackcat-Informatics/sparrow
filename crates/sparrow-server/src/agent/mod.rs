@@ -120,16 +120,8 @@ fn decimal_u64(value: &Value) -> std::result::Result<u64, purrdf_lex::json::reco
         })
 }
 
-fn evidence(mut target: wire::evidence::Builder<'_>, store: &str, id: &str) -> Result<()> {
-    target.set_store_id(store);
-    if id.starts_with("artifact:") {
-        target.set_artifact(id);
-    } else if id.starts_with("record:") {
-        target.set_record(id);
-    } else {
-        return Err(invalid("evidence ID requires artifact: or record: prefix"));
-    }
-    Ok(())
+fn evidence(target: wire::evidence::Builder<'_>, store: &str, id: &str) -> Result<()> {
+    sparrow_client::encode_evidence(target, store, id).map_err(Into::into)
 }
 
 impl Default for Options {

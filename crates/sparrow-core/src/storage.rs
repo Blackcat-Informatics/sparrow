@@ -853,7 +853,7 @@ impl Writer {
             if maximum.is_some_and(|maximum| bytes.len() > maximum) {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
-                    "pin catalog entry exceeds RDF scope admission",
+                    "pin catalog entry exceeds operation admission",
                 ));
             }
             if let Some(remaining) = remaining.as_deref_mut() {
@@ -1585,7 +1585,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    /// Read an exact bounded range of complete artifact or retained record bytes.
+    /// Read an exact bounded range of artifact, record, or complete retained file bytes.
     pub fn bytes(&self, id: &str, offset: u64, length: usize, now: u64) -> Result<Vec<u8>, Error> {
         if length > BYTE_READ_BYTES {
             return Err(Error::new(
@@ -1594,6 +1594,9 @@ impl Store {
             ));
         }
         let writer = self.lock()?;
+        if id.starts_with("file-generation:") {
+            return tail_ranges::bytes(&writer, id, offset, length, now);
+        }
         let protected = writer.protected(now)?;
         let (chunks, size) = if id.starts_with("artifact:") {
             let artifact: Artifact = writer.get(id)?;

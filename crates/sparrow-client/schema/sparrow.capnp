@@ -312,7 +312,10 @@ struct Ingest {
   requestId @0 :Text; source @1 :Text; format @2 :Format; bytes @3 :Data;
   durability @4 :Durability = durable;
 }
-struct ReadBytes { evidence @0 :Evidence; offset @1 :UInt64; length @2 :UInt32; }
+struct ReadBytes {
+  union { evidence @0 :Evidence; fileGeneration @3 :TailGenerationQuery; }
+  offset @1 :UInt64; length @2 :UInt32;
+}
 struct Bytes { storeId @0 :Text; data @1 :Data; }
 struct PinRequest {
   requestId @0 :Text; name @1 :Text; targets @2 :List(Evidence); days @3 :UInt32;

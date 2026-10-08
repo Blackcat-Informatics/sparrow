@@ -29,7 +29,9 @@ mod transport;
 pub use transport::{Connection, Endpoint, connect, connect_tcp};
 mod error;
 pub use error::Error;
+mod bytes;
 mod receipt;
+pub use bytes::{encode_evidence, read_bytes};
 pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through};
 mod imports;
 pub use imports::{CompletedFileIdentity, import_file, import_open_file, open_completed_file};
@@ -53,7 +55,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 39;
+pub const SCHEMA_VERSION: u32 = 40;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -115,6 +117,18 @@ pub struct Client {
 }
 
 impl Client {
+    /// Read an exact artifact, record, or complete retained file-generation range.
+    pub async fn bytes(&self, id: &str, offset: u64, length: u32) -> Result<Vec<u8>, Error> {
+        read_bytes(
+            self.capability(),
+            &self.discovery.store_id,
+            id,
+            offset,
+            length,
+        )
+        .await
+        .map(|(_, bytes)| bytes)
+    }
     /// Accept an atomic typed event batch using the caller's stable retry identity.
     /// A transport failure requires retrying this same immutable batch.
     pub async fn events(&self, batch: &EventBatch) -> Result<ArtifactReceipt, Error> {

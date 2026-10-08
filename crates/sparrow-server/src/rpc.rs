@@ -221,6 +221,34 @@ impl Rpc {
         })?
     }
 
+    fn tail_reference(
+        &self,
+        query: wire::tail_generation_query::Reader<'_>,
+    ) -> Result<String, Error> {
+        self.check_store(
+            query
+                .get_store_id()
+                .map_err(invalid)?
+                .to_str()
+                .map_err(invalid)?,
+        )?;
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            return Err(Error::new(
+                "UNSUPPORTED",
+                "file-generation reads require the current discovered schema",
+            ));
+        }
+        let id = query.get_id().map_err(invalid)?;
+        if id.len() > 128 {
+            return Err(invalid("file-generation ID exceeds 128 bytes"));
+        }
+        let id = id.to_str().map_err(invalid)?;
+        if !id.starts_with("file-generation:") {
+            return Err(invalid("reference has the wrong evidence kind"));
+        }
+        Ok(id.to_owned())
+    }
+
     fn scoped_id(&self, evidence: wire::evidence::Reader<'_>) -> Result<String, Error> {
         let store = evidence
             .get_store_id()
@@ -2415,7 +2443,11 @@ impl wire::sparrow::Server for Rpc {
         let request = params.get()?.get_request()?;
         let offset = request.get_offset();
         let length = request.get_length() as usize;
-        let result = match self.scoped_id(request.get_evidence()?) {
+        let target = match request.which()? {
+            wire::read_bytes::Evidence(evidence) => self.scoped_id(evidence?),
+            wire::read_bytes::FileGeneration(query) => self.tail_reference(query?),
+        };
+        let result = match target {
             Ok(id) => {
                 self.work(move |store, now| store.bytes(&id, offset, length, now))
                     .await
@@ -2580,29 +2612,13 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::TailGenerationGetResults,
     ) -> capnp::Result<()> {
         let query = params.get()?.get_query()?;
-        if let Err(error) = self.check_store(query.get_store_id()?.to_str()?) {
-            failure(results.get().init_result(), error);
-            return Ok(());
-        }
-        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
-            failure(
-                results.get().init_result(),
-                Error::new(
-                    "UNSUPPORTED",
-                    "file-generation reads require the current discovered schema",
-                ),
-            );
-            return Ok(());
-        }
-        let id = query.get_id()?;
-        if id.len() > 128 {
-            failure(
-                results.get().init_result(),
-                invalid("file-generation ID exceeds 128 bytes"),
-            );
-            return Ok(());
-        }
-        let id = id.to_str()?.to_owned();
+        let id = match self.tail_reference(query) {
+            Ok(id) => id,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
         match self.work(move |store, _| store.tail_generation(&id)).await {
             Err(error) => failure(results.get().init_result(), error),
             Ok(generation) => crate::tail_wire::generation(

@@ -110,6 +110,7 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
                 .as_str()
                 .unwrap();
             let store = client.discovery().store_id.clone();
+            assert!(matches!(client.bytes(id, 0, 1).await, Err(sparrow_client::Error::Domain { code, .. }) if code == "EVIDENCE_UNAVAILABLE"));
             let previous =
                 cli(&socket, &["records", "--source", "consume-acceptance"])["rows"][0].clone();
             let intent_path = dir.path().join("finish.capnp");
@@ -167,6 +168,20 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
             assert_eq!(finished.records, 2);
             assert!(finished.gap.is_none());
             assert_eq!(client.tail_finish(&intent).await.unwrap(), finished);
+            assert_eq!(client.bytes(id, 0, 11).await.unwrap(), b"first\r\nlast");
+            assert_eq!(client.bytes(id, 5, 6).await.unwrap(), b"\r\nlast");
+            let export = dir.path().join("whole-file-export.log");
+            cli(&socket, &["bytes", &store, id, "0", "11", export.to_str().unwrap()]);
+            assert_eq!(std::fs::read(&export).unwrap(), b"first\r\nlast");
+            for (foreign, expected) in [(true, "STORE_MISMATCH"), (false, "UNSUPPORTED")] {
+                let mut call = client.capability().bytes_read_request();
+                let mut query = call.get().init_request().init_file_generation();
+                query.set_store_id(if foreign { "store:foreign" } else { &store });
+                query.set_id(id);
+                query.set_schema_version(if foreign { sparrow_client::SCHEMA_VERSION } else { sparrow_client::SCHEMA_VERSION - 1 });
+                let response = call.send().promise.await.unwrap();
+                assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(error) if error.as_ref().unwrap().get_code().unwrap().to_str().unwrap() == expected));
+            }
             let original_rows =
                 cli(&socket, &["records", "--source", "consume-acceptance"])["rows"].clone();
             assert_eq!(original_rows.as_array().unwrap().len(), 2);
@@ -202,6 +217,11 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
                 assert_eq!(result["isError"].as_bool(), Some(false));
                 assert_eq!(result["structuredContent"], rendered);
             }
+
+            let range = mcp.tool(4, "bytes_read", Object::new().with("store_id", store.clone())
+                .with("id", id).with("offset", "5").with("length", 6_u64).with("encoding", "utf8").into()).await;
+            assert_eq!(range["isError"].as_bool(), Some(false));
+            assert_eq!(range["structuredContent"]["data"].as_str(), Some("\r\nlast"));
             drop(mcp);
             drop(client);
             drop(daemon);
@@ -232,8 +252,10 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
                 original_rows
             );
             assert_eq!(client.tail_finish_get(&intent).await.unwrap(), finished);
+            assert_eq!(client.bytes(id, 0, 11).await.unwrap(), b"first\r\nlast");
             // Original admission remains recoverable after the producer independently removes the file.
             std::fs::remove_file(&input).unwrap();
+            assert_eq!(client.bytes(id, 0, 11).await.unwrap(), b"first\r\nlast");
             assert_eq!(client.tail_finish(&intent).await.unwrap(), finished);
             assert_eq!(std::fs::read(&intent_path).unwrap(), saved);
             changed.observed.length = observed.length + 1;
