@@ -40,7 +40,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "sources_list",
-        "Page an immutable capture of exact intake keys, retained occurrence counts, declared mapping IDs and configured watch bindings; producer continuity remains explicitly unknown.",
+        "Page an immutable capture of exact intake keys, retained occurrence counts, mapping IDs, producer windows, file-generation checkpoint IDs and configured watch bindings; continuity remains explicitly unknown.",
     ),
     (
         "artifacts_list",

@@ -2512,10 +2512,10 @@ names = ['^(encode_discovery_durability|encode_status_durability)$']
 
 [[job]]
 id = "source-catalog-discovery"
-summary = "Discover exact intake keys, retained occurrences, durable mappings and runtime-owned watch declarations through one immutable metadata capture."
+summary = "Discover exact intake keys, retained occurrences, durable mappings, producer windows, active/recent tail generation checkpoints and runtime-owned watch declarations through one immutable metadata capture."
 home = "sparrow_core::Store::source_read"
 entry_points = ["sparrow_server::rpc::Rpc::sources_list", "sparrow_server::agent::sources::Input::execute"]
-spec = "docs/interfaces.md: schema 25 source discovery and explicit unknown producer continuity."
+spec = "docs/interfaces.md: source discovery, schema 46 tail generation IDs and explicit unknown producer continuity."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true

@@ -1003,7 +1003,19 @@ Producer stream continuity remains `continuity_unknown=true`. Schema 35 adds
 `producer_stream_ids` for finite currently retained structured producer windows.
 These identities resolve through `producerStreamGet`, CLI `producer-stream
 STORE_ID STREAM_ID`, or the read-only closed MCP `producer_stream_get` tool.
-Active-file generation and syslog stream discovery remain unfinished.
+Schema 46 adds `tail_generation_ids`, sorted opaque IDs for active or unexpired
+terminal file-generation checkpoints under the exact source key. Empty inputs
+remain discoverable with zero retained records. IDs resolve through
+`tailGenerationGet`, CLI `file-generation STORE_ID ID`, and MCP
+`file_generation_get`. The existing native registry decoder owns identity and
+metadata validation; registry bytes and entries count against source scan
+admission, and reference allocation counts against capture/lease capacity.
+Source pages freeze these IDs with their original catalog snapshot: later
+generations and terminal metadata expiry change fresh reads, while continuation
+retains captured IDs. A captured reference is not a pin or a promise that a
+later checkpoint lookup will still succeed. Store formats are unchanged and
+older discovery schemas refuse instead of silently omitting the added field.
+Syslog stream discovery remains unfinished.
 
 ### Structured producer sequence windows (schema 35)
 

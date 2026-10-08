@@ -92,6 +92,8 @@ pub struct SourceSummary {
     pub watches: Vec<SourceWatchInfo>,
     /// Finite currently retained producer-window identities; each has a typed summary.
     pub producer_stream_ids: Vec<String>,
+    /// Unexpired or active descriptor-owned generation checkpoints, including empty inputs.
+    pub tail_generation_ids: Vec<String>,
 }
 
 /// The native occurrence metadata IRI for an exact intake key.
@@ -114,14 +116,17 @@ impl SourceSummary {
             continuity_unknown: true,
             watches: Vec::new(),
             producer_stream_ids: Vec::new(),
+            tail_generation_ids: Vec::new(),
         }
     }
     fn capacity(&self) -> usize {
         512 + self.source_id.capacity() * 2
             + self.producer_stream_ids.capacity() * std::mem::size_of::<String>()
+            + self.tail_generation_ids.capacity() * std::mem::size_of::<String>()
             + self
                 .producer_stream_ids
                 .iter()
+                .chain(self.tail_generation_ids.iter())
                 .map(String::capacity)
                 .sum::<usize>()
             + self.rdf_iri.capacity()
@@ -324,6 +329,49 @@ impl Store {
                 row.producer_stream_ids.push(stream.id);
             }
         }
+        let tail_registry = writer.db.get(super::tail::KEY)?.ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "file-generation checkpoint registry missing",
+            )
+        })?;
+        admission.entry(tail_registry.len())?;
+        for generation in super::tail::decode_registry(&tail_registry)? {
+            admission.entry(0)?;
+            if generation.expires_at.is_none_or(|deadline| deadline > now)
+                && query
+                    .selector
+                    .source
+                    .as_ref()
+                    .is_none_or(|wanted| wanted == &generation.declaration.source)
+            {
+                let row = admit_source(&mut rows, &generation.declaration.source, &mut capacity)?;
+                let planned = generation.id.capacity() + std::mem::size_of::<String>();
+                if capacity + planned > CAPTURE_BYTES {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "tail generation references exceed source capture capacity",
+                    ));
+                }
+                let before = row.capacity();
+                row.tail_generation_ids
+                    .try_reserve_exact(1)
+                    .map_err(|error| {
+                        Error::new(
+                            "RESOURCE_LIMIT",
+                            format!("tail generation reference allocation refused: {error}"),
+                        )
+                    })?;
+                row.tail_generation_ids.push(generation.id);
+                capacity += row.capacity() - before;
+                if capacity > CAPTURE_BYTES {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "allocated tail generation references exceed source capture capacity",
+                    ));
+                }
+            }
+        }
         for binding in configured {
             if binding.source.is_empty()
                 || binding.source.len() > 512
@@ -415,6 +463,7 @@ impl Store {
             iterator.status()?;
         }
         for row in rows.values_mut() {
+            row.tail_generation_ids.sort();
             row.watches.sort_by(|a, b| a.watch_id.cmp(&b.watch_id));
         }
         let snapshot = catalog_lease::Snapshot {

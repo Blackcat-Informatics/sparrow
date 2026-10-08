@@ -786,7 +786,7 @@ async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_s
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (store_id, generation_id, record_id) = {
+            let (store_id, generation_id, record_id, empty_id) = {
                 let store = sparrow_server::ServerConfig::read(&config)
                     .unwrap()
                     .open_store()
@@ -810,6 +810,14 @@ async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_s
                 let generation = store
                     .tail_start(&declaration, sparrow_server::now().unwrap())
                     .unwrap();
+                let mut empty = declaration.clone();
+                empty.request_id = "generation-wire-empty".into();
+                empty.source = "wire-empty".into();
+                empty.inode += 1;
+                empty.path = b"empty.log".to_vec();
+                let empty = store
+                    .tail_start(&empty, sparrow_server::now().unwrap())
+                    .unwrap();
                 let receipt = store
                     .tail_append(
                         &generation.id,
@@ -828,7 +836,7 @@ async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_s
                         sparrow_server::now().unwrap(),
                     )
                     .unwrap();
-                (store.store_id().unwrap(), generation.id, record)
+                (store.store_id().unwrap(), generation.id, record, empty.id)
             };
             let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
@@ -869,6 +877,62 @@ async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_s
             assert_eq!(tail["source_start"].as_str(), Some("0"));
             assert_eq!(tail["source_end"].as_str(), Some("7"));
             assert_eq!(tail["declaration"], result["declaration"]);
+            let sources = cli(&socket, &["sources", &store_id, "--page-size", "1"]);
+            assert_eq!(sources["total_items"].as_str(), Some("2"));
+            assert_eq!(sources["rows"][0]["source_id"].as_str(), Some("wire-empty"));
+            assert_eq!(sources["rows"][0]["retained_records"].as_str(), Some("0"));
+            assert_eq!(
+                sources["rows"][0]["tail_generation_ids"][0].as_str(),
+                Some(empty_id.as_str())
+            );
+            let continuation = mcp
+                .tool(
+                    4,
+                    "result_next",
+                    purrdf_lex::json::Object::new()
+                        .with("store_id", store_id.clone())
+                        .with("cursor", sources["next_cursor"].as_str().unwrap())
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                continuation["structuredContent"]["rows"][0]["tail_generation_ids"][0].as_str(),
+                Some(generation_id.as_str())
+            );
+            let empty = mcp
+                .tool(
+                    5,
+                    "file_generation_get",
+                    purrdf_lex::json::Object::new()
+                        .with("store_id", store_id.clone())
+                        .with("generation_id", empty_id.clone())
+                        .into(),
+                )
+                .await;
+            assert_eq!(empty["structuredContent"]["offset"].as_str(), Some("0"));
+            assert_eq!(empty["structuredContent"]["records"].as_str(), Some("0"));
+            let mut request = client.capability().sources_list_request();
+            let mut query = request.get().init_query();
+            query.set_store_id(&store_id);
+            query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+            query.set_page_size(200);
+            query.set_scan_budget(10000);
+            query.init_source().set_value("wire-tail");
+            let response = request.send().promise.await.unwrap();
+            let rows = rpc_ok(response.get().unwrap().get_result().unwrap())
+                .get_rows()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows.get(0)
+                    .get_tail_generation_ids()
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                generation_id
+            );
             let context = cli(
                 &socket,
                 &[

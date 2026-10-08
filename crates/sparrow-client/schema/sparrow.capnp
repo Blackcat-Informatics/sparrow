@@ -59,6 +59,7 @@ struct SourceSummary {
   timeProfileId @5 :OptionalText; diagnosticProfileId @6 :OptionalText;
   continuityUnknown @7 :Bool; watches @8 :List(SourceWatchInfo);
   producerStreamIds @9 :List(Text);
+  tailGenerationIds @10 :List(Text);
 }
 struct SourceListQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;

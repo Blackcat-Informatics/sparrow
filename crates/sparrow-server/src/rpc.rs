@@ -533,6 +533,12 @@ fn sources_page(
         for (index, id) in summary.producer_stream_ids.iter().enumerate() {
             streams.set(index as u32, id);
         }
+        let mut generations = row
+            .reborrow()
+            .init_tail_generation_ids(summary.tail_generation_ids.len() as u32);
+        for (index, id) in summary.tail_generation_ids.iter().enumerate() {
+            generations.set(index as u32, id);
+        }
         let mut watches = row.init_watches(summary.watches.len() as u32);
         for (index, binding) in summary.watches.iter().enumerate() {
             let mut watch = watches.reborrow().get(index as u32);

@@ -8196,6 +8196,115 @@ fn source_catalog_admission_is_shared_and_keeps_exact_keys_and_sorted_watch_revi
 }
 
 #[test]
+fn source_discovery_captures_empty_active_and_terminal_generations_without_retaining_bytes() {
+    use sparrow_core::{SourceRead, SourceSelector, TailStart};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut declaration = TailStart {
+        request_id: "source-tail-a".into(),
+        watch: "tail".into(),
+        watch_revision: 1,
+        directories: CONSUMPTION_DIRECTORIES,
+        path: b"a.log".to_vec(),
+        source: "a".into(),
+        format: "log".into(),
+        device: 7,
+        inode: 1,
+    };
+    let a = store.tail_start(&declaration, 1).unwrap();
+    declaration.request_id = "source-tail-z".into();
+    declaration.source = "z".into();
+    declaration.inode = 2;
+    declaration.path = b"z.log".to_vec();
+    let active = store.tail_start(&declaration, 2).unwrap();
+    declaration.request_id = "source-tail-terminal".into();
+    declaration.inode = 3;
+    declaration.path = b"terminal.log".to_vec();
+    let terminal = store.tail_start(&declaration, 3).unwrap();
+    store.tail_append(&terminal.id, 0, b"", true, 4).unwrap();
+    let deadline = store
+        .tail_generation(&terminal.id)
+        .unwrap()
+        .expires_at
+        .unwrap();
+    let mut query = SourceRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.source_read(&query, 5, &[]).unwrap();
+    assert_eq!(first.total_items, 2);
+    assert_eq!(first.body.sources[0].tail_generation_ids, [a.id]);
+    assert_eq!(first.body.sources[0].retained_records, 0);
+    declaration.request_id = "source-tail-after-capture".into();
+    declaration.inode = 4;
+    declaration.path = b"later.log".to_vec();
+    let later = store.tail_start(&declaration, 6).unwrap();
+    query.cursor = first.next_cursor;
+    let captured = store.source_read(&query, 7, &[]).unwrap();
+    assert_eq!(captured.snapshot_id, first.snapshot_id);
+    let mut expected = vec![active.id.clone(), terminal.id.clone()];
+    expected.sort();
+    assert_eq!(captured.body.sources[0].tail_generation_ids, expected);
+    assert_eq!(captured.body.sources[0].complete_artifacts, 0);
+    assert_eq!(captured.body.sources[0].retained_records, 0);
+    assert!(captured.body.sources[0].continuity_unknown);
+    let selected = SourceRead {
+        selector: SourceSelector {
+            source: Some("z".into()),
+        },
+        ..Default::default()
+    };
+    let fresh = store.source_read(&selected, deadline, &[]).unwrap();
+    let mut expected = vec![active.id, later.id];
+    expected.sort();
+    assert_eq!(fresh.body.sources[0].tail_generation_ids, expected);
+    assert_eq!(
+        store.status(deadline).unwrap()["live_records"].as_str(),
+        Some("0")
+    );
+    drop(store);
+    let reopened = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        reopened
+            .source_read(&selected, deadline, &[])
+            .unwrap()
+            .body
+            .sources[0]
+            .tail_generation_ids,
+        expected
+    );
+}
+
+#[test]
+fn source_discovery_refuses_corrupt_tail_registry_and_small_scan_budget_without_a_capture() {
+    use sparrow_core::SourceRead;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let tiny = SourceRead {
+        scan_budget: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        store.source_read(&tiny, 1, &[]).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(1).unwrap()["source_read_handles"].as_str(),
+        Some("0")
+    );
+    // Native registry corruption must refuse open rather than disappear from discovery.
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put(b"tail-generation-registry", b"broken registry")
+        .unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+}
+
+#[test]
 fn source_discovery_counts_occurrences_mappings_and_idle_watch_bindings_in_one_capture() {
     use purrdf::DatasetView;
     use sparrow_core::{

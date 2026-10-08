@@ -18,7 +18,9 @@ and member retrieval now use finite immutable catalog pages shared by the typed
 daemon, CLI and MCP. Artifact and source discovery share the catalog lease owner;
 source inventory includes exact intake keys, mapping IDs, retained occurrence
 counts and configured watch bindings. Producer continuity remains explicitly
-unknown while stream generations and gap tracking are unfinished.
+unknown. Source discovery includes finite producer windows and active/recent
+terminal file-generation checkpoint IDs, including empty inputs; checkpoint/gap
+evidence does not imply complete history.
 Artifact discovery now admits live, explicit evidence and revision-guarded pin
 membership through the same reference owner as record queries, including
 recordless artifacts and frozen pages after pin release. Artifact source-array
