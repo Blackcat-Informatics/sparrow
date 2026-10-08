@@ -9,6 +9,52 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Filesystem-full recovery
+
+The currently installed source `ebea75a`, schema 46, has a separate real
+filesystem-full qualification at
+`~/.local/state/sparrow/fs-full-qual-3u16g3kc`. It uses the frozen uncapped images
+from `tail-discovery-images-5du4trjg`, with SHA-256 readback, inside a private user
+and mount namespace. A 64 MiB tmpfs contains only an owned test store and ballast;
+the application budget is 1 GiB with 128 MiB reserve. This deliberately exercises
+native filesystem failure independently of application admission. No host mount,
+quota, producer, public service configuration or installed image is changed.
+
+Two log records are durably accepted and protected by one seven-day pin. Writing
+53,616,640 ballast bytes outside the data directory reaches errno 28, `ENOSPC`;
+`statvfs` reports zero available bytes. One subsequent 2 MiB opaque trial receives
+a durable receipt and one independent record. A second distinct 2 MiB trial
+refuses with `STORAGE_FAILURE`, empty stdout and a native WAL append `No space
+left on device` error. The run accounts for confirmed receipts rather than
+assuming every write must fail immediately from a free-space observation.
+
+Status remains readable with three confirmed records, the original pin and an
+explicit durability failure. Both pinned record byte spans remain exact while
+the filesystem is full. Application pressure remains ready with zero retirement
+passes because its tracked files are below the application budget. Removing the
+ballast restores filesystem capacity; the existing process still reports its
+durability failure on final flush and exits with code 1, while cleaning its owned
+socket. This is an explicit failure, not a successful graceful-close claim.
+
+Reopen preserves all three confirmed records, the pin, seed receipt and original
+pin mutation receipt. The refused import resumes through its durable journal,
+accepts exactly one new record, and returns the same receipt on retry. All seed
+and accepted trial bytes are checked within the one-MiB range ceiling. Pin release
+works after recovery. Two subsequent close/reopen boundaries succeed with four
+records and no pins. The final closed store is copied out before namespace exit;
+that Btrfs copy independently reopens with matching store identity, all original
+durable receipts, exact bytes and healthy durability. The namespace mount is gone
+and the public unit remains PID 406435 throughout.
+
+`report.json`, `driver.py`, input fingerprints, daemon/restore logs, export chunks,
+`restored-report.json`, mount evidence and before/after public unit evidence retain
+the method. An earlier fixture at `fs-full-qual-tlrpt13a` stopped because its count
+assertion omitted an acknowledged opaque record; the final driver counts each
+confirmed receipt and respects artifact/pin IDs and bounded byte reads. This
+qualifies one real ENOSPC/native WAL failure and process recovery. It does not
+establish Btrfs quota behavior, hardware or power-loss recovery, sustained volume,
+forced native physical reclamation, or complete operational acceptance.
+
 ## Tail generation discovery
 
 Signed source `ebea75a` adds sorted `tail_generation_ids` to the existing source

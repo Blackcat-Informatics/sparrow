@@ -41,3 +41,11 @@ Qualification must compare resident and persisted answers for all four forms,
 named/default graph selection, joins/modifiers/paths, RDF 1.2 layers and terms,
 empty graphs, selected scope, retention/pins and failures during result staging.
 It must separately verify certified governor stops and storage failures.
+
+The public explanation APIs do not bypass this gap. At the pinned revision,
+`explain_query_fallible_view` delegates to `explain_fallible_for`, which reserves
+reporting, prepares the query and calls `reserve_fallible_workspace` before
+`explain_prepared`. Explanation includes a metered measuring evaluation, not
+just syntax or a plan description. Required unpriced forms therefore need the
+same upstream admission extension before Sparrow can qualify `sparql_explain`.
+Do not advertise a parser-only description as a native measured explanation.
