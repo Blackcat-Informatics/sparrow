@@ -58,6 +58,7 @@ struct SourceSummary {
   completeArtifacts @2 :UInt64; fragmentParents @3 :UInt64; retainedRecords @4 :UInt64;
   timeProfileId @5 :OptionalText; diagnosticProfileId @6 :OptionalText;
   continuityUnknown @7 :Bool; watches @8 :List(SourceWatchInfo);
+  producerStreamIds @9 :List(Text);
 }
 struct SourceListQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;
@@ -71,6 +72,22 @@ struct Record {
   byteStart @6 :UInt64; byteEnd @7 :UInt64;
   eventTime @8 :EventTime;
   diagnostics @9 :DiagnosticSnapshot;
+  producer @10 :OptionalProducerPosition;
+}
+struct ProducerPosition { streamId @0 :Text; sequence @1 :UInt64; }
+struct OptionalProducerPosition { union { absent @0 :Void; value @1 :ProducerPosition; } }
+struct ProducerGap { first @0 :UInt64; last @1 :UInt64; }
+struct ProducerStream {
+  storeId @0 :Text; id @1 :Text; source @2 :Text; instance @3 :Data;
+  firstSequence @4 :UInt64; lastSequence @5 :UInt64; acceptedEvents @6 :UInt64;
+  unobservedSequences @7 :UInt64; gaps @8 :List(ProducerGap); gapsComplete @9 :Bool;
+  firstReceivedAt @10 :Instant; lastReceivedAt @11 :Instant; expiresAt @12 :Instant;
+  continuityUnknown @13 :Bool;
+}
+struct ProducerStreamQuery { storeId @0 :Text; schemaVersion @1 :UInt32; id @2 :Text; }
+struct ProducerLimits {
+  maxStreams @0 :UInt32; maxGapIntervals @1 :UInt32; maxRegistryBytes @2 :UInt64;
+  metadataRetentionSeconds @3 :UInt64;
 }
 enum DiagnosticDimension { service @0; host @1; severity @2; traceId @3; spanId @4; }
 struct DiagnosticMapping { dimension @0 :DiagnosticDimension; path @1 :Text; }
@@ -134,6 +151,7 @@ struct Status {
   recordReadHandles @37 :UInt64; recordReadBytes @38 :UInt64;
   maxRecordReadHandles @39 :UInt64; maxRecordReadBytes @40 :UInt64;
   recordReadLeaseMs @41 :UInt64;
+  producerLimits @42 :ProducerLimits;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
@@ -143,6 +161,7 @@ struct Discovery {
   textAnalyzer @4 :Text; textProfile @5 :Text; rdfProfile @6 :Text;
   maxEventBatchBytes @7 :UInt32; maxEventBatchEvents @8 :UInt32;
   durabilityStatus @9 :DurabilityStatus;
+  producerLimits @10 :ProducerLimits;
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; }
@@ -492,4 +511,5 @@ interface Sparrow {
   artifactsList @35 (query :ArtifactListQuery) -> (result :Result(ArtifactListPage));
   sourcesList @36 (query :SourceListQuery) -> (result :Result(SourceListPage));
   resultNext @37 (query :ResultNextQuery) -> (result :Result(ResultPage));
+  producerStreamGet @38 (query :ProducerStreamQuery) -> (result :Result(ProducerStream));
 }

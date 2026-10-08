@@ -701,8 +701,59 @@ not collapse occurrences. Immutable time/diagnostic mapping IDs are optional;
 use their existing get operations for definitions. Declared mapping and
 configured watch sources remain discoverable with zero retained input.
 Watch IDs, revisions and enabled state are captured and sorted within each row.
-Producer stream continuity remains `continuity_unknown=true`; this catalog is
-not a stream generation or gap ledger. Those operations remain unfinished.
+Producer stream continuity remains `continuity_unknown=true`. Schema 35 adds
+`producer_stream_ids` for finite currently retained structured producer windows.
+These identities resolve through `producerStreamGet`, CLI `producer-stream
+STORE_ID STREAM_ID`, or the read-only closed MCP `producer_stream_get` tool.
+Active-file generation and syslog stream discovery remain unfinished.
+
+### Structured producer sequence windows (schema 35)
+
+`eventsIngest` commits the normalized batch, its record positions, native RDF
+metadata and producer checkpoint in one atomic storage write at the requested
+buffered or durable boundary. Ordinary uploads share that record preparation
+path and carry no declared producer position. Each complete artifact here is
+one complete event batch; it does not imply a finished continuous stream.
+
+The exact source and 16-byte producer instance identify an observation window.
+New sequences must increase beyond its last accepted position. Overlapping or
+backward batches fail with `CONFLICT` before publishing records or checkpoint
+changes. An exact committed retry returns the original occurrence IDs without
+advancing the window, even after newer batches or reconnect/reopen. Producer
+instance and sequence declarations are part of the immutable retry receipt;
+they cannot be attached retrospectively to an ordinary accepted upload.
+
+Records expose an optional typed `ProducerPosition` with opaque stream ID and
+UInt64 sequence. Native occurrence metadata includes `stream` and
+`producerSequence` triples through PurRDF's dataset builder. `producerStreamGet`
+requires the discovered schema version and matching store identity. Its typed
+summary reports first/last accepted sequence, accepted event count, aggregate
+unobserved sequence count, recent inclusive gap intervals and whether those
+intervals cover all observed gaps. CLI/MCP render UInt64 values as decimal
+strings. Gaps count positions absent between accepted observations; they do not
+identify a loss cause. Positions before the first event and after the last
+remain unknown, so every summary retains `continuity_unknown=true`.
+
+The registry admits at most 64 windows and 128 KiB of native encoded metadata.
+Each window retains at most 16 recent gap intervals while preserving its exact
+aggregate counts; older intervals make `gaps_complete=false`. Metadata expires
+30 days after the most recent acceptance. Expired windows are omitted from
+discovery and return `NOT_FOUND`; a later observation creates a fresh opaque
+window ID, including for the same source and instance. Pins on records preserve
+their original positions without extending the stream summary deadline. The
+bounded registry reclaims expired entries on its next atomic replacement.
+Missing or invalid registry state is a hard storage failure, not an empty
+fallback. Full capacity refuses a new window with `RESOURCE_LIMIT`.
+The existing Rust `events` example accepts an optional sequence after its
+durability argument so separate invocations can demonstrate ordered batches
+using one instance. Its default sequence remains 1; exact retries keep all
+arguments unchanged, and new events require new request IDs and higher sequences.
+
+Discovery and status advertise these bounds through typed `ProducerLimits`.
+Storage families 17/18/19/20 fence earlier writers while preserving base,
+consumption, watch and handoff authority respectively. Families 13..16 upgrade
+without reinterpreting historical unpositioned records or diagnostic mappings.
+Earlier pre-diagnostic families retain their existing invariant checks.
 
 Sources share artifact and pin catalog lease/cursor/receipt ownership. A capture
 uses at most 2 MiB, 10,000 source rows, a 32 MiB conservative catalog charge and the

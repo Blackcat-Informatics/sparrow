@@ -212,6 +212,32 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         );
     let output = output
         .with(
+            "producer_limits",
+            Object::new()
+                .with(
+                    "max_streams",
+                    u64::from(value.get_producer_limits()?.get_max_streams()),
+                )
+                .with(
+                    "max_gap_intervals",
+                    u64::from(value.get_producer_limits()?.get_max_gap_intervals()),
+                )
+                .with(
+                    "max_registry_bytes",
+                    value
+                        .get_producer_limits()?
+                        .get_max_registry_bytes()
+                        .to_string(),
+                )
+                .with(
+                    "metadata_retention_seconds",
+                    value
+                        .get_producer_limits()?
+                        .get_metadata_retention_seconds()
+                        .to_string(),
+                ),
+        )
+        .with(
             "record_read_handles",
             value.get_record_read_handles().to_string(),
         )

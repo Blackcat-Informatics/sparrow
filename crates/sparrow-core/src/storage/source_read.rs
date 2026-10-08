@@ -90,6 +90,8 @@ pub struct SourceSummary {
     pub continuity_unknown: bool,
     /// Configured watch bindings, including sources with no retained input.
     pub watches: Vec<SourceWatchInfo>,
+    /// Finite currently retained producer-window identities; each has a typed summary.
+    pub producer_stream_ids: Vec<String>,
 }
 
 /// The native occurrence metadata IRI for an exact intake key.
@@ -111,10 +113,17 @@ impl SourceSummary {
             diagnostic_profile_id: None,
             continuity_unknown: true,
             watches: Vec::new(),
+            producer_stream_ids: Vec::new(),
         }
     }
     fn capacity(&self) -> usize {
         512 + self.source_id.capacity() * 2
+            + self.producer_stream_ids.capacity() * std::mem::size_of::<String>()
+            + self
+                .producer_stream_ids
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
             + self.rdf_iri.capacity()
             + self.time_profile_id.as_ref().map_or(0, String::capacity)
             + self
@@ -257,6 +266,32 @@ impl Store {
             remaining: &mut remaining,
         };
         let mut watch_ids = std::collections::BTreeSet::new();
+        admission.entry(
+            writer
+                .db
+                .get(super::producer_stream::KEY)?
+                .map_or(0, |bytes| bytes.len()),
+        )?;
+        for stream in super::producer_stream::registry(&writer)? {
+            admission.entry(0)?;
+            if stream.expires_at > now
+                && query
+                    .selector
+                    .source
+                    .as_ref()
+                    .is_none_or(|wanted| wanted == &stream.source)
+            {
+                let row = admit_source(&mut rows, &stream.source, &mut capacity)?;
+                capacity += stream.id.capacity() + std::mem::size_of::<String>();
+                if capacity > CAPTURE_BYTES {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "producer stream references exceed source capture capacity",
+                    ));
+                }
+                row.producer_stream_ids.push(stream.id);
+            }
+        }
         for binding in configured {
             if binding.source.is_empty()
                 || binding.source.len() > 512

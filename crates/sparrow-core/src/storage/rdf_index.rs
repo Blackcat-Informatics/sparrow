@@ -610,6 +610,17 @@ pub(super) fn metadata(
         let predicate = builder.intern_iri(&predicate);
         builder.push_quad(subject, predicate, object, None);
     }
+    if let Some(position) = &record.producer {
+        let predicate = builder.intern_iri(&format!("{NS}stream"));
+        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.stream_id));
+        builder.push_quad(subject, predicate, object, None);
+        let predicate = builder.intern_iri(&format!("{NS}producerSequence"));
+        let object = builder.intern_literal(RdfLiteral::typed(
+            position.sequence.to_string(),
+            "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+        ));
+        builder.push_quad(subject, predicate, object, None);
+    }
     if let crate::EventTime::Known {
         millis, profile_id, ..
     } = &record.event_time

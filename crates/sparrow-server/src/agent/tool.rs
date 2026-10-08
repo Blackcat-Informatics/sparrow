@@ -53,6 +53,10 @@ impl Operation {
         let decode = || -> std::result::Result<Self, DecodeError> {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
+                "producer_stream_get" => Self::Query(Command::Producer(super::producer::Input {
+                    store: fields.required("store_id")?,
+                    id: fields.required("stream_id")?,
+                })),
                 "status" => Self::Status,
                 "flush" => Self::Query(Command::Flush(sparrow_client::DurabilityWatermark {
                     store_id: fields.required("store_id")?,

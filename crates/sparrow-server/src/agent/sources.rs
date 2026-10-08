@@ -73,6 +73,13 @@ pub(super) fn render(page: wire::source_list_page::Reader<'_>) -> Result<Value> 
         }
         rows.push(Value::from(
             Object::new()
+                .with(
+                    "producer_stream_ids",
+                    row.get_producer_stream_ids()?
+                        .iter()
+                        .map(|id| Ok(id?.to_str()?.to_owned()))
+                        .collect::<Result<Vec<_>>>()?,
+                )
                 .with("source_id", row.get_source_id()?.to_str()?)
                 .with("rdf_iri", row.get_rdf_iri()?.to_str()?)
                 .with(

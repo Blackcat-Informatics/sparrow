@@ -342,6 +342,7 @@ impl Store {
         let diagnostic_profile = progress.captured_diagnostic_profile(&writer, &manifest.source)?;
         let mut builder = ingest::RecordBatch::new(&writer)?;
         let record = builder.record(ingest::RecordInput {
+            producer: None,
             id: random_id("record")?,
             artifact_id: &progress.artifact_id,
             source: &manifest.source,
@@ -526,7 +527,7 @@ impl Store {
             )
             .into();
         batch.put(receipt_key(id), json::write_compact(&saved));
-        writer.ingest_receipt(&mut batch, &manifest.request_id, &artifact, now)?;
+        writer.ingest_receipt(&mut batch, &manifest.request_id, &artifact, None, now)?;
         if batch.size_in_bytes() > PUBLICATION_BYTES {
             return Err(Error::new(
                 "RESOURCE_LIMIT",

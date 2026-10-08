@@ -10,8 +10,8 @@ use sparrow_client::{
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if !(6..=7).contains(&args.len()) || args[3].len() != 32 {
-        return Err(std::io::Error::other("usage: events SOCKET SOURCE REQUEST_ID INSTANCE_HEX UNIX_MILLIS MESSAGE [buffered|durable]; instance is 16 bytes in canonical hex; retries keep event arguments identical").into());
+    if !(6..=8).contains(&args.len()) || args[3].len() != 32 {
+        return Err(std::io::Error::other("usage: events SOCKET SOURCE REQUEST_ID INSTANCE_HEX UNIX_MILLIS MESSAGE [buffered|durable [SEQUENCE]]; sequence defaults to 1; instance is 16 bytes in canonical hex; retries keep event arguments identical").into());
     }
     let durability = match args.get(6).map(String::as_str) {
         None | Some("durable") => Durability::Durable,
@@ -28,7 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .try_into()
             .map_err(|_| std::io::Error::other("instance must contain 16 bytes"))?,
         events: vec![ProducerEvent {
-            sequence: 1,
+            sequence: args
+                .get(7)
+                .map(|sequence| sequence.parse())
+                .transpose()?
+                .unwrap_or(1),
             event_time: args[4].parse()?,
             kind: EventKind::Log,
             level: EventLevel::Info,

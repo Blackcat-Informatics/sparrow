@@ -28,6 +28,7 @@ pub(crate) mod import;
 mod ingest;
 pub(crate) mod pin_read;
 pub(crate) mod pressure;
+pub(crate) mod producer_stream;
 pub(crate) mod publication;
 mod query_membership;
 mod rdf_index;
@@ -42,7 +43,7 @@ pub(crate) mod source_time;
 mod text_index;
 pub(crate) mod watch_registry;
 
-const FORMAT: &[u8] = b"sparrow.store/13";
+const FORMAT: &[u8] = b"sparrow.store/17";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -252,6 +253,8 @@ pub struct Record {
     pub event_time: source_time::EventTime,
     /// Immutable declared diagnostic values and their native occurrence evidence.
     pub diagnostics: diagnostic::DiagnosticSnapshot,
+    /// Immutable accepted position in a producer sequence window, when declared.
+    pub producer: Option<producer_stream::ProducerPosition>,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -476,6 +479,7 @@ impl Catalog for Record {
             .with("rdf_projection_id", self.rdf_projection_id.clone())
             .with("event_time", self.event_time.encode())
             .with("diagnostics", self.diagnostics.encode())
+            .with("producer", self.producer.as_ref().map(Catalog::encode))
             .with("chunks", self.chunks.clone())
             .with("evicted", self.evicted)
             .into()
@@ -508,6 +512,11 @@ impl Catalog for Record {
                 })
                 .transpose()?
                 .unwrap_or_default(),
+            producer: v
+                .get("producer")
+                .filter(|value| !value.is_null())
+                .map(producer_stream::ProducerPosition::decode)
+                .transpose()?,
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             evicted: read_field(v, "evicted")?,
         };
@@ -573,6 +582,22 @@ impl Writer {
             )
             .with("text_profile", crate::text::PROFILE)
             .with("retry_window_seconds", (RETRY_WINDOW / 1000).to_string())
+            .with(
+                "max_producer_streams",
+                producer_stream::MAX_PRODUCER_STREAMS.to_string(),
+            )
+            .with(
+                "max_producer_gap_intervals",
+                producer_stream::MAX_PRODUCER_GAPS.to_string(),
+            )
+            .with(
+                "max_producer_registry_bytes",
+                producer_stream::MAX_PRODUCER_REGISTRY_BYTES.to_string(),
+            )
+            .with(
+                "producer_metadata_retention_seconds",
+                (30 * DAY / 1000).to_string(),
+            )
             .with("disk_budget", self.config.disk_budget.to_string())
             .with(
                 "max_artifact_bytes",
@@ -989,13 +1014,19 @@ impl Store {
         }
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
+        if db.get(producer_stream::KEY)?.is_none() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "producer registry missing from fenced store",
+            ));
+        }
         // Recovered buffered writes are certified only after a real synchronization.
         db.flush_wal(true)?;
         let durability = std::cell::RefCell::new(durability::State::new(
             random_id("session")?,
             db.latest_sequence_number(),
         ));
-        Ok(Self {
+        let store = Self {
             inner: Arc::new(Mutex::new(Writer {
                 db: Arc::new(db),
                 id,
@@ -1010,7 +1041,11 @@ impl Store {
             artifact_reads: Arc::new(Mutex::new(artifact_read::Reads::default())),
             source_reads: Arc::new(Mutex::new(source_read::Reads::default())),
             record_reads: Arc::new(Mutex::new(record_read::Reads::default())),
-        })
+        };
+        let writer = store.lock()?;
+        producer_stream::registry(&writer)?;
+        drop(writer);
+        Ok(store)
     }
 
     /// Return this persistent store's identity.
@@ -1058,6 +1093,45 @@ impl Store {
         now: u64,
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
+        self.ingest_input(request_id, source, format, bytes, None, now, mode)
+    }
+
+    /// Accept normalized typed events and their producer positions in one WAL batch.
+    pub fn ingest_producer(
+        &self,
+        request_id: &str,
+        source: &str,
+        bytes: &[u8],
+        producer: &producer_stream::ProducerBatch,
+        now: u64,
+        mode: durability::Durability,
+    ) -> Result<Artifact, Error> {
+        producer.validate()?;
+        self.ingest_input(
+            request_id,
+            source,
+            "jsonl",
+            bytes,
+            Some(producer),
+            now,
+            mode,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one shared artifact publication path with optional producer provenance"
+    )]
+    fn ingest_input(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        bytes: &[u8],
+        producer: Option<&producer_stream::ProducerBatch>,
+        now: u64,
+        mode: durability::Durability,
+    ) -> Result<Artifact, Error> {
         validate_ingest_labels(request_id, source, format)?;
         if request_id.starts_with("consume:") {
             return Err(Error::new(
@@ -1079,6 +1153,7 @@ impl Store {
             format,
             bytes.len() as u64,
             &payload_id,
+            producer,
             now,
         )? {
             return writer.receipt(receipt, mode);
@@ -1097,17 +1172,27 @@ impl Store {
                 "acceptance timestamp overflows retention deadline",
             )
         })?;
-        if record_ends(format, bytes, true).count() > writer.config.max_records {
+        let record_count = record_ends(format, bytes, true).count();
+        if producer.is_some_and(|input| input.sequences.len() != record_count) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "producer sequence count differs from normalized record count",
+            ));
+        }
+        if record_count > writer.config.max_records {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "artifact exceeds configured record count",
             ));
         }
+        let stream = producer
+            .map(|input| producer_stream::prepare(&writer, source, input, now))
+            .transpose()?;
         let id = random_id("artifact")?;
         let mut prepared = ingest::RecordBatch::new(&writer)?;
         let mut records = Vec::new();
         let mut start = 0;
-        for end in record_ends(format, bytes, true) {
+        for (ordinal, end) in record_ends(format, bytes, true).enumerate() {
             let record = prepared.record(ingest::RecordInput {
                 id: random_id("record")?,
                 artifact_id: &id,
@@ -1119,6 +1204,12 @@ impl Store {
                 expires_at,
                 source_time_profile: &source_time_profile,
                 diagnostic_profile: diagnostic_profile.as_ref(),
+                producer: producer.zip(stream.as_ref()).map(|(input, stream)| {
+                    producer_stream::ProducerPosition {
+                        stream_id: stream.id.clone(),
+                        sequence: input.sequences[ordinal],
+                    }
+                }),
             })?;
             put(&mut prepared.batch, &record.id, &record);
             prepared.batch.put(
@@ -1144,7 +1235,10 @@ impl Store {
         };
         put(&mut batch, &artifact.id, &artifact);
         recordless::publish(&mut batch, &artifact)?;
-        writer.ingest_receipt(&mut batch, request_id, &artifact, now)?;
+        writer.ingest_receipt(&mut batch, request_id, &artifact, producer, now)?;
+        if let Some(stream) = stream {
+            stream.publish(&mut batch);
+        }
         if batch.size_in_bytes() > 128 * 1024 * 1024 {
             return Err(Error::new(
                 "RESOURCE_LIMIT",

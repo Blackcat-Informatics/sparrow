@@ -219,6 +219,7 @@ pub(super) fn advance(
     let diagnostic_profile = progress.captured_diagnostic_profile(writer, &manifest.source)?;
     let mut builder = ingest::RecordBatch::new(writer)?;
     let record: Record = builder.record(ingest::RecordInput {
+        producer: None,
         id: raw.record_id,
         artifact_id: &progress.artifact_id,
         source: &manifest.source,

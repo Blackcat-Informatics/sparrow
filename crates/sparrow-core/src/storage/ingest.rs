@@ -29,6 +29,7 @@ pub(super) struct RecordInput<'a> {
     pub expires_at: u64,
     pub source_time_profile: &'a Option<source_time::SourceTimeProfile>,
     pub diagnostic_profile: Option<&'a super::diagnostic::DiagnosticProfile>,
+    pub producer: Option<super::producer_stream::ProducerPosition>,
 }
 
 pub(super) struct RecordBatch<'a> {
@@ -200,6 +201,7 @@ impl<'a> RecordBatch<'a> {
             self.chunks.push(digest);
         }
         let record = Record {
+            producer: input.producer,
             id: input.id,
             artifact_id: input.artifact_id.to_owned(),
             source: source.to_owned(),
@@ -414,6 +416,10 @@ impl Writer {
 impl Writer {
     /// Both upload paths compare the original source/format and exact payload identity.
     /// Legacy receipts already contain these fields in their artifact catalog.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "compare all immutable request provenance through one owner"
+    )]
     pub(super) fn accepted_ingest(
         &self,
         request_id: &str,
@@ -421,10 +427,19 @@ impl Writer {
         format: &str,
         byte_length: u64,
         payload_id: &str,
+        producer: Option<&super::producer_stream::ProducerBatch>,
         now: u64,
     ) -> Result<Option<super::Artifact>, Error> {
         let artifact = match self.retry(&format!("request:ingest:{request_id}"), now)? {
             Some(saved) => {
+                if let Some(producer) = producer
+                    && saved.get("producer") != Some(&producer.encode())
+                {
+                    return Err(Error::new(
+                        "CONFLICT",
+                        "request_id was committed with different producer provenance",
+                    ));
+                }
                 <super::Artifact as super::Catalog>::decode(super::field(&saved, "receipt")?)?
             }
             None => match super::publication::published(
@@ -432,7 +447,13 @@ impl Writer {
                 &super::import::import_id(request_id),
                 now,
             )? {
-                Some((_, artifact)) => artifact,
+                Some((_, artifact)) if producer.is_none() => artifact,
+                Some(_) => {
+                    return Err(Error::new(
+                        "CONFLICT",
+                        "staged artifact has no accepted producer provenance",
+                    ));
+                }
                 None => return Ok(None),
             },
         };
@@ -454,6 +475,7 @@ impl Writer {
         batch: &mut WriteBatch,
         request_id: &str,
         artifact: &super::Artifact,
+        producer: Option<&super::producer_stream::ProducerBatch>,
         now: u64,
     ) -> Result<(), Error> {
         let receipt: Value = Object::new()
@@ -464,6 +486,10 @@ impl Writer {
                     .to_string(),
             )
             .with("receipt", super::Catalog::encode(artifact))
+            .with(
+                "producer",
+                producer.map(super::producer_stream::ProducerBatch::encode),
+            )
             .into();
         batch.put(
             format!("request:ingest:{request_id}"),

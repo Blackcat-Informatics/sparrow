@@ -2583,3 +2583,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(parse_json_query_pointer|unescape_json_query_pointer)$']
+
+[[job]]
+id = "producer-sequence-window-publication"
+summary = "One bounded checkpoint owner observes producer positions and recent gaps; the shared ingestion pipeline commits registry, occurrences and immutable retry provenance together."
+home = "sparrow_core::storage::producer_stream::prepare"
+entry_points = ["sparrow_core::storage::Store::ingest_producer", "sparrow_core::storage::Store::producer_stream", "sparrow_server::rpc::Rpc::events_ingest"]
+spec = "docs/interfaces.md: structured producer sequence windows."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(infer_producer_loss_cause|reset_producer_checkpoint_on_reconnect)$']
+
+[[job]]
+id = "producer-stream-agent-read"
+summary = "CLI and MCP producer stream reads share the generated contract and one exact renderer."
+home = "sparrow_server::agent::producer::Input::execute"
+entry_points = ["sparrow_server::agent::Command::execute"]
+spec = "docs/interfaces.md: producer_stream_get and producer-stream."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []

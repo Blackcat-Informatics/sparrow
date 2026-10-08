@@ -1403,7 +1403,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/16");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/20");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -1620,7 +1620,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/15")
+                Some("sparrow.store/19")
             );
         })
         .await;
@@ -1984,7 +1984,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/15"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/19"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -3891,6 +3891,40 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         assert_eq!(receipt.record_ids.len(), 3);
         assert_eq!(receipt.durability, wire::Durability::Durable);
         assert_eq!(producer.events(&batch).await.unwrap(), receipt);
+        let mut request = producer.capability().record_get_request();
+        let mut reference = request.get().init_record(); reference.set_store_id(&receipt.store_id); reference.set_id(&receipt.record_ids[0]);
+        let response = request.send().promise.await.unwrap();
+        let record = rpc_ok(response.get().unwrap().get_result().unwrap());
+        let position = match record.get_producer().unwrap().which().unwrap() {
+            wire::optional_producer_position::Value(value) => value.unwrap(),
+            _ => panic!("accepted producer record has no typed stream position"),
+        };
+        assert_eq!(position.get_sequence(), 1);
+        let stream_id = position.get_stream_id().unwrap().to_str().unwrap().to_owned();
+        let initial = cli(&socket, &["producer-stream", &receipt.store_id, &stream_id]);
+        assert_eq!(initial["accepted_events"].as_str(), Some("3"));
+        assert_eq!(initial["unobserved_sequences"].as_str(), Some("1"));
+        assert_eq!(initial["gaps"][0]["first"].as_str(), Some("3"));
+        assert_eq!(initial["continuity_unknown"].as_bool(), Some(true));
+        let mut mcp = Mcp::start(&socket); mcp.initialize(1).await;
+        let read = mcp.tool(2, "producer_stream_get", purrdf_lex::json::Object::new()
+            .with("store_id", receipt.store_id.clone()).with("stream_id", stream_id.clone()).into()).await;
+        assert_eq!(read["structuredContent"], initial);
+        let sources = cli(&socket, &["sources", &receipt.store_id, "--source", "structured-sdk"]);
+        assert_eq!(sources["rows"][0]["producer_stream_ids"][0].as_str(), Some(stream_id.as_str()));
+        let mut next = batch.clone(); next.request_id = "typed-events-next".into();
+        next.events = vec![batch.events[1].clone()]; next.events[0].sequence = 8; next.events[0].event_time += 1000;
+        let next_receipt = producer.events(&next).await.unwrap();
+        assert_eq!(producer.events(&batch).await.unwrap(), receipt);
+        let after = cli(&socket, &["producer-stream", &receipt.store_id, &stream_id]);
+        assert_eq!(after["accepted_events"].as_str(), Some("4"));
+        assert_eq!(after["unobserved_sequences"].as_str(), Some("4"));
+        assert_eq!(after["gaps"][1]["first"].as_str(), Some("5"));
+        assert_eq!(after["gaps"][1]["last"].as_str(), Some("7"));
+        let mut overlap = batch.clone(); overlap.request_id = "typed-events-overlap".into();
+        assert!(matches!(producer.events(&overlap).await.unwrap_err(), sparrow_client::Error::Domain { ref code, .. } if code == "CONFLICT"));
+        assert_eq!(cli(&socket, &["producer-stream", &receipt.store_id, &stream_id]), after);
+        assert_ne!(next_receipt.id, receipt.id);
         let mut read = producer.capability().bytes_read_request();
         let mut input = read.get().init_request();
         input.set_length(receipt.byte_length.try_into().unwrap());
@@ -3977,7 +4011,7 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         assert_eq!(producer.events(&batch).await.unwrap(), receipt);
         assert_eq!(producer.artifact(&receipt.id).await.unwrap(), receipt);
         let response = producer.capability().status_request().send().promise.await.unwrap();
-        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 3);
+        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 4);
         drop(producer); drop(daemon);
     }).await;
 }
@@ -4588,7 +4622,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 24);
+    assert_eq!(definitions.len(), 25);
     assert_eq!(
         definitions
             .iter()

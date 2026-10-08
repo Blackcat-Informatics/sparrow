@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "producer_stream_get",
+        "Read a finite accepted producer window, exact aggregate unobserved positions and bounded recent gaps; prefix and trailing continuity remain unknown.",
+    ),
+    (
         "result_next",
         "Resume the captured operation, scope and limits from an immutable cursor; reading never renews its lease or evidence retention.",
     ),
@@ -123,6 +127,12 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
+        if *name == "producer_stream_get" {
+            properties = properties
+                .with("store_id", string())
+                .with("stream_id", string());
+            required.extend(["store_id", "stream_id"]);
+        }
         if *name == "result_next" {
             properties = properties
                 .with("store_id", string())

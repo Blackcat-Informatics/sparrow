@@ -427,6 +427,12 @@ fn sources_page(
             |mut out, value| out.set_value(value),
             |mut out| out.set_absent(()),
         );
+        let mut streams = row
+            .reborrow()
+            .init_producer_stream_ids(summary.producer_stream_ids.len() as u32);
+        for (index, id) in summary.producer_stream_ids.iter().enumerate() {
+            streams.set(index as u32, id);
+        }
         let mut watches = row.init_watches(summary.watches.len() as u32);
         for (index, binding) in summary.watches.iter().enumerate() {
             let mut watch = watches.reborrow().get(index as u32);
@@ -658,6 +664,23 @@ fn import_progress(
     Ok(())
 }
 
+fn producer_limits(
+    mut out: wire::producer_limits::Builder<'_>,
+    value: &purrdf_lex::json::Value,
+) -> capnp::Result<()> {
+    out.set_max_streams(
+        u32::try_from(number(value, "max_producer_streams")?)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?,
+    );
+    out.set_max_gap_intervals(
+        u32::try_from(number(value, "max_producer_gap_intervals")?)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?,
+    );
+    out.set_max_registry_bytes(number(value, "max_producer_registry_bytes")?);
+    out.set_metadata_retention_seconds(number(value, "producer_metadata_retention_seconds")?);
+    Ok(())
+}
+
 fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> capnp::Result<()> {
     out.set_store_id(store);
     out.set_id(&value.id);
@@ -672,7 +695,15 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> cap
     out.set_byte_start(value.byte_start);
     out.set_byte_end(value.byte_end);
     event_time(out.reborrow().init_event_time(), &value.event_time)?;
-    crate::diagnostics::snapshot(out.init_diagnostics(), &value.diagnostics);
+    crate::diagnostics::snapshot(out.reborrow().init_diagnostics(), &value.diagnostics);
+    match value.producer {
+        Some(position) => {
+            let mut producer = out.init_producer().init_value();
+            producer.set_stream_id(&position.stream_id);
+            producer.set_sequence(position.sequence);
+        }
+        None => out.init_producer().set_absent(()),
+    }
     Ok(())
 }
 
@@ -1395,11 +1426,14 @@ impl wire::sparrow::Server for Rpc {
                     "/event_time",
                     sparrow_core::TimeRepresentation::UnixMillis,
                 )?;
-                store.ingest_with_durability(
+                store.ingest_producer(
                     &input.request_id,
                     &input.source,
-                    "jsonl",
                     &bytes,
+                    &sparrow_core::ProducerBatch {
+                        instance: input.client_instance,
+                        sequences: input.events.iter().map(|event| event.sequence).collect(),
+                    },
                     now,
                     mode,
                 )
@@ -2048,6 +2082,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
                 out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
+                producer_limits(out.reborrow().init_producer_limits(), &value)?;
                 encode_durability(out.init_durability_status(), &durability);
             }
         }
@@ -2112,6 +2147,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
+                producer_limits(out.reborrow().init_producer_limits(), &value)?;
                 out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
@@ -2433,6 +2469,79 @@ impl wire::sparrow::Server for Rpc {
             Err(error) => failure(results.get().init_result(), error),
             Ok(page) => {
                 artifacts_page(results.get().init_result().init_ok(), &page)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn producer_stream_get(
+        self: Rc<Self>,
+        params: wire::sparrow::ProducerStreamGetParams,
+        mut results: wire::sparrow::ProducerStreamGetResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(query.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "producer stream reads require the current discovered schema",
+                ),
+            );
+            return Ok(());
+        }
+        let id = query.get_id()?;
+        if id.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("producer stream ID exceeds 128 bytes"),
+            );
+            return Ok(());
+        }
+        let id = id.to_str()?.to_owned();
+        match self
+            .work(move |store, now| store.producer_stream(&id, now))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(stream) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(
+                    &self
+                        .store
+                        .store_id()
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?,
+                );
+                out.set_id(&stream.id);
+                out.set_source(&stream.source);
+                let instance = purrdf_hash::hex::decode(&stream.instance)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                out.set_instance(&instance);
+                out.set_first_sequence(stream.first_sequence);
+                out.set_last_sequence(stream.last_sequence);
+                out.set_accepted_events(stream.accepted_events);
+                out.set_unobserved_sequences(stream.unobserved_sequences);
+                out.set_gaps_complete(stream.gaps_complete);
+                out.set_continuity_unknown(true);
+                out.reborrow()
+                    .init_first_received_at()
+                    .set_unix_millis(stream.first_received_at);
+                out.reborrow()
+                    .init_last_received_at()
+                    .set_unix_millis(stream.last_received_at);
+                out.reborrow()
+                    .init_expires_at()
+                    .set_unix_millis(stream.expires_at);
+                let mut gaps = out.init_gaps(stream.gaps.len() as u32);
+                for (index, gap) in stream.gaps.iter().enumerate() {
+                    let mut row = gaps.reborrow().get(index as u32);
+                    row.set_first(gap.first);
+                    row.set_last(gap.last);
+                }
             }
         }
         Ok(())

@@ -15,6 +15,7 @@ mod error;
 mod ingest;
 mod json;
 mod pin;
+mod producer;
 mod query_receipt;
 mod rdf;
 mod read;
@@ -37,6 +38,7 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
+    " | producer-stream STORE_ID STREAM_ID",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR",
@@ -68,6 +70,7 @@ pub(super) enum Command {
     PinRead(pin::Read),
     Artifacts(artifacts::Input),
     Sources(sources::Input),
+    Producer(producer::Input),
     Rdf {
         store: String,
         id: String,
@@ -227,6 +230,15 @@ impl Command {
         }
         if args.first().is_some_and(|arg| arg == "sources") {
             return Ok(Self::Sources(sources::Input::parse(&args[1..])?));
+        }
+        if args.first().is_some_and(|arg| arg == "producer-stream") {
+            if args.len() != 3 {
+                return Err(invalid("producer-stream requires STORE_ID STREAM_ID"));
+            }
+            return Ok(Self::Producer(producer::Input {
+                store: args[1].clone(),
+                id: args[2].clone(),
+            }));
         }
         if args.first().is_some_and(|arg| arg == "artifacts") {
             return Ok(Self::Artifacts(artifacts::Input::parse(&args[1..])?));
@@ -462,6 +474,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Sources(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::Producer(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Artifacts(input) = self {

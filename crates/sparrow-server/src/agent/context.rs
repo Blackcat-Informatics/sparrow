@@ -58,7 +58,18 @@ impl Input {
 }
 
 pub(super) fn render_record(value: wire::record::Reader<'_>) -> Result<Value> {
+    let producer = match value.get_producer()?.which()? {
+        wire::optional_producer_position::Absent(()) => Value::Null,
+        wire::optional_producer_position::Value(position) => {
+            let position = position?;
+            Object::new()
+                .with("stream_id", position.get_stream_id()?.to_str()?)
+                .with("sequence", position.get_sequence().to_string())
+                .into()
+        }
+    };
     Ok(Object::new()
+        .with("producer", producer)
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("record_id", value.get_id()?.to_str()?)
         .with("artifact_id", value.get_artifact_id()?.to_str()?)

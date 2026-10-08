@@ -9,6 +9,354 @@ use sparrow_test_support::catalog_db;
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
+    use sparrow_core::{Durability, ProducerBatch, ProducerGap};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let first = ProducerBatch {
+        instance: [7; 16],
+        sequences: vec![5, 7],
+    };
+    let a = store
+        .ingest_producer(
+            "producer-a",
+            "producer",
+            b"{}\n{}\n",
+            &first,
+            1,
+            Durability::Buffered,
+        )
+        .unwrap();
+    let position = store.record(&a.record_ids[0]).unwrap().producer.unwrap();
+    assert_eq!(position.sequence, 5);
+    assert_eq!(
+        store
+            .record(&a.record_ids[1])
+            .unwrap()
+            .producer
+            .unwrap()
+            .sequence,
+        7
+    );
+    let state = store.producer_stream(&position.stream_id, 2).unwrap();
+    assert_eq!(state.first_sequence, 5); // No invented missing prefix 1..4.
+    assert_eq!(state.unobserved_sequences, 1);
+    assert_eq!(state.gaps, vec![ProducerGap { first: 6, last: 6 }]);
+    let fence = a.buffered.as_ref().unwrap();
+    store.flush_through(fence).unwrap();
+    let native = store.with_rdf_records(&a.record_ids, 2, Default::default(), |view| {
+        purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
+            purrdf::SparqlRequest { query: "SELECT ?record ?stream ?sequence WHERE { ?record <urn:sparrow:vocab:stream> ?stream . ?record <urn:sparrow:vocab:producerSequence> ?sequence . }", base_iri: None, substitutions: &[] },
+            purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
+                .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0))
+            .map_err(Box::new)
+    }).unwrap().unwrap();
+    let purrdf::SparqlResult::Solutions { rows, .. } = native.result else {
+        panic!("native SELECT result");
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(format!("{rows:?}").contains(&position.stream_id));
+    let second = ProducerBatch {
+        instance: [7; 16],
+        sequences: vec![10],
+    };
+    let b = store
+        .ingest_producer(
+            "producer-b",
+            "producer",
+            b"{}\n",
+            &second,
+            3,
+            Durability::Durable,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .record(&b.record_ids[0])
+            .unwrap()
+            .producer
+            .unwrap()
+            .stream_id,
+        position.stream_id
+    );
+    let state = store.producer_stream(&position.stream_id, 4).unwrap();
+    assert_eq!(state.accepted_events, 3);
+    assert_eq!(state.unobserved_sequences, 3);
+    assert_eq!(state.gaps.last(), Some(&ProducerGap { first: 8, last: 9 }));
+    for (request, input, expected) in [
+        ("producer-overlap", first.clone(), "CONFLICT"),
+        (
+            "producer-a",
+            ProducerBatch {
+                instance: [8; 16],
+                sequences: vec![5, 7],
+            },
+            "CONFLICT",
+        ),
+        (
+            "producer-count",
+            ProducerBatch {
+                instance: [8; 16],
+                sequences: vec![1],
+            },
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        assert_eq!(
+            store
+                .ingest_producer(
+                    request,
+                    "producer",
+                    b"{}\n{}\n",
+                    &input,
+                    4,
+                    Durability::Durable
+                )
+                .unwrap_err()
+                .code,
+            expected
+        );
+    }
+    assert_eq!(
+        store
+            .producer_stream(&position.stream_id, 4)
+            .unwrap()
+            .last_sequence,
+        10
+    );
+    assert_eq!(store.status(4).unwrap()["live_records"].as_str(), Some("3"));
+    assert_eq!(
+        store
+            .ingest_producer(
+                "producer-a",
+                "producer",
+                b"{}\n{}\n",
+                &first,
+                5,
+                Durability::Durable
+            )
+            .unwrap()
+            .id,
+        a.id
+    );
+    let pin = store
+        .pin(
+            "producer-pin",
+            "producer",
+            &[a.record_ids[0].clone()],
+            40,
+            5,
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .ingest_producer(
+                "producer-a",
+                "producer",
+                b"{}\n{}\n",
+                &first,
+                6,
+                Durability::Durable
+            )
+            .unwrap()
+            .record_ids,
+        a.record_ids
+    );
+    assert_eq!(
+        store
+            .producer_stream(&position.stream_id, 6)
+            .unwrap()
+            .accepted_events,
+        3
+    );
+    let deadline = 30 * DAY + 4;
+    assert_eq!(
+        store
+            .producer_stream(&position.stream_id, deadline)
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+    store.expire(deadline).unwrap();
+    assert_eq!(
+        store.record(&a.record_ids[0]).unwrap().producer,
+        Some(position.clone())
+    );
+    let c = store
+        .ingest_producer(
+            "producer-new-window",
+            "producer",
+            b"{}\n{}\n",
+            &first,
+            deadline,
+            Durability::Durable,
+        )
+        .unwrap();
+    let new = store.record(&c.record_ids[0]).unwrap().producer.unwrap();
+    assert_ne!(new.stream_id, position.stream_id);
+    assert_eq!(
+        store
+            .producer_stream(&new.stream_id, deadline)
+            .unwrap()
+            .accepted_events,
+        2
+    );
+    store
+        .release_retry("producer-release", &pin.id, deadline)
+        .unwrap();
+}
+
+#[test]
+fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures() {
+    use sparrow_core::{Durability, MAX_PRODUCER_GAPS, MAX_PRODUCER_STREAMS, ProducerBatch};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let sequence = ProducerBatch {
+        instance: [1; 16],
+        sequences: (1..=40).map(|n| n * 2).collect(),
+    };
+    let bytes = b"{}\n".repeat(sequence.sequences.len());
+    let first = store
+        .ingest_producer(
+            "producer-gaps",
+            "producer",
+            &bytes,
+            &sequence,
+            1,
+            Durability::Durable,
+        )
+        .unwrap();
+    let id = store
+        .record(&first.record_ids[0])
+        .unwrap()
+        .producer
+        .unwrap()
+        .stream_id;
+    let state = store.producer_stream(&id, 1).unwrap();
+    assert_eq!(state.first_sequence, 2);
+    assert_eq!(state.accepted_events, 40);
+    assert_eq!(state.unobserved_sequences, 39);
+    assert_eq!(state.gaps.len(), MAX_PRODUCER_GAPS);
+    assert!(!state.gaps_complete);
+    assert_eq!(state.gaps[0].first, 49);
+    for index in 1..MAX_PRODUCER_STREAMS {
+        store
+            .ingest_producer(
+                &format!("producer-{index}"),
+                "producer",
+                b"{}\n",
+                &ProducerBatch {
+                    instance: [index as u8 + 1; 16],
+                    sequences: vec![1],
+                },
+                2,
+                Durability::Durable,
+            )
+            .unwrap();
+    }
+    let overflow = ProducerBatch {
+        instance: [255; 16],
+        sequences: vec![1],
+    };
+    assert_eq!(
+        store
+            .ingest_producer(
+                "producer-overflow",
+                "producer",
+                b"{}\n",
+                &overflow,
+                2,
+                Durability::Durable
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(2).unwrap()["live_records"].as_str(),
+        Some("103")
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("producer-stream-registry", b"[{}]").unwrap();
+    drop(db);
+    assert!(
+        matches!(Store::open(dir.path(), config()), Err(error) if error.code == "STORAGE_FAILURE")
+    );
+    let db = catalog_db(dir.path()).unwrap();
+    db.delete("producer-stream-registry").unwrap();
+    drop(db);
+    assert!(
+        matches!(Store::open(dir.path(), config()), Err(error) if error.code == "STORAGE_FAILURE")
+    );
+}
+
+#[test]
+fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_annotation() {
+    use sparrow_core::DiagnosticDimension;
+    for (legacy, current, watch) in [
+        (13, 17, false),
+        (14, 18, false),
+        (15, 19, true),
+        (16, 20, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let profile = store
+            .define_diagnostic_profile(
+                "source",
+                [(DiagnosticDimension::Service, "/service".to_owned())].into(),
+            )
+            .unwrap();
+        let a = store
+            .ingest(
+                "migration-input",
+                "source",
+                "json",
+                br#"{"service":"preserved"}"#,
+                1,
+            )
+            .unwrap();
+        if watch {
+            store
+                .watch_registry_replace(None, b"preserved-watch")
+                .unwrap();
+        }
+        let identity = store.store_id().unwrap();
+        drop(store);
+        let db = catalog_db(dir.path()).unwrap();
+        db.put("store_format", format!("sparrow.store/{legacy}"))
+            .unwrap();
+        db.delete("producer-stream-registry").unwrap();
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(store.store_id().unwrap(), identity);
+        assert_eq!(
+            store.status(2).unwrap()["store_format"].as_str(),
+            Some(format!("sparrow.store/{current}").as_str())
+        );
+        let record = store.record(&a.record_ids[0]).unwrap();
+        assert!(record.producer.is_none());
+        assert_eq!(
+            record.diagnostics.profile_id.as_deref(),
+            Some(profile.id.as_str())
+        );
+        assert_eq!(
+            store.bytes(&a.id, 0, a.byte_length as usize, 2).unwrap(),
+            br#"{"service":"preserved"}"#
+        );
+        if watch {
+            assert_eq!(
+                store.watch_registry().unwrap().as_deref(),
+                Some(b"preserved-watch".as_slice())
+            );
+        }
+    }
+}
+
+#[test]
 fn admission_properties_share_status_metadata_without_evidence_catalog_scans() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -616,6 +964,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         let db = catalog_db(dir.path()).unwrap();
         db.put("store_format", format!("sparrow.store/{version}"))
             .unwrap();
+        db.delete("producer-stream-registry").unwrap();
         if version >= 11 {
             db.put("watch_registry", b"preserved").unwrap();
         }
@@ -624,7 +973,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 4).as_str())
+            Some(format!("sparrow.store/{}", version + 8).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -1096,7 +1445,7 @@ fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() 
 #[test]
 fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity() {
     use sparrow_core::EvictionLimits;
-    for (legacy, current, watch) in [(5, 13, false), (6, 14, false), (7, 15, true), (8, 16, true)] {
+    for (legacy, current, watch) in [(5, 17, false), (6, 18, false), (7, 19, true), (8, 20, true)] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
         let identity = store.store_id().unwrap();
@@ -1118,6 +1467,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
             .unwrap();
         db.put("store_format", format!("sparrow.store/{legacy}"))
             .unwrap();
+        db.delete("producer-stream-registry").unwrap();
         drop(db);
         let store = Store::open(dir.path(), config()).unwrap();
         assert_eq!(store.store_id().unwrap(), identity);
@@ -2081,7 +2431,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/15")
+        Some("sparrow.store/19")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -2096,7 +2446,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/15")
+        Some("sparrow.store/19")
     );
 }
 
@@ -2153,7 +2503,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/13")
+        Some("sparrow.store/17")
     );
     let digest = format!(
         "blake3:{}",
@@ -2178,7 +2528,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/14")
+        Some("sparrow.store/18")
     );
     assert_eq!(
         store
@@ -2212,7 +2562,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/16")
+        Some("sparrow.store/20")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     store
@@ -2220,7 +2570,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/16")
+        Some("sparrow.store/20")
     );
     assert_eq!(
         store
@@ -2447,7 +2797,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/15")
+        Some("sparrow.store/19")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -6625,7 +6975,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/13")
+        Some("sparrow.store/17")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]

@@ -8,7 +8,7 @@ use super::{Catalog, Error, RETRY_WINDOW, Store, Writer, integer, put, read_fiel
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 
-pub(super) const FORMAT: &[u8] = b"sparrow.store/16";
+pub(super) const FORMAT: &[u8] = b"sparrow.store/20";
 const PREFIX: &str = "request:consumption-handoff:";
 const MAX_HANDOFFS: u64 = 128;
 

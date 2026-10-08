@@ -39,10 +39,14 @@ pub(super) struct LegacyFormat {
 /// Preserve consumption/watch/handoff authority through every admitted upgrade.
 pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
     let target = match format {
-        b"sparrow.store/5" | b"sparrow.store/9" => super::FORMAT,
-        b"sparrow.store/6" | b"sparrow.store/10" => super::consumption::FORMAT,
-        b"sparrow.store/7" | b"sparrow.store/11" => super::watch_registry::FORMAT,
-        b"sparrow.store/8" | b"sparrow.store/12" => super::handoff::FORMAT,
+        b"sparrow.store/5" | b"sparrow.store/9" | b"sparrow.store/13" => super::FORMAT,
+        b"sparrow.store/6" | b"sparrow.store/10" | b"sparrow.store/14" => {
+            super::consumption::FORMAT
+        }
+        b"sparrow.store/7" | b"sparrow.store/11" | b"sparrow.store/15" => {
+            super::watch_registry::FORMAT
+        }
+        b"sparrow.store/8" | b"sparrow.store/12" | b"sparrow.store/16" => super::handoff::FORMAT,
         _ => return None,
     };
     Some(LegacyFormat {
@@ -57,7 +61,12 @@ pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
 pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
     matches!(
         format,
-        b"sparrow.store/7" | b"sparrow.store/8" | b"sparrow.store/11" | b"sparrow.store/12"
+        b"sparrow.store/7"
+            | b"sparrow.store/8"
+            | b"sparrow.store/11"
+            | b"sparrow.store/12"
+            | b"sparrow.store/15"
+            | b"sparrow.store/16"
     ) || format == super::watch_registry::FORMAT
         || format == super::handoff::FORMAT
 }
@@ -140,6 +149,13 @@ fn fence(db: &DB) -> Result<(), Error> {
         }
         let mut batch = WriteBatch::default();
         batch.put("store_format", legacy.target);
+        if db.get(super::producer_stream::KEY)?.is_some() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "legacy store has unfenced producer stream registry",
+            ));
+        }
+        batch.put(super::producer_stream::KEY, b"[]");
         super::put(&mut batch, UPGRADE, &Progress::default());
         commit(db, batch)?;
     }

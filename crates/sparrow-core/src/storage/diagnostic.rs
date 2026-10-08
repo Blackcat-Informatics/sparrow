@@ -658,7 +658,15 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
         .and_then(super::recordless::legacy_format)
         .filter(|legacy| !legacy.needs_recordless_index)
     {
-        if let Some(row) = db.prefix_iterator("source-diagnostic:").next()
+        if !matches!(
+            db.get("store_format")?.as_deref(),
+            Some(
+                b"sparrow.store/13"
+                    | b"sparrow.store/14"
+                    | b"sparrow.store/15"
+                    | b"sparrow.store/16"
+            )
+        ) && let Some(row) = db.prefix_iterator("source-diagnostic:").next()
             && row?.0.starts_with(b"source-diagnostic:")
         {
             return Err(Error::new(
@@ -666,8 +674,15 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
                 "legacy store has unfenced diagnostic mappings",
             ));
         }
+        if db.get(super::producer_stream::KEY)?.is_some() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "legacy store has unfenced producer stream registry",
+            ));
+        }
         let mut batch = WriteBatch::default();
         batch.put("store_format", legacy.target);
+        batch.put(super::producer_stream::KEY, b"[]");
         let mut options = WriteOptions::default();
         options.set_sync(true);
         options.disable_wal(false);

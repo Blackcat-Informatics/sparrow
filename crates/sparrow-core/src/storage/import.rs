@@ -440,9 +440,15 @@ impl Store {
         }
         let writer = self.lock()?;
         writer.require_consumption(request_id, source, format, byte_length)?;
-        if let Some(receipt) =
-            writer.accepted_ingest(request_id, source, format, byte_length, payload_id, now)?
-        {
+        if let Some(receipt) = writer.accepted_ingest(
+            request_id,
+            source,
+            format,
+            byte_length,
+            payload_id,
+            None,
+            now,
+        )? {
             return Ok(ImportStart::Accepted(
                 writer.receipt(receipt, super::durability::Durability::Durable)?,
             ));
@@ -843,7 +849,15 @@ impl Writer {
             return Ok(saved);
         }
         if writer
-            .accepted_ingest(request_id, source, format, byte_length, payload_id, now)?
+            .accepted_ingest(
+                request_id,
+                source,
+                format,
+                byte_length,
+                payload_id,
+                None,
+                now,
+            )?
             .is_some()
         {
             return Err(Error::new(

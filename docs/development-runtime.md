@@ -32,8 +32,46 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 34; the schema sections
+The current source implements schema 35; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 35 structured producer windows
+
+Typed event ingestion persists finite producer windows and immutable record
+positions through the existing shared preparation pipeline. The registry,
+occurrences, native RDF metadata and retry declaration commit in the same WAL
+batch. Exact retries preserve occurrence identity after newer batches and
+reopen; overlapping new sequences refuse without advancing the checkpoint.
+Observed gaps count absent intermediate positions. Prefix/trailing continuity
+and the cause of absence remain unknown. Recent intervals have an explicit
+completeness flag; aggregate counts stay exact when older intervals leave the
+bounded suffix.
+
+Source discovery exposes retained window IDs. The generated producerStreamGet
+operation, CLI producer-stream and read-only MCP producer_stream_get share one
+typed client/rendering path. Record metadata includes an optional position;
+ordinary and historical unpositioned uploads are not reinterpreted. Finite
+stream summaries expire independently of record pins; a later observation uses
+a new opaque identity. Native RDF metadata uses PurRDF's dataset builder and is
+verified by a governed native SELECT over the stored view.
+
+The release gate passes 128 storage scenarios and 39 real-daemon RPC scenarios,
+seeded census self-tests and the pinned cross-workspace gate with 173 ownership
+jobs and zero distinct exceptions. Migration scenarios preserve exact bytes,
+diagnostic mappings, store identity and watch/handoff authority through families
+13..16 into 17..20. Missing or malformed producer registries refuse startup.
+The existing events example can send an explicit sequence for a declared
+instance; its exact retries retain all arguments.
+
+Isolated compatibility evidence in
+/tmp/sparrow-artifact-scope-schema34-compat.fcn3p10k verifies ten current-client
+operations refuse the archived schema-34 daemon with UNSUPPORTED and no stdout.
+That archived executable is SHA-256
+b60962b4d917abee4e9cdc03aa083b4de76c01ef57c960529399cb4641330e14;
+the owned child exits cleanly and removes its socket. Running development-daemon
+adoption and acceptance of schema 35 are pending at this source qualification.
+Live tailing, syslog, full governed SPARQL and full architecture acceptance
+remain unmet.
 
 ## Schema 34 exact key path discovery
 
