@@ -32,10 +32,57 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 35; the schema sections
+The current source implements schema 36; the schema sections
 below retain their historical qualification evidence.
 
-## Schema 35 structured producer windows
+## Schema 36 public TCP and syslog
+
+Signed implementation `ff6a7a3` adds the public Cap'n Proto listener requested
+on 2026-10-08. Configuration binds `0.0.0.0:518`, without authentication.
+TCP and Unix use one generated service, connection admission/lease owner,
+operation semaphore and storage owner. Rust clients use `Client::connect_tcp`;
+the events example accepts `tcp://IP:PORT`. CLI and stdio MCP retain Unix access.
+
+The normal commit hook passed the full release gate: warnings-denied Clippy,
+131 storage scenarios, 41 real-daemon RPC scenarios, seeded census self-tests
+and the pinned cross gate with 179 ownership jobs and zero distinct exceptions.
+Tests cover durable cross-transport retries/reopen, exact syslog packets,
+embedded newlines, encoded repeated parameters, malformed interpretation,
+framing/connection/deadline/UDP-size refusals and migration preserving producer
+windows and watch/handoff fences. Syslog listeners are explicit and disabled in
+the development config; their end-to-end acceptance uses isolated real daemons.
+
+After the owned schema-35 PID 2471270 exited successfully under SIGINT,
+`sparrow-development.service` adopted schema 36 at 2026-10-08T07:08:37Z,
+PID 2802541. The executable is
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema36`, SHA-256
+`fcfb0d5fe1dc063889fd8d1a7ab2902236696c5eefd6c9f8bfe57680a9ee6586`.
+Its sole file capability is `cap_net_bind_service=ep` for port 518. The installed
+and running binary hashes agree. Config remains `config/development.toml`;
+Unix remains `/home/paudley/.local/state/sparrow/development-v5/rpc.sock`.
+The existing store `store:46c88e949ccec658600b66c7becd5bb7` reopened under
+`sparrow.store/24` with all 197 pre-existing records preserved.
+
+Live evidence in `/tmp/sparrow-public-tcp-live.uopb00va` publishes one durable
+typed event through `192.168.2.4:518`. Exact TCP and Unix retries return the same
+artifact `artifact:19b3f05f9dfa8803d3f24806d164a735` and record
+`record:49ee5bde6185bf1e5bc14d5f07ce3395`; exact-byte inspection preserves sequence
+1. Final status has 198 records, no active pins, no handles in any registry and
+no pending writes. This verifies the host's LAN interface, not external routing.
+
+Regression evidence in `/tmp/sparrow-context-live.cc6za0su`,
+`/tmp/sparrow-key-path-live.sx7o818w`, `/tmp/sparrow-result-next-live.dvge0vju`
+and `/tmp/sparrow-artifact-filters-raw-regression.tiry_jen` preserves CLI/MCP
+equality, partial/unknown scope evidence, all eight frozen continuation shapes,
+82-byte descriptor and 87-byte CRLF handoff bytes and the producer replacement.
+`/tmp/sparrow-artifact-scope-schema35-compat.q1n_yets` verifies ten current client
+operations refuse the archived schema-35 daemon with UNSUPPORTED and no stdout;
+the isolated child exits cleanly and removes its socket.
+
+Live tailing, full governed SPARQL and full physical/resource/recovery
+qualification remain unfinished. Full architecture acceptance remains unmet.
+
+## Schema 35 structured producer windows (preceding adoption)
 
 Typed event ingestion persists finite producer windows and immutable record
 positions through the existing shared preparation pipeline. The registry,
