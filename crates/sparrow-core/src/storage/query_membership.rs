@@ -87,7 +87,7 @@ impl Writer {
         let Some(admission) = admission else {
             return self.get(key);
         };
-        self.get_admitted(key, |bytes| admission.entry(bytes))
+        self.get_admitted(key, |bytes| admission.entry(bytes.len()))
     }
 
     /// The record-query facade uses the same reference owner as artifact discovery.

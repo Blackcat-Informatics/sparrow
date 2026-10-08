@@ -9,6 +9,39 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Structural stored-catalog admission
+
+An accepted 8,000-record manifest exposed a retention failure: multiplying every
+encoded catalog byte by 64 refused that first row under the default 32 MiB pass
+allowance, leaving expiry unable to traverse it. A regression reproduces this
+before the change even while the evidence is live. Stored-catalog decoding now
+preflights the encoded slice through PurRDF's borrowed JSON events before
+constructing an owned tree. The reservation charges 8 KiB for the bounded native
+reader, eight times the encoded length for strings, typed copies and re-encoding,
+and 1 KiB per member/value/container-opening event for simultaneous native tree,
+vector, uniqueness-set and typed decoding scaffolding. Closing events add no
+owned nodes. This is conservative storage admission, not measured RSS.
+
+The complete charge must fit before allocation. Budget failure or native grammar
+failure leaves admission unchanged. Native catalog decoding retains its depth,
+value-count, string and unique-member limits through one shared limits constant.
+No JSON grammar or tree decoder was added. Expiry, pressure eviction, bounded
+record/context lookup and pin-protection capture use this stored-row owner;
+aggregate query capture retains its existing opaque-row charge, entry ceilings,
+lease and cancellation rules. The default pass limits remain 32 MiB catalog,
+32 retirement units and 4,096 payload references. Rows whose actual shape still
+exceeds admission refuse; this does not make every configured artifact size
+retirable under every smaller pass budget. Larger manifest paging remains a
+separate capacity concern.
+
+The regression retains all original bytes during live traversal, performs bounded
+pressure eviction, then expires the remaining unprotected records while preserving
+the record pin and its exact bytes. Releasing that pin permits complete logical
+payload reclamation. Dense input still refuses under a finite allowance; malformed
+native JSON reports storage failure without spending that allowance. These checks
+cover logical ownership and cursor progress, not physical compaction or sustained
+production retention throughput.
+
 ## Final RPC admission drain
 
 Signed source `c7e3960` joins owned intake workers, then reserves the complete

@@ -156,9 +156,9 @@ impl Writer {
                         "expiry catalog key exceeds its bounded identity contract",
                     ));
                 }
-                match Self::charge_catalog(&mut catalog, bytes.len()) {
+                match Self::charge_catalog_shape(&mut catalog, &bytes) {
                     Ok(()) => {}
-                    Err(_error) if report.visited != 0 => {
+                    Err(error) if error.code == "RESOURCE_LIMIT" && report.visited != 0 => {
                         report.frontier = ExpiryFrontier::CatalogBudget;
                         break 'phases;
                     }

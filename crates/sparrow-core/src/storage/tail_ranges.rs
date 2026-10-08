@@ -159,13 +159,13 @@ pub(super) fn bytes(
         }
         let record: Record = writer
             .get_admitted(identity, |bytes| {
-                if bytes > ROW_BYTES {
+                if bytes.len() > ROW_BYTES {
                     return Err(Error::new(
                         "RESOURCE_LIMIT",
                         "tail range record exceeds streaming catalog row admission",
                     ));
                 }
-                remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
                     Error::new(
                         "RESOURCE_LIMIT",
                         "file byte cover exceeds streaming catalog byte admission",

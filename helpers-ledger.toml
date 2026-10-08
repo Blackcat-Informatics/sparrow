@@ -1715,7 +1715,7 @@ names = ['^(decode_context_time_record|decode_eviction_time_record)$']
 
 [[job]]
 id = "bounded-catalog-decode"
-summary = "Read one native pinned catalog value and charge its decoded shape before the shared PurRDF decoder."
+summary = "Read one native pinned catalog value and admit its encoded slice before the shared PurRDF decoder; aggregate captures keep their separate opaque-row charge."
 home = "sparrow_core::storage::Writer::get_admitted"
 entry_points = ["sparrow_core::storage::Writer::get_limited", "sparrow_core::storage::Writer::charge_catalog"]
 spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
@@ -1726,6 +1726,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(decode_eviction_catalog|decode_pressure_catalog)$']
+
+[[job]]
+id = "stored-catalog-structural-admission"
+summary = "Price owned stored-catalog decode and retirement encoding before allocation through PurRDF's borrowed JSON events; charge fixed reader, encoded copies and per-event scaffolding without changing pass byte ceilings or aggregate capture admission."
+home = "sparrow_core::storage::Writer::charge_catalog_shape"
+entry_points = ["sparrow_core::storage::Writer::get_limited", "sparrow_core::storage::Writer::protected_matching", "sparrow_core::storage::expiry::Writer::expire_bounded"]
+spec = "docs/development-runtime.md: structural stored-catalog admission."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(price_retirement_catalog_elsewhere|parse_retirement_json_elsewhere)$']
 
 [[job]]
 id = "data-write-capacity-admission"

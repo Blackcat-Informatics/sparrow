@@ -56,6 +56,12 @@ const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
 const BYTE_READ_BYTES: usize = 1024 * 1024;
 const CATALOG_STRING_BYTES: usize = 16 * 1024 * 1024;
+const CATALOG_LIMITS: json::Limits = json::Limits {
+    max_depth: 128,
+    max_values: 1048576,
+    max_string_bytes: CATALOG_STRING_BYTES,
+    unique_members: true,
+};
 
 fn read_chunk_range(
     chunks: impl IntoIterator<Item = Result<Vec<u8>, Error>>,
@@ -351,16 +357,7 @@ fn random_id(kind: &str) -> Result<String, Error> {
 }
 
 fn parse(bytes: &[u8]) -> Result<Value, Error> {
-    json::read_slice(
-        bytes,
-        json::Limits {
-            max_depth: 128,
-            max_values: 1048576,
-            max_string_bytes: CATALOG_STRING_BYTES,
-            unique_members: true,
-        },
-    )
-    .map_err(Error::from)
+    json::read_slice(bytes, CATALOG_LIMITS).map_err(Error::from)
 }
 
 impl From<json::Error> for Error {
@@ -716,20 +713,20 @@ impl Writer {
     }
 
     fn get_limited<T: Catalog>(&self, key: &str, remaining: &mut usize) -> Result<T, Error> {
-        self.get_admitted(key, |bytes| Self::charge_catalog(remaining, bytes))
+        self.get_admitted(key, |bytes| Self::charge_catalog_shape(remaining, bytes))
     }
 
     /// Decode one pinned catalog value only after the caller's admission succeeds.
     fn get_admitted<T: Catalog>(
         &self,
         key: &str,
-        admit: impl FnOnce(usize) -> Result<(), Error>,
+        admit: impl FnOnce(&[u8]) -> Result<(), Error>,
     ) -> Result<T, Error> {
         let bytes = self
             .db
             .get_pinned(key)?
             .ok_or_else(|| Error::new("NOT_FOUND", format!("unknown evidence {key}")))?;
-        admit(bytes.len())?;
+        admit(&bytes)?;
         T::decode(&parse(&bytes)?)
     }
 
@@ -742,6 +739,38 @@ impl Writer {
                     "catalog capture exceeds operation admission",
                 )
             })?;
+        Ok(())
+    }
+
+    /// Reserve native tree construction, typed decoding and retirement encoding
+    /// before any owned tree is built. Native events borrow the encoded input.
+    /// Aggregate query capture retains its separate opaque-row admission law.
+    fn charge_catalog_shape(remaining: &mut usize, bytes: &[u8]) -> Result<(), Error> {
+        let refusal = || {
+            Error::new(
+                "RESOURCE_LIMIT",
+                "catalog capture exceeds operation admission",
+            )
+        };
+        // Eight copies of encoded bytes cover decoded strings/numbers, typed
+        // clones and re-encoding. Per-event charge covers Value/member/vector
+        // and uniqueness-set scaffolding, including simultaneous parse/decode
+        // owners. The fixed allowance covers the bounded native reader stack.
+        let strings = bytes
+            .len()
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(refusal)?;
+        let mut available = remaining.checked_sub(strings).ok_or_else(refusal)?;
+        let mut reader = json::Reader::from_slice(bytes, CATALOG_LIMITS)?;
+        loop {
+            match reader.next_event()? {
+                json::Event::End => break,
+                json::Event::EndObject { .. } | json::Event::EndArray { .. } => {}
+                _ => available = available.checked_sub(1024).ok_or_else(refusal)?,
+            }
+        }
+        *remaining = available;
         Ok(())
     }
 
@@ -878,7 +907,7 @@ impl Writer {
                 ));
             }
             if let Some(remaining) = remaining.as_deref_mut() {
-                Self::charge_catalog(remaining, bytes.len())?;
+                Self::charge_catalog_shape(remaining, &bytes)?;
             }
             let pin: Pin = Self::decode_evidence(&key, &bytes)?;
             if pin.expires_at > now {
@@ -2019,5 +2048,28 @@ impl Store {
                     .to_string(),
             )
             .into())
+    }
+}
+
+#[cfg(test)]
+mod catalog_admission_tests {
+    #[test]
+    fn dense_shape_refusal_and_malformed_input_do_not_spend_admission() {
+        let dense = super::json::write_compact(&super::Value::array(vec![0_u64; 1000]));
+        let mut remaining = 64 * 1024;
+        assert_eq!(
+            super::Writer::charge_catalog_shape(&mut remaining, dense.as_bytes())
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT"
+        );
+        assert_eq!(remaining, 64 * 1024);
+        assert_eq!(
+            super::Writer::charge_catalog_shape(&mut remaining, b"[null,]")
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        assert_eq!(remaining, 64 * 1024);
     }
 }

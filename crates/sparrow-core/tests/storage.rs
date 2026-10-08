@@ -3503,6 +3503,91 @@ fn bounded_expiry_batch_and_catalog_refusal_preserve_dependencies_and_position()
 }
 
 #[test]
+fn bounded_expiry_traverses_large_accepted_manifest_and_preserves_record_pin() {
+    use purrdf_lex::json::record::ToJson;
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"needle\n".repeat(8000);
+    let artifact = store
+        .ingest("expiry-large", "large", "log", &input, 0)
+        .unwrap();
+    assert_eq!(artifact.record_ids.len(), 8000);
+    let limits = EvictionLimits::default();
+    assert!(
+        purrdf_lex::json::write_compact(&artifact.to_json()).len() * 64 > limits.max_catalog_bytes
+    );
+    let pin = store
+        .pin("expiry-large-pin", "case", &artifact.record_ids[..1], 40, 0)
+        .unwrap();
+    // A live manifest must not strand the cursor before the record phase.
+    let mut exhausted = false;
+    for _ in 0..1000 {
+        let report = store.expire_bounded(1, limits).unwrap();
+        assert_eq!(report.records + report.artifacts, 0);
+        if !report.continuation {
+            exhausted = true;
+            break;
+        }
+    }
+    assert!(exhausted);
+    assert_eq!(store.bytes(&artifact.id, 0, input.len(), 1).unwrap(), input);
+    let eviction = store
+        .evict_oldest(
+            1,
+            EvictionLimits {
+                max_records: 1,
+                ..limits
+            },
+        )
+        .unwrap();
+    assert_eq!(eviction.records.len(), 1);
+    assert_ne!(eviction.records[0], artifact.record_ids[0]);
+    assert!(eviction.payload_refs <= limits.max_payload_refs);
+    let mut retired = eviction.records.len() as u64;
+    exhausted = false;
+    for _ in 0..1000 {
+        let report = store.expire_bounded(30 * DAY, limits).unwrap();
+        assert!(report.records + report.artifacts <= limits.max_records as u64);
+        assert!(report.payload_refs <= limits.max_payload_refs);
+        retired += report.records;
+        if !report.continuation {
+            exhausted = true;
+            break;
+        }
+    }
+    assert!(exhausted);
+    assert_eq!(retired, 7999);
+    assert_eq!(
+        store
+            .bytes(&artifact.record_ids[0], 0, 7, 30 * DAY)
+            .unwrap(),
+        b"needle\n"
+    );
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.release(&pin.id).unwrap();
+    exhausted = false;
+    for _ in 0..1000 {
+        if !store.expire_bounded(30 * DAY, limits).unwrap().continuation {
+            exhausted = true;
+            break;
+        }
+    }
+    assert!(exhausted);
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["live_records"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
 fn pressure_continues_past_a_protected_prefix_without_restarting_after_renewal() {
     use sparrow_core::{EvictionFrontier, EvictionLimits, PressurePhase};
     let dir = tempfile::tempdir().unwrap();
