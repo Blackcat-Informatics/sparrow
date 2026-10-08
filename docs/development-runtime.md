@@ -1,5 +1,12 @@
 # Development runtime
 
+The current installed server is the enabled persistent user unit
+`sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
+private Unix socket. It uses schema 41 and store format 37. The stable installed
+client is `~/.local/bin/sparrow`. See [persistent service adoption](#persistent-service-adoption)
+for image identities, configuration and qualified live evidence. Earlier
+transient-unit and schema sections below retain historical evidence.
+
 ## Oldest-unpinned logical retirement
 
 `Store::evict_oldest` serializes finite chronological retirement against pin
@@ -32,7 +39,7 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 40; the schema sections
+The current source implements schema 41; the schema sections
 below retain their historical qualification evidence.
 
 ## Durable file-completion storage foundation
@@ -4081,3 +4088,65 @@ by `mcp --stdio`, or a CLI command such as `status`. The daemon continues to bin
 `0.0.0.0:518`. Permanent service packaging and full architecture acceptance,
 including the documented upstream stored-view SPARQL integration gaps, remain
 unfinished.
+
+## Persistent service adoption
+
+Signed packaging source 9e6fc41 adds the persistent user unit and deployment
+contract. The installed unit is /home/paudley/.config/systemd/user/sparrow.service;
+its ExecStart uses /home/paudley/.local/libexec/sparrow/sparrowd and
+/home/paudley/.config/sparrow/server.toml. The daemon symlink retains the qualified
+schema-41 image sparrowd-schema41-d535b1a, SHA-256
+762e88469f82fdebe939b734c2ecd97b6299d05be2f1046445542ee02d38553d,
+with its sole cap_net_bind_service=ep file capability. The installed CLI symlink
+/home/paudley/.local/bin/sparrow selects sparrow-schema41-9406d95, SHA-256
+7f57ba0de3c036b8e542ddf956345ab1e5c913bbcb229d1686a1f291dcbab532.
+No runtime source or wire schema changed in this packaging step.
+
+The installed configuration preserves the existing database, public binding,
+private socket, budgets and synthetic intake. Its only changed field is the
+lexicon bundle path, now under /home/paudley/.local/share/sparrow/lexicons-
+e58974e504b9681597faea1490002ce8ddaf7448/artifacts (one continuous path).
+Artifacts, provenance, collision evidence, notices and licenses were copied from
+the exact census archive. Every copied file was compared byte-for-byte with that
+archive; the five CBOR artifacts also match the previous live configuration's
+inputs. The existing daemon resolver certifies them, and its text-analyzer
+fingerprint remains e5533b9df7c75ab405290d27872c6392515acb3d0d77d21d4433ec4c59904058.
+Runtime startup no longer depends on the sibling checkout or repository cwd.
+Configuration directory/file modes are 0700/0600; the service retains UMask 0077.
+
+The installed unit passed systemd-analyze --user verify. The initial repository
+unit verification identified its not-yet-installed executable alias; verification
+passed after installing that alias. The old sparrow-development.service was
+stopped through SIGINT; PID 1157669 was confirmed terminal and its owned Unix
+socket absent before taking a closed-store snapshot and starting the new owner.
+The persistent unit started on 2026-10-08T13:02:33Z as PID 1452634, and is enabled
+in default.target.wants. Linger=yes was already configured and remains enabled.
+Boot configuration is verified; no host reboot was performed. The unit uses
+SIGINT drain, a 120-second stop limit and explicit failure without automatic
+restart after a crash or failed open.
+
+Live evidence is /tmp/sparrow-persistent-service-live.2whydbvj: before/after status,
+unit and process invocation, installed image/configuration hashes, lexicon hashes,
+listener observation, native intents, exact byte reads, CLI/MCP retry receipts,
+query comparisons and a closed-store-before-cutover snapshot. Store identity
+store:46c88e949ccec658600b66c7becd5bb7, schema 41, format 37, 212 live records,
+213 payload chunks and 208 JSON projections survived. Profiles match, the
+session identity changed, and there are no pending buffered writes or watch
+failures. Public TCP and Unix text/key/value/temporal/record rows agree with
+pre-cutover evidence. The saved native tail handoff still returns its original
+receipt through CLI/MCP and SDK retries, preserving its 92 source bytes,
+terminal clocks and replacement file. No new source intake was performed.
+
+The collector initially attempted to resolve the capability-bearing process's
+protected executable link. That observation was unavailable; collection
+continued through the configured systemd invocation, process arguments, verified
+installed alias/image and live service evidence. It did not trigger a restart.
+The closed-store snapshot has not been restored in a recovery exercise.
+
+Repository and normal signed-hook gates passed 139 storage scenarios, 51 RPC
+scenarios, 16 SDK tests, remaining workspace tests and seeded/pinned census gates:
+210 ownership jobs, no distinct exceptions. Logs are
+/tmp/sparrow-persistent-service-check.log and
+/tmp/sparrow-persistent-service-commit.log. Full architecture acceptance remains
+unmet, including full governed stored-view SPARQL, native forced reclamation and
+whole-corpus performance/resource/recovery qualification.
