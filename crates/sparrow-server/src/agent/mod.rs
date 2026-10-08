@@ -34,7 +34,7 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
+    " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N] [--require-complete-index true|false];",
@@ -591,8 +591,6 @@ fn render_count(value: wire::count::Reader<'_>) -> Result<Value> {
 
 fn receipt(value: wire::receipt::Reader<'_>) -> Result<Value> {
     let coverage = value.get_coverage()?;
-    let count = render_count(coverage.get_eligible_records()?)?;
-    let diagnostic = coverage.get_diagnostic_scope()?;
     Ok(Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("membership_at", instant(value.get_membership_at()?)?)
@@ -610,36 +608,52 @@ fn receipt(value: wire::receipt::Reader<'_>) -> Result<Value> {
                 wire::Certainty::Incomplete => "incomplete",
             },
         )
-        .with(
-            "coverage",
-            Object::new()
-                .with("visited", coverage.get_visited().to_string())
-                .with("eligible_records", count)
-                .with(
-                    "known_eligible_records",
-                    coverage.get_known_eligible_records().to_string(),
-                )
-                .with(
-                    "diagnostic_scope",
-                    Object::new()
-                        .with("evaluated", diagnostic.get_evaluated().to_string())
-                        .with("matched", diagnostic.get_matched().to_string())
-                        .with("excluded", diagnostic.get_excluded().to_string())
-                        .with("unknown", diagnostic.get_unknown().to_string())
-                        .with("membership_complete", diagnostic.get_membership_complete()),
-                )
-                .with(
-                    "failed_json_records",
-                    coverage.get_failed_json_records().to_string(),
-                )
-                .with(
-                    "non_json_records",
-                    coverage.get_non_json_records().to_string(),
-                )
-                .with(
-                    "decoding_failures",
-                    coverage.get_decoding_failures().to_string(),
-                ),
-        )
+        .with("coverage", render_coverage(coverage)?)
         .into())
+}
+
+fn render_membership_coverage(
+    diagnostic: wire::diagnostic_coverage::Reader<'_>,
+    count: wire::count::Reader<'_>,
+) -> Result<Object> {
+    Ok(Object::new()
+        .with("eligible_records", render_count(count)?)
+        .with(
+            "known_eligible_records",
+            diagnostic.get_matched().to_string(),
+        )
+        .with(
+            "diagnostic_scope",
+            Object::new()
+                .with("evaluated", diagnostic.get_evaluated().to_string())
+                .with("matched", diagnostic.get_matched().to_string())
+                .with("excluded", diagnostic.get_excluded().to_string())
+                .with("unknown", diagnostic.get_unknown().to_string())
+                .with("membership_complete", diagnostic.get_membership_complete()),
+        ))
+}
+
+fn render_coverage(coverage: wire::coverage::Reader<'_>) -> Result<Value> {
+    Ok(render_membership_coverage(
+        coverage.get_diagnostic_scope()?,
+        coverage.get_eligible_records()?,
+    )?
+    .with("visited", coverage.get_visited().to_string())
+    .with(
+        "known_eligible_records",
+        coverage.get_known_eligible_records().to_string(),
+    )
+    .with(
+        "failed_json_records",
+        coverage.get_failed_json_records().to_string(),
+    )
+    .with(
+        "non_json_records",
+        coverage.get_non_json_records().to_string(),
+    )
+    .with(
+        "decoding_failures",
+        coverage.get_decoding_failures().to_string(),
+    )
+    .into())
 }

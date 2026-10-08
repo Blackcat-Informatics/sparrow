@@ -22,6 +22,10 @@ impl Input {
         let mut selection = Box::<super::selection::Input>::default();
         let mut fields = args[1..].iter();
         while let Some(flag) = fields.next() {
+            if flag == "--require-complete-index" {
+                query.selector.require_complete_index = true;
+                continue;
+            }
             let value = fields
                 .next()
                 .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
@@ -38,10 +42,8 @@ impl Input {
             match flag.as_str() {
                 "--scope-file" => {
                     selection = Box::new(
-                        super::selection::decode_membership(&super::records::read_control_file(
-                            value,
-                        )?)
-                        .map_err(|error| invalid(error.to_string()))?,
+                        super::selection::decode(&super::records::read_control_file(value)?)
+                            .map_err(|error| invalid(error.to_string()))?,
                     )
                 }
                 "--received-from" => {
@@ -68,8 +70,14 @@ impl Input {
         let mut query = request.get().init_query();
         query.set_store_id(&self.store);
         query.set_schema_version(sparrow_client::SCHEMA_VERSION);
-        self.selection
-            .encode_membership(query.reborrow().init_selection())?;
+        let mut scope = query.reborrow().init_scope();
+        scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
+        scope
+            .reborrow()
+            .init_received_before()
+            .set_unix_millis(u64::MAX);
+        scope.set_require_complete_index(self.query.selector.require_complete_index);
+        self.selection.encode(scope)?;
         optional(query.reborrow().init_source(), &self.query.selector.source);
         optional(query.reborrow().init_cursor(), &self.query.cursor);
         let mut received = query.reborrow().init_received();
@@ -122,13 +130,46 @@ impl Input {
                         "complete_bytes_available",
                         row.get_complete_bytes_available(),
                     )
-                    .with("retained_records", row.get_retained_records().to_string()),
+                    .with("retained_records", row.get_retained_records().to_string())
+                    .with(
+                        "coverage",
+                        Value::from(super::render_membership_coverage(
+                            row.get_coverage()?,
+                            row.get_matching_records()?,
+                        )?),
+                    ),
             ));
         }
+        let coverage = page.get_coverage()?;
+        let complete = coverage.get_membership_complete();
         Ok(super::catalog::receipt(page.get_receipt()?)?
+            .with(
+                "answer_certainty",
+                if complete { "exact" } else { "incomplete" },
+            )
+            .with(
+                "known_matching_artifacts",
+                page.get_receipt()?.get_total_items().to_string(),
+            )
+            .with(
+                "matching_artifacts",
+                if complete {
+                    Value::from(page.get_receipt()?.get_total_items().to_string())
+                } else {
+                    Value::Null
+                },
+            )
+            .with(
+                "coverage",
+                Value::from(
+                    super::render_membership_coverage(coverage, page.get_matching_records()?)?
+                        .with("catalog_complete", true)
+                        .with("scanned", page.get_receipt()?.get_scanned().to_string()),
+                ),
+            )
             .with("operation", "artifacts_list")
             .with("rows", Value::array(rows))
-            .with("profile_ids", Value::array(["sparrow-artifact-catalog-v1"]))
+            .with("profile_ids", Value::array(["sparrow-artifact-catalog-v2"]))
             .into())
     }
 }

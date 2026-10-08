@@ -8150,3 +8150,161 @@ fn source_time_registry_pressure_is_retryable_without_publishing_a_mapping() {
         )
         .unwrap();
 }
+
+#[test]
+fn artifact_diagnostic_filters_preserve_unknown_counts_and_original_receipt_scope() {
+    use sparrow_core::{
+        ArtifactRead, ArtifactSelector, DiagnosticDimension as D, QueryAlternatives, QuerySelection,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_diagnostic_profile("mapped", [(D::Service, "/svc".into())].into())
+        .unwrap();
+    let a = store
+        .ingest(
+            "artifact-filter-a",
+            "mapped",
+            "jsonl",
+            b"{\"svc\":\"worker\"}\n{}\n{\"svc\":\"other\"}\n",
+            10,
+        )
+        .unwrap();
+    let unknown = store
+        .ingest("artifact-filter-unknown", "mapped", "jsonl", b"{}\n", 11)
+        .unwrap();
+    let other = store
+        .ingest("artifact-filter-other", "other", "jsonl", b"{}\n", 12)
+        .unwrap();
+    let empty = store
+        .ingest("artifact-filter-empty", "mapped", "jsonl", b"", 13)
+        .unwrap();
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            sources: Some(QueryAlternatives::new(vec!["mapped".into()]).unwrap()),
+            diagnostics: [(
+                D::Service,
+                QueryAlternatives::new(vec!["worker".into()]).unwrap(),
+            )]
+            .into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let page = store.artifact_read(&query, 20).unwrap();
+    assert_eq!(page.total_items, 1);
+    assert_eq!(page.body.artifacts[0].id, a.id);
+    assert_eq!(page.body.artifacts[0].retained_records, 3);
+    assert_eq!(page.body.artifacts[0].diagnostic_coverage.matched, 1);
+    assert_eq!(page.body.artifacts[0].diagnostic_coverage.unknown, 1);
+    assert_eq!(page.body.diagnostic_coverage.evaluated, 4);
+    assert_eq!(page.body.diagnostic_coverage.excluded, 1);
+    assert_eq!(page.body.diagnostic_coverage.unknown, 2);
+    assert!(!page.body.diagnostic_coverage.complete(false));
+    query.selector.require_complete_index = true;
+    assert_eq!(
+        store.artifact_read(&query, 20).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    query.selector.received_from = 12;
+    assert!(
+        store
+            .artifact_read(&query, 20)
+            .unwrap()
+            .body
+            .artifacts
+            .is_empty()
+    );
+    query.selector.received_from = 0;
+    query.selector.selection = QuerySelection::Evidence(vec![other.id.clone()]);
+    assert!(
+        store
+            .artifact_read(&query, 20)
+            .unwrap()
+            .body
+            .artifacts
+            .is_empty()
+    );
+    query.selector.selection = QuerySelection::Evidence(vec![empty.id]);
+    assert!(
+        store
+            .artifact_read(&query, 20)
+            .unwrap()
+            .body
+            .artifacts
+            .is_empty()
+    );
+    query.selector.selection = QuerySelection::Evidence(vec!["artifact:missing".into()]);
+    assert_eq!(
+        store.artifact_read(&query, 20).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    query.selector.require_complete_index = false;
+    query.selector.selection = QuerySelection::Evidence(vec![unknown.id]);
+    let only_unknown = store.artifact_read(&query, 20).unwrap();
+    assert!(only_unknown.body.artifacts.is_empty());
+    assert_eq!(only_unknown.body.diagnostic_coverage.unknown, 1);
+    query.selector.selection = QuerySelection::Evidence(vec![a.record_ids[0].clone()]);
+    query.selector.require_complete_index = true;
+    let known = store.artifact_read(&query, 20).unwrap();
+    assert_eq!(known.body.artifacts[0].retained_records, 1);
+    assert_eq!(known.body.diagnostic_coverage.matched, 1);
+    assert!(known.body.diagnostic_coverage.complete(false));
+}
+
+#[test]
+fn artifact_filter_pages_freeze_coverage_and_bind_all_filters() {
+    use sparrow_core::{
+        ArtifactRead, ArtifactSelector, DiagnosticDimension as D, QueryAlternatives,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_diagnostic_profile("mapped", [(D::Service, "/svc".into())].into())
+        .unwrap();
+    for request in ["artifact-filter-page-a", "artifact-filter-page-b"] {
+        store
+            .ingest(
+                request,
+                "mapped",
+                "jsonl",
+                b"{\"svc\":\"worker\"}\n{}\n",
+                10,
+            )
+            .unwrap();
+    }
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            diagnostics: [(
+                D::Service,
+                QueryAlternatives::new(vec!["worker".into()]).unwrap(),
+            )]
+            .into(),
+            ..Default::default()
+        },
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.artifact_read(&query, 20).unwrap();
+    query.cursor = first.next_cursor.clone();
+    store
+        .ingest("artifact-filter-page-new", "mapped", "jsonl", b"{}\n", 21)
+        .unwrap();
+    let second = store.artifact_read(&query, 22).unwrap();
+    assert_eq!(
+        second.body.diagnostic_coverage,
+        first.body.diagnostic_coverage
+    );
+    assert_eq!(second.total_items, 2);
+    query.selector.require_complete_index = true;
+    assert_eq!(
+        store.artifact_read(&query, 22).unwrap_err().code,
+        "CONFLICT"
+    );
+    query.selector.require_complete_index = false;
+    query.selector.sources = Some(QueryAlternatives::new(vec!["mapped".into()]).unwrap());
+    assert_eq!(
+        store.artifact_read(&query, 22).unwrap_err().code,
+        "CONFLICT"
+    );
+}

@@ -19,6 +19,12 @@ pub struct ArtifactSelector {
     pub selection: crate::QuerySelection,
     /// Exact source label, or all sources.
     pub source: Option<String>,
+    /// OR alternatives intersected with the outer exact source.
+    pub sources: Option<crate::QueryAlternatives>,
+    /// AND dimensions and OR alternatives, using the shared record matcher.
+    pub diagnostics: BTreeMap<crate::DiagnosticDimension, crate::QueryAlternatives>,
+    /// Refuse unknown diagnostic membership.
+    pub require_complete_index: bool,
     /// Inclusive original artifact receipt time, in Unix milliseconds.
     pub received_from: u64,
     /// Exclusive original artifact receipt time.
@@ -30,8 +36,27 @@ impl Default for ArtifactSelector {
         Self {
             selection: crate::QuerySelection::Live,
             source: None,
+            sources: None,
+            diagnostics: BTreeMap::new(),
+            require_complete_index: false,
             received_from: 0,
             received_before: u64::MAX,
+        }
+    }
+}
+
+impl ArtifactSelector {
+    fn scope(&self) -> crate::QueryScope {
+        crate::QueryScope {
+            selection: self.selection.clone(),
+            source: self.source.clone(),
+            sources: self.sources.clone(),
+            diagnostics: self.diagnostics.clone(),
+            require_complete_index: self.require_complete_index,
+            received_from: self.received_from,
+            received_before: self.received_before,
+            limit: 1000,
+            scan_budget: 100000,
         }
     }
 }
@@ -39,6 +64,13 @@ impl Default for ArtifactSelector {
 impl catalog_lease::Selector for ArtifactSelector {
     fn capacity(&self) -> usize {
         self.source.as_ref().map_or(0, String::capacity)
+            + self
+                .sources
+                .iter()
+                .chain(self.diagnostics.values())
+                .map(crate::QueryAlternatives::capacity)
+                .sum::<usize>()
+            + usize::from(!self.diagnostics.is_empty()) * 1024
             + match &self.selection {
                 crate::QuerySelection::Live => 0,
                 crate::QuerySelection::Evidence(ids) => {
@@ -102,6 +134,8 @@ pub struct ArtifactSummary {
     pub complete_bytes_available: bool,
     /// Exact number of retained records within the captured membership.
     pub retained_records: usize,
+    /// Matching retained records; unknown mappings remain explicit.
+    pub diagnostic_coverage: crate::DiagnosticCoverage,
 }
 
 impl ArtifactSummary {
@@ -120,6 +154,8 @@ impl ArtifactSummary {
 pub struct ArtifactPageBody {
     /// Page rows. Missing parents retain identity/source and explicit unknown metadata.
     pub artifacts: Vec<ArtifactSummary>,
+    /// Coverage across all eligible records, including parents with no proven match.
+    pub diagnostic_coverage: crate::DiagnosticCoverage,
 }
 
 impl catalog_lease::PageBody for ArtifactPageBody {
@@ -138,6 +174,7 @@ impl catalog_lease::PageBody for ArtifactPageBody {
     fn page(&self, start: usize, end: usize) -> Self {
         Self {
             artifacts: self.artifacts[start..end].to_vec(),
+            diagnostic_coverage: self.diagnostic_coverage,
         }
     }
 }
@@ -207,7 +244,7 @@ impl Store {
             page_size: query.page_size,
             scan_budget: query.scan_budget,
             scanned,
-            body: ArtifactPageBody { artifacts },
+            body: artifacts,
         };
         drop(writer);
         reads.publish(snapshot, now, CAPTURE_BYTES, HANDLE_BYTES, MAX_HANDLES)
@@ -227,6 +264,8 @@ impl Store {
 struct ArtifactCapture {
     rows: BTreeMap<String, ArtifactSummary>,
     capacity: usize,
+    scope: crate::QueryScope,
+    diagnostic_coverage: crate::DiagnosticCoverage,
 }
 impl ArtifactCapture {
     /// Fold one admitted native catalog entry without retaining its decoded body.
@@ -265,6 +304,7 @@ impl ArtifactCapture {
                     }),
                     complete_bytes_available: complete,
                     retained_records: 0,
+                    diagnostic_coverage: crate::DiagnosticCoverage::default(),
                 },
                 false,
             )
@@ -280,6 +320,18 @@ impl ArtifactCapture {
             if !writer.live_record(&record, now, protected) {
                 return Ok(());
             }
+            let mut diagnostic_coverage = crate::DiagnosticCoverage::default();
+            let parent = self.rows.get(&record.artifact_id);
+            let origin = parent.and_then(|row| row.origin.as_ref());
+            if artifact_eligible(&self.scope, &record.source, origin)? {
+                writer.matches_diagnostic_scope(
+                    &self.scope,
+                    &record,
+                    &mut diagnostic_coverage,
+                    self.scope.require_complete_index,
+                )?;
+                self.diagnostic_coverage.merge(diagnostic_coverage);
+            }
             (
                 ArtifactSummary {
                     id: record.artifact_id,
@@ -287,6 +339,7 @@ impl ArtifactCapture {
                     origin: None,
                     complete_bytes_available: false,
                     retained_records: 0,
+                    diagnostic_coverage,
                 },
                 true,
             )
@@ -316,6 +369,9 @@ impl ArtifactCapture {
             }
             if retained {
                 existing.retained_records += 1;
+                existing
+                    .diagnostic_coverage
+                    .merge(summary.diagnostic_coverage);
             }
         } else {
             if self.rows.len() == MAX_ITEMS || self.capacity + summary.capacity() > CAPTURE_BYTES {
@@ -342,7 +398,7 @@ impl Writer {
         scan_budget: usize,
         scanned: &mut usize,
         remaining: &mut usize,
-    ) -> Result<Vec<ArtifactSummary>, Error> {
+    ) -> Result<ArtifactPageBody, Error> {
         let protected = self.protected_matching(
             now,
             |_| true,
@@ -376,6 +432,8 @@ impl Writer {
         let mut capture = ArtifactCapture {
             rows: BTreeMap::new(),
             capacity: 4096,
+            scope: selector.scope(),
+            diagnostic_coverage: crate::DiagnosticCoverage::default(),
         };
         if let Some(selection) = selection {
             for id in &selection.parents {
@@ -425,13 +483,6 @@ impl Writer {
             if !summary.complete_bytes_available && summary.retained_records == 0 {
                 continue;
             }
-            if selector
-                .source
-                .as_ref()
-                .is_some_and(|source| source != &summary.source)
-            {
-                continue;
-            }
             if let Some(origin) = &summary.origin {
                 if summary.retained_records > origin.original_records {
                     return Err(Error::new(
@@ -442,19 +493,39 @@ impl Writer {
                 crate::format_instant(origin.received_at)
                     .and_then(|_| crate::format_instant(origin.expires_at))
                     .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
-                if origin.received_at < selector.received_from
-                    || origin.received_at >= selector.received_before
-                {
-                    continue;
-                }
-            } else if selector.received_from != 0 || selector.received_before != u64::MAX {
-                return Err(Error::new(
-                    "INDEX_NOT_READY",
-                    "original artifact receipt time is unknown after parent reclamation; omit the receipt filter or select retained records",
-                ));
+            }
+            if !artifact_eligible(&capture.scope, &summary.source, summary.origin.as_ref())?
+                || !selector.diagnostics.is_empty() && summary.diagnostic_coverage.matched == 0
+            {
+                continue;
             }
             artifacts.push(summary);
         }
-        Ok(artifacts)
+        Ok(ArtifactPageBody {
+            artifacts,
+            diagnostic_coverage: capture.diagnostic_coverage,
+        })
+    }
+}
+
+// Original artifact receipt time is independent of record acceptance time.
+fn artifact_eligible(
+    scope: &crate::QueryScope,
+    source: &str,
+    origin: Option<&ArtifactOrigin>,
+) -> Result<bool, Error> {
+    if !scope.matches_source(source) {
+        return Ok(false);
+    }
+    match origin {
+        Some(origin) => {
+            Ok(origin.received_at >= scope.received_from
+                && origin.received_at < scope.received_before)
+        }
+        None if scope.received_from == 0 && scope.received_before == u64::MAX => Ok(true),
+        None => Err(Error::new(
+            "INDEX_NOT_READY",
+            "original artifact receipt time is unknown after parent reclamation; omit the receipt filter or select retained records",
+        )),
     }
 }

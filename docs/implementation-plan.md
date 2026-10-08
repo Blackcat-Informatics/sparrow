@@ -21,8 +21,10 @@ counts and configured watch bindings. Producer continuity remains explicitly
 unknown while stream generations and gap tracking are unfinished.
 Artifact discovery now admits live, explicit evidence and revision-guarded pin
 membership through the same reference owner as record queries, including
-recordless artifacts and frozen pages after pin release. Artifact diagnostic
-scope filtering and broader record/field/text query pagination remain required.
+recordless artifacts and frozen pages after pin release. Artifact source-array
+and diagnostic filters use the shared record matcher, with frozen coverage,
+unknown counts and strict refusal. Broader record/field/text query pagination
+and corpus-scale indexed selection remain required.
 The standalone producer client and schema-11 typed event batch operation are
 present. Native event JSONL enters the same occurrence/field/text/time indexes;
 the bounded producer queue now reconnects with immutable pending batches and

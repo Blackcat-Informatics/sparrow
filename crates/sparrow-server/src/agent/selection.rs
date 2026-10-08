@@ -121,17 +121,6 @@ pub(super) fn decode(value: &Value) -> std::result::Result<Input, DecodeError> {
     })
 }
 
-/// Artifact metadata admits the shared membership vocabulary, without silent filter omission.
-pub(super) fn decode_membership(value: &Value) -> std::result::Result<Input, DecodeError> {
-    let result = decode(value)?;
-    if result.sources.is_some() || !result.diagnostics.is_empty() {
-        return Err(DecodeError::custom(
-            "artifact discovery accepts membership-only scope; use outer source and original receipt-time filters",
-        ));
-    }
-    Ok(result)
-}
-
 impl Input {
     pub(super) async fn require_supported(&self, client: &wire::sparrow::Client) -> Result<()> {
         sparrow_client::Discovery::fetch(client).await?;
@@ -195,7 +184,7 @@ impl Input {
     }
 }
 
-pub(super) fn schema(filters: bool) -> Value {
+pub(super) fn schema() -> Value {
     let string = || Value::from(Object::new().with("type", "string"));
     let alternatives = Value::from(
         Object::new()
@@ -228,10 +217,8 @@ pub(super) fn schema(filters: bool) -> Value {
             .with("minProperties", 1_u64)
             .with("properties", properties),
     );
-    let object = |mut properties: Object, required: Vec<&str>| {
-        if filters {
-            properties = properties.with("filter", filter.clone());
-        }
+    let object = |properties: Object, required: Vec<&str>| {
+        let properties = properties.with("filter", filter.clone());
         Value::from(
             Object::new()
                 .with("type", "object")
@@ -256,14 +243,12 @@ pub(super) fn schema(filters: bool) -> Value {
             Value::array([
                 object(Object::new().with("kind", kind("live")), vec!["kind"]),
                 {
-                    let mut properties = Object::new()
+                    let properties = Object::new()
                         .with("kind", kind("selection"))
                         .with("store_id", string())
                         .with("artifact_ids", ids())
-                        .with("record_ids", ids());
-                    if filters {
-                        properties = properties.with("filter", filter.clone());
-                    }
+                        .with("record_ids", ids())
+                        .with("filter", filter.clone());
                     Value::from(
                         Object::new()
                             .with("type", "object")

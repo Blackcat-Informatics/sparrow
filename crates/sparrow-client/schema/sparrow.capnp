@@ -36,6 +36,7 @@ struct OptionalArtifactOrigin { union { absent @0 :Void; value @1 :ArtifactOrigi
 struct ArtifactSummary {
   id @0 :Text; source @1 :Text; origin @2 :OptionalArtifactOrigin;
   completeBytesAvailable @3 :Bool; retainedRecords @4 :UInt64;
+  coverage @5 :DiagnosticCoverage; matchingRecords @6 :Count;
 }
 struct ArtifactReceiptInterval { from @0 :Instant; before @1 :Instant; }
 struct OptionalArtifactReceiptInterval {
@@ -45,9 +46,12 @@ struct ArtifactListQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;
   received @3 :OptionalArtifactReceiptInterval;
   cursor @4 :OptionalText; pageSize @5 :UInt32 = 200; scanBudget @6 :UInt32 = 10000;
-  selection @7 :QuerySelection;
+  scope @7 :Scope;
 }
-struct ArtifactListPage { receipt @0 :CatalogReadReceipt; rows @1 :List(ArtifactSummary); }
+struct ArtifactListPage {
+  receipt @0 :CatalogReadReceipt; rows @1 :List(ArtifactSummary);
+  coverage @2 :DiagnosticCoverage; matchingRecords @3 :Count;
+}
 struct SourceWatchInfo { watchId @0 :Text; revision @1 :UInt64; enabled @2 :Bool; }
 struct SourceSummary {
   sourceId @0 :Text; rdfIri @1 :Text;

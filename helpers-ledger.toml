@@ -621,7 +621,7 @@ names = ['^(json_time_candidates|text_time_candidates)$']
 id = "agent-query-selection"
 summary = "CLI control files and MCP inputs share one closed native JSON scope codec and generated Capnp encoder."
 home = "sparrow_server::agent::selection::decode"
-entry_points = ["sparrow_server::agent::selection::Input::encode", "sparrow_server::agent::selection::Input::encode_membership", "sparrow_server::agent::selection::decode_membership"]
+entry_points = ["sparrow_server::agent::selection::Input::encode", "sparrow_server::agent::selection::Input::encode_membership"]
 spec = "docs/interfaces.md: scope-file and MCP scope input."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2348,6 +2348,34 @@ summary = "One parser owns shared source, cursor, page-size and scan-budget opti
 home = "sparrow_server::agent::catalog::option"
 entry_points = []
 spec = "docs/interfaces.md: sources and artifacts catalog CLI options."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "artifact-original-receipt-scope"
+summary = "Artifact capture shares source matching with record queries and applies original parent receipt intervals before diagnostic evaluation."
+home = "sparrow_core::storage::artifact_read::artifact_eligible"
+entry_points = ["sparrow_core::storage::artifact_read::ArtifactSelector::scope"]
+spec = "docs/interfaces.md: schema 27 artifact source and diagnostic filters."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "agent-query-coverage"
+summary = "One typed coverage renderer preserves unknown counts and diagnostic membership for record and artifact agent results."
+home = "sparrow_server::agent::render_membership_coverage"
+entry_points = ["sparrow_server::agent::render_coverage", "sparrow_server::agent::receipt", "sparrow_server::rpc::diagnostic_coverage"]
+spec = "docs/interfaces.md: explicit diagnostic coverage across query surfaces."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true

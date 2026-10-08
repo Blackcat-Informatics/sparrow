@@ -456,7 +456,9 @@ still validate the evidence they read. Corrupt evidence must produce an
 actionable failure on those paths even when discovery succeeds. Status metadata
 must agree with discovery. This wire revision does not change storage formats.
 
-Schema 26 adds live/evidence/pin membership to typed `artifactsList.selection`.
+Schema 27 uses the common typed `Scope` in `ArtifactListQuery.scope`, including
+live/evidence/pin membership and source/diagnostic filter arrays. Membership was
+introduced in schema 26.
 CLI artifact reads accept the existing bounded native JSON control file through
 `--scope-file FILE`; MCP `artifacts_list` accepts the same membership object as
 `scope`. The default is live. Explicit selections admit 1..1000 store-scoped
@@ -478,16 +480,34 @@ Overlapping references never duplicate parent rows or record counts.
 Selected captures seek only resolved records and parent/whole-artifact metadata;
 they do not scan unrelated artifact/record catalog entries. Reference expansion
 and metadata folding share one aggregate entry/byte/scan/time admission. The
-existing live scan and selected seeks use one collector. Diagnostic/source-array
-`scope.filter` is not yet admitted for artifact metadata: the decoder refuses it
-and the artifact MCP schema does not advertise it. Use the existing outer exact
-source and original receipt interval; record query scope filters remain unchanged.
-Full artifact diagnostic filtering remains required.
+existing live scan and selected seeks use one collector. `scope.filter.source_ids`
+uses OR alternatives intersected with the outer exact source. Diagnostic arrays
+use the shared record matcher: AND across dimensions, OR within arrays, and exact
+captured decoded values. Source and original parent receipt filters run before
+diagnostic evaluation. The outer receipt interval never becomes a record
+acceptance-time interval. The typed scope's source/time/limits must retain their
+canonical defaults; callers use outer artifact query fields for those values.
+
+With diagnostic filters, rows require at least one proven matching retained
+record. Recordless artifacts have no diagnostic matches. Unknown-only parents
+contribute coverage without being presented as proven results. Each row retains
+its exact `retained_records` within membership and carries shared typed coverage:
+`eligible_records` is the matching-record count or unknown, accompanied by a
+`known_eligible_records` lower bound and matched/excluded/unknown evidence.
+Page coverage includes every source/receipt-eligible record, including parents
+without proven matches, and remains identical across continuation.
+
+`total_items` and `known_matching_artifacts` count captured proven rows;
+`matching_artifacts` is null and `answer_certainty` is incomplete when diagnostic
+membership is unknown. CLI `--require-complete-index` and MCP
+`require_complete_index=true` refuse with `INDEX_NOT_READY` on applicable unknown
+mappings. No prefix or handle is published on refusal. CLI and MCP share scope
+decoding, typed coverage encoding and rendering.
 
 Cursors bind the original membership, selector and limits. Continuation serves
 the immutable capture after pin release, collection changes or evidence retirement;
 fresh reads revalidate current evidence. No read renews protection. Current
-discovery schema 26 is required; old clients/daemons are explicitly refused.
+discovery schema 27 is required; old clients/daemons are explicitly refused.
 Storage formats and retained evidence encodings are unchanged.
 
 Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`
@@ -541,8 +561,9 @@ check current retention. All counts render as decimal strings in agent output.
 
 Status now carries typed artifact catalog handle/byte counts, limits and lease
 duration. Artifact and pin pages share both their receipt wire codec and agent
-renderer. This surface still requires full live/pin/selection and diagnostic
-scope support and corpus-scale indexed selection; source discovery is unfinished.
+renderer. Schema 27 supersedes this initial scope with membership and diagnostic
+filtering. Corpus-scale indexed selection and producer stream discovery remain
+unfinished.
 
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity

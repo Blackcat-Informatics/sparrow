@@ -238,7 +238,7 @@ impl Store {
         )?;
         let mut rows = BTreeMap::<String, SourceSummary>::new();
         let mut capacity = 4096;
-        for artifact in artifacts {
+        for artifact in artifacts.artifacts {
             let row = admit_source(&mut rows, &artifact.source, &mut capacity)?;
             row.complete_artifacts += usize::from(artifact.complete_bytes_available);
             row.fragment_parents += usize::from(!artifact.complete_bytes_available);

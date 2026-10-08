@@ -32,8 +32,30 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 26; the schema sections
+The current source implements schema 27; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 27 artifact scope filters
+
+Artifact discovery uses the shared typed scope and agent scope codec for source
+alternatives and diagnostic dimensions. Original artifact receipt filtering runs
+before the existing record diagnostic matcher. Rows require proven matches when
+diagnostic filters are present; retained membership counts remain exact.
+Shared typed coverage carries matching-record lower bounds and unknown mappings.
+Unknown-only parents contribute capture coverage even without a proven row.
+Matching artifact totals remain unknown when coverage is incomplete, and strict
+CLI/MCP admission refuses rather than publishing a prefix.
+
+Continuation freezes aggregate and per-parent coverage and binds all filters,
+strictness and membership. Source discovery still uses an unfiltered artifact
+capture and keeps exact retained occurrence counts. Storage formats remain
+unchanged. Local qualification passed formatting, release Clippy with warnings
+denied, workspace release tests (110 storage and 32 RPC/daemon/MCP scenarios),
+seeded census self-tests and the pinned cross-workspace gate. All 157 ownership
+jobs hold with zero distinct exceptions. Evidence is
+`/tmp/sparrow-artifact-filters-gate-20261007.log`. The normal commit hook verifies
+the final source, including CLI help and removal of the obsolete restricted scope
+schema mode. Live adoption evidence is recorded separately after that gate.
 
 ## Schema 26 artifact membership
 

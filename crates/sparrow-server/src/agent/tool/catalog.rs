@@ -136,7 +136,12 @@ pub(crate) fn definitions() -> Value {
                 );
             }
             if *name == "artifacts_list" {
-                properties = properties.with("scope", super::super::selection::schema(false));
+                properties = properties
+                    .with("scope", super::super::selection::schema())
+                    .with(
+                        "require_complete_index",
+                        Object::new().with("type", "boolean"),
+                    );
             }
             required.push("store_id");
         }
@@ -163,7 +168,7 @@ pub(crate) fn definitions() -> Value {
                 );
             }
             properties = properties
-                .with("scope", super::super::selection::schema(true))
+                .with("scope", super::super::selection::schema())
                 .with(
                     "require_complete_index",
                     Object::new().with("type", "boolean"),

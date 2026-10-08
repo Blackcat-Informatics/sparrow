@@ -666,7 +666,13 @@ fn coverage(mut target: wire::coverage::Builder<'_>, coverage: &Value) -> capnp:
     let scope = coverage
         .get("diagnostic_scope")
         .ok_or_else(|| capnp::Error::failed("missing diagnostic coverage".into()))?;
-    let mut out = target.init_diagnostic_scope();
+    diagnostic_coverage(target.init_diagnostic_scope(), scope)
+}
+
+fn diagnostic_coverage(
+    mut out: wire::diagnostic_coverage::Builder<'_>,
+    scope: &Value,
+) -> capnp::Result<()> {
     out.set_evaluated(number(scope, "evaluated")?);
     out.set_matched(number(scope, "matched")?);
     out.set_excluded(number(scope, "excluded")?);
@@ -2009,16 +2015,33 @@ impl wire::sparrow::Server for Rpc {
                 )
             }
         };
-        let selected = match selection(input.get_selection()?, &self)? {
+        let selected = match scope(input.get_scope()?, &self)? {
             Ok(selection) => selection,
             Err(error) => {
                 failure(results.get().init_result(), error);
                 return Ok(());
             }
         };
+        if selected.source.is_some()
+            || selected.received_from != 0
+            || selected.received_before != u64::MAX
+            || selected.limit != 100
+            || selected.scan_budget != 10000
+        {
+            failure(
+                results.get().init_result(),
+                invalid(
+                    "artifact scope uses membership and filters; source, receipt interval and limits belong to the outer artifact query",
+                ),
+            );
+            return Ok(());
+        }
         let query = sparrow_core::ArtifactRead {
             selector: sparrow_core::ArtifactSelector {
-                selection: selected,
+                selection: selected.selection,
+                sources: selected.sources,
+                diagnostics: selected.diagnostics,
+                require_complete_index: selected.require_complete_index,
                 source: optional(input.get_source()?)?,
                 received_from,
                 received_before,
@@ -2035,6 +2058,23 @@ impl wire::sparrow::Server for Rpc {
             Ok(page) => {
                 let mut out = results.get().init_result().init_ok();
                 catalog_receipt(out.reborrow().init_receipt(), &page);
+                let encoded = page.body.diagnostic_coverage.encode(
+                    page.body.diagnostic_coverage.evaluated,
+                    page.body.diagnostic_coverage.matched,
+                    [0; 3],
+                    false,
+                );
+                diagnostic_coverage(
+                    out.reborrow().init_coverage(),
+                    encoded.get("diagnostic_scope").ok_or_else(|| {
+                        capnp::Error::failed("missing artifact diagnostic coverage".into())
+                    })?,
+                )?;
+                count(
+                    out.reborrow().init_matching_records(),
+                    &encoded,
+                    "eligible_records",
+                )?;
                 let mut rows = out.init_rows(page.body.artifacts.len() as u32);
                 for (index, summary) in page.body.artifacts.iter().enumerate() {
                     let mut row = rows.reborrow().get(index as u32);
@@ -2042,6 +2082,23 @@ impl wire::sparrow::Server for Rpc {
                     row.set_source(&summary.source);
                     row.set_complete_bytes_available(summary.complete_bytes_available);
                     row.set_retained_records(summary.retained_records as u64);
+                    let encoded = summary.diagnostic_coverage.encode(
+                        summary.diagnostic_coverage.evaluated,
+                        summary.diagnostic_coverage.matched,
+                        [0; 3],
+                        false,
+                    );
+                    diagnostic_coverage(
+                        row.reborrow().init_coverage(),
+                        encoded.get("diagnostic_scope").ok_or_else(|| {
+                            capnp::Error::failed("missing artifact record coverage".into())
+                        })?,
+                    )?;
+                    count(
+                        row.reborrow().init_matching_records(),
+                        &encoded,
+                        "eligible_records",
+                    )?;
                     let mut original = row.init_origin();
                     match &summary.origin {
                         None => original.set_absent(()),

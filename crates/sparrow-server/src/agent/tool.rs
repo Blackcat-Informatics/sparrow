@@ -114,6 +114,8 @@ impl Operation {
                 }
                 "artifacts_list" => {
                     let mut query = sparrow_core::ArtifactRead::default();
+                    query.selector.require_complete_index =
+                        fields.optional("require_complete_index")?.unwrap_or(false);
                     query.selector.source = fields.optional("source")?;
                     query.cursor = fields.optional("cursor")?;
                     let from: Option<String> = fields.optional("received_from")?;
@@ -142,7 +144,7 @@ impl Operation {
                         selection: Box::new(
                             fields
                                 .raw("scope")?
-                                .map(super::selection::decode_membership)
+                                .map(super::selection::decode)
                                 .transpose()?
                                 .unwrap_or_default(),
                         ),

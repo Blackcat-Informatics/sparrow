@@ -72,7 +72,7 @@ impl QuerySelection {
 }
 
 /// Admitted exact filter alternatives; vocabulary ownership stays with Sparrow.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryAlternatives {
     ids: Vec<String>,
 }
@@ -89,6 +89,11 @@ impl QueryAlternatives {
             ));
         }
         Ok(Self { ids })
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.ids.capacity() * std::mem::size_of::<String>()
+            + self.ids.iter().map(String::capacity).sum::<usize>()
     }
 
     /// Exact alternatives, preserving caller spelling and order.

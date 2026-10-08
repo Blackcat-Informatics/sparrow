@@ -471,7 +471,7 @@ pub(super) fn rdf(record: &Record) -> Result<std::sync::Arc<purrdf::RdfDataset>,
 }
 
 /// Diagnostic membership evidence over the visited live source/time selection.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiagnosticCoverage {
     /// Records whose diagnostic scope was evaluated.
     pub evaluated: u64,

@@ -213,7 +213,7 @@ async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages
             );
             let filtered = Value::from(Object::new().with("kind", "live").with(
                 "filter",
-                Object::new().with("service", Value::array(["worker"])),
+                Object::new().with("service", Value::array(Vec::<Value>::new())),
             ));
             for (input, code) in [
                 (scope, "NOT_FOUND"),
@@ -5620,6 +5620,142 @@ async fn typed_queries_and_exact_bytes_survive_daemon_crash() {
             assert!(String::from_utf8_lossy(&expired.stderr).contains("RESULT_EXPIRED"));
             assert_eq!(exercise(&socket).await, first);
             drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn artifact_diagnostic_scope_reports_unknown_membership_through_cli_and_mcp() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let configuration = sparrow_server::ServerConfig::read(&config).unwrap();
+            let owner = configuration.open_store().unwrap();
+            owner
+                .define_diagnostic_profile(
+                    "mapped",
+                    [(sparrow_core::DiagnosticDimension::Service, "/svc".into())].into(),
+                )
+                .unwrap();
+            let clock = sparrow_server::now().unwrap();
+            owner
+                .ingest(
+                    "wire-artifact-filter-a",
+                    "mapped",
+                    "jsonl",
+                    b"{\"svc\":\"worker\"}\n{}\n{\"svc\":\"other\"}\n",
+                    clock,
+                )
+                .unwrap();
+            owner
+                .ingest(
+                    "wire-artifact-filter-unknown",
+                    "mapped",
+                    "jsonl",
+                    b"{}\n",
+                    clock,
+                )
+                .unwrap();
+            owner
+                .ingest(
+                    "wire-artifact-filter-excluded",
+                    "excluded",
+                    "jsonl",
+                    b"{}\n",
+                    clock,
+                )
+                .unwrap();
+            drop(owner);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            let scope = Value::from(
+                Object::new().with("kind", "live").with(
+                    "filter",
+                    Object::new()
+                        .with("source_ids", Value::array(["mapped"]))
+                        .with("service", Value::array(["worker"])),
+                ),
+            );
+            let scope_file = dir.path().join("scope.json");
+            std::fs::write(&scope_file, purrdf_lex::json::write_compact(&scope)).unwrap();
+            let path = scope_file.to_str().unwrap();
+            let result = cli(&socket, &["artifacts", &store, "--scope-file", path]);
+            assert_eq!(result["answer_certainty"].as_str(), Some("incomplete"));
+            assert_eq!(result["known_matching_artifacts"].as_str(), Some("1"));
+            assert_eq!(result["matching_artifacts"], Value::Null);
+            assert_eq!(
+                result["coverage"]["diagnostic_scope"]["unknown"].as_str(),
+                Some("2")
+            );
+            assert_eq!(result["rows"][0]["retained_records"].as_str(), Some("3"));
+            assert_eq!(
+                result["rows"][0]["coverage"]["known_eligible_records"].as_str(),
+                Some("1")
+            );
+            assert_eq!(
+                result["rows"][0]["coverage"]["eligible_records"],
+                Value::Null
+            );
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let response = mcp
+                .tool(
+                    2,
+                    "artifacts_list",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("scope", scope.clone())
+                        .into(),
+                )
+                .await;
+            assert!(!response["isError"].as_bool().unwrap());
+            let payload = &response["structuredContent"];
+            assert_eq!(payload["rows"], result["rows"]);
+            assert_eq!(payload["coverage"], result["coverage"]);
+            let strict = mcp
+                .tool(
+                    3,
+                    "artifacts_list",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("scope", scope.clone())
+                        .with("require_complete_index", true)
+                        .into(),
+                )
+                .await;
+            assert!(strict["isError"].as_bool().unwrap());
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
+                    "artifacts",
+                    &store,
+                    "--scope-file",
+                    path,
+                    "--require-complete-index",
+                ])
+                .output()
+                .unwrap();
+            assert!(!output.status.success() && output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("INDEX_NOT_READY"));
+            let excluded = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--scope-file",
+                    path,
+                    "--source",
+                    "excluded",
+                    "--require-complete-index",
+                ],
+            );
+            assert_eq!(excluded["matching_artifacts"].as_str(), Some("0"));
+            assert_eq!(excluded["answer_certainty"].as_str(), Some("exact"));
         })
         .await;
 }
