@@ -3456,11 +3456,11 @@ names = ['^(unlink_stale_socket_elsewhere|replace_local_endpoint)$']
 
 [[job]]
 id = "complete-daemon-teardown"
-summary = "One teardown owner joins both intake workers, flushes storage and cleans only the owned endpoint while retaining primary and cleanup failures on startup refusal, terminal failure and graceful shutdown; main retains one native interrupt subscription through startup and awaited maintenance."
+summary = "One teardown owner joins intake workers, reserves and closes the complete native RPC admission budget before the final flush, and cleans only the owned endpoint while retaining primary and cleanup failures; main retains one native interrupt subscription through startup and awaited maintenance."
 home = "sparrowd::shutdown::finish"
-entry_points = ["sparrowd::shutdown::record_failure", "sparrowd::main"]
+entry_points = ["sparrowd::shutdown::record_failure", "sparrowd::shutdown::drain", "sparrowd::main"]
 spec = "docs/interfaces.md: daemon teardown."
-vectors = ["crates/sparrow-server/tests/rpc.rs"]
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/shutdown.rs", "crates/sparrow-server/src/rpc.rs"]
 bench = []
 enforced = true
 [job.forbidden]

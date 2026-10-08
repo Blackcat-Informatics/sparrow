@@ -56,14 +56,27 @@ can request teardown. It does not interrupt an individual native operation or
 certify a shutdown latency bound.
 
 Socket-bind refusal, syslog-start refusal, terminal serving/worker failure and
-graceful shutdown route through one teardown owner. It attempts consume join,
-syslog join, final store flush and owned socket-name cleanup even when an earlier
-step fails. Errors retain their original cause and label each cleanup failure;
+graceful shutdown route through one teardown owner. It attempts both intake joins
+and owned socket-name cleanup even when an earlier step fails; the final store
+flush requires the successful RPC drain described below. Errors retain their
+original cause and label each cleanup failure;
 a later flush or cleanup failure cannot replace the original error. During
 normal serving teardown the RPC LocalSet remains active while intake workers
 join. Endpoint cleanup preserves replacement names under the ownership rules
 above. Failed startup returns a failure after cleanup, allowing a corrected
 configuration to reopen the same store.
+
+After intake workers join, teardown reserves all configured operation slots
+through Tokio's fair admission queue. Fresh storage dispatch cannot overtake
+that reservation; admitted workers retain their slots until they finish, even
+when their caller disappears. Once the reservation completes, admission closes
+and remains reserved through the final store flush and endpoint cleanup.
+Closed storage admission returns retryable `SHUTTING_DOWN`; preserve the same
+immutable intent when reconnecting. While the reservation is pending, ordinary
+capacity refusal remains `RESOURCE_LIMIT`. A failed admission drain is reported
+and withholds the final flush rather than claiming a fence over active workers.
+During intake joins, existing RPC connections remain available for completing
+owned producer work. This establishes ordering, not a worst-case drain deadline.
 
 ### Pressure retirement recovery
 

@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = config.open_store()?;
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
+    let operation_slots = u32::try_from(config.max_concurrent_requests)?;
     let watches = sparrow_server::watches::WatchRegistry::default();
     let mut consumer = Some(sparrow_server::watches::ConsumeWorker::start(
         store.clone(),
@@ -43,7 +44,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = match local_endpoint::LocalEndpoint::bind(&config.socket_path, &store).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
-            return shutdown::finish(Err(error.into()), consumer.take(), None, &store, None).await;
+            return shutdown::finish(
+                Err(error.into()),
+                consumer.take(),
+                None,
+                &store,
+                None,
+                &operations,
+                operation_slots,
+            )
+            .await;
         }
     };
     let connections = Arc::new(Semaphore::new(config.max_rpc_connections));
@@ -67,6 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     &store,
                     Some(&endpoint),
+                    &operations,
+                    operation_slots,
                 )
                 .await;
             }
@@ -74,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut rpc = Rpc::new(
         store.clone(),
-        operations,
+        operations.clone(),
         config.max_artifact_bytes,
         config.max_pin_members,
     )
@@ -157,6 +169,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), Box<dyn std::error::Error>>(())
         }.await;
-        shutdown::finish(serving, consumer.take(), syslog.take(), &store, Some(&endpoint)).await
+        shutdown::finish(serving, consumer.take(), syslog.take(), &store, Some(&endpoint), &operations, operation_slots).await
     }).await
 }

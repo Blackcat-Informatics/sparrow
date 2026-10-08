@@ -243,9 +243,17 @@ impl Rpc {
             .requests
             .clone()
             .try_acquire_owned()
-            .map_err(|_| Error {
-                code: "RESOURCE_LIMIT",
-                message: "RPC operation concurrency is at its configured limit".into(),
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => Error {
+                    code: "RESOURCE_LIMIT",
+                    message: "RPC operation concurrency is at its configured limit".into(),
+                },
+                tokio::sync::TryAcquireError::Closed => Error {
+                    code: "SHUTTING_DOWN",
+                    message:
+                        "RPC storage admission is closed; retry the same intent after reconnecting"
+                            .into(),
+                },
             })?;
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
@@ -759,7 +767,10 @@ pub(crate) fn failure<T: capnp::traits::Owned + 'static>(
     let mut out = output.init_error();
     out.set_code(error.code);
     out.set_message(&error.message);
-    out.set_retryable(matches!(error.code, "STORAGE_PRESSURE" | "RESOURCE_LIMIT"));
+    out.set_retryable(matches!(
+        error.code,
+        "STORAGE_PRESSURE" | "RESOURCE_LIMIT" | "SHUTTING_DOWN"
+    ));
 }
 
 pub(crate) use sparrow_client::{format_label as format, parse_format as stored_format};
@@ -3759,5 +3770,37 @@ mod tests {
             rpc.store.status(now().unwrap()).unwrap()["active_pins"].as_str(),
             Some("2")
         );
+        admission.close();
+        let error = rpc
+            .work(|store, now| {
+                store.ingest(
+                    "closed-intake",
+                    "closed",
+                    "opaque",
+                    b"must not publish",
+                    now,
+                )
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "SHUTTING_DOWN");
+        assert_eq!(
+            rpc.store.status(now().unwrap()).unwrap()["live_records"].as_str(),
+            Some("3")
+        );
+        let mut message = capnp::message::Builder::new_default();
+        failure(
+            message.init_root::<wire::result::Builder<wire::artifact::Owned>>(),
+            error,
+        );
+        let reply = message
+            .get_root_as_reader::<wire::result::Reader<wire::artifact::Owned>>()
+            .unwrap();
+        let wire::result::Error(error) = reply.which().unwrap() else {
+            panic!("closed admission rendered a successful reply");
+        };
+        let error = error.unwrap();
+        assert_eq!(error.get_code().unwrap().to_str().unwrap(), "SHUTTING_DOWN");
+        assert!(error.get_retryable());
     }
 }

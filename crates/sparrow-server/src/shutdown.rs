@@ -4,6 +4,20 @@
 //! Complete owned teardown, preserving the primary failure and every cleanup failure.
 
 use crate::local_endpoint::LocalEndpoint;
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Reserve the complete native admission budget, waiting for every owned worker.
+/// Tokio's fair queue blocks fresh try-acquires while the full reservation waits.
+async fn drain(operations: Arc<Semaphore>, slots: u32) -> Result<OwnedSemaphorePermit, String> {
+    let guard = operations
+        .clone()
+        .acquire_many_owned(slots)
+        .await
+        .map_err(|error| format!("RPC admission drain failed: {error}"))?;
+    operations.close();
+    Ok(guard)
+}
 
 pub(super) async fn finish(
     initial: Result<(), Box<dyn std::error::Error>>,
@@ -11,6 +25,8 @@ pub(super) async fn finish(
     syslog: Option<sparrow_server::syslog_listener::SyslogWorker>,
     store: &sparrow_core::Store,
     endpoint: Option<&LocalEndpoint>,
+    operations: &Arc<Semaphore>,
+    slots: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut errors = Vec::with_capacity(5);
     record_failure(&mut errors, "daemon", initial);
@@ -20,7 +36,15 @@ pub(super) async fn finish(
     if let Some(worker) = syslog {
         record_failure(&mut errors, "syslog shutdown", worker.shutdown().await);
     }
-    record_failure(&mut errors, "store flush", store.flush());
+    // Intake workers may need their owned RPC transport to finish an admitted import.
+    // Once joined, reserve all slots and retain them through the final WAL fence.
+    let drained = drain(operations.clone(), slots).await;
+    if drained.is_ok() {
+        record_failure(&mut errors, "store flush", store.flush());
+    } else if let Err(error) = &drained {
+        errors.push(error.clone());
+        errors.push("store flush withheld because RPC admission could not be drained".into());
+    }
     if let Some(endpoint) = endpoint {
         record_failure(
             &mut errors,
@@ -42,5 +66,99 @@ fn record_failure<T, E: std::fmt::Display>(
 ) {
     if let Err(error) = result {
         errors.push(format!("{phase}: {error}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn final_drain_waits_for_all_workers_and_closes_fresh_admission() {
+        let operations = Arc::new(Semaphore::new(2));
+        let worker = operations.clone().acquire_owned().await.unwrap();
+        let barrier = drain(operations.clone(), 2);
+        tokio::pin!(barrier);
+        tokio::select! {
+            biased;
+            _ = &mut barrier => panic!("drain completed with an admitted worker"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(operations.clone().try_acquire_owned().is_err());
+        drop(worker);
+        let guard = barrier.await.unwrap();
+        assert!(operations.is_closed());
+        assert_eq!(guard.num_permits(), 2);
+        drop(guard);
+        assert!(matches!(
+            operations.try_acquire_owned(),
+            Err(tokio::sync::TryAcquireError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_flush_covers_buffered_worker_after_its_caller_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let config = sparrow_server::ServerConfig::read(&config).unwrap();
+        let store = config.open_store().unwrap();
+        let identity = store.store_id().unwrap();
+        let operations = Arc::new(Semaphore::new(2));
+        let permit = operations.clone().acquire_owned().await.unwrap();
+        let owner = store.clone();
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        let (published, receipt) = tokio::sync::oneshot::channel();
+        let (completed, abandoned) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(abandoned);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            entered.send(()).unwrap();
+            paused.recv().unwrap();
+            let result = owner.ingest_with_durability(
+                "drain-buffered",
+                "drain",
+                "opaque",
+                b"buffered evidence",
+                1000,
+                sparrow_core::Durability::Buffered,
+            );
+            published.send(result).unwrap();
+            assert!(
+                completed.send(()).is_err(),
+                "abandoned caller retained its response"
+            );
+        });
+        running.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        {
+            let teardown = finish(Ok(()), None, None, &store, None, &operations, 2);
+            tokio::pin!(teardown);
+            tokio::select! {
+                biased;
+                _ = &mut teardown => panic!("final flush overtook an admitted worker"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert!(operations.clone().try_acquire_owned().is_err());
+            release.send(()).unwrap();
+            teardown.await.unwrap();
+        }
+        worker.await.unwrap();
+        let artifact = receipt.await.unwrap().unwrap();
+        let status = store.durability_status().unwrap();
+        assert_eq!(status.pending_writes, 0);
+        assert_eq!(status.pending_bytes, 0);
+        assert_eq!(status.accepted_through, status.durable_through);
+        assert!(operations.is_closed());
+        drop(store);
+        let reopened = config.open_store().unwrap();
+        assert_eq!(reopened.store_id().unwrap(), identity);
+        assert_eq!(
+            reopened.bytes(&artifact.id, 0, 17, 1001).unwrap(),
+            b"buffered evidence"
+        );
     }
 }
