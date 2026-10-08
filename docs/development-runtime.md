@@ -4,10 +4,67 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`32b288a`; see [durable receiver history](#durable-receiver-history) for
+`8b56d65`; see [catalogue capture cancellation](#catalogue-capture-cancellation) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Catalogue capture cancellation
+
+Signed source `8b56d65` extends the existing connection/caller cancellation
+owner to source, artifact, pin-list and pin-member captures. They use the same
+native catalogue admission and publication owner as ordinary reads. Checkpoints
+cover metadata scans and final publication; cancelled fresh captures are not
+retained. The generic RPC reply guard distinguishes fresh captures from
+continuations: abandoning a continuation preserves the previously delivered
+snapshot and original cursor. Immutable store identity is validated at open and
+can be read without acquiring the catalogue writer, keeping identity validation
+off the event loop's storage wait path. Admitted mutations retain their delivery
+semantics. No schema, format, runtime dependency or PurRDF pin changed.
+
+The full source gate passed formatting, release Clippy with warnings denied,
+155 storage tests, 59 RPC integration tests, all remaining workspace tests,
+seeded census tests and the pinned cross gate: 242 ledger jobs and zero distinct
+exceptions. Native scenarios cover cancelled fresh and continued metadata reads,
+original cursor replay, cancellation during initial page staging, and unchanged
+records/pins/bytes. One shared RPC unit scenario exercises records, sources,
+artifacts, pin lists and direct members under caller teardown and connection
+closure before and after capture, preserving worker admission until exit.
+An admitted mutation still publishes after caller cancellation. An initial census
+run rejected an ownership entry for a unit-test-only helper; that entry was
+removed because the existing scanner excludes `cfg(test)` modules, while the
+scenario remains a verification vector of the production cancellation owner.
+No detector or gate was bypassed.
+
+All five selected executables were built after the gate and frozen with exact
+source and SHA-256 evidence at
+`~/.local/state/sparrow/receiver-history-images-ix_dl4_q`. Private closed Btrfs
+copies `catalog-cancel-unix-4c8qee54` and `catalog-cancel-tcp-iq_nrzc2` each
+interrupt twelve actual record captures after observing partial anonymous
+staging. Cleanup is observed within the private two-second bound, with zero
+record handles/bytes. All 7,058 records match the full 48-page baseline after
+fresh traversal and reopening; the public service is unchanged during these
+runs. These transport tests qualify the shared record reply/publication path;
+metadata lifetime races are covered by the deterministic native/RPC scenarios,
+not by a claimed metadata transport latency measurement.
+
+Controlled public adoption evidence is `/tmp/sparrow-catalog-cancel-live.bxkly9bs`,
+including frozen/installed hashes, complete source gate output, private drivers,
+closed pre-adoption backup and readback reports. The enabled active unit runs
+PID 1228283 from `sparrowd-schema48-8b56d65`; the stable CLI resolves to
+`sparrow-schema48-8b56d65`. The daemon retains `cap_net_bind_service=ep` and
+the observed `0.0.0.0:518` listener. TCP, Unix, CLI and MCP readback preserve
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37, all 212 records, zero
+pins/read leases and healthy watches. Saved intents retain exact original
+receipts, bytes, clocks and replacement files without new intake or retirement.
+The 21-source inventory, five generation checkpoints, grouped pages, temporal
+and field witnesses, text scores, four JSON keys and twenty values remain exact.
+Syslog listeners remain unconfigured.
+
+Individual native calls, sorts and storage mutex waits are not interruptible;
+their next host checkpoint observes cancellation. Direct Cap'n Proto promise
+cancellation, sustained cancellation resource/latency bounds, reboot acceptance,
+complete governed SPARQL and correlation remain unfinished.
 
 ## Durable receiver history
 
