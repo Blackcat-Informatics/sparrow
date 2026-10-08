@@ -74,7 +74,43 @@ for this finite warm corpus. The capture writer remains serialized; cancellation
 latency, sustained/burst production volume, a deployment quota and native
 reclamation admission remain separate unfinished requirements.
 
-## Build, host and method
+### Four-importer burst
+
+The independent private clone at
+`~/.local/state/sparrow/disk-query-burst-is7zc4sc` uses the same qualified images,
+budgets, six query families and twenty input formats. Ten workers start together:
+six query workers and four durable importers, each assigned five inputs. All
+120 complete traversals retain exact baseline rows/page counts, all twenty
+durable receipts and original bytes survive retry/reopen, and the reopened store
+has 7,198 records with zero pins and result handles/bytes. The public service PID
+remains unchanged. The same explicit-refusal retry policy applies; transport
+disconnects and unexpected failures are not retried into success.
+
+| Query family | p50 seconds | p95 seconds |
+| --- | ---: | ---: |
+| Broad records | 0.175798 | 1.130155 |
+| Source records | 0.114489 | 0.364287 |
+| Temporal records | 0.116889 | 0.797748 |
+| Native text | 0.118715 | 0.278884 |
+| Keys | 0.056072 | 0.271236 |
+| Values | 0.080717 | 0.567337 |
+
+The concurrent phase lasts 8.403313 seconds. The complete run records 2,402 CLI
+attempts, 308 explicit operation-admission refusals, zero staging-journal refusals
+and zero transport disconnects, plus the intentional strict-index refusal.
+Eighty-one 100 ms RSS samples have a maximum of 167,600 KiB. Closed file lengths
+are 23,063,383 bytes and allocated blocks 23,142,400 bytes, including 21,708,080
+SST, 170,895 blob, zero WAL and 1,184,408 control/log bytes. Admission footprint
+is 24,585,668 bytes after load and 23,121,908 after reopen. The same sampled-peak,
+anonymous-staging, native-log and physical-reclamation limits apply.
+
+These independent finite runs establish correctness and explicit backpressure
+under their recorded offered loads. Their timing difference is not evidence of
+four-importer scaling or production-volume acceptance: neither run isolates CPU,
+OS cache, native background work or other host workloads, and each family has
+only twenty observations.
+
+## Original baseline build, host and method
 
 The installed daemon is signed source `008cd78`, SHA-256
 `cd6aca0d425ffb4b57f401bf07538bdaf95517052979548aaf3d482eb834513b`.
