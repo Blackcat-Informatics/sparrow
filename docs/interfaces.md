@@ -530,9 +530,11 @@ Producer stream continuity remains `continuity_unknown=true`; this catalog is
 not a stream generation or gap ledger. Those operations remain unfinished.
 
 Sources share artifact and pin catalog lease/cursor/receipt ownership. A capture
-uses at most 2 MiB, 10,000 source rows, 32 MiB scanned catalog bytes and the
+uses at most 2 MiB, 10,000 source rows, a 32 MiB conservative catalog charge and the
 requested aggregate scan budget (including pins, artifacts, records, mappings
 and watch declarations). Native catalog entries are bounded before decoding.
+The catalog byte charge multiplies encoded bytes by 64 to admit decoded shapes;
+32 MiB is the charged ceiling, not an allowance to scan 32 MiB of raw JSON.
 Pages have a conservative 256 KiB ceiling, at most 15 source rows per page.
 Eight handles and 8 MiB retained source metadata are shared across store clones,
 with absolute 60-second wall/monotonic expiry. Cursors bind selector and limits;

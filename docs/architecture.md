@@ -1,8 +1,10 @@
 # Sparrow architecture
 
 This is the design contract for Sparrow's first implementation. It defines
-required behavior, selected defaults, and qualification work; it does not claim
-that a storage engine or service has been implemented.
+required behavior, selected defaults, and qualification work. Implementation is
+in progress; current executable surfaces and qualified runtime evidence are
+recorded in [Development runtime](development-runtime.md). Full architecture
+acceptance remains unmet.
 
 The external contracts and examples are defined in [Interfaces](interfaces.md).
 

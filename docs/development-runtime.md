@@ -55,7 +55,43 @@ seeded census self-tests and the pinned cross-workspace gate. All 157 ownership
 jobs hold with zero distinct exceptions. Evidence is
 `/tmp/sparrow-artifact-filters-gate-20261007.log`. The normal commit hook verifies
 the final source, including CLI help and removal of the obsolete restricted scope
-schema mode. Live adoption evidence is recorded separately after that gate.
+schema mode. Signed implementation `a97b695` passed that normal full gate.
+
+The owned schema-26 unit exited successfully under SIGINT, with PID zero and
+socket removal, before the same unit/config/store reopened under schema 27 at
+2026-10-08 03:10:27 UTC (observed PID 1285304). The executable remains
+`target/release/sparrowd`, config `config/development.toml`, and private socket
+`/home/paudley/.local/state/sparrow/development-v5/rpc.sock`. Store identity is
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`; all 195 live
+records remain and directory/socket modes are 0700/0600.
+
+Live evidence in `/tmp/sparrow-artifact-filters-live.38pormiv` proves one known
+matching artifact alongside one unknown record, incomplete total/coverage,
+strict refusal with no stdout, exact selected-record strict filtering, source
+intersection before strict evaluation, and equal frozen CLI/MCP page replay.
+`/tmp/sparrow-artifact-scope-live.jpgx7ef0` requalifies pin revision changes,
+release and immutable continuation, overlap deduplication, scoped record counts
+and zero active pins. The shared handle assertion checks its 1..8 ceiling rather
+than assuming no other admitted captures exist.
+
+`/tmp/sparrow-source-wire-live.cnu4qrj0` verifies all 16 source pages and unchanged
+mapping/watch/occurrence counts. `/tmp/sparrow-artifact-filters-regression.x9j1hxb_`
+preserves record, native text and context default/strict coverage, CLI/MCP
+equivalence and exact 104-byte retry/export. Raw regressions in
+`/tmp/sparrow-artifact-filters-raw-regression.yi1admhf` preserve descriptor/handoff
+identities, exact 82/87-byte exports, removed handoff phase and producer replacement.
+
+The current client refuses status, keys, sources and artifacts against the
+private archived schema-26 daemon with `UNSUPPORTED`, exit 1 and zero stdout.
+That owned child exits cleanly and removes its socket. Evidence is
+`/tmp/sparrow-artifact-scope-schema26-compat.4sboem7d`; archive SHA-256 is
+`2aeef354b1a7f5d339e07dac3b59c865722f8937f1eec667b35fa449494e6a86`.
+Commit-hook evidence is `/tmp/sparrow-artifact-filters-commit-20261007.log`.
+
+Broader query pagination, indexed corpus-scale selection, producer stream
+generation/gap operations, full governed SPARQL integration, and physical
+resource/recovery qualification remain required. This is development acceptance
+for artifact scope filtering, not completion of the server architecture.
 
 ## Schema 26 artifact membership
 
