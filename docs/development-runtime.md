@@ -56,8 +56,40 @@ spelling, native escape syntax, byte admission and frozen counts after ingestion
 The new RPC scenario verifies generated capture limits, CLI/MCP agreement,
 path-bound continuations, cursor-only replay and refusals without rows.
 
-Owned daemon qualification remains separate from these source checks; full
-architecture acceptance remains unmet.
+The signed feature commit `8e8399f` passed the complete verification hook. The
+owned development unit reopened this build at `2026-10-08T05:34:33Z`, PID
+2190724, after graceful exit, successful inactive state and socket removal of
+owned PID 2028003. The same private Unix socket, config and persistent store
+remain in use: `store:46c88e949ccec658600b66c7becd5bb7`, format
+`sparrow.store/16`, with 195 live records.
+
+Live evidence in `/tmp/sparrow-key-path-live.ilsf1h4r` compares CLI/MCP message,
+root and level counts, exact absent-path results with scope coverage, frozen
+unrestricted continuation and refusal when its path changes. Invalid syntax and
+oversized paths refuse without rows. Unknown diagnostic membership remains
+incomplete; strict mode refuses INDEX_NOT_READY without stdout. This sample has
+one kind per tested exact path; the release RPC scenario separately proves
+multi-kind exact-path pagination and frozen duplicate counts after later ingestion.
+
+Compatibility evidence in `/tmp/sparrow-artifact-scope-schema33-compat.jnmtd9v7`
+checks nine operations, including path-restricted keys, against the archived
+schema-33 daemon, SHA-256
+`17343965f3853f963dfdcfa32e124794d3158daa4fea0d57f83f8dbb73e7bb75`.
+All refuse UNSUPPORTED with empty stdout; the isolated daemon exits cleanly and
+removes its socket. Context regression evidence in
+`/tmp/sparrow-context-live.0o7hn3j8` checks CLI/MCP agreement, capture limits,
+partial frontiers and strict unknown refusal without creating handles or pins.
+Raw regression evidence in `/tmp/sparrow-artifact-filters-raw-regression.st62umtm`
+compares exact 82-byte descriptor and 87-byte CRLF handoff downloads, stable
+artifact identity, removed handoff phase and preserved producer replacement.
+Query regression evidence in `/tmp/sparrow-result-next-live.nvmdfynb` compares
+all eight leased page shapes through original and CLI/MCP cursor-only
+continuation, including frozen receipts after pin expansion and release.
+After their fixed absolute deadlines, both the key discovery cursor and the
+released-pin query cursor refuse RESULT_EXPIRED without stdout. Final read
+handles across all four registries, active pins and pending writes are zero;
+all 195 records remain. Directory/socket modes are 0700/0600.
+Full architecture acceptance remains unmet.
 
 ## Schema 33 bounded single context capture
 
