@@ -44,7 +44,7 @@ survive reopen and exact retries without refreshing existing record deadlines or
 minting duplicate occurrences. Terminal publication and its final checkpoint
 share the existing record/index WAL batch. Admission alone is not completion.
 
-This source uses storage formats 29..32. Existing 25..28 registries are validated
+That foundation used storage formats 29..32. Existing 25..28 registries are validated
 and preserved during upgrade; missing checkpoints or unfenced completion
 metadata refuse startup. Older executables cannot safely open the new formats.
 The schema-38 deployment used format 28 when this foundation shipped. No source
@@ -100,7 +100,7 @@ operation-budget gate, separately exercised by the tail waiting scenario.
 
 ## Schema 39 daemon adoption and retained completion acceptance
 
-The current `sparrow-development.service` runs PID **136502**, started at
+The original schema-39 adoption ran `sparrow-development.service` PID **136502**, started at
 2026-10-08T10:29:10Z, from the signed functional source **818e020**.
 Its immutable executable is
 `/home/paudley/.local/libexec/sparrow/sparrowd-schema39-818e020`, SHA-256
@@ -3734,6 +3734,46 @@ receipts, and deadlines. It does not reread source files or restore retired
 chunks.
 
 This is the ownership/index foundation for retained-file assembly. A complete
-file reader and completed-tail claim/deletion handoff remain unfinished. The
-running schema-39 deployment described above has not adopted this storage
-change yet.
+file reader and completed-tail claim/deletion handoff remain unfinished. The adoption evidence below records the current deployed build.
+
+
+## Retained-range daemon adoption
+
+The current `sparrow-development.service` runs PID **469821**, started at
+2026-10-08T11:08:06Z, from signed functional source **cf924de**. Its executable
+is `/home/paudley/.local/libexec/sparrow/sparrowd-schema39-cf924de`, SHA-256
+`61075ed429ba5c57094ef5de2c8f5664656cc7060431e910c59ff39c5e4d2b90`,
+with sole capability `cap_net_bind_service=ep`. It listens on **0.0.0.0:518**
+and the existing private Unix socket. Matching installed CLI and events example
+names use `schema39-cf924de`; their hashes match the original schema-39 clients
+above because their source did not change. All three installed hashes were
+compared with the explicit all-bin/example build after the signed hook passed.
+
+Store `store:46c88e949ccec658600b66c7becd5bb7` migrated from format 32 to 36.
+CLI/MCP receipt equality, exact-byte reads, provenance/context, and SDK public
+TCP/TCP/Unix retries passed with **210 records**, six tail checkpoint records,
+one active held generation, and no tail admission failure. No new occurrence
+or source removal was part of this adoption. The closed pre-upgrade snapshot is
+`/tmp/sparrow-tail-range-live.2qmojs6w/store-before-range-upgrade`; restoration
+was not exercised. Live acceptance evidence, hashes, service state, before/after
+status, and request/response captures are in that same directory.
+
+The old unit's default stop signal released its PID and TCP endpoint but left a
+stale Unix socket. After confirming the unit inactive, PID absent, and connection
+refused, that owned socket was removed before the new process started. The new
+unit explicitly uses `KillSignal=SIGINT`, the signal handled by the daemon's
+shutdown path. This remains a transient development unit; permanent deployment
+packaging is unfinished.
+
+The normal signed hook passed release Clippy with warnings denied, 136 storage
+scenarios, 48 RPC scenarios, remaining workspace tests, seeded census self-tests,
+and the pinned cross-workspace gate: **201 jobs, no distinct exceptions**.
+Its first attempt exposed a transport-fixture capacity race: four concurrent
+syslog publishers could occupy all four permits while status was polled. The
+fixture now admits five operations for four publishers plus its observer;
+production admission limits and all packet/counter assertions are unchanged.
+The focused scenario and final full hook passed. Evidence:
+`/tmp/sparrow-tail-range-syslog.log`,
+`/tmp/sparrow-tail-range-commit-final.log`, and
+`/tmp/sparrow-tail-range-bins.log`. Complete retained-file assembly and
+completed-tail claim/deletion handoff still require implementation.
