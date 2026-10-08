@@ -58,6 +58,20 @@ fingerprints = []
 names = ['^(turnover_expire_records|turnover_decode_json|turnover_project_rdf)$']
 
 [[job]]
+id = "typed-load-capture-traversal"
+summary = "One dev-only workload capture traverses and releases all record/text/key/value pages through production CLI renderers and generated cursor operations; no local matcher, renderer or evaluator."
+home = "sparrow_server::example_crate::load::capture"
+entry_points = ["sparrow_server::example_crate::load::main"]
+spec = "docs/load-qualification.md: concurrent typed workload."
+vectors = ["crates/sparrow-server/examples/load.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(load_query_matcher|load_result_renderer)$']
+
+[[job]]
 id = "rpc-connection-default"
 summary = "One daemon configuration default supplies independent finite transport admission for Unix and TCP."
 home = "sparrow_server::config::default_rpc_connections"

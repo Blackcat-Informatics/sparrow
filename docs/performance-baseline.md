@@ -1,5 +1,10 @@
 # Copied-corpus import and query baseline
 
+[Concurrent typed workload](load-qualification.md) supplies a repeatable private
+ingestion/query executable through the production SDK and agent renderers.
+It complements the copied-corpus and offline retention measurements below;
+none establishes full production-rate or density acceptance.
+
 This is measured preliminary qualification, not full performance acceptance.
 The initial 2026-10-08 experiment exposed broad chronological capture and
 caller-controlled retirement limits. Later installed sources address those
