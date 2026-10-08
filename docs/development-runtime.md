@@ -35,7 +35,42 @@ Implementation is in progress in `/home/paudley/Active/sparrow`, on
 The current source implements schema 36; the schema sections
 below retain their historical qualification evidence.
 
-## Schema 36 public TCP and syslog
+## Public TCP logging worker
+
+Signed source `2789516` routes the bounded producer worker through the same
+explicit `Endpoint::Unix` / `Endpoint::Tcp` selection and discovery owner as
+direct clients. `DeliveryConfig::tcp(address, source)` and the tracing example
+now support the public listener. Queues, deadlines, immutable pending batches,
+store binding and durable flush/shutdown use the existing worker; there is no
+parallel logging transport implementation. The normal commit hook passed the
+full release gate, including 42 real-daemon RPC scenarios, cancellation of hung
+Unix/TCP discovery, 182 ledger ownership jobs and zero distinct exceptions.
+The new TCP scenario queues before startup and during an outage, preserves
+pending batch/instance/sequence identities across reopen and verifies exact
+retry receipts through Unix.
+
+The installed SDK artifacts are
+`/home/paudley/.local/libexec/sparrow/sparrow-2789516` (SHA-256
+`a23fad45c9e45767ee3c8987ebcb88dc8640299250a4427513a8f695b7fa1fe2`)
+and `/home/paudley/.local/libexec/sparrow/tracing-2789516` (SHA-256
+`cb3d968b32ee3465c26967f538bb10926ec7eab1aca7e0b963dd353ff9460403`).
+Explicitly build both selected bins and examples before capturing artifacts.
+The managed build publisher visits the entire leased output directory; an
+unselected older CLI was observed in `target/release` after an example-only
+build and correctly refused schema 36. Versioned installed acceptance clients
+avoid later build publication replacing the executable under test.
+
+Live evidence `/tmp/sparrow-public-tracing-live.x9pdflg9` runs the application-
+owned tracing subscriber against `192.168.2.4:518`. Span new/enter, typed log,
+exit and close become five durable records with sequences 1..5, zero observed
+producer gaps and no drops. Original JSONL preserves boolean `ready`, unsigned
+`bytes=64` and unsigned span `attempt=1`; record metadata preserves the producer
+positions. CLI/MCP rows agree. Final status has 203 records, zero pins, no handles
+and no pending writes. The qualified schema-36 daemon below remains PID 2802541;
+this client change requires no daemon lifecycle action. Active-log tailing and
+the other full architecture qualification requirements remain unfinished.
+
+## Schema 36 public TCP and syslog (daemon adoption)
 
 Signed implementation `ff6a7a3` adds the public Cap'n Proto listener requested
 on 2026-10-08. Configuration binds `0.0.0.0:518`, without authentication.
