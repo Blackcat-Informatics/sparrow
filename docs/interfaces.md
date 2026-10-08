@@ -33,6 +33,18 @@ only the original bound socket identity and reports a replacement as a failure.
 Socket-bind refusal joins the already-started consume worker before returning.
 The public TCP bind still happens before opening or migrating the store.
 
+### Daemon teardown
+
+Socket-bind refusal, syslog-start refusal, terminal serving/worker failure and
+graceful shutdown route through one teardown owner. It attempts consume join,
+syslog join, final store flush and owned socket-name cleanup even when an earlier
+step fails. Errors retain their original cause and label each cleanup failure;
+a later flush or cleanup failure cannot replace the original error. During
+normal serving teardown the RPC LocalSet remains active while intake workers
+join. Endpoint cleanup preserves replacement names under the ownership rules
+above. Failed startup returns a failure after cleanup, allowing a corrected
+configuration to reopen the same store.
+
 ### Pressure retirement recovery
 
 Pressure retirement publishes its physical recovery floor and refused-write

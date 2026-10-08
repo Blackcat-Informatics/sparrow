@@ -8,6 +8,7 @@ use std::{path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 
 mod local_endpoint;
+mod shutdown;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("sparrowd: capnp_tcp={}", listener.local_addr()?);
     }
     let store = config.open_store()?;
+    let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let watches = sparrow_server::watches::WatchRegistry::default();
     let mut consumer = Some(sparrow_server::watches::ConsumeWorker::start(
@@ -38,15 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = match local_endpoint::LocalEndpoint::bind(&config.socket_path, &store).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
-            if let Err(shutdown) = consumer
-                .take()
-                .expect("worker started above")
-                .shutdown()
-                .await
-            {
-                return Err(format!("{error}; consume shutdown failed: {shutdown}").into());
-            }
-            return Err(error.into());
+            return shutdown::finish(Err(error.into()), consumer.take(), None, &store, None).await;
         }
     };
     let connections = Arc::new(Semaphore::new(config.max_rpc_connections));
@@ -54,15 +48,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut syslog = if config.syslog.is_empty() {
         None
     } else {
-        Some(
-            sparrow_server::syslog_listener::SyslogWorker::start(
-                store.clone(),
-                &config.syslog,
-                operations.clone(),
-                syslog_registry.clone(),
-            )
-            .await?,
+        match sparrow_server::syslog_listener::SyslogWorker::start(
+            store.clone(),
+            &config.syslog,
+            operations.clone(),
+            syslog_registry.clone(),
         )
+        .await
+        {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                return shutdown::finish(
+                    Err(error.into()),
+                    consumer.take(),
+                    None,
+                    &store,
+                    Some(&endpoint),
+                )
+                .await;
+            }
+        }
     };
     let mut rpc = Rpc::new(
         store.clone(),
@@ -83,14 +88,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client: sparrow::Client = capnp_rpc::new_client(rpc);
     eprintln!(
         "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={}",
-        store.store_id()?,
+        store_id,
         config.socket_path.display(),
         config.data_dir.display(),
         config.max_rpc_connections,
         config.max_concurrent_requests
     );
     let local = tokio::task::LocalSet::new();
-    let serving = local.run_until(async {
+    local.run_until(async {
         let serving = async {
         let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
         let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -147,11 +152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), Box<dyn std::error::Error>>(())
         }.await;
-        if let Some(worker) = consumer.take() { worker.shutdown().await?; }
-        if let Some(worker) = syslog.take() { worker.shutdown().await?; }
-        serving
-    }).await;
-    store.flush()?;
-    endpoint.remove_name()?;
-    serving
+        shutdown::finish(serving, consumer.take(), syslog.take(), &store, Some(&endpoint)).await
+    }).await
 }

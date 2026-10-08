@@ -1153,11 +1153,10 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         // Four independent packet publishers plus the status observer need five permits.
         assert_eq!(text.matches("max_concurrent_requests = 4").count(), 1);
         text = text.replace("max_concurrent_requests = 4", "max_concurrent_requests = 5");
-        for (id, transport, framing) in [("octets", "tcp", Some("octet_counting")), ("datagrams", "udp", None), ("lf", "tcp", Some("lf")), ("crlf", "tcp", Some("cr_lf"))] {
-            text.push_str(&format!("\n[[syslog]]\nid = \"{id}\"\naddress = \"127.0.0.1:0\"\nsource = \"syslog-{id}\"\ntransport = \"{transport}\"\nmax_message_bytes = 480\nmax_connections = 1\nread_timeout_ms = 1000\n"));
-            if let Some(framing) = framing { text.push_str(&format!("framing = \"{framing}\"\n")); }
-        }
         std::fs::write(&config, text).unwrap();
+        for (id, transport, framing) in [("octets", "tcp", Some("octet_counting")), ("datagrams", "udp", None), ("lf", "tcp", Some("lf")), ("crlf", "tcp", Some("cr_lf"))] {
+            append_syslog_config(&config, id, "127.0.0.1:0", &format!("syslog-{id}"), transport, framing);
+        }
         let daemon = start(&config, &socket).await;
         let client = sparrow_client::Client::connect(&socket).await.unwrap();
         let response = client.capability().status_request().send().promise.await.unwrap();
@@ -5335,11 +5334,184 @@ fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, (occupied, guard)) = configure_tcp_listener(&config);
+            drop(guard);
+            let text = std::fs::read_to_string(&config).unwrap();
+            let text = text
+                .lines()
+                .filter(|line| !line.starts_with("rpc_tcp_address ="))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&config, text).unwrap();
+            append_syslog_config(
+                &config,
+                "occupied",
+                &address.to_string(),
+                "syslog-fixture",
+                "tcp",
+                Some("lf"),
+            );
+            let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+                .arg("--config")
+                .arg(&config)
+                .admitted_output()
+                .unwrap();
+            assert!(!result.status.success());
+            let stderr = String::from_utf8(result.stderr).unwrap();
+            assert!(
+                stderr.contains("Address already in use"),
+                "unexpected refusal: {stderr}"
+            );
+            assert!(
+                !stderr.contains("pthread lock"),
+                "unjoined startup worker: {stderr}"
+            );
+            assert!(
+                !socket.exists(),
+                "startup refusal left its owned socket behind"
+            );
+            assert!(std::net::TcpStream::connect(address).is_ok());
+            drop(occupied);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let receipt = client
+                .ingest("startup-retry", "source", wire::Format::Log, b"recovered\n")
+                .await
+                .unwrap();
+            assert_eq!(receipt.record_ids.len(), 1);
+            assert_eq!(
+                cli(&socket, &["status"])["syslog_listeners"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_terminal_worker_failure_preserves_primary_and_replacement_errors() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("input");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 1000, 8, 8);
+            append_syslog_config(
+                &config,
+                "active",
+                "127.0.0.1:0",
+                "syslog-fixture",
+                "tcp",
+                Some("lf"),
+            );
+            let mut daemon = start_with_stderr(&config, &socket, Stdio::piped()).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let receipt = client
+                .ingest(
+                    "terminal-cleanup",
+                    "source",
+                    wire::Format::Log,
+                    b"durable\n",
+                )
+                .await
+                .unwrap();
+            drop(client);
+            let old_socket = data.join("original.sock");
+            std::fs::rename(&socket, &old_socket).unwrap();
+            std::fs::write(&socket, b"preserve replacement").unwrap();
+            let old_root = dir.path().join("original-input");
+            std::fs::rename(&root, &old_root).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = daemon.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "terminal worker shutdown stalled"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(!status.success());
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(&mut daemon.0.stderr.take().unwrap(), &mut stderr)
+                .unwrap();
+            assert!(
+                stderr.contains("root changed"),
+                "primary failure was lost: {stderr}"
+            );
+            assert!(
+                stderr.contains("local endpoint cleanup") && stderr.contains("preserving it"),
+                "cleanup failure was lost: {stderr}"
+            );
+            assert!(!stderr.contains("pthread lock"));
+            assert_eq!(std::fs::read(&socket).unwrap(), b"preserve replacement");
+            std::fs::remove_dir(&root).unwrap();
+            std::fs::rename(&old_root, &root).unwrap();
+            std::fs::remove_file(&socket).unwrap();
+            std::fs::rename(&old_socket, &socket).unwrap();
+            let _reopened = start(&config, &socket).await;
+            assert_eq!(
+                cli(&socket, &["status"])["live_records"].as_str(),
+                Some("1")
+            );
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert_eq!(
+                client
+                    .ingest(
+                        "terminal-cleanup",
+                        "source",
+                        wire::Format::Log,
+                        b"durable\n"
+                    )
+                    .await
+                    .unwrap(),
+                receipt
+            );
+        })
+        .await;
+}
+
+fn append_syslog_config(
+    config: &Path,
+    id: &str,
+    address: &str,
+    source: &str,
+    transport: &str,
+    framing: Option<&str>,
+) {
+    let mut text = std::fs::read_to_string(config).unwrap();
+    text.push_str(&format!("\n[[syslog]]\nid = \"{id}\"\naddress = \"{address}\"\nsource = \"{source}\"\ntransport = \"{transport}\"\nmax_message_bytes = 480\nmax_connections = 1\nread_timeout_ms = 1000\n"));
+    if let Some(framing) = framing {
+        text.push_str(&format!("framing = \"{framing}\"\n"));
+    }
+    std::fs::write(config, text).unwrap();
+}
+
 async fn start(config: &Path, socket: &Path) -> Daemon {
+    start_with_stderr(config, socket, Stdio::inherit()).await
+}
+
+async fn start_with_stderr(config: &Path, socket: &Path, stderr: Stdio) -> Daemon {
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_sparrowd"))
             .arg("--config")
             .arg(config)
+            .stderr(stderr)
             .stdout(Stdio::null())
             .admitted_spawn()
             .unwrap(),

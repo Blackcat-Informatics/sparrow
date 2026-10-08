@@ -3341,3 +3341,45 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(unlink_stale_socket_elsewhere|replace_local_endpoint)$']
+
+[[job]]
+id = "complete-daemon-teardown"
+summary = "One teardown owner joins both intake workers, flushes storage and cleans only the owned endpoint while retaining primary and cleanup failures on startup refusal, terminal failure and graceful shutdown."
+home = "sparrowd::shutdown::finish"
+entry_points = ["sparrowd::shutdown::record_failure"]
+spec = "docs/interfaces.md: daemon teardown."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(teardown_daemon_elsewhere|discard_shutdown_failure)$']
+
+[[job]]
+id = "rpc-syslog-config-fixture"
+summary = "One RPC fixture writes complete bounded syslog listener configuration for transport and teardown tests."
+home = "sparrow_server::test_crate::rpc::append_syslog_config"
+entry_points = []
+spec = "docs/interfaces.md: syslog listeners and daemon teardown."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(append_syslog_config_elsewhere)$']
+
+[[job]]
+id = "rpc-daemon-start-fixture"
+summary = "One admitted daemon startup and bounded readiness loop supports inherited or captured stderr."
+home = "sparrow_server::test_crate::rpc::start_with_stderr"
+entry_points = ["sparrow_server::test_crate::rpc::start"]
+spec = "docs/interfaces.md: daemon teardown."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(start_daemon_elsewhere)$']
