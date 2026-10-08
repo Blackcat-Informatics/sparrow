@@ -204,6 +204,7 @@ impl SyslogWorker {
             .lock()
             .map_err(|_| io::Error::other("syslog registry poisoned"))? = metrics;
         let (stop, receiver) = watch::channel(false);
+        let shutdown = stop.clone();
         let task = tokio::spawn(async move {
             let mut listeners = JoinSet::new();
             for (socket, metrics) in sockets {
@@ -213,12 +214,10 @@ impl SyslogWorker {
                     store.clone(),
                     operations.clone(),
                     receiver.clone(),
+                    shutdown.clone(),
                 ));
             }
-            while let Some(result) = listeners.join_next().await {
-                result.map_err(io::Error::other)??;
-            }
-            Ok(())
+            finish_tasks(Ok(()), &mut listeners, &shutdown).await
         });
         Ok(Self { stop, task })
     }
@@ -230,6 +229,30 @@ impl SyslogWorker {
     pub async fn shutdown(self) -> io::Result<()> {
         self.stop.send_replace(true);
         self.task.await.map_err(io::Error::other)?
+    }
+}
+
+/// Stop the entire intake group on failure, but join every admitted child first.
+async fn finish_tasks(
+    initial: io::Result<()>,
+    tasks: &mut JoinSet<io::Result<()>>,
+    stop: &watch::Sender<bool>,
+) -> io::Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = initial {
+        stop.send_replace(true);
+        failures.push(error.to_string());
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result.map_err(io::Error::other).and_then(|value| value) {
+            stop.send_replace(true);
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(failures.join("; ")))
     }
 }
 
@@ -285,13 +308,16 @@ async fn listen(
     store: sparrow_core::Store,
     operations: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
+    shutdown: watch::Sender<bool>,
 ) -> io::Result<()> {
     let definition = metrics.snapshot()?.definition;
     match socket {
         Socket::Tcp(listener) => {
             let connections = Arc::new(Semaphore::new(definition.max_connections));
             let mut tasks = JoinSet::new();
+            let serving = async {
             loop {
+                if *stop.borrow() { break; }
                 tokio::select! {
                     changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } },
                     result = tasks.join_next(), if !tasks.is_empty() => { if let Some(result) = result { result.map_err(io::Error::other)??; } },
@@ -309,15 +335,17 @@ async fn listen(
                     }
                 }
             }
-            drop(listener);
-            while let Some(result) = tasks.join_next().await {
-                result.map_err(io::Error::other)??;
-            }
             Ok(())
+            }.await;
+            drop(listener);
+            finish_tasks(serving, &mut tasks, &shutdown).await
         }
         Socket::Udp(socket) => {
             let mut buffer = vec![0; definition.max_message_bytes + 1];
             loop {
+                if *stop.borrow() {
+                    break;
+                }
                 let size = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } continue; }, received = socket.recv_from(&mut buffer) => received?.0 };
                 if size > definition.max_message_bytes {
                     metrics.update(|status| increment(&mut status.counts.truncated))?;
@@ -353,6 +381,9 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
         .framing
         .ok_or_else(|| io::Error::other("TCP syslog framing missing"))?;
     loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
         let result = tokio::select! {
             changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { return Ok(()); } continue; },
             frame = tokio::time::timeout(Duration::from_millis(u64::from(definition.read_timeout_ms)), read_frame(&mut stream, framing, definition.max_message_bytes)) => frame,
@@ -482,6 +513,64 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_intake_joins_blocking_publication_and_retains_all_child_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("publication");
+        let published = path.clone();
+        let (stop, mut stopped) = watch::channel(false);
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                paused.recv().unwrap();
+                std::fs::write(&published, b"admitted publication")?;
+                std::fs::File::open(&published)?.sync_all()?;
+                Ok::<_, io::Error>(())
+            })
+            .await
+            .map_err(io::Error::other)??;
+            Err(io::Error::other("publication completion failure"))
+        });
+        running.await.unwrap();
+        tasks.spawn(async { Err(io::Error::other("listener failure")) });
+        tasks.spawn(async { panic!("intake task panic") });
+        let mut idle = stopped.clone();
+        tasks.spawn(async move {
+            idle.changed().await.map_err(io::Error::other)?;
+            assert!(*idle.borrow());
+            Ok(())
+        });
+        let supervisor = tokio::spawn(async move { finish_tasks(Ok(()), &mut tasks, &stop).await });
+        tokio::time::timeout(Duration::from_secs(5), stopped.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*stopped.borrow());
+        assert!(
+            !supervisor.is_finished(),
+            "admitted publication was not joined"
+        );
+        assert!(!path.exists());
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        for cause in [
+            "listener failure",
+            "intake task panic",
+            "publication completion failure",
+        ] {
+            assert!(error.contains(cause), "lost {cause}: {error}");
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"admitted publication");
+    }
 
     #[tokio::test]
     async fn configured_frames_preserve_octets_delimiters_and_reject_partial_or_oversized_messages()

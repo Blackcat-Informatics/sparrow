@@ -889,6 +889,13 @@ TCP sends therefore do not prove publication; UDP kernel/network loss remains
 unknown. Identical newly received packets are independent occurrences sharing
 payload storage. Sources include configured listeners before their first packet.
 
+Listener and TCP connection task failures stop admission for the entire syslog
+group. Both levels join every admitted child, including blocking publications,
+before reporting termination to the daemon's final store flush. Returned task
+errors and task panics remain visible together; one failure cannot abort sibling
+publications or replace another error. Receivers also observe an already-published
+stop state before admitting more work.
+
 The daemon contract is `crates/sparrow-client/schema/sparrow.capnp`. Generated
 client/server types carry requests, binary payloads, instants, counts,
 result/error unions and store-scoped references. Mutation requests carry stable

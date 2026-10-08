@@ -1233,6 +1233,132 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_packet() {
+    use tokio::io::AsyncWriteExt;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            for id in ["failing", "idle"] {
+                append_syslog_config(&config, id, "127.0.0.1:0", id, "tcp", Some("lf"));
+            }
+            let mut config = sparrow_server::ServerConfig::read(&config).unwrap();
+            // Outlast the failure deadline: ordinary frame timeout cannot stop the sibling.
+            for listener in &mut config.syslog {
+                listener.read_timeout_ms = 60000;
+            }
+            let store = config.open_store().unwrap();
+            let operations = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let registry = sparrow_server::syslog_listener::SyslogRegistry::default();
+            let worker = sparrow_server::syslog_listener::SyslogWorker::start(
+                store.clone(),
+                &config.syslog,
+                operations.clone(),
+                registry.clone(),
+            )
+            .await
+            .unwrap();
+            // Keep the typed observer available while deliberately failing intake admission.
+            let observer: wire::sparrow::Client = capnp_rpc::new_client(
+                sparrow_server::Rpc::new(
+                    store.clone(),
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                    1024 * 1024,
+                    100,
+                )
+                .with_syslog(registry),
+            );
+            let response = observer.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let addresses: Vec<std::net::SocketAddr> = status
+                .get_syslog_listeners()
+                .unwrap()
+                .iter()
+                .map(|listener| {
+                    listener
+                        .get_address()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            let mut writer = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+            let packet = b"<13>1 - host app - - - durable before failure";
+            writer.write_all(packet).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            let mut idle = tokio::net::TcpStream::connect(addresses[1]).await.unwrap();
+            idle.write_all(b"partial frame").await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let response = observer.status_request().send().promise.await.unwrap();
+                let listeners = rpc_ok(response.get().unwrap().get_result().unwrap())
+                    .get_syslog_listeners()
+                    .unwrap();
+                if listeners.get(0).get_accepted_messages() == 1
+                    && listeners.get(1).get_active_connections() == 1
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "syslog fixture did not admit both peers"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            operations.close();
+            writer
+                .write_all(b"<13>1 - host app - - - refused\n")
+                .await
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "failed listener group did not stop"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let error = worker.shutdown().await.unwrap_err().to_string();
+            assert!(
+                error.contains("semaphore closed"),
+                "primary failure lost: {error}"
+            );
+            let response = observer.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            assert_eq!(status.get_live_records(), 1);
+            for listener in status.get_syslog_listeners().unwrap().iter() {
+                assert_eq!(
+                    listener.get_active_connections(),
+                    0,
+                    "sibling connection was aborted instead of joined"
+                );
+            }
+            drop(response);
+            drop(observer);
+            drop(writer);
+            drop(idle);
+            store.flush().unwrap();
+            drop(store);
+            let reopened = config.open_store().unwrap();
+            let now = sparrow_server::now().unwrap();
+            let records = reopened.records(now).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].source, "failing");
+            assert_eq!(
+                reopened
+                    .bytes(&records[0].artifact_id, 0, packet.len(), now)
+                    .unwrap(),
+                packet
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_storage_work() {
     tokio::task::LocalSet::new()
         .run_until(async {

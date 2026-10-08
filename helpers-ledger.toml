@@ -3383,3 +3383,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(start_daemon_elsewhere)$']
+
+[[job]]
+id = "syslog-child-task-teardown"
+summary = "Listener and TCP child groups stop global intake on failure and join every admitted task, retaining returned and panic errors before the daemon WAL fence."
+home = "sparrow_server::syslog_listener::finish_tasks"
+entry_points = ["sparrow_server::syslog_listener::SyslogWorker::start", "sparrow_server::syslog_listener::listen"]
+spec = "docs/interfaces.md: syslog listener task failures."
+vectors = ["crates/sparrow-server/src/syslog_listener.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(abort_syslog_publications|join_syslog_children_elsewhere)$']
