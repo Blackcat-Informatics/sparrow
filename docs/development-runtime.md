@@ -4525,3 +4525,15 @@ zero. The separate
 [concurrent repeat](performance-baseline.md#independent-connection-budget-repeat)
 records zero transport disconnects, explicit storage concurrency refusals and
 successful bounded stable retries. Full architecture acceptance remains unmet.
+
+## Offline 30-day turnover qualification
+
+Signed qualifier `c5e776c` completes 60 simulated daily cohorts on three new
+Btrfs stores, covering no pins, a sparse record pin, and dense artifact pins.
+[The report](turnover-qualification.md#qualified-run) binds source, installed
+image, frozen inputs, independent count/native RDF comparisons, reopen boundaries,
+release/refused resurrection, logical cleanup, RSS and measured physical lag.
+This adds offline operational evidence; the enabled public server remains
+source `608327f` at PID 2551939, schema 43 and format 37, without a restart or
+production intake change. Full performance acceptance and forced physical
+reclamation remain unfinished.

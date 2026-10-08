@@ -385,3 +385,10 @@ is a fresh clone baseline rather than the original immutable artifact size.
 This small warm workload does not establish sustained turnover, sparse/dense pin
 capacity, full-corpus distributions, forced physical recovery or complete
 performance acceptance.
+
+The separate [offline turnover qualification](turnover-qualification.md#qualified-run)
+now verifies 60 simulated daily cohorts on three new disk stores with no pins,
+one sparse record pin, and dense protection of every accepted artifact. It records
+exact bytes, native RDF stability, bounded expiry/reopen, high-entropy input,
+logical cleanup and physical lag. It does not establish forced reclamation or
+production-volume performance acceptance.
