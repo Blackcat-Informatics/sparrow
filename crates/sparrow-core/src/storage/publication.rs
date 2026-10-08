@@ -32,6 +32,8 @@ pub struct ImportPreparation {
     pub expires_at: u64,
     /// Immutable source-time profile captured before native preparation.
     pub source_time_profile: Option<String>,
+    /// Immutable diagnostic interpretation captured before any record preparation.
+    pub diagnostic_profile: Option<String>,
     /// Bounded raw chunk preparation of the current oversized record, if any.
     pub raw: Option<RawPreparation>,
     reclaimed_records: u64,
@@ -47,6 +49,7 @@ impl Catalog for ImportPreparation {
             .with("received_at", self.received_at.to_string())
             .with("expires_at", self.expires_at.to_string())
             .with("source_time_profile", self.source_time_profile.clone())
+            .with("diagnostic_profile", self.diagnostic_profile.clone())
             .with(
                 "raw",
                 self.raw
@@ -66,6 +69,11 @@ impl Catalog for ImportPreparation {
             received_at: integer(value, "received_at")?,
             expires_at: integer(value, "expires_at")?,
             source_time_profile: read_field(value, "source_time_profile")?,
+            diagnostic_profile: value
+                .get("diagnostic_profile")
+                .map(purrdf_lex::json::record::FromJson::from_json)
+                .transpose()?
+                .unwrap_or(None),
             raw: match value.get("raw") {
                 None | Some(Value::Null) => None,
                 Some(value) => Some(RawPreparation::decode(value)?),
@@ -93,6 +101,26 @@ impl Catalog for ImportPreparation {
 }
 
 impl ImportPreparation {
+    fn captured_diagnostic_profile(
+        &self,
+        writer: &Writer,
+        source: &str,
+    ) -> Result<Option<super::diagnostic::DiagnosticProfile>, Error> {
+        match &self.diagnostic_profile {
+            None => Ok(None),
+            Some(id) => writer
+                .diagnostic_profile(source)?
+                .filter(|profile| profile.id == *id)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::new(
+                        "STORAGE_FAILURE",
+                        "captured diagnostic profile is missing or changed",
+                    )
+                }),
+        }
+    }
+
     fn captured_profile(
         &self,
         writer: &Writer,
@@ -259,6 +287,9 @@ impl Store {
                     source_time_profile: writer
                         .time_profile(&manifest.source)?
                         .map(|profile| profile.id),
+                    diagnostic_profile: writer
+                        .diagnostic_profile(&manifest.source)?
+                        .map(|profile| profile.id),
                     raw: None,
                     reclaimed_records: 0,
                 };
@@ -308,6 +339,7 @@ impl Store {
             ));
         }
         let profile = progress.captured_profile(&writer, &manifest.source)?;
+        let diagnostic_profile = progress.captured_diagnostic_profile(&writer, &manifest.source)?;
         let mut builder = ingest::RecordBatch::new(&writer)?;
         let record = builder.record(ingest::RecordInput {
             id: random_id("record")?,
@@ -319,6 +351,7 @@ impl Store {
             received_at: progress.received_at,
             expires_at: progress.expires_at,
             source_time_profile: &profile,
+            diagnostic_profile: diagnostic_profile.as_ref(),
         })?;
         let ingest::PreparedRecords { mut batch, .. } = builder.finish()?;
         put(&mut batch, &record_key(id, expected_index), &record);

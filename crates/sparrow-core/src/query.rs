@@ -11,7 +11,9 @@ pub struct QueryScope {
     /// Restrict to this exact logical source label.
     pub source: Option<String>,
     /// Exact logical source IDs, combined with OR and intersected with `source`.
-    pub sources: Option<SourceFilter>,
+    pub sources: Option<QueryAlternatives>,
+    /// AND across explicit diagnostic dimensions, OR within each admitted array.
+    pub diagnostics: std::collections::BTreeMap<crate::DiagnosticDimension, QueryAlternatives>,
     /// Inclusive server acceptance time, in Unix milliseconds.
     pub received_from: u64,
     /// Exclusive server acceptance time, in Unix milliseconds.
@@ -39,21 +41,21 @@ pub enum QuerySelection {
     },
 }
 
-/// Admitted exact source-ID alternatives; vocabulary ownership stays with Sparrow.
+/// Admitted exact filter alternatives; vocabulary ownership stays with Sparrow.
 #[derive(Clone, Debug)]
-pub struct SourceFilter {
+pub struct QueryAlternatives {
     ids: Vec<String>,
 }
 
-impl SourceFilter {
-    /// Admit 1..128 source IDs, each using the ingestion bound of 1..512 bytes.
+impl QueryAlternatives {
+    /// Admit 1..128 alternatives, each using the interpretation bound of 1..512 bytes.
     /// Duplicates are harmless alternatives and never duplicate result occurrences.
     pub fn new(ids: Vec<String>) -> Result<Self, crate::Error> {
         if ids.is_empty() || ids.len() > 128 || ids.iter().any(|id| id.is_empty() || id.len() > 512)
         {
             return Err(crate::Error::new(
                 "INVALID_ARGUMENT",
-                "source_ids requires 1..128 nonempty source IDs of at most 512 bytes each",
+                "filter alternatives require 1..128 nonempty strings of at most 512 bytes each",
             ));
         }
         Ok(Self { ids })

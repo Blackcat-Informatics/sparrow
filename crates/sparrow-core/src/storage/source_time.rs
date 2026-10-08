@@ -54,20 +54,11 @@ impl SourceTimeProfile {
         if source.is_empty()
             || source.len() > 512
             || path.len() > 4096
-            || (!path.is_empty() && !path.starts_with('/'))
+            || purrdf_lex::json_pointer::tokens(path).is_none()
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "require source 1..512 bytes and a concrete JSON pointer of at most 4096 bytes",
-            ));
-        }
-        if path
-            .split('/')
-            .any(|token| purrdf_lex::json_pointer::unescape_token(token).is_none())
-        {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "invalid native JSON pointer escape",
             ));
         }
         let mut bytes = Vec::new();
@@ -270,7 +261,40 @@ fn source_key(source: &str) -> String {
 }
 
 impl Writer {
+    pub(super) fn admit_source_profile(
+        &self,
+        prefix: &str,
+        encoded: &[u8],
+        validate: impl Fn(&[u8], &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        for (count, entry) in self.db.prefix_iterator(prefix).enumerate() {
+            let (key, bytes) = entry?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            validate(&key, &bytes)?;
+            if count == 1023 {
+                return Err(Error::new(
+                    "RESOURCE_LIMIT",
+                    "source profile registry admits at most 1024 immutable mappings",
+                ));
+            }
+        }
+        if self
+            .physical_bytes()?
+            .saturating_add(encoded.len() as u64 * 4 + 65536)
+            > self.config.disk_budget
+        {
+            return Err(Error::new(
+                "STORAGE_PRESSURE",
+                "source profile exceeds physical control admission budget",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_event_record(&self, record: &Record) -> Result<(), Error> {
+        self.validate_diagnostic_record(record)?;
         let profile_id = match &record.event_time {
             EventTime::Known { profile_id, .. } => Some(profile_id),
             EventTime::Unknown { profile_id, .. } => profile_id.as_ref(),
@@ -323,37 +347,18 @@ impl Store {
             }
             return Ok(previous);
         }
-        for (count, entry) in writer.db.prefix_iterator("source-time:").enumerate() {
-            let (key, bytes) = entry?;
-            if !key.starts_with(b"source-time:") {
-                break;
-            }
-            if count == 1023 {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "source time registry admits at most 1024 immutable mappings",
-                ));
-            }
-            let retained = SourceTimeProfile::decode(&parse(&bytes)?)?;
-            if key.as_ref() != source_key(&retained.source).as_bytes() {
+        let mut batch = WriteBatch::default();
+        let encoded = json::write_compact(&profile.encode());
+        writer.admit_source_profile("source-time:", encoded.as_bytes(), |key, bytes| {
+            let retained = SourceTimeProfile::decode(&parse(bytes)?)?;
+            if key != source_key(&retained.source).as_bytes() {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
                     "source time registry key mismatch",
                 ));
             }
-        }
-        let mut batch = WriteBatch::default();
-        let encoded = json::write_compact(&profile.encode());
-        if writer
-            .physical_bytes()?
-            .saturating_add(encoded.len() as u64 * 4 + 65536)
-            > writer.config.disk_budget
-        {
-            return Err(Error::new(
-                "STORAGE_PRESSURE",
-                "source time mapping exceeds physical control admission budget",
-            ));
-        }
+            Ok(())
+        })?;
         batch.put(source_key(source), encoded);
         writer.commit(batch)?;
         Ok(profile)
@@ -395,17 +400,14 @@ pub(super) fn capture(
     let values = field(facts, "values")?
         .as_array()
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "native time projection values missing"))?;
-    let mut selected = None;
-    for value in values {
-        if read_field::<String>(value, "path")? == profile.path {
-            if selected.is_some() {
-                return Ok(EventTime::unknown("ambiguous_field", Some(profile)));
-            }
-            selected = Some(value);
+    let value = match super::diagnostic::mapped_occurrence(values, &profile.path)? {
+        super::diagnostic::MappedOccurrence::Missing => {
+            return Ok(EventTime::unknown("missing_field", Some(profile)));
         }
-    }
-    let Some(value) = selected else {
-        return Ok(EventTime::unknown("missing_field", Some(profile)));
+        super::diagnostic::MappedOccurrence::Ambiguous => {
+            return Ok(EventTime::unknown("ambiguous_field", Some(profile)));
+        }
+        super::diagnostic::MappedOccurrence::Value(value) => value,
     };
     let kind = read_field::<String>(value, "kind")?;
     if kind

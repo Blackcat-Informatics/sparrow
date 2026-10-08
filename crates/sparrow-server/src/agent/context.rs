@@ -68,6 +68,10 @@ pub(super) fn render_record(value: wire::record::Reader<'_>) -> Result<Value> {
         .with("byte_start", value.get_byte_start().to_string())
         .with("byte_end", value.get_byte_end().to_string())
         .with(
+            "diagnostics",
+            crate::diagnostics::render_snapshot(value.get_diagnostics()?)?,
+        )
+        .with(
             "event_time",
             super::source_time::event(value.get_event_time()?)?,
         )

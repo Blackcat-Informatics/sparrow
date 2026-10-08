@@ -59,6 +59,20 @@ impl Operation {
                     session_id: fields.required("session_id")?,
                     sequence: fields.required_with("sequence", super::decimal_u64)?,
                 })),
+                "diagnostic_define" | "diagnostic_get" => {
+                    Self::Query(Command::Diagnostic(super::diagnostic::Input {
+                        source: fields.required("source")?,
+                        mappings: if name == "diagnostic_define" {
+                            Some(super::diagnostic::decode_mappings(
+                                fields
+                                    .raw("mappings")?
+                                    .ok_or_else(|| DecodeError::custom("mappings is required"))?,
+                            )?)
+                        } else {
+                            None
+                        },
+                    }))
+                }
                 "source_time_define" | "source_time_get" => {
                     let definition = if name == "source_time_define" {
                         let representation: String = fields.required("representation")?;
@@ -82,11 +96,13 @@ impl Operation {
                 "keys_list" | "values_search" | "text_search" | "records_context"
                 | "records_search" => {
                     let mut options = Options {
-                        selection: fields
-                            .raw("scope")?
-                            .map(super::selection::decode)
-                            .transpose()?
-                            .unwrap_or_default(),
+                        selection: Box::new(
+                            fields
+                                .raw("scope")?
+                                .map(super::selection::decode)
+                                .transpose()?
+                                .unwrap_or_default(),
+                        ),
                         source: fields.optional("source")?,
                         ..Options::default()
                     };

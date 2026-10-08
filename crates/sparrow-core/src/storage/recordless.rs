@@ -30,20 +30,35 @@ pub(super) fn publish(batch: &mut WriteBatch, artifact: &Artifact) -> Result<(),
     Ok(())
 }
 
-/// Preserve the pre-existing consumption/watch/handoff writer fence on upgrade.
-pub(super) fn legacy_target(format: &[u8]) -> Option<&'static [u8]> {
-    match format {
-        b"sparrow.store/5" => Some(super::FORMAT),
-        b"sparrow.store/6" => Some(super::consumption::FORMAT),
-        b"sparrow.store/7" => Some(super::watch_registry::FORMAT),
-        b"sparrow.store/8" => Some(super::handoff::FORMAT),
-        _ => None,
-    }
+/// Shared legacy format identity and required index backfill.
+pub(super) struct LegacyFormat {
+    pub target: &'static [u8],
+    pub needs_recordless_index: bool,
+}
+
+/// Preserve consumption/watch/handoff authority through every admitted upgrade.
+pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
+    let target = match format {
+        b"sparrow.store/5" | b"sparrow.store/9" => super::FORMAT,
+        b"sparrow.store/6" | b"sparrow.store/10" => super::consumption::FORMAT,
+        b"sparrow.store/7" | b"sparrow.store/11" => super::watch_registry::FORMAT,
+        b"sparrow.store/8" | b"sparrow.store/12" => super::handoff::FORMAT,
+        _ => return None,
+    };
+    Some(LegacyFormat {
+        target,
+        needs_recordless_index: matches!(
+            format,
+            b"sparrow.store/5" | b"sparrow.store/6" | b"sparrow.store/7" | b"sparrow.store/8"
+        ),
+    })
 }
 
 pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
-    matches!(format, b"sparrow.store/7" | b"sparrow.store/8")
-        || format == super::watch_registry::FORMAT
+    matches!(
+        format,
+        b"sparrow.store/7" | b"sparrow.store/8" | b"sparrow.store/11" | b"sparrow.store/12"
+    ) || format == super::watch_registry::FORMAT
         || format == super::handoff::FORMAT
 }
 
@@ -112,7 +127,7 @@ fn fence(db: &DB) -> Result<(), Error> {
             "store format missing during recordless index upgrade",
         )
     })?;
-    if let Some(target) = legacy_target(&format) {
+    if let Some(legacy) = legacy_format(&format).filter(|legacy| legacy.needs_recordless_index) {
         let present = match db.prefix_iterator(PREFIX).next() {
             Some(row) => row?.0.starts_with(PREFIX),
             None => false,
@@ -124,7 +139,7 @@ fn fence(db: &DB) -> Result<(), Error> {
             ));
         }
         let mut batch = WriteBatch::default();
-        batch.put("store_format", target);
+        batch.put("store_format", legacy.target);
         super::put(&mut batch, UPGRADE, &Progress::default());
         commit(db, batch)?;
     }

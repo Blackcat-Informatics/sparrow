@@ -7,6 +7,14 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "diagnostic_define",
+        "Durably bind immutable explicit JSON pointer mappings for service, host, severity and trace/span IDs; existing records are never reinterpreted.",
+    ),
+    (
+        "diagnostic_get",
+        "Read an immutable diagnostic source mapping or explicit absence.",
+    ),
+    (
         "flush",
         "Synchronize through a specified current-session acceptance fence; earlier sessions and future sequences are refused.",
     ),
@@ -136,6 +144,25 @@ pub(crate) fn definitions() -> Value {
                     field,
                     Object::new().with("type", Value::array(["string", "null"])),
                 );
+            }
+        }
+        if ["diagnostic_define", "diagnostic_get"].contains(name) {
+            properties = properties.with("source", string());
+            required.push("source");
+            if *name == "diagnostic_define" {
+                let mut mapping = Object::new();
+                for field in ["service", "host", "severity", "trace_id", "span_id"] {
+                    mapping = mapping.with(field, string());
+                }
+                properties = properties.with(
+                    "mappings",
+                    Object::new()
+                        .with("type", "object")
+                        .with("additionalProperties", false)
+                        .with("minProperties", 1_u64)
+                        .with("properties", mapping),
+                );
+                required.push("mappings");
             }
         }
         if ["source_time_define", "source_time_get"].contains(name) {
@@ -339,6 +366,7 @@ pub(crate) fn definitions() -> Value {
                             "pin_release",
                             "pin_renew",
                             "source_time_define",
+                            "diagnostic_define",
                             "flush",
                         ]
                         .contains(name),

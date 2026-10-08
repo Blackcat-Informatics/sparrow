@@ -169,8 +169,56 @@ UTF-8 bytes. An absent filter admits all sources; an empty array, empty ID or
 unsupported dimension fails with `INVALID_ARGUMENT`. Alternatives combine with
 OR, and intersect the outer exact `source`, receipt interval and resolved
 membership. Duplicate alternatives never duplicate records or counts. Context
-remains source-local and refuses an anchor excluded by the filter. Diagnostic
-service/host/severity/trace/span dimensions remain planned.
+remains source-local and refuses an anchor excluded by the filter.
+
+Schema 21 also supports `service`, `host`, `severity`, `trace_id` and `span_id`
+arrays in the same closed filter object. Each dimension uses the same alternative
+bounds, OR within an array and AND across dimensions. Before ingesting that
+source, define explicit native JSON pointer mappings with `diagnostic_define`,
+or `sparrow SOCKET diagnostic-define SOURCE MAPPINGS.json`. The mapping object
+is a nonempty subset of those five names, with one concrete RFC 6901 pointer per
+dimension. `diagnostic_get` and `diagnostic-get SOURCE` expose the immutable
+profile. Identical definitions are idempotent; conflicts require a new source ID.
+There are at most 1,024 immutable diagnostic profiles, independently of time
+profiles, and definitions obey the shared physical control-admission gate.
+
+The declared interpretation is exact native decoded string equality. It makes
+no severity case, integer, host or trace-ID guesses. Known values are nonempty
+strings of at most 512 UTF-8 bytes. Their profile, native occurrence and original
+string-body byte span are captured atomically with record publication. Duplicate
+mapped occurrences remain ambiguous even when their strings are equal. Missing
+fields, wrong kinds, decode failures, oversized/empty values, non-JSON inputs and
+failed projections retain explicit unknown reasons. Raw bytes and ordered JSON
+projections remain unchanged. Profile creation never reinterprets existing
+records, and staged preparation captures profile presence or absence once before
+any record; later definitions cannot split an import's interpretation.
+
+All five query surfaces filter captured evidence before qualification/ranking;
+context applies the same predicate to anchor and same-source neighbors. A mapped
+filter encountering an unknown or unprofiled selected record refuses the whole
+read with `INDEX_NOT_READY`, without successful rows. This conservative exact
+mode does not implement the planned partial diagnostic-scope coverage/counts-
+unknown response; callers can narrow source, membership and receipt time.
+Membership references are still validated before filtering.
+
+`Record.diagnostics` and chronological or ranked combined-query rows use a typed snapshot
+with a profile reference and per-dimension known/unknown union. The generated
+`diagnosticDefine`/`diagnosticGet` methods use typed mapping lists. Each captured
+profile produces an occurrence-owned diagnostic RDF graph, separately named
+from metadata and shared content; it includes interpreted values or reasons,
+profile references, native occurrences and byte evidence. RDF inspection exposes
+the graph and exact persisted primary-row count. Pin retention, expiry, eviction
+and canceled private preparation use the existing graph retirement owner.
+Scoped native views include it without resident-corpus replay. Full graph-layer
+selection and correlation/explanation queries remain unfinished.
+
+Storage formats 13/14/15/16 fence older writers for the basic, consumption,
+watch-registry and handoff states. Existing 9/10/11/12 stores durably advance to
+the corresponding state before serving, retaining their completed recordless
+index and store identity. Earlier recordless upgrades also preserve their
+consumption/watch/handoff authority. Absent historical diagnostic fields remain
+unprofiled. The current adapters require schema 21 discovery for mapped operations
+and filtered reads.
 
 The generated contract uses `Scope.sourceIds :OptionalSourceIds`, with distinct
 absent and present-list states. CLI scope files and MCP use the same native JSON

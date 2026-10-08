@@ -26,6 +26,14 @@ pub(super) async fn inspect(
         .with("membership_at", instant(found.get_membership_at()?)?)
         .with("metadata_graph", found.get_metadata_graph()?.to_str()?)
         .with(
+            "diagnostic_graph",
+            optional_value(found.get_diagnostic_graph()?)?,
+        )
+        .with(
+            "diagnostic_primary_rows",
+            found.get_diagnostic_primary_rows().to_string(),
+        )
+        .with(
             "metadata_primary_rows",
             found.get_metadata_primary_rows().to_string(),
         )

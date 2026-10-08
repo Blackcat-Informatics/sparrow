@@ -5,6 +5,7 @@
 
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
 mod config;
+mod diagnostics;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;

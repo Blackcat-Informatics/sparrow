@@ -32,8 +32,61 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 20; the schema sections
+The current source implements schema 21; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 21 diagnostic mappings and filters
+
+Immutable source profiles map service, host, severity and trace/span dimensions
+to concrete native JSON pointers. One capture owner uses PurRDF's retained ordered
+occurrences and decoded strings; timestamp interpretation shares its unique
+mapped-occurrence selector. Native pointer parsing and RDF construction remain
+PurRDF functions. No field name, severity case or trace syntax is inferred.
+The direct and staged publication paths share the same record preparation owner.
+Staged checkpoints bind profile presence or absence before the first record and
+retain that decision through reopen and later source definitions.
+
+Known dimensions retain decoded value, native occurrence, immutable profile and
+original string-body span. Unknown dimensions retain explicit reasons; duplicate
+fields stay ambiguous even if equal. Diagnostic graphs use independent per-record
+owners and the existing dictionary/index, scoped view and retirement paths.
+Inspection reports their persisted primary rows separately from metadata/content.
+
+All query surfaces AND diagnostic dimensions with source/time/membership and OR
+their bounded alternatives. Unknown filtered evidence causes `INDEX_NOT_READY`
+with no successful prefix; partial diagnostic-scope coverage/counts-unknown
+responses remain unfinished. CLI and MCP share mapping/filter codecs and typed
+operations. Schema discovery refuses older endpoints. Source and diagnostic
+alternatives now share the concrete `QueryAlternatives` admission owner.
+
+The storage fence advances basic/consumption/watch/handoff formats to 13/14/15/16.
+Legacy 9/10/11/12 retain their completed recordless index and store identity while
+durably advancing before serving. Historical absent diagnostic snapshots remain
+unprofiled; later mappings do not rewrite them. Legacy stores with unfenced
+diagnostic registry state refuse startup. The development unit still runs schema
+20/format 12 until the verified source is adopted below. Full governed SPARQL,
+graph-layer selection/correlation, tailing/syslog, physical reclamation and the
+remaining full architecture qualification are still unfinished.
+
+Local qualification on 2026-10-07: `make check` passed formatting, release Clippy
+with warnings denied, all workspace release tests (93 storage and 27 RPC/daemon/
+MCP scenarios), seeded census self-tests and the pinned cross-workspace gate.
+All 140 ledger jobs hold with zero distinct exceptions. The scenarios cover
+native decoded escapes and original body spans, ambiguous equal duplicate
+fields, immutable staged-import absence across reopen, diagnostic RDF pin
+retention and retirement, all five query surfaces through CLI/MCP, and each
+legacy storage authority upgrade. Ranked combined results carry the same
+snapshot as chronological results.
+
+An independent private executable check created store
+`store:7d736e9327c4ac9cf4a37831e7dc6bbe`, format 15/schema 21. The archived
+schema-20 executable (SHA-256
+`795b2e312a03075d0bfef5cc8341246647cc38fd8d1d1cb419489f2a7f974d2f`)
+refused it with `UNSUPPORTED`, exit 1. The current executable reopened the same
+identity and recovered the identical mapping and durable artifact retry receipt.
+Both owned current processes shut down with SIGINT, exit 0 and socket cleanup.
+Evidence is under `/tmp/sparrow-diagnostic-writer-fence.lbr4q7qy`. This verifies
+writer refusal and reopen, not full architecture acceptance.
 
 ## Schema 20 source alternatives
 

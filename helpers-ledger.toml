@@ -1994,8 +1994,8 @@ names = ['^(collect_status_records|decode_status_record_catalog|decode_status_pi
 
 [[job]]
 id = "query-source-filter-admission"
-summary = "Admit bounded exact logical source alternatives once for core and agent inputs."
-home = "sparrow_core::query::SourceFilter::new"
+summary = "Admit bounded exact source and diagnostic alternatives once for core and agent inputs."
+home = "sparrow_core::query::QueryAlternatives::new"
 entry_points = ["sparrow_server::agent::selection::decode"]
 spec = "docs/interfaces.md: schema 20 source alternatives."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
@@ -2019,3 +2019,129 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(match_json_sources|match_text_sources|match_context_sources)$']
+
+[[job]]
+id = "immutable-source-profile-admission"
+summary = "Time and diagnostic definitions share registry capacity validation and physical control admission."
+home = "sparrow_core::storage::Writer::admit_source_profile"
+entry_points = []
+spec = "docs/interfaces.md: schema 21 immutable diagnostic mappings."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(admit_time_registry|admit_diagnostic_registry)$']
+
+[[job]]
+id = "mapped-native-occurrence"
+summary = "Time and diagnostic capture share unique concrete native occurrence selection; duplicates remain ambiguous."
+home = "sparrow_core::storage::diagnostic::mapped_occurrence"
+entry_points = ["sparrow_core::storage::source_time::capture", "sparrow_core::storage::diagnostic::capture"]
+spec = "docs/interfaces.md: explicit mappings and duplicate-field ambiguity."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(select_timestamp_occurrence|select_diagnostic_occurrence)$']
+
+[[job]]
+id = "diagnostic-snapshot"
+summary = "Direct and staged records capture one immutable diagnostic snapshot with known spans or explicit failures."
+home = "sparrow_core::storage::diagnostic::capture"
+entry_points = ["sparrow_core::storage::diagnostic::DiagnosticSnapshot::decode"]
+spec = "docs/interfaces.md: schema 21 diagnostic evidence."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(capture_buffered_diagnostics|capture_staged_diagnostics)$']
+
+[[job]]
+id = "diagnostic-scope-predicate"
+summary = "All query surfaces intersect captured diagnostic alternatives and refuse uncertifiable membership."
+home = "sparrow_core::storage::Writer::matches_diagnostic_scope"
+entry_points = []
+spec = "docs/interfaces.md: schema 21 diagnostic filters."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(match_json_diagnostics|match_text_diagnostics|match_context_diagnostics)$']
+
+[[job]]
+id = "diagnostic-rdf-owner"
+summary = "One occurrence-owned native diagnostic graph follows publication, scoped reads, inspection and retirement."
+home = "sparrow_core::storage::diagnostic::graph_owner"
+entry_points = ["sparrow_core::storage::diagnostic::rdf"]
+spec = "docs/interfaces.md: schema 21 diagnostic graph ownership."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(ingest_diagnostic_owner|retire_diagnostic_owner)$']
+
+[[job]]
+id = "diagnostic-wire-codec"
+summary = "RPC and agent adapters share typed dimension, profile and snapshot codecs."
+home = "sparrow_server::diagnostics::snapshot"
+entry_points = ["sparrow_server::diagnostics::render_snapshot", "sparrow_server::diagnostics::profile", "sparrow_server::diagnostics::render_profile"]
+spec = "docs/interfaces.md: schema 21 generated contract."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_cli_diagnostics|render_mcp_diagnostics)$']
+
+[[job]]
+id = "diagnostic-profile-agent-input"
+summary = "CLI control files and MCP share one closed native JSON mapping decoder and typed operation."
+home = "sparrow_server::agent::diagnostic::decode_mappings"
+entry_points = ["sparrow_server::agent::diagnostic::Input::execute"]
+spec = "docs/interfaces.md: diagnostic-define and diagnostic-get."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_cli_diagnostic_mapping|parse_mcp_diagnostic_mapping)$']
+
+[[job]]
+id = "immutable-diagnostic-profile"
+summary = "One durable source mapping owner preserves identical retries and refuses reinterpretation."
+home = "sparrow_core::Store::define_diagnostic_profile"
+entry_points = ["sparrow_core::storage::diagnostic::DiagnosticProfile::new", "sparrow_core::storage::Writer::validate_diagnostic_record"]
+spec = "docs/interfaces.md: schema 21 immutable diagnostic mappings."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(bind_diagnostic_profile|reinterpret_record_diagnostics)$']
+
+[[job]]
+id = "legacy-storage-format"
+summary = "One format decoder preserves writer authority and distinguishes required recordless backfill from diagnostic fencing."
+home = "sparrow_core::storage::recordless::legacy_format"
+entry_points = ["sparrow_core::storage::diagnostic::fence_format"]
+spec = "docs/interfaces.md: schema 21 storage writer fences."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(legacy_recordless_target|legacy_diagnostic_target)$']

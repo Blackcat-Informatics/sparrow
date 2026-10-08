@@ -188,6 +188,10 @@ impl Input {
                     .with("byte_start", row.get_byte_start().to_string())
                     .with("byte_end", row.get_byte_end().to_string())
                     .with(
+                        "diagnostics",
+                        crate::diagnostics::render_snapshot(row.get_diagnostics()?)?,
+                    )
+                    .with(
                         "event_time",
                         super::source_time::event(row.get_event_time()?)?,
                     )

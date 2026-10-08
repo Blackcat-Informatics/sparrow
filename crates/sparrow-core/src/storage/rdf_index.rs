@@ -67,12 +67,24 @@ impl Store {
             ));
         }
         let metadata = manifest_counts(&writer, &record.id)?;
+        let diagnostic_owner = super::diagnostic::graph_owner(&record);
+        let diagnostic_rows = diagnostic_owner
+            .as_ref()
+            .map(|id| manifest_counts(&writer, id))
+            .transpose()?
+            .map_or(0, |counts| counts[0]);
         let mut result = Object::new()
             .with("store_id", writer.id.clone())
             .with("record_id", record.id.clone())
             .with("membership_at", crate::format_instant(now)?)
             .with("metadata_graph", graph_iri(&record.id))
             .with("metadata_primary_rows", metadata[0].to_string());
+        result = result
+            .with(
+                "diagnostic_graph",
+                diagnostic_owner.map(|id| graph_iri(&id)),
+            )
+            .with("diagnostic_primary_rows", diagnostic_rows.to_string());
         let mut counts = [0; 3];
         if record.rdf_projection_id.is_empty() {
             result = result

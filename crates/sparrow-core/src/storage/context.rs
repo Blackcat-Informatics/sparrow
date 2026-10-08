@@ -84,6 +84,7 @@ impl Store {
             || anchor.received_at < scope.received_from
             || anchor.received_at >= scope.received_before
             || !scope.matches_source(&anchor.source)
+            || !writer.matches_diagnostic_scope(scope, &anchor)?
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
@@ -175,6 +176,9 @@ fn scan_context_neighbors(
         writer.validate_event_record(&record)?;
         if !writer.live_record(&record, now, protected) {
             result.retired += 1;
+            continue;
+        }
+        if !writer.matches_diagnostic_scope(scope, &record)? {
             continue;
         }
         result.records.push(record);

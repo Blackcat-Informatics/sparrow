@@ -28,6 +28,7 @@ pub(super) struct RecordInput<'a> {
     pub received_at: u64,
     pub expires_at: u64,
     pub source_time_profile: &'a Option<source_time::SourceTimeProfile>,
+    pub diagnostic_profile: Option<&'a super::diagnostic::DiagnosticProfile>,
 }
 
 pub(super) struct RecordBatch<'a> {
@@ -214,6 +215,12 @@ impl<'a> RecordBatch<'a> {
                 end,
             )?,
             rdf_projection_id,
+            diagnostics: super::diagnostic::capture(
+                input.diagnostic_profile,
+                self.projections.get(&projection_id).map(|(facts, _)| facts),
+                start,
+                end,
+            )?,
             chunks: record_chunks,
             evicted: false,
         };
@@ -238,6 +245,13 @@ impl<'a> RecordBatch<'a> {
             &record.id,
             rdf_index::metadata(&record, &digest, rdf_state)?.as_ref(),
         )?;
+        if let Some(owner) = super::diagnostic::graph_owner(&record) {
+            self.rdf.graph(
+                &mut self.batch,
+                &owner,
+                super::diagnostic::rdf(&record)?.as_ref(),
+            )?;
+        }
         self.byte_count = self
             .byte_count
             .checked_add(raw_bytes.map_or(0, |bytes| bytes.len() as u64))

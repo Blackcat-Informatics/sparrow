@@ -27,7 +27,11 @@ enum Membership {
 #[derive(Default)]
 pub(super) struct Input {
     membership: Membership,
-    sources: Option<sparrow_core::SourceFilter>,
+    sources: Option<sparrow_core::QueryAlternatives>,
+    diagnostics: std::collections::BTreeMap<
+        sparrow_core::DiagnosticDimension,
+        sparrow_core::QueryAlternatives,
+    >,
 }
 
 pub(super) fn decode(value: &Value) -> std::result::Result<Input, DecodeError> {
@@ -83,26 +87,43 @@ pub(super) fn decode(value: &Value) -> std::result::Result<Input, DecodeError> {
             ));
         }
     };
-    let sources = fields
-        .raw("filter")?
-        .map(|value| {
-            let mut filter = Record::new(value, "scope filter")?;
-            let ids: Vec<String> = filter.required("source_ids")?;
-            filter.deny_unknown()?;
-            sparrow_core::SourceFilter::new(ids)
-                .map_err(|error| DecodeError::custom(error.to_string()))
-        })
-        .transpose()?;
+    let mut sources = None;
+    let mut diagnostics = std::collections::BTreeMap::new();
+    if let Some(value) = fields.raw("filter")? {
+        let mut filter = Record::new(value, "scope filter")?;
+        sources = filter
+            .optional::<Vec<String>>("source_ids")?
+            .map(sparrow_core::QueryAlternatives::new)
+            .transpose()
+            .map_err(DecodeError::custom)?;
+        for name in ["service", "host", "severity", "trace_id", "span_id"] {
+            if let Some(values) = filter.optional::<Vec<String>>(name)? {
+                diagnostics.insert(
+                    sparrow_core::DiagnosticDimension::from_name(name)
+                        .map_err(DecodeError::custom)?,
+                    sparrow_core::QueryAlternatives::new(values).map_err(DecodeError::custom)?,
+                );
+            }
+        }
+        filter.deny_unknown()?;
+        if sources.is_none() && diagnostics.is_empty() {
+            return Err(DecodeError::custom(
+                "scope filter requires at least one nonempty supported array",
+            ));
+        }
+    }
+
     fields.deny_unknown()?;
     Ok(Input {
         membership: result,
         sources,
+        diagnostics,
     })
 }
 
 impl Input {
     pub(super) async fn require_supported(&self, client: &wire::sparrow::Client) -> Result<()> {
-        if self.sources.is_some() {
+        if self.sources.is_some() || !self.diagnostics.is_empty() {
             sparrow_client::Discovery::fetch(client).await?;
         }
         Ok(())
@@ -116,6 +137,17 @@ impl Input {
                 .init_value(filter.ids().len() as u32);
             for (index, id) in filter.ids().iter().enumerate() {
                 target.set(index as u32, id);
+            }
+        }
+        let mut filters = scope
+            .reborrow()
+            .init_diagnostics(self.diagnostics.len() as u32);
+        for (index, (dimension, values)) in self.diagnostics.iter().enumerate() {
+            let mut row = filters.reborrow().get(index as u32);
+            row.set_dimension(crate::diagnostics::wire_dimension(*dimension));
+            let mut target = row.init_alternatives(values.ids().len() as u32);
+            for (index, value) in values.ids().iter().enumerate() {
+                target.set(index as u32, value);
             }
         }
         let mut target = scope.init_selection();
@@ -149,28 +181,36 @@ impl Input {
 
 pub(super) fn schema() -> Value {
     let string = || Value::from(Object::new().with("type", "string"));
+    let alternatives = Value::from(
+        Object::new()
+            .with("type", "array")
+            .with("minItems", 1_u64)
+            .with("maxItems", 128_u64)
+            .with(
+                "items",
+                Object::new()
+                    .with("type", "string")
+                    .with("minLength", 1_u64)
+                    .with("maxLength", 512_u64),
+            ),
+    );
+    let mut properties = Object::new();
+    for name in [
+        "source_ids",
+        "service",
+        "host",
+        "severity",
+        "trace_id",
+        "span_id",
+    ] {
+        properties = properties.with(name, alternatives.clone());
+    }
     let filter = Value::from(
         Object::new()
             .with("type", "object")
             .with("additionalProperties", false)
-            .with("required", vec!["source_ids"])
-            .with(
-                "properties",
-                Object::new().with(
-                    "source_ids",
-                    Object::new()
-                        .with("type", "array")
-                        .with("minItems", 1_u64)
-                        .with("maxItems", 128_u64)
-                        .with(
-                            "items",
-                            Object::new()
-                                .with("type", "string")
-                                .with("minLength", 1_u64)
-                                .with("maxLength", 512_u64),
-                        ),
-                ),
-            ),
+            .with("minProperties", 1_u64)
+            .with("properties", properties),
     );
     let object = |properties: Object, required: Vec<&str>| {
         Value::from(

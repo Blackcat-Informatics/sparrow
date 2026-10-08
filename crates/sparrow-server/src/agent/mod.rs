@@ -7,6 +7,7 @@ use crate::sparrow_capnp as wire;
 use purrdf_lex::json::{Object, Value};
 
 mod context;
+mod diagnostic;
 mod durability;
 mod error;
 mod ingest;
@@ -30,7 +31,7 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
+    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] [--require-complete-index true|false] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
     "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp"
@@ -49,6 +50,7 @@ pub(super) enum Command {
     Status,
     Watch(watch::Input),
     SourceTime(source_time::Input),
+    Diagnostic(diagnostic::Input),
     Records(records::Input),
     Ingest(ingest::Input),
     Bytes(read::Input),
@@ -67,7 +69,7 @@ pub(super) enum Command {
 }
 
 pub(super) struct Options {
-    selection: selection::Input,
+    selection: Box<selection::Input>,
     source: Option<String>,
     from: u64,
     before: u64,
@@ -112,7 +114,7 @@ fn evidence(mut target: wire::evidence::Builder<'_>, store: &str, id: &str) -> R
 impl Default for Options {
     fn default() -> Self {
         Self {
-            selection: selection::Input::default(),
+            selection: Box::default(),
             source: None,
             from: 0,
             before: u64::MAX,
@@ -162,6 +164,29 @@ fn parse_kind(
 
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
+        if args
+            .first()
+            .is_some_and(|arg| arg == "diagnostic-define" || arg == "diagnostic-get")
+        {
+            let define = args[0] == "diagnostic-define";
+            if args.len() != if define { 3 } else { 2 } {
+                return Err(invalid(
+                    "diagnostic-define requires SOURCE MAPPINGS.json; diagnostic-get requires SOURCE",
+                ));
+            }
+            let mappings = if define {
+                Some(
+                    diagnostic::decode_mappings(&records::read_control_file(&args[2])?)
+                        .map_err(|e| invalid(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            return Ok(Self::Diagnostic(diagnostic::Input {
+                source: args[1].clone(),
+                mappings,
+            }));
+        }
         if args.first().is_some_and(|arg| arg == "watch") {
             return Ok(Self::Watch(watch::Input::parse(&args[1..])?));
         }
@@ -284,8 +309,10 @@ impl Command {
                 }
                 "--source" => options.source = Some(value.clone()),
                 "--scope-file" => {
-                    options.selection = selection::decode(&records::read_control_file(value)?)
-                        .map_err(|e| invalid(e.to_string()))?
+                    options.selection = Box::new(
+                        selection::decode(&records::read_control_file(value)?)
+                            .map_err(|e| invalid(e.to_string()))?,
+                    )
                 }
                 "--received-from" => {
                     options.from =
@@ -354,6 +381,9 @@ impl Command {
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+        if let Self::Diagnostic(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
         let options = match self {
             Self::Query { options, .. } => Some(options),
             Self::Records(input) => Some(&input.options),

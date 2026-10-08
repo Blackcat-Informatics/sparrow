@@ -34,7 +34,17 @@ struct Record {
   receivedAt @4 :Instant; expiresAt @5 :Instant;
   byteStart @6 :UInt64; byteEnd @7 :UInt64;
   eventTime @8 :EventTime;
+  diagnostics @9 :DiagnosticSnapshot;
 }
+enum DiagnosticDimension { service @0; host @1; severity @2; traceId @3; spanId @4; }
+struct DiagnosticMapping { dimension @0 :DiagnosticDimension; path @1 :Text; }
+struct DiagnosticDefinition { source @0 :Text; mappings @1 :List(DiagnosticMapping); }
+struct DiagnosticProfile { storeId @0 :Text; id @1 :Text; source @2 :Text; mappings @3 :List(DiagnosticMapping); }
+struct OptionalDiagnosticProfile { union { absent @0 :Void; value @1 :DiagnosticProfile; } }
+struct KnownDiagnostic { value @0 :Text; occurrence @1 :UInt64; sourceStart @2 :UInt64; sourceEnd @3 :UInt64; }
+struct DiagnosticField { dimension @0 :DiagnosticDimension; union { unknown @1 :Text; known @2 :KnownDiagnostic; } }
+struct DiagnosticSnapshot { profileId @0 :OptionalText; fields @1 :List(DiagnosticField); }
+struct DiagnosticFilter { dimension @0 :DiagnosticDimension; alternatives @1 :List(Text); }
 enum TimeRepresentation { rfc3339 @0; unixMillis @1; unixSeconds @2; }
 enum UnknownTimeReason {
   legacyUnprofiled @0; noProfile @1; notJson @2; projectionFailed @3;
@@ -190,6 +200,7 @@ struct Scope {
   receivedBefore @2 :Instant; limit @3 :UInt32 = 100; scanBudget @4 :UInt32 = 10000;
   selection @5 :QuerySelection;
   sourceIds @6 :OptionalSourceIds;
+  diagnostics @7 :List(DiagnosticFilter);
 }
 struct OptionalSourceIds { union { absent @0 :Void; value @1 :List(Text); } }
 struct PinScope { storeId @0 :Text; id @1 :Text; expectedRevision @2 :OptionalRevision; }
@@ -255,6 +266,7 @@ struct RdfInspection {
   metadataGraph @3 :Text; metadataPrimaryRows @4 :UInt64;
   state @5 :ProjectionState; contentGraph @6 :OptionalText; diagnostic @7 :OptionalText;
   primaryRows @8 :UInt64; reifierRows @9 :UInt64; annotationRows @10 :UInt64;
+  diagnosticGraph @11 :OptionalText; diagnosticPrimaryRows @12 :UInt64;
 }
 struct PinSelector { union { active @0 :Void; id @1 :Text; name @2 :Text; } }
 struct PinReadQuery {
@@ -297,6 +309,7 @@ struct RecordMatch {
   recordId @0 :Text; artifactId @1 :Text; source @2 :Text; receivedAt @3 :Instant;
   byteStart @4 :UInt64; byteEnd @5 :UInt64; fields @6 :List(FieldEvidence);
   eventTime @7 :EventTime;
+  diagnostics @8 :DiagnosticSnapshot;
 }
 struct OptionalTextResults { union { absent @0 :Void; value @1 :TextResults; } }
 struct RecordsResults {
@@ -325,6 +338,7 @@ struct ImportPreparation {
   preparedRecords @3 :UInt64; totalRecords @4 :UInt64;
   receivedAt @5 :Instant; expiresAt @6 :Instant; sourceTimeProfile @7 :OptionalText;
   raw @8 :OptionalRawPreparation;
+  diagnosticProfile @9 :OptionalText;
 }
 struct RawPreparation {
   recordIndex @0 :UInt64; reservedRecordId @1 :Text;
@@ -366,4 +380,6 @@ interface Sparrow {
   watchRemove @29 (request :WatchRemove) -> (result :Result(WatchMutation));
   watchHandoff @30 (request :WatchHandoff) -> (result :Result(HandoffReceipt));
   watchHandoffGet @31 (request :WatchHandoff) -> (result :Result(HandoffReceipt));
+  diagnosticDefine @32 (definition :DiagnosticDefinition) -> (result :Result(DiagnosticProfile));
+  diagnosticGet @33 (source :Text) -> (result :Result(OptionalDiagnosticProfile));
 }

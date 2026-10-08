@@ -12,14 +12,17 @@ mod text;
 pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
 pub use query::{
-    EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryScope, QuerySelection,
-    RecordQuery, SourceFilter,
+    EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryAlternatives, QueryScope,
+    QuerySelection, RecordQuery,
 };
 pub use storage::consumption::{
     ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, MAX_CONSUMPTION_JOURNALS,
     validate_consumption_path,
 };
 pub use storage::context::{Context, ContextFrontier, ContextSide};
+pub use storage::diagnostic::{
+    DiagnosticDimension, DiagnosticProfile, DiagnosticSnapshot, DiagnosticValue,
+};
 pub use storage::durability::{
     DEFAULT_FLUSH_INTERVAL_MS, Durability, DurabilityStatus, DurabilityWatermark,
     MAX_BUFFERED_BYTES, MAX_BUFFERED_WRITES,

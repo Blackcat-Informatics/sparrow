@@ -17,6 +17,7 @@ use rocksdb::{
 
 pub(crate) mod consumption;
 pub(crate) mod context;
+pub(crate) mod diagnostic;
 pub(crate) mod durability;
 pub(crate) mod eviction;
 pub(crate) mod expiry;
@@ -36,7 +37,7 @@ pub(crate) mod source_time;
 mod text_index;
 pub(crate) mod watch_registry;
 
-const FORMAT: &[u8] = b"sparrow.store/9";
+const FORMAT: &[u8] = b"sparrow.store/13";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -244,6 +245,8 @@ pub struct Record {
     pub rdf_projection_id: String,
     /// Declared source instant and evidence, or an explicit unknown diagnostic.
     pub event_time: source_time::EventTime,
+    /// Immutable declared diagnostic values and their native occurrence evidence.
+    pub diagnostics: diagnostic::DiagnosticSnapshot,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -463,6 +466,7 @@ impl Catalog for Record {
             .with("projection_id", self.projection_id.clone())
             .with("rdf_projection_id", self.rdf_projection_id.clone())
             .with("event_time", self.event_time.encode())
+            .with("diagnostics", self.diagnostics.encode())
             .with("chunks", self.chunks.clone())
             .with("evicted", self.evicted)
             .into()
@@ -484,6 +488,17 @@ impl Catalog for Record {
                 .map(source_time::EventTime::decode)
                 .transpose()?
                 .unwrap_or_else(|| source_time::EventTime::unknown("legacy_unprofiled", None)),
+            diagnostics: v
+                .get("diagnostics")
+                .map(|value| {
+                    diagnostic::DiagnosticSnapshot::decode(
+                        value,
+                        integer(v, "byte_start")?,
+                        integer(v, "byte_end")?,
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default(),
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             evicted: read_field(v, "evicted")?,
         };
@@ -838,7 +853,7 @@ impl Store {
                     || format == consumption::FORMAT
                     || format == watch_registry::FORMAT
                     || format == handoff::FORMAT
-                    || recordless::legacy_target(&format).is_some() =>
+                    || recordless::legacy_format(&format).is_some() =>
             {
                 if recordless::requires_watch_registry(&format)
                     != db.get("watch_registry")?.is_some()
@@ -918,6 +933,7 @@ impl Store {
             }
         }
         recordless::upgrade(&db)?;
+        diagnostic::fence_format(&db)?;
         // Recovered buffered writes are certified only after a real synchronization.
         db.flush_wal(true)?;
         let durability = std::cell::RefCell::new(durability::State::new(
@@ -1015,6 +1031,7 @@ impl Store {
             ));
         }
         let source_time_profile = writer.time_profile(source)?;
+        let diagnostic_profile = writer.diagnostic_profile(source)?;
         let expires_at = now.checked_add(30 * DAY).ok_or_else(|| {
             Error::new(
                 "INVALID_ARGUMENT",
@@ -1042,6 +1059,7 @@ impl Store {
                 received_at: now,
                 expires_at,
                 source_time_profile: &source_time_profile,
+                diagnostic_profile: diagnostic_profile.as_ref(),
             })?;
             put(&mut prepared.batch, &record.id, &record);
             prepared.batch.put(
@@ -1154,6 +1172,7 @@ impl Store {
             visited += 1;
             if !writer.live_record(&record, now, &protected)
                 || !scope.matches_source(&record.source)
+                || !writer.matches_diagnostic_scope(scope, &record)?
             {
                 continue;
             }

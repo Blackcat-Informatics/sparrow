@@ -322,7 +322,9 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> cap
         .set_unix_millis(value.expires_at);
     out.set_byte_start(value.byte_start);
     out.set_byte_end(value.byte_end);
-    event_time(out.init_event_time(), &value.event_time)
+    event_time(out.reborrow().init_event_time(), &value.event_time)?;
+    crate::diagnostics::snapshot(out.init_diagnostics(), &value.diagnostics);
+    Ok(())
 }
 
 fn time_representation(value: wire::TimeRepresentation) -> sparrow_core::TimeRepresentation {
@@ -463,6 +465,35 @@ fn optional(value: wire::optional_text::Reader<'_>) -> capnp::Result<Option<Stri
 
 fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<QueryScope, Error>> {
     let source = optional(value.get_source()?)?;
+    let filters = value.get_diagnostics()?;
+    if filters.len() > 5 {
+        return Ok(Err(invalid("at most five diagnostic scope dimensions")));
+    }
+    let mut diagnostics = std::collections::BTreeMap::new();
+    for filter in filters.iter() {
+        let dimension = crate::diagnostics::dimension(filter.get_dimension()?);
+        let alternatives = filter.get_alternatives()?;
+        if alternatives.is_empty() || alternatives.len() > 128 {
+            return Ok(Err(invalid(
+                "diagnostic alternatives require 1..128 strings",
+            )));
+        }
+        let mut values = Vec::with_capacity(alternatives.len() as usize);
+        for value in alternatives.iter() {
+            let value = value?;
+            if value.len() > 512 {
+                return Ok(Err(invalid("diagnostic filter string exceeds 512 bytes")));
+            }
+            values.push(value.to_str()?.to_owned());
+        }
+        let alternatives = match sparrow_core::QueryAlternatives::new(values) {
+            Ok(value) => value,
+            Err(e) => return Ok(Err(e)),
+        };
+        if diagnostics.insert(dimension, alternatives).is_some() {
+            return Ok(Err(invalid("duplicate diagnostic filter dimension")));
+        }
+    }
     let sources = match value.get_source_ids()?.which()? {
         wire::optional_source_ids::Absent(()) => None,
         wire::optional_source_ids::Value(ids) => {
@@ -478,7 +509,7 @@ fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<Quer
                 }
                 names.push(id.to_str()?.to_owned());
             }
-            match sparrow_core::SourceFilter::new(names) {
+            match sparrow_core::QueryAlternatives::new(names) {
                 Ok(filter) => Some(filter),
                 Err(error) => return Ok(Err(error)),
             }
@@ -520,6 +551,7 @@ fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<Quer
         selection,
         source,
         sources,
+        diagnostics,
         received_from,
         received_before,
         limit: value.get_limit() as usize,
@@ -1075,8 +1107,11 @@ impl wire::sparrow::Server for Rpc {
                     }
                 }
                 match value.source_time_profile {
-                    Some(id) => out.init_source_time_profile().set_value(id),
-                    None => out.init_source_time_profile().set_absent(()),
+                    Some(id) => out.reborrow().init_source_time_profile().set_value(id),
+                    None => out.reborrow().init_source_time_profile().set_absent(()),
+                }
+                if let Some(id) = value.diagnostic_profile {
+                    out.init_diagnostic_profile().set_value(id);
                 }
             }
             Err(e) => failure(results.get().init_result(), e),
@@ -1165,6 +1200,10 @@ impl wire::sparrow::Server for Rpc {
                 );
                 out.set_metadata_graph(field::<String>(&value, "metadata_graph")?);
                 out.set_metadata_primary_rows(number(&value, "metadata_primary_rows")?);
+                out.set_diagnostic_primary_rows(number(&value, "diagnostic_primary_rows")?);
+                if let Some(graph) = value.get("diagnostic_graph").and_then(Value::as_str) {
+                    out.reborrow().init_diagnostic_graph().set_value(graph);
+                }
                 out.set_state(match field::<String>(&value, "state")?.as_str() {
                     "complete" => wire::ProjectionState::Complete,
                     "failed" => wire::ProjectionState::Failed,
@@ -1243,6 +1282,68 @@ impl wire::sparrow::Server for Rpc {
         }
         Ok(())
     }
+    async fn diagnostic_define(
+        self: Rc<Self>,
+        params: wire::sparrow::DiagnosticDefineParams,
+        mut results: wire::sparrow::DiagnosticDefineResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_definition()?;
+        let source = input.get_source()?;
+        if source.len() > 512 {
+            failure(
+                results.get().init_result(),
+                invalid("diagnostic source exceeds 512 bytes"),
+            );
+            return Ok(());
+        }
+        let source = source.to_str()?.to_owned();
+        let mappings = crate::diagnostics::mappings(input.get_mappings()?)?;
+        match self
+            .work(move |store, _| {
+                Ok((
+                    store.define_diagnostic_profile(&source, mappings?)?,
+                    store.store_id()?,
+                ))
+            })
+            .await
+        {
+            Ok((profile, store)) => {
+                crate::diagnostics::profile(results.get().init_result().init_ok(), &profile, &store)
+            }
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn diagnostic_get(
+        self: Rc<Self>,
+        params: wire::sparrow::DiagnosticGetParams,
+        mut results: wire::sparrow::DiagnosticGetResults,
+    ) -> capnp::Result<()> {
+        let source = params.get()?.get_source()?;
+        if source.len() > 512 {
+            failure(
+                results.get().init_result(),
+                invalid("diagnostic source exceeds 512 bytes"),
+            );
+            return Ok(());
+        }
+        let source = source.to_str()?.to_owned();
+        match self
+            .work(move |store, _| Ok((store.diagnostic_profile(&source)?, store.store_id()?)))
+            .await
+        {
+            Ok((Some(profile), store)) => crate::diagnostics::profile(
+                results.get().init_result().init_ok().init_value(),
+                &profile,
+                &store,
+            ),
+            Ok((None, _)) => results.get().init_result().init_ok().set_absent(()),
+            Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
     async fn source_time_define(
         self: Rc<Self>,
         params: wire::sparrow::SourceTimeDefineParams,
@@ -1387,6 +1488,10 @@ impl wire::sparrow::Server for Rpc {
                         )
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
                     event_time(target.reborrow().init_event_time(), &event)?;
+                    crate::diagnostics::snapshot(
+                        target.reborrow().init_diagnostics(),
+                        &field::<sparrow_core::DiagnosticSnapshot>(row, "diagnostics")?,
+                    );
                     let fields = row.get("fields").and_then(Value::as_array).ok_or_else(|| {
                         capnp::Error::failed("missing captured field witnesses".into())
                     })?;

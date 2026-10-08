@@ -147,6 +147,7 @@ impl Store {
             visited += 1;
             if !writer.live_record(&record, now, &protected)
                 || !scope.matches_source(&record.source)
+                || !writer.matches_diagnostic_scope(scope, &record)?
             {
                 continue;
             }
@@ -190,6 +191,7 @@ impl Store {
                         .with("record_id", record.id.clone())
                         .with("artifact_id", record.artifact_id.clone())
                         .with("source", record.source.clone())
+                        .with("diagnostics", record.diagnostics.encode())
                         .with("received_at", crate::format_instant(record.received_at)?)
                         .with("byte_start", record.byte_start.to_string())
                         .with("byte_end", record.byte_end.to_string())
@@ -448,6 +450,7 @@ impl Store {
                 .with("record_id", id.clone())
                 .with("artifact_id", record.artifact_id.clone())
                 .with("source", record.source.clone())
+                .with("diagnostics", record.diagnostics.encode())
                 .with("received_at", crate::format_instant(record.received_at)?)
                 .with("byte_start", record.byte_start.to_string())
                 .with("byte_end", record.byte_end.to_string())

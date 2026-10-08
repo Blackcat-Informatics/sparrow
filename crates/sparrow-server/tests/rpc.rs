@@ -13,6 +13,69 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new().run_until(async {
+        let dir=tempfile::tempdir().unwrap();let data=dir.path().join("store");let socket=data.join("rpc.sock");
+        let config=write_server_config(dir.path(),&data,&socket);let daemon=start(&config,&socket).await;
+        let client=sparrow_client::Client::connect(&socket).await.unwrap();let store=client.discovery().store_id.clone();
+        let file=dir.path().join("mappings.json");std::fs::write(&file,br#"{"service":"/svc","severity":"/level"}"#).unwrap();
+        let definition=cli(&socket,&["diagnostic-define","producer",file.to_str().unwrap()]);
+        let mut mcp=Mcp::start(&socket);mcp.initialize(1).await;
+        let retry=mcp.tool(2,"diagnostic_define",Object::new().with("source","producer")
+            .with("mappings",Object::new().with("service","/svc").with("severity","/level")).into()).await;
+        assert_eq!(retry["structuredContent"],definition);
+        let artifact=client.ingest("diag-wire","producer",wire::Format::Jsonl,
+            b"{\"svc\":\"worker\",\"level\":\"ERROR\",\"message\":\"needle\"}\n{\"svc\":\"worker\",\"level\":\"WARN\",\"message\":\"needle\"}\n{\"svc\":\"other\",\"level\":\"ERROR\",\"message\":\"needle\"}\n").await.unwrap();
+        let anchor=artifact.record_ids[..2].iter().min().unwrap();
+        let pinned=mcp.tool(3,"pin",Object::new().with("store_id",store.clone()).with("request_id","diag-pin")
+            .with("name","diagnostics").with("targets",vec![artifact.id.clone()]).with("days",2_u64).into()).await;
+        let pin=pinned["structuredContent"]["pin_id"].as_str().unwrap();
+        let filter=Object::new().with("source_ids",vec!["producer"]).with("service",vec!["worker","worker"])
+            .with("severity",vec!["ERROR","WARN"]);
+        let scope_file=dir.path().join("scope.json");let mut request_id=4;
+        for scope in [Object::new().with("kind","live"),Object::new().with("kind","selection").with("store_id",store.clone()).with("artifact_ids",vec![artifact.id.clone()]),
+            Object::new().with("kind","pin").with("store_id",store.clone()).with("pin_id",pin)] {
+            let scope:Value=scope.with("filter",filter.clone()).into();std::fs::write(&scope_file,purrdf_lex::json::write_compact(&scope)).unwrap();
+            for (tool,command) in [("keys_list","keys"),("values_search","values"),("text_search","text"),("records_search","records"),("records_context","context")] {
+                let mut input=Object::new().with("scope",scope.clone());let mut args=vec![command];
+                if tool=="text_search" {input=input.with("text","needle");args.push("needle");}
+                if tool=="values_search" {input=input.with("path","/message");args.extend(["--path","/message"]);}
+                if tool=="records_context" {input=input.with("store_id",store.clone()).with("id",anchor.clone());args.extend([store.as_str(),anchor.as_str()]);}
+                args.extend(["--scope-file",scope_file.to_str().unwrap()]);let cli_result=cli(&socket,&args);
+                let result=mcp.tool(request_id,tool,input.into()).await;request_id+=1;
+                assert_eq!(result["isError"].as_bool(),Some(false),"{tool}: {result:?}");let found=&result["structuredContent"];
+                if tool=="records_context" {assert_eq!(found["anchor"],cli_result["anchor"]);assert_eq!(found["after"]["rows"].as_array().unwrap().len(),1);}
+                else {assert_eq!(found["rows"],cli_result["rows"]);if tool!="keys_list" {assert_eq!(found["rows"].as_array().unwrap().len(),2);}}
+            }
+        }
+        let rdf=cli(&socket,&["rdf",&store,&artifact.record_ids[0]]);assert_eq!(rdf["diagnostic_primary_rows"].as_str(),Some("16"));
+        let mut call=client.capability().record_get_request();let mut input=call.get().init_record();input.set_store_id(&store);input.set_id(&artifact.record_ids[0]);
+        let reply=call.send().promise.await.unwrap();let evidence=rpc_ok(reply.get().unwrap().get_result().unwrap()).get_diagnostics().unwrap();
+        assert_eq!(evidence.get_fields().unwrap().len(),2);
+        match evidence.get_profile_id().unwrap().which().unwrap() {
+            wire::optional_text::Value(value) => assert_eq!(value.unwrap().to_str().unwrap(),definition["profile_id"].as_str().unwrap()),
+            wire::optional_text::Absent(()) => panic!("captured diagnostic mapping disappeared"),
+        }
+        let conflict=mcp.tool(request_id,"diagnostic_define",Object::new().with("source","producer").with("mappings",Object::new().with("service","/other")).into()).await;request_id+=1;
+        assert_eq!(conflict["structuredContent"]["error"]["code"].as_str(),Some("CONFLICT"));
+        client.ingest("diag-unprofiled","unprofiled",wire::Format::Json,br#"{"svc":"worker"}"#).await.unwrap();
+        let uncertain=mcp.tool(request_id,"records_search",Object::new().with("scope",Object::new().with("kind","live")
+            .with("filter",Object::new().with("service",vec!["worker"]))).into()).await;request_id+=1;
+        assert_eq!(uncertain["structuredContent"]["error"]["code"].as_str(),Some("INDEX_NOT_READY"));
+        for filter in [Object::new(),Object::new().with("service",Vec::<String>::new()),Object::new().with("severity",vec![""]),Object::new().with("guess_field",vec!["worker"])] {
+            let invalid=mcp.tool(request_id,"keys_list",Object::new().with("scope",Object::new().with("kind","live").with("filter",filter)).into()).await;request_id+=1;
+            assert_eq!(invalid["structuredContent"]["error"]["code"].as_str(),Some("INVALID_ARGUMENT"));
+        }
+        mcp.close(true).await;drop(client);drop(daemon);
+        std::fs::remove_file(&socket).unwrap();
+        let _daemon=start(&config,&socket).await;
+        assert_eq!(cli(&socket,&["diagnostic-get","producer"])["profile"],definition);
+        assert_eq!(cli(&socket,&["rdf",&store,&artifact.record_ids[0]])["diagnostic_primary_rows"].as_str(),Some("16"));
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn source_arrays_are_shared_by_generated_cli_and_mcp_queries() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new()
@@ -585,7 +648,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/12");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/16");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -802,7 +865,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/11")
+                Some("sparrow.store/15")
             );
         })
         .await;
@@ -1165,7 +1228,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/11"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/15"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -2825,7 +2888,7 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
 }
 
 async fn start(config: &Path, socket: &Path) -> Daemon {
-    let daemon = Daemon(
+    let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_sparrowd"))
             .arg("--config")
             .arg(config)
@@ -2834,7 +2897,11 @@ async fn start(config: &Path, socket: &Path) -> Daemon {
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !socket.exists() {
+    while tokio::net::UnixStream::connect(socket).await.is_err() {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited before readiness"
+        );
         assert!(Instant::now() < deadline, "daemon startup timed out");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -3752,7 +3819,7 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 19);
+    assert_eq!(definitions.len(), 21);
     assert!(
         !definitions
             .iter()

@@ -791,6 +791,9 @@ impl Store {
                     "RDF selection contains expired evidence",
                 )));
             }
+            if let Some(owner) = super::diagnostic::graph_owner(&record) {
+                graphs.insert(owner);
+            }
             graphs.insert(record.id);
             if !record.rdf_projection_id.is_empty() {
                 let _decode = view.budget.reserve(4096 * 64)?;

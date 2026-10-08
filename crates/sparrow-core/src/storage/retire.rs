@@ -43,6 +43,9 @@ impl<'a> Retirement<'a> {
             return Ok(false);
         }
         self.rdf.remove(&mut self.batch, &record.id)?;
+        if let Some(owner) = super::diagnostic::graph_owner(record) {
+            self.rdf.remove(&mut self.batch, &owner)?;
+        }
         if !record.rdf_projection_id.is_empty() {
             *self
                 .rdf_removals

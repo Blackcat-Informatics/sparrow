@@ -8,8 +8,317 @@ use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() {
+    use sparrow_core::{
+        DiagnosticDimension as D, DiagnosticValue as V, JsonQuery, QueryAlternatives, QueryScope,
+        QuerySelection, RecordQuery,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let legacy = store
+        .ingest("diag-before", "events", "json", br#"{"svc":"worker"}"#, 0)
+        .unwrap();
+    let mappings = [
+        (D::Service, "/svc"),
+        (D::Host, "/h"),
+        (D::Severity, "/level"),
+        (D::TraceId, "/trace"),
+        (D::SpanId, "/span"),
+    ]
+    .into_iter()
+    .map(|(d, p)| (d, p.to_owned()))
+    .collect();
+    let profile = store.define_diagnostic_profile("events", mappings).unwrap();
+    assert_eq!(
+        store
+            .define_diagnostic_profile("events", profile.mappings.clone())
+            .unwrap(),
+        profile
+    );
+    assert_eq!(
+        store
+            .define_diagnostic_profile("events", [(D::Service, "/other".into())].into())
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert!(
+        store
+            .record(&legacy.record_ids[0])
+            .unwrap()
+            .diagnostics
+            .fields
+            .is_empty()
+    );
+    let bytes = b"{\"svc\":\"w\\u006frker\",\"h\":\"h1\",\"level\":\"ERROR\",\"trace\":\"t1\",\"span\":\"s1\",\"message\":\"needle\"}\r\n{\"svc\":\"worker\",\"h\":\"h1\",\"level\":\"WARN\",\"trace\":\"t2\",\"span\":\"s2\",\"message\":\"needle\"}\n";
+    let artifact = store
+        .ingest("diag-known", "events", "jsonl", bytes, 1)
+        .unwrap();
+    let record = store.record(&artifact.record_ids[0]).unwrap();
+    assert_eq!(
+        record.diagnostics.profile_id.as_deref(),
+        Some(profile.id.as_str())
+    );
+    let V::Known {
+        value,
+        source_start,
+        source_end,
+        ..
+    } = &record.diagnostics.fields[&D::Service]
+    else {
+        panic!("decoded service unavailable")
+    };
+    assert_eq!(value, "worker");
+    assert_eq!(
+        &bytes[*source_start as usize..*source_end as usize],
+        br#"w\u006frker"#
+    );
+    let inspection = store.rdf_inspect(&record.id, 2).unwrap();
+    assert_eq!(inspection["diagnostic_primary_rows"].as_str(), Some("40"));
+    store
+        .with_rdf_records(
+            std::slice::from_ref(&record.id),
+            2,
+            sparrow_core::RdfReadLimits::default(),
+            |view| {
+                use purrdf::DatasetView;
+                use purrdf::TermRef;
+                use purrdf::dataset_view::TermGuard;
+                assert!(view.quads().any(|q| {
+                    let p = view.resolve(q.p).unwrap();
+                    let o = view.resolve(q.o).unwrap();
+                    matches!(p.term(), TermRef::Iri("urn:sparrow:vocab:service"))
+                        && matches!(
+                            o.term(),
+                            TermRef::Literal {
+                                lexical: "worker",
+                                ..
+                            }
+                        )
+                }));
+            },
+        )
+        .unwrap();
+    let mut scope = QueryScope {
+        selection: QuerySelection::Live,
+        source: Some("events".into()),
+        sources: None,
+        diagnostics: [
+            (
+                D::Service,
+                QueryAlternatives::new(vec!["worker".into(), "worker".into()]).unwrap(),
+            ),
+            (
+                D::Severity,
+                QueryAlternatives::new(vec!["ERROR".into(), "WARN".into()]).unwrap(),
+            ),
+        ]
+        .into(),
+        received_from: 1,
+        received_before: 2,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 2)
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store.text_query(&scope, "needle", 2).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store.json_query(&scope, &JsonQuery::Keys, 2).unwrap()["coverage"]["eligible_records"]
+            .as_str(),
+        Some("2")
+    );
+    assert_eq!(
+        store
+            .records_context(artifact.record_ids.iter().min().unwrap(), &scope, 0, 5, 2)
+            .unwrap()
+            .after
+            .records
+            .len(),
+        1
+    );
+    scope.diagnostics.insert(
+        D::TraceId,
+        QueryAlternatives::new(vec!["t1".into()]).unwrap(),
+    );
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 2)
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    scope.received_from = 0;
+    assert_eq!(
+        store
+            .json_query(&scope, &JsonQuery::Keys, 2)
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    scope.received_from = 3;
+    scope.received_before = 4;
+    let ambiguous = store
+        .ingest(
+            "diag-ambiguous",
+            "events",
+            "json",
+            br#"{"svc":"worker","svc":"worker","h":null,"level":"ERROR","trace":"t1"}"#,
+            3,
+        )
+        .unwrap();
+    let evidence = store.record(&ambiguous.record_ids[0]).unwrap().diagnostics;
+    assert_eq!(
+        evidence.fields[&D::Service],
+        V::Unknown("ambiguous_field".into())
+    );
+    assert_eq!(evidence.fields[&D::Host], V::Unknown("wrong_kind".into()));
+    assert_eq!(
+        evidence.fields[&D::SpanId],
+        V::Unknown("missing_field".into())
+    );
+    assert_eq!(
+        store.text_query(&scope, "needle", 4).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    let pin = store
+        .pin("diag-pin", "case", &artifact.record_ids[..1], 40, 4)
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.diagnostic_profile("events").unwrap(), Some(profile));
+    assert_eq!(
+        store.rdf_inspect(&record.id, 31 * DAY).unwrap()["diagnostic_primary_rows"].as_str(),
+        Some("40")
+    );
+    scope.received_from = 1;
+    scope.received_before = 2;
+    scope.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision),
+    };
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 31 * DAY)
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    store.release(&pin.id).unwrap();
+    store.expire(31 * DAY).unwrap();
+    assert_eq!(
+        store.rdf_inspect(&record.id, 31 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    drop(store);
+    let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+    assert!(
+        db.get(format!("rdf:graph:diagnostic:{}", record.id))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences() {
+    use sparrow_core::DiagnosticDimension as D;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = b"{\"svc\":\"worker\"}\n{\"svc\":\"worker\"}\n";
+    let payload = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+    );
+    let stage = store
+        .import_begin(
+            "diag-staged",
+            "events",
+            "jsonl",
+            bytes.len() as u64,
+            &payload,
+            0,
+        )
+        .unwrap();
+    store.import_append(&stage.id, 0, bytes, 0).unwrap();
+    store.import_seal(&stage.id, 0).unwrap();
+    store.import_prepare_layout(&stage.id, 0).unwrap();
+    let checkpoint = store.import_prepare_record(&stage.id, 0, 1).unwrap();
+    assert_eq!(checkpoint.diagnostic_profile, None);
+    store
+        .define_diagnostic_profile("events", [(D::Service, "/svc".into())].into())
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.import_prepare_record(&stage.id, 1, 2).unwrap();
+    let artifact = store.import_publish(&stage.id, 2).unwrap();
+    assert!(
+        artifact.record_ids.iter().all(|id| store
+            .record(id)
+            .unwrap()
+            .diagnostics
+            .fields
+            .is_empty())
+    );
+    let next = store
+        .ingest("diag-next", "events", "json", br#"{"svc":"worker"}"#, 3)
+        .unwrap();
+    assert!(
+        !store
+            .record(&next.record_ids[0])
+            .unwrap()
+            .diagnostics
+            .fields
+            .is_empty()
+    );
+    for version in 9..=12 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let id = store.store_id().unwrap();
+        drop(store);
+        let columns = rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path()).unwrap();
+        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.path(), columns).unwrap();
+        db.put("store_format", format!("sparrow.store/{version}"))
+            .unwrap();
+        if version >= 11 {
+            db.put("watch_registry", b"preserved").unwrap();
+        }
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(store.store_id().unwrap(), id);
+        assert_eq!(
+            store.status(0).unwrap()["store_format"].as_str(),
+            Some(format!("sparrow.store/{}", version + 4).as_str())
+        );
+        if version >= 11 {
+            assert_eq!(
+                store.watch_registry().unwrap().as_deref(),
+                Some(b"preserved".as_slice())
+            );
+        }
+    }
+}
+
+#[test]
 fn source_alternatives_intersect_membership_time_and_context_without_duplicates() {
-    use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery, SourceFilter};
+    use sparrow_core::{JsonQuery, QueryAlternatives, QueryScope, QuerySelection, RecordQuery};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let mut artifacts = Vec::new();
@@ -39,8 +348,9 @@ fn source_alternatives_intersect_membership_time_and_context_without_duplicates(
         selection: QuerySelection::Live,
         source: None,
         sources: Some(
-            SourceFilter::new(vec!["alpha".into(), "beta".into(), "alpha".into()]).unwrap(),
+            QueryAlternatives::new(vec!["alpha".into(), "beta".into(), "alpha".into()]).unwrap(),
         ),
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 100,
         limit: 100,
@@ -153,7 +463,7 @@ fn source_alternatives_intersect_membership_time_and_context_without_duplicates(
         3
     );
     store.release(&pin.id).unwrap();
-    scope.sources = Some(SourceFilter::new(vec!["absent".into()]).unwrap());
+    scope.sources = Some(QueryAlternatives::new(vec!["absent".into()]).unwrap());
     assert_eq!(
         store
             .records_query(&scope, &RecordQuery::default(), 31 * DAY)
@@ -173,7 +483,7 @@ fn source_alternatives_intersect_membership_time_and_context_without_duplicates(
 
 #[test]
 fn source_filter_admission_uses_ingestion_byte_bounds() {
-    use sparrow_core::SourceFilter;
+    use sparrow_core::QueryAlternatives;
     for ids in [
         vec![],
         vec![String::new()],
@@ -181,9 +491,12 @@ fn source_filter_admission_uses_ingestion_byte_bounds() {
         vec!["é".repeat(257)],
         vec!["source".into(); 129],
     ] {
-        assert_eq!(SourceFilter::new(ids).unwrap_err().code, "INVALID_ARGUMENT");
+        assert_eq!(
+            QueryAlternatives::new(ids).unwrap_err().code,
+            "INVALID_ARGUMENT"
+        );
     }
-    let filter = SourceFilter::new(vec!["é".repeat(256); 128]).unwrap();
+    let filter = QueryAlternatives::new(vec!["é".repeat(256); 128]).unwrap();
     assert_eq!(filter.ids().len(), 128);
 }
 
@@ -463,7 +776,7 @@ fn recordless_index_corruption_and_batch_refusal_publish_no_retirement_prefix() 
 #[test]
 fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity() {
     use sparrow_core::EvictionLimits;
-    for (legacy, current, watch) in [(5, 9, false), (6, 10, false), (7, 11, true), (8, 12, true)] {
+    for (legacy, current, watch) in [(5, 13, false), (6, 14, false), (7, 15, true), (8, 16, true)] {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), config()).unwrap();
         let identity = store.store_id().unwrap();
@@ -1195,6 +1508,7 @@ fn eviction_preserves_record_pins_shared_projections_and_durable_retry_identity(
         selection: QuerySelection::Evidence(vec![old.record_ids[1].clone(), new.id.clone()]),
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: u64::MAX,
         limit: 100,
@@ -1445,7 +1759,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/11")
+        Some("sparrow.store/15")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -1460,7 +1774,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/11")
+        Some("sparrow.store/15")
     );
 }
 
@@ -1517,7 +1831,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/9")
+        Some("sparrow.store/13")
     );
     let digest = format!(
         "blake3:{}",
@@ -1542,7 +1856,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/10")
+        Some("sparrow.store/14")
     );
     assert_eq!(
         store
@@ -1576,7 +1890,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/12")
+        Some("sparrow.store/16")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     store
@@ -1584,7 +1898,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/12")
+        Some("sparrow.store/16")
     );
     assert_eq!(
         store
@@ -1811,7 +2125,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/11")
+        Some("sparrow.store/15")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -2133,6 +2447,7 @@ fn query_selection_intersects_filters_deduplicates_and_seeks_selected_evidence()
         ]),
         source: Some("source".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 100,
         limit: 10,
@@ -2229,6 +2544,7 @@ fn query_selection_pin_identity_revision_and_complete_artifact_retention_are_enf
         },
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: now + 1,
         limit: 10,
@@ -2685,6 +3001,7 @@ fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_by
         selection: sparrow_core::QuerySelection::Live,
         source: Some("oversized".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 10,
         limit: 100,
@@ -2831,6 +3148,7 @@ fn oversized_documents_keep_bytes_with_declared_projection_limits_or_nonapplicab
             selection: sparrow_core::QuerySelection::Live,
             source: Some("oversized".into()),
             sources: None,
+            diagnostics: Default::default(),
             received_from: 0,
             received_before: 10,
             limit: 10,
@@ -3399,6 +3717,7 @@ fn native_import_publishes_files_above_buffered_limit_without_a_whole_file_batch
         selection: sparrow_core::QuerySelection::Live,
         source: Some("copy".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 10,
         limit: 10,
@@ -5127,7 +5446,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/9")
+        Some("sparrow.store/13")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]
@@ -5181,6 +5500,7 @@ fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers()
         selection: sparrow_core::QuerySelection::Live,
         source: Some("context".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 10,
         received_before: 13,
         limit: 100,
@@ -5274,6 +5594,7 @@ fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 3,
         limit: 100,
@@ -5356,6 +5677,7 @@ fn context_keeps_record_pins_and_exposes_observed_retirement_gaps() {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: now + 1,
         limit: 100,
@@ -5406,6 +5728,7 @@ fn persisted_text_ranking_spans_scope_and_record_pins_survive_reopen() {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("logs".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 2,
         limit: 100,
@@ -5482,6 +5805,7 @@ fn decoded_text_uses_scalar_evidence_and_failed_coverage_is_visible() {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 1,
         limit: 100,
@@ -5619,6 +5943,7 @@ fn native_json_discovery_preserves_duplicates_lexical_values_and_time_scope() {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("alpha".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 100,
         received_before: 200,
         limit: 100,
@@ -5684,6 +6009,7 @@ fn projection_failure_is_visible_without_discarding_raw_evidence() {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 200,
         limit: 100,
@@ -5745,6 +6071,7 @@ fn query_budget_and_row_limit_do_not_claim_complete_coverage() {
         selection: sparrow_core::QuerySelection::Live,
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 200,
         limit: 1,
@@ -6024,6 +6351,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
         selection: sparrow_core::QuerySelection::Live,
         source: Some("logs".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 10,
         received_before: 11,
         limit: 100,
@@ -6086,6 +6414,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
         selection: sparrow_core::QuerySelection::Live,
         source: Some("parents".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 20,
         received_before: 21,
         ..scope
@@ -6131,6 +6460,7 @@ fn combined_records_qualify_before_ranking_and_preserve_native_parent_identity()
         selection: sparrow_core::QuerySelection::Live,
         source: Some("nested".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 30,
         received_before: 31,
         ..scope
@@ -6171,6 +6501,7 @@ fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
         selection: sparrow_core::QuerySelection::Live,
         source: Some("test".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 1,
         received_before: 4,
         limit: 100,
@@ -6389,6 +6720,7 @@ fn event_intervals_exclude_unknowns_sort_source_time_and_keep_retention_on_accep
         selection: sparrow_core::QuerySelection::Live,
         source: Some("events".into()),
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 100,
         limit: 1,
@@ -6547,6 +6879,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
         selection: sparrow_core::QuerySelection::Live,
         source: None,
         sources: None,
+        diagnostics: Default::default(),
         received_from: 0,
         received_before: 1,
         limit: 100,

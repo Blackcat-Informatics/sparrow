@@ -216,6 +216,7 @@ pub(super) fn advance(
         ));
     }
     let profile = progress.captured_profile(writer, &manifest.source)?;
+    let diagnostic_profile = progress.captured_diagnostic_profile(writer, &manifest.source)?;
     let mut builder = ingest::RecordBatch::new(writer)?;
     let record: Record = builder.record(ingest::RecordInput {
         id: raw.record_id,
@@ -231,6 +232,7 @@ pub(super) fn advance(
         received_at: progress.received_at,
         expires_at: progress.expires_at,
         source_time_profile: &profile,
+        diagnostic_profile: diagnostic_profile.as_ref(),
     })?;
     parse(super::super::json::write_compact(&record.encode()).as_bytes())?;
     let ingest::PreparedRecords { mut batch, .. } = builder.finish()?;
