@@ -7593,6 +7593,202 @@ async fn mcp_cancellation_admission_and_partial_frames_do_not_lose_messages() {
     oversized.close(false).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_notifications_cancel_actual_captures_without_closing_the_stdio_session() {
+    use purrdf_lex::json::{Object, Value};
+    use sparrow_test_support::anonymous_query_files;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let text = std::fs::read_to_string(&config)
+                .unwrap()
+                .replace("disk_budget = 134217728", "disk_budget = 1073741824");
+            std::fs::write(&config, text).unwrap();
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let (line, _) = sparrow_test_support::wide_jsonl_keys(1, 1, 0);
+            let path = dir.path().join("cancel.jsonl");
+            std::fs::write(&path, line.repeat(8000)).unwrap();
+            let receipt = client
+                .import_file("mcp-cancel-corpus", "cancel", wire::Format::Jsonl, &path)
+                .await
+                .unwrap();
+            assert_eq!(receipt.record_ids.len(), 8000);
+            let tcp = format!("tcp://{address}");
+            for endpoint in [socket.to_str().unwrap(), tcp.as_str()] {
+                let mut mcp = Mcp::start(endpoint);
+                mcp.initialize(1).await;
+                for (ordinal, name) in [
+                    "records_search",
+                    "values_search",
+                    "text_search",
+                    "keys_list",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert!(
+                        anonymous_query_files(daemon.0.id(), &data)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let id = if ordinal % 2 == 0 {
+                        Value::from(40_u64 + ordinal as u64)
+                    } else {
+                        Value::from(format!("cancel-{ordinal}"))
+                    };
+                    let mut arguments = Object::new()
+                        .with("source", "cancel")
+                        .with("scan_budget", 100000_u64)
+                        .with("page_size", 1_u64);
+                    if name == "text_search" {
+                        arguments.insert("text", Value::from("needle"));
+                    }
+                    mcp.send(
+                        Object::new()
+                            .with("jsonrpc", "2.0")
+                            .with("id", id.clone())
+                            .with("method", "tools/call")
+                            .with(
+                                "params",
+                                Object::new()
+                                    .with("name", name)
+                                    .with("arguments", arguments),
+                            )
+                            .into(),
+                    )
+                    .await;
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let files = anonymous_query_files(daemon.0.id(), &data).unwrap();
+                        // Keys/scoring stage only after their complete aggregation/membership
+                        // scan, so an empty anonymous file is the admitted in-flight witness.
+                        if files.iter().any(|file| {
+                            name == "keys_list" || name == "text_search" || file.len() > 0
+                        }) {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "capture was not observed for {name}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    mcp.send(
+                        Object::new()
+                            .with("jsonrpc", "2.0")
+                            .with("method", "notifications/cancelled")
+                            .with(
+                                "params",
+                                Object::new()
+                                    .with("requestId", id)
+                                    .with("reason", "qualification"),
+                            )
+                            .into(),
+                    )
+                    .await;
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !anonymous_query_files(daemon.0.id(), &data)
+                        .unwrap()
+                        .is_empty()
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "cancelled {name} staging survived"
+                        );
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    // Only the ping responds: cancellation itself and the aborted tool
+                    // must not produce an unsolicited or successful-prefix response.
+                    assert!(
+                        mcp.call(100 + ordinal as u64, "ping", Object::new().into())
+                            .await
+                            .get("error")
+                            .is_none()
+                    );
+                    let status = mcp
+                        .tool(200 + ordinal as u64, "status", Object::new().into())
+                        .await;
+                    assert_eq!(
+                        status["structuredContent"]["record_read_handles"].as_str(),
+                        Some("0")
+                    );
+                    assert_eq!(
+                        status["structuredContent"]["record_read_bytes"].as_str(),
+                        Some("0")
+                    );
+                    assert_eq!(
+                        status["structuredContent"]["live_records"].as_str(),
+                        Some("8000")
+                    );
+                }
+                let mut page = mcp
+                    .tool(
+                        300,
+                        "records_search",
+                        Object::new()
+                            .with("source", "cancel")
+                            .with("scan_budget", 100000_u64)
+                            .with("page_size", 1000_u64)
+                            .into(),
+                    )
+                    .await["structuredContent"]
+                    .clone();
+                let snapshot = page["page"]["snapshot_id"].as_str().unwrap().to_owned();
+                let mut ids = std::collections::BTreeSet::new();
+                let mut request_id = 301;
+                loop {
+                    for row in page["rows"].as_array().unwrap() {
+                        assert!(ids.insert(row["record_id"].as_str().unwrap().to_owned()));
+                    }
+                    let Some(cursor) = page["page"]["next_cursor"].as_str() else {
+                        break;
+                    };
+                    page = mcp
+                        .tool(
+                            request_id,
+                            "result_next",
+                            Object::new()
+                                .with("store_id", receipt.store_id.clone())
+                                .with("cursor", cursor)
+                                .into(),
+                        )
+                        .await["structuredContent"]
+                        .clone();
+                    request_id += 1;
+                }
+                assert_eq!(ids, receipt.record_ids.iter().cloned().collect());
+                let released = mcp
+                    .tool(
+                        request_id,
+                        "result_release",
+                        Object::new()
+                            .with("store_id", receipt.store_id.clone())
+                            .with("snapshot_id", snapshot)
+                            .into(),
+                    )
+                    .await;
+                assert_eq!(
+                    released["structuredContent"]["released"].as_bool(),
+                    Some(true)
+                );
+                assert!(
+                    anonymous_query_files(daemon.0.id(), &data)
+                        .unwrap()
+                        .is_empty()
+                );
+                mcp.close(true).await;
+            }
+            assert_eq!(cli(&socket, &["status"])["active_pins"].as_str(), Some("0"));
+        })
+        .await;
+}
+
 async fn mcp_pin_pages(socket: &Path, store: &str, artifact: &str, record: &str) -> String {
     use purrdf_lex::json::{Object, Value};
     let mut mcp = Mcp::start(socket);

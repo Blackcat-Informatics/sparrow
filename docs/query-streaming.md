@@ -173,5 +173,23 @@ releases the snapshot through the existing result owner. Cleanup failures are
 reported, not swallowed. Successfully rendered captures keep their ordinary
 replayable lease: rendering is not proof that the peer received the response,
 and a later disconnect does not revoke a cursor intended for reconnect/retry.
-Explicit cancellation-message propagation through every adapter and production
-tail-latency/resource bounds remain separate acceptance work.
+MCP `notifications/cancelled` aborts the selected tool's owned SDK connection;
+its stdio session and sibling tools remain open. The pending admission/ID slot
+is retained until that aborted job is actually retired, keeping both jobs and
+slots bounded by four even during cancellation floods. Cancelled jobs emit no
+tool reply. Direct Cap'n Proto promise cancellation and production tail-latency/
+resource bounds remain separate acceptance work.
+
+### Real MCP cancellation qualification
+
+The daemon integration scenario uses 8,000 separately identified occurrences
+of one native JSONL payload under a private 1 GiB test allowance. Over Unix and
+TCP it observes admitted anonymous capture files, sends actual cancellation
+notifications for records, values, text and keys, and requires allocation
+cleanup without closing the stdio session. Numeric and string request IDs both
+traverse the native MCP ID owner. Ping and status continue normally, with zero
+query leases/bytes and unchanged records. A subsequent complete paged MCP read
+must return every original intake ID exactly once and release its capture.
+The existing fault-endpoint scenario separately checks four-call admission,
+notification cancellation, partial framing and session responsiveness. These
+are focused scenarios, not sustained production cancellation-load acceptance.

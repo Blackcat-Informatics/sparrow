@@ -22,7 +22,9 @@ retains its permit until exit; private files and reservations are dropped, and
 completed captures abandoned before response rendering are released. Successfully
 rendered cursors retain their ordinary replayable lease. Cancellation does not
 establish non-delivery of a mutation, interrupt individual native calls or mutex
-waits, or qualify explicit cancellation-message propagation through every adapter.
+waits, or qualify direct Cap'n Proto promise cancellation. MCP cancellation
+notifications abort only the selected tool's owned SDK connection and retain its
+four-call admission slot until the job is dropped; cancelled tools emit no reply.
 See [cooperative query cancellation](query-streaming.md#cooperative-query-cancellation).
 
 MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not

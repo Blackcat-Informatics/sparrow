@@ -3,6 +3,38 @@
 
 //! Dev-only shared native storage fixtures. Runtime crates must not depend on this crate.
 
+/// Observe anonymous query allocations in an owned, uncapped Linux test daemon.
+/// Disappearing descriptors are normal races; other inspection failures remain errors.
+pub fn anonymous_query_files(
+    pid: u32,
+    store: &std::path::Path,
+) -> std::io::Result<Vec<std::fs::Metadata>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let path = entry?.path();
+        let inspect = || -> std::io::Result<Option<std::fs::Metadata>> {
+            let target = std::fs::read_link(&path)?;
+            if target.starts_with(store)
+                && target
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .ends_with(b" (deleted)")
+            {
+                Ok(Some(std::fs::metadata(&path)?))
+            } else {
+                Ok(None)
+            }
+        };
+        match inspect() {
+            Ok(Some(metadata)) => files.push(metadata),
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(files)
+}
+
 /// One bounded daemon configuration for local RPC unit and integration fixtures.
 pub fn write_server_config(
     dir: &std::path::Path,

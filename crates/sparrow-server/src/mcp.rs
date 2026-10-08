@@ -135,7 +135,10 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
         tokio::select! {
             completed = jobs.next(), if !jobs.is_empty() => {
-                if let Some(Ok((key, reply))) = completed { pending.remove(&key); send(&mut writer, &reply).await?; }
+                if let Some((key, reply)) = completed {
+                    pending.remove(&key);
+                    if let Ok(reply) = reply { send(&mut writer, &reply).await?; }
+                }
             }
             received = &mut incoming, if !eof => {
                 let bytes = match received {
@@ -167,7 +170,7 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     match method.as_str() {
                         "notifications/initialized" if initialized => ready = true,
                         "notifications/cancelled" => {
-                            if let Some(key) = params.get("requestId").and_then(id_key) && let Some(handle) = pending.remove(&key) { handle.abort(); }
+                            if let Some(key) = params.get("requestId").and_then(id_key) && let Some(handle) = pending.get(&key) { handle.abort(); }
                         }
                         _ => {},
                     }
@@ -221,7 +224,8 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         };
                         if pending.len() == 4 { send(&mut writer, &response(id, tool_result(Object::new().with("error", Object::new().with("code", "RESOURCE_LIMIT").with("message", "four MCP calls are already in progress").with("retryable", true)).into(), true))).await?; continue; }
                         let endpoint = endpoint.clone(); let result_key = key.clone(); let (handle, registration) = AbortHandle::new_pair(); pending.insert(key, handle);
-                        jobs.push(Abortable::new(async move {
+                        jobs.push(async move {
+                            let reply = Abortable::new(async move {
                             let result = tokio::time::timeout(Duration::from_secs(30), async {
                                 let client = Client::connect_endpoint(&endpoint).await.map_err(|error| match error {
                                     sparrow_client::Error::Io(error) => AgentError::from(capnp::Error::from(error)),
@@ -230,8 +234,10 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                                 operation.execute(client.capability()).await
                             }).await.unwrap_or_else(|_| Err(AgentError { code: "RPC_TIMEOUT".into(), message: "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID".into(), retryable: true }));
                             let output = match result { Ok(value) => tool_result(value, false), Err(error) => tool_result(Object::new().with("error", error.json()).into(), true) };
-                            (result_key, response(id, output))
-                        }.boxed_local(), registration));
+                            response(id, output)
+                            }, registration).await;
+                            (result_key, reply)
+                        }.boxed_local());
                     }
                     _ => send(&mut writer, &protocol_error(id, -32601, format!("unknown method: {method}"))).await?,
                 }
