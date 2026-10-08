@@ -35,7 +35,43 @@ Implementation is in progress in `/home/paudley/Active/sparrow`, on
 The current source implements schema 38; the schema sections
 below retain their historical qualification evidence.
 
-## Schema 38 active file capture (local qualification)
+## Schema 38 daemon adoption and active file capture
+
+The current service is `sparrow-development.service`, PID **3844123**, started
+at 2026-10-08T09:16:37Z. It runs
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema38-8a45378`, SHA-256
+`12cd4812d65a214e4582997749e71e49907d7280252a4757868fec338616bdeb`, with
+the configured public Cap'n Proto binding **0.0.0.0:518** and the existing private
+Unix socket. Its sole file capability remains `cap_net_bind_service=ep`.
+The matching installed CLI is `sparrow-schema38-8a45378`, SHA-256
+`63af6ff85e399dbc550f9dc7220162a25eb6d92079bf141fafedc60f1cd277c8`.
+The installed events SDK example is `events-schema38-8a45378`, SHA-256
+`85d20ee0cee250d926d6a9a53e22a2c5c3ae61c823f34e7f9169f7cd4ede9758`.
+
+Signed source `8a45378` passed the normal full commit gate. The previous owned
+schema-36 daemon exited successfully with MainPID 0, released port 518 and removed
+its Unix endpoint before a closed-store snapshot and adoption. Store identity
+`store:46c88e949ccec658600b66c7becd5bb7` and all 203 previous records survived
+the 24-to-28 store migration. The snapshot and live evidence are in
+`/tmp/sparrow-schema38-live.ckt5QQ`.
+
+Typed administration added only the owned synthetic watch
+`development-tail-8a45378`, revision 7, rooted at
+`/home/paudley/.local/state/sparrow/development-active-8a45378`.
+Live capture preserved CRLF, deferred a partial second record, drained an open
+rotated descriptor and independently captured its replacement. Four exact-byte
+record reads and file spans agree with the original files; CLI/MCP record rows
+and context provenance agree. Its two generations remain explicitly incomplete,
+covered, descriptor-held and free of observed failures. No claim directory or
+source deletion occurred. The initial acceptance driver correctly received
+range and concurrent-call refusals; the corrected sequential driver read exact
+ranges without replaying intake.
+
+The current SDK example durably ingested over `192.168.2.4:518`; exact TCP and
+Unix retries returned artifact `artifact:6a81f30ff545ca344c0d579cbffcfdce`.
+Final captured status has **208 records**, zero pins and record-read handles,
+no pending writes, and no tail admission waiting. Historical schema sections
+below describe earlier qualification rather than the current process.
 
 Recursive tail definitions use explicit `active_files_retain` producer authority,
 the existing watch catalog and the shared inotify reconciliation owner. Descriptor
@@ -65,10 +101,10 @@ with held TCP reservations as well as selecting outside the outbound ephemeral
 pool; parallel TCP reopen acceptance passed. Evidence is in
 `/tmp/sparrow-active-tail-test.log` and `/tmp/sparrow-tail-engine-gate.log`.
 
-Deployment evidence will be recorded separately after artifact capture and live
-acceptance. Full architecture acceptance remains unmet.
+Completed tail handoff, full governed SPARQL and the remaining physical/resource/
+recovery qualification remain unfinished. Full architecture acceptance is unmet.
 
-## Schema 37 file-generation checkpoint queries (not deployed)
+## Schema 37 file-generation checkpoint queries (preceding qualification)
 
 Signed core source `67f168b` publishes complete line prefixes and generation
 checkpoints through the existing atomic durable record ingestion path. Partial
@@ -94,9 +130,9 @@ The shared TCP fixture selects outside the native outbound ephemeral pool to
 avoid released reservation races with concurrent clients. Evidence is in
 `/tmp/sparrow-tail-core-commit.log` and `/tmp/sparrow-tail-wire-gate.log`.
 
-This source has not replaced the qualified schema-36 public daemon below.
-Daemon tail administration, active discovery, retained rotated descriptors and
-completed tail handoff remain unfinished. Full architecture acceptance is unmet.
+Schema 37 was qualified locally before the schema-38 adoption above. Its typed
+queries and immutable record positions are included in that deployed source.
+Completed tail handoff and full architecture acceptance remain unfinished.
 
 ## Public TCP logging worker
 

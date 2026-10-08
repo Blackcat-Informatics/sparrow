@@ -1027,7 +1027,7 @@ uses the durable claim journal and the SDK descriptor upload path before retirin
 the exact private source. Schema 15 `status.consumeWatches` reports coverage,
 bounded candidates/deferral, pending claims, completion counts and failures;
 the CLI and stdio MCP share its rendering. No live producer roots are configured
-in the development daemon. Tail watches, forced-overflow
+in the development daemon. Completed tail handoff, forced-overflow
 qualification, and whole-process crash injection at every filesystem boundary
 remain unfinished. Ordinary upload continues to preserve every caller source.
 
@@ -1052,7 +1052,7 @@ sparrow SOCKET_PATH watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION R
 sparrow SOCKET_PATH watch handoff INTENT.capnp
 sparrow SOCKET_PATH watch handoff-status INTENT.capnp
 # Save intents outside consumption roots; retry the same intent after uncertain delivery.
-# Tail watches remain unfinished.
+# Completed tail handoff remains unfinished.
 
 sparrow records search --service worker --severity ERROR --text timeout
 sparrow record get record:42
