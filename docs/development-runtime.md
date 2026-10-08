@@ -2,12 +2,90 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 46 and store format 37. The stable installed
+private Unix socket. It uses schema 47 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`ebea75a`; see [tail generation discovery](#tail-generation-discovery) for
+`f9fee6c`; see [syslog listener discovery](#syslog-listener-discovery) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Syslog listener discovery
+
+Signed source `cf16519` adds schema 47 source references and the generated
+`syslogListenerGet` operation; final installed source `f9fee6c` also preserves
+typed registry failures on source listing. Source pages now carry sorted
+`syslog_listener_ids` supplied by the runtime registry, including listeners with
+no packets and several listeners sharing one source. Configured IDs and exact
+source labels count against the existing scan/capture admission. Continuation
+freezes the original bindings. No new parser, scoring law or runtime dependency
+is introduced, and no store format migration is needed.
+
+`syslog-listener STORE_ID SOURCE LISTENER_ID` and the closed read-only MCP tool
+`syslog_listener_get` use that same typed RPC. Store/source/schema/ID guards
+refuse wrong namespaces, old schemas, invalid declarations and missing or rebound
+listeners. The reply exposes the existing transport/framing, actual binding,
+bounds, active connections and observed counters. Status and both adapters use
+one canonical listener renderer. Counters are current process observations and
+reset on restart; producer continuity and UDP kernel/network loss remain unknown.
+
+The native storage scenario qualifies shared-source sorting, empty listeners,
+frozen continuation after binding removal, exact source selection, duplicate and
+oversized declaration refusal, tiny scan refusal without a lease, and reopen
+without persisting runtime authority. The existing real daemon TCP/UDP packet
+scenario now traverses source pages from TCP CLI through Unix MCP, resolves every
+empty listener through generated Rust, CLI and MCP, checks namespace/schema
+failures and compares counters after real intake. A separate actual poisoned
+registry scenario verifies typed `STORAGE_FAILURE` from both lookup and source
+discovery, with no source lease published. Its daemon configuration was moved
+into `sparrow-test-support` for one dev-only implementation shared with RPC tests.
+The first correction gate rejected a test function listed as a helper entry point;
+the row now names the actual shared fixture home and retains both test files as
+vectors. No detector or duplicate exception was changed. The final full source
+gate passed: 150 storage scenarios, 58 RPC scenarios, the remaining workspace
+tests, seeded census self-tests and 233 ledger jobs with zero distinct exceptions.
+
+The selected executables were built after verification and frozen with source and
+SHA-256 readback at `~/.local/state/sparrow/syslog-discovery-images-mzod7gq1`.
+Independent Btrfs qualification at `syslog-discovery-qual-2gz_ct5d` uses three
+private loopback listeners, two sharing a source. Before intake, all bindings are
+discoverable with zero records. Two identical modern TCP packets, the same UDP
+packet and a malformed UDP packet create four independent records; an oversized
+datagram is observed as truncated without publication. Listener counters match
+those observations. A source capture taken before intake still returns its
+original zero count after publication, while a fresh read reports four records.
+All four byte exports match their original inputs, including three equal payloads
+with distinct occurrences. Reopen resets listener counters while preserving all
+four IDs and exact bytes. Removing the shared listeners removes only their fresh
+bindings: their retained source still reports four records, and lookup refuses
+with `NOT_FOUND`. Final read handles are zero and the private owner closes cleanly.
+
+The earlier `syslog-discovery-qual-nzxz4u67` driver stopped on incorrect export
+field names; the corrected qualification uses the actual `byte_start`/`byte_end`
+contract. Parent image `cf16519` also passed at `syslog-discovery-qual-x_9mxfdu`.
+Its independent closed 7,058-record copy at `json-pages-qualification-5ot9qbge`
+preserves predecessor record/text rows, ranking witnesses, artifact groups,
+51 keys and 286 value occurrences. Broad traversal returns every record in
+48 bounded pages. Fingerprinted images, drivers, logs, original/exported bytes
+and reports retain these methods; private runs leave the public owner unchanged.
+
+Final public adoption evidence is
+`/tmp/sparrow-syslog-discovery-live.o2sdh4yt`, with the closed predecessor backup,
+saved-intent retries, source/generation pages, grouped/JSON/field-time comparisons,
+tool declaration, typed missing-listener replies, image/alias SHA readback,
+capability, listener and unit evidence. The enabled unit is active at PID 593030
+on `0.0.0.0:518`, LAN `192.168.2.4:518`, and the existing Unix endpoint. All
+21 sources preserve every predecessor field; the added listener references are
+explicitly empty because public syslog remains unconfigured. Store identity
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37 and 212 records are unchanged,
+with zero pins/read leases and healthy watches/durability. No new public intake
+or source retirement was performed; the saved-intent driver's historical
+two-record checkpoint wording describes its original acceptance, not this cutover.
+
+This completes current listener discovery, not durable receiver-stream windows
+or per-record receiver sequence/gap relationships. Those contracts, complete
+governed SPARQL/correlation/explanations, prompt query cancellation, production
+volume/quota qualification, forced native physical reclamation and reboot
+acceptance remain unfinished.
 
 ## Abandoned query capture cleanup
 
