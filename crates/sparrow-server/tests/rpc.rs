@@ -5207,6 +5207,134 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
     }).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn killed_owner_restarts_without_socket_unlink_and_preserves_durable_evidence() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let receipt = client
+                .ingest(
+                    "socket-restart",
+                    "restart",
+                    wire::Format::Jsonl,
+                    b"{\"message\":\"first\"}\n{\"message\":\"second\"}\n",
+                )
+                .await
+                .unwrap();
+            let before = cli(&socket, &["records", "--source", "restart"]);
+            let held = cli(
+                &socket,
+                &["records", "--source", "restart", "--page-size", "1"],
+            );
+            let cursor = held["page"]["next_cursor"].as_str().unwrap().to_owned();
+            drop(client);
+            drop(daemon); // SIGKILL and wait; deliberately leave the original socket name.
+            assert!(socket.exists());
+            let mut daemon = start(&config, &socket).await;
+            let after = cli(&socket, &["status"]);
+            assert_eq!(after["store_id"].as_str(), Some(receipt.store_id.as_str()));
+            assert_eq!(after["live_records"].as_str(), Some("2"));
+            assert_eq!(after["record_read_handles"].as_str(), Some("0"));
+            assert_eq!(after["record_read_bytes"].as_str(), Some("0"));
+            assert_eq!(
+                cli(&socket, &["records", "--source", "restart"])["rows"],
+                before["rows"]
+            );
+            let tcp = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            assert_eq!(tcp.discovery().store_id, receipt.store_id);
+            let old = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args(["result-next", &receipt.store_id, &cursor])
+                .admitted_output()
+                .unwrap();
+            assert!(!old.status.success() && old.stdout.is_empty());
+            assert!(
+                String::from_utf8(old.stderr)
+                    .unwrap()
+                    .contains("RESULT_EXPIRED")
+            );
+            drop(tcp);
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
+                rustix::process::Signal::INT,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = daemon.0.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "recovered daemon shutdown stalled"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!socket.exists());
+        })
+        .await;
+}
+
+#[test]
+fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
+    use std::os::unix::fs::MetadataExt;
+    for kind in ["file", "symlink", "listener"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        std::fs::create_dir(&data).unwrap();
+        let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        let target = dir.path().join("preserved");
+        std::fs::write(&target, b"keep").unwrap();
+        let foreign = match kind {
+            "file" => {
+                std::fs::write(&socket, b"keep").unwrap();
+                None
+            }
+            "symlink" => {
+                std::os::unix::fs::symlink(&target, &socket).unwrap();
+                None
+            }
+            _ => Some(std::os::unix::net::UnixListener::bind(&socket).unwrap()),
+        };
+        let before = std::fs::symlink_metadata(&socket).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+            .arg("--config")
+            .arg(&config)
+            .admitted_output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "occupied endpoint was admitted: {kind}"
+        );
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(
+            stderr.contains("preserving it"),
+            "unexpected refusal: {stderr}"
+        );
+        assert!(
+            !stderr.contains("pthread lock"),
+            "startup left its worker unjoined"
+        );
+        let after = std::fs::symlink_metadata(&socket).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        if foreign.is_some() {
+            assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+        } else {
+            assert_eq!(std::fs::read(&socket).unwrap(), b"keep");
+        }
+    }
+}
+
 async fn start(config: &Path, socket: &Path) -> Daemon {
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_sparrowd"))

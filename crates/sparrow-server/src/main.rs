@@ -4,8 +4,10 @@
 //! One database owner, serving typed Cap'n Proto RPC over Unix and configured TCP sockets.
 
 use sparrow_server::{Rpc, ServerConfig, sparrow_capnp::sparrow};
-use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 use tokio::sync::Semaphore;
+
+mod local_endpoint;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,9 +34,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         watches.clone(),
         operations.clone(),
     )?);
-    // Validate the watch catalog before publishing an endpoint, and refuse an existing socket.
-    let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
-    std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
+    // Validate the catalog first; recover only a refused socket under exclusive store ownership.
+    let endpoint = match local_endpoint::LocalEndpoint::bind(&config.socket_path, &store).await {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            if let Err(shutdown) = consumer
+                .take()
+                .expect("worker started above")
+                .shutdown()
+                .await
+            {
+                return Err(format!("{error}; consume shutdown failed: {shutdown}").into());
+            }
+            return Err(error.into());
+        }
+    };
     let connections = Arc::new(Semaphore::new(config.max_rpc_connections));
     let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
     let mut syslog = if config.syslog.is_empty() {
@@ -120,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("sparrowd: pressure maintenance failed: {error}");
                     }
                 }
-                accepted = listener.accept() => {
+                accepted = endpoint.listener.accept() => {
                     let (stream, _) = accepted?;
                     sparrow_server::admit_connection(stream, client.clone(), connections.clone());
                 }
@@ -138,6 +152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serving
     }).await;
     store.flush()?;
-    std::fs::remove_file(&config.socket_path)?;
+    endpoint.remove_name()?;
     serving
 }

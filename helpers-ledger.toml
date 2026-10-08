@@ -3327,3 +3327,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(stage_record_rows_elsewhere|copy_query_spool)$']
+
+[[job]]
+id = "owned-local-endpoint"
+summary = "Under exclusive store ownership, recover only a refused socket with unchanged device/inode, preserve live or unproven endpoints and non-sockets, and remove only the original owned name on shutdown."
+home = "sparrowd::local_endpoint::LocalEndpoint::bind"
+entry_points = ["sparrowd::local_endpoint::LocalEndpoint::remove_name", "sparrowd::local_endpoint::remove_socket", "sparrowd::local_endpoint::socket_identity"]
+spec = "docs/interfaces.md: local endpoint recovery."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(unlink_stale_socket_elsewhere|replace_local_endpoint)$']

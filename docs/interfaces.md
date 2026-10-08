@@ -19,6 +19,20 @@ MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not
 implement separate filtering, retention, pin, or query semantics. The daemon
 owns the database; the local CLI and stdio MCP adapter connect to it.
 
+### Local endpoint recovery
+
+The Unix socket is directly inside the private store directory. Startup first
+obtains the native exclusive store lock and validates the watch catalog. If bind
+finds an occupied name, the daemon requires a socket (never a symlink or regular
+file), a connection refusal from a bounded 250 ms probe and an unchanged
+device/inode before removing that stale name and rebinding. A live connection,
+probe timeout, other error or changed identity refuses startup and preserves the
+name. Recovery coordinates with other Sparrow owners through the store lock;
+the private directory remains its pathname ownership boundary. Shutdown removes
+only the original bound socket identity and reports a replacement as a failure.
+Socket-bind refusal joins the already-started consume worker before returning.
+The public TCP bind still happens before opening or migrating the store.
+
 ## 1. Common types and defaults
 
 | Type | Contract |
