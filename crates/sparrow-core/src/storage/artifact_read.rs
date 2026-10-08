@@ -71,14 +71,7 @@ impl catalog_lease::Selector for ArtifactSelector {
                 .map(crate::QueryAlternatives::capacity)
                 .sum::<usize>()
             + usize::from(!self.diagnostics.is_empty()) * 1024
-            + match &self.selection {
-                crate::QuerySelection::Live => 0,
-                crate::QuerySelection::Evidence(ids) => {
-                    ids.capacity() * std::mem::size_of::<String>()
-                        + ids.iter().map(String::capacity).sum::<usize>()
-                }
-                crate::QuerySelection::Pin { id, .. } => id.capacity(),
-            }
+            + self.selection.capacity()
     }
 }
 

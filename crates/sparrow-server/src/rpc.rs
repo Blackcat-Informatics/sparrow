@@ -1546,13 +1546,35 @@ impl wire::sparrow::Server for Rpc {
             require_complete_index: input.get_require_complete_index(),
         };
         let has_text = query.text.is_some();
+        if let wire::optional_text::Value(cursor) = input.get_cursor()?.which()?
+            && cursor?.len() > 160
+        {
+            failure(
+                results.get().init_result(),
+                invalid("record cursor exceeds 160 bytes"),
+            );
+            return Ok(());
+        }
+        let cursor = optional(input.get_cursor()?)?;
         match self
-            .work(move |store, now| store.records_query(&scope?, &query, now))
+            .work(move |store, now| {
+                let page = store.records_read(
+                    &sparrow_core::RecordRead {
+                        scope: scope?,
+                        query,
+                        cursor,
+                    },
+                    now,
+                )?;
+                let value = page.body.result()?;
+                Ok((page, value))
+            })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
-            Ok(value) => {
+            Ok((page, value)) => {
                 let mut out = results.get().init_result().init_ok();
+                catalog_receipt(out.reborrow().init_page(), &page);
                 receipt(out.reborrow().init_receipt(), &value)?;
                 out.set_field_visits(number(&value, "field_visits")?);
                 count(
@@ -1771,6 +1793,11 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_source_read_handles(number(&value, "max_source_read_handles")?);
                 out.set_max_source_read_bytes(number(&value, "max_source_read_bytes")?);
                 out.set_source_read_lease_ms(number(&value, "source_read_lease_ms")?);
+                out.set_record_read_handles(number(&value, "record_read_handles")?);
+                out.set_record_read_bytes(number(&value, "record_read_bytes")?);
+                out.set_max_record_read_handles(number(&value, "max_record_read_handles")?);
+                out.set_max_record_read_bytes(number(&value, "max_record_read_bytes")?);
+                out.set_record_read_lease_ms(number(&value, "record_read_lease_ms")?);
             }
         }
         Ok(())

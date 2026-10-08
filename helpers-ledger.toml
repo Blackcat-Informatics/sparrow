@@ -2383,3 +2383,45 @@ enforced = true
 constants = []
 fingerprints = []
 names = []
+
+[[job]]
+id = "record-result-capture"
+summary = "One record matcher and native ranker serves both bounded direct reads and complete immutable result captures; capture exhaustion refuses without a prefix."
+home = "sparrow_core::storage::text_index::Store::records_query_capture"
+entry_points = ["sparrow_core::storage::text_index::Store::records_query", "sparrow_core::storage::Store::records_read"]
+spec = "docs/interfaces.md: schema 28 record pagination."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^paged_record_matcher$']
+
+[[job]]
+id = "record-result-page-body"
+summary = "Bounded encoded result ownership uses PurRDF JSON, preserving immutable native receipts and rows without keeping database versions."
+home = "sparrow_core::storage::record_read::RecordPageBody::capture"
+entry_points = ["sparrow_core::storage::record_read::RecordPageBody::result", "sparrow_core::storage::record_read::RecordPageBody::page_end", "sparrow_core::storage::record_read::RecordPageBody::is_boundary"]
+spec = "docs/interfaces.md: bounded native record result pages and variable byte boundaries."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "query-selector-capacity"
+summary = "Typed query owners account retained membership, alternatives and predicate allocations once, shared by artifact and record leases."
+home = "sparrow_core::query::QuerySelection::capacity"
+entry_points = ["sparrow_core::query::QueryScope::capacity", "sparrow_core::query::RecordQuery::capacity"]
+spec = "docs/interfaces.md: finite leased selector and result capacity."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []

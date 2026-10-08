@@ -131,6 +131,9 @@ struct Status {
   sourceReadHandles @32 :UInt64; sourceReadBytes @33 :UInt64;
   maxSourceReadHandles @34 :UInt64; maxSourceReadBytes @35 :UInt64;
   sourceReadLeaseMs @36 :UInt64;
+  recordReadHandles @37 :UInt64; recordReadBytes @38 :UInt64;
+  maxRecordReadHandles @39 :UInt64; maxRecordReadBytes @40 :UInt64;
+  recordReadLeaseMs @41 :UInt64;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
@@ -357,6 +360,7 @@ struct RecordQuery {
   scope @0 :Scope; text @1 :OptionalText; fields @2 :List(FieldConstraint);
   requireCompleteIndex @3 :Bool;
   eventInterval @4 :OptionalEventInterval;
+  cursor @5 :OptionalText;
 }
 struct OptionalOccurrence { union { absent @0 :Void; value @1 :UInt64; } }
 struct FieldEvidence {
@@ -376,6 +380,7 @@ struct RecordsResults {
   fieldVisits @3 :UInt64; qualifiedRecords @4 :Count;
   timeBasis @5 :TimeBasis; eventCoverage @6 :EventCoverage;
   knownQualifiedRecords @7 :UInt64;
+  page @8 :CatalogReadReceipt;
 }
 # Private upload progress is distinct from accepted evidence.
 struct ImportRef { storeId @0 :Text; id @1 :Text; }

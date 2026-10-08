@@ -254,8 +254,49 @@ candidate scan; it is not an all-I/O budget. Explicit field/text reads seek only
 resolved candidates, ordered by receipt time and ID. Context reads continue
 bounded directional scans of the source catalog, excluding unselected records
 and reporting a scan frontier when the budget is exhausted. The writer lock
-holds membership stable throughout each operation. Persistent query snapshots,
-query cursors and complete scope receipts remain unfinished.
+holds membership stable throughout each operation. Schema 28 adds immutable
+result captures and cursors for `recordsSearch`, including its same-record field,
+source-time and native ranked-text forms. Standalone key/value/text pagination and
+the remaining complete scope receipt fields remain unfinished.
+
+### Record result pagination
+
+Typed `RecordQuery.cursor`, CLI `records --cursor CURSOR --page-size N`, and MCP
+`records_search.cursor/page_size` use one captured result. `Scope.limit`, CLI
+`--limit`, and MCP `limit` are page item ceilings for this operation; the agent
+adapters refuse supplying both page-size spellings. Other query operations retain
+their existing limit semantics. The daemon uses the complete-capture mode of the
+existing record matcher and native ranker, rather than paging a truncated prefix.
+Candidate scan exhaustion, more than 10,000 matches, and result capacity exhaustion
+refuse with `RESOURCE_LIMIT` before a page or handle is published. Diagnostic and
+applicable index uncertainty remains explicit in the original query receipt.
+
+`RecordsResults.page` is the shared typed catalog capture receipt. Agent output
+keeps it in `page` alongside the original semantic `receipt`; its store/snapshot,
+as-of, absolute deadline, total captured rows, page start and continuation describe
+pagination. `total_items` counts captured proven rows, while semantic matching
+counts retain their existing unknown/lower-bound laws. Pagination alone does not
+mark query execution limited. Query receipt, coverage, time basis, ranking corpus,
+native scores and witnesses are frozen across pages. Reading summaries neither
+protects evidence nor renews the lease; raw bytes independently check retention.
+
+A capture owns at most 2 MiB including encoded native JSON metadata/rows and
+selector capacity, with 32 KiB per row and 32 KiB metadata ceilings. PurRDF's native
+codec owns encoding and page reconstruction; no database snapshot versions are
+retained. Pages conservatively charge duplicated typed record/text rendering and
+may return fewer than the requested 1..1000 items to fit 256 KiB. Variable byte
+boundaries are verified by the shared lease owner. Eight handles and 8 MiB retained
+result capacity are shared by Store clones, with fixed 60-second wall/monotonic
+expiry. Status exposes record result handle counts, retained bytes and ceilings.
+
+Cursors bind every membership, predicate, text query, time interval, strictness and
+limit. Continuations replay captured rows after pin mutation/release and evidence
+retirement; fresh reads revalidate current evidence. A changed query refuses with
+`CONFLICT`, an invalid page boundary with `INVALID_ARGUMENT`, and expired, unknown
+or previous-owner handles with `RESULT_EXPIRED`. Current schema 28 is required;
+storage formats remain unchanged. `scanned` records candidate visits, not all I/O:
+reference expansion, field visits and posting visits retain their independent
+documented bounds and original coverage evidence.
 
 SPARQL additionally selects graph layers `metadata`, `diagnostic`, and `content`,
 defaulting to all three. The default RDF graph is the set union of visible
@@ -507,7 +548,7 @@ decoding, typed coverage encoding and rendering.
 Cursors bind the original membership, selector and limits. Continuation serves
 the immutable capture after pin release, collection changes or evidence retirement;
 fresh reads revalidate current evidence. No read renews protection. Current
-discovery schema 27 is required; old clients/daemons are explicitly refused.
+discovery schema 28 is required; old clients/daemons are explicitly refused.
 Storage formats and retained evidence encodings are unchanged.
 
 Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`

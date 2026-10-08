@@ -8308,3 +8308,270 @@ fn artifact_filter_pages_freeze_coverage_and_bind_all_filters() {
         "CONFLICT"
     );
 }
+
+fn record_page_scope(source: &str, page_size: usize) -> sparrow_core::QueryScope {
+    sparrow_core::QueryScope {
+        selection: sparrow_core::QuerySelection::Live,
+        source: Some(source.into()),
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: u64::MAX,
+        limit: page_size,
+        scan_budget: 10000,
+    }
+}
+
+#[test]
+fn record_pages_capture_more_than_the_old_row_ceiling_without_limited_execution() {
+    use sparrow_core::{RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest(
+            "record-pages-large",
+            "pages",
+            "jsonl",
+            b"{}\n".repeat(1005).as_slice(),
+            1,
+        )
+        .unwrap();
+    let mut query = RecordRead {
+        scope: record_page_scope("pages", 113),
+        query: RecordQuery::default(),
+        cursor: None,
+    };
+    let first = store.records_read(&query, 2).unwrap();
+    assert_eq!(first.total_items, 1005);
+    assert!(first.next_cursor.is_some());
+    let mut ids = std::collections::BTreeSet::new();
+    let mut page = first.clone();
+    loop {
+        let value = page.body.result().unwrap();
+        assert_eq!(value["execution"].as_str(), Some("complete"));
+        assert_eq!(value["qualified_records"].as_str(), Some("1005"));
+        assert!(value["rows"].as_array().unwrap().len() <= 113);
+        for row in value["rows"].as_array().unwrap() {
+            assert!(ids.insert(row["record_id"].as_str().unwrap().to_owned()));
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        query.cursor = Some(cursor);
+        page = store.records_read(&query, 3).unwrap();
+        assert_eq!(page.snapshot_id, first.snapshot_id);
+        assert_eq!(page.as_of, first.as_of);
+        assert_eq!(page.lease_expires_at, first.lease_expires_at);
+    }
+    assert_eq!(ids, artifact.record_ids.into_iter().collect());
+    query.scope.limit = 1;
+    assert_eq!(store.records_read(&query, 3).unwrap_err().code, "CONFLICT");
+}
+
+#[test]
+fn record_pages_keep_pin_capture_after_release_and_retirement_and_expire_absolutely() {
+    use sparrow_core::{QuerySelection, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("record-pages-pin", "pages", "log", b"a\nb\nc\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("record-pages-protect", "pages", &[artifact.id], 40, 0)
+        .unwrap();
+    let mut scope = record_page_scope("pages", 1);
+    scope.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision),
+    };
+    let mut query = RecordRead {
+        scope,
+        query: RecordQuery::default(),
+        cursor: None,
+    };
+    let first = store.records_read(&query, 31 * DAY).unwrap();
+    query.cursor = first.next_cursor.clone();
+    let before = store.records_read(&query, 31 * DAY).unwrap();
+    store
+        .release_retry("record-pages-release", &pin.id, 31 * DAY + 1)
+        .unwrap();
+    store.expire(31 * DAY + 2).unwrap();
+    assert_eq!(store.records_read(&query, 31 * DAY + 3).unwrap(), before);
+    let mut fresh = query.clone();
+    fresh.cursor = None;
+    assert_eq!(
+        store.records_read(&fresh, 31 * DAY + 3).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    query.query.text = Some("needle".into());
+    assert_eq!(
+        store.records_read(&query, 31 * DAY + 3).unwrap_err().code,
+        "CONFLICT"
+    );
+    query.query.text = None;
+    assert_eq!(
+        store
+            .records_read(&query, first.lease_expires_at)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store.status(first.lease_expires_at).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+    drop(store);
+    let reopened = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        reopened
+            .records_read(&query, 31 * DAY + 4)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+}
+
+#[test]
+fn ranked_record_pages_freeze_native_corpus_scores_and_diagnostic_coverage() {
+    use sparrow_core::{DiagnosticDimension as D, QueryAlternatives, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_diagnostic_profile("pages", [(D::Service, "/svc".into())].into())
+        .unwrap();
+    store.ingest("record-pages-ranked", "pages", "jsonl",
+        b"{\"svc\":\"worker\",\"message\":\"needle\"}\n{\"svc\":\"worker\",\"message\":\"needle needle\"}\n{\"message\":\"needle\"}\n", 1).unwrap();
+    let mut scope = record_page_scope("pages", 1);
+    scope.diagnostics = [(
+        D::Service,
+        QueryAlternatives::new(vec!["worker".into()]).unwrap(),
+    )]
+    .into();
+    let mut query = RecordRead {
+        scope: scope.clone(),
+        query: RecordQuery {
+            text: Some("needle".into()),
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let first = store.records_read(&query, 2).unwrap();
+    let first_value = first.body.result().unwrap();
+    assert_eq!(first_value["execution"].as_str(), Some("complete"));
+    assert_eq!(first_value["certainty"].as_str(), Some("incomplete"));
+    assert_eq!(
+        first_value["coverage"]["diagnostic_scope"]["unknown"].as_str(),
+        Some("1")
+    );
+    assert!(first_value["qualified_records"].is_null());
+    scope.limit = 1000;
+    let expected = store.records_query(&scope, &query.query, 2).unwrap();
+    store
+        .ingest(
+            "record-pages-ranked-new",
+            "pages",
+            "jsonl",
+            b"{\"svc\":\"worker\",\"message\":\"needle\"}\n",
+            3,
+        )
+        .unwrap();
+    query.cursor = first.next_cursor;
+    let second = store
+        .records_read(&query, 4)
+        .unwrap()
+        .body
+        .result()
+        .unwrap();
+    assert_eq!(second["ranking"], first_value["ranking"]);
+    assert_eq!(second["coverage"], first_value["coverage"]);
+    let mut actual = first_value["rows"].as_array().unwrap().clone();
+    actual.extend(second["rows"].as_array().unwrap().iter().cloned());
+    assert_eq!(
+        actual.as_slice(),
+        expected["rows"].as_array().unwrap().as_slice()
+    );
+}
+
+#[test]
+fn record_pages_admit_variable_byte_boundaries_and_refuse_without_publishing_prefixes() {
+    use sparrow_core::{FieldConstraint, JsonPredicate, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let key = "k".repeat(2048);
+    let line = format!("{{\"{key}\":1}}\n");
+    store
+        .ingest(
+            "record-pages-bytes",
+            "pages",
+            "jsonl",
+            line.repeat(20).as_bytes(),
+            1,
+        )
+        .unwrap();
+    let field = FieldConstraint {
+        predicate: JsonPredicate {
+            path: Some(format!("/{key}")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut query = RecordRead {
+        scope: record_page_scope("pages", 100),
+        query: RecordQuery {
+            fields: vec![field.clone(); 4],
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let first = store.records_read(&query, 2).unwrap();
+    let first_rows = first.body.result().unwrap()["rows"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(first_rows > 1 && first_rows < 20);
+    assert_eq!(first.total_items, 20);
+    query.cursor = Some(format!("{}/1", first.snapshot_id));
+    assert_eq!(
+        store.records_read(&query, 2).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+    query.cursor = first.next_cursor.clone();
+    let second = store.records_read(&query, 2).unwrap();
+    assert_eq!(second.page_start, first_rows);
+    let mut fresh = query.clone();
+    fresh.cursor = None;
+    fresh.scope.scan_budget = 1;
+    assert_eq!(
+        store.records_read(&fresh, 2).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    fresh.scope.scan_budget = 10000;
+    fresh.query.fields = vec![field; 20];
+    assert_eq!(
+        store.records_read(&fresh, 2).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(2).unwrap()["record_read_handles"].as_str(),
+        Some("1")
+    );
+    let clone = store.clone();
+    query.cursor = None;
+    for _ in 1..8 {
+        clone.records_read(&query, 2).unwrap();
+    }
+    assert_eq!(
+        store.status(2).unwrap()["record_read_handles"].as_str(),
+        Some("8")
+    );
+    assert_eq!(
+        store.records_read(&query, 2).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    store.expire(first.lease_expires_at).unwrap();
+    assert_eq!(
+        clone.status(first.lease_expires_at).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+}

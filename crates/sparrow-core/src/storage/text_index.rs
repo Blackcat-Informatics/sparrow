@@ -93,8 +93,23 @@ impl Store {
         query: &crate::RecordQuery,
         now: u64,
     ) -> Result<Value, Error> {
+        self.records_query_capture(scope, query, now, false)
+    }
+
+    pub(super) fn records_query_capture(
+        &self,
+        scope: &crate::QueryScope,
+        query: &crate::RecordQuery,
+        now: u64,
+        capture: bool,
+    ) -> Result<Value, Error> {
         scope.validate()?;
         query.validate()?;
+        let row_limit = if capture {
+            catalog_lease::MAX_ITEMS
+        } else {
+            scope.limit
+        };
         let strict = scope.require_complete_index || query.require_complete_index;
         let mut diagnostics = super::diagnostic::DiagnosticCoverage::default();
         let writer = self.lock()?;
@@ -143,6 +158,12 @@ impl Store {
                 break;
             }
             if visited == scope.scan_budget {
+                if capture {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "record capture exhausted candidate scan_budget; narrow scope or raise the budget; no page published",
+                    ));
+                }
                 limited = true;
                 break;
             }
@@ -187,8 +208,14 @@ impl Store {
                 continue;
             };
             qualified += 1;
+            if capture && query.text.is_none() && qualified > row_limit {
+                return Err(Error::new(
+                    "RESOURCE_LIMIT",
+                    "record capture exceeds 10000 matches; narrow scope",
+                ));
+            }
             if query.text.is_none() {
-                if query.event_interval.is_some() || chronological.len() < scope.limit {
+                if query.event_interval.is_some() || chronological.len() < row_limit {
                     let row: Value = Object::new()
                         .with("record_id", record.id.clone())
                         .with("artifact_id", record.artifact_id.clone())
@@ -202,7 +229,7 @@ impl Store {
                         .into();
                     capture_bytes += json::write_compact(&row).len();
                     if capture_bytes
-                        > if query.event_interval.is_some() {
+                        > if query.event_interval.is_some() && !capture {
                             64 * 1024 * 1024
                         } else {
                             2 * 1024 * 1024
@@ -281,13 +308,19 @@ impl Store {
             .with("outside_interval", event_outside.to_string())
             .with("membership_complete", diagnostics.complete(limited));
         if query.text.is_none() {
-            limited |= qualified > scope.limit;
+            limited |= qualified > row_limit;
             chronological.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             let mut response_bytes = 0_usize;
             let mut selected_rows = Vec::new();
-            for (_, _, row) in chronological.into_iter().take(scope.limit) {
+            for (_, _, row) in chronological.into_iter().take(row_limit) {
                 response_bytes += json::write_compact(&row).len();
                 if response_bytes > 2 * 1024 * 1024 {
+                    if capture {
+                        return Err(Error::new(
+                            "RESOURCE_LIMIT",
+                            "record result capture exceeds 2 MiB; narrow scope",
+                        ));
+                    }
                     limited = true;
                     break;
                 }
@@ -418,10 +451,16 @@ impl Store {
             scored.push((score, id.clone()));
         }
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        limited |= scored.len() > scope.limit;
+        if capture && scored.len() > row_limit {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "ranked record capture exceeds 10000 matches; narrow scope",
+            ));
+        }
+        limited |= scored.len() > row_limit;
         let mut rows = Vec::new();
         let mut response_bytes = 0_usize;
-        for (score, id) in scored.into_iter().take(scope.limit) {
+        for (score, id) in scored.into_iter().take(row_limit) {
             let (record, _) = &documents[&id];
             let mut evidence = Vec::<Value>::new();
             let mut evidence_limited = false;
@@ -483,6 +522,12 @@ impl Store {
                 .into();
             response_bytes += json::write_compact(&row).len();
             if response_bytes > 2 * 1024 * 1024 {
+                if capture {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "ranked result capture exceeds 2 MiB; narrow scope",
+                    ));
+                }
                 limited = true;
                 break;
             }

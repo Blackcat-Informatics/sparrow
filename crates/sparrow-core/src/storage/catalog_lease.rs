@@ -53,6 +53,12 @@ pub(super) trait PageBody: Sized {
     fn len(&self) -> usize;
     fn capacity(&self) -> usize;
     fn page(&self, start: usize, end: usize) -> Self;
+    fn page_end(&self, start: usize, page_size: usize) -> usize {
+        self.len().min(start + page_size.min(Self::PAGE_ITEMS))
+    }
+    fn is_boundary(&self, start: usize, page_size: usize) -> bool {
+        start.is_multiple_of(page_size.min(Self::PAGE_ITEMS))
+    }
 }
 
 /// Complete immutable metadata capture with bounded pagination.
@@ -108,10 +114,7 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
         now < self.expires_at && self.started.elapsed() < Duration::from_millis(LEASE_MS)
     }
     fn page(&self, start: usize) -> CatalogReadPage<B> {
-        let end = self
-            .body
-            .len()
-            .min(start + self.page_size.min(B::PAGE_ITEMS));
+        let end = self.body.page_end(start, self.page_size);
         CatalogReadPage {
             store_id: self.store_id.clone(),
             snapshot_id: self.id.clone(),
@@ -185,7 +188,7 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
         }
         if start == 0
             || start >= snapshot.body.len()
-            || !start.is_multiple_of(snapshot.page_size.min(B::PAGE_ITEMS))
+            || !snapshot.body.is_boundary(start, snapshot.page_size)
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",

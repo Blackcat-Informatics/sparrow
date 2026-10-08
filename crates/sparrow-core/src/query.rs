@@ -4,7 +4,7 @@
 //! Bounded concrete JSON occurrence queries over stored native facts.
 
 /// Explicit scope shared by JSON discovery operations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryScope {
     /// Membership resolved and validated before applying source/time predicates.
     pub selection: QuerySelection,
@@ -44,6 +44,17 @@ pub enum QuerySelection {
 }
 
 impl QuerySelection {
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::Live => 0,
+            Self::Evidence(ids) => {
+                ids.capacity() * std::mem::size_of::<String>()
+                    + ids.iter().map(String::capacity).sum::<usize>()
+            }
+            Self::Pin { id, .. } => id.capacity(),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
         match self {
             Self::Live => Ok(()),
@@ -103,6 +114,18 @@ impl QueryAlternatives {
 }
 
 impl QueryScope {
+    pub(crate) fn capacity(&self) -> usize {
+        self.selection.capacity()
+            + self.source.as_ref().map_or(0, String::capacity)
+            + self
+                .sources
+                .iter()
+                .chain(self.diagnostics.values())
+                .map(QueryAlternatives::capacity)
+                .sum::<usize>()
+            + usize::from(!self.diagnostics.is_empty()) * 1024
+    }
+
     pub(crate) fn matches_source(&self, source: &str) -> bool {
         self.source.as_deref().is_none_or(|id| id == source)
             && self
@@ -145,7 +168,7 @@ pub enum JsonQuery {
 }
 
 /// One exact conjunction over a retained native JSON occurrence.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JsonPredicate {
     /// Exact native concrete RFC 6901 pointer, or any occurrence.
     pub path: Option<String>,
@@ -218,7 +241,7 @@ impl JsonQuery {
 }
 
 /// One record constraint, optionally sharing a native parent occurrence binding.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FieldConstraint {
     /// Exact native occurrence conditions; all supplied conditions intersect.
     pub predicate: JsonPredicate,
@@ -229,7 +252,7 @@ pub struct FieldConstraint {
 }
 
 /// Combined record qualification before optional native text ranking.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EventInterval {
     /// Inclusive source instant in UTC Unix milliseconds.
     pub from: u64,
@@ -238,7 +261,7 @@ pub struct EventInterval {
 }
 
 /// Combined record qualification before optional native text ranking.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordQuery {
     /// Explicit source-time interval; acceptance scope remains an independent filter.
     pub event_interval: Option<EventInterval>,
@@ -251,6 +274,27 @@ pub struct RecordQuery {
 }
 
 impl RecordQuery {
+    pub(crate) fn capacity(&self) -> usize {
+        self.text.as_ref().map_or(0, String::capacity)
+            + self.fields.capacity() * std::mem::size_of::<FieldConstraint>()
+            + self
+                .fields
+                .iter()
+                .flat_map(|field| {
+                    [
+                        &field.predicate.path,
+                        &field.predicate.kind,
+                        &field.predicate.lexical,
+                        &field.predicate.decoded,
+                        &field.parent_binding,
+                        &field.parent_path,
+                    ]
+                })
+                .flatten()
+                .map(String::capacity)
+                .sum::<usize>()
+    }
+
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
         if self
             .event_interval

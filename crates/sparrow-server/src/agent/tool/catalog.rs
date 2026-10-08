@@ -176,6 +176,12 @@ pub(crate) fn definitions() -> Value {
                 .with("limit", integer(1000))
                 .with("scan_budget", integer(100000));
         }
+        if *name == "records_search" {
+            properties = properties.with("page_size", integer(1000)).with(
+                "cursor",
+                Object::new().with("type", Value::array(["string", "null"])),
+            );
+        }
         if *name == "values_search" {
             for field in ["path", "kind", "lexical", "decoded"] {
                 properties = properties.with(

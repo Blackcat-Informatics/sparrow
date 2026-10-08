@@ -5759,3 +5759,282 @@ async fn artifact_diagnostic_scope_reports_unknown_membership_through_cli_and_mc
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_pages_share_frozen_ranked_receipts_after_pin_release_in_cli_and_mcp() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let configuration = sparrow_server::ServerConfig::read(&config).unwrap();
+            let owner = configuration.open_store().unwrap();
+            let clock = sparrow_server::now().unwrap();
+            let old = clock - 31 * 86400000;
+            let artifact = owner
+                .ingest(
+                    "wire-record-page-old",
+                    "page-source",
+                    "log",
+                    b"needle a\nneedle needle b\nneedle c\nneedle needle needle d\nneedle e\n",
+                    old,
+                )
+                .unwrap();
+            let pin = owner
+                .pin("wire-record-page-pin", "paged", &[artifact.id], 40, old)
+                .unwrap();
+            drop(owner);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            let scope = Value::from(
+                Object::new()
+                    .with("kind", "pin")
+                    .with("store_id", store.clone())
+                    .with("pin_id", pin.id.clone())
+                    .with("expected_revision", pin.revision.to_string()),
+            );
+            let scope_file = dir.path().join("scope.json");
+            std::fs::write(&scope_file, purrdf_lex::json::write_compact(&scope)).unwrap();
+            let path = scope_file.to_str().unwrap();
+            let first = cli(
+                &socket,
+                &[
+                    "records",
+                    "--scope-file",
+                    path,
+                    "--text",
+                    "needle",
+                    "--page-size",
+                    "2",
+                ],
+            );
+            assert_eq!(first["receipt"]["execution"].as_str(), Some("complete"));
+            assert_eq!(first["page"]["total_items"].as_str(), Some("5"));
+            assert_eq!(first["qualified_records"].as_str(), Some("5"));
+            assert_eq!(first["rows"].as_array().unwrap().len(), 2);
+            let cursor = first["page"]["next_cursor"].as_str().unwrap();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let released = mcp
+                .tool(
+                    2,
+                    "pin_release",
+                    Object::new()
+                        .with("request_id", "wire-record-page-release")
+                        .with("store_id", store.clone())
+                        .with("pin_id", pin.id)
+                        .into(),
+                )
+                .await;
+            assert!(!released["isError"].as_bool().unwrap());
+            let second = cli(
+                &socket,
+                &[
+                    "records",
+                    "--scope-file",
+                    path,
+                    "--text",
+                    "needle",
+                    "--page-size",
+                    "2",
+                    "--cursor",
+                    cursor,
+                ],
+            );
+            let replay = mcp
+                .tool(
+                    3,
+                    "records_search",
+                    Object::new()
+                        .with("scope", scope.clone())
+                        .with("text", "needle")
+                        .with("page_size", 2_u32)
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert!(!replay["isError"].as_bool().unwrap());
+            assert_eq!(replay["structuredContent"], second);
+            assert_eq!(first["receipt"], second["receipt"]);
+            assert_eq!(first["text"]["ranking"], second["text"]["ranking"]);
+            assert_eq!(first["page"]["snapshot_id"], second["page"]["snapshot_id"]);
+            let third = cli(
+                &socket,
+                &[
+                    "records",
+                    "--scope-file",
+                    path,
+                    "--text",
+                    "needle",
+                    "--page-size",
+                    "2",
+                    "--cursor",
+                    second["page"]["next_cursor"].as_str().unwrap(),
+                ],
+            );
+            let ids = [first.clone(), second.clone(), third.clone()]
+                .iter()
+                .flat_map(|page| {
+                    page["rows"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["record_id"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(ids.len(), 5);
+            assert!(!third["page"]["has_more"].as_bool().unwrap());
+            for (arguments, code) in [
+                (
+                    vec![
+                        "records",
+                        "--scope-file",
+                        path,
+                        "--text",
+                        "needle",
+                        "--page-size",
+                        "2",
+                    ],
+                    "NOT_FOUND",
+                ),
+                (
+                    vec![
+                        "records",
+                        "--scope-file",
+                        path,
+                        "--text",
+                        "other",
+                        "--page-size",
+                        "2",
+                        "--cursor",
+                        cursor,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "records",
+                        "--scope-file",
+                        path,
+                        "--text",
+                        "needle",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        cursor,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "records",
+                        "--scope-file",
+                        path,
+                        "--limit",
+                        "1",
+                        "--page-size",
+                        "2",
+                    ],
+                    "INVALID_ARGUMENT",
+                ),
+            ] {
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(arguments)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success() && output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(code),
+                    "{output:?}"
+                );
+            }
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["record_read_handles"].as_str(), Some("1"));
+            assert_eq!(status["max_record_read_handles"].as_str(), Some("8"));
+            assert_eq!(status["record_read_lease_ms"].as_str(), Some("60000"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_pages_enforce_agent_byte_ceilings_and_scan_refusal() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let key = "k".repeat(2048);
+            let line = format!("{{\"{key}\":1}}\n");
+            client
+                .ingest(
+                    "wire-record-page-bytes",
+                    "page-source",
+                    wire::Format::Jsonl,
+                    line.repeat(20).as_bytes(),
+                )
+                .await
+                .unwrap();
+            let fields =
+                Value::array((0..4).map(|_| Object::new().with("path", format!("/{key}"))));
+            let where_file = dir.path().join("fields.json");
+            std::fs::write(&where_file, purrdf_lex::json::write_compact(&fields)).unwrap();
+            let path = where_file.to_str().unwrap();
+            let first = cli(
+                &socket,
+                &[
+                    "records",
+                    "--source",
+                    "page-source",
+                    "--where-file",
+                    path,
+                    "--page-size",
+                    "100",
+                ],
+            );
+            assert!(
+                purrdf_lex::json::write_compact(&first).len() <= sparrow_core::PIN_READ_PAGE_BYTES
+            );
+            assert!(
+                first["rows"].as_array().unwrap().len() > 1
+                    && first["rows"].as_array().unwrap().len() < 20
+            );
+            assert_eq!(first["page"]["total_items"].as_str(), Some("20"));
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let cursor = first["page"]["next_cursor"].as_str().unwrap();
+            let continuation = mcp
+                .tool(
+                    2,
+                    "records_search",
+                    Object::new()
+                        .with("source", "page-source")
+                        .with("fields", fields.clone())
+                        .with("page_size", 100_u32)
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert!(!continuation["isError"].as_bool().unwrap());
+            assert!(
+                purrdf_lex::json::write_compact(&continuation).len()
+                    <= sparrow_core::PIN_READ_PAGE_BYTES
+            );
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args(["records", "--source", "page-source", "--scan-budget", "1"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success() && output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("RESOURCE_LIMIT"));
+        })
+        .await;
+}

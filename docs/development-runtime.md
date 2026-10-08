@@ -32,8 +32,35 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 27; the schema sections
+The current source implements schema 28; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 28 record result pages
+
+The production `recordsSearch` path captures the complete admitted result through
+the existing same-record matcher and native text ranker. Page item limits no longer
+truncate execution. Candidate scan, item or byte exhaustion refuses the operation
+without a prefix. Native query coverage and diagnostic uncertainty are preserved.
+
+Cap'n Proto, CLI and MCP carry the same frozen capture, including ranking corpus,
+scores, source-time basis and field witnesses. Captured encoded metadata/rows use
+PurRDF's native JSON codec and share the finite catalog lease/cursor owner. Byte
+admission chooses variable page boundaries and accounts duplicated record/text
+rendering. Store clones share eight handles and an 8 MiB retained ceiling, with
+fixed 60-second expiry; the capture ceiling is 2 MiB. Reading pages does not pin
+records or keep storage versions alive. Source/artifact/pin pages retain their
+existing fixed-boundary contracts.
+
+Local qualification passed formatting, release Clippy with warnings denied,
+workspace release tests (114 storage and 34 RPC/daemon/MCP scenarios), seeded
+census self-tests and the pinned cross-workspace gate. All 160 ownership jobs
+hold with zero distinct exceptions. Evidence is
+`/tmp/sparrow-record-pages-final-gate-20261007.log`. Tests cover capture beyond
+1,000 rows, frozen native ranking and uncertainty, pin release/retirement,
+absolute expiry/reopen, variable byte boundaries, scan/row refusal without a
+prefix, and shared handle ceilings. Owned runtime adoption is recorded separately.
+Standalone key/value/text pagination, complete scope receipts, streams and the
+other architecture acceptance work remain unfinished.
 
 ## Schema 27 artifact scope filters
 

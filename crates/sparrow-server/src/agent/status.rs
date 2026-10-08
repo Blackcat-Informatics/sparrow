@@ -210,5 +210,26 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "source_read_lease_ms",
             value.get_source_read_lease_ms().to_string(),
         );
+    let output = output
+        .with(
+            "record_read_handles",
+            value.get_record_read_handles().to_string(),
+        )
+        .with(
+            "record_read_bytes",
+            value.get_record_read_bytes().to_string(),
+        )
+        .with(
+            "max_record_read_handles",
+            value.get_max_record_read_handles().to_string(),
+        )
+        .with(
+            "max_record_read_bytes",
+            value.get_max_record_read_bytes().to_string(),
+        )
+        .with(
+            "record_read_lease_ms",
+            value.get_record_read_lease_ms().to_string(),
+        );
     Ok(output.into())
 }
