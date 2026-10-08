@@ -6776,16 +6776,22 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
                     Object::new()
                         .with("store_id", store.clone())
                         .with("id", anchor.record_ids[0].clone())
-                        .with("before", 0_u32)
+                        .with("before", 1_u32)
                         .with("after", 1_u32)
-                        .with("limit", 2_u32)
+                        .with("limit", 3_u32)
                         .with("scan_budget", 1_u32)
                         .into(),
                 )
                 .await;
             assert_eq!(partial["isError"].as_bool(), Some(false));
             let partial = &partial["structuredContent"];
-            assert_eq!(partial["after"]["frontier"].as_str(), Some("scan_budget"));
+            // Three skipped-source records guarantee at least two on one side,
+            // including when acceptance times tie and opaque IDs break the tie.
+            assert!(
+                ["before", "after"]
+                    .into_iter()
+                    .any(|side| { partial[side]["frontier"].as_str() == Some("scan_budget") })
+            );
             assert_eq!(
                 partial["receipt"]["execution_status"].as_str(),
                 Some("partial")
