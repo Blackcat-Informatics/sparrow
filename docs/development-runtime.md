@@ -2,9 +2,9 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 41 and store format 37. The stable installed
+private Unix socket. It uses schema 43 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`008cd78`; see [temporal bounds](#native-half-open-temporal-query-bounds) for
+`316d2c8`; see [artifact grouping](#frozen-artifact-match-groups) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
@@ -41,7 +41,7 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 41; the schema sections
+The current source implements schema 43; the schema sections
 below retain their historical qualification evidence.
 
 ## Durable file-completion storage foundation
@@ -4410,3 +4410,73 @@ stable retries and restart persistence. It records 134 transport refusals and
 bounded reconnects rather than hiding them. Matching-binary disk SIGKILL checks
 also pass. These qualify the identified staging lifecycle fix; broad capture,
 full SPARQL, forced reclamation and complete performance acceptance remain unmet.
+
+## Frozen artifact match groups
+
+Signed source `316d2c8` adds optional artifact grouping to the existing captured
+record operation. Typed RPC, CLI and MCP share the same matcher and page renderer.
+Groups reference unchanged page rows and carry frozen counts across the capture;
+native text order, ranking, scores and witnesses are preserved. The
+[interface contract](interfaces.md#artifact-match-grouping) defines count scope,
+pagination and limits. No storage migration, runtime dependency, detector
+relaxation or ownership exception was added.
+
+Full check and the normal signed commit hook passed 142 storage scenarios,
+51 RPC scenarios, 17 SDK tests, remaining workspace tests, release Clippy with
+warnings denied and 217 helper ownership jobs with zero distinct exceptions.
+Logs are `/tmp/sparrow-artifact-groups-check.log` and
+`/tmp/sparrow-artifact-groups-commit.log`. Tests prove frozen counts after a new
+artifact arrives, unchanged native rows/scores/evidence, selector conflicts,
+all existing cursor-only page families, release and strict flag decoding.
+
+All matching binaries and SDK examples were explicitly rebuilt after the hook
+(`/tmp/sparrow-artifact-groups-bins.log`). Installed daemon
+`~/.local/libexec/sparrow/sparrowd-schema43-316d2c8` has SHA-256
+`d264be843de31744abcfc4b939f6ffc5d33644d54ac1abaed527fab64a76ebc4`
+and sole capability `cap_net_bind_service=ep`. Installed CLI
+`~/.local/libexec/sparrow/sparrow-schema43-316d2c8` has SHA-256
+`a07d9fd53b4b834cb9f98788029919e229dfac29b59d7d90c16cd578b80d4156`.
+Stable aliases select those immutable images. Matching events, bytes and handoff
+example paths and hashes are recorded in the live evidence directory.
+
+Adoption evidence is `/tmp/sparrow-artifact-groups-live.e3vtoo01`: image hashes,
+unit/status, closed-store snapshot, saved handoff intents and retry verification,
+`group-report.json` and `group-mcp.json`. The enabled unit gracefully stopped
+PID 2222752 and adopted PID 2455426. The listener is still `0.0.0.0:518`,
+reachable at `tcp://192.168.2.4:518`, with the same private Unix socket.
+Store `store:46c88e949ccec658600b66c7becd5bb7`, format 37, 212 records, zero pins,
+existing watch checkpoints and owned producer replacement bytes are preserved.
+TCP/Unix/CLI/MCP/SDK saved handoff retries retain their receipts and exact bytes.
+No producer file or intake changed. The new closed snapshot has not separately
+been restored.
+
+Live grouped source and text traversals compare unchanged native rows, scores
+and ranking with ordinary captures. Every page group count agrees with an
+independently counted ordinary capture, and indices partition page rows exactly.
+MCP cursor-only continuation matches CLI, a changed grouping flag refuses
+`CONFLICT`, explicit release invalidates continuation, empty grouped captures
+return an empty list, and string/number/null flags refuse `INVALID_ARGUMENT`.
+The schema 42 client refuses discovery. Final read handles and bytes are zero,
+with unchanged record/pin counts and healthy owned watches.
+
+Separate Btrfs corpus evidence is
+`~/.local/state/sparrow/artifact-groups-qualification-62ll3f78`, containing the
+driver, isolated configuration, daemon log and report. It cloned the closed
+7,058-record corpus without opening its original store or configuring intake.
+Source grouping captures 286 records across two pages and two artifacts with
+143 matches each. The half-open first-pass receipt interval captures 3,529 records
+across 24 pages with artifact counts 143, 2, 3,380 and 4. Scoped native ranked text
+captures 12 rows with two artifact counts of six. Ordinary and grouped complete
+traversals preserve exact row order, scores and witnesses; frozen counts and
+page-local indices hold throughout. Every lease is explicitly released, final
+handles/bytes are zero, records remain 7,058, and the isolated owner closes cleanly.
+The broad grouped capture refuses `RESOURCE_LIMIT` with empty stdout under the
+existing 2 MiB capture ceiling. One earlier collector attempt in
+`artifact-groups-qualification-wxbc3hob` wrongly expected the refusal to print
+the numeric ceiling; its evidence is retained as an unsuccessful collector run.
+The corrected check matches the actual typed refusal code and message.
+
+This is query-behavior qualification on a small copied corpus, not sustained
+performance or full architecture acceptance. Full SPARQL, forced physical
+reclamation, broad capture strategy and complete performance acceptance remain
+unfinished.

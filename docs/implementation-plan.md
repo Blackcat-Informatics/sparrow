@@ -28,7 +28,12 @@ and native ranked text, now use immutable result pages with frozen receipts and
 ranking corpus evidence. Standalone text search shares those captures, native
 ranking, operation-bound cursors and aggregate handle admission. Key/value discovery now shares those leases and captures complete native occurrence
 rows or key counts before paging. Cursor-only result_next resumes all existing typed page families through their
-shared lease and canonical renderers. Existing paged query receipts now freeze
+shared lease and canonical renderers.
+Optional artifact grouping uses the same captured record matcher and native
+ranking, with frozen per-artifact counts and page-local row references across
+typed RPC, CLI and MCP. Its schema-43 live and copied-corpus evidence is recorded
+in [Development runtime](development-runtime.md#frozen-artifact-match-groups).
+Existing paged query receipts now freeze
 capture identity, native profiles and effective host admission ceilings while
 preserving original coverage and certainty. Native certified governor receipts,
 full scope receipts and corpus-scale indexed selection remain required.
