@@ -9,6 +9,69 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Abandoned query capture cleanup
+
+The frozen uncapped `ebea75a` images were separately qualified on two private
+Btrfs copies of the closed 7,058-record corpus:
+`~/.local/state/sparrow/query-disconnect-c2cyovfv` for Unix and
+`~/.local/state/sparrow/query-disconnect-tcp-upkug15y` for native TCP. Each run
+first traverses all 48 broad-query pages and explicitly releases that baseline.
+It then starts three query clients sequentially and kills only each owned client
+after observing a nonempty, partially written anonymous capture through the
+private daemon's file descriptors. These are actual in-progress captures, not
+idle connections or completed replies. No public client or daemon is killed.
+
+Each complete capture has 2,442,774 data bytes. Unix interruptions observe
+27,288, 29,362 and 16,918 bytes; TCP interruptions observe 20,026, 17,610 and
+23,831 bytes. Every interrupted client has empty stdout. The admitted storage
+work nevertheless finishes, leaving one, two, then three result leases and
+complete anonymous files of 2,445,312 allocated bytes each. A subsequent status
+response arrives 60–65 ms after each client kill. That duration includes CLI
+startup and status execution; it is not a direct worker-cancellation latency.
+
+After those three observations, the driver makes no status or release call
+while sampling anonymous file descriptors every 100 ms. The owner alone purges
+the abandoned staging. All files are observed gone 60.78–60.91 seconds after
+the Unix interruptions and 60.70–60.83 seconds after the TCP interruptions.
+These are sampled upper observations for the last file's removal, not precise
+per-file expiry timestamps. Final status reports zero read handles/bytes and
+unchanged 7,058 records with no pins. Complete fresh traversals after expiry and
+after a graceful close/reopen exactly equal the original 7,058 captured rows in
+all 48 pages. Store identity is preserved and both owned endpoints are cleaned.
+The public unit remains active at PID 406435 throughout both runs.
+
+Each fixture retains `driver.py`, image/source fingerprints, client output,
+daemon logs, all 606/607 maintenance observations and statuses in `report.json`,
+and a fingerprinted `qualification-summary.json`. The earlier
+`query-disconnect-tuau0m57` attempt stopped on an invalid CLI argument before
+query execution; the successful drivers use the actual records CLI contract.
+This qualifies bounded abandoned-result cleanup at the existing lease deadline.
+Disconnect does not promptly cancel the admitted capture or reclaim its lease.
+Prompt in-flight cancellation, its resource/latency bound, and sustained
+abandonment under production offered load remain unfinished acceptance work.
+
+## Btrfs quota qualification prerequisite
+
+The isolated quota attempt at
+`~/.local/state/sparrow/btrfs-quota-ta5r2obw` did not run a quota workload.
+It created a new sparse 512 MiB image, formatted only that owned file as Btrfs,
+and attempted its mount inside a private root mount namespace. Mount returned
+32: it could not set up a loop device. No loop block device was available in the
+readback, and `modinfo loop` reported no available module. The host `/home`
+filesystem separately reported quotas disabled. Neither its quota configuration
+nor kernel/module configuration was changed to make the experiment pass.
+
+The failure occurred before quota enable, subvolume creation or daemon startup.
+`supervisor.json`, `supervisor-trace.txt`, `mount-failure.txt` and
+`host-prerequisites.json` retain the attempted method and prerequisite evidence.
+After namespace exit, the owned image has no loop association, the outer mount
+directory is empty and still resolves to the original host filesystem, and the
+public service remains active at PID 406435. This is an unrun Btrfs quota test,
+not quota-error or recovery qualification. The real tmpfs ENOSPC result below
+remains separate evidence. A quota-capable isolated filesystem is still needed
+for this acceptance case; enabling host quotas or changing the host kernel is
+outside this experiment.
+
 ## Filesystem-full recovery
 
 The currently installed source `ebea75a`, schema 46, has a separate real

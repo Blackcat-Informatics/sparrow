@@ -72,7 +72,13 @@ owner preserves all twenty durable receipts, all 7,198 records and every origina
 query baseline, and closes gracefully. This qualifies concurrent offered load
 for this finite warm corpus. The capture writer remains serialized; cancellation
 latency, sustained/burst production volume, a deployment quota and native
-reclamation admission remain separate unfinished requirements.
+reclamation admission remain separate unfinished requirements. Later source
+`ebea75a` measures abandoned in-progress Unix/TCP captures on this finite corpus:
+work finishes after client interruption, and owner maintenance removes its
+anonymous staging at the result lease deadline. See
+[abandoned query cleanup](development-runtime.md#abandoned-query-capture-cleanup)
+for the observed cleanup intervals and preserved corpus. This does not establish
+prompt cancellation or sustained abandonment acceptance.
 
 ### Four-importer burst
 

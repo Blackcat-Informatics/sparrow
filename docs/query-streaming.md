@@ -113,10 +113,16 @@ without a driver-side unlink, on a copied 7,058-record Btrfs store. See
 [owned endpoint recovery](development-runtime.md#owned-local-endpoint-recovery)
 for ownership checks, preserved names and the unchanged service restart policy.
 
-The chronological writer remains serialized during
-capture; concurrency and cancellation latency require measurement rather than a
-claim of asynchronous native snapshot execution. Read leases do not create pins
-or renew retention. Typed, CLI and MCP rendering must retain their contracts.
+The chronological writer remains serialized during capture. Mixed finite
+concurrency is measured in the [performance baseline](performance-baseline.md).
+Private Unix and TCP client interruptions during partially written captures
+show that admitted work finishes and abandoned result leases retain their staging
+until owner maintenance purges them at the sixty-second deadline; see
+[abandoned query cleanup](development-runtime.md#abandoned-query-capture-cleanup).
+This is bounded lease cleanup, not prompt in-flight cancellation or asynchronous
+native snapshot execution. Cancellation resource/latency bounds and sustained
+abandonment remain unfinished. Read leases do not create pins or renew retention.
+Typed, CLI and MCP rendering must retain their contracts.
 
 JSON discovery uses the same anonymous staging owner. The native fact matcher
 stages each value occurrence directly. Key counts aggregate completely in a
