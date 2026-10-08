@@ -2864,13 +2864,19 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
+        let intakes = match self.syslog.sources() {
+            Ok(intakes) => intakes,
+            Err(error) => {
+                failure(
+                    results.get().init_result(),
+                    Error::new("STORAGE_FAILURE", error.to_string()),
+                );
+                return Ok(());
+            }
+        };
         match self
-            .work({
-                let intakes = self
-                    .syslog
-                    .sources()
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                move |store, now| store.source_read_with_syslog(&query, now, &configured, &intakes)
+            .work(move |store, now| {
+                store.source_read_with_syslog(&query, now, &configured, &intakes)
             })
             .await
         {

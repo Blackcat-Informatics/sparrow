@@ -4,6 +4,7 @@
 //! Typed wire acceptance through a real daemon and private Unix socket.
 
 use sparrow_server::{connect, sparrow_capnp as wire};
+use sparrow_test_support::write_server_config;
 use std::{
     path::Path,
     process::{Child, Command, Stdio},
@@ -5941,12 +5942,6 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         drop(connection);
         drop(daemon);
     }).await;
-}
-
-fn write_server_config(dir: &Path, store: &Path, socket: &Path) -> std::path::PathBuf {
-    let config = dir.join("server.toml");
-    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", concat!(env!("CARGO_MANIFEST_DIR"), "/../../../purrdf/crates/text/lexicons/artifacts"))).unwrap();
-    config
 }
 
 #[tokio::test(flavor = "current_thread")]

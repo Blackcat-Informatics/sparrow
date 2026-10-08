@@ -2963,6 +2963,20 @@ fingerprints = []
 names = []
 
 [[job]]
+id = "bounded-server-config-fixture"
+summary = "Unit and integration RPC scenarios share one dev-only bounded daemon configuration and native analyzer artifact location."
+home = "sparrow_test_support::write_server_config"
+entry_points = []
+spec = "docs/interfaces.md: required native dependencies and typed discovery failures."
+vectors = ["crates/sparrow-server/src/syslog_listener.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^write_server_config$']
+
+[[job]]
 id = "syslog-listener-lookup"
 summary = "One generated RPC resolves a bounded current listener under its exact store and source, preserving schema refusal and runtime registry failures."
 home = "sparrow_server::rpc::Rpc::syslog_listener_get"

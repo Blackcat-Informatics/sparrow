@@ -517,6 +517,88 @@ impl Status {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn poisoned_syslog_registry_refuses_both_discovery_paths_with_typed_failure() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let data = dir.path().join("store");
+                let config = sparrow_test_support::write_server_config(
+                    dir.path(),
+                    &data,
+                    &data.join("rpc.sock"),
+                );
+                let store = crate::ServerConfig::read(&config)
+                    .unwrap()
+                    .open_store()
+                    .unwrap();
+                let sid = store.store_id().unwrap();
+                let registry = SyslogRegistry::default();
+                let poisoning = registry.clone();
+                assert!(
+                    std::thread::spawn(move || {
+                        let _locked = poisoning.0.lock().unwrap();
+                        panic!("injected syslog registry owner failure");
+                    })
+                    .join()
+                    .is_err()
+                );
+                let client: crate::sparrow_capnp::sparrow::Client = capnp_rpc::new_client(
+                    crate::Rpc::new(store.clone(), Arc::new(Semaphore::new(4)), 8388608, 100)
+                        .with_syslog(registry),
+                );
+                let mut request = client.sources_list_request();
+                let mut query = request.get().init_query();
+                query.set_store_id(&sid);
+                query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                query.reborrow().init_source().set_absent(());
+                query.reborrow().init_cursor().set_absent(());
+                query.set_page_size(100);
+                query.set_scan_budget(10000);
+                let response = request.send().promise.await.unwrap();
+                let crate::sparrow_capnp::result::Error(error) = response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                else {
+                    panic!("poisoned source registry published a page")
+                };
+                assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "STORAGE_FAILURE"
+                );
+                let mut request = client.syslog_listener_get_request();
+                let mut query = request.get().init_query();
+                query.set_store_id(&sid);
+                query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                query.set_source("source");
+                query.set_id("listener");
+                let response = request.send().promise.await.unwrap();
+                let crate::sparrow_capnp::result::Error(error) = response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                else {
+                    panic!("poisoned listener registry published a lookup")
+                };
+                assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "STORAGE_FAILURE"
+                );
+                assert_eq!(
+                    store.status(crate::now().unwrap()).unwrap()["source_read_handles"].as_str(),
+                    Some("0")
+                );
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn failed_intake_joins_blocking_publication_and_retains_all_child_errors() {
         let dir = tempfile::tempdir().unwrap();

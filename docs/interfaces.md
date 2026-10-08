@@ -1035,7 +1035,10 @@ cannot satisfy the query. Older schemas refuse with `UNSUPPORTED`; a different
 store refuses with `STORE_MISMATCH`; an absent or rebound listener refuses with
 `NOT_FOUND`. Current source labels are 1..512 bytes and listener IDs 1..128 bytes.
 The runtime registry has at most four entries and is read through its existing
-fallible snapshot owner. Registry failures remain `STORAGE_FAILURE`.
+fallible snapshot owner. Both source discovery and listener lookup return registry
+failures as typed `STORAGE_FAILURE`, rather than a successful empty result or a
+transport error. A poisoned-registry RPC unit scenario verifies both error unions
+and zero published source leases using the shared dev-only daemon configuration.
 
 The reply uses the existing typed `SyslogListenerStatus`: configured listener
 ID, exact source, actual binding, transport/framing, payload/connection/time

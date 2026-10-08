@@ -3,6 +3,17 @@
 
 //! Dev-only shared native storage fixtures. Runtime crates must not depend on this crate.
 
+/// One bounded daemon configuration for local RPC unit and integration fixtures.
+pub fn write_server_config(
+    dir: &std::path::Path,
+    store: &std::path::Path,
+    socket: &std::path::Path,
+) -> std::path::PathBuf {
+    let config = dir.join("server.toml");
+    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", concat!(env!("CARGO_MANIFEST_DIR"), "/../../../purrdf/crates/text/lexicons/artifacts"))).unwrap();
+    config
+}
+
 /// Build wide JSONL through the native codec, returning its ordered unique leaf paths.
 /// Generated member names contain only ASCII letters/digits and need no pointer escapes.
 pub fn wide_jsonl_keys(
