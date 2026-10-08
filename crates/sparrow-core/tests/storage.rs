@@ -9,6 +9,93 @@ use sparrow_test_support::{catalog_db, remove_tail_range_index};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn cancelled_catalogue_reads_preserve_original_cursors_and_evidence() {
+    use sparrow_core::{ArtifactRead, QueryCancellation, SourceRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("cancel-catalogue-a", "a", "json", b"{}", 1)
+        .unwrap();
+    let b = store
+        .ingest("cancel-catalogue-b", "b", "json", b"{}", 1)
+        .unwrap();
+    let members = [a.record_ids[0].clone(), b.record_ids[0].clone()];
+    store
+        .pin("cancel-catalogue-pin-a", "a", &members, 40, 2)
+        .unwrap();
+    store
+        .pin("cancel-catalogue-pin-b", "b", &members, 40, 2)
+        .unwrap();
+    let mut source = SourceRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let mut artifacts = ArtifactRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let mut pins = PinRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let sources = store.source_read(&source, 3, &[]).unwrap();
+    let parents = store.artifact_read(&artifacts, 3).unwrap();
+    let collections = store.pin_read(&pins, 3).unwrap();
+    let token = QueryCancellation::default();
+    token.cancel();
+    for continuation in [false, true] {
+        if continuation {
+            source.cursor = sources.next_cursor.clone();
+            artifacts.cursor = parents.next_cursor.clone();
+            pins.cursor = collections.next_cursor.clone();
+        }
+        assert_eq!(
+            store
+                .source_read_with_syslog_cancellable(&source, 4, &[], &[], &token)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+        assert_eq!(
+            store
+                .artifact_read_cancellable(&artifacts, 4, &token)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+        assert_eq!(
+            store
+                .pin_read_cancellable(&pins, 4, &token)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+    }
+    for (id, cursor) in [
+        (&sources.snapshot_id, sources.next_cursor.as_ref().unwrap()),
+        (&parents.snapshot_id, parents.next_cursor.as_ref().unwrap()),
+        (
+            &collections.snapshot_id,
+            collections.next_cursor.as_ref().unwrap(),
+        ),
+    ] {
+        assert!(store.result_next(&sources.store_id, cursor, 5).is_ok());
+        assert!(store.result_release(&sources.store_id, id, 5).unwrap());
+    }
+    let status = store.status(5).unwrap();
+    for key in [
+        "source_read_handles",
+        "artifact_read_handles",
+        "pin_read_handles",
+    ] {
+        assert_eq!(status[key].as_str(), Some("0"));
+    }
+    assert_eq!(status["live_records"].as_str(), Some("2"));
+    assert_eq!(status["active_pins"].as_str(), Some("2"));
+    assert_eq!(store.bytes(&members[0], 0, 2, 5).unwrap(), b"{}");
+}
+
+#[test]
 fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins() {
     use sparrow_core::{ReceiverDiscard, SourceRead, SyslogReceiver};
     let dir = tempfile::tempdir().unwrap();

@@ -233,6 +233,24 @@ impl Store {
         configured: &[SourceWatchBinding],
         intakes: &[SourceSyslogBinding],
     ) -> Result<SourceReadPage, Error> {
+        self.source_read_with_syslog_cancellable(
+            query,
+            now,
+            configured,
+            intakes,
+            &crate::QueryCancellation::default(),
+        )
+    }
+
+    /// Capture runtime and stored source declarations with the caller's cooperative lifetime.
+    pub fn source_read_with_syslog_cancellable(
+        &self,
+        query: &SourceRead,
+        now: u64,
+        configured: &[SourceWatchBinding],
+        intakes: &[SourceSyslogBinding],
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<SourceReadPage, Error> {
         if intakes.len() > 4
             || intakes.iter().any(|binding| {
                 binding.source.is_empty()
@@ -265,11 +283,13 @@ impl Store {
                 "source reads require an exact 1..512 byte key, page_size 1..1000 and scan_budget 1..100000",
             ));
         }
+        cancellation.checkpoint()?;
         let mut reads = self
             .source_reads
             .lock()
             .map_err(|_| Error::new("STORAGE_FAILURE", "source read registry poisoned"))?;
         reads.purge(now);
+        cancellation.checkpoint()?;
         if let Some(cursor) = &query.cursor {
             return reads.resume(
                 &query.selector,
@@ -286,22 +306,28 @@ impl Store {
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
         let writer = self.lock()?;
+        cancellation.checkpoint()?;
         let mut scanned = 0;
         let mut remaining = SCAN_BYTES;
+        let mut admission = catalog_lease::CaptureAdmission {
+            cancellation,
+            started,
+            scan_budget: query.scan_budget,
+            scanned: &mut scanned,
+            remaining: &mut remaining,
+        };
         let artifacts = writer.artifact_capture(
             &ArtifactSelector {
                 source: query.selector.source.clone(),
                 ..Default::default()
             },
             now,
-            started,
-            query.scan_budget,
-            &mut scanned,
-            &mut remaining,
+            &mut admission,
         )?;
         let mut rows = BTreeMap::<String, SourceSummary>::new();
         let mut capacity = 4096;
         for artifact in artifacts.artifacts {
+            cancellation.checkpoint()?;
             let row = admit_source(&mut rows, &artifact.source, &mut capacity)?;
             row.complete_artifacts += usize::from(artifact.complete_bytes_available);
             row.fragment_parents += usize::from(!artifact.complete_bytes_available);
@@ -313,12 +339,6 @@ impl Store {
                 "source watch declarations exceed the runtime's eight-watch ceiling",
             ));
         }
-        let mut admission = catalog_lease::CaptureAdmission {
-            started,
-            scan_budget: query.scan_budget,
-            scanned: &mut scanned,
-            remaining: &mut remaining,
-        };
         let mut watch_ids = std::collections::BTreeSet::new();
         for binding in intakes {
             admission.entry(binding.source.len() + binding.listener_id.len())?;
@@ -541,6 +561,7 @@ impl Store {
             iterator.status()?;
         }
         for row in rows.values_mut() {
+            cancellation.checkpoint()?;
             row.tail_generation_ids.sort();
             row.syslog_listener_ids.sort();
             row.receiver_window_ids.sort();
@@ -562,7 +583,14 @@ impl Store {
             },
         };
         drop(writer);
-        reads.publish(snapshot, now, CAPTURE_BYTES, HANDLE_BYTES, MAX_HANDLES)
+        reads.publish(
+            snapshot,
+            now,
+            CAPTURE_BYTES,
+            HANDLE_BYTES,
+            MAX_HANDLES,
+            cancellation,
+        )
     }
     pub(super) fn source_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {
         let mut reads = self

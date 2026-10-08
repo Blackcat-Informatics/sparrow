@@ -522,6 +522,7 @@ impl Store {
             catalog_lease::CAPTURE_BYTES,
             catalog_lease::HANDLE_BYTES,
             catalog_lease::MAX_HANDLES,
+            cancellation,
         )
     }
 

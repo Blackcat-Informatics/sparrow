@@ -180,6 +180,16 @@ impl Store {
     /// Discover eligible complete artifacts and surviving records' parent provenance.
     /// No partial capture is published on catalog, resource or coverage failure.
     pub fn artifact_read(&self, query: &ArtifactRead, now: u64) -> Result<ArtifactReadPage, Error> {
+        self.artifact_read_cancellable(query, now, &crate::QueryCancellation::default())
+    }
+
+    /// Use the same capture owner with cooperative caller cancellation.
+    pub fn artifact_read_cancellable(
+        &self,
+        query: &ArtifactRead,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<ArtifactReadPage, Error> {
         query.selector.selection.validate()?;
         if !(1..=1000).contains(&query.page_size)
             || !(1..=100000).contains(&query.scan_budget)
@@ -195,11 +205,13 @@ impl Store {
                 "artifact reads require a bounded source, increasing receipt interval, page_size 1..1000 and scan_budget 1..100000",
             ));
         }
+        cancellation.checkpoint()?;
         let mut reads = self
             .artifact_reads
             .lock()
             .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
         reads.purge(now);
+        cancellation.checkpoint()?;
         if let Some(cursor) = &query.cursor {
             return reads.resume(
                 &query.selector,
@@ -216,16 +228,17 @@ impl Store {
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
         let writer = self.lock()?;
+        cancellation.checkpoint()?;
         let mut scanned = 0;
         let mut remaining = SCAN_BYTES;
-        let artifacts = writer.artifact_capture(
-            &query.selector,
-            now,
+        let mut admission = CaptureAdmission {
+            cancellation,
             started,
-            query.scan_budget,
-            &mut scanned,
-            &mut remaining,
-        )?;
+            scan_budget: query.scan_budget,
+            scanned: &mut scanned,
+            remaining: &mut remaining,
+        };
+        let artifacts = writer.artifact_capture(&query.selector, now, &mut admission)?;
         let snapshot = catalog_lease::Snapshot {
             bytes: 0,
             id: random_id("artifact-read")?,
@@ -240,7 +253,14 @@ impl Store {
             body: artifacts,
         };
         drop(writer);
-        reads.publish(snapshot, now, CAPTURE_BYTES, HANDLE_BYTES, MAX_HANDLES)
+        reads.publish(
+            snapshot,
+            now,
+            CAPTURE_BYTES,
+            HANDLE_BYTES,
+            MAX_HANDLES,
+            cancellation,
+        )
     }
 
     pub(super) fn artifact_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {
@@ -387,16 +407,21 @@ impl Writer {
         &self,
         selector: &ArtifactSelector,
         now: u64,
-        started: Instant,
-        scan_budget: usize,
-        scanned: &mut usize,
-        remaining: &mut usize,
+        admission: &mut CaptureAdmission<'_>,
     ) -> Result<ArtifactPageBody, Error> {
+        let CaptureAdmission {
+            cancellation,
+            started,
+            scan_budget,
+            scanned,
+            remaining,
+        } = &mut *admission;
         let protected = self.protected_matching(
             now,
             |_| true,
             || {
-                if *scanned == scan_budget
+                cancellation.checkpoint()?;
+                if **scanned == *scan_budget
                     || started.elapsed() >= Duration::from_millis(catalog_lease::LEASE_MS)
                 {
                     return Err(Error::new(
@@ -404,24 +429,14 @@ impl Writer {
                         "artifact pin capture exhausted scan/time admission",
                     ));
                 }
-                *scanned += 1;
+                **scanned += 1;
                 Ok(())
             },
             Some(ENTRY_BYTES),
-            Some(remaining),
+            Some(&mut **remaining),
         )?;
-        let mut admission = CaptureAdmission {
-            started,
-            scan_budget,
-            scanned,
-            remaining,
-        };
-        let selection = self.query_selection_membership(
-            &selector.selection,
-            now,
-            &protected,
-            Some(&mut admission),
-        )?;
+        let selection =
+            self.query_selection_membership(&selector.selection, now, &protected, Some(admission))?;
         let mut capture = ArtifactCapture {
             rows: BTreeMap::new(),
             capacity: 4096,
@@ -431,7 +446,7 @@ impl Writer {
         if let Some(selection) = selection {
             for id in &selection.parents {
                 if let Some(bytes) = self.db.get_pinned(id)? {
-                    capture.push(self, id.as_bytes(), &bytes, now, &protected, &mut admission)?;
+                    capture.push(self, id.as_bytes(), &bytes, now, &protected, admission)?;
                 } else if selection.artifacts.contains(id) {
                     return Err(Error::new(
                         "STORAGE_FAILURE",
@@ -446,7 +461,7 @@ impl Writer {
                         "resolved selected record disappeared during capture",
                     )
                 })?;
-                capture.push(self, id.as_bytes(), &bytes, now, &protected, &mut admission)?;
+                capture.push(self, id.as_bytes(), &bytes, now, &protected, admission)?;
             }
         } else {
             for prefix in [b"artifact:".as_slice(), b"record:".as_slice()] {
@@ -465,7 +480,7 @@ impl Writer {
                             "artifact discovery iterator value missing",
                         )
                     })?;
-                    capture.push(self, key, bytes, now, &protected, &mut admission)?;
+                    capture.push(self, key, bytes, now, &protected, admission)?;
                     iterator.next();
                 }
                 iterator.status()?;
@@ -473,6 +488,7 @@ impl Writer {
         }
         let mut artifacts = Vec::new();
         for (_, summary) in capture.rows {
+            admission.cancellation.checkpoint()?;
             if !summary.complete_bytes_available && summary.retained_records == 0 {
                 continue;
             }

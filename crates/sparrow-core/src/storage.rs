@@ -323,6 +323,7 @@ fn pin_deadline(days: u64, now: u64) -> Result<u64, Error> {
 /// One database owner. Clones share a serialized catalog writer.
 #[derive(Clone)]
 pub struct Store {
+    id: Arc<str>,
     inner: Arc<Mutex<Writer>>,
     pin_reads: Arc<Mutex<pin_read::Reads>>,
     rdf_read: Arc<Mutex<()>>,
@@ -1096,6 +1097,7 @@ impl Store {
         ));
         let pressure = pressure::State::load(&db)?;
         let store = Self {
+            id: Arc::from(id.as_str()),
             inner: Arc::new(Mutex::new(Writer {
                 db: Arc::new(db),
                 id,
@@ -1120,9 +1122,9 @@ impl Store {
         Ok(store)
     }
 
-    /// Return this persistent store's identity.
+    /// Return the immutable identity validated at open, without waiting for a writer.
     pub fn store_id(&self) -> Result<String, Error> {
-        Ok(self.lock()?.id.clone())
+        Ok(self.id.to_string())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Writer>, Error> {

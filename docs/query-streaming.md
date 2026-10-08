@@ -154,25 +154,29 @@ acceptance remains unfinished.
 
 Each admitted production TCP or Unix connection has its own cancellation owner.
 Connection completion, failure, lease expiry or task teardown cancels its child
-record/text/key/value captures. Each RPC also has an independent caller lifetime;
+record/text/key/value and source/artifact/pin captures. Each RPC also has an independent caller lifetime;
 cancelling one child does not cancel sibling operations. A worker keeps its
 concurrency permit until it exits. Mutation workers still finish admitted work,
 and cancellation does not establish non-delivery of an intake or pin mutation.
 
 The native storage read and spool share one host cancellation token. Checkpoints
 precede capture admission/publication and occur at candidate records, JSON facts,
-text postings, corpus identity/scoring entries, staged rows and sort completion.
+text postings, corpus identity/scoring entries, metadata members, staged rows and sort completion.
+Immutable store identity checks do not acquire the catalogue writer, so a busy
+capture cannot block the RPC event loop through identity validation.
 Cancellation returns `CANCELLED` without a successful prefix, drops private
 staging and releases its disk reservation. It does not interrupt an individual
 native database call, codec/projection call, sort, or a wait for a storage mutex;
 the next host checkpoint observes it. PurRDF still owns analysis and scoring.
 
-A completed capture has a reply guard until typed response rendering finishes.
+A newly created capture has a reply guard until typed response rendering finishes.
 If the blocking worker's result is abandoned or rendering fails, that guard
 releases the snapshot through the existing result owner. Cleanup failures are
 reported, not swallowed. Successfully rendered captures keep their ordinary
 replayable lease: rendering is not proof that the peer received the response,
 and a later disconnect does not revoke a cursor intended for reconnect/retry.
+An abandoned continuation also preserves that previously delivered capture and
+its original cursor; only the unclaimed fresh capture belongs to the reply guard.
 MCP `notifications/cancelled` aborts the selected tool's owned SDK connection;
 its stdio session and sibling tools remain open. The pending admission/ID slot
 is retained until that aborted job is actually retired, keeping both jobs and

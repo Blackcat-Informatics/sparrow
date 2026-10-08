@@ -3386,11 +3386,11 @@ names = ['^(stage_record_rows_elsewhere|copy_query_spool)$']
 
 [[job]]
 id = "query-cancellation-owner"
-summary = "One connection/caller-scoped cooperative host read lifetime stops candidate/fact/posting/scoring/staging work, preserves worker admission until exit and releases completed captures abandoned before reply rendering; mutations retain their delivery semantics."
+summary = "One connection/caller-scoped cooperative host read lifetime stops candidate/fact/posting/scoring/metadata/staging work, preserves worker admission until exit and releases fresh captures abandoned before reply rendering while retaining previously delivered continuation leases; mutations retain their delivery semantics."
 home = "sparrow_core::QueryCancellation::checkpoint"
-entry_points = ["sparrow_core::Store::records_read_cancellable", "sparrow_core::Store::json_read_cancellable", "sparrow_core::storage::record_spool::Builder::checkpoint", "sparrow_server::rpc::Rpc::query_work", "sparrow_server::rpc::Rpc::for_connection", "sparrow_server::transport::admit_connection"]
+entry_points = ["sparrow_core::Store::records_read_cancellable", "sparrow_core::Store::json_read_cancellable", "sparrow_core::Store::artifact_read_cancellable", "sparrow_core::Store::source_read_with_syslog_cancellable", "sparrow_core::Store::pin_read_cancellable", "sparrow_core::storage::catalog_lease::CaptureAdmission::entry", "sparrow_core::storage::catalog_lease::Reads::publish", "sparrow_core::storage::record_spool::Builder::checkpoint", "sparrow_server::rpc::Rpc::query_work", "sparrow_server::rpc::Rpc::for_connection", "sparrow_server::transport::admit_connection"]
 spec = "docs/query-streaming.md: cooperative query cancellation."
-vectors = ["crates/sparrow-server/src/rpc.rs"]
+vectors = ["crates/sparrow-server/src/rpc.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/catalog_lease.rs"]
 bench = []
 enforced = true
 [job.forbidden]

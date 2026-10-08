@@ -219,12 +219,24 @@ impl Store {
     /// Capture or continue immutable pin metadata under a finite shared handle budget.
     /// Reads neither renew protection nor hold database versions/evidence bytes alive.
     pub fn pin_read(&self, query: &PinRead, now: u64) -> Result<PinReadPage, Error> {
+        self.pin_read_cancellable(query, now, &crate::QueryCancellation::default())
+    }
+
+    /// Resolve and page a collection with the same capture owner and caller lifetime.
+    pub fn pin_read_cancellable(
+        &self,
+        query: &PinRead,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<PinReadPage, Error> {
         validate(query)?;
+        cancellation.checkpoint()?;
         let mut reads = self
             .pin_reads
             .lock()
             .map_err(|_| Error::new("STORAGE_FAILURE", "pin read registry poisoned"))?;
         reads.purge(now);
+        cancellation.checkpoint()?;
         if let Some(cursor) = &query.cursor {
             return reads.resume(
                 &query.selector,
@@ -241,6 +253,7 @@ impl Store {
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
         let writer = self.lock()?;
+        cancellation.checkpoint()?;
         let mut scanned = 0;
         let mut inspected_bytes = 0_usize;
         let mut selected = None;
@@ -248,6 +261,7 @@ impl Store {
         let mut summaries = Vec::new();
         let mut summary_capacity = 4096;
         let mut admit = |key: &[u8], bytes: &[u8]| -> Result<Pin, Error> {
+            cancellation.checkpoint()?;
             if scanned >= query.scan_budget || started.elapsed() >= Duration::from_millis(LEASE_MS)
             {
                 return Err(Error::new(
@@ -366,7 +380,14 @@ impl Store {
             let summary = PinSummary::of(&pin);
             PinPageBody::Members {
                 pin: summary,
-                members: pin.members.into_iter().collect(),
+                members: pin
+                    .members
+                    .into_iter()
+                    .map(|member| {
+                        cancellation.checkpoint()?;
+                        Ok(member)
+                    })
+                    .collect::<Result<_, Error>>()?,
             }
         };
         let snapshot = Snapshot {
@@ -383,7 +404,14 @@ impl Store {
             body,
         };
         drop(writer);
-        reads.publish(snapshot, now, SNAPSHOT_BYTES, HANDLE_BYTES, MAX_HANDLES)
+        reads.publish(
+            snapshot,
+            now,
+            SNAPSHOT_BYTES,
+            HANDLE_BYTES,
+            MAX_HANDLES,
+            cancellation,
+        )
     }
 
     pub(super) fn pin_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {

@@ -87,14 +87,15 @@ impl Drop for CancelQuery {
 }
 
 /// A completed capture stays private until its response has been rendered.
-struct QueryReply {
-    page: sparrow_core::RecordReadPage,
+struct QueryReply<B> {
+    page: sparrow_core::CatalogReadPage<B>,
     store: Store,
     delivered: bool,
+    owns_capture: bool,
 }
-impl Drop for QueryReply {
+impl<B> Drop for QueryReply<B> {
     fn drop(&mut self) {
-        if !self.delivered {
+        if self.owns_capture && !self.delivered {
             let released = now().and_then(|now| {
                 self.store
                     .result_release(&self.page.store_id, &self.page.snapshot_id, now)
@@ -258,16 +259,17 @@ impl Rpc {
         })?
     }
 
-    async fn query_work(
+    async fn query_work<B: Send + 'static>(
         &self,
+        owns_capture: bool,
         operation: impl FnOnce(
             Store,
             u64,
             sparrow_core::QueryCancellation,
-        ) -> Result<sparrow_core::RecordReadPage, Error>
+        ) -> Result<sparrow_core::CatalogReadPage<B>, Error>
         + Send
         + 'static,
-    ) -> Result<QueryReply, Error> {
+    ) -> Result<QueryReply<B>, Error> {
         let cancellation = self.connection.child();
         let _caller = CancelQuery(cancellation.clone());
         self.work(move |store, now| {
@@ -277,6 +279,7 @@ impl Rpc {
                 page,
                 store,
                 delivered: false,
+                owns_capture,
             };
             cancellation.checkpoint()?;
             Ok(reply)
@@ -2223,18 +2226,21 @@ impl wire::sparrow::Server for Rpc {
             sparrow_core::RecordOperation::Records
         };
         match self
-            .query_work(move |store, now, cancellation| {
-                store.records_read_cancellable(
-                    &sparrow_core::RecordRead {
-                        operation,
-                        scope: scope?,
-                        query,
-                        cursor: cursor?,
-                    },
-                    now,
-                    &cancellation,
-                )
-            })
+            .query_work(
+                cursor.as_ref().is_ok_and(Option::is_none),
+                move |store, now, cancellation| {
+                    store.records_read_cancellable(
+                        &sparrow_core::RecordRead {
+                            operation,
+                            scope: scope?,
+                            query,
+                            cursor: cursor?,
+                        },
+                        now,
+                        &cancellation,
+                    )
+                },
+            )
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
@@ -2271,18 +2277,21 @@ impl wire::sparrow::Server for Rpc {
         };
         let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
         match self
-            .query_work(move |store, now, cancellation| {
-                store.records_read_cancellable(
-                    &sparrow_core::RecordRead {
-                        operation: sparrow_core::RecordOperation::Text,
-                        scope: scope?,
-                        query,
-                        cursor: cursor?,
-                    },
-                    now,
-                    &cancellation,
-                )
-            })
+            .query_work(
+                cursor.as_ref().is_ok_and(Option::is_none),
+                move |store, now, cancellation| {
+                    store.records_read_cancellable(
+                        &sparrow_core::RecordRead {
+                            operation: sparrow_core::RecordOperation::Text,
+                            scope: scope?,
+                            query,
+                            cursor: cursor?,
+                        },
+                        now,
+                        &cancellation,
+                    )
+                },
+            )
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
@@ -2729,12 +2738,15 @@ impl wire::sparrow::Server for Rpc {
             scan_budget: input.get_scan_budget() as usize,
         };
         match self
-            .work(move |store, now| store.artifact_read(&query, now))
+            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+                store.artifact_read_cancellable(&query, now, &cancellation)
+            })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
-            Ok(page) => {
-                artifacts_page(results.get().init_result().init_ok(), &page)?;
+            Ok(mut reply) => {
+                artifacts_page(results.get().init_result().init_ok(), &reply.page)?;
+                reply.delivered = true;
             }
         }
         Ok(())
@@ -3049,14 +3061,21 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| {
-                store.source_read_with_syslog(&query, now, &configured, &intakes)
+            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+                store.source_read_with_syslog_cancellable(
+                    &query,
+                    now,
+                    &configured,
+                    &intakes,
+                    &cancellation,
+                )
             })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
-            Ok(page) => {
-                sources_page(results.get().init_result().init_ok(), &page)?;
+            Ok(mut reply) => {
+                sources_page(results.get().init_result().init_ok(), &reply.page)?;
+                reply.delivered = true;
             }
         }
         Ok(())
@@ -3110,12 +3129,15 @@ impl wire::sparrow::Server for Rpc {
             scan_budget: input.get_scan_budget() as usize,
         };
         match self
-            .work(move |store, now| store.pin_read(&query, now))
+            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+                store.pin_read_cancellable(&query, now, &cancellation)
+            })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
-            Ok(page) => {
-                pins_page(results.get().init_result().init_ok(), &page)?;
+            Ok(mut reply) => {
+                pins_page(results.get().init_result().init_ok(), &reply.page)?;
+                reply.delivered = true;
             }
         }
         Ok(())
@@ -3331,17 +3353,20 @@ impl wire::sparrow::Server for Rpc {
             "JSON query path exceeds 65536 UTF-8 bytes",
         );
         match self
-            .query_work(move |store, now, cancellation| {
-                store.json_read_cancellable(
-                    &sparrow_core::JsonRead {
-                        scope: scope?,
-                        query: JsonQuery::Keys { path: path? },
-                        cursor: cursor?,
-                    },
-                    now,
-                    &cancellation,
-                )
-            })
+            .query_work(
+                cursor.as_ref().is_ok_and(Option::is_none),
+                move |store, now, cancellation| {
+                    store.json_read_cancellable(
+                        &sparrow_core::JsonRead {
+                            scope: scope?,
+                            query: JsonQuery::Keys { path: path? },
+                            cursor: cursor?,
+                        },
+                        now,
+                        &cancellation,
+                    )
+                },
+            )
             .await
         {
             Ok(mut reply) => {
@@ -3375,22 +3400,25 @@ impl wire::sparrow::Server for Rpc {
         let lexical = optional(input.get_lexical()?)?;
         let decoded = optional(input.get_decoded()?)?;
         match self
-            .query_work(move |store, now, cancellation| {
-                store.json_read_cancellable(
-                    &sparrow_core::JsonRead {
-                        scope: scope?,
-                        query: JsonQuery::Values {
-                            path: path?,
-                            kind,
-                            lexical,
-                            decoded,
+            .query_work(
+                cursor.as_ref().is_ok_and(Option::is_none),
+                move |store, now, cancellation| {
+                    store.json_read_cancellable(
+                        &sparrow_core::JsonRead {
+                            scope: scope?,
+                            query: JsonQuery::Values {
+                                path: path?,
+                                kind,
+                                lexical,
+                                decoded,
+                            },
+                            cursor: cursor?,
                         },
-                        cursor: cursor?,
-                    },
-                    now,
-                    &cancellation,
-                )
-            })
+                        now,
+                        &cancellation,
+                    )
+                },
+            )
             .await
         {
             Ok(mut reply) => {
@@ -3412,26 +3440,146 @@ impl wire::sparrow::Server for Rpc {
 mod tests {
     use super::*;
 
+    /// One lifetime scenario drives every native catalogue body and its replayable cursor.
+    async fn capture_lifetime<B: Send + 'static, F>(
+        rpc: &Rpc,
+        admission: &Arc<Semaphore>,
+        handles: &str,
+        capture: F,
+    ) where
+        F: Fn(
+                Store,
+                u64,
+                &sparrow_core::QueryCancellation,
+                Option<String>,
+            ) -> Result<sparrow_core::CatalogReadPage<B>, Error>
+            + Clone
+            + Send
+            + 'static,
+    {
+        for owns_capture in [true, false] {
+            let original = if owns_capture {
+                None
+            } else {
+                let action = capture.clone();
+                let mut reply = rpc
+                    .query_work(true, move |store, now, token| {
+                        action(store, now, &token, None)
+                    })
+                    .await
+                    .unwrap();
+                let original = (
+                    reply.page.store_id.clone(),
+                    reply.page.snapshot_id.clone(),
+                    reply
+                        .page
+                        .next_cursor
+                        .clone()
+                        .expect("fixture requires continuation"),
+                );
+                reply.delivered = true;
+                drop(reply);
+                Some(original)
+            };
+            let cursor = original.as_ref().map(|(_, _, cursor)| cursor.clone());
+            let expected = if owns_capture { "0" } else { "1" };
+            for (after_capture, connection_close) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (worker, connection_guard) = rpc.for_connection();
+                let action = capture.clone();
+                let cursor = cursor.clone();
+                let (entered, running) = tokio::sync::oneshot::channel();
+                let (release, paused) = std::sync::mpsc::channel();
+                let task = tokio::spawn(async move {
+                    worker
+                        .query_work(owns_capture, move |store, now, cancellation| {
+                            let page = if after_capture {
+                                Some(action(store.clone(), now, &cancellation, cursor.clone())?)
+                            } else {
+                                None
+                            };
+                            entered
+                                .send(())
+                                .map_err(|_| invalid("test caller disappeared"))?;
+                            paused.recv().map_err(invalid)?;
+                            match page {
+                                Some(page) => Ok(page),
+                                None => action(store, now, &cancellation, cursor),
+                            }
+                        })
+                        .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), running)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if connection_close {
+                    drop(connection_guard);
+                } else {
+                    task.abort();
+                }
+                assert_eq!(admission.available_permits(), 0);
+                release.send(()).unwrap();
+                if connection_close {
+                    assert!(matches!(task.await, Ok(Err(error)) if error.code == "CANCELLED"));
+                } else {
+                    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+                }
+                let permit = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    admission.clone().acquire_owned(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                drop(permit);
+                assert_eq!(
+                    rpc.store.status(now().unwrap()).unwrap()[handles].as_str(),
+                    Some(expected)
+                );
+            }
+            let action = capture.clone();
+            let reply = rpc
+                .query_work(owns_capture, move |store, now, token| {
+                    action(store, now, &token, cursor)
+                })
+                .await
+                .unwrap();
+            drop(reply);
+            assert_eq!(
+                rpc.store.status(now().unwrap()).unwrap()[handles].as_str(),
+                Some(expected)
+            );
+            if let Some((store_id, id, cursor)) = original {
+                assert!(
+                    rpc.store
+                        .result_next(&store_id, &cursor, now().unwrap())
+                        .is_ok()
+                );
+                assert!(
+                    rpc.store
+                        .result_release(&store_id, &id, now().unwrap())
+                        .unwrap()
+                );
+            }
+            assert_eq!(
+                rpc.store.status(now().unwrap()).unwrap()[handles].as_str(),
+                Some("0")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_rpc_keeps_worker_admission_until_storage_work_finishes() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            dir.path(),
-            sparrow_core::Config {
-                buffered_flush_interval_ms: sparrow_core::DEFAULT_FLUSH_INTERVAL_MS,
-                disk_budget: 32 * 1024 * 1024,
-                maintenance_reserve: 4 * 1024 * 1024,
-                max_artifact_bytes: 1024 * 1024,
-                max_records: 100,
-                max_pin_members: 100,
-                text_analyzer: sparrow_core::resolve_text_analyzer(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../../purrdf/crates/text/lexicons/artifacts"
-                ))
-                .unwrap(),
-            },
-        )
-        .unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = crate::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap();
         let admission = Arc::new(Semaphore::new(1));
         let rpc = Arc::new(Rpc::new(store, admission.clone(), 1024 * 1024, 100));
         let (entered, running) = tokio::sync::oneshot::channel();
@@ -3439,12 +3587,18 @@ mod tests {
         let worker = rpc.clone();
         let task = tokio::spawn(async move {
             worker
-                .work(move |_, _| {
+                .work(move |store, now| {
                     entered
                         .send(())
                         .map_err(|_| invalid("test caller disappeared"))?;
                     paused.recv().map_err(invalid)?;
-                    Ok(())
+                    store.ingest(
+                        "cancelled-intake",
+                        "mutation",
+                        "opaque",
+                        b"admitted mutation",
+                        now,
+                    )
                 })
                 .await
         });
@@ -3465,12 +3619,16 @@ mod tests {
         .unwrap();
         drop(permit);
         assert_eq!(admission.available_permits(), 1);
+        assert_eq!(
+            rpc.store.status(now().unwrap()).unwrap()["live_records"].as_str(),
+            Some("1")
+        );
 
         let instant = now().unwrap();
         rpc.store
             .ingest(
                 "cancel-a",
-                "cancel",
+                "cancel-a",
                 "json",
                 br#"{"value":"needle"}"#,
                 instant,
@@ -3479,7 +3637,7 @@ mod tests {
         rpc.store
             .ingest(
                 "cancel-b",
-                "cancel",
+                "cancel-b",
                 "json",
                 br#"{"value":"needle"}"#,
                 instant,
@@ -3489,7 +3647,7 @@ mod tests {
             operation: sparrow_core::RecordOperation::Records,
             scope: QueryScope {
                 selection: sparrow_core::QuerySelection::Live,
-                source: Some("cancel".into()),
+                source: None,
                 sources: None,
                 diagnostics: Default::default(),
                 require_complete_index: false,
@@ -3501,94 +3659,105 @@ mod tests {
             query: Default::default(),
             cursor: None,
         };
-        // Exercise both cancellation before capture and a published page abandoned
-        // before the async caller receives ownership. Mutations above still finish.
-        for (after_capture, connection_close) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let (worker, connection_guard) = rpc.for_connection();
-            let query = query.clone();
-            let (entered, running) = tokio::sync::oneshot::channel();
-            let (release, paused) = std::sync::mpsc::channel();
-            let task = tokio::spawn(async move {
-                worker
-                    .query_work(move |store, now, cancellation| {
-                        let page = if after_capture {
-                            Some(store.records_read_cancellable(&query, now, &cancellation)?)
-                        } else {
-                            None
-                        };
-                        entered
-                            .send(())
-                            .map_err(|_| invalid("test caller disappeared"))?;
-                        paused.recv().map_err(invalid)?;
-                        match page {
-                            Some(page) => Ok(page),
-                            None => store.records_read_cancellable(&query, now, &cancellation),
-                        }
-                    })
-                    .await
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(5), running)
-                .await
-                .unwrap()
-                .unwrap();
-            if connection_close {
-                drop(connection_guard);
-            } else {
-                task.abort();
-            }
-            assert_eq!(admission.available_permits(), 0);
-            release.send(()).unwrap();
-            if connection_close {
-                assert!(matches!(task.await, Ok(Err(error)) if error.code == "CANCELLED"));
-            } else {
-                assert!(matches!(task.await, Err(error) if error.is_cancelled()));
-            }
-            let permit = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                admission.clone().acquire_owned(),
-            )
-            .await
+        capture_lifetime(
+            &rpc,
+            &admission,
+            "record_read_handles",
+            move |store, now, token, cursor| {
+                let mut query = query.clone();
+                query.cursor = cursor;
+                store.records_read_cancellable(&query, now, token)
+            },
+        )
+        .await;
+        capture_lifetime(
+            &rpc,
+            &admission,
+            "source_read_handles",
+            |store, now, token, cursor| {
+                store.source_read_with_syslog_cancellable(
+                    &sparrow_core::SourceRead {
+                        cursor,
+                        page_size: 1,
+                        ..Default::default()
+                    },
+                    now,
+                    &[],
+                    &[],
+                    token,
+                )
+            },
+        )
+        .await;
+        capture_lifetime(
+            &rpc,
+            &admission,
+            "artifact_read_handles",
+            |store, now, token, cursor| {
+                store.artifact_read_cancellable(
+                    &sparrow_core::ArtifactRead {
+                        cursor,
+                        page_size: 1,
+                        ..Default::default()
+                    },
+                    now,
+                    token,
+                )
+            },
+        )
+        .await;
+        let records = rpc
+            .store
+            .records(instant)
             .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        let pin = rpc
+            .store
+            .pin("cancel-pin-a", "cancel-pin-a", &records, 40, instant)
             .unwrap();
-            drop(permit);
-            assert_eq!(
-                rpc.store.status(now().unwrap()).unwrap()["record_read_handles"].as_str(),
-                Some("0")
-            );
-        }
-        let captured = query.clone();
-        let reply = rpc
-            .query_work(move |store, now, token| {
-                store.records_read_cancellable(&captured, now, &token)
-            })
-            .await
+        rpc.store
+            .pin("cancel-pin-b", "cancel-pin-b", &records, 40, instant)
             .unwrap();
-        assert!(reply.page.next_cursor.is_some());
-        drop(reply);
+        capture_lifetime(
+            &rpc,
+            &admission,
+            "pin_read_handles",
+            |store, now, token, cursor| {
+                store.pin_read_cancellable(
+                    &PinRead {
+                        cursor,
+                        page_size: 1,
+                        ..Default::default()
+                    },
+                    now,
+                    token,
+                )
+            },
+        )
+        .await;
+        capture_lifetime(
+            &rpc,
+            &admission,
+            "pin_read_handles",
+            move |store, now, token, cursor| {
+                store.pin_read_cancellable(
+                    &PinRead {
+                        selector: PinSelector::Id(pin.id.clone()),
+                        cursor,
+                        page_size: 1,
+                        ..Default::default()
+                    },
+                    now,
+                    token,
+                )
+            },
+        )
+        .await;
         assert_eq!(
-            rpc.store.status(now().unwrap()).unwrap()["record_read_handles"].as_str(),
-            Some("0")
-        );
-        let mut reply = rpc
-            .query_work(move |store, now, token| {
-                store.records_read_cancellable(&query, now, &token)
-            })
-            .await
-            .unwrap();
-        let id = reply.page.snapshot_id.clone();
-        let store_id = reply.page.store_id.clone();
-        reply.delivered = true;
-        drop(reply);
-        assert_eq!(
-            rpc.store.status(now().unwrap()).unwrap()["record_read_handles"].as_str(),
-            Some("1")
-        );
-        assert!(
-            rpc.store
-                .result_release(&store_id, &id, now().unwrap())
-                .unwrap()
+            rpc.store.status(now().unwrap()).unwrap()["active_pins"].as_str(),
+            Some("2")
         );
     }
 }

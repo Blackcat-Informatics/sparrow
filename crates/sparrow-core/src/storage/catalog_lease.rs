@@ -27,6 +27,7 @@ pub(super) fn response_row_bytes(encoded: usize) -> usize {
 
 /// One aggregate catalog entry/byte/time admission across capture and reference expansion.
 pub(super) struct CaptureAdmission<'a> {
+    pub cancellation: &'a super::record_read::QueryCancellation,
     pub started: Instant,
     pub scan_budget: usize,
     pub scanned: &'a mut usize,
@@ -35,6 +36,7 @@ pub(super) struct CaptureAdmission<'a> {
 
 impl CaptureAdmission<'_> {
     pub(super) fn entry(&mut self, bytes: usize) -> Result<(), Error> {
+        self.cancellation.checkpoint()?;
         if *self.scanned == self.scan_budget
             || bytes > ENTRY_BYTES
             || self.started.elapsed() >= Duration::from_millis(LEASE_MS)
@@ -251,7 +253,9 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
         max_capture_bytes: usize,
         max_handle_bytes: usize,
         max_handles: usize,
+        cancellation: &super::record_read::QueryCancellation,
     ) -> Result<CatalogReadPage<B>, Error> {
+        cancellation.checkpoint()?;
         snapshot.bytes = snapshot.capacity();
         if !snapshot.alive(now) {
             return Err(Error::new(
@@ -267,6 +271,7 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
             ));
         }
         let page = snapshot.page(0)?;
+        cancellation.checkpoint()?;
         if !snapshot.alive(now) {
             return Err(Error::new(
                 "RESULT_EXPIRED",
@@ -282,6 +287,64 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
             }
             self.snapshots.insert(snapshot.id.clone(), snapshot);
         }
+        if let Err(error) = cancellation.checkpoint() {
+            self.snapshots.remove(&page.snapshot_id);
+            return Err(error);
+        }
         Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CancelDuringPage(super::super::record_read::QueryCancellation);
+    impl PageBody for CancelDuringPage {
+        const PAGE_ITEMS: usize = 1;
+        fn len(&self) -> usize {
+            2
+        }
+        fn capacity(&self) -> usize {
+            64
+        }
+        fn page(&self, _: usize, _: usize) -> Result<Self, Error> {
+            self.0.cancel();
+            Ok(Self(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn cancellation_during_page_staging_does_not_publish_a_catalogue_lease() {
+        let cancellation = super::super::record_read::QueryCancellation::default();
+        let mut reads =
+            Reads::<super::super::source_read::SourceSelector, CancelDuringPage>::default();
+        let snapshot = Snapshot {
+            bytes: 0,
+            id: "source-read:staging".into(),
+            store_id: "store:test".into(),
+            selector: Default::default(),
+            as_of: 1,
+            expires_at: LEASE_MS + 1,
+            started: Instant::now(),
+            page_size: 1,
+            scan_budget: 10,
+            scanned: 2,
+            body: CancelDuringPage(cancellation.clone()),
+        };
+        let error = reads
+            .publish(
+                snapshot,
+                1,
+                CAPTURE_BYTES,
+                HANDLE_BYTES,
+                MAX_HANDLES,
+                &cancellation,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "CANCELLED");
+        assert_eq!(reads.capacity(), 0);
+        assert!(reads.snapshots.is_empty());
     }
 }
