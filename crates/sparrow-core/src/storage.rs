@@ -15,6 +15,8 @@ use rocksdb::{
     ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions,
 };
 
+pub(crate) mod artifact_read;
+mod catalog_lease;
 pub(crate) mod consumption;
 pub(crate) mod context;
 pub(crate) mod diagnostic;
@@ -305,6 +307,7 @@ pub struct Store {
     inner: Arc<Mutex<Writer>>,
     pin_reads: Arc<Mutex<pin_read::Reads>>,
     rdf_read: Arc<Mutex<()>>,
+    artifact_reads: Arc<Mutex<artifact_read::Reads>>,
 }
 
 struct Writer {
@@ -990,6 +993,7 @@ impl Store {
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
             rdf_read: Arc::new(Mutex::new(())),
+            artifact_reads: Arc::new(Mutex::new(artifact_read::Reads::default())),
         })
     }
 
@@ -1658,6 +1662,7 @@ impl Store {
     /// Report measured database bytes and deduplicated live payload references.
     pub fn status(&self, now: u64) -> Result<Value, Error> {
         let (pin_handles, pin_bytes) = self.pin_read_stats(now)?;
+        let (artifact_handles, artifact_bytes) = self.artifact_read_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         let live = writer.count_catalog::<Record>("record:", |record| {
@@ -1671,6 +1676,20 @@ impl Store {
             .with("max_pin_read_handles", pin_read::MAX_HANDLES.to_string())
             .with("max_pin_read_bytes", pin_read::HANDLE_BYTES.to_string())
             .with("pin_read_lease_ms", pin_read::LEASE_MS.to_string())
+            .with("artifact_read_handles", artifact_handles.to_string())
+            .with("artifact_read_bytes", artifact_bytes.to_string())
+            .with(
+                "max_artifact_read_handles",
+                artifact_read::MAX_HANDLES.to_string(),
+            )
+            .with(
+                "max_artifact_read_bytes",
+                artifact_read::HANDLE_BYTES.to_string(),
+            )
+            .with(
+                "artifact_read_lease_ms",
+                catalog_lease::LEASE_MS.to_string(),
+            )
             .with(
                 "unique_json_projections",
                 writer.count_prefix("projection-ref:")?.to_string(),

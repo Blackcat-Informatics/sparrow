@@ -5517,6 +5517,248 @@ fn stored_rdf_snapshot_survives_concurrent_pin_release_retirement_and_ingestion(
 }
 
 #[test]
+fn artifact_pages_are_immutable_source_time_scoped_occurrence_discovery() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("artifact-list-a", "source-a", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    let b = store
+        .ingest("artifact-list-b", "source-a", "jsonl", b"{}\n{}\n", 2)
+        .unwrap();
+    store
+        .ingest("artifact-list-other", "source-b", "log", b"other\n", 3)
+        .unwrap();
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            source: Some("source-a".into()),
+            received_from: 1,
+            received_before: 3,
+        },
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.artifact_read(&query, 10).unwrap();
+    assert_eq!(first.total_items, 2);
+    assert_eq!(first.body.artifacts.len(), 1);
+    assert_eq!(first.as_of, 10);
+    assert_eq!(first.lease_expires_at, 60_010);
+    assert!(first.body.artifacts[0].complete_bytes_available);
+    assert_eq!(first.body.artifacts[0].retained_records, 2);
+    assert_eq!(
+        first.body.artifacts[0].origin.as_ref().unwrap().byte_length,
+        6
+    );
+    store
+        .ingest("artifact-list-later", "source-a", "jsonl", b"{}\n", 2)
+        .unwrap();
+    query.cursor = first.next_cursor.clone();
+    let second = store.artifact_read(&query, 11).unwrap();
+    assert_eq!(first.snapshot_id, second.snapshot_id);
+    assert_eq!(second.total_items, 2);
+    assert!(second.next_cursor.is_none());
+    let mut ids = vec![
+        first.body.artifacts[0].id.clone(),
+        second.body.artifacts[0].id.clone(),
+    ];
+    let mut expected = vec![a.id, b.id];
+    ids.sort();
+    expected.sort();
+    assert_eq!(ids, expected);
+    let mut changed = query.clone();
+    changed.selector.received_before = 4;
+    assert_eq!(
+        store.artifact_read(&changed, 12).unwrap_err().code,
+        "CONFLICT"
+    );
+    changed = query.clone();
+    changed.page_size = 2;
+    assert_eq!(
+        store.artifact_read(&changed, 12).unwrap_err().code,
+        "CONFLICT"
+    );
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = Store::open(other_dir.path(), config()).unwrap();
+    assert_eq!(
+        other.artifact_read(&query, 12).unwrap_err().code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store
+            .artifact_read(&query, first.lease_expires_at)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store.status(first.lease_expires_at).unwrap()["artifact_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn artifact_discovery_keeps_reclaimed_parent_unknown_and_never_invents_complete_bytes() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest(
+            "artifact-fragments",
+            "fragment-source",
+            "jsonl",
+            b"{}\n{}\n",
+            0,
+        )
+        .unwrap();
+    let empty = store
+        .ingest("artifact-empty", "empty-source", "jsonl", b"", 0)
+        .unwrap();
+    let record_pin = store
+        .pin("fragment-pin", "fragment", &artifact.record_ids[..1], 40, 0)
+        .unwrap();
+    let whole_pin = store
+        .pin("empty-pin", "empty", std::slice::from_ref(&empty.id), 40, 0)
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    assert!(store.artifact(&artifact.id).is_err());
+    let mut query = ArtifactRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.artifact_read(&query, 31 * DAY).unwrap();
+    assert_eq!(first.total_items, 2);
+    query.cursor = first.next_cursor.clone();
+    let second = store.artifact_read(&query, 31 * DAY + 1).unwrap();
+    let rows = [&first.body.artifacts[0], &second.body.artifacts[0]];
+    let fragment = rows.iter().find(|row| row.id == artifact.id).unwrap();
+    assert!(fragment.origin.is_none());
+    assert!(!fragment.complete_bytes_available);
+    assert_eq!(fragment.retained_records, 1);
+    let complete = rows.iter().find(|row| row.id == empty.id).unwrap();
+    assert!(complete.complete_bytes_available);
+    assert_eq!(complete.retained_records, 0);
+    assert_eq!(complete.origin.as_ref().unwrap().byte_length, 0);
+    let timed = ArtifactRead {
+        selector: ArtifactSelector {
+            source: Some("fragment-source".into()),
+            received_from: 0,
+            received_before: 1,
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        store.artifact_read(&timed, 31 * DAY).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    let timed_empty = ArtifactRead {
+        selector: ArtifactSelector {
+            source: Some("empty-source".into()),
+            received_from: 0,
+            received_before: 1,
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        store
+            .artifact_read(&timed_empty, 31 * DAY)
+            .unwrap()
+            .total_items,
+        1
+    );
+    store.release(&record_pin.id).unwrap();
+    store.release(&whole_pin.id).unwrap();
+    store.expire(31 * DAY + 2).unwrap();
+    assert_eq!(store.artifact_read(&query, 31 * DAY + 3).unwrap(), second);
+    assert_eq!(
+        store
+            .artifact_read(&ArtifactRead::default(), 31 * DAY + 3)
+            .unwrap()
+            .total_items,
+        0
+    );
+}
+
+#[test]
+fn artifact_capture_refuses_budget_and_corruption_without_publishing_prefixes() {
+    use purrdf_lex::json::record::ToJson;
+    use sparrow_core::ArtifactRead;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("artifact-budget", "source", "json", b"{}", 0)
+        .unwrap();
+    let tiny = ArtifactRead {
+        scan_budget: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        store.artifact_read(&tiny, 1).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(1).unwrap()["artifact_read_handles"].as_str(),
+        Some("0")
+    );
+    let mut corrupt = store.record(&artifact.record_ids[0]).unwrap().to_json();
+    corrupt.as_object_mut().unwrap().insert("source", "");
+    let invalid_source = purrdf_lex::json::write_compact(&corrupt);
+    drop(store);
+    for bytes in [b"{invalid".as_slice(), invalid_source.as_bytes()] {
+        let db = catalog_db(dir.path()).unwrap();
+        db.put(&artifact.record_ids[0], bytes).unwrap();
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store
+                .artifact_read(&ArtifactRead::default(), 1)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        assert!(store.properties().is_ok());
+    }
+}
+
+#[test]
+fn artifact_handles_are_bounded_shared_by_clones_and_preserve_full_source_labels() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let source = "\n".repeat(512);
+    for request in ["artifact-capacity-a", "artifact-capacity-b"] {
+        store.ingest(request, &source, "json", b"{}", 0).unwrap();
+    }
+    let query = ArtifactRead {
+        page_size: 1,
+        selector: ArtifactSelector {
+            source: Some(source.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for _ in 0..8 {
+        let page = store.clone().artifact_read(&query, 1).unwrap();
+        assert_eq!(page.body.artifacts[0].source, source);
+        assert!(page.next_cursor.is_some());
+    }
+    assert_eq!(
+        store.clone().artifact_read(&query, 1).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(1).unwrap()["artifact_read_handles"].as_str(),
+        Some("8")
+    );
+    store.expire(60_001).unwrap();
+    assert_eq!(
+        store.status(60_001).unwrap()["artifact_read_handles"].as_str(),
+        Some("0")
+    );
+    assert!(store.artifact_read(&query, 60_001).is_ok());
+}
+
+#[test]
 fn stored_rdf_reads_refuse_exhaustion_and_failed_projection_without_prefixes() {
     use purrdf::DatasetView;
     let dir = tempfile::tempdir().unwrap();

@@ -1839,6 +1839,63 @@ RDF 1.2 nested terms, distinct blank scopes, directional literals, reifier and
 annotation layers, and declaration-only empty graphs. Profile drift/missing
 identity and shared CLI/MCP inspection are covered by the repository gate.
 
+## Artifact discovery and shared catalog leases
+
+`Store::artifact_read` captures eligible complete artifacts and the parent
+provenance of surviving records. Identical payloads retain separate artifact
+occurrences. Summaries distinguish complete byte availability, exact eligible
+record count and optional original metadata. After parent catalog reclamation,
+the source and parent ID remain discoverable through surviving records, but the
+original format, receipt time, byte count and original record count are unknown.
+Fragment byte counts and record timestamps never substitute for those values.
+
+The initial selector supports an exact source label and a half-open original
+artifact receipt interval. A time-filtered capture with an applicable reclaimed
+parent refuses with `INDEX_NOT_READY`; a known source mismatch can exclude it
+before that check. Whole-artifact pins preserve complete empty inputs as well
+as nonempty ones. Record pins preserve surviving parent provenance without
+claiming downloadable complete files. The capture uses the existing retention,
+protection, event-record validation and native catalog decoding owners.
+
+One `catalog_lease` implementation now serves both pin and artifact captures.
+It owns absolute wall/monotonic expiry, page construction, cursor validation,
+operation/selector/limit binding and publication admission. The original pin
+reader routes through it; its specialized name selects the generic page type,
+without retaining a second paging implementation. Capture limits are shared
+constants. Each reader has at most eight retained handles and 8 MiB of admitted
+metadata, with a 2 MiB per-capture ceiling. The artifact capture inspects at most
+32 MiB of catalog bytes, refuses entries over 512 KiB before native decoding,
+and admits at most 10,000 summary rows. Each page has a conservative 256 KiB
+structured ceiling, which can reduce the requested item count. All pin/artifact/
+record visits consume the request's scan budget. Exhaustion or corrupt evidence
+publishes no successful prefix or handle.
+
+Pages preserve their captured availability/counts after ingestion or retirement;
+`as_of` identifies that observation. A subsequent byte request validates current
+availability independently. Captures neither pin bytes nor retain database
+versions. Expiry maintenance and status purge expired handles even when clients
+stop reading. Core status exposes artifact handle/byte counts and limits.
+
+The artifact reader is currently a core API. Cap'n Proto, CLI and MCP wiring,
+full live/pin/selection and diagnostic scope support, source discovery and
+corpus-scale indexed selection remain unfinished requirements. No artifact list
+tool is advertised yet.
+
+Local qualification on 2026-10-07: final `make check` passed formatting,
+release Clippy with warnings denied, all workspace release tests (100 storage
+and 28 RPC/daemon/MCP scenarios), seeded census self-tests and the pinned
+cross-workspace gate. All 147 ownership jobs hold with no distinct exceptions.
+Evidence is `/tmp/sparrow-artifact-catalog-final-check-20261007.log`.
+Artifact scenarios verify immutable source/time pages after later ingestion,
+distinct repeated occurrences, changed-selector/limits and foreign-store cursor
+refusal, lease expiry, surviving record parents with unknown origin metadata,
+whole-artifact empty pins, frozen observations after release/retirement, no
+published prefix on scan/corruption failure, full admitted 512-byte source labels
+and the shared-by-clones handle ceiling. Existing pin paging and monotonic expiry
+scenarios pass through the shared lease owner. No runtime dependency, store format,
+wire schema or PurRDF pin changed. This does not qualify the unfinished typed
+artifact-list endpoint or larger-corpus/indexed selection requirements.
+
 ## Bounded stored RDF reads
 
 ### Concurrent native snapshots

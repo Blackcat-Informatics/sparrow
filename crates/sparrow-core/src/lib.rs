@@ -15,6 +15,10 @@ pub use query::{
     EventInterval, FieldConstraint, JsonPredicate, JsonQuery, QueryAlternatives, QueryScope,
     QuerySelection, RecordQuery,
 };
+pub use storage::artifact_read::{
+    ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,
+    ArtifactSummary,
+};
 pub use storage::consumption::{
     ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, MAX_CONSUMPTION_JOURNALS,
     validate_consumption_path,

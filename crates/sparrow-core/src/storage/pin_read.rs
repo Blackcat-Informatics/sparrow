@@ -6,25 +6,15 @@
 use super::{Catalog, Error, Pin, Store, random_id};
 use purrdf_lex::json;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     mem::size_of,
     time::{Duration, Instant},
 };
 
-/// Maximum live pin metadata handles shared by every clone of a store owner.
-pub(super) const MAX_HANDLES: usize = 8;
-/// Maximum admitted retained catalog capacity across all pin read handles.
-pub(super) const HANDLE_BYTES: usize = 8 * 1024 * 1024;
-/// Maximum admitted capacity of one captured pin result.
-const SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
-/// Absolute catalog read lease; page consumption never extends it.
-pub(super) const LEASE_MS: u64 = 60_000;
-/// Maximum original catalog bytes inspected by one capture.
-const SCAN_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum items in a captured result or members in one readable collection.
-const MAX_ITEMS: usize = 10_000;
 /// Conservative structured output ceiling used to bound page admission.
-pub const PAGE_BYTES: usize = 256 * 1024;
+pub use super::catalog_lease::PAGE_BYTES;
+use super::catalog_lease::{CAPTURE_BYTES as SNAPSHOT_BYTES, MAX_ITEMS, SCAN_BYTES};
+pub(super) use super::catalog_lease::{HANDLE_BYTES, LEASE_MS, MAX_HANDLES};
 const PAGE_ITEMS: usize = (PAGE_BYTES - 4096) / 2048;
 
 /// A store-local catalog read scope; names resolve once at capture time.
@@ -106,7 +96,8 @@ pub enum PinPageBody {
     },
 }
 
-impl PinPageBody {
+impl super::catalog_lease::PageBody for PinPageBody {
+    const PAGE_ITEMS: usize = PAGE_ITEMS;
     fn len(&self) -> usize {
         match self {
             Self::Collections(rows) => rows.len(),
@@ -138,91 +129,17 @@ impl PinPageBody {
     }
 }
 
-/// Exact complete catalog capture with bounded pagination, not a live pin scope.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PinReadPage {
-    /// Persistent store identity.
-    pub store_id: String,
-    /// Opaque identity of this immutable metadata capture.
-    pub snapshot_id: String,
-    /// Eligibility clock captured once, in Unix milliseconds.
-    pub as_of: u64,
-    /// Absolute page lease deadline; never renewed by a read.
-    pub lease_expires_at: u64,
-    /// Full captured result size; pagination does not imply incomplete execution.
-    pub total_items: usize,
-    /// Zero-based position of the first returned item.
-    pub page_start: usize,
-    /// Opaque next-page cursor, absent when the captured result is exhausted.
-    pub next_cursor: Option<String>,
-    /// Requested item ceiling bound into the cursor.
-    pub page_size: usize,
-    /// Effective catalog scan admission ceiling bound into the cursor.
-    pub scan_budget: usize,
-    /// Number of catalog entries inspected to establish the complete capture.
-    pub scanned: usize,
-    /// Captured rows and metadata.
-    pub body: PinPageBody,
-}
+/// Exact complete pin metadata capture with bounded pagination.
+pub type PinReadPage = super::catalog_lease::CatalogReadPage<PinPageBody>;
+type Snapshot = super::catalog_lease::Snapshot<PinSelector, PinPageBody>;
+pub(super) type Reads = super::catalog_lease::Reads<PinSelector, PinPageBody>;
 
-struct Snapshot {
-    bytes: usize,
-    id: String,
-    store_id: String,
-    selector: PinSelector,
-    as_of: u64,
-    expires_at: u64,
-    started: Instant,
-    page_size: usize,
-    scan_budget: usize,
-    scanned: usize,
-    body: PinPageBody,
-}
-
-impl Snapshot {
+impl super::catalog_lease::Selector for PinSelector {
     fn capacity(&self) -> usize {
-        // Include the map key, node allowance and selector as well as owned rows.
-        512 + size_of::<Self>()
-            + self.id.capacity() * 2
-            + self.store_id.capacity()
-            + match &self.selector {
-                PinSelector::Active => 0,
-                PinSelector::Id(s) | PinSelector::Name(s) => s.capacity(),
-            }
-            + self.body.capacity()
-    }
-    fn alive(&self, now: u64) -> bool {
-        now < self.expires_at && self.started.elapsed() < Duration::from_millis(LEASE_MS)
-    }
-    fn page(&self, start: usize) -> PinReadPage {
-        let end = self.body.len().min(start + self.page_size.min(PAGE_ITEMS));
-        PinReadPage {
-            store_id: self.store_id.clone(),
-            snapshot_id: self.id.clone(),
-            as_of: self.as_of,
-            lease_expires_at: self.expires_at,
-            total_items: self.body.len(),
-            page_start: start,
-            next_cursor: (end < self.body.len()).then(|| format!("{}/{end}", self.id)),
-            page_size: self.page_size,
-            scan_budget: self.scan_budget,
-            scanned: self.scanned,
-            body: self.body.page(start, end),
+        match self {
+            Self::Active => 0,
+            Self::Id(s) | Self::Name(s) => s.capacity(),
         }
-    }
-}
-
-#[derive(Default)]
-pub(super) struct Reads {
-    snapshots: BTreeMap<String, Snapshot>,
-}
-
-impl Reads {
-    fn purge(&mut self, now: u64) {
-        self.snapshots.retain(|_, value| value.alive(now));
-    }
-    fn capacity(&self) -> usize {
-        self.snapshots.values().map(|snapshot| snapshot.bytes).sum()
     }
 }
 
@@ -309,48 +226,13 @@ impl Store {
             .map_err(|_| Error::new("STORAGE_FAILURE", "pin read registry poisoned"))?;
         reads.purge(now);
         if let Some(cursor) = &query.cursor {
-            let (id, index) = cursor
-                .split_once('/')
-                .filter(|_| cursor.len() <= 160)
-                .ok_or_else(|| Error::new("INVALID_ARGUMENT", "invalid pin page cursor"))?;
-            if !index.is_empty() && index.as_bytes().iter().all(u8::is_ascii_digit) {
-                let start: usize = index
-                    .parse()
-                    .map_err(|_| Error::new("INVALID_ARGUMENT", "invalid pin page position"))?;
-                let snapshot = reads.snapshots.get(id).ok_or_else(|| {
-                    Error::new(
-                        "RESULT_EXPIRED",
-                        "pin read handle is expired, unknown, or from a previous store owner",
-                    )
-                })?;
-                if snapshot.selector != query.selector
-                    || snapshot.page_size != query.page_size
-                    || snapshot.scan_budget != query.scan_budget
-                {
-                    return Err(Error::new(
-                        "CONFLICT",
-                        "cursor requires its original operation, selector and limits",
-                    ));
-                }
-                if start == 0
-                    || start >= snapshot.body.len()
-                    || !start.is_multiple_of(snapshot.page_size.min(PAGE_ITEMS))
-                {
-                    return Err(Error::new(
-                        "INVALID_ARGUMENT",
-                        "cursor is not a captured page boundary",
-                    ));
-                }
-                let page = snapshot.page(start);
-                if !snapshot.alive(now) {
-                    return Err(Error::new(
-                        "RESULT_EXPIRED",
-                        "pin read lease ended during page staging",
-                    ));
-                }
-                return Ok(page);
-            }
-            return Err(Error::new("INVALID_ARGUMENT", "invalid pin page position"));
+            return reads.resume(
+                &query.selector,
+                cursor,
+                query.page_size,
+                query.scan_budget,
+                now,
+            );
         }
         let started = Instant::now();
         let expires_at = now
@@ -487,7 +369,7 @@ impl Store {
                 members: pin.members.into_iter().collect(),
             }
         };
-        let mut snapshot = Snapshot {
+        let snapshot = Snapshot {
             bytes: 0,
             id: random_id("pin-read")?,
             store_id: writer.id.clone(),
@@ -501,36 +383,7 @@ impl Store {
             body,
         };
         drop(writer);
-        snapshot.bytes = snapshot.capacity();
-        if !snapshot.alive(now) {
-            return Err(Error::new(
-                "RESULT_EXPIRED",
-                "pin catalog capture lease ended before publication",
-            ));
-        }
-        if snapshot.bytes > SNAPSHOT_BYTES || reads.capacity() + snapshot.bytes > HANDLE_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "pin metadata snapshot capacity is exhausted",
-            ));
-        }
-        let page = snapshot.page(0);
-        if !snapshot.alive(now) {
-            return Err(Error::new(
-                "RESULT_EXPIRED",
-                "pin read lease ended during page staging",
-            ));
-        }
-        if page.next_cursor.is_some() {
-            if reads.snapshots.len() >= MAX_HANDLES {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "pin metadata handle count is exhausted",
-                ));
-            }
-            reads.snapshots.insert(snapshot.id.clone(), snapshot);
-        }
-        Ok(page)
+        reads.publish(snapshot, now, SNAPSHOT_BYTES, HANDLE_BYTES, MAX_HANDLES)
     }
 
     pub(super) fn pin_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {

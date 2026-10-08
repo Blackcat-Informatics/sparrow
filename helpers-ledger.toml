@@ -985,6 +985,34 @@ fingerprints = []
 names = ['^capture_pin_catalog$']
 
 [[job]]
+id = "catalog-read-leases"
+summary = "One metadata lease owner serves immutable pin and artifact pages, cursor binding, capacity admission and absolute monotonic expiry."
+home = "sparrow_core::storage::catalog_lease::Reads::resume"
+entry_points = ["sparrow_core::storage::catalog_lease::Reads::publish", "sparrow_core::storage::catalog_lease::Snapshot::page"]
+spec = "docs/development-runtime.md: artifact discovery and shared catalog leases."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/pin_read.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^resume_artifact_cursor$', '^resume_pin_cursor$']
+
+[[job]]
+id = "artifact-catalog-discovery"
+summary = "Discover complete eligible artifacts and surviving record parents without inventing missing origin metadata or complete bytes."
+home = "sparrow_core::Store::artifact_read"
+entry_points = []
+spec = "docs/architecture.md: artifact identity, minimal parent provenance and pin-aware retention."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^capture_artifact_catalog$']
+
+[[job]]
 id = "pin-lifetime"
 summary = "Durably extend active stable pin identities with shared deadline, revision and atomic retry receipt publication."
 home = "sparrow_core::Store::renew_pin"
