@@ -8,6 +8,27 @@ use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy)]
+pub(super) enum Origin<'a> {
+    Ordinary,
+    Producer(&'a super::producer_stream::ProducerBatch),
+    Tail(super::tail::Append<'a>),
+}
+impl<'a> Origin<'a> {
+    pub(super) fn producer(self) -> Option<&'a super::producer_stream::ProducerBatch> {
+        match self {
+            Self::Producer(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub(super) fn tail(self) -> Option<super::tail::Append<'a>> {
+        match self {
+            Self::Tail(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 pub(super) enum RecordPayload<'a> {
     Buffered(&'a [u8]),
     /// Exact normalized chunks already durably owned by this private record and parent.
@@ -30,6 +51,7 @@ pub(super) struct RecordInput<'a> {
     pub source_time_profile: &'a Option<source_time::SourceTimeProfile>,
     pub diagnostic_profile: Option<&'a super::diagnostic::DiagnosticProfile>,
     pub producer: Option<super::producer_stream::ProducerPosition>,
+    pub tail: Option<super::tail::TailPosition>,
 }
 
 pub(super) struct RecordBatch<'a> {
@@ -232,6 +254,7 @@ impl<'a> RecordBatch<'a> {
             )?,
         };
         let record = Record {
+            tail: input.tail,
             syslog,
             producer: input.producer,
             id: input.id,
@@ -449,17 +472,24 @@ impl Writer {
         format: &str,
         byte_length: u64,
         payload_id: &str,
-        producer: Option<&super::producer_stream::ProducerBatch>,
+        origin: Origin<'_>,
         now: u64,
     ) -> Result<Option<super::Artifact>, Error> {
         let artifact = match self.retry(&format!("request:ingest:{request_id}"), now)? {
             Some(saved) => {
-                if let Some(producer) = producer
-                    && saved.get("producer") != Some(&producer.encode())
+                if saved
+                    .get("producer")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    != origin
+                        .producer()
+                        .map(super::producer_stream::ProducerBatch::encode)
+                    || saved.get("tail").filter(|value| !value.is_null()).cloned()
+                        != origin.tail().map(|input| input.encode())
                 {
                     return Err(Error::new(
                         "CONFLICT",
-                        "request_id was committed with different producer provenance",
+                        "request_id was committed with different intake provenance",
                     ));
                 }
                 <super::Artifact as super::Catalog>::decode(super::field(&saved, "receipt")?)?
@@ -469,7 +499,7 @@ impl Writer {
                 &super::import::import_id(request_id),
                 now,
             )? {
-                Some((_, artifact)) if producer.is_none() => artifact,
+                Some((_, artifact)) if matches!(origin, Origin::Ordinary) => artifact,
                 Some(_) => {
                     return Err(Error::new(
                         "CONFLICT",
@@ -497,7 +527,7 @@ impl Writer {
         batch: &mut WriteBatch,
         request_id: &str,
         artifact: &super::Artifact,
-        producer: Option<&super::producer_stream::ProducerBatch>,
+        origin: Origin<'_>,
         now: u64,
     ) -> Result<(), Error> {
         let receipt: Value = Object::new()
@@ -510,8 +540,11 @@ impl Writer {
             .with("receipt", super::Catalog::encode(artifact))
             .with(
                 "producer",
-                producer.map(super::producer_stream::ProducerBatch::encode),
+                origin
+                    .producer()
+                    .map(super::producer_stream::ProducerBatch::encode),
             )
+            .with("tail", origin.tail().map(|input| input.encode()))
             .into();
         batch.put(
             format!("request:ingest:{request_id}"),

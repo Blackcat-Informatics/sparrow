@@ -598,6 +598,41 @@ days does not shorten a record that would ordinarily remain for another twenty.
 
 ## 5. Cap'n Proto ingestion, queries, and administration
 
+### File-generation checkpoint core (daemon tail watches unfinished)
+
+The core has `tail_start`, `tail_append`, `tail_generation` and
+`tail_discontinue`. An explicit declaration binds a stable start request,
+watch/revision, original root/parent directory identities, raw relative Unix
+path, source, line format and opened device/inode.
+The observer owns file-descriptor validation; these calls do not probe, rename
+or delete producer files. Reusing a declaration preserves its generation and
+current checkpoint; changing it conflicts. At most 64 generations and 512 KiB
+of encoded checkpoint metadata are retained. Active entries consume this quota;
+terminal summaries become eligible for registry replacement 30 days after
+completion/discontinuity.
+
+Append accepts only the complete prefix found by the existing log/JSONL record
+boundary owner. An unfinished suffix remains at the uncommitted source offset;
+it is not acknowledged as stored. Explicit completion admits a final line
+without LF, including completion at an already committed EOF. Idle time and
+writable close do not imply completion. Generation checkpoint, exact records,
+native indexes and immutable retry provenance commit in one durable WAL batch.
+Conflicting or failed publication advances no checkpoint. Exact retries reuse
+the original occurrence IDs even after later records or a declared discontinuity.
+
+Record metadata retains the original declaration and file byte range, so a
+pinned record keeps its provenance after parent/terminal metadata expiry.
+The batch artifact represents precisely that accepted prefix; it does not claim
+to be the entire source file. Native RDF metadata includes the generation IRI
+and original file offsets. A discontinuity stops the old generation at its
+accepted offset without inventing overwritten bytes; a replacement has a new
+opaque identity. Missing/corrupt registries refuse startup. The 25..28 writer
+fences preserve the prior consumption/watch/handoff family across upgrade.
+
+These storage APIs are not yet wired to daemon tail-watch administration,
+inotify discovery, retained rotated descriptors or completed-file handoff.
+Those integration and acceptance requirements remain unfinished.
+
 ### Public TCP and syslog packet interpretation
 
 `rpc_tcp_address` explicitly enables the same generated Cap'n Proto service as

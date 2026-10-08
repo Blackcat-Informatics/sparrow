@@ -41,10 +41,11 @@ mod retire;
 pub(crate) mod source_read;
 pub(crate) mod source_time;
 pub(crate) mod syslog;
+pub(crate) mod tail;
 mod text_index;
 pub(crate) mod watch_registry;
 
-const FORMAT: &[u8] = b"sparrow.store/21";
+const FORMAT: &[u8] = b"sparrow.store/25";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
@@ -258,6 +259,8 @@ pub struct Record {
     pub producer: Option<producer_stream::ProducerPosition>,
     /// Immutable syslog packet interpretation; raw bytes remain authoritative.
     pub syslog: Option<syslog::SyslogSnapshot>,
+    /// Immutable original file-generation byte position, when tailed.
+    pub tail: Option<tail::TailPosition>,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -484,6 +487,7 @@ impl Catalog for Record {
             .with("diagnostics", self.diagnostics.encode())
             .with("producer", self.producer.as_ref().map(Catalog::encode))
             .with("syslog", self.syslog.as_ref().map(Catalog::encode))
+            .with("tail", self.tail.as_ref().map(Catalog::encode))
             .with("chunks", self.chunks.clone())
             .with("evicted", self.evicted)
             .into()
@@ -521,6 +525,11 @@ impl Catalog for Record {
                 .filter(|value| !value.is_null())
                 .map(producer_stream::ProducerPosition::decode)
                 .transpose()?,
+            tail: v
+                .get("tail")
+                .filter(|value| !value.is_null())
+                .map(tail::TailPosition::decode)
+                .transpose()?,
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             syslog: v
                 .get("syslog")
@@ -545,6 +554,18 @@ impl Catalog for Record {
         }
         if let Some(snapshot) = &record.syslog {
             snapshot.validate_record(&record)?;
+        }
+        if let Some(position) = &record.tail
+            && (record.producer.is_some()
+                || record.syslog.is_some()
+                || record.source != position.declaration.source
+                || position.source_end.checked_sub(position.source_start)
+                    != record.byte_end.checked_sub(record.byte_start))
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "file-generation record provenance disagrees with its byte span or intake kind",
+            ));
         }
         Ok(record)
     }
@@ -1056,6 +1077,7 @@ impl Store {
         };
         let writer = store.lock()?;
         producer_stream::registry(&writer)?;
+        tail::registry(&writer)?;
         drop(writer);
         Ok(store)
     }
@@ -1105,7 +1127,15 @@ impl Store {
         now: u64,
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
-        self.ingest_input(request_id, source, format, bytes, None, now, mode)
+        self.ingest_input(
+            request_id,
+            source,
+            format,
+            bytes,
+            ingest::Origin::Ordinary,
+            now,
+            mode,
+        )
     }
 
     /// Accept normalized typed events and their producer positions in one WAL batch.
@@ -1124,7 +1154,7 @@ impl Store {
             source,
             "jsonl",
             bytes,
-            Some(producer),
+            ingest::Origin::Producer(producer),
             now,
             mode,
         )
@@ -1140,7 +1170,7 @@ impl Store {
         source: &str,
         format: &str,
         bytes: &[u8],
-        producer: Option<&producer_stream::ProducerBatch>,
+        origin: ingest::Origin<'_>,
         now: u64,
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
@@ -1158,6 +1188,16 @@ impl Store {
                 "artifact exceeds the configured bounded ingestion size",
             ));
         }
+        if let Some(input) = origin.tail()
+            && (input.offset.checked_add(bytes.len() as u64) != Some(input.end)
+                || (!input.complete && bytes.last() != Some(&b'\n'))
+                || mode != durability::Durability::Durable)
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "tail checkpoint requires an exact complete byte prefix and durable publication",
+            ));
+        }
         let payload_id = format!("blake3:{}", hex::encode(blake3::hash(bytes).as_bytes()));
         if let Some(receipt) = writer.accepted_ingest(
             request_id,
@@ -1165,7 +1205,7 @@ impl Store {
             format,
             bytes.len() as u64,
             &payload_id,
-            producer,
+            origin,
             now,
         )? {
             return writer.receipt(receipt, mode);
@@ -1185,6 +1225,7 @@ impl Store {
             )
         })?;
         let record_count = record_ends(format, bytes, true).count();
+        let producer = origin.producer();
         if producer.is_some_and(|input| input.sequences.len() != record_count) {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
@@ -1199,6 +1240,10 @@ impl Store {
         }
         let stream = producer
             .map(|input| producer_stream::prepare(&writer, source, input, now))
+            .transpose()?;
+        let tail_checkpoint = origin
+            .tail()
+            .map(|input| tail::prepare(&writer, source, format, input, record_count, now))
             .transpose()?;
         let id = random_id("artifact")?;
         let mut prepared = ingest::RecordBatch::new(&writer)?;
@@ -1222,6 +1267,14 @@ impl Store {
                         sequence: input.sequences[ordinal],
                     }
                 }),
+                tail: tail_checkpoint
+                    .as_ref()
+                    .map(|checkpoint| tail::TailPosition {
+                        generation_id: checkpoint.id.clone(),
+                        declaration: checkpoint.declaration.clone(),
+                        source_start: checkpoint.offset + start as u64,
+                        source_end: checkpoint.offset + end as u64,
+                    }),
             })?;
             put(&mut prepared.batch, &record.id, &record);
             prepared.batch.put(
@@ -1247,7 +1300,10 @@ impl Store {
         };
         put(&mut batch, &artifact.id, &artifact);
         recordless::publish(&mut batch, &artifact)?;
-        writer.ingest_receipt(&mut batch, request_id, &artifact, producer, now)?;
+        writer.ingest_receipt(&mut batch, request_id, &artifact, origin, now)?;
+        if let Some(checkpoint) = tail_checkpoint {
+            batch.put(tail::KEY, checkpoint.encoded);
+        }
         if let Some(stream) = stream {
             stream.publish(&mut batch);
         }

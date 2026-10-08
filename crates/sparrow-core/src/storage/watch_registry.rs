@@ -8,7 +8,7 @@ use rocksdb::WriteBatch;
 
 /// Bound on the complete watch catalog, including finite mutation receipts.
 pub const MAX_WATCH_REGISTRY_BYTES: usize = 512 * 1024;
-pub(super) const FORMAT: &[u8] = b"sparrow.store/23";
+pub(super) const FORMAT: &[u8] = b"sparrow.store/27";
 
 impl Store {
     /// Capture the exact administrative catalog without a second configuration codec.

@@ -680,6 +680,13 @@ pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
         }
         let mut batch = WriteBatch::default();
         batch.put("store_format", legacy.target);
+        if db.get(super::tail::KEY)?.is_some() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "legacy store has unfenced file-generation registry",
+            ));
+        }
+        batch.put(super::tail::KEY, b"[]");
         if !legacy.producer_registry {
             batch.put(super::producer_stream::KEY, b"[]");
         }

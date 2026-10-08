@@ -220,6 +220,7 @@ pub(super) fn advance(
     let mut builder = ingest::RecordBatch::new(writer)?;
     let record: Record = builder.record(ingest::RecordInput {
         producer: None,
+        tail: None,
         id: raw.record_id,
         artifact_id: &progress.artifact_id,
         source: &manifest.source,

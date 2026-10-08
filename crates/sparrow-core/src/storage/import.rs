@@ -446,7 +446,7 @@ impl Store {
             format,
             byte_length,
             payload_id,
-            None,
+            super::ingest::Origin::Ordinary,
             now,
         )? {
             return Ok(ImportStart::Accepted(
@@ -855,7 +855,7 @@ impl Writer {
                 format,
                 byte_length,
                 payload_id,
-                None,
+                super::ingest::Origin::Ordinary,
                 now,
             )?
             .is_some()

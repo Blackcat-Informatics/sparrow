@@ -40,19 +40,17 @@ pub(super) struct LegacyFormat {
 
 /// Preserve consumption/watch/handoff authority through every admitted upgrade.
 pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
-    let target =
-        match format {
-            b"sparrow.store/5" | b"sparrow.store/9" | b"sparrow.store/13" | b"sparrow.store/17" => {
-                super::FORMAT
-            }
-            b"sparrow.store/6" | b"sparrow.store/10" | b"sparrow.store/14"
-            | b"sparrow.store/18" => super::consumption::FORMAT,
-            b"sparrow.store/7" | b"sparrow.store/11" | b"sparrow.store/15"
-            | b"sparrow.store/19" => super::watch_registry::FORMAT,
-            b"sparrow.store/8" | b"sparrow.store/12" | b"sparrow.store/16"
-            | b"sparrow.store/20" => super::handoff::FORMAT,
-            _ => return None,
-        };
+    let target = match format {
+        b"sparrow.store/5" | b"sparrow.store/9" | b"sparrow.store/13" | b"sparrow.store/17"
+        | b"sparrow.store/21" => super::FORMAT,
+        b"sparrow.store/6" | b"sparrow.store/10" | b"sparrow.store/14" | b"sparrow.store/18"
+        | b"sparrow.store/22" => super::consumption::FORMAT,
+        b"sparrow.store/7" | b"sparrow.store/11" | b"sparrow.store/15" | b"sparrow.store/19"
+        | b"sparrow.store/23" => super::watch_registry::FORMAT,
+        b"sparrow.store/8" | b"sparrow.store/12" | b"sparrow.store/16" | b"sparrow.store/20"
+        | b"sparrow.store/24" => super::handoff::FORMAT,
+        _ => return None,
+    };
     Some(LegacyFormat {
         target,
         diagnostic_mappings: matches!(
@@ -65,10 +63,21 @@ pub(super) fn legacy_format(format: &[u8]) -> Option<LegacyFormat> {
                 | b"sparrow.store/18"
                 | b"sparrow.store/19"
                 | b"sparrow.store/20"
+                | b"sparrow.store/21"
+                | b"sparrow.store/22"
+                | b"sparrow.store/23"
+                | b"sparrow.store/24"
         ),
         producer_registry: matches!(
             format,
-            b"sparrow.store/17" | b"sparrow.store/18" | b"sparrow.store/19" | b"sparrow.store/20"
+            b"sparrow.store/17"
+                | b"sparrow.store/18"
+                | b"sparrow.store/19"
+                | b"sparrow.store/20"
+                | b"sparrow.store/21"
+                | b"sparrow.store/22"
+                | b"sparrow.store/23"
+                | b"sparrow.store/24"
         ),
         needs_recordless_index: matches!(
             format,
@@ -88,6 +97,8 @@ pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
             | b"sparrow.store/16"
             | b"sparrow.store/19"
             | b"sparrow.store/20"
+            | b"sparrow.store/23"
+            | b"sparrow.store/24"
     ) || format == super::watch_registry::FORMAT
         || format == super::handoff::FORMAT
 }
@@ -177,6 +188,13 @@ fn fence(db: &DB) -> Result<(), Error> {
             ));
         }
         batch.put(super::producer_stream::KEY, b"[]");
+        if db.get(super::tail::KEY)?.is_some() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "legacy store has unfenced file-generation registry",
+            ));
+        }
+        batch.put(super::tail::KEY, b"[]");
         super::put(&mut batch, UPGRADE, &Progress::default());
         commit(db, batch)?;
     }

@@ -610,6 +610,22 @@ pub(super) fn metadata(
         let predicate = builder.intern_iri(&predicate);
         builder.push_quad(subject, predicate, object, None);
     }
+    if let Some(position) = &record.tail {
+        let predicate = builder.intern_iri(&format!("{NS}fileGeneration"));
+        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.generation_id));
+        builder.push_quad(subject, predicate, object, None);
+        for (name, value) in [
+            ("fileByteStart", position.source_start),
+            ("fileByteEnd", position.source_end),
+        ] {
+            let predicate = builder.intern_iri(&format!("{NS}{name}"));
+            let object = builder.intern_literal(RdfLiteral::typed(
+                value.to_string(),
+                "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+            ));
+            builder.push_quad(subject, predicate, object, None);
+        }
+    }
     if let Some(snapshot) = &record.syslog {
         let predicate = builder.intern_iri(&format!("{NS}syslogProfile"));
         let object = builder.intern_iri(&format!("urn:sparrow:{}", snapshot.profile_id));
