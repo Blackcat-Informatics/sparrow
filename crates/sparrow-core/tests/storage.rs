@@ -9,6 +9,283 @@ use sparrow_test_support::{catalog_db, remove_tail_range_index};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry() {
+    use sparrow_core::{ConsumptionGeneration, ConsumptionHandoff, TailFinishIntent, TailStart};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.watch_registry_replace(None, b"registered").unwrap();
+    let mut declaration = TailStart {
+        request_id: "retirement-start".into(),
+        watch: "tail".into(),
+        watch_revision: 1,
+        directories: CONSUMPTION_DIRECTORIES,
+        path: b"active.log".to_vec(),
+        source: "retirement-source".into(),
+        format: "log".into(),
+        device: 1,
+        inode: 42,
+    };
+    let generation = store.tail_start(&declaration, 1).unwrap();
+    let original = store
+        .tail_append(&generation.id, 0, b"first\n", false, 2)
+        .unwrap()
+        .artifact
+        .unwrap();
+    let record = store.record(&original.record_ids[0]).unwrap();
+    let finish = TailFinishIntent {
+        request_id: "retirement-finish".into(),
+        generation_id: generation.id.clone(),
+        watch_revision: 1,
+        observed: ConsumptionGeneration {
+            device: 1,
+            inode: 42,
+            byte_length: 10,
+            modified: (3, 4),
+            changed: (5, 6),
+        },
+    };
+    // The producer may have rotated the path before declaring final clocks.
+    let intent = ConsumptionHandoff {
+        request_id: "retirement-handoff".into(),
+        watch: "tail".into(),
+        watch_revision: 1,
+        relative_path: b"rotated.log".to_vec(),
+        observed: finish.observed.clone(),
+        tail_generation_id: Some(generation.id.clone()),
+    };
+    store.tail_finish_start(&finish, 3).unwrap();
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(
+                &intent,
+                &declaration.source,
+                "log",
+                CONSUMPTION_DIRECTORIES,
+                4
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert!(store.consumption_pending().unwrap().is_empty());
+    let final_record = store
+        .tail_append(&generation.id, 6, b"last", true, 5)
+        .unwrap()
+        .artifact
+        .unwrap();
+    let terminal = store.tail_generation(&generation.id).unwrap();
+    for field in 0..4 {
+        let mut changed = intent.clone();
+        match field {
+            0 => changed.observed.changed.1 += 1,
+            1 => changed.observed.modified.1 += 1,
+            2 => changed.watch_revision += 1,
+            _ => changed.watch = "another-watch".into(),
+        }
+        assert_eq!(
+            store
+                .consumption_handoff_reserve(
+                    &changed,
+                    &declaration.source,
+                    "log",
+                    CONSUMPTION_DIRECTORIES,
+                    6
+                )
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+    }
+    let mut wrong_root = CONSUMPTION_DIRECTORIES;
+    wrong_root.root_inode += 1;
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(&intent, &declaration.source, "log", wrong_root, 6)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let reserved = store
+        .consumption_handoff_reserve(
+            &intent,
+            &declaration.source,
+            "log",
+            CONSUMPTION_DIRECTORIES,
+            6,
+        )
+        .unwrap();
+    assert_eq!(reserved.tail, Some(terminal.clone()));
+    assert_eq!(reserved.published_id(), None);
+    drop(store);
+    let key = format!("consumption:{}", reserved.import_id);
+    let saved = {
+        let db = catalog_db(dir.path()).unwrap();
+        db.get(&key).unwrap().unwrap()
+    };
+    for corruption in 0..5 {
+        {
+            use purrdf_lex::json;
+            let db = catalog_db(dir.path()).unwrap();
+            let mut value = json::read_slice(&saved, json::Limits::DEFAULT).unwrap();
+            match corruption {
+                0 => *value.get_mut("tail").unwrap() = json::Value::Null,
+                1 => *value.get_mut("tail_published").unwrap() = true.into(),
+                2 => {
+                    *value
+                        .get_mut("tail")
+                        .unwrap()
+                        .get_mut("started_at")
+                        .unwrap() = "0".into()
+                }
+                3 => {
+                    let json::Value::Object(object) = &mut value else {
+                        panic!("journal is an object")
+                    };
+                    object.remove("tail_published").unwrap();
+                }
+                _ => db.put("store_format", b"sparrow.store/36").unwrap(),
+            }
+            db.put(&key, json::write_compact(&value)).unwrap();
+        }
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store.consumption_get(&reserved.import_id).unwrap_err().code,
+            "STORAGE_FAILURE"
+        );
+        drop(store);
+        let db = catalog_db(dir.path()).unwrap();
+        db.put(&key, &saved).unwrap();
+        db.put("store_format", b"sparrow.store/37").unwrap();
+    }
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        Some("sparrow.store/37")
+    );
+    assert_eq!(
+        store
+            .consumption_publish_tail(&reserved.import_id, &intent.observed)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let mut claimed = intent.observed.clone();
+    claimed.changed = (7, 8); // Atomic rename changes ctime; content identity stays fixed.
+    let claim = store
+        .consumption_claimed(&reserved.import_id, claimed.clone())
+        .unwrap();
+    assert_eq!(
+        store
+            .import_begin(
+                &claim.request_id,
+                &declaration.source,
+                "log",
+                10,
+                "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                7
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        store
+            .consumption_removed(&claim.import_id, &generation.id, &claimed, 7)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    // Expire the bounded generation registry while ownership remains pending.
+    declaration.request_id = "replacement-start".into();
+    declaration.inode += 1;
+    store.tail_start(&declaration, 32 * DAY).unwrap();
+    assert_eq!(
+        store.tail_generation(&generation.id).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        store
+            .consumption_handoff_reserve(
+                &intent,
+                &declaration.source,
+                "log",
+                CONSUMPTION_DIRECTORIES,
+                32 * DAY
+            )
+            .unwrap(),
+        claim
+    );
+    let published = store
+        .consumption_publish_tail(&claim.import_id, &claimed)
+        .unwrap();
+    assert_eq!(published.published_id(), Some(generation.id.as_str()));
+    assert!(published.published_artifact.is_none());
+    assert_eq!(published.tail, Some(terminal));
+    assert_eq!(
+        store
+            .consumption_publish_tail(&claim.import_id, &claimed)
+            .unwrap(),
+        published
+    );
+    let unchanged = store.record(&record.id).unwrap();
+    assert_eq!(unchanged.received_at, record.received_at);
+    assert_eq!(unchanged.expires_at, record.expires_at);
+    assert_eq!(unchanged.tail, record.tail);
+    assert_eq!(store.records(10).unwrap().len(), 2);
+    assert!(store.records(32 * DAY).unwrap().is_empty());
+    assert_eq!(
+        store.bytes(&final_record.record_ids[0], 0, 4, 10).unwrap(),
+        b"last"
+    );
+    let removed = store
+        .consumption_removed(&claim.import_id, &generation.id, &claimed, 32 * DAY)
+        .unwrap();
+    assert_eq!(removed.removed_at, Some(32 * DAY));
+    assert!(store.consumption_pending().unwrap().is_empty());
+    assert_eq!(
+        store
+            .consumption_removed(&claim.import_id, &generation.id, &claimed, 33 * DAY)
+            .unwrap(),
+        removed
+    );
+    store
+        .watch_registry_replace(Some(b"registered"), b"changed")
+        .unwrap();
+    // Ordinary subsequent handoffs cannot downgrade the tail writer fence.
+    let mut ordinary = intent.clone();
+    ordinary.request_id = "ordinary-after-tail".into();
+    ordinary.tail_generation_id = None;
+    store
+        .consumption_handoff_reserve(
+            &ordinary,
+            "ordinary",
+            "log",
+            CONSUMPTION_DIRECTORIES,
+            32 * DAY,
+        )
+        .unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        Some("sparrow.store/37")
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.consumption_handoff_get(&intent, 33 * DAY).unwrap(),
+        Some(removed)
+    );
+    assert_eq!(
+        store
+            .consumption_handoff_get(&intent, 35 * DAY)
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+}
+
+#[test]
 fn completed_file_bytes_span_original_records_and_follow_full_cover_pin_eligibility() {
     use sparrow_core::TailStart;
     let dir = tempfile::tempdir().unwrap();
@@ -3570,6 +3847,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     let handoff = sparrow_core::ConsumptionHandoff {
         request_id: "finished-file-1".into(),
+        tail_generation_id: None,
         watch: reserved.watch.clone(),
         watch_revision: 1,
         relative_path: reserved.relative_path.clone(),
@@ -3782,6 +4060,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     let store = Store::open(dir.path(), config()).unwrap();
     let mut intent = sparrow_core::ConsumptionHandoff {
         request_id: "handoff-0".into(),
+        tail_generation_id: None,
         watch: "watch".into(),
         watch_revision: 1,
         relative_path: b"nested/\xff.log".to_vec(),

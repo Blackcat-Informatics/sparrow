@@ -968,6 +968,7 @@ impl Store {
                     || format == consumption::FORMAT
                     || format == watch_registry::FORMAT
                     || format == handoff::FORMAT
+                    || format == consumption::TAIL_FORMAT
                     || recordless::legacy_format(&format).is_some() =>
             {
                 if recordless::requires_watch_registry(&format)

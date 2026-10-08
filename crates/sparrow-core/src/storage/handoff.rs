@@ -26,11 +26,20 @@ pub struct ConsumptionHandoff {
     pub relative_path: Vec<u8>,
     /// Exact generation the producer has finished writing.
     pub observed: ConsumptionGeneration,
+    /// Original completed tail checkpoint, when retiring already accepted records.
+    pub tail_generation_id: Option<String>,
 }
 
 impl ConsumptionHandoff {
     fn validate(&self) -> Result<(), Error> {
-        if self.request_id.is_empty() || self.request_id.len() > 128 || self.watch_revision == 0 {
+        if self.request_id.is_empty()
+            || self.request_id.len() > 128
+            || self.watch_revision == 0
+            || self
+                .tail_generation_id
+                .as_ref()
+                .is_some_and(|id| !id.starts_with("file-generation:") || id.len() > 128)
+        {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "handoff requires a request ID of 1..128 bytes and a nonzero watch revision",
@@ -81,6 +90,7 @@ impl Catalog for Binding {
                 super::hex::encode(&self.intent.relative_path),
             )
             .with("observed", self.intent.observed.encode())
+            .with("tail_generation_id", self.intent.tail_generation_id.clone())
             .with("import_id", self.import_id.clone())
             .with("expires_at", self.expires_at.to_string())
             .with("completed", self.completed)
@@ -99,6 +109,11 @@ impl Catalog for Binding {
                 )?)
                 .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?,
                 observed: ConsumptionGeneration::decode(super::field(value, "observed")?)?,
+                tail_generation_id: value
+                    .get("tail_generation_id")
+                    .map(|_| read_field(value, "tail_generation_id"))
+                    .transpose()?
+                    .flatten(),
             },
             import_id: read_field(value, "import_id")?,
             expires_at: integer(value, "expires_at")?,
@@ -144,6 +159,11 @@ impl Writer {
         if journal.watch != intent.watch
             || journal.relative_path != intent.relative_path
             || journal.observed != intent.observed
+            || journal.tail.as_ref().map(|tail| &tail.id) != intent.tail_generation_id.as_ref()
+            || journal
+                .tail
+                .as_ref()
+                .is_some_and(|tail| tail.declaration.watch_revision != intent.watch_revision)
             || binding.completed != journal.removed_at.is_some()
         {
             return Err(Error::new(
@@ -194,7 +214,9 @@ impl Writer {
                 completed: journal.removed_at.is_some(),
             },
         );
-        batch.put("store_format", FORMAT);
+        if self.db.get("store_format")?.as_deref() != Some(super::consumption::TAIL_FORMAT) {
+            batch.put("store_format", FORMAT);
+        }
         Ok(())
     }
 
@@ -289,7 +311,10 @@ impl Store {
         now: u64,
     ) -> Result<ConsumptionJournal, Error> {
         intent.validate()?;
-        let journal = ConsumptionJournal::reservation(
+        if let Some(previous) = self.consumption_handoff_get(intent, now)? {
+            return Ok(previous);
+        }
+        let mut journal = ConsumptionJournal::reservation(
             &intent.watch,
             &intent.relative_path,
             source,
@@ -297,6 +322,16 @@ impl Store {
             intent.observed.clone(),
             directories,
         )?;
+        if let Some(id) = &intent.tail_generation_id {
+            let tail = self.tail_generation(id)?;
+            if tail.declaration.watch_revision != intent.watch_revision {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "tail handoff changed the original watch revision",
+                ));
+            }
+            journal.bind_tail(tail)?;
+        }
         self.reserve_consumption(journal, Some((intent, now)))
     }
 }

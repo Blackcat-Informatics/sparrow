@@ -3854,3 +3854,47 @@ jobs, no distinct exceptions**. Evidence is in
 `/tmp/sparrow-file-bytes-example-commit.log`, and
 `/tmp/sparrow-schema40-bins.log`. Completed-tail claim/deletion coordination and
 full architecture acceptance remain unfinished.
+
+## Completed-tail claim storage foundation
+
+The core consumption journal now supports retiring a producer-finished tail
+generation without importing its accepted bytes again. An explicit handoff
+names the original generation; admission loads its actual durable terminal
+checkpoint and requires a complete, gap-free producer finish, the original
+watch revision, source interpretation, root identity, and exact final descriptor
+observation, including nanosecond modification and change clocks. A path rotated
+before the producer finish may be handed off under its current relative path.
+A changed final observation is refused.
+
+The entire original checkpoint is included in reservation identity and persisted
+with source ownership. It keeps the original declaration, record count, byte
+prefix, completion admission/publication times, and metadata deadline. Pending
+ownership can therefore recover after the bounded generation registry expires.
+Acknowledging the claimed checkpoint publishes its existing generation identity;
+it creates no artifact, record, payload, pin, or new acceptance clock. Uploads
+using this reserved consumption identity fail rather than duplicate records.
+Source removal confirmation and the completed 48-hour retry lease use the same
+consumption journal and handoff binding as ordinary completed-file imports.
+
+The first such reservation atomically selects `sparrow.store/37`, which older
+writers refuse. Ordinary stores continue to use formats 33–36; this change does
+not migrate or rebuild their catalog. Watch updates and subsequent ordinary
+handoffs preserve format 37. A tail journal under an older format fails when
+read, and altered or missing checkpoint proof fails its reservation identity.
+Reservations leave 512 bytes under the 8 KiB journal ceiling for the subsequent
+claimed observation, removal clock, and completed receipt wrapper.
+
+This is a core storage foundation. Public RPC/SDK/CLI/MCP handoff selection and
+the filesystem claim/deletion worker still need to be wired to this mode. The
+running schema-40 development service has not been changed by this work.
+
+Qualification includes a release storage scenario covering incomplete-finish
+refusal, exact-clock/revision/root conflicts, checkpoint tampering and missing
+publication state, a downgraded writer fence, reopen before publication,
+generation-registry expiry, import refusal, unchanged record clocks, absence of
+expired-record resurrection, removal retries, and subsequent ordinary handoffs.
+The repository gate passed with 139 storage scenarios, 48 RPC scenarios, 15 SDK
+tests, remaining workspace tests, seeded census self-tests, and the pinned cross
+gate with 206 ownership jobs and no distinct exceptions. Gate and normal signed
+commit verification logs are `/tmp/sparrow-tail-claim-check.log` and
+`/tmp/sparrow-tail-claim-commit.log`.

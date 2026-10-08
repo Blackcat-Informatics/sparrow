@@ -13,6 +13,7 @@ pub(crate) fn intent(value: &CompletedHandoff) -> Result<ConsumptionHandoff, Err
         watch: value.watch.clone(),
         watch_revision: value.watch_revision,
         relative_path: value.relative_path.clone(),
+        tail_generation_id: None,
         observed: crate::consumption::generation(value.generation)
             .map_err(|e| Error::new("INVALID_ARGUMENT", e.to_string()))?,
     })

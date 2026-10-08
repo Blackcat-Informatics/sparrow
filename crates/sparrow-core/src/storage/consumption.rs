@@ -14,6 +14,7 @@ use rocksdb::WriteBatch;
 pub const MAX_CONSUMPTION_JOURNALS: usize = 16;
 const JOURNAL_BYTES: usize = 8192;
 pub(super) const FORMAT: &[u8] = b"sparrow.store/34";
+pub(super) const TAIL_FORMAT: &[u8] = b"sparrow.store/37";
 
 /// Directory identities anchoring the source namespace across recovery.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +138,10 @@ pub struct ConsumptionJournal {
     pub claimed: Option<ConsumptionGeneration>,
     /// Original atomically published artifact, independent of retry expiry.
     pub published_artifact: Option<String>,
+    /// Original terminal checkpoint for source retirement without reimporting bytes.
+    pub tail: Option<super::tail::TailGeneration>,
+    /// Durable acknowledgement of the original checkpoint under this claim.
+    pub tail_published: bool,
     /// Explicit directory-synced removal confirmation clock.
     pub removed_at: Option<u64>,
 }
@@ -168,6 +173,8 @@ impl Catalog for ConsumptionJournal {
                     .unwrap_or(Value::Null),
             )
             .with("published_artifact", self.published_artifact.clone())
+            .with("tail", self.tail.as_ref().map(Catalog::encode))
+            .with("tail_published", self.tail_published)
             .with("removed_at", self.removed_at.map(|v| v.to_string()))
             .into()
     }
@@ -188,6 +195,21 @@ impl Catalog for ConsumptionJournal {
                 value => Some(ConsumptionGeneration::decode(value)?),
             },
             published_artifact: read_field(value, "published_artifact")?,
+            tail: value
+                .get("tail")
+                .filter(|value| !value.is_null())
+                .map(super::tail::TailGeneration::decode)
+                .transpose()?,
+            tail_published: match value.get("tail_published") {
+                Some(_) => read_field(value, "tail_published")?,
+                None if value.get("tail").is_none_or(Value::is_null) => false,
+                None => {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "tail claim publication state missing",
+                    ));
+                }
+            },
             removed_at: read_field::<Option<String>>(value, "removed_at")?
                 .map(|v| {
                     v.parse()
@@ -200,8 +222,8 @@ impl Catalog for ConsumptionJournal {
             .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
         if journal.request_id != journal.reserved_request()
             || journal.import_id != super::import::import_id(&journal.request_id)
-            || (journal.published_artifact.is_some() && journal.claimed.is_none())
-            || (journal.removed_at.is_some() && journal.published_artifact.is_none())
+            || (journal.published_id().is_some() && journal.claimed.is_none())
+            || (journal.removed_at.is_some() && journal.published_id().is_none())
             || journal
                 .published_artifact
                 .as_ref()
@@ -236,6 +258,8 @@ impl ConsumptionJournal {
             directories,
             claimed: None,
             published_artifact: None,
+            tail: None,
+            tail_published: false,
             removed_at: None,
         };
         journal.validate()?;
@@ -255,6 +279,32 @@ impl ConsumptionJournal {
             ));
         }
         validate_ingest_labels(&self.request_id, &self.source, &self.format)?;
+        if self.tail_published && self.tail.is_none() {
+            return Err(Error::new(
+                "CONFLICT",
+                "tail publication requires its original checkpoint",
+            ));
+        }
+        if let Some(tail) = &self.tail {
+            let declaration = &tail.declaration;
+            if !tail.complete
+                || tail.gap.is_some()
+                || tail.finish.as_ref().is_none_or(|finish| {
+                    finish.finished_at.is_none() || finish.intent.observed != self.observed
+                })
+                || declaration.watch != self.watch
+                || declaration.source != self.source
+                || declaration.format != self.format
+                || declaration.directories.root_device != self.directories.root_device
+                || declaration.directories.root_inode != self.directories.root_inode
+                || self.published_artifact.is_some()
+            {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "tail claim requires the original complete gap-free producer checkpoint and rooted source observation",
+                ));
+            }
+        }
         if let Some(claimed) = &self.claimed {
             claimed.validate()?;
             if claimed.device != self.observed.device
@@ -272,16 +322,38 @@ impl ConsumptionJournal {
     }
 
     fn reserved_request(&self) -> String {
-        let identity = json::write_compact(&Value::array(vec![
+        let mut parts = vec![
             self.watch.clone().into(),
             hex::encode(&self.relative_path).into(),
             self.observed.encode(),
             self.directories.encode(),
-        ]));
+        ];
+        if let Some(tail) = &self.tail {
+            parts.push(tail.encode());
+        }
+        let identity = json::write_compact(&Value::array(parts));
         format!(
             "consume:{}",
             hex::encode(blake3::hash(identity.as_bytes()).as_bytes())
         )
+    }
+
+    /// Original durable publication identity; tail retirement does not mint an artifact.
+    pub fn published_id(&self) -> Option<&str> {
+        self.published_artifact.as_deref().or_else(|| {
+            self.tail
+                .as_ref()
+                .filter(|_| self.tail_published)
+                .map(|tail| tail.id.as_str())
+        })
+    }
+
+    pub(super) fn bind_tail(&mut self, tail: super::tail::TailGeneration) -> Result<(), Error> {
+        self.tail = Some(tail);
+        self.validate()?;
+        self.request_id = self.reserved_request();
+        self.import_id = super::import::import_id(&self.request_id);
+        Ok(())
     }
 }
 
@@ -335,6 +407,12 @@ impl Writer {
         }
         let value = parse(&bytes)?;
         let journal = ConsumptionJournal::decode(value.get("journal").unwrap_or(&value))?;
+        if journal.tail.is_some() && self.db.get("store_format")?.as_deref() != Some(TAIL_FORMAT) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "tail source ownership is missing its writer fence",
+            ));
+        }
         if journal.import_id != id {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -355,6 +433,12 @@ impl Writer {
             return Ok(false);
         }
         let journal = self.consumption(&super::import::import_id(request))?.ok_or_else(|| Error::new("CONFLICT", "consumption request has no recovery journal; reserve the source generation first"))?;
+        if journal.tail.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "completed tail claims acknowledge original checkpoints; importing their bytes would duplicate records",
+            ));
+        }
         if journal.request_id != request
             || journal.source != source
             || journal.format != format
@@ -441,8 +525,9 @@ impl Store {
         {
             return Ok(previous);
         }
-        if journal.observed.byte_length
-            > writer.config.disk_budget - writer.config.maintenance_reserve
+        if journal.tail.is_none()
+            && journal.observed.byte_length
+                > writer.config.disk_budget - writer.config.maintenance_reserve
         {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -472,6 +557,14 @@ impl Store {
         let mut batch = WriteBatch::default();
         let is_new = previous.is_none();
         let journal = previous.unwrap_or(journal);
+        // Leave room for the claimed observation, completed receipt wrapper,
+        // and removal clock without exceeding the reader's 8 KiB ceiling.
+        if json::write_compact(&journal.encode()).len() > JOURNAL_BYTES - 512 {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "source ownership proof exceeds the 8 KiB journal budget",
+            ));
+        }
         if is_new {
             put(&mut batch, &key(&journal.import_id), &journal);
         }
@@ -481,6 +574,9 @@ impl Store {
         }
         if let Some((intent, now)) = handoff {
             writer.bind_handoff(&mut batch, intent, &journal, now)?;
+        }
+        if journal.tail.is_some() {
+            batch.put("store_format", TAIL_FORMAT);
         }
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
@@ -492,6 +588,36 @@ impl Store {
         self.lock()?
             .consumption(id)?
             .ok_or_else(|| Error::new("NOT_FOUND", "unknown consumption journal"))
+    }
+
+    /// Acknowledge a claimed terminal checkpoint without creating records,
+    /// payloads, pins, or new acceptance/retention clocks. The sealed journal
+    /// remains authoritative after bounded generation metadata expires.
+    pub fn consumption_publish_tail(
+        &self,
+        id: &str,
+        claimed: &ConsumptionGeneration,
+    ) -> Result<ConsumptionJournal, Error> {
+        let writer = self.lock()?;
+        let mut journal = writer
+            .consumption(id)?
+            .ok_or_else(|| Error::new("NOT_FOUND", "unknown consumption journal"))?;
+        if journal.tail.is_none() || journal.claimed.as_ref() != Some(claimed) {
+            return Err(Error::new(
+                "CONFLICT",
+                "tail publication requires the original claimed terminal checkpoint",
+            ));
+        }
+        if journal.tail_published {
+            return Ok(journal);
+        }
+        journal.tail_published = true;
+        journal.validate()?;
+        let mut batch = WriteBatch::default();
+        put(&mut batch, &key(id), &journal);
+        writer.admit_import_batch(&batch)?;
+        writer.commit(batch)?;
+        Ok(journal)
     }
 
     /// Enumerate the bounded active recovery set, including unpublished claims
@@ -560,7 +686,7 @@ impl Store {
     pub fn consumption_removed(
         &self,
         id: &str,
-        artifact_id: &str,
+        publication_id: &str,
         claimed: &ConsumptionGeneration,
         now: u64,
     ) -> Result<ConsumptionJournal, Error> {
@@ -569,12 +695,12 @@ impl Store {
         let mut journal = writer
             .consumption(id)?
             .ok_or_else(|| Error::new("NOT_FOUND", "unknown consumption journal"))?;
-        if journal.published_artifact.as_deref() != Some(artifact_id)
+        if journal.published_id() != Some(publication_id)
             || journal.claimed.as_ref() != Some(claimed)
         {
             return Err(Error::new(
                 "CONFLICT",
-                "removal confirmation requires the original published claim and artifact",
+                "removal confirmation requires the original published claim and evidence identity",
             ));
         }
         if journal.removed_at.is_some() {

@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "completed-tail-claim-publication"
+summary = "Seal an original terminal checkpoint into consumption identity and acknowledge its publication without reimporting bytes or refreshing record clocks; ordinary imports and tail claims share removal and retry ownership."
+home = "sparrow_core::storage::consumption::Store::consumption_publish_tail"
+entry_points = ["sparrow_core::storage::consumption::ConsumptionJournal::bind_tail", "sparrow_core::storage::consumption::ConsumptionJournal::published_id", "sparrow_core::storage::consumption::Store::consumption_removed"]
+spec = "docs/development-runtime.md: completed-tail claim storage foundation."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(reimport_completed_tail|write_tail_removal_journal)$']
+
+[[job]]
 id = "typed-handoff-intent"
 summary = "One bounded generated codec preserves immutable store/watch/revision/raw-path/file-clock authority in RPC and strict single-message Cap'n Proto retry files; its unit module owns one dev-only shared intent fixture."
 home = "sparrow_client::handoff::CompletedHandoff::encode"

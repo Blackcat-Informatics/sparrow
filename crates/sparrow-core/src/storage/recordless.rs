@@ -146,6 +146,7 @@ pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
             | b"sparrow.store/32"
     ) || format == super::watch_registry::FORMAT
         || format == super::handoff::FORMAT
+        || format == super::consumption::TAIL_FORMAT
 }
 
 /// Startup is unavailable until this persistent index is complete. Each page is durable.
