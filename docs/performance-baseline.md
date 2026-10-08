@@ -1,9 +1,78 @@
 # Copied-corpus import and query baseline
 
 This is measured preliminary qualification, not full performance acceptance.
-The 2026-10-08 experiment exposed two query-capacity limits that need further
-implementation: broad chronological capture and caller-controlled retirement
-of replayable result leases. No budgets were relaxed to obtain successful runs.
+The initial 2026-10-08 experiment exposed broad chronological capture and
+caller-controlled retirement limits. Later installed sources address those
+limits; see [current runtime evidence](development-runtime.md) and the mixed
+disk-backed paging qualification below. Historical measurements remain tied to
+their original images. No budgets were relaxed to obtain successful runs.
+
+## Mixed disk-backed paging during durable intake
+
+Signed daemon source `5ca7eeb`, schema 45, was qualified on a private Btrfs clone
+at `~/.local/state/sparrow/disk-query-concurrency-x_bve6d_`. Its `driver.py` and
+`report.json` retain image SHA-256 fingerprints, configuration, every CLI attempt,
+all native baseline rows, trial durations, input fingerprints, durable receipts,
+byte checks, RDF inspection and sampled RSS. The installed public service's PID
+was checked before and after and remained unchanged. No production source watch
+was created or changed.
+
+The initial corpus has 7,058 records. Six query workers each perform twenty
+complete traversals while one sequential importer publishes twenty mixed JSON,
+JSONL, Markdown, log and opaque inputs. Malformed JSONL and duplicate members
+are included. Durable receipts add 140 distinct record occurrences from 22,044
+raw bytes, yielding 7,198 records. Exact import retries preserve their receipts;
+exported bytes match each original input fingerprint, and native RDF inspection
+is recorded for every added record. Strict discovery over the malformed input
+refuses with `INDEX_NOT_READY`; that intentional negative check is separate from
+admission refusals.
+
+Queries use the native scope/time boundaries to exclude the new intake, making
+every complete result comparable to its frozen pre-load baseline. Broad queries
+use an exclusive receipt-time upper bound one millisecond after the final
+original receipt. Source, temporal, text, key and value scopes retain their native
+counts, scores, ordering and witnesses. All 120 traversals exactly match their
+baseline rows and page counts. Each multi-page lease is explicitly released.
+
+| Query family | Rows | Pages | p50 seconds | p95 seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Broad records | 7,058 | 48 | 0.208189 | 0.893225 |
+| Source records | 286 | 2 | 0.130639 | 0.621055 |
+| Temporal records | 3,529 | 24 | 0.132395 | 1.303984 |
+| Native text | 12 | 1 | 0.086759 | 0.249548 |
+| Keys | 51 | 1 | 0.087030 | 0.463866 |
+| Values | 286 | 3 | 0.152098 | 0.451372 |
+
+Durations include CLI startup, discovery, all continuation pages and admitted
+retry delays; release time is separately retained per trial. p95 is an inclusive
+interpolated percentile over twenty observations per family, without confidence
+intervals. The concurrent phase lasted 9.134515 seconds. The driver retries only
+explicit operation/staging admission refusals, with at most forty attempts and
+bounded backoff; disconnects and other unexpected failures fail qualification.
+The complete run records 2,459 CLI attempts, 365 explicit `RESOURCE_LIMIT`
+operation refusals, zero staging-journal refusals and zero transport disconnects.
+These refusal counts include retries and are not a request-level failure rate.
+No connection, operation, page, lease, item or disk budget was raised: four
+storage operations, sixteen connections, 1 GiB disk with 128 MiB maintenance
+reserve, the existing 256 KiB pages and sixty-second leases remain in force.
+
+RSS was sampled every 100 ms during the concurrent phase: eighty-seven samples
+with a maximum of 164,896 KiB. This is an observed sampled peak, not an allocation
+certificate or a guarantee that shorter peaks were captured. Closed-store file
+lengths went from 22,531,779 to 23,062,280 bytes; allocated blocks went from
+22,614,016 to 23,142,400 bytes. The final lengths comprise 21,706,917 SST bytes,
+170,895 blob bytes, zero WAL bytes and 1,184,468 control/log bytes. Live admission
+footprint after load is 24,596,642 bytes; after reopening it is 23,120,835 bytes.
+Directory totals omit anonymous staging while it is held, and engine/log files
+can change on reopening. These observations do not certify bounded physical
+reclamation or steady-state density.
+
+After load and after reopen, pins and result handles/bytes are zero. The reopened
+owner preserves all twenty durable receipts, all 7,198 records and every original
+query baseline, and closes gracefully. This qualifies concurrent offered load
+for this finite warm corpus. The capture writer remains serialized; cancellation
+latency, sustained/burst production volume, a deployment quota and native
+reclamation admission remain separate unfinished requirements.
 
 ## Build, host and method
 
