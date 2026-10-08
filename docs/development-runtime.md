@@ -60,8 +60,8 @@ No new parser, scoring law, or persisted evidence representation is introduced.
 Queries now declare `Scope.schemaVersion`; the daemon refuses older/absent
 versions before encoding changed count fields. Every agent query first checks
 native discovery. The extra discovery still scans status; bounded handshake and
-full query leases/snapshots/pagination remain unfinished. The development unit
-still runs schema 21 pending source qualification and adoption below.
+full query leases/snapshots/pagination remain unfinished. Before the verified
+adoption below the development unit ran schema 21.
 
 Local qualification on 2026-10-07: `make check` passed formatting, release Clippy
 with warnings denied, all workspace release tests (94 storage and 27 RPC/daemon/
@@ -83,6 +83,29 @@ schema-22 daemon: `UNSUPPORTED`, exit 1 and zero stdout bytes. The current CLI
 returned one proven member, one unknown member, a null eligible total and a
 known lower bound of one. The owned daemon shut down with SIGINT, exit 0 and
 socket cleanup. Evidence is under `/tmp/sparrow-coverage-compat.btajhgee`.
+
+The owned development unit adopted signed commit `d319902` after SIGINT shutdown,
+MainPID 0, successful result and socket cleanup. PID 850878 now serves schema
+22 at the same private socket, directory 0700/socket 0600, on format 16 and store
+`store:46c88e949ccec658600b66c7becd5bb7`. One synthetic record with a missing
+mapped severity was durably accepted as
+`artifact:88c0813c1febf6bd2a103c26f669701d`, retaining all 104 original bytes.
+Default combined reads through CLI/MCP agree on the existing proven worker
+occurrence, one certainly excluded occurrence and one unknown member. Eligible
+and qualified totals are null; their known lower bounds are one. Native text
+corpus and context receipts also report incomplete membership. Strict combined
+reads refuse with `INDEX_NOT_READY`, exit 1 and zero stdout. Exact-byte export
+and stable ingestion retry passed. Status reported 195 live records and no
+durability backlog.
+
+Historical descriptor evidence remains unprofiled with an exact unfiltered
+count of one. Its original ingestion retry and the immutable handoff retry
+retained their artifact identities; independent byte comparisons passed for
+all 82 descriptor bytes, all 87 handoff bytes and the replacement producer file.
+Evidence is under `/tmp/sparrow-coverage-live.d53na_mw`. This is owned transient
+development acceptance. Full SPARQL admission, graph correlation/explanations,
+active tailing/syslog, complete read leases/pagination, permanent packaging and
+whole-corpus resource/retention qualification remain unfinished.
 
 ## Schema 21 diagnostic mappings and filters
 
