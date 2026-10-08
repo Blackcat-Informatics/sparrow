@@ -133,3 +133,17 @@ The probe and logs are preserved in the first failed directory and
 it remains a shutdown-under-failed-load acceptance concern. Later collectors
 save samples before waiting and capture stacks if the owned process remains
 live after ten seconds. No production process was signalled during these runs.
+
+### Persistent interrupt follow-up
+
+Subsequent signed source `b8a9a6c` fixes a concrete lost-subscription window in
+the serving loop: one native SIGINT receiver is registered before storage/worker
+startup and retained while maintenance branches await their blocking work.
+The original timeout had no stack capture, so its exact cause is not proven
+retroactively. [The runtime evidence](development-runtime.md#persistent-interrupt-subscription)
+records the real startup comparison, full source gate and public adoption.
+Frozen failed-load probes `typed-load-qualification-4zk0g50_` and
+`typed-load-qualification-mw88zyrx` retain the same 10,000-match refusal and then
+exit zero about 0.114 seconds after SIGINT, removing their sockets. These are
+failed workloads with successful teardown observations, not larger successful
+load measurements or a general shutdown latency guarantee.

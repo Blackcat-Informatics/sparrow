@@ -4,10 +4,65 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`8b56d65`; see [catalogue capture cancellation](#catalogue-capture-cancellation) for
+`b8a9a6c`; see [persistent interrupt subscription](#persistent-interrupt-subscription) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Persistent interrupt subscription
+
+Signed source `b8a9a6c` registers one native SIGINT subscription before storage
+opening and worker startup, retaining it through awaited maintenance branches.
+The previous serving loop recreated `ctrl_c()` inside each `select!` iteration;
+selecting another branch dropped that subscription while its worker was awaited.
+Tokio 1.53.2 implements `ctrl_c()` by creating a fresh native signal receiver,
+and each registry subscription starts at the current watch version. Retaining
+the receiver removes this lost-notification window and routes early interrupts
+through the existing complete teardown owner. Individual native calls remain
+non-interruptible. No schema, format, runtime dependency or PurRDF pin changed.
+
+The full source gate passes formatting, release Clippy with warnings denied,
+155 storage tests, 60 RPC integration tests, all remaining workspace tests,
+seeded census tests and the pinned cross gate: 243 ledger jobs and zero distinct
+exceptions. The new real-process regression sends SIGINT after the TCP startup
+announcement, before native store/worker initialization, then verifies exit zero,
+owned endpoint cleanup, reopening and exact SDK byte readback. Its initial
+failure incorrectly expected the fixture's connect address in the announcement;
+the assertion now checks its actual configured `0.0.0.0` binding.
+
+All five selected executables were built after the gate and frozen with exact
+source and SHA-256 evidence at
+`~/.local/state/sparrow/receiver-history-images-ki7wt_cg`. Private comparison
+`interrupt-startup-stwx4aop` signals old and new images during actual startup:
+all three old-image trials terminate under SIGINT, while all three new-image
+trials finish initialization and teardown with exit zero and no socket. The
+new-image observations range from 0.915 to 1.166 seconds. Earlier development
+probe `interrupt-startup-kqcqc2ns` refused its incomplete configuration; corrected
+development comparison `interrupt-startup-415ialb3` showed the same behavior.
+
+Two frozen private 128-cohort load attempts, `typed-load-qualification-4zk0g50_`
+and `typed-load-qualification-mw88zyrx`, preserve the expected 10,000-match
+`RESOURCE_LIMIT`. Their workload tools fail explicitly and emit no successful
+report. Subsequent SIGINT teardown exits zero after observed waits of 0.114
+seconds, removes both owned sockets and preserves the public unit throughout
+qualification. Their source/images, configuration, inputs, RSS/I/O samples,
+failure stderr, shutdown observations and closed files remain in those
+directories. These probes address the concrete subscription defect; the
+original untraced timeout's exact cause and a worst-case shutdown latency bound
+are not established retroactively.
+
+Controlled public adoption evidence is `/tmp/sparrow-interrupt-live.c94zb7e4`.
+The enabled active unit runs PID 1407227 from `sparrowd-schema48-b8a9a6c`; the
+stable CLI resolves to `sparrow-schema48-b8a9a6c`. Frozen/installed/alias hashes
+match, the daemon retains `cap_net_bind_service=ep`, and the observed listener
+is `0.0.0.0:518`. TCP/Unix/CLI/MCP readback preserves
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37, all 212 records, zero
+pins/read leases and healthy watches. Saved intents retain their original
+receipts, bytes, clocks and replacement files without new intake or retirement.
+The 21-source inventory, five generation checkpoints, grouped pages, temporal
+and field witnesses, native text scores, four JSON keys and twenty values remain
+exact. Syslog listeners remain unconfigured. Reboot, sustained resource/latency
+acceptance, complete governed SPARQL and correlation remain unfinished.
 
 ## Concurrent typed load qualifier
 
