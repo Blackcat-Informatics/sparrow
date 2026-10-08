@@ -4,15 +4,54 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 47 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`f9fee6c`; see [syslog listener discovery](#syslog-listener-discovery) for
+`40b0e6c`; see [stored RDF graph layers](#stored-rdf-graph-layers) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Stored RDF graph layers
+
+Signed source `40b0e6c` adds native `RdfGraphLayers` selection through
+`Store::with_rdf_record_layers`. Metadata, occurrence diagnostics and shared
+content can be selected independently through the existing bounded immutable
+RocksDB view. `with_rdf_records` delegates with all layers; no second reader,
+projector or evaluator was added. Selecting diagnostics alone does not inspect
+an excluded content projection's failed or corrupt state. Record identity,
+pin-aware eligibility and read admission still apply, including empty layer
+selection. Wire schema, store format, runtime dependencies and PurRDF pin are
+unchanged.
+
+The real-store scenario exercises all eight combinations, deduplicated content,
+native governed diagnostic queries and metadata/diagnostic joins, all-layer
+facade equivalence, failed and corrupt content state, request refusal and
+pin/release/expiry boundaries. The full source gate passed 151 storage tests,
+58 RPC tests, the remaining workspace tests, seeded census self-tests and the
+pinned cross-workspace check: 233 ledger jobs and zero distinct exceptions.
+
+Selected executables were built after that gate and frozen with exact source
+and SHA-256 evidence at `~/.local/state/sparrow/rdf-layers-images-kn4ilfus`.
+Public adoption evidence at `/tmp/sparrow-rdf-layers-live.7obb8b59` retains the
+closed predecessor backup, installed image/alias hashes, saved-intent retries,
+complete source inventory and generation traversal, JSON keys/values, grouped
+queries, field/time witnesses, native text scores, MCP declarations and typed
+refusals. The first source readback overlapped a JSON readback and failed its
+global zero-lease assertion; a sequential rerun passed. Final readback confirms
+zero leases, healthy watches/durability and unchanged store identity
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37 and 212 records. The enabled
+unit is active at PID 664147 on `0.0.0.0:518`, LAN `192.168.2.4:518`, and the
+existing Unix socket. No new public intake or retirement was performed.
+
+This qualifies a native integration seam and the existing public query paths.
+It does not add a public SPARQL/graph-layer RPC, CLI or MCP operation. Complete
+native query admission, diagnostic coverage/correlation/explanation contracts,
+durable syslog receiver windows, prompt query cancellation, production
+volume/quota qualification, forced physical reclamation and reboot acceptance
+remain unfinished.
+
 ## Syslog listener discovery
 
 Signed source `cf16519` adds schema 47 source references and the generated
-`syslogListenerGet` operation; final installed source `f9fee6c` also preserves
+`syslogListenerGet` operation; subsequently adopted source `f9fee6c` also preserves
 typed registry failures on source listing. Source pages now carry sorted
 `syslog_listener_ids` supplied by the runtime registry, including listeners with
 no packets and several listeners sharing one source. Configured IDs and exact
