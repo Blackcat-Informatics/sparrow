@@ -472,7 +472,7 @@ can inspect evidence for each asserted relationship.
 ## 3. MCP operations
 
 Use the standard stdio MCP transport. The adapter translates MCP messages into
-generated typed Cap'n Proto client calls over the daemon's private socket.
+generated typed Cap'n Proto client calls over the selected Unix or public TCP endpoint.
 The stdio adapter writes protocol messages to stdout and diagnostics to stderr.
 Tools use JSON Schema inputs and bounded structured outputs; reads are marked
 read-only, while pin mutations are marked as mutations. [MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports),
@@ -1113,6 +1113,26 @@ qualification, and whole-process crash injection at every filesystem boundary
 remain unfinished. Ordinary upload continues to preserve every caller source.
 
 ## 6. CLI
+
+The implemented client takes an endpoint as its first argument: a Unix socket
+path or `tcp://IP:PORT`. Numeric IPv4 and bracketed IPv6 addresses use the SDK's
+native endpoint parser. CLI operations and every stdio MCP tool call use the same
+SDK client constructor and discovery certification over either transport. No
+HTTP envelope or alternate query implementation is involved.
+
+```text
+sparrow /path/to/rpc.sock status
+sparrow tcp://192.168.2.4:518 status
+sparrow tcp://192.168.2.4:518 records --source SOURCE
+sparrow tcp://192.168.2.4:518 mcp --stdio
+```
+
+File input/output and immutable-intent preparation use the client's filesystem.
+Producer-finish/handoff preparation therefore requires access to the actual
+producer file; saved-intent replay and progress queries do not recapture paths.
+MCP keeps its bounded framing, four-call admission, cancellation and 30-second
+tool deadline over both transports. Connection refusal produces a failed tool
+result with `RPC_FAILURE`; CLI failures leave stdout empty and exit nonzero.
 
 The planned binary names are `sparrowd` for the daemon and `sparrow` for its
 client. Read/analysis commands default to JSON envelopes with the same receipts

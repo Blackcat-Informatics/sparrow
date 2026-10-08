@@ -4,24 +4,25 @@
 //! CLI and stdio MCP entry point over the shared generated daemon client.
 
 use purrdf_lex::json;
-use sparrow_server::{connect, run_cli, run_mcp};
-use std::path::Path;
+use sparrow_client::{Client, Endpoint};
+use sparrow_server::{run_cli, run_mcp};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() < 2 {
         return Err(
-            "usage: sparrow SOCKET_PATH COMMAND; mcp --stdio starts the agent adapter".into(),
+            "usage: sparrow ENDPOINT COMMAND; ENDPOINT is a Unix socket path or tcp://IP:PORT; mcp --stdio starts the agent adapter".into(),
         );
     }
+    let endpoint = Endpoint::parse(&args[0])?;
     tokio::task::LocalSet::new()
         .run_until(async {
             if args[1..] == ["mcp", "--stdio"] {
-                run_mcp(Path::new(&args[0])).await?;
+                run_mcp(&endpoint).await?;
             } else {
-                let connection = connect(Path::new(&args[0])).await?;
-                let output = run_cli(&connection.client, &args[1..]).await?;
+                let client = Client::connect_endpoint(&endpoint).await?;
+                let output = run_cli(client.capability(), &args[1..]).await?;
                 println!("{}", json::write_compact(&output));
             }
             Ok::<(), Box<dyn std::error::Error>>(())

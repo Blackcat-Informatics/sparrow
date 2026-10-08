@@ -3,24 +3,25 @@
 
 //! Bounded stdio MCP lifecycle and tool dispatch over the typed daemon client.
 
-use crate::{AgentError, agent::tool, connect};
+use crate::{AgentError, agent::tool};
 use futures::{
     FutureExt, StreamExt,
     future::{AbortHandle, Abortable},
     stream::FuturesUnordered,
 };
 use purrdf_lex::json::{self, Object, Value, record::Record};
-use std::{collections::BTreeMap, io, path::Path, time::Duration};
+use sparrow_client::{Client, Endpoint};
+use std::{collections::BTreeMap, io, time::Duration};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 const VERSION: &str = "2025-11-25";
 const FRAME_LIMIT: usize = 128 * 1024;
 
 /// Serve newline-delimited MCP on stdin/stdout without opening a database writer.
-/// Call within a Tokio `LocalSet`; each tool connects to the private daemon socket.
-pub async fn run_mcp(socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Call within a Tokio `LocalSet`; each tool uses the SDK's selected RPC endpoint.
+pub async fn run_mcp(endpoint: &Endpoint) -> Result<(), Box<dyn std::error::Error>> {
     serve(
-        socket,
+        endpoint,
         tokio::io::BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
     )
@@ -117,7 +118,7 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> io::Resul
 }
 
 async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
-    socket: &Path,
+    endpoint: &Endpoint,
     mut reader: R,
     mut writer: W,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -219,11 +220,14 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                             Err(error) => { send(&mut writer, &response(id, tool_result(Object::new().with("error", error.json()).into(), true))).await?; continue; }
                         };
                         if pending.len() == 4 { send(&mut writer, &response(id, tool_result(Object::new().with("error", Object::new().with("code", "RESOURCE_LIMIT").with("message", "four MCP calls are already in progress").with("retryable", true)).into(), true))).await?; continue; }
-                        let socket = socket.to_owned(); let result_key = key.clone(); let (handle, registration) = AbortHandle::new_pair(); pending.insert(key, handle);
+                        let endpoint = endpoint.clone(); let result_key = key.clone(); let (handle, registration) = AbortHandle::new_pair(); pending.insert(key, handle);
                         jobs.push(Abortable::new(async move {
                             let result = tokio::time::timeout(Duration::from_secs(30), async {
-                                let connection = connect(&socket).await.map_err(AgentError::from)?;
-                                operation.execute(&connection.client).await
+                                let client = Client::connect_endpoint(&endpoint).await.map_err(|error| match error {
+                                    sparrow_client::Error::Io(error) => AgentError::from(capnp::Error::from(error)),
+                                    error => AgentError::from(error),
+                                })?;
+                                operation.execute(client.capability()).await
                             }).await.unwrap_or_else(|_| Err(AgentError { code: "RPC_TIMEOUT".into(), message: "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID".into(), retryable: true }));
                             let output = match result { Ok(value) => tool_result(value, false), Err(error) => tool_result(Object::new().with("error", error.json()).into(), true) };
                             (result_key, response(id, output))

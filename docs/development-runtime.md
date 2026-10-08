@@ -4035,3 +4035,25 @@ seeded census self-tests, and the pinned cross gate: 210 ownership jobs with no
 distinct exceptions. Logs are `/tmp/sparrow-schema41-commit.log` and
 `/tmp/sparrow-schema41-bins.log`. Permanent packaging and full architecture
 acceptance remain unfinished.
+
+## Unix and public TCP agent adapters
+
+The CLI and stdio MCP adapter now accept the SDK's shared endpoint spelling:
+a Unix socket path or `tcp://IP:PORT`. CLI operations and individual MCP calls
+use `Client::connect_endpoint`, which validates discovery and owns the same
+generated capability/connection lifetime for either transport. The endpoint
+parser remains in the SDK; no second address parser or query path was added.
+MCP retains bounded framing, four in-flight calls, cancellation and its existing
+tool deadline. Network refusal remains a typed `RPC_FAILURE` tool result.
+
+The existing release RPC/MCP acceptance harness now accepts either endpoint
+through one shared home. A real-daemon TCP scenario runs its full evidence,
+temporal, text/field/value, RDF inspection, context, pin and mutation scenarios,
+compares current record rows/store identity with Unix access, and verifies bad
+numeric endpoints and a reaped server refuse without successful output. No wire
+schema or storage format changed. Focused evidence is
+`/tmp/sparrow-agent-tcp-focused.log`; repository and normal signed commit gates
+are `/tmp/sparrow-agent-tcp-check.log` and `/tmp/sparrow-agent-tcp-commit.log`.
+
+This client change has not yet been installed; the schema-41 daemon remains
+running without a lifecycle change. Full architecture acceptance remains unmet.

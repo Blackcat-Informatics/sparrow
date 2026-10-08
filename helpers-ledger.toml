@@ -2768,9 +2768,9 @@ names = []
 
 [[job]]
 id = "producer-endpoint-selection"
-summary = "Direct clients and logging workers select one explicit Unix or TCP endpoint and validate discovery through the same client constructor."
+summary = "Direct clients, CLI, MCP calls and logging workers select one explicit Unix or TCP endpoint and validate discovery through the same client constructor."
 home = "sparrow_client::Client::connect_endpoint"
-entry_points = ["sparrow_client::Client::connect", "sparrow_client::Client::connect_tcp", "sparrow_client::delivery::run"]
+entry_points = ["sparrow_client::Client::connect", "sparrow_client::Client::connect_tcp", "sparrow_client::delivery::run", "sparrow_server::mcp::serve"]
 spec = "docs/interfaces.md: public TCP logging."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2782,7 +2782,7 @@ names = ['^(connect_tcp_logging_client|discover_tcp_logging_client)$']
 
 [[job]]
 id = "producer-endpoint-spelling"
-summary = "Examples share explicit numeric TCP address or Unix-path interpretation; native SocketAddr owns address parsing."
+summary = "CLI and examples share explicit numeric TCP address or Unix-path interpretation; native SocketAddr owns address parsing."
 home = "sparrow_client::transport::Endpoint::parse"
 entry_points = []
 spec = "docs/interfaces.md: public TCP logging."

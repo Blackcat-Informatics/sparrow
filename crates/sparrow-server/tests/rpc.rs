@@ -1010,6 +1010,63 @@ async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_re
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn remote_agent_adapters_share_all_query_and_mutation_paths_and_report_connection_failure() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use purrdf_lex::json::Object;
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let daemon = start(&config, &socket).await;
+            let endpoint = format!("tcp://{address}");
+            let (store, artifact, _) = exercise(endpoint.as_str()).await;
+            let tcp = cli(endpoint.as_str(), &["status"]);
+            let unix = cli(&socket, &["status"]);
+            assert_eq!(tcp["store_id"], unix["store_id"]);
+            assert_eq!(tcp["live_records"], unix["live_records"]);
+            assert_eq!(tcp["store_id"].as_str(), Some(store.as_str()));
+            assert_eq!(
+                cli(endpoint.as_str(), &["records", "--source", "synthetic-rpc"])["rows"],
+                cli(&socket, &["records", "--source", "synthetic-rpc"])["rows"]
+            );
+            let native = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert_eq!(native.artifact(&artifact).await.unwrap().id, artifact);
+            drop(native);
+            for invalid in ["tcp://127.0.0.1:0", "tcp://hostname:518"] {
+                let result = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .args([invalid, "status"])
+                    .admitted_output()
+                    .unwrap();
+                assert!(!result.status.success());
+                assert!(result.stdout.is_empty());
+            }
+            drop(daemon); // Reaped by the shared daemon owner before testing refusal.
+            let result = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .args([&endpoint, "status"])
+                .admitted_output()
+                .unwrap();
+            assert!(!result.status.success());
+            assert!(result.stdout.is_empty());
+            let mut mcp = Mcp::start(endpoint.as_str());
+            mcp.initialize(1).await;
+            let result = mcp.tool(2, "status", Object::new().into()).await;
+            assert_eq!(result["isError"].as_bool(), Some(true));
+            assert_eq!(
+                result["structuredContent"]["error"]["code"].as_str(),
+                Some("RPC_FAILURE")
+            );
+            assert_eq!(
+                result["structuredContent"]["error"]["retryable"].as_bool(),
+                Some(true)
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix() {
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -5414,9 +5471,13 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
     }).await;
 }
 
-async fn exercise(socket: &Path) -> (String, String, String) {
-    let connection = connect(socket).await.unwrap();
-    let client = &connection.client;
+async fn exercise(endpoint: impl AsRef<std::ffi::OsStr>) -> (String, String, String) {
+    let endpoint = endpoint.as_ref();
+    let target = sparrow_client::Endpoint::parse(endpoint.to_str().unwrap()).unwrap();
+    let connection = sparrow_client::Client::connect_endpoint(&target)
+        .await
+        .unwrap();
+    let client = connection.capability();
     let response = client.status_request().send().promise.await.unwrap();
     let status = match response
         .get()
@@ -5469,7 +5530,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     let copied = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(copied.path(), bytes).unwrap();
     let imported = cli(
-        socket,
+        endpoint,
         &[
             "ingest",
             "rpc-acceptance-v1",
@@ -5490,7 +5551,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     copied.as_file().set_len(0).unwrap();
     copied.as_file().set_len(8388609).unwrap();
     let streamed = cli(
-        socket,
+        endpoint,
         &[
             "ingest",
             "oversized-cli-v1",
@@ -5502,7 +5563,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     assert_eq!(streamed["byte_length"].as_str(), Some("8388609"));
     assert_eq!(streamed["durability"].as_str(), Some("durable"));
     let retried = cli(
-        socket,
+        endpoint,
         &[
             "ingest",
             "oversized-cli-v1",
@@ -5516,7 +5577,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     let exported = exported_dir.path().join("evidence.bin");
     let length = bytes.len().to_string();
     let saved = cli(
-        socket,
+        endpoint,
         &[
             "bytes",
             &store,
@@ -5532,7 +5593,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     );
     assert_eq!(std::fs::read(&exported).unwrap(), bytes);
     let overwrite = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-        .arg(socket)
+        .arg(endpoint)
         .args(["bytes", &store, &id, "0", "1", exported.to_str().unwrap()])
         .admitted_output()
         .unwrap();
@@ -5598,7 +5659,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     assert_eq!(x.get_occurrences(), 2);
     assert_eq!(x.get_records(), 1);
     assert_eq!(x.get_kind().unwrap(), wire::JsonKind::Number);
-    let text = cli(socket, &["text", "hello", "--source", "synthetic-rpc"]);
+    let text = cli(endpoint, &["text", "hello", "--source", "synthetic-rpc"]);
     assert_eq!(text["rows"].as_array().unwrap().len(), 1);
     assert_eq!(
         text["rows"][0]["record_id"].as_str(),
@@ -5620,7 +5681,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     let from = sparrow_core::format_instant(received).unwrap();
     let before = sparrow_core::format_instant(received + 1).unwrap();
     let cli_keys = cli(
-        socket,
+        endpoint,
         &[
             "keys",
             "--source",
@@ -5647,7 +5708,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
         Some("incomplete")
     );
     let cli_values = cli(
-        socket,
+        endpoint,
         &[
             "values",
             "--path",
@@ -5670,7 +5731,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
             .as_str(),
         Some(first_record.as_str())
     );
-    let limited = cli(socket, &["values", "--limit", "1"]);
+    let limited = cli(endpoint, &["values", "--limit", "1"]);
     assert_eq!(
         limited
             .get("receipt")
@@ -5683,10 +5744,10 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     assert_eq!(limited["rows"].as_array().unwrap().len(), 1);
     assert_eq!(limited["page"]["has_more"].as_bool(), Some(true));
     assert!(limited["page"]["next_cursor"].as_str().is_some());
-    let excluded = cli(socket, &["keys", "--source", "unrelated-source"]);
+    let excluded = cli(endpoint, &["keys", "--source", "unrelated-source"]);
     assert!(excluded.get("rows").unwrap().as_array().unwrap().is_empty());
     let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-        .arg(socket)
+        .arg(endpoint)
         .args(["keys", "--decoded", "hello"])
         .admitted_output()
         .unwrap();
@@ -5796,7 +5857,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
     );
     assert_eq!(renewed.get_members().unwrap().len(), 1);
     let cli_receipt = cli(
-        socket,
+        endpoint,
         &["pin-renew", "rpc-renew-v1", &store, &pin_id, "2", "1"],
     );
     assert_eq!(cli_receipt["revision"].as_str(), Some("2"));
@@ -5876,7 +5937,7 @@ async fn exercise(socket: &Path) -> (String, String, String) {
             error.unwrap().get_message()
         ),
     }
-    mcp_exercise(socket, &store, &id, &first_record, bytes).await;
+    mcp_exercise(endpoint, &store, &id, &first_record, bytes).await;
     (store, id, first_record)
 }
 
@@ -5887,7 +5948,7 @@ struct Mcp {
 }
 
 impl Mcp {
-    fn start(socket: &Path) -> Self {
+    fn start(socket: impl AsRef<std::ffi::OsStr>) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow"))
             .arg(socket)
             .args(["mcp", "--stdio"])
@@ -6004,7 +6065,14 @@ impl Mcp {
     }
 }
 
-async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, bytes: &[u8]) {
+async fn mcp_exercise(
+    endpoint: impl AsRef<std::ffi::OsStr>,
+    store: &str,
+    artifact: &str,
+    record: &str,
+    bytes: &[u8],
+) {
+    let socket = endpoint.as_ref();
     use purrdf_lex::json::{Object, Value};
     let mut mcp = Mcp::start(socket);
     use tokio::io::AsyncWriteExt;
@@ -7053,7 +7121,7 @@ async fn mcp_pin_pages(socket: &Path, store: &str, artifact: &str, record: &str)
     cursor
 }
 
-fn cli(socket: &Path, args: &[&str]) -> purrdf_lex::json::Value {
+fn cli(socket: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> purrdf_lex::json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
         .arg(socket)
         .args(args)

@@ -15,8 +15,9 @@ record context, durable stable-ID pin renewal and paginated pin discovery,
 persistent native JSON/Markdown RDF dictionaries and six-way
 quad indexes, a standalone typed producer client with bounded delivery and a
 composable tracing layer, bounded buffered/durable ingestion with session-scoped
-WAL flush controls, and helper-census tooling are implemented. Stored-view SPARQL,
-active tailing/syslog and
+WAL flush controls, and helper-census tooling are implemented. Active tailing
+with explicit completed-generation retirement, typed public TCP
+ingestion, and syslog are implemented. Stored-view SPARQL and
 full architecture acceptance
 remain unfinished. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
@@ -63,7 +64,7 @@ independently. Reads do not extend a pin's deadline.
   named pins, and reference-aware reclamation.
 - **Agent access:** typed Cap'n Proto RPC and a stdio MCP adapter, a CLI, bounded evidence
   reads, typed query results, and explicit completeness information.
-- **Rust logging integration:** a planned composable `tracing` layer with
+- **Rust logging integration:** a composable `tracing` layer with
   structured events and spans, bounded buffering, drop counters, and explicit
   flush/shutdown.
 
