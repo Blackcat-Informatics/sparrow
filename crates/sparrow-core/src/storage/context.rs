@@ -3,10 +3,48 @@
 
 //! Bounded source-local neighbors over one serialized membership capture.
 
-use super::{Error, Record, Store, Writer};
+use super::{Catalog, Error, Record, Store, Writer, catalog_lease, json, random_id};
 use crate::QueryScope;
 use rocksdb::{Direction, IteratorMode};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Host-owned context admission; record interpretation profiles remain in each row.
+pub const CONTEXT_CAPTURE_PROFILE: &str = "sparrow-context-capture/1";
+
+/// Effective ceilings bound into one context capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextLimits {
+    /// Independent chronological visits for each direction.
+    pub direction_visits: u64,
+    /// Aggregate conservative catalog decoding allowance, including the anchor.
+    pub catalog_bytes: u64,
+    /// Aggregate conservative typed/agent reply allowance.
+    pub response_bytes: u64,
+    /// Requested total output ceiling, including the anchor.
+    pub output_records: u32,
+    /// Requested earlier neighbors, excluding the anchor.
+    pub requested_before: u32,
+    /// Requested later neighbors, excluding the anchor.
+    pub requested_after: u32,
+    /// Independent membership member traversal ceiling.
+    pub membership_member_visits: u64,
+    /// Independent membership record traversal ceiling.
+    pub membership_record_visits: u64,
+}
+
+struct Admission {
+    catalog: usize,
+    response: usize,
+}
+impl Admission {
+    fn output(&mut self, record: &Record) -> Result<(), Error> {
+        let charge = catalog_lease::response_row_bytes(json::write_compact(&record.encode()).len());
+        self.response = self.response.checked_sub(charge).ok_or_else(|| {
+            Error::new("RESOURCE_LIMIT", "context reply exceeds aggregate byte admission; request fewer neighbors; no result published")
+        })?;
+        Ok(())
+    }
+}
 
 /// Why a directional context scan stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +75,10 @@ pub struct ContextSide {
 /// Context ordered by `(received_at, record_id)`, independent of producer order.
 #[derive(Debug)]
 pub struct Context {
+    /// Opaque identity of this single, non-paginated capture.
+    pub snapshot_id: String,
+    /// Actual host admission ceilings used for this capture.
+    pub limits: ContextLimits,
     /// Store identity of all returned references.
     pub store_id: String,
     /// One captured eligibility instant for the complete operation.
@@ -71,10 +113,15 @@ impl Store {
                 "context requires a record ID and before + after + 1 <= limit",
             ));
         }
+        crate::format_instant(now)?;
         let writer = self.lock()?;
+        let mut admission = Admission {
+            catalog: catalog_lease::SCAN_BYTES,
+            response: catalog_lease::PAGE_BYTES - 4096,
+        };
         let protected = writer.protected(now)?;
         let membership = writer.query_membership(scope, now, &protected)?;
-        let anchor: Record = writer.get(id)?;
+        let anchor: Record = writer.get_limited(id, &mut admission.catalog)?;
         writer.validate_event_record(&anchor)?;
         if !writer.live_record(&anchor, now, &protected) {
             return Err(Error::new(
@@ -103,6 +150,7 @@ impl Store {
                 "context anchor time index is missing or inconsistent",
             ));
         }
+        admission.output(&anchor)?;
         let earlier = scan_context_neighbors(
             &writer,
             &anchor,
@@ -110,7 +158,7 @@ impl Store {
             (before, Direction::Reverse),
             now,
             &protected,
-            membership.as_ref(),
+            (membership.as_ref(), &mut admission),
         )?;
         let later = scan_context_neighbors(
             &writer,
@@ -119,11 +167,22 @@ impl Store {
             (after, Direction::Forward),
             now,
             &protected,
-            membership.as_ref(),
+            (membership.as_ref(), &mut admission),
         )?;
         diagnostics.merge(earlier.diagnostics);
         diagnostics.merge(later.diagnostics);
         Ok(Context {
+            snapshot_id: random_id("context-read")?,
+            limits: ContextLimits {
+                direction_visits: scope.scan_budget as u64,
+                catalog_bytes: catalog_lease::SCAN_BYTES as u64,
+                response_bytes: catalog_lease::PAGE_BYTES as u64,
+                output_records: scope.limit as u32,
+                requested_before: before as u32,
+                requested_after: after as u32,
+                membership_member_visits: super::query_membership::MAX_SELECTION_VISITS as u64,
+                membership_record_visits: super::query_membership::MAX_SELECTION_VISITS as u64,
+            },
             store_id: writer.id.clone(),
             membership_at: now,
             anchor,
@@ -141,8 +200,9 @@ fn scan_context_neighbors(
     neighbors: (usize, Direction),
     now: u64,
     protected: &BTreeSet<String>,
-    membership: Option<&BTreeMap<String, u64>>,
+    capture: (Option<&BTreeMap<String, u64>>, &mut Admission),
 ) -> Result<ContextSide, Error> {
+    let (membership, admission) = capture;
     let (count, direction) = neighbors;
     let mut result = ContextSide {
         records: Vec::new(),
@@ -171,8 +231,7 @@ fn scan_context_neighbors(
             result.frontier = ContextFrontier::ScanBudget;
             break;
         }
-        let mut remaining = usize::MAX;
-        let record = writer.time_record(&key, &value, &mut remaining)?;
+        let record = writer.time_record(&key, &value, &mut admission.catalog)?;
         if record.received_at < scope.received_from || record.received_at >= scope.received_before {
             break;
         }
@@ -195,6 +254,7 @@ fn scan_context_neighbors(
         )? {
             continue;
         }
+        admission.output(&record)?;
         result.records.push(record);
         if result.records.len() == count {
             result.frontier = ContextFrontier::RequestedCount;

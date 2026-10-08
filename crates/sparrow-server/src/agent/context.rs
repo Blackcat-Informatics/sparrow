@@ -47,7 +47,7 @@ impl Input {
             wire::ContextOrder::ReceivedAtRecordId => "received_at_record_id",
         };
         Ok(Object::new()
-            .with("receipt", receipt(value.get_receipt()?)?)
+            .with("receipt", capture_receipt(value)?)
             .with("ordering", ordering)
             .with("continuity_unknown", value.get_continuity_unknown())
             .with("anchor", render_record(value.get_anchor()?)?)
@@ -101,4 +101,65 @@ fn render_side(value: wire::context_side::Reader<'_>) -> Result<Value> {
             ),
         )
         .into())
+}
+
+fn capture_receipt(value: wire::context::Reader<'_>) -> Result<Value> {
+    let capture = value.get_capture()?;
+    let mut result = receipt(value.get_receipt()?)?;
+    let out = result
+        .as_object_mut()
+        .ok_or_else(|| invalid("context receipt must be an object"))?;
+    let limited = value.get_before()?.get_frontier()? == wire::ContextFrontier::ScanBudget
+        || value.get_after()?.get_frontier()? == wire::ContextFrontier::ScanBudget;
+    out.insert("snapshot_id", capture.get_snapshot_id()?.to_str()?);
+    out.insert("as_of", instant(capture.get_as_of()?)?);
+    out.insert(
+        "execution_status",
+        if limited { "partial" } else { "complete" },
+    );
+    out.insert(
+        "stop_reason",
+        if limited {
+            "direction_scan_budget".into()
+        } else {
+            Value::Null
+        },
+    );
+    out.insert(
+        "native_governor",
+        super::optional_value(capture.get_native_governor()?)?,
+    );
+    out.insert("has_more", false);
+    out.insert("next_cursor", Value::Null);
+    out.insert(
+        "profile_ids",
+        Value::array(vec![
+            Object::new()
+                .with("role", "host_admission")
+                .with("id", capture.get_host_profile()?.to_str()?),
+        ]),
+    );
+    let limits = capture.get_limits()?;
+    out.insert(
+        "limits",
+        Object::new()
+            .with(
+                "direction_visits",
+                limits.get_direction_visits().to_string(),
+            )
+            .with("catalog_bytes", limits.get_catalog_bytes().to_string())
+            .with("response_bytes", limits.get_response_bytes().to_string())
+            .with("output_records", u64::from(limits.get_output_records()))
+            .with("requested_before", u64::from(limits.get_requested_before()))
+            .with("requested_after", u64::from(limits.get_requested_after()))
+            .with(
+                "membership_member_visits",
+                limits.get_membership_member_visits().to_string(),
+            )
+            .with(
+                "membership_record_visits",
+                limits.get_membership_record_visits().to_string(),
+            ),
+    );
+    Ok(result)
 }

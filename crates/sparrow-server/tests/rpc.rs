@@ -4688,6 +4688,36 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     assert_eq!(context["anchor"]["record_id"].as_str(), Some(record));
     assert_eq!(context["ordering"].as_str(), Some("received_at_record_id"));
     assert_eq!(context["continuity_unknown"].as_bool(), Some(true));
+    for output in [context, &cli_context] {
+        let receipt = &output["receipt"];
+        assert!(
+            receipt["snapshot_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("context-read:")
+        );
+        assert_eq!(receipt["as_of"], receipt["membership_at"]);
+        assert_eq!(receipt["execution_status"].as_str(), Some("complete"));
+        assert!(receipt["stop_reason"].is_null() && receipt["native_governor"].is_null());
+        assert_eq!(receipt["has_more"].as_bool(), Some(false));
+        assert!(receipt["next_cursor"].is_null());
+        assert_eq!(
+            receipt["limits"]["catalog_bytes"].as_str(),
+            Some("33554432")
+        );
+        assert_eq!(receipt["limits"]["response_bytes"].as_str(), Some("262144"));
+        assert_eq!(receipt["limits"]["requested_before"].as_u64(), Some(10));
+        assert_eq!(receipt["limits"]["requested_after"].as_u64(), Some(10));
+        assert_eq!(
+            receipt["profile_ids"][0]["id"].as_str(),
+            Some(sparrow_core::CONTEXT_CAPTURE_PROFILE)
+        );
+    }
+    assert_ne!(
+        context["receipt"]["snapshot_id"],
+        cli_context["receipt"]["snapshot_id"]
+    );
+
     let neighbors: Vec<_> = ["before", "after"]
         .into_iter()
         .flat_map(|side| context[side]["rows"].as_array().unwrap())
@@ -6703,6 +6733,175 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 ),
                 wire::result::Ok(_) => panic!("obsolete continuation schema admitted"),
             }
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_callers() {
+    use purrdf_lex::json::Object;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            let anchor = client
+                .ingest(
+                    "wire-context-anchor",
+                    "target",
+                    wire::Format::Log,
+                    b"anchor\n",
+                )
+                .await
+                .unwrap();
+            client
+                .ingest(
+                    "wire-context-noise",
+                    "noise",
+                    wire::Format::Log,
+                    b"noise\nnoise\nnoise\n",
+                )
+                .await
+                .unwrap();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let partial = mcp
+                .tool(
+                    2,
+                    "records_context",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("id", anchor.record_ids[0].clone())
+                        .with("before", 0_u32)
+                        .with("after", 1_u32)
+                        .with("limit", 2_u32)
+                        .with("scan_budget", 1_u32)
+                        .into(),
+                )
+                .await;
+            assert_eq!(partial["isError"].as_bool(), Some(false));
+            let partial = &partial["structuredContent"];
+            assert_eq!(partial["after"]["frontier"].as_str(), Some("scan_budget"));
+            assert_eq!(
+                partial["receipt"]["execution_status"].as_str(),
+                Some("partial")
+            );
+            assert_eq!(
+                partial["receipt"]["stop_reason"].as_str(),
+                Some("direction_scan_budget")
+            );
+            assert_eq!(partial["receipt"]["certainty"].as_str(), Some("incomplete"));
+            assert!(partial["receipt"]["native_governor"].is_null());
+            let source = "s".repeat(512);
+            let input = client
+                .ingest(
+                    "wire-context-large",
+                    &source,
+                    wire::Format::Log,
+                    &b"neighbor\n".repeat(151),
+                )
+                .await
+                .unwrap();
+            let mut ids = input.record_ids;
+            ids.sort();
+            let id = &ids[75];
+            let mut request = client.capability().records_context_request();
+            let mut query = request.get().init_query();
+            let mut reference = query.reborrow().init_anchor();
+            reference.set_store_id(&store);
+            reference.set_id(id);
+            query.set_before(40);
+            query.set_after(0);
+            let mut scope = query.init_scope();
+            scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
+            scope.set_limit(1000);
+            scope.set_scan_budget(1000);
+            scope.init_received_before().set_unix_millis(u64::MAX);
+            let response = request.send().promise.await.unwrap();
+            let output = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let capture = output.get_capture().unwrap();
+            assert!(
+                capture
+                    .get_snapshot_id()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("context-read:")
+            );
+            assert_eq!(
+                capture.get_as_of().unwrap().get_unix_millis(),
+                output
+                    .get_receipt()
+                    .unwrap()
+                    .get_membership_at()
+                    .unwrap()
+                    .get_unix_millis()
+            );
+            assert_eq!(
+                capture.get_host_profile().unwrap().to_str().unwrap(),
+                sparrow_core::CONTEXT_CAPTURE_PROFILE
+            );
+            assert!(matches!(
+                capture.get_native_governor().unwrap().which().unwrap(),
+                wire::optional_text::Absent(())
+            ));
+            assert_eq!(
+                capture.get_limits().unwrap().get_catalog_bytes(),
+                32 * 1024 * 1024
+            );
+            assert_eq!(
+                capture.get_limits().unwrap().get_response_bytes(),
+                256 * 1024
+            );
+            assert_eq!(output.get_before().unwrap().get_rows().unwrap().len(), 40);
+            let args = Object::new()
+                .with("store_id", store.clone())
+                .with("id", id.as_str())
+                .with("before", 80_u32)
+                .with("after", 80_u32)
+                .with("limit", 1000_u32)
+                .with("scan_budget", 1000_u32);
+            let refused = mcp.tool(3, "records_context", args.into()).await;
+            assert_eq!(refused["isError"].as_bool(), Some(true));
+            assert_eq!(
+                refused["structuredContent"]["error"]["code"].as_str(),
+                Some("RESOURCE_LIMIT")
+            );
+            assert!(refused["structuredContent"].get("anchor").is_none());
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
+                    "context",
+                    &store,
+                    id,
+                    "--before",
+                    "80",
+                    "--after",
+                    "80",
+                    "--limit",
+                    "1000",
+                    "--scan-budget",
+                    "1000",
+                ])
+                .output()
+                .unwrap();
+            assert!(!output.status.success() && output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("RESOURCE_LIMIT"));
+            let accepted = cli(
+                &socket,
+                &[
+                    "context", &store, id, "--before", "40", "--after", "0", "--limit", "1000",
+                ],
+            );
+            assert!(
+                purrdf_lex::json::write_compact(&accepted).len()
+                    <= sparrow_core::PIN_READ_PAGE_BYTES
+            );
+            assert_eq!(accepted["before"]["rows"].as_array().unwrap().len(), 40);
         })
         .await;
 }

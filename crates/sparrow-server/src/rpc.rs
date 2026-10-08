@@ -782,6 +782,25 @@ fn pin_summary(mut out: wire::pin_summary::Builder<'_>, pin: &PinSummary) {
     out.init_expires_at().set_unix_millis(pin.expires_at);
 }
 
+fn context_capture(mut out: wire::context_capture::Builder<'_>, value: &sparrow_core::Context) {
+    out.set_snapshot_id(&value.snapshot_id);
+    out.reborrow()
+        .init_as_of()
+        .set_unix_millis(value.membership_at);
+    out.set_host_profile(sparrow_core::CONTEXT_CAPTURE_PROFILE);
+    out.reborrow().init_native_governor().set_absent(());
+    let limits = &value.limits;
+    let mut target = out.init_limits();
+    target.set_direction_visits(limits.direction_visits);
+    target.set_catalog_bytes(limits.catalog_bytes);
+    target.set_response_bytes(limits.response_bytes);
+    target.set_output_records(limits.output_records);
+    target.set_requested_before(limits.requested_before);
+    target.set_requested_after(limits.requested_after);
+    target.set_membership_member_visits(limits.membership_member_visits);
+    target.set_membership_record_visits(limits.membership_record_visits);
+}
+
 fn context_side(
     mut out: wire::context_side::Builder<'_>,
     value: sparrow_core::ContextSide,
@@ -1742,6 +1761,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_ordering(wire::ContextOrder::ReceivedAtRecordId);
                 out.set_continuity_unknown(true);
+                context_capture(out.reborrow().init_capture(), &value);
                 let mut receipt = out.reborrow().init_receipt();
                 receipt.set_store_id(&value.store_id);
                 receipt

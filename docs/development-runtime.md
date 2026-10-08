@@ -32,8 +32,32 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 32; the schema sections
+The current source implements schema 33; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 33 bounded single context capture
+
+Context uses one conservative catalog allowance for the anchor and both
+chronological directions, and one reply allowance for all output rows. Every
+visited catalog entry is charged before decoding, including skipped sources.
+The response row charge is shared with immutable query pages. Byte exhaustion
+refuses the operation without a successful prefix, evidence mutation or handle.
+Directional visit frontiers retain their existing visible partial semantics.
+
+The generated ContextCapture carries a fresh single-reply identity, eligibility
+instant, host admission profile, explicit native governor absence and actual
+limits. CLI and MCP use one adapter for the capture receipt; original certainty,
+diagnostic coverage, record mapping profiles and continuity evidence remain.
+The full source gate passes release Clippy with warnings denied, 123 storage
+scenarios, 38 RPC/daemon scenarios, seeded census self-tests and the pinned
+cross-workspace gate (170 ledger jobs, zero distinct exceptions). New core
+scenarios exercise a combined reply refusal across both directions and aggregate
+catalog admission over skipped sources. The new RPC scenario checks generated
+capture fields, a partial scan frontier, CLI/MCP byte refusals without rows and
+an accepted reply within the shared output ceiling.
+
+Owned daemon qualification remains separate from these source checks. Full
+architecture acceptance remains unmet.
 
 ## Schema 32 frozen query capture provenance
 

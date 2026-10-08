@@ -309,7 +309,7 @@ predicates otherwise agree.
 Continuations replay captured rows after pin mutation/release and evidence
 retirement; fresh reads revalidate current evidence. A changed query refuses with
 `CONFLICT`, an invalid page boundary with `INVALID_ARGUMENT`, and expired, unknown
-or previous-owner handles with `RESULT_EXPIRED`. Current schema 32 is required;
+or previous-owner handles with `RESULT_EXPIRED`. Current schema 33 is required;
 storage formats remain unchanged. `scanned` records candidate visits, not all I/O:
 reference expansion, field visits and posting visits retain their independent
 documented bounds and original coverage evidence.
@@ -366,8 +366,42 @@ and null stop_reason; capacity/scan exhaustion refuses before a page is publishe
 These operations do not invoke a native query governor, and native_governor is
 explicitly absent. Existing incomplete index/scope certainty is preserved;
 it is not relabeled as a native certified partial answer. The wider receipt
-contract, native governor certification, context capture provenance and remaining
-query surfaces remain first-version requirements.
+contract, native governor certification, remaining query surfaces remain first-version requirements.
+
+
+### Single context capture admission
+
+Schema 33 adds a typed ContextCapture to records_context. Each successful
+operation has a fresh snapshot_id and captured as_of, the host admission
+profile sparrow-context-capture/1, explicit native governor absence, and
+ContextLimits. Context is one complete reply without a continuation or retained
+result handle. CLI/MCP receipts report has_more=false and next_cursor=null;
+there is no read lease deadline to renew. Original execution, certainty,
+directional frontiers, diagnostic coverage and continuity_unknown remain visible.
+
+Chronological visits remain independently bounded per direction. Catalog decoding
+now charges the anchor and every visited neighbor, including skipped sources,
+against one 32 MiB conservative allowance across both scans. The shared catalog
+owner charges encoded catalog bytes at its established expansion factor before
+decoding. One 256 KiB response allowance includes the anchor, both directional
+outputs and a metadata reserve. Native encoded record rows use the same
+conservative typed/agent envelope charge as paged searches. Byte exhaustion is
+RESOURCE_LIMIT with no successful result; it never publishes a byte-limited
+prefix. Request fewer neighbors or narrow the acceptance interval to reduce work.
+These are host admission allowances, not a measured RSS or all-I/O guarantee.
+
+Limits report direction_visits, catalog_bytes, response_bytes, output_records,
+requested_before, requested_after and independent membership member/record visit
+ceilings. UInt64 limits remain exact decimal strings; bounded output counts are
+integers. Record diagnostic/source-time profile references stay in each immutable
+row. Context does not perform JSON projection, text scoring or a native governor
+query, so its receipt identifies host admission without inventing those profiles.
+
+A direction scan frontier reports execution_status=partial and
+stop_reason=direction_scan_budget. Otherwise execution_status=complete and
+stop_reason=null. This describes host traversal only; it does not relabel
+incomplete diagnostic membership or producer continuity as a native-certified
+answer. A snapshot ID identifies this captured reply, not an investigation pin.
 
 
 SPARQL additionally selects graph layers `metadata`, `diagnostic`, and `content`,
@@ -620,7 +654,7 @@ decoding, typed coverage encoding and rendering.
 Cursors bind the original membership, selector and limits. Continuation serves
 the immutable capture after pin release, collection changes or evidence retirement;
 fresh reads revalidate current evidence. No read renews protection. Current
-discovery schema 32 is required; old clients/daemons are explicitly refused.
+discovery schema 33 is required; old clients/daemons are explicitly refused.
 Storage formats and retained evidence encodings are unchanged.
 
 Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`

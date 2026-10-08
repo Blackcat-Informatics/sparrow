@@ -2538,3 +2538,33 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^invent_query_governor_certificate$']
+
+[[job]]
+id = "context-capture-admission"
+summary = "Admit anchor and both directional scans against one catalog/reply allowance and expose typed capture limits."
+home = "sparrow_core::storage::context::Admission::output"
+entry_points = ["sparrow_server::rpc::context_capture", "sparrow_server::agent::context::capture_receipt"]
+spec = "docs/interfaces.md: single context capture provenance and aggregate admission."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(reset_context_catalog_budget|emit_context_prefix_on_byte_exhaustion)$']
+
+[[job]]
+id = "query-response-row-charge"
+summary = "Charge native-encoded record rows once for conservative typed and agent response admission."
+home = "sparrow_core::storage::catalog_lease::response_row_bytes"
+entry_points = ["sparrow_core::storage::context::Admission::output", "sparrow_core::storage::record_read::RecordPageBody::page_end"]
+spec = "docs/interfaces.md: bounded typed result replies."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(context_row_bytes|record_page_row_bytes)$']

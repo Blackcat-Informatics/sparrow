@@ -338,9 +338,18 @@ struct ContextSide {
   rows @0 :List(Record); visited @1 :UInt64; retired @2 :UInt64;
   frontier @3 :ContextFrontier;
 }
+struct ContextLimits {
+  directionVisits @0 :UInt64; catalogBytes @1 :UInt64; responseBytes @2 :UInt64;
+  outputRecords @3 :UInt32; requestedBefore @4 :UInt32; requestedAfter @5 :UInt32;
+  membershipMemberVisits @6 :UInt64; membershipRecordVisits @7 :UInt64;
+}
+struct ContextCapture {
+  snapshotId @0 :Text; asOf @1 :Instant; hostProfile @2 :Text;
+  limits @3 :ContextLimits; nativeGovernor @4 :OptionalText;
+}
 struct Context {
   receipt @0 :Receipt; anchor @1 :Record; before @2 :ContextSide; after @3 :ContextSide;
-  ordering @4 :ContextOrder; continuityUnknown @5 :Bool = true;
+  ordering @4 :ContextOrder; continuityUnknown @5 :Bool = true; capture @6 :ContextCapture;
 }
 enum ProjectionState { complete @0; failed @1; notApplicable @2; }
 struct RdfInspection {

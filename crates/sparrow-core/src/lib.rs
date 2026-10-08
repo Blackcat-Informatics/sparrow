@@ -24,7 +24,9 @@ pub use storage::consumption::{
     ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, MAX_CONSUMPTION_JOURNALS,
     validate_consumption_path,
 };
-pub use storage::context::{Context, ContextFrontier, ContextSide};
+pub use storage::context::{
+    CONTEXT_CAPTURE_PROFILE, Context, ContextFrontier, ContextLimits, ContextSide,
+};
 pub use storage::diagnostic::{
     DiagnosticCoverage, DiagnosticDimension, DiagnosticProfile, DiagnosticSnapshot, DiagnosticValue,
 };

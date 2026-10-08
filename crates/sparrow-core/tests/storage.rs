@@ -6746,6 +6746,106 @@ fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers()
 }
 
 #[test]
+fn context_admits_catalog_and_output_bytes_across_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let source = "s".repeat(512);
+    let input = store
+        .ingest(
+            "context-large-reply",
+            &source,
+            "log",
+            &b"neighbor\n".repeat(151),
+            1,
+        )
+        .unwrap();
+    let mut ids = input.record_ids;
+    ids.sort();
+    let anchor = &ids[75];
+    let scope = sparrow_core::QueryScope {
+        selection: Default::default(),
+        source: Some(source),
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 3,
+        limit: 1000,
+        scan_budget: 1000,
+    };
+    let before = store.records_context(anchor, &scope, 40, 0, 2).unwrap();
+    let after = store.records_context(anchor, &scope, 0, 40, 2).unwrap();
+    assert_eq!(before.before.records.len(), 40);
+    assert_eq!(after.after.records.len(), 40);
+    assert_ne!(before.snapshot_id, after.snapshot_id);
+    assert!(before.snapshot_id.starts_with("context-read:"));
+    assert_eq!(before.limits.catalog_bytes, 32 * 1024 * 1024);
+    assert_eq!(before.limits.response_bytes, 256 * 1024);
+    assert_eq!(before.limits.direction_visits, 1000);
+    assert_eq!(before.limits.output_records, 1000);
+    assert_eq!(before.limits.requested_before, 40);
+    assert_eq!(before.limits.requested_after, 0);
+    let refused = store
+        .records_context(anchor, &scope, 80, 80, 2)
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert!(refused.message.contains("context reply"));
+    assert_eq!(store.bytes(anchor, 0, 9, 2).unwrap(), b"neighbor\n");
+    assert_eq!(
+        store.status(2).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn context_catalog_admission_charges_skipped_sources_without_resetting_per_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let anchor = store
+        .ingest("context-budget-anchor", "target", "log", b"anchor\n", 0)
+        .unwrap();
+    store
+        .ingest(
+            "context-budget-noise",
+            &"n".repeat(512),
+            "log",
+            &b"noise\n".repeat(900),
+            1,
+        )
+        .unwrap();
+    let mut scope = sparrow_core::QueryScope {
+        selection: Default::default(),
+        source: Some("target".into()),
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 3,
+        limit: 100,
+        scan_budget: 1,
+    };
+    let partial = store
+        .records_context(&anchor.record_ids[0], &scope, 0, 1, 2)
+        .unwrap();
+    assert_eq!(partial.after.visited, 1);
+    assert!(partial.after.records.is_empty());
+    assert_eq!(
+        partial.after.frontier,
+        sparrow_core::ContextFrontier::ScanBudget
+    );
+    scope.scan_budget = 1000;
+    let refused = store
+        .records_context(&anchor.record_ids[0], &scope, 0, 1, 2)
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert!(refused.message.contains("catalog capture"));
+    assert_eq!(
+        store.bytes(&anchor.record_ids[0], 0, 7, 2).unwrap(),
+        b"anchor\n"
+    );
+}
+
+#[test]
 fn context_refuses_broken_time_indexes_instead_of_publishing_a_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();

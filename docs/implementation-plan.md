@@ -31,7 +31,9 @@ rows or key counts before paging. Cursor-only result_next resumes all existing t
 shared lease and canonical renderers. Existing paged query receipts now freeze
 capture identity, native profiles and effective host admission ceilings while
 preserving original coverage and certainty. Native certified governor receipts,
-context provenance and corpus-scale indexed selection remain required.
+full scope receipts and corpus-scale indexed selection remain required.
+Context now reports single-capture identity and effective directional, catalog
+and response admission; byte exhaustion refuses without a successful prefix.
 The standalone producer client and schema-11 typed event batch operation are
 present. Native event JSONL enters the same occurrence/field/text/time indexes;
 the bounded producer queue now reconnects with immutable pending batches and

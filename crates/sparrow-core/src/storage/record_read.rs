@@ -290,7 +290,7 @@ impl catalog_lease::PageBody for RecordPageBody {
             .skip(start)
             .take(page_size.min(Self::PAGE_ITEMS))
         {
-            let charge = row.len() * 2 + 1024;
+            let charge = catalog_lease::response_row_bytes(row.len());
             if bytes + charge > catalog_lease::PAGE_BYTES {
                 break;
             }

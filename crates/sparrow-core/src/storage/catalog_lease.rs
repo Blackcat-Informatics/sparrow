@@ -20,6 +20,11 @@ pub(super) const SCAN_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const MAX_ITEMS: usize = 10_000;
 pub(super) const ENTRY_BYTES: usize = 512 * 1024;
 
+/// Conservative charge for one native-encoded row and its typed/agent envelopes.
+pub(super) fn response_row_bytes(encoded: usize) -> usize {
+    encoded.saturating_mul(2).saturating_add(1024)
+}
+
 /// One aggregate catalog entry/byte/time admission across capture and reference expansion.
 pub(super) struct CaptureAdmission<'a> {
     pub started: Instant,
