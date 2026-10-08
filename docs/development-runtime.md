@@ -3884,8 +3884,8 @@ read, and altered or missing checkpoint proof fails its reservation identity.
 Reservations leave 512 bytes under the 8 KiB journal ceiling for the subsequent
 claimed observation, removal clock, and completed receipt wrapper.
 
-The storage foundation was committed as `c68cc36`. Public RPC/SDK/CLI/MCP
-handoff selection remains unfinished. Filesystem-worker integration is recorded
+The storage foundation was committed as `c68cc36`. At that commit public
+RPC/SDK/CLI/MCP handoff selection remained unfinished. Filesystem-worker integration is recorded
 below. The running schema-40 development service has not been changed by this
 work.
 
@@ -3919,9 +3919,9 @@ precedence over ordinary upload connections, and a tail failure does not discard
 an unrelated upload connection.
 
 Admission requires a tail-generation target for active-file watches and ordinary
-handoff for completed-file watches. The current public intent codec cannot yet
-name the tail target; those RPC/SDK/CLI/MCP changes and live adoption remain
-unfinished. This worker change is not deployed in the running development unit.
+handoff for completed-file watches. At worker commit `590c09a` the public intent
+codec could not yet name the tail target; public wiring and live adoption were
+unfinished. That worker commit was not independently deployed.
 
 A release acceptance scenario runs the actual worker without any RPC listener,
 recovering reserved, claimed, published, and already-unlinked sources. It verifies
@@ -3936,3 +3936,33 @@ The repository gate passed with 139 storage scenarios, 49 RPC scenarios, 15 SDK
 tests, remaining workspace tests, seeded census self-tests, and the pinned cross
 gate with 208 ownership jobs and no distinct exceptions. Public tail handoff
 qualification and live deployment remain unrun.
+
+## Schema 41 typed completed-tail handoff
+
+The public Cap'n Proto intent, SDK, CLI and MCP now expose completed-tail source
+retirement. The immutable intent adds an optional original generation target.
+The receipt separately certifies its existing generation publication and leaves
+the artifact identity absent; ordinary handoff keeps its original artifact
+semantics. Intent files use the same bounded native codec and historical ordinary
+files decode with no tail target. CLI preparation checks the original producer
+finish against the current exact descriptor observation before saving an intent.
+Both MCP handoff operations share the CLI's SDK call and renderer, and producer
+finish/source handoff share one strict native JSON file-observation decoder.
+
+The Rust `handoff` example admits or reads a saved intent through the same SDK
+over Unix or public TCP, printing the certified typed receipt. It accepts
+`handoff admit|get ENDPOINT INTENT.capnp`. The MCP catalog now contains 30 tools;
+handoff mutation is marked destructive and lookup is read only.
+
+A real-daemon acceptance scenario admits the original finished tail over public
+TCP, reads exact retained bytes after source retirement, replays the saved intent
+through SDK, CLI and MCP, preserves a replacement source, and recovers the same
+receipt/records/checkpoint after reopening the store. It refuses preparation
+before producer completion, a missing tail target, and conflicting retry targets.
+The SDK additionally checks all receipt phases and refuses wrong or competing
+artifact/tail publication identities. Focused evidence is
+`/tmp/sparrow-schema41-focused.log`; repository and normal signed commit gates
+are `/tmp/sparrow-schema41-check.log` and `/tmp/sparrow-schema41-commit.log`.
+
+These changes are not yet deployed in the development unit. Live adoption and
+full architecture acceptance remain unfinished.

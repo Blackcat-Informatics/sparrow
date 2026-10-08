@@ -55,27 +55,42 @@ impl Operation {
             let result = match name {
                 "file_finish" | "file_finish_get" => {
                     let observed: Value = fields.required("observed")?;
-                    let mut observation = Record::new(&observed, "final file observation")?;
                     let intent = sparrow_client::TailFinishIntent {
                         store_id: fields.required("store_id")?,
                         request_id: fields.required("request_id")?,
                         generation_id: fields.required("generation_id")?,
                         watch_revision: fields
                             .required_with("watch_revision", super::decimal_u64)?,
-                        observed: sparrow_client::CompletedFileIdentity {
-                            device: observation.required_with("device", super::decimal_u64)?,
-                            inode: observation.required_with("inode", super::decimal_u64)?,
-                            length: observation.required_with("byte_length", super::decimal_u64)?,
-                            modified_seconds: observation.required("modified_seconds")?,
-                            modified_nanos: observation.required("modified_nanos")?,
-                            changed_seconds: observation.required("changed_seconds")?,
-                            changed_nanos: observation.required("changed_nanos")?,
-                        },
+                        observed: file_observation(&observed)?,
                     };
-                    observation.deny_unknown()?;
                     Self::Query(Command::TailFinish(super::tail_finish::Input::Finish {
                         intent,
                         read_only: name == "file_finish_get",
+                    }))
+                }
+                "watch_handoff" | "watch_handoff_get" => {
+                    let observed: Value = fields.required("observed")?;
+                    let intent = sparrow_client::CompletedHandoff {
+                        store_id: fields.required("store_id")?,
+                        request_id: fields.required("request_id")?,
+                        watch: fields.required("watch")?,
+                        watch_revision: fields
+                            .required_with("watch_revision", super::decimal_u64)?,
+                        relative_path: fields.required_with("relative_path_hex", |value| {
+                            let text = String::from_json(value)?;
+                            if text.len() > 4096 {
+                                return Err(DecodeError::custom(
+                                    "handoff raw path exceeds 2048 bytes",
+                                ));
+                            }
+                            purrdf_hash::hex::decode_canonical(&text).map_err(DecodeError::custom)
+                        })?,
+                        generation: file_observation(&observed)?,
+                        tail_generation_id: fields.optional("tail_generation_id")?,
+                    };
+                    Self::Query(Command::Watch(super::watch::Input::Handoff {
+                        intent,
+                        read_only: name == "watch_handoff_get",
                     }))
                 }
                 "file_generation_get" => Self::Query(Command::Tail(super::tail::Input {
@@ -526,4 +541,21 @@ impl Operation {
             }
         }
     }
+}
+
+fn file_observation(
+    value: &Value,
+) -> std::result::Result<sparrow_client::CompletedFileIdentity, DecodeError> {
+    let mut fields = Record::new(value, "final file observation")?;
+    let observed = sparrow_client::CompletedFileIdentity {
+        device: fields.required_with("device", super::decimal_u64)?,
+        inode: fields.required_with("inode", super::decimal_u64)?,
+        length: fields.required_with("byte_length", super::decimal_u64)?,
+        modified_seconds: fields.required("modified_seconds")?,
+        modified_nanos: fields.required("modified_nanos")?,
+        changed_seconds: fields.required("changed_seconds")?,
+        changed_nanos: fields.required("changed_nanos")?,
+    };
+    fields.deny_unknown()?;
+    Ok(observed)
 }

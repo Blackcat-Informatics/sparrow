@@ -307,7 +307,9 @@ These do not prevent foundation work or synthetic query fixtures:
 
 - Deployment host, filesystem/quota, RAM ceiling, disk budget, and maintenance
   reserve. Establish numerical targets after initial whole-store measurement.
-- Local versus remote agent access and the remote authentication/TLS arrangement.
+- Public Cap'n Proto TCP at `0.0.0.0:518` is authorized, with no ingestion
+  authentication requirement (2026-10-08); qualify remote agent access through
+  the same typed operations.
 - Explicit production watch roots and each producer's completed-file, append,
   rotation, or truncation handoff contract. Sample paths authorize read-only
   inspection, not production consumption or source deletion.

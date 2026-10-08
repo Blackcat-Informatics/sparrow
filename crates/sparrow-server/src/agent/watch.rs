@@ -24,6 +24,7 @@ pub(crate) enum Input {
         expected: u64,
         relative: String,
         output: String,
+        tail_generation_id: Option<String>,
     },
     Handoff {
         intent: sparrow_client::CompletedHandoff,
@@ -34,9 +35,15 @@ pub(crate) enum Input {
 impl Input {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
         match args {
-            [operation, request, id, expected, relative, output]
-                if operation == "handoff-prepare" =>
-            {
+            [
+                operation,
+                request,
+                id,
+                expected,
+                relative,
+                output,
+                tail @ ..,
+            ] if operation == "handoff-prepare" && tail.len() <= 1 => {
                 sparrow_core::validate_consumption_path(id, relative.as_bytes())
                     .map_err(|e| invalid(e.to_string()))?;
                 Ok(Self::Prepare {
@@ -46,6 +53,7 @@ impl Input {
                         .map_err(|e| invalid(e.to_string()))?,
                     relative: relative.clone(),
                     output: output.clone(),
+                    tail_generation_id: tail.first().cloned(),
                 })
             }
             [operation, path] if operation == "handoff" || operation == "handoff-status" => {
@@ -77,7 +85,7 @@ impl Input {
                     .map_err(|error| invalid(error.to_string()))?,
             }),
             _ => Err(invalid(
-                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp; zero revision creates a watch",
+                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp; zero revision creates a watch",
             )),
         }
     }
@@ -101,6 +109,7 @@ impl Input {
                         },
                     )
                     .with("artifact_id", receipt.artifact_id)
+                    .with("tail_generation_id", receipt.tail_generation_id)
                     .with("durability", "durable")
                     .into())
             }
@@ -110,6 +119,7 @@ impl Input {
                 expected,
                 relative,
                 output,
+                tail_generation_id,
             } => {
                 let response = client.watch_list_request().send().promise.await?;
                 let list = match response.get()?.get_result()?.which()? {
@@ -129,6 +139,13 @@ impl Input {
                                 "handoff preparation requires the current enabled watch revision",
                             ));
                         }
+                        if (definition.get_mode()? == wire::WatchMode::Tail)
+                            != tail_generation_id.is_some()
+                        {
+                            return Err(invalid(
+                                "tail handoff preparation requires the original completed generation ID",
+                            ));
+                        }
                         root = Some(std::path::PathBuf::from(definition.get_root()?.to_str()?));
                     }
                 }
@@ -143,7 +160,47 @@ impl Input {
                     generation: sparrow_client::CompletedFileIdentity::capture(
                         &file.metadata().map_err(sparrow_client::Error::Io)?,
                     ),
+                    tail_generation_id: tail_generation_id.clone(),
                 };
+                if let Some(generation) = tail_generation_id {
+                    let mut call = client.tail_generation_get_request();
+                    let mut query = call.get().init_query();
+                    query.set_store_id(&intent.store_id);
+                    query.set_id(generation);
+                    query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                    let response = call.send().promise.await?;
+                    let row = match response.get()?.get_result()?.which()? {
+                        wire::result::Ok(row) => row?,
+                        wire::result::Error(error) => return Err(failure(error?)),
+                    };
+                    let finish = match row.get_finish()?.which()? {
+                        wire::optional_tail_finish::Value(finish) => finish?,
+                        wire::optional_tail_finish::Absent(()) => {
+                            return Err(invalid(
+                                "tail handoff requires the original producer finish",
+                            ));
+                        }
+                    };
+                    let declaration = row.get_declaration()?;
+                    if row.get_store_id()?.to_str()? != intent.store_id
+                        || row.get_id()?.to_str()? != generation
+                        || !row.get_complete()
+                        || !matches!(row.get_gap()?.which()?, wire::optional_text::Absent(()))
+                        || !matches!(
+                            finish.get_finished_at()?.which()?,
+                            wire::optional_instant::Value(_)
+                        )
+                        || declaration.get_watch()?.to_str()? != id
+                        || declaration.get_watch_revision() != *expected
+                        || sparrow_client::CompletedFileIdentity::decode(
+                            finish.get_request()?.get_observed()?,
+                        )? != intent.generation
+                    {
+                        return Err(invalid(
+                            "tail handoff preparation requires the original completed checkpoint and unchanged final file observation",
+                        ));
+                    }
+                }
                 // Encode before creating an output, then refuse overwriting an existing retry identity.
                 let mut bytes = Vec::new();
                 intent.write(&mut bytes)?;

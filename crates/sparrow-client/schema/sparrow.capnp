@@ -276,11 +276,13 @@ struct FileGeneration {
 struct WatchHandoff {
   storeId @0 :Text; requestId @1 :Text; watch @2 :Text; watchRevision @3 :UInt64;
   relativePath @4 :Data; generation @5 :FileGeneration;
+  tailGenerationId @6 :OptionalText;
 }
 enum HandoffPhase { reserved @0; claimed @1; published @2; removed @3; }
 struct HandoffReceipt {
   request @0 :WatchHandoff; importId @1 :Text; phase @2 :HandoffPhase;
   artifactId @3 :OptionalText; durability @4 :Durability = durable;
+  tailGenerationId @5 :OptionalText;
 }
 
 struct WideInteger { high @0 :UInt64; low @1 :UInt64; }

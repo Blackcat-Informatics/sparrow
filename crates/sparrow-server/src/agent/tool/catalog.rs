@@ -7,6 +7,14 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "watch_handoff",
+        "Admit an immutable completed source for durable claim and deletion; a tail target acknowledges its original producer-finished checkpoint without reimporting records.",
+    ),
+    (
+        "watch_handoff_get",
+        "Read original source retirement progress using the exact saved handoff intent; only removed confirms synchronized deletion.",
+    ),
+    (
         "file_finish",
         "Durably admit an immutable producer assertion for a held file generation, then drain through its final size; source files remain retained and admission alone is not completion.",
     ),
@@ -139,7 +147,14 @@ pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
         let mut properties = Object::new();
         let mut required = Vec::new();
-        if ["file_finish", "file_finish_get"].contains(name) {
+        if [
+            "file_finish",
+            "file_finish_get",
+            "watch_handoff",
+            "watch_handoff_get",
+        ]
+        .contains(name)
+        {
             let seconds: Value = Object::new().with("type", "integer").into();
             let nanos: Value = Object::new()
                 .with("type", "integer")
@@ -149,7 +164,6 @@ pub(crate) fn definitions() -> Value {
             properties = properties
                 .with("store_id", string())
                 .with("request_id", string())
-                .with("generation_id", string())
                 .with("watch_revision", string())
                 .with(
                     "observed",
@@ -180,13 +194,17 @@ pub(crate) fn definitions() -> Value {
                                 .with("changed_nanos", nanos),
                         ),
                 );
-            required.extend([
-                "store_id",
-                "request_id",
-                "generation_id",
-                "watch_revision",
-                "observed",
-            ]);
+            required.extend(["store_id", "request_id", "watch_revision", "observed"]);
+            if ["file_finish", "file_finish_get"].contains(name) {
+                properties = properties.with("generation_id", string());
+                required.push("generation_id");
+            } else {
+                properties = properties
+                    .with("watch", string())
+                    .with("relative_path_hex", string())
+                    .with("tail_generation_id", string());
+                required.extend(["watch", "relative_path_hex"]);
+            }
         }
         if *name == "file_generation_get" {
             properties = properties
@@ -511,10 +529,14 @@ pub(crate) fn definitions() -> Value {
                             "diagnostic_define",
                             "flush",
                             "file_finish",
+                            "watch_handoff",
                         ]
                         .contains(name),
                     )
-                    .with("destructiveHint", *name == "pin_release")
+                    .with(
+                        "destructiveHint",
+                        ["pin_release", "watch_handoff"].contains(name),
+                    )
                     .with("idempotentHint", true)
                     .with("openWorldHint", false),
             )

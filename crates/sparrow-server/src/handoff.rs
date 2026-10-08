@@ -13,7 +13,7 @@ pub(crate) fn intent(value: &CompletedHandoff) -> Result<ConsumptionHandoff, Err
         watch: value.watch.clone(),
         watch_revision: value.watch_revision,
         relative_path: value.relative_path.clone(),
-        tail_generation_id: None,
+        tail_generation_id: value.tail_generation_id.clone(),
         observed: crate::consumption::generation(value.generation)
             .map_err(|e| Error::new("INVALID_ARGUMENT", e.to_string()))?,
     })
@@ -33,7 +33,7 @@ pub(crate) fn result(
             receipt.set_import_id(&journal.import_id);
             receipt.set_phase(if journal.removed_at.is_some() {
                 wire::HandoffPhase::Removed
-            } else if journal.published_artifact.is_some() {
+            } else if journal.published_id().is_some() {
                 wire::HandoffPhase::Published
             } else if journal.claimed.is_some() {
                 wire::HandoffPhase::Claimed
@@ -41,10 +41,20 @@ pub(crate) fn result(
                 wire::HandoffPhase::Reserved
             });
             let mut artifact = receipt.reborrow().init_artifact_id();
-            match journal.published_artifact {
-                Some(id) => artifact.set_value(&id),
+            match &journal.published_artifact {
+                Some(id) => artifact.set_value(id),
                 None => artifact.set_absent(()),
             }
+            sparrow_client::encode_optional(
+                receipt.reborrow().init_tail_generation_id(),
+                journal
+                    .tail
+                    .as_ref()
+                    .filter(|_| journal.tail_published)
+                    .map(|tail| tail.id.as_str()),
+                |mut out, value| out.set_value(value),
+                |mut out| out.set_absent(()),
+            );
             receipt.set_durability(wire::Durability::Durable);
         }
         Err(error) => crate::rpc::failure(out, error),

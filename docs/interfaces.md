@@ -1129,7 +1129,7 @@ sparrow SOCKET_PATH watch list
 sparrow SOCKET_PATH watch put REQUEST_ID 0 completed-watch.toml
 sparrow SOCKET_PATH watch put REQUEST_ID CURRENT_REVISION updated-watch.toml
 sparrow SOCKET_PATH watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
-sparrow SOCKET_PATH watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp
+sparrow SOCKET_PATH watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID]
 sparrow SOCKET_PATH watch handoff INTENT.capnp
 sparrow SOCKET_PATH watch handoff-status INTENT.capnp
 # Save intents outside consumption roots; retry the same intent after uncertain delivery.
@@ -1338,5 +1338,50 @@ on the constituent artifacts/records when the investigation requires it.
 
 Generation metadata's `complete` still denotes the original terminal checkpoint,
 not current byte availability. A successful zero-length file read can probe full
-cover under the same admission. Completed-tail claim/deletion handoff remains
-unfinished; a readable generation grants no source-removal authority.
+cover under the same admission. A readable generation grants no source-removal
+authority; source retirement requires the explicit handoff below.
+
+### Schema 41 completed-tail source retirement
+
+`WatchHandoff.tailGenerationId` names an existing producer-finished tail
+generation. The intent still binds store, request, original watch revision, raw
+relative path, and the exact final descriptor observation, including nanosecond
+modification and change clocks. An active-file watch requires this target;
+an ordinary completed-file watch requires it absent. A close, idle interval,
+readable byte range, or retain-watch definition alone grants no retirement.
+
+Admission requires the original complete, gap-free producer checkpoint and
+matching final observation. The journal seals that checkpoint, including original
+acceptance/completion clocks, before the rooted filesystem claim. The claim
+worker acknowledges the existing checkpoint instead of uploading the file again.
+It then removes only the private exact claimed generation, after directory
+synchronization. Replacements at the original path remain independent inputs.
+Pending ownership survives bounded checkpoint-registry expiry without refreshing
+record retention or pinning bytes.
+
+The receipt retains `reserved`, `claimed`, `published`, and `removed` phases.
+For a tail target, `artifactId` is absent throughout; `tailGenerationId` is absent
+until publication and then equals the original target. Ordinary handoff retains
+its artifact receipt and no tail publication identity. The SDK certifies the
+original intent, durable phase, and matching publication kind before reporting
+progress. Only `removed` confirms synchronized source retirement.
+
+CLI preparation adds the target as a final positional argument:
+
+```text
+sparrow SOCKET watch handoff-prepare REQUEST WATCH REVISION RELATIVE_PATH INTENT.capnp GENERATION_ID
+sparrow SOCKET watch handoff INTENT.capnp
+sparrow SOCKET watch handoff-status INTENT.capnp
+```
+
+Preparation checks the original terminal producer finish against the current
+file observation and saves the immutable Cap'n Proto intent outside watch roots.
+Retries use that saved file rather than capturing a replacement path. Existing
+ordinary intent files continue to decode with no tail target.
+
+MCP `watch_handoff` and `watch_handoff_get` use the same SDK operation and receipt
+renderer. Arguments are `store_id`, `request_id`, `watch`, `watch_revision`
+(decimal string), `relative_path_hex` (canonical raw Unix path bytes), `observed`
+(the same exact descriptor fields as `file_finish`), and optional
+`tail_generation_id`. Mutation is marked destructive; progress lookup is read
+only. Unknown fields and oversized/noncanonical raw paths are refused.

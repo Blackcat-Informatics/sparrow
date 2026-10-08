@@ -20,6 +20,8 @@ pub struct CompletedHandoff {
     pub relative_path: Vec<u8>,
     /// Generation the producer has finished writing.
     pub generation: CompletedFileIdentity,
+    /// Retire an existing completed tail checkpoint instead of importing again.
+    pub tail_generation_id: Option<String>,
 }
 
 impl CompletedFileIdentity {
@@ -72,6 +74,12 @@ impl CompletedHandoff {
         out.set_watch(&self.watch);
         out.set_watch_revision(self.watch_revision);
         out.set_relative_path(&self.relative_path);
+        crate::encode_optional(
+            out.reborrow().init_tail_generation_id(),
+            self.tail_generation_id.as_deref(),
+            |mut out, value| out.set_value(value),
+            |mut out| out.set_absent(()),
+        );
         self.generation.encode(out.init_generation())
     }
 
@@ -93,6 +101,7 @@ impl CompletedHandoff {
             watch_revision: value.get_watch_revision(),
             relative_path: path.into(),
             generation: CompletedFileIdentity::decode(value.get_generation()?)?,
+            tail_generation_id: optional_identity(value.get_tail_generation_id()?)?,
         };
         intent.validate()?;
         Ok(intent)
@@ -105,6 +114,10 @@ impl CompletedHandoff {
             || self.watch_revision == 0
             || self.relative_path.is_empty()
             || self.relative_path.len() > 2048
+            || self
+                .tail_generation_id
+                .as_ref()
+                .is_some_and(|id| !id.starts_with("file-generation:") || id.len() > 128)
         {
             return Err(Error::InvalidArgument(
                 "handoff requires bounded nonempty store/request/watch/path and a nonzero revision",
@@ -142,6 +155,21 @@ pub struct HandoffReceipt {
     pub phase: wire::HandoffPhase,
     /// Original published artifact once publication is durable.
     pub artifact_id: Option<String>,
+    /// Existing terminal tail identity once acknowledgement is durable.
+    pub tail_generation_id: Option<String>,
+}
+
+fn optional_identity(value: wire::optional_text::Reader<'_>) -> Result<Option<String>, Error> {
+    match value.which()? {
+        wire::optional_text::Absent(()) => Ok(None),
+        wire::optional_text::Value(value) => {
+            let value = value?.to_str()?;
+            if value.len() > 128 {
+                return Err(Error::Protocol("handoff identity exceeds 128 bytes"));
+            }
+            Ok(Some(value.to_owned()))
+        }
+    }
 }
 
 impl HandoffReceipt {
@@ -151,27 +179,25 @@ impl HandoffReceipt {
     ) -> Result<Self, Error> {
         let request = CompletedHandoff::decode(value.get_request()?)?;
         let phase = value.get_phase()?;
-        let artifact_id = match value.get_artifact_id()?.which()? {
-            wire::optional_text::Absent(()) => None,
-            wire::optional_text::Value(value) => {
-                let value = value?.to_str()?;
-                if value.len() > 128 {
-                    return Err(Error::Protocol(
-                        "handoff artifact identity exceeds 128 bytes",
-                    ));
-                }
-                Some(value.to_owned())
+        let artifact_id = optional_identity(value.get_artifact_id()?)?;
+        let tail_generation_id = optional_identity(value.get_tail_generation_id()?)?;
+        let published = matches!(
+            phase,
+            wire::HandoffPhase::Published | wire::HandoffPhase::Removed
+        );
+        let publication_matches = match &request.tail_generation_id {
+            Some(id) => {
+                artifact_id.is_none()
+                    && tail_generation_id.as_deref() == published.then_some(id.as_str())
             }
+            None => tail_generation_id.is_none() && published == artifact_id.is_some(),
         };
         let import_id = value.get_import_id()?.to_str()?;
         if request != *expected
             || value.get_durability()? != wire::Durability::Durable
             || import_id.len() > 128
             || !import_id.starts_with("import:")
-            || matches!(
-                phase,
-                wire::HandoffPhase::Published | wire::HandoffPhase::Removed
-            ) != artifact_id.is_some()
+            || !publication_matches
             || artifact_id
                 .as_ref()
                 .is_some_and(|v| v.len() > 128 || !v.starts_with("artifact:"))
@@ -185,6 +211,7 @@ impl HandoffReceipt {
             import_id: import_id.into(),
             phase,
             artifact_id,
+            tail_generation_id,
         })
     }
 }
@@ -241,6 +268,7 @@ mod tests {
             watch: "completed".into(),
             watch_revision: 7,
             relative_path: b"nested/\xff.jsonl".to_vec(),
+            tail_generation_id: None,
             generation: CompletedFileIdentity {
                 device: u64::MAX,
                 inode: 42,
@@ -259,6 +287,11 @@ mod tests {
         let mut bytes = Vec::new();
         expected.write(&mut bytes).unwrap();
         assert_eq!(CompletedHandoff::read(bytes.as_slice()).unwrap(), expected);
+        let mut tail = expected.clone();
+        tail.tail_generation_id = Some("file-generation:fixture".into());
+        let mut tail_bytes = Vec::new();
+        tail.write(&mut tail_bytes).unwrap();
+        assert_eq!(CompletedHandoff::read(tail_bytes.as_slice()).unwrap(), tail);
         bytes.push(0);
         assert!(CompletedHandoff::read(bytes.as_slice()).is_err());
         assert!(CompletedHandoff::read(&vec![0; 16_385][..]).is_err());
@@ -272,6 +305,57 @@ mod tests {
         intent().encode(wire.reborrow()).unwrap();
         wire.init_generation().set_changed_nanos(1_000_000_000);
         assert!(CompletedHandoff::decode(message.get_root_as_reader().unwrap()).is_err());
+    }
+
+    #[test]
+    fn tail_admission_certificate_requires_only_the_original_checkpoint_publication() {
+        let mut expected = intent();
+        expected.tail_generation_id = Some("file-generation:fixture".into());
+        for phase in [
+            wire::HandoffPhase::Reserved,
+            wire::HandoffPhase::Claimed,
+            wire::HandoffPhase::Published,
+            wire::HandoffPhase::Removed,
+        ] {
+            let mut message = capnp::message::Builder::new_default();
+            let mut receipt = message.init_root::<wire::handoff_receipt::Builder<'_>>();
+            expected.encode(receipt.reborrow().init_request()).unwrap();
+            receipt.set_import_id("import:fixture");
+            receipt.set_phase(phase);
+            let published = matches!(
+                phase,
+                wire::HandoffPhase::Published | wire::HandoffPhase::Removed
+            );
+            if published {
+                receipt
+                    .reborrow()
+                    .init_tail_generation_id()
+                    .set_value("file-generation:fixture");
+            }
+            let certified =
+                HandoffReceipt::certify(receipt.reborrow_as_reader(), &expected).unwrap();
+            assert!(certified.artifact_id.is_none());
+            assert_eq!(
+                certified.tail_generation_id.as_deref(),
+                published.then_some("file-generation:fixture")
+            );
+            receipt
+                .reborrow()
+                .init_tail_generation_id()
+                .set_value("file-generation:another");
+            assert!(HandoffReceipt::certify(receipt.reborrow_as_reader(), &expected).is_err());
+            receipt.reborrow().init_tail_generation_id().set_absent(());
+            receipt
+                .reborrow()
+                .init_artifact_id()
+                .set_value("artifact:fixture");
+            assert!(HandoffReceipt::certify(receipt.reborrow_as_reader(), &expected).is_err());
+            receipt
+                .reborrow()
+                .init_tail_generation_id()
+                .set_value("file-generation:fixture");
+            assert!(HandoffReceipt::certify(receipt.reborrow_as_reader(), &expected).is_err());
+        }
     }
 
     #[test]

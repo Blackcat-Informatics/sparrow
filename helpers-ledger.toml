@@ -2,6 +2,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "handoff-bounded-identity-decoding"
+summary = "One generated optional-text reader bounds owned handoff target and publication identities before allocation; the receipt certificate owns their mode and phase agreement."
+home = "sparrow_client::handoff::optional_identity"
+entry_points = ["sparrow_client::handoff::CompletedHandoff::decode", "sparrow_client::handoff::HandoffReceipt::certify"]
+spec = "docs/interfaces.md: schema 41 completed-tail source retirement."
+vectors = ["crates/sparrow-client/src/handoff.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_handoff_artifact_id|decode_handoff_tail_id)$']
+
+[[job]]
+id = "agent-final-file-observation"
+summary = "Producer finish and source handoff tools share one strict native JSON record decoder for exact descriptor identity and nanosecond file clocks."
+home = "sparrow_server::agent::tool::file_observation"
+entry_points = ["sparrow_server::agent::tool::Operation::parse"]
+spec = "docs/interfaces.md: schema 41 completed-tail source retirement."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_finish_file_observation|decode_handoff_file_observation)$']
+
+[[job]]
 id = "shared-claimed-descriptor-validation"
 summary = "Ordinary uploads and terminal tail acknowledgement certify the same rooted namespace and exact claimed descriptor before publication."
 home = "sparrow_server::consumption::ClaimRoot::validate_claim"
@@ -77,7 +105,7 @@ summary = "The SDK and CLI share generated handoff admission/progress calls, dis
 home = "sparrow_client::handoff::completed_handoff"
 entry_points = ["sparrow_client::Client::handoff", "sparrow_client::Client::handoff_get"]
 spec = "docs/development-runtime.md: typed explicit completed handoff."
-vectors = ["crates/sparrow-server/tests/rpc.rs"]
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-client/examples/handoff.rs"]
 bench = []
 enforced = true
 [job.forbidden]

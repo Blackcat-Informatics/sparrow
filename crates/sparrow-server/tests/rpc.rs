@@ -83,6 +83,119 @@ fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, TcpReservatio
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_through_cli_mcp_and_reopen()
+ {
+    tokio::task::LocalSet::new().run_until(async {
+        use purrdf_lex::json::Object;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("active");
+        std::fs::create_dir(&root).unwrap();
+        let input = root.join("finished.log");
+        std::fs::write(&input, b"first\nlast").unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        let (address, reservation) = configure_tcp_listener(&config);
+        drop(reservation);
+        append_tail_config(&config, &root, "log");
+        let daemon = start(&config, &socket).await;
+        let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+        watch_until(client.capability(), |watch| watch.get_tail_checkpoint_records() == 1).await;
+        let status = cli(&socket, &["status"]);
+        let generation = status["consume_watches"][0]["tail_generation_ids"][0].as_str().unwrap().to_owned();
+        let intent_path = dir.path().join("handoff.capnp");
+        let early = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args([
+            "watch", "handoff-prepare", "tail-retire", "completed", "1", "finished.log", intent_path.to_str().unwrap(), &generation,
+        ]).admitted_output().unwrap();
+        assert!(!early.status.success());
+        assert!(!intent_path.exists());
+        assert!(!root.join(".sparrow-inflight").exists());
+        let observed = sparrow_client::CompletedFileIdentity::capture(&input.metadata().unwrap());
+        let finish = sparrow_client::TailFinishIntent {
+            store_id: client.discovery().store_id.clone(),
+            request_id: "tail-retire-finish".into(),
+            generation_id: generation.clone(),
+            watch_revision: 1,
+            observed,
+        };
+        client.tail_finish(&finish).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if client.tail_finish_get(&finish).await.unwrap().finished_at.is_some() { break; }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let original_records = cli(&socket, &["records", "--source", "consume-acceptance"])["rows"].clone();
+        let original_checkpoint = cli(&socket, &["file-generation", &finish.store_id, &generation]);
+        let prepared = cli(&socket, &[
+            "watch", "handoff-prepare", "tail-retire", "completed", "1", "finished.log", intent_path.to_str().unwrap(), &generation,
+        ]);
+        assert_eq!(prepared["phase"].as_str(), Some("prepared"));
+        let saved = std::fs::read(&intent_path).unwrap();
+        let intent = sparrow_client::CompletedHandoff::read(saved.as_slice()).unwrap();
+        assert_eq!(intent.tail_generation_id.as_deref(), Some(generation.as_str()));
+        assert_eq!(intent.generation, observed);
+        let mut missing_target = intent.clone();
+        missing_target.request_id = "tail-retire-no-target".into();
+        missing_target.tail_generation_id = None;
+        assert!(matches!(client.handoff(&missing_target).await, Err(sparrow_client::Error::Domain { code, .. }) if code == "CONFLICT"));
+        assert!(input.exists());
+        assert!(!root.join(".sparrow-inflight").exists());
+        let admitted = client.handoff(&intent).await.unwrap();
+        assert_eq!(admitted.request, intent);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let completed = loop {
+            let receipt = client.handoff_get(&intent).await.unwrap();
+            if receipt.phase == wire::HandoffPhase::Removed { break receipt; }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(completed.import_id, admitted.import_id);
+        assert!(completed.artifact_id.is_none());
+        assert_eq!(completed.tail_generation_id.as_deref(), Some(generation.as_str()));
+        assert!(!input.exists());
+        assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
+        std::fs::write(&input, b"replacement stays independent").unwrap();
+        let rendered = cli(&socket, &["watch", "handoff-status", intent_path.to_str().unwrap()]);
+        assert_eq!(rendered["phase"].as_str(), Some("removed"));
+        assert_eq!(rendered["tail_generation_id"].as_str(), Some(generation.as_str()));
+        assert!(rendered["artifact_id"].is_null());
+        assert_eq!(cli(&socket, &["watch", "handoff", intent_path.to_str().unwrap()]), rendered);
+        let arguments = Object::new().with("store_id", intent.store_id.clone()).with("request_id", intent.request_id.clone())
+            .with("watch", intent.watch.clone()).with("watch_revision", intent.watch_revision.to_string())
+            .with("relative_path_hex", purrdf_hash::hex::encode(&intent.relative_path)).with("tail_generation_id", generation.clone())
+            .with("observed", Object::new().with("device", observed.device.to_string()).with("inode", observed.inode.to_string())
+                .with("byte_length", observed.length.to_string()).with("modified_seconds", observed.modified_seconds).with("modified_nanos", observed.modified_nanos)
+                .with("changed_seconds", observed.changed_seconds).with("changed_nanos", observed.changed_nanos));
+        let mut mcp = Mcp::start(&socket);
+        mcp.initialize(1).await;
+        for (number, operation) in [(2, "watch_handoff_get"), (3, "watch_handoff")] {
+            let response = mcp.tool(number, operation, arguments.clone().into()).await;
+            assert_eq!(response["isError"].as_bool(), Some(false));
+            assert_eq!(response["structuredContent"], rendered);
+        }
+        let mut conflicting = intent.clone();
+        conflicting.tail_generation_id = Some("file-generation:another".into());
+        assert!(matches!(client.handoff(&conflicting).await, Err(sparrow_client::Error::Domain { code, .. }) if code == "CONFLICT"));
+        assert_eq!(std::fs::read(&intent_path).unwrap(), saved);
+        assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
+        assert_eq!(cli(&socket, &["file-generation", &intent.store_id, &generation]), original_checkpoint);
+        drop(mcp); drop(client); drop(daemon);
+        std::fs::remove_file(&socket).unwrap();
+        let _daemon = start(&config, &socket).await;
+        let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+        assert_eq!(client.handoff(&intent).await.unwrap(), completed);
+        assert_eq!(cli(&socket, &["watch", "handoff-status", intent_path.to_str().unwrap()]), rendered);
+        assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
+        assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
+        let status = cli(&socket, &["status"]);
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/37"));
+        assert_eq!(status["live_records"].as_str(), Some("2"));
+        assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retained_sources_across_reopen()
  {
     tokio::task::LocalSet::new()
@@ -5907,8 +6020,13 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 28);
-    for (name, read_only) in [("file_finish", false), ("file_finish_get", true)] {
+    assert_eq!(definitions.len(), 30);
+    for (name, read_only) in [
+        ("file_finish", false),
+        ("file_finish_get", true),
+        ("watch_handoff", false),
+        ("watch_handoff_get", true),
+    ] {
         assert_eq!(
             definitions
                 .iter()
