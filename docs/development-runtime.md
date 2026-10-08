@@ -4216,3 +4216,30 @@ and image identity are recorded as installed-recovery-report.json,
 installed-refusals.json and installed-artifacts.json in the same evidence
 directory. Final live status remains schema 41 with 212 records and daemon
 PID 1452634. This offline tool requires no daemon image change or restart.
+
+## Native half-open temporal query bounds
+
+The shared live query-candidate iterator now uses the existing inclusive forward
+seek together with RocksDB's native exclusive `iterate_upper_bound` at
+`received_before`. Record, native text and JSON key/value queries therefore do
+not decode the first catalog record beyond their requested interval. Selected
+membership keeps its existing explicit-reference validation and finite seeks.
+No query semantics, wire schema, storage format or dependency pin changed.
+
+The regression fixture corrupts catalog encodings both before the inclusive
+start and exactly at the exclusive end. The earlier implementation failed a
+valid `[20,30)` record query by loading the damaged record at 30. The corrected
+implementation returns its one valid in-interval record and native text/key/value
+results. Widening either end to include damaged evidence still produces
+`STORAGE_FAILURE`, with no swallowed catalog error. This changes which data a
+query reads, not its integrity requirements for selected input. The shared
+query-candidates ledger job owns the iterator; no second traversal helper was
+introduced.
+
+Before/after focused evidence is `/tmp/sparrow-temporal-bound-before.log` and
+`/tmp/sparrow-temporal-bound-after.log`. The full repository gate is recorded in
+`/tmp/sparrow-temporal-bound-check.log`. Runtime adoption will use the persistent
+unit, existing store, native installed lexicons and the schema-41 client after
+signed-hook qualification and an explicitly selected daemon build. Full
+architecture acceptance remains unmet; native forced reclamation and full
+SPARQL still require the documented upstream seams.

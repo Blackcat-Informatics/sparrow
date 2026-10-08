@@ -689,7 +689,7 @@ names = ['^(resolve_json_query_selection|resolve_text_query_selection|resolve_co
 
 [[job]]
 id = "query-candidates"
-summary = "Field and text reads share temporal-index validation and selected-candidate seeks."
+summary = "Field and text reads share temporal-index validation, native half-open iterator bounds and selected-candidate seeks; records beyond the requested interval are not loaded."
 home = "sparrow_core::storage::Writer::query_candidates"
 entry_points = []
 spec = "docs/interfaces.md: schema 13 membership scopes."

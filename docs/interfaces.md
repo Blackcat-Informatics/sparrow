@@ -171,6 +171,12 @@ OR, and intersect the outer exact `source`, receipt interval and resolved
 membership. Duplicate alternatives never duplicate records or counts. Context
 remains source-local and refuses an anchor excluded by the filter.
 
+Live record, text and JSON discovery
+use a forward temporal-index seek at the inclusive receipt start and a native
+exclusive iterator bound at the receipt end. They do not load the first record
+beyond that interval. Invalid catalog/index data inside the interval remains an
+operational failure; an out-of-interval record is not query input.
+
 Schema 21 also supports `service`, `host`, `severity`, `trace_id` and `span_id`
 arrays in the same closed filter object. Each dimension uses the same alternative
 bounds, OR within an array and AND across dimensions. Before ingesting that

@@ -5,7 +5,7 @@
 
 use super::{Artifact, Catalog, Error, Pin, Record, Writer, catalog_lease::CaptureAdmission};
 use crate::{QueryScope, QuerySelection};
-use rocksdb::IteratorMode;
+use rocksdb::{IteratorMode, ReadOptions};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const MAX_SELECTION_VISITS: usize = 100_000;
@@ -209,10 +209,16 @@ impl Writer {
             ));
         }
         let start = format!("time:{:020}:", scope.received_from);
-        let mut iterator = self.db.iterator(IteratorMode::From(
-            start.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let mut options = ReadOptions::default();
+        // Stop before decoding a catalog record beyond the half-open interval.
+        // The forward seek supplies its inclusive lower bound; RocksDB supplies
+        // the exclusive upper bound even when the next record is corrupt.
+        options
+            .set_iterate_upper_bound(format!("time:{:020}:", scope.received_before).into_bytes());
+        let mut iterator = self.db.iterator_opt(
+            IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward),
+            options,
+        );
         Ok(Box::new(std::iter::from_fn(move || {
             let (key, id) = match iterator.next()? {
                 Ok(entry) => entry,

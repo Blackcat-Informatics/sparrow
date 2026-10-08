@@ -9,6 +9,104 @@ use sparrow_test_support::{catalog_db, remove_tail_range_index};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
+    use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let past = store
+        .ingest("past", "source", "json", br#"{"message":"past"}"#, 10)
+        .unwrap();
+    let inside = store
+        .ingest("inside", "source", "json", br#"{"message":"inside"}"#, 20)
+        .unwrap();
+    let future = store
+        .ingest("future", "source", "json", br#"{"message":"future"}"#, 30)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    for artifact in [past, future] {
+        db.put(&artifact.record_ids[0], b"broken catalog encoding")
+            .unwrap();
+    }
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let scope = QueryScope {
+        selection: QuerySelection::Live,
+        source: None,
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 20,
+        received_before: 30,
+        limit: 100,
+        scan_budget: 100,
+    };
+    let query = RecordQuery::default();
+    let rows = store.records_query(&scope, &query, 40).unwrap();
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        rows["rows"][0]["record_id"].as_str(),
+        Some(inside.record_ids[0].as_str())
+    );
+    assert_eq!(
+        store.text_query(&scope, "inside", 40).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for discovery in [
+        JsonQuery::Keys { path: None },
+        JsonQuery::Values {
+            path: Some("/message".into()),
+            kind: None,
+            lexical: None,
+            decoded: Some("inside".into()),
+        },
+    ] {
+        assert!(
+            !store.json_query(&scope, &discovery, 40).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .json_query(
+                    &QueryScope {
+                        received_before: 31,
+                        ..scope.clone()
+                    },
+                    &discovery,
+                    40
+                )
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+    }
+    for widened in [
+        QueryScope {
+            received_before: 31,
+            ..scope.clone()
+        },
+        QueryScope {
+            received_from: 10,
+            ..scope
+        },
+    ] {
+        assert_eq!(
+            store.records_query(&widened, &query, 40).unwrap_err().code,
+            "STORAGE_FAILURE"
+        );
+        assert_eq!(
+            store.text_query(&widened, "inside", 40).unwrap_err().code,
+            "STORAGE_FAILURE"
+        );
+    }
+}
+
+#[test]
 fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry() {
     use sparrow_core::{ConsumptionGeneration, ConsumptionHandoff, TailFinishIntent, TailStart};
     let dir = tempfile::tempdir().unwrap();
