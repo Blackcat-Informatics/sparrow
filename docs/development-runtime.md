@@ -53,9 +53,36 @@ evidence checks native profile identity, applicable limits and frozen evidence
 after ingestion; the RPC scenario checks all four paged query receipts through
 CLI, MCP and cursor-only continuation.
 
-Source validation and running daemon qualification remain separate. Native
-certified SPARQL receipts and context capture provenance are still unfinished;
-the following schema sections preserve earlier runtime evidence.
+The signed source commit `86fee32` passed the complete verification hook. The
+owned development unit reopened this build at `2026-10-08T04:58:11Z`, PID
+1973781, after graceful exit, successful inactive state and socket removal of
+owned PID 1818673. The persistent store remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`, with 195 live
+records and directory/socket modes 0700/0600.
+
+Live evidence in `/tmp/sparrow-result-next-live.ajcsexav` checks all eight
+existing page shapes against original continuation and CLI/MCP cursor-only
+replay. The four query surfaces report frozen native profile roles, capture
+identity, applicable limits, explicit governor absence and unchanged semantic
+receipts. Query replay remains identical after pin expansion and release.
+Foreign, malformed, zero-boundary and unknown cursors refuse without rows.
+After the absolute deadline `2026-10-08T04:59:15.708Z`, the released-pin cursor
+refuses `RESULT_EXPIRED` without stdout. Final query handles, active pins and
+pending writes are zero; all 195 live records remain.
+
+The archived schema-31 daemon is SHA-256
+`62ae76a5c928d90abae96e57769f35661e6513e1e467d5acbebe9db02e441278`.
+Compatibility evidence in `/tmp/sparrow-artifact-scope-schema31-compat.f1fm4tu5`
+checks eight current-client operations: each refuses `UNSUPPORTED` with empty
+stdout; the isolated old daemon exits cleanly and removes its socket. Raw
+regression evidence in `/tmp/sparrow-artifact-filters-raw-regression.aw_5o2wo`
+compares exact 82-byte descriptor and 87-byte CRLF handoff downloads, stable
+artifact identity, removed handoff phase and preserved producer replacement.
+
+Incomplete diagnostic scope retains one unknown member, null total eligible
+count and original incomplete certainty with no native governor claim. Full
+architecture acceptance, certified native SPARQL receipts and context capture
+provenance remain unfinished. Historical qualification follows.
 
 ## Schema 31 cursor-only result continuation
 
