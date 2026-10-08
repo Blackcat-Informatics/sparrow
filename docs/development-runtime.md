@@ -4373,3 +4373,40 @@ Only finite pin control journals were added; no producer file or intake changed.
 The [disk crash qualification](performance-baseline.md#disk-crash-recovery)
 checks durable pin/import/release boundaries on a separate closed-store clone.
 It passed two SIGKILL/reopen cycles without affecting the production unit.
+
+## Completed import staging retirement
+
+Concurrent disk qualification exposed completed staging journals occupying the
+16-upload ceiling throughout their recovery lease. Signed fix `7f01e3e` uses the
+existing publication transfer and independent retry receipt to retire their
+private staging immediately. Finite shares keep large completed files from
+monopolizing small journal cleanup. The 16-journal and 128-unit limits, unfinished
+upload leases, consumption authority, evidence ownership, retention and retry
+windows are unchanged. No schema or storage migration is needed.
+
+Full check and the normal hook passed 141 storage scenarios, 51 RPC scenarios,
+17 SDK tests, remaining workspace checks and 215 ownership rules with no distinct
+exceptions. Logs are `/tmp/sparrow-staging-retirement-check.log` and
+`/tmp/sparrow-staging-retirement-commit.log`. The explicit daemon rebuild after
+the hook is `/tmp/sparrow-staging-retirement-bin.log`. Installed image
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema42-7f01e3e` matches the selected
+artifact, SHA-256 `a87dbe752a1b9b07fbc0370a5a00c6a8e794e82c7d971f6a01f4e44a989f4f68`.
+Its sole capability remains `cap_net_bind_service=ep`. The stable daemon alias
+selects it; the schema 42 CLI remains the qualified `b17f121` image.
+
+Live evidence is `/tmp/sparrow-staging-retirement-live.lul9cbw_`: images/hashes,
+unit/status, closed-store snapshot, configured invocation, listener and exact
+saved handoff retries. The unit gracefully stopped PID 2062025, confirmed its
+socket absent, captured the closed store and adopted PID 2222752. Schema 42,
+format 37, store identity, 212 records, existing watch checkpoints and owned
+replacement bytes are preserved. The listener remains `0.0.0.0:518`; TCP/Unix,
+CLI/MCP/SDK handoff retries preserve their original receipts and bytes. No intake
+or producer file was changed. The new closed snapshot has not separately been
+restored.
+
+The [concurrent disk qualification](performance-baseline.md#concurrent-mixed-format-workload-and-staging-retirement)
+now completes 100 scoped query traversals and 20 mixed durable imports with
+stable retries and restart persistence. It records 134 transport refusals and
+bounded reconnects rather than hiding them. Matching-binary disk SIGKILL checks
+also pass. These qualify the identified staging lifecycle fix; broad capture,
+full SPARQL, forced reclamation and complete performance acceptance remain unmet.

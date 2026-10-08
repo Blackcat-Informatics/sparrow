@@ -239,9 +239,99 @@ failure, WAL corruption, interruption inside a storage commit, unknown buffered
 delivery, forced reclamation, or every query operator. Those acceptance cases
 remain separate.
 
+## Concurrent mixed-format workload and staging retirement
+
+A six-worker trial on another closed Btrfs clone exposed completed imports holding
+all 16 staging slots until lease expiry. The initial fixture already contained
+eight completed journals. The corrected collector admitted eight new files, then
+refused the ninth with `RESOURCE_LIMIT: 16 import journals are occupied`. This
+finding is preserved in `concurrent-qualification-bci7r_jj` under the same state
+directory. Earlier collector stops are also preserved in
+`concurrent-qualification-3ua4xt7v` and `concurrent-qualification-g9a0cysj`
+(observed disconnected transport forms), and `concurrent-qualification-u3zrctgq`
+(incorrect zero-record expectation for opaque input). Each has `report.json`,
+daemon logs and `collector-failure.log`; none is a successful trial.
+
+Signed source `7f01e3e` reclaims completed staging at the existing durable
+publication boundary. Durable retry receipts and evidence remain independent.
+The 16-journal and 128-unit ceilings are unchanged; still-live unfinished uploads
+retain their recovery leases. A regression completes 32 imports at one injected
+clock, then verifies retries, bytes and native RDF after reopening. It separately
+verifies that 16 unfinished uploads retain their bytes and refuse a seventeenth.
+The full hook passed 141 storage scenarios, 51 RPC scenarios, 17 SDK tests and
+215 ownership rules with no distinct exceptions.
+
+The successful trial uses installed daemon `sparrowd-schema42-7f01e3e` and CLI
+`sparrow-schema42-b17f121` with the original four-operation/four-connection
+configuration. It starts five query workers and one sequential importer together
+over a private loopback Cap'n Proto TCP endpoint. Every query worker performs
+20 complete traversals, checks exact rows against a pre-load baseline and releases
+its capture. The import worker accepts 20 inputs, four each of JSON, JSONL,
+Markdown, logs and opaque bytes, and repeats every request with identical arguments.
+JSONL includes one malformed physical record per input. Non-line formats,
+including opaque bytes, have one whole-input record under the existing layout law.
+
+The collector records every failed CLI attempt. It retries only the precise
+operation-concurrency, staging-capacity or two observed disconnected transport
+outcomes, with unchanged request arguments, at most 40 attempts and bounded
+backoff. Other errors or successful stdout on a refusal abort the trial. This
+is collector retry behavior, not a new daemon or generic CLI reconnect policy.
+
+All 100 traversals and 20 imports completed. The timed concurrent interval was
+8.7265 seconds, including CLI startup, complete pagination, releases, retries and
+the final stable ingestion replays. The importer accepted 22,044 bytes and 140
+new records; the store grew from 7,058 to 7,198 occurrences. Its 20 first durable
+replies had p50 182.51 ms and inclusive p95 538.45 ms, including SDK upload/native
+projection and bounded retries but excluding the following explicit stable replay.
+
+| Query | Trials | Complete rows / pages | p50 ms | Inclusive p95 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Correction records | 20 | 286 / 2 | 132.78 | 649.06 |
+| First-pass receipt interval | 20 | 3,529 / 24 | 170.10 | 2,165.56 |
+| Pacman log text `error` | 20 | 12 / 1 | 105.23 | 240.17 |
+| Correction keys | 20 | 51 / 1 | 48.62 | 166.04 |
+| Correction `/timestamp` values | 20 | 286 / 3 | 211.09 | 336.24 |
+
+Query timings exclude the separate release round trip, recorded as
+`seconds_with_release`, and include reconnect backoff. There were 894 CLI attempts
+during load: 760 successful invocations and 134 disconnected attempts (91 peer
+disconnects and 43 TCP resets). No typed RPC-concurrency or staging-capacity
+refusal occurred in this repaired trial. The four-connection ceiling deliberately
+closes unadmitted connections; it does not give them a typed overload receipt.
+Successful workflow counts must not conceal these refusals or claim unlimited
+client admission. CLI invocations can contain multiple native RPC calls, so these
+are not native RPC request counts.
+
+All 20 artifact byte sequences match their recorded SHA-256 identities. Native
+inspection of every new record reports 68 complete projections, 68 not applicable
+and four failed malformed JSONL projections. Non-strict key discovery reports
+complete execution with incomplete certainty and four failed JSON records;
+strict discovery refuses `INDEX_NOT_READY` without successful stdout. Stable
+import replay and all five original scoped answer sets also match after reopening.
+The final query registry has zero retained handles and bytes.
+
+Sampled load RSS peaks at 168,504 KiB, observed every 100 ms; shorter peaks and
+allocation/cache bounds are not established. Closed-store file lengths grow from
+22,531,779 to 23,059,920 bytes (SST 21,704,537, blobs 170,895, control/logs
+1,184,488, WAL zero); final allocated blocks total 23,142,400 bytes. These totals
+include cloned/reopened engine logs and ongoing compaction, not steady-state
+index costs or a compression win. The small synthetic workload is not a measured
+saturation rate, sustained-load envelope or numerical deployment target.
+
+Successful evidence is
+`/home/paudley/.local/state/sparrow/concurrent-qualification-q3wdyj1_`:
+`driver.py`, `report.json`, `collector.log`, exact input/output bytes, configuration
+and daemon logs. The production unit stayed PID 2222752 during this trial; no
+production data or producer input was used. The two disk SIGKILL/reopen boundaries
+were repeated with the new daemon and passed, including original receipts/bytes,
+pins and query answers. Their new evidence is
+`/home/paudley/.local/state/sparrow/crash-qualification-y5vxargh`; the earlier crash
+qualification remains historical evidence, not proof about the new binary.
+
 Full performance acceptance remains unmet: complete corpus census and size/
 repetition distributions, full JSON/Markdown/malformed/opaque input mix,
-concurrent ingestion and maintenance, sustained/burst backpressure, 30-day
+representative sustained concurrent ingestion and maintenance, sustained/burst
+backpressure, 30-day
 turnover, sparse/dense pins, forced reclamation, cache/write-amplification
 measurement, and numerical deployment targets remain required. This baseline
 does not establish whole-store steady-state compression or capacity for the
