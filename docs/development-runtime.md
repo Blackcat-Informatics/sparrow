@@ -4,7 +4,7 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`c7e3960`; see [final RPC admission drain](#final-rpc-admission-drain) for
+`081f981`; see [structural stored-catalog admission](#structural-stored-catalog-admission) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
@@ -41,6 +41,40 @@ payload reclamation. Dense input still refuses under a finite allowance; malform
 native JSON reports storage failure without spending that allowance. These checks
 cover logical ownership and cursor progress, not physical compaction or sustained
 production retention throughput.
+
+Signed source `081f981` passes the full gate: formatting, release Clippy with
+warnings denied, 156 storage scenarios, 13 core unit tests, 60 RPC integration
+scenarios, seven RPC and three daemon unit tests, remaining workspace tests,
+seeded census tests and the pinned cross gate (244 ledger jobs, zero distinct
+exceptions). The real-daemon 8,000-record direct/MCP cancellation scenario also
+passes independently in 7.21 seconds, without the earlier retention refusal.
+No schema, storage representation, dependency or PurRDF revision changed.
+
+All five selected executables were rebuilt and frozen with source and SHA-256
+evidence at `~/.local/state/sparrow/receiver-history-images-q4w_vn4s`. Private
+qualification `~/.local/state/sparrow/typed-load-qualification-xus6nm2s` runs the
+existing typed load client against that exact daemon: 32 mixed-format cohorts,
+4,160 records and 8,678,582 original bytes, complete query traversal, exact-byte
+checks and released captures. It completes in 8.058163 seconds, with sampled
+high-water RSS 183,844 KiB, closed native files totaling 16,687,452 bytes, and
+clean SIGINT teardown in an observed 0.114 seconds. The public unit remains
+unchanged during private qualification. These observations establish neither a
+production throughput target nor a worst-case memory/shutdown bound.
+
+Controlled adoption evidence is `/tmp/sparrow-expiry-live.204gpmxe`, including a
+closed-store backup. The enabled active unit runs PID 1703194 from
+`sparrowd-schema48-081f981`; the stable CLI resolves to
+`sparrow-schema48-081f981`. Frozen, installed and alias hashes agree, the daemon
+retains `cap_net_bind_service=ep`, and its listener is `0.0.0.0:518`.
+TCP/Unix/CLI/MCP checks preserve store
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37, 212 records, healthy watches,
+zero pins and read leases. Saved intents preserve their original receipts, bytes,
+clocks and replacement files without new intake or retirement. The complete
+21-source inventory, five generation checkpoints, grouped pages, temporal/field
+witnesses, native text scores, four JSON keys and twenty values remain exact.
+Syslog listeners remain unconfigured. Complete governed SPARQL, correlation,
+larger-manifest capacity, physical reclamation, sustained resource/latency and
+reboot acceptance remain unfinished.
 
 ## Final RPC admission drain
 
