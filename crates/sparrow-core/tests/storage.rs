@@ -5434,6 +5434,89 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
 }
 
 #[test]
+fn stored_rdf_snapshot_survives_concurrent_pin_release_retirement_and_ingestion() {
+    use purrdf::{DatasetView, TermValue};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let accepted = store
+        .ingest(
+            "snapshot-original",
+            "snapshot",
+            "json",
+            br#"{"message":"before"}"#,
+            0,
+        )
+        .unwrap();
+    let pin = store
+        .pin("snapshot-pin", "snapshot", &accepted.record_ids, 40, 0)
+        .unwrap();
+    let (complete, completed) = std::sync::mpsc::sync_channel(1);
+    let selected = accepted.record_ids.clone();
+    let (sequence, new_record) = store
+        .with_rdf_records(&selected, 31 * DAY, Default::default(), |view| {
+            let before = view.quads().collect::<Vec<_>>();
+            let graphs = view.named_graphs().collect::<Vec<_>>();
+            assert!(!before.is_empty() && !graphs.is_empty());
+            assert_eq!(
+                store
+                    .with_rdf_records(&selected, 31 * DAY, Default::default(), |_| ())
+                    .unwrap_err()
+                    .code,
+                "RESOURCE_LIMIT"
+            );
+            let old_graph = TermValue::iri(format!("urn:sparrow:graph:{}", selected[0]));
+            let old_owner = view.term_id_by_value(&old_graph).unwrap().unwrap();
+            let owner = store.clone();
+            let mutation = std::thread::spawn(move || {
+                owner.release(&pin.id).unwrap();
+                owner.expire(31 * DAY).unwrap();
+                let new = owner
+                    .ingest(
+                        "snapshot-after",
+                        "snapshot",
+                        "json",
+                        br#"{"message":"after"}"#,
+                        31 * DAY,
+                    )
+                    .unwrap();
+                complete.send(new).unwrap();
+            });
+            // A lock held during query execution would prevent this writer finishing.
+            let new = completed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("query snapshot must release the writer owner");
+            mutation.join().unwrap();
+            assert_eq!(view.quads().collect::<Vec<_>>(), before);
+            assert_eq!(view.named_graphs().collect::<Vec<_>>(), graphs);
+            assert_eq!(view.term_id_by_value(&old_graph).unwrap(), Some(old_owner));
+            assert!(view.resolve(old_owner).is_ok());
+            assert!(
+                view.term_id_by_value(&TermValue::iri(format!(
+                    "urn:sparrow:graph:{}",
+                    new.record_ids[0]
+                )))
+                .unwrap()
+                .is_none()
+            );
+            (view.snapshot_sequence_number(), new.record_ids[0].clone())
+        })
+        .unwrap();
+    assert!(store.record(&selected[0]).is_err());
+    assert!(
+        store
+            .with_rdf_records(&selected, 31 * DAY, Default::default(), |_| ())
+            .is_err()
+    );
+    let later = store
+        .with_rdf_records(&[new_record], 31 * DAY, Default::default(), |view| {
+            assert!(!view.quads().collect::<Vec<_>>().is_empty());
+            view.snapshot_sequence_number()
+        })
+        .unwrap();
+    assert!(later > sequence);
+}
+
+#[test]
 fn stored_rdf_reads_refuse_exhaustion_and_failed_projection_without_prefixes() {
     use purrdf::DatasetView;
     let dir = tempfile::tempdir().unwrap();

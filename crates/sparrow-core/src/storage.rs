@@ -304,10 +304,11 @@ fn pin_deadline(days: u64, now: u64) -> Result<u64, Error> {
 pub struct Store {
     inner: Arc<Mutex<Writer>>,
     pin_reads: Arc<Mutex<pin_read::Reads>>,
+    rdf_read: Arc<Mutex<()>>,
 }
 
 struct Writer {
-    db: DB,
+    db: Arc<DB>,
     id: String,
     config: Config,
     durability: std::cell::RefCell<durability::State>,
@@ -979,7 +980,7 @@ impl Store {
         ));
         Ok(Self {
             inner: Arc::new(Mutex::new(Writer {
-                db,
+                db: Arc::new(db),
                 id,
                 config,
                 durability,
@@ -988,6 +989,7 @@ impl Store {
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
+            rdf_read: Arc::new(Mutex::new(())),
         })
     }
 

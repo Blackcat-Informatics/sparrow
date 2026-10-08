@@ -1841,6 +1841,52 @@ identity and shared CLI/MCP inspection are covered by the repository gate.
 
 ## Bounded stored RDF reads
 
+### Concurrent native snapshots
+
+Stored RDF reads now capture one native RocksDB snapshot while validating
+selected record membership, projection readiness and active pin protection under
+the writer owner. Execution releases that owner. Point reads, forward/reverse
+term validation, quad probes and graph declarations all use the same snapshot.
+The native sequence number is exposed by `snapshot_sequence_number`; it is
+read evidence rather than an occurrence identity or an investigation pin.
+
+The database handle is shared only for lifetime ownership. Snapshot scope does
+not retain source records in the current catalog or renew their expiry. A query
+may finish reading its captured versions while concurrent pin release and
+retention remove current evidence; later reads revalidate current eligibility.
+Subsequent ingests are excluded from the captured dictionary and graph state.
+The existing bounded lease, sticky resource failure and native checkpoint
+boundary still apply. Native snapshot versions can delay physical reclamation;
+the pressure worker already observes the native snapshot count. Snapshot release
+occurs when the callback exits, including failed execution. A callback that never
+returns is not preempted by the storage lease.
+
+One native RDF snapshot per store is admitted across all store clones; another
+request returns retryable `RESOURCE_LIMIT` rather than retaining another native
+version or waiting in an unbounded queue. This preserves the former single-query
+memory admission while allowing ingestion and maintenance to run during it.
+The admission slot is released on callback return or a typed error.
+
+The concurrency scenario releases the selected record's protection, retires it
+and ingests a new record from another thread while the callback is active. It
+requires that writer to finish before the callback continues, verifies unchanged
+quads/graph declarations and old-term resolution, refuses lookup of the later
+graph, then checks that a new read sees the later sequence and rejects the
+retired record. This is native stored-view qualification, not completion of the
+CLI/MCP query snapshot, result-handle or pagination contracts. Full SPARQL still
+requires the upstream native workspace admission described below.
+
+Local qualification on 2026-10-07: the final `make check` passed formatting,
+release Clippy with warnings denied, all workspace release tests (96 storage
+and 28 RPC/daemon/MCP scenarios), seeded census self-tests and the pinned
+cross-workspace gate. All 145 ownership jobs hold with no distinct exceptions.
+Evidence is `/tmp/sparrow-rdf-snapshot-final-check-20261007.log`. The final
+concurrency test also verifies shared admission refusal and successful admission
+after the first snapshot is released. Existing native semantic, storage-failure
+and governor scenarios remain passing. No wire schema, store format, runtime
+dependency or PurRDF pin changed. The owned development daemon remained active;
+this local stored-view qualification does not claim a live SPARQL RPC endpoint.
+
 Store format 5 adds atomic dictionary cardinality, a conservative encoded-term
 high-water bound, and graph-declaration postings. Opening a native view does not
 scan the dictionary or decode each graph manifest. Missing or inconsistent control
@@ -1852,9 +1898,9 @@ record IDs. It includes occurrence metadata and complete shared content, validat
 the selection atomically, and refuses failed applicable projections. Pin-aware
 eligibility uses the same retention law as ordinary reads. Scope preparation,
 pin parsing, term access, lazy index scans and native operator scratch share one
-read budget; ordinary-age selections do not scan pins. The callback holds the
-serialized store owner for its bounded lease. Concurrent snapshot qualification
-and the full live/pin/selection query scope interface remain required work.
+read budget; ordinary-age selections do not scan pins. Scope capture holds the
+serialized store owner; execution reads its immutable snapshot after releasing
+the owner. The full live/pin/selection query scope interface remains required work.
 
 The default ceilings are 128 MiB live admitted capacity, 100,000 read admissions,
 128 MiB admitted maximum read bytes, 100,000 index-row admissions, and a 30-second

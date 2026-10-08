@@ -12,7 +12,7 @@ use purrdf::{
     dataset_view::{TermGuard, WorkspaceReservation},
     ir::GlobalTermId,
 };
-use rocksdb::{DB, DBIteratorWithThreadMode, Direction, IteratorMode};
+use rocksdb::{DB, DBIteratorWithThreadMode, Direction, IteratorMode, Snapshot};
 use std::{collections::BTreeSet, sync::Arc};
 
 mod budget;
@@ -64,9 +64,10 @@ pub struct RdfReadEvidence {
 }
 
 /// One native read view, scoped to concrete retained graph owners.
-/// The store's serialized owner remains locked for this bounded callback lease.
+/// Scope is captured under the serialized owner; execution uses a native snapshot
+/// after releasing that owner, for this bounded callback lease.
 pub struct StoredRdfView<'a> {
-    db: &'a DB,
+    snapshot: Snapshot<'a>,
     owners: BTreeSet<u64>,
     budget: Arc<Budget>,
     _scope: Reservation,
@@ -176,7 +177,7 @@ impl<'a> StoredRdfView<'a> {
         let budget = Budget::new(limits)?;
         let scope = budget.reserve(4096 + (graph_ids.len() as u64).saturating_mul(256))?;
         let mut view = Self {
-            db,
+            snapshot: db.snapshot(),
             owners: BTreeSet::new(),
             budget,
             _scope: scope,
@@ -222,6 +223,11 @@ impl<'a> StoredRdfView<'a> {
         Ok(view)
     }
 
+    /// Native sequence at which evidence membership and indexed values were captured.
+    pub fn snapshot_sequence_number(&self) -> u64 {
+        self.snapshot.sequence_number()
+    }
+
     fn point(
         &self,
         key: &[u8],
@@ -229,7 +235,7 @@ impl<'a> StoredRdfView<'a> {
     ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
         self.budget.request(key.len() as u64 + maximum, false)?;
         let bytes = self
-            .db
+            .snapshot
             .get_pinned(key)
             .map_err(|error| self.budget.fail(error.into()))?;
         if bytes
@@ -347,7 +353,7 @@ impl<'a> StoredRdfView<'a> {
         }
         let reservation = self.budget.reserve(4096);
         let iterator = reservation.as_ref().ok().map(|_| {
-            self.db
+            self.snapshot
                 .iterator(IteratorMode::From(&prefix, Direction::Forward))
         });
         QuadIter {
@@ -367,7 +373,7 @@ impl<'a> StoredRdfView<'a> {
     fn graph_rows(&self) -> GraphIter<'_> {
         let reservation = self.budget.reserve(4096);
         let iterator = reservation.as_ref().ok().map(|_| {
-            self.db
+            self.snapshot
                 .iterator(IteratorMode::From(b"rdf:g:", Direction::Forward))
         });
         GraphIter {
@@ -705,7 +711,10 @@ impl FallibleDatasetView for StoredRdfView<'_> {
 
 impl Store {
     /// Run a native operation over one concrete selection of retained records.
-    /// This callback holds the serialized owner and cannot publish a failed read prefix.
+    /// Capture scope under the serialized owner, then release it before execution.
+    /// Snapshot reads cannot observe subsequent ingestion, pin changes or retirement,
+    /// and the fail-aware boundary cannot publish a failed read prefix.
+    /// One RDF snapshot per store is admitted; concurrent requests refuse explicitly.
     pub fn with_rdf_records<T>(
         &self,
         ids: &[String],
@@ -719,8 +728,20 @@ impl Store {
                 "RDF selection requires 1..1000 record IDs",
             )));
         }
+        let _lease = self.rdf_read.try_lock().map_err(|error| {
+            Arc::new(match error {
+                std::sync::TryLockError::WouldBlock => Error::new(
+                    "RESOURCE_LIMIT",
+                    "store already has an active RDF snapshot; retry after its lease ends",
+                ),
+                std::sync::TryLockError::Poisoned(_) => {
+                    Error::new("STORAGE_FAILURE", "RDF snapshot admission owner poisoned")
+                }
+            })
+        })?;
         let writer = self.lock().map_err(Arc::new)?;
-        let mut view = StoredRdfView::new(&writer.db, limits, &[])?;
+        let db = Arc::clone(&writer.db);
+        let mut view = StoredRdfView::new(&db, limits, &[])?;
         let mut scope_bytes = 4096 + ids.len() as u64 * 2048;
         view._scope.resize(scope_bytes)?;
         let catalog_bound = (writer.config.max_artifact_bytes / super::CHUNK + 1)
@@ -835,6 +856,7 @@ impl Store {
                 })?;
             view.owners.insert(ordinal(owner));
         }
+        drop(writer);
         purrdf::dataset_view::checkpointed_drain(&view, operation).map_err(|failure| failure.error)
     }
 }

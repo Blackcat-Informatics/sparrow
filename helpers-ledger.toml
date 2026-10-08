@@ -1001,7 +1001,7 @@ names = ['^renew_pin$']
 
 [[job]]
 id = "stored-rdf-read"
-summary = "Resolve scoped native RDF guards and lazy physical probes under one sticky RocksDB read budget."
+summary = "Resolve scoped native RDF guards and lazy physical probes on one immutable RocksDB snapshot under one sticky read budget; release the writer owner before execution."
 home = "sparrow_core::StoredRdfView::resolve"
 entry_points = ["sparrow_core::StoredRdfView::term_id_by_value", "sparrow_core::Store::with_rdf_records"]
 spec = "docs/development-runtime.md: bounded stored RDF reads; native DatasetView and FallibleDatasetView contracts."
