@@ -17,6 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: sparrowd --config FILE.toml".into());
     }
     let config = ServerConfig::read(Path::new(&args[1]))?;
+    // Keep the subscription alive through startup and awaited maintenance work.
+    // Recreating ctrl_c() inside select drops its listener when another branch wins.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     // Refuse an unavailable public port before opening/migrating the store or Unix endpoint.
     let tcp_listener = match config.rpc_tcp_address {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
@@ -107,7 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         synchronize.tick().await;
         loop {
             tokio::select! {
-                signal = tokio::signal::ctrl_c() => { signal?; break; }
+                signal = interrupt.recv() => {
+                    signal.ok_or("daemon interrupt subscription terminated unexpectedly")?;
+                    break;
+                }
                 _ = consumer_health.tick(), if consumer.is_some() || syslog.is_some() => {
                     if consumer.as_ref().is_some_and(sparrow_server::watches::ConsumeWorker::is_finished) {
                         consumer.take().expect("worker checked above").shutdown().await?;

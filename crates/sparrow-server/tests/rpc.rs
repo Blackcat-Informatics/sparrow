@@ -5633,6 +5633,74 @@ fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn interrupt_during_startup_is_retained_until_owned_teardown() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    let (address, (reserved, guard)) = configure_tcp_listener(&config);
+    drop(reserved);
+    drop(guard);
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+        .arg("--config")
+        .arg(&config)
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .admitted_spawn()
+        .unwrap();
+    let pid = rustix::process::Pid::from_raw(daemon.id().unwrap() as i32).unwrap();
+    let mut stderr = tokio::io::BufReader::new(daemon.stderr.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(30), stderr.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    // This actual startup announcement precedes opening the native store and workers.
+    assert_eq!(
+        line.trim(),
+        format!("sparrowd: capnp_tcp=0.0.0.0:{}", address.port())
+    );
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    stderr.read_to_string(&mut line).await.unwrap();
+    assert!(
+        status.success(),
+        "interrupt bypassed teardown: {status}: {line}"
+    );
+    assert!(
+        line.contains("sparrowd: store="),
+        "startup did not finish: {line}"
+    );
+    assert!(!socket.exists(), "owned endpoint survived interrupt");
+    assert!(std::net::TcpStream::connect(address).is_err());
+    // Graceful startup interruption leaves a recoverable initialized store.
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let receipt = client
+                .ingest(
+                    "interrupt-reopen",
+                    "source",
+                    wire::Format::Log,
+                    b"recovered\n",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                client.bytes(&receipt.id, 0, 10).await.unwrap(),
+                b"recovered\n"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
     tokio::task::LocalSet::new()
         .run_until(async {

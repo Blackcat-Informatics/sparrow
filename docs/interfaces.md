@@ -49,6 +49,12 @@ The public TCP bind still happens before opening or migrating the store.
 
 ### Daemon teardown
 
+One native SIGINT subscription is registered before opening storage or starting
+workers and retained through serving, including awaited maintenance branches.
+A signal during startup or maintenance remains pending until the serving loop
+can request teardown. It does not interrupt an individual native operation or
+certify a shutdown latency bound.
+
 Socket-bind refusal, syslog-start refusal, terminal serving/worker failure and
 graceful shutdown route through one teardown owner. It attempts consume join,
 syslog join, final store flush and owned socket-name cleanup even when an earlier
