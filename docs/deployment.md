@@ -71,6 +71,36 @@ image/configuration; reverting a binary alone cannot undo a store-format upgrade
 A closed-store backup is a recovery artifact, and its existence does not prove
 restoration has been exercised.
 
+For isolated recovery qualification, copy a closed-store backup to a separate
+directory and copy the deployment configuration with `data_dir` and
+`socket_path` changed to that directory. Keep the backup immutable. The recovery
+example uses the existing configuration/store readers directly, without starting
+listeners, maintenance or saved watch workers:
+
+```bash
+cargo build --locked --release -p sparrow-server --example recovery
+target/release/examples/recovery restored.toml EXPECTED_STORE RFC3339 EVIDENCE_ID...
+```
+
+Supply explicit artifact, record or finished file-generation IDs from captured
+discovery pages, following every continuation. The example admits at most 1024
+distinct targets and 1 GiB of aggregate reads, with 1 MiB byte calls. It checks
+store identity, retained/complete-byte eligibility and native byte integrity;
+streams native BLAKE3 over each target; compares full artifacts with their
+catalog payload identity; and reports existing native RDF inspection for records.
+Compare target bytes/hashes and RDF inspection with independently captured
+evidence. The output is one native JSON report after all checks; a failure has
+nonzero exit status and no successful stdout prefix. Missing dependencies,
+unfinished generations and expired evidence are failures, not skipped targets.
+
+This is a selected-evidence recovery probe, not a whole-engine integrity scrub or
+a query-performance qualification. Its target report defines its coverage. A
+missing blob may not affect a small inline target, so include all required
+evidence when qualifying a restore. Opening a store can perform required format
+upgrades; always work on a disposable restored copy. A live store is protected
+by the existing single-owner database lock. The example never activates its
+saved source paths, even when the copied watch catalog names original roots.
+
 For boot startup independently of an interactive login, verify
 `loginctl show-user "$USER" -p Linger`. Enabling lingering when absent is a host
 administration action. The enabled unit and lingering establish boot

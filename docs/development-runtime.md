@@ -4150,3 +4150,55 @@ scenarios, 16 SDK tests, remaining workspace tests and seeded/pinned census gate
 /tmp/sparrow-persistent-service-commit.log. Full architecture acceptance remains
 unmet, including full governed stored-view SPARQL, native forced reclamation and
 whole-corpus performance/resource/recovery qualification.
+
+## Isolated closed-store restoration qualification
+
+The recovery example in crates/sparrow-server/examples/recovery.rs opens an
+explicit restored copy through ServerConfig and Store. It never starts listeners,
+watch workers or maintenance. Its one coordination path uses the existing native
+byte reader, PurRDF streaming BLAKE3, native JSON renderer and RDF inspection.
+It admits 1..1024 distinct explicit evidence targets and at most 1 GiB of reads,
+checking target lengths before reading with 1 MiB calls. Complete artifact
+hashes must agree with their original catalog payload identities. Failure exits
+nonzero with no successful report prefix. The ownership ledger now has 211 jobs
+and no distinct exceptions; no second parser, hash law or projector was added.
+
+Evidence is /tmp/sparrow-restoration-live.xy2ws3bp. The closed-store snapshot
+from persistent service adoption was copied to restored-store inside that
+separate directory. Only the copied configuration's database/socket paths were
+changed. The original backup, active database and source roots were not modified.
+A fixed eligibility instant of 2026-10-08T13:02:33Z was used. All continuation
+pages were followed to capture 212 unique records and 32 complete artifacts,
+plus three producer-finished file generations. Every restored target's exact
+length and streaming digest matches independent SDK public TCP reads: 247
+explicit targets and 36,005,499 aggregate bytes (overlapping artifact/record
+bytes counted for each check). All 212 native RDF inspections match live TCP
+inspection identities, states and stream counts after excluding capture clocks.
+The report preserves store:46c88e949ccec658600b66c7becd5bb7, format 37, 212 live
+records and the existing native semantic fingerprints.
+
+Eight refusal cases cover wrong store identity, duplicate or untyped targets,
+unfinished generation, expired evidence, live-store ownership conflict, target
+count overflow and missing blob evidence in another disposable restored copy.
+Each exits nonzero with actionable stderr and empty stdout. The initial fault
+collector removed one blob and checked a small inline record; that selected
+record remained valid. The fault exercise was corrected to remove blob files
+only in its disposable copy and inspect the complete evidence target list,
+which then reports the missing blob. The probe is intentionally explicit about
+selected evidence and does not claim an engine-wide integrity scrub. Initial
+artifact collection also needed a second continuation page; complete collection
+followed the native cursor instead of treating the first page as all evidence.
+
+The active persistent daemon remains PID 1452634. No service stop/restart, source
+handoff, new intake or original-source mutation was needed for this restoration
+exercise. The historical snapshot-not-restored statements above describe the
+state before this separate qualification. Successful selected-evidence restore
+does not establish whole-process crash injection at every consumption boundary,
+query-semantic recovery for all operators, host reboot acceptance or whole-corpus
+resource/throughput qualification. Full architecture acceptance remains unmet.
+
+Focused release Clippy and the full repository gate passed. Logs are
+/tmp/sparrow-recovery-lint.log, /tmp/sparrow-recovery-build.log and
+/tmp/sparrow-recovery-check.log. Qualification used the explicit selected example
+build, not an unselected volatile target. Installed signed-image qualification
+will be recorded after the normal commit hook and explicit example rebuild.

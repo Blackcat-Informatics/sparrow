@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "offline-restored-evidence-probe"
+summary = "The recovery example coordinates explicit offline evidence checks through the existing configuration, store byte reader, RDF inspection and native hash/JSON owners; it never starts watchers or transport."
+home = "sparrow_server::example_crate::recovery::main"
+entry_points = []
+spec = "docs/deployment.md: isolated restoration qualification."
+vectors = ["crates/sparrow-server/examples/recovery.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(restore_payload_parser|restore_rdf_projector|restore_content_hash)$']
+
+[[job]]
 id = "handoff-bounded-identity-decoding"
 summary = "One generated optional-text reader bounds owned handoff target and publication identities before allocation; the receipt certificate owns their mode and phase agreement."
 home = "sparrow_client::handoff::optional_identity"
