@@ -88,8 +88,23 @@ The sampled daemon RSS peak during imports was 221,748 KiB, sampled every
 shorter peak was observed. Native cache use, write amplification and peak
 physical file growth were not separately measured. File-byte totals changed
 during native flush/compaction; status during import must not be equated with
-the final closed-store footprint. The final component snapshot follows in the
-evidence directory. SSTs combine catalog, dictionaries and indexes, so this
+the final closed-store footprint. The final component snapshot is:
+
+| Closed-store component | File bytes |
+| --- | ---: |
+| SSTs | 21,241,084 |
+| Blobs | 170,895 |
+| WALs | 0 |
+| Control/options/engine logs | 947,409 |
+| Total file lengths | 22,359,388 |
+| Allocated bytes from `st_blocks` | 22,433,792 |
+
+The two passes accepted 1,157,768 raw bytes. The measured closed-store file
+lengths are 19.31 times that input, so this small semantic/indexed fixture does
+not demonstrate a whole-store density win. This includes inspection/reopen log
+growth and is neither a steady-state ratio nor a strict filesystem quota
+measurement. Executable and lexicon assets live outside the measured store.
+SSTs combine catalog, dictionaries and indexes, so this
 experiment does not isolate graph/text index bytes from that family.
 
 | Query | Successful trials / 10 | Complete rows / pages | Successful p50 ms | Successful p95 ms | Refusal |
@@ -128,7 +143,8 @@ Disk evidence is
 `original-source-manifest.json`, `corpus.json`, immutable input copies,
 `config.toml`, `run.py`, `run.log`, `report.json`, `matrix.py`, `matrix.log`,
 `matrix-report.json`, per-family daemon logs, `rdf-inspection-*.json`,
-`rdf-summary.json` and `positive-value-report.json`. The original tmpfs
+`rdf-summary.json`, `positive-value-report.json` and `store-physical-final.json`.
+The original tmpfs
 experiment is `/tmp/sparrow-performance-baseline.8yyvo1pw`; its initial collector
 stopped on the broad refusal and then on a lease-capacity refusal. Later matrix
 collection records both successes and refusals rather than suppressing them.

@@ -4271,3 +4271,19 @@ no failure or pending claims. No new intake or source mutation was needed.
 The new closed-store snapshot has not separately been restored; the earlier
 isolated restoration qualification remains recorded above. Full architecture
 acceptance is still unmet.
+
+## Copied-corpus disk baseline
+
+[Performance baseline](performance-baseline.md) records the first selected
+sample import/query measurements on Btrfs/NVMe using the installed images,
+without changing the production unit or its 212 records. Two independent
+occurrence passes imported 1,157,768 bytes into 7,058 records, and stable retries
+preserved all receipts. Native inspection covers every record. The broad
+chronological capture refused at its real byte ceiling; repeated multi-page
+queries also encountered retained lease budgets. Successful single-page
+queries, positive exact value search, sampled RSS and closed-store file
+components are measured separately from these refusals. This evidence directs
+the next query-lifecycle work and does not establish full performance acceptance.
+Signed evidence source `49923fe` passed the normal full hook; its log is
+`/tmp/sparrow-performance-baseline-commit.log`. No daemon rebuild or lifecycle
+change was needed for this measurement/documentation step.
