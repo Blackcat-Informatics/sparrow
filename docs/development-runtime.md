@@ -3804,7 +3804,7 @@ this source section alone is not deployment evidence.
 
 ## Schema 40 daemon adoption and whole-file acceptance
 
-The current `sparrow-development.service` runs PID **723224**, started at
+The schema-40 `sparrow-development.service` adoption ran PID **723224**, started at
 2026-10-08T11:39:02Z, from signed functional source **d2bdd98** plus the SDK byte
 example commit **fb49020**. Its immutable executable is
 `/home/paudley/.local/libexec/sparrow/sparrowd-schema40-fb49020`, SHA-256
@@ -3964,5 +3964,74 @@ artifact/tail publication identities. Focused evidence is
 `/tmp/sparrow-schema41-focused.log`; repository and normal signed commit gates
 are `/tmp/sparrow-schema41-check.log` and `/tmp/sparrow-schema41-commit.log`.
 
-These changes are not yet deployed in the development unit. Live adoption and
-full architecture acceptance remain unfinished.
+These changes were committed as `d535b1a`; live adoption is recorded below.
+Full architecture acceptance remains unfinished.
+
+## Schema 41 daemon adoption and public tail retirement
+
+The current `sparrow-development.service` runs PID **1157669**, started at
+2026-10-08T12:34:36Z, from signed source **d535b1a**. Its immutable executable is
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema41-d535b1a`, SHA-256
+`762e88469f82fdebe939b734c2ecd97b6299d05be2f1046445542ee02d38553d`.
+Its sole capability is `cap_net_bind_service=ep`; public Cap'n Proto remains
+**0.0.0.0:518**, with LAN acceptance through **192.168.2.4:518**. The unit uses
+`KillSignal=SIGINT`, working directory `/home/paudley/Active/sparrow`, and
+`UMask=0077`. The prior process exited and removed its private socket before
+the closed snapshot and reopen. This remains a transient development unit.
+
+Matching installed clients under `/home/paudley/.local/libexec/sparrow` are:
+
+- `sparrow-schema41-d535b1a`, SHA-256
+  `bfefd120759f976a5f2c236c187f5121f1f55f14c894382d3c6b8603dfaea422`.
+- `events-schema41-d535b1a`, SHA-256
+  `3354982a6100facce24d65049abe408b3bb51e785ef78f2c7b4b899835962a85`.
+- `bytes-schema41-d535b1a`, SHA-256
+  `ebd880f1982948dbae44e616b9eeabfb86c40e1ef2f2f94d6aeb2479eccfdcab`.
+- `handoff-schema41-d535b1a`, SHA-256
+  `dd22c5a9e208dba91d3095a438cbf3819fe609e94734dc6065d0e2f0fc2f2995`.
+
+All installed hashes matched the explicit all-bin/example build after signed
+hooks passed. Before new intake, live verification preserved the original store
+identity, format 36, 210 records, old completion receipts and exact bytes,
+record provenance/context, and original schema-38 event artifact
+`artifact:6a81f30ff545ca344c0d579cbffcfdce`. Old complete files still reconstruct
+exactly over SDK TCP/Unix, CLI and MCP; active generation reads still refuse
+without returning a byte prefix.
+
+One exclusively created synthetic file in the owned development tail root
+contained 92 bytes, including a final unterminated JSONL record. Preparation
+before producer finish refused without creating an intent or deleting its source.
+After its original producer completion, the SDK handoff example admitted the
+saved intent through the LAN TCP endpoint. The worker retired only that original
+source and published generation
+`file-generation:238fc933ad32a1a5f95004cd5c6bb1db`, with no artifact identity.
+Original finish admission/publication remain 2026-10-08T12:37:07.256Z and
+2026-10-08T12:37:07.310Z. The complete 92 bytes remain readable over TCP/Unix.
+
+An independent replacement at the original path remains intact. SDK TCP/Unix,
+CLI and MCP mutation/progress retries all return the same removed receipt and
+preserve post-retirement record clocks, checkpoint metadata, and replacement
+bytes. Store `store:46c88e949ccec658600b66c7becd5bb7` now uses format **37** and
+has **212 records**: exactly the two new checkpoint records, with no reimport.
+The tail watch has eight checkpoint records, two active held descriptors, no
+pending claim or failure, and no admission wait; pins and record-read handles
+remain zero. Post-handoff verification also preserves all older completion and
+event retry evidence. No production or Lillith source was watched or consumed.
+
+Evidence is `/tmp/sparrow-schema41-live.nts9vrel`: installed artifact hashes,
+before/after status, original synthetic bytes, native retry intents, receipt,
+checkpoint and record captures, public SDK output, MCP transcripts, and service
+state. Its `store-before-schema41` is a closed snapshot; restoration was not
+exercised. `handoff_live.py` creates/adopts one synthetic source and must not be
+rerun against this accepted fixture. `handoff_retry_verify.py` and the two
+`*_post_handoff.py` verifiers perform reads and exact admitted retries only.
+The initial collector stopped after successful retirement on JSON-field/type
+assertions; those collection errors were repaired, and verification continued
+using the original saved intent without reingestion or service restart.
+
+Normal signed hooks passed formatting, release Clippy with warnings denied,
+139 storage scenarios, 50 RPC scenarios, 16 SDK tests, remaining workspace tests,
+seeded census self-tests, and the pinned cross gate: 210 ownership jobs with no
+distinct exceptions. Logs are `/tmp/sparrow-schema41-commit.log` and
+`/tmp/sparrow-schema41-bins.log`. Permanent packaging and full architecture
+acceptance remain unfinished.
