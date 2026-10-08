@@ -4,10 +4,82 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 45 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`5ca7eeb`; see [owned local endpoint recovery](#owned-local-endpoint-recovery) for
+`9103292`; see [durable pressure retirement recovery](#durable-pressure-retirement-recovery) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Durable pressure retirement recovery
+
+Signed source `9103292` fixes two pressure-maintenance invariants. A successful
+retirement batch now atomically publishes its linked-file recovery floor and
+refused-write estimate alongside the deletions. Reopening restores that wait,
+instead of permitting another pass merely because session-local state reset.
+Stored-file progress excludes anonymous query allocation/reservations; those
+allocations still count toward write admission. If temporary query allocation
+alone prevents the requested write, maintenance preserves evidence and waits
+for capacity rather than evicting it.
+
+The first durable pressure retirement fences a store at format 38 without a
+watch registry, or 39 with one. The shared native publication owner retains that
+fence through subsequent watch, consumption and handoff batches and after the
+wait clears. Tail ownership checks accept the newer watched format. Older
+binaries refuse the fenced formats. Existing stores retain their earlier format
+until this durable invariant is first published; wire schema remains 45.
+Recovery markers use the existing native catalog decoder, decimal count strings
+and a 512-byte bound. Invalid markers or a missing writer fence refuse open.
+
+The full release gate and normal signed source hook passed release Clippy with
+warnings denied, 147 storage scenarios, 55 RPC scenarios, all remaining workspace
+tests, seeded census self-tests and 225 pinned ledger jobs with no distinct
+exceptions. New scenarios cover restart while stored files remain above the
+recovery floor, preservation of the next unpinned record, clearing the wait on
+capacity recovery, continued format fencing, watch-catalog transitions and
+malformed/oversized markers. A real anonymous result lease supplies the separate
+query-only-pressure scenario: releasing it restores capacity without retiring
+the original evidence. Development corrected a native decimal-string encoding
+mismatch and a synchronization return-type mismatch before the final gate.
+
+The selected runtime build followed the source hook. Qualified images are
+`~/.local/state/sparrow/pressure-images-afn67zko`. The private Btrfs daemon
+qualification is `~/.local/state/sparrow/pressure-wait-qualification-eedm2ij1`.
+It ingests 64 distinct log occurrences under a 16 MiB budget with 4 MiB reserve,
+then uses owned sparse ballast to trigger admission pressure. One pass retires
+32 occurrences and publishes format 39. After increasing that ballast and
+closing/reopening, twenty-five observations preserve all 32 survivors with zero
+new passes. Every survivor's original bytes are checked; every retired reference
+refuses with `EVIDENCE_UNAVAILABLE`. The installed predecessor binary refuses
+the closed format-39 store. Removing the fixture ballast permits measured
+admission recovery and a durable retry of the previously refused request.
+A final reopen retains 33 records, that exact receipt, ready pressure state and
+format 39. The public service PID remains unchanged throughout this private run.
+Sparse ballast tests accounting/admission and durable wait recovery; it does not
+simulate filesystem ENOSPC or certify forced native physical reclamation.
+
+The separate closed copied corpus at
+`~/.local/state/sparrow/json-pages-qualification-4mch4gzm` retains all 7,058
+ordinary/grouped record rows over 48 pages, source/temporal/text rows and native
+scores, 51 keys and 286 value occurrences, exactly matching predecessor evidence.
+All result leases are released and the private owner closes gracefully.
+
+Public adoption evidence is `/tmp/sparrow-pressure-live.cmmhwj0j`. The old daemon
+stopped gracefully and its closed store was copied before replacement. The
+enabled unit started as PID 4018805 with
+`~/.local/libexec/sparrow/sparrowd-schema45-9103292`, SHA-256
+`d43bc58b99d7639a9a4354c4d6e0bb7794ee093015cc4ec961b8bbd69c7e8412`.
+The stable CLI selects `sparrow-schema45-9103292`, SHA-256
+`39031f80027a5b8acc7614b060aee7bbf05db62042c41220d97503fd65dfa79f`.
+All five installed images match qualification hashes. TCP `0.0.0.0:518`, the
+private Unix endpoint, CLI/MCP key/value continuations, grouped record behavior,
+saved temporal/field/text witnesses, original finish/handoff intent retries and
+six idle MCP peers plus status passed. Final public state retains format 37,
+212 records, zero pins/result leases, ready pressure and healthy watches without
+pending claims. The public store did not require pressure retirement during this
+adoption. `Restart=no`, the sole bind capability and the PurRDF pin are unchanged.
+
+Full governed SPARQL, bounded forced physical reclamation, cancellation latency,
+filesystem quota/production-volume acceptance and reboot acceptance remain
+unfinished. Historical evidence below remains tied to its original identities.
 
 ## Owned local endpoint recovery
 
