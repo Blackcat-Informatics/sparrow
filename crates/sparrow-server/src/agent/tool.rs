@@ -175,7 +175,8 @@ impl Operation {
                             sparrow_core::parse_instant(&value).map_err(DecodeError::custom)?;
                     }
                     let limit = fields.raw("limit")?.map(u32::from_json).transpose()?;
-                    let page_size = if name == "records_search" {
+                    let paged = ["records_search", "text_search"].contains(&name);
+                    let page_size = if paged {
                         fields.raw("page_size")?.map(u32::from_json).transpose()?
                     } else {
                         None
@@ -186,6 +187,9 @@ impl Operation {
                         ));
                     }
                     options.limit = page_size.or(limit).unwrap_or(options.limit);
+                    if paged {
+                        options.cursor = fields.optional("cursor")?;
+                    }
                     options.scan_budget = fields
                         .raw("scan_budget")?
                         .map(u32::from_json)
@@ -206,7 +210,6 @@ impl Operation {
                         .unwrap_or(false);
                     if name == "records_search" {
                         let input = super::records::Input {
-                            cursor: fields.optional("cursor")?,
                             event_interval: super::records::interval(
                                 fields.optional("event_from")?,
                                 fields.optional("event_before")?,

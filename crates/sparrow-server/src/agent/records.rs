@@ -14,7 +14,6 @@ use purrdf_lex::json::{
 
 pub(crate) struct Input {
     pub options: Options,
-    pub cursor: Option<String>,
     pub text: Option<String>,
     pub fields: Vec<sparrow_core::FieldConstraint>,
     pub event_interval: Option<sparrow_core::EventInterval>,
@@ -110,7 +109,7 @@ impl Input {
         let mut call = client.records_search_request();
         let mut input = call.get().init_query();
         fill_scope(input.reborrow().init_scope(), &self.options)?;
-        optional(input.reborrow().init_cursor(), &self.cursor);
+        optional(input.reborrow().init_cursor(), &self.options.cursor);
         optional(input.reborrow().init_text(), &self.text);
         input.set_require_complete_index(self.options.require_complete_index);
         if let Some(interval) = self.event_interval {
@@ -150,7 +149,7 @@ impl Input {
         }
         let text = match found.get_text()?.which()? {
             wire::optional_text_results::Absent(()) => Value::Null,
-            wire::optional_text_results::Value(value) => search::render(value?)?,
+            wire::optional_text_results::Value(value) => Value::from(search::render(value?)?),
         };
         let rows = found
             .get_rows()?
@@ -201,10 +200,7 @@ impl Input {
             })
             .collect::<Result<Vec<Value>>>()?;
         let coverage = found.get_event_coverage()?;
-        let mut page = super::catalog::receipt(found.get_page()?)?;
-        page.remove("execution_status");
-        page.remove("answer_certainty");
-        page.remove("coverage");
+        let page = super::catalog::page(found.get_page()?)?;
         Ok(Object::new()
             .with("page", page)
             .with(

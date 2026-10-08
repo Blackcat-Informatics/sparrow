@@ -1028,9 +1028,9 @@ names = []
 
 [[job]]
 id = "catalog-receipt-render"
-summary = "Pin, artifact and source CLI/MCP pages share one exact catalog receipt renderer."
+summary = "Catalog pages share one receipt renderer; record and standalone text pages share its pagination-only projection alongside native semantic receipts."
 home = "sparrow_server::agent::catalog::receipt"
-entry_points = []
+entry_points = ["sparrow_server::agent::catalog::page"]
 spec = "docs/interfaces.md: shared catalog receipt rendering."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2386,7 +2386,7 @@ names = []
 
 [[job]]
 id = "record-result-capture"
-summary = "One record matcher and native ranker serves both bounded direct reads and complete immutable result captures; capture exhaustion refuses without a prefix."
+summary = "One record matcher and native ranker serves direct reads and operation-bound record/text captures; both paged surfaces share admission and refuse capture exhaustion without a prefix."
 home = "sparrow_core::storage::text_index::Store::records_query_capture"
 entry_points = ["sparrow_core::storage::text_index::Store::records_query", "sparrow_core::storage::Store::records_read"]
 spec = "docs/interfaces.md: schema 28 record pagination."
@@ -2425,3 +2425,18 @@ enforced = true
 constants = []
 fingerprints = []
 names = []
+
+
+[[job]]
+id = "standalone-text-page-adapter"
+summary = "Standalone text RPC routes through the record result owner and the same native ranked result codec; CLI/MCP share one renderer and pagination projection."
+home = "sparrow_server::agent::search::execute"
+entry_points = ["sparrow_server::agent::search::render", "sparrow_server::rpc::Rpc::text_search"]
+spec = "docs/interfaces.md: schema 29 standalone text pages."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^standalone_text_ranker$']

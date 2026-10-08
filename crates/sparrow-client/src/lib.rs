@@ -50,7 +50,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 29;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 

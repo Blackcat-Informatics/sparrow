@@ -9,9 +9,21 @@ use std::time::Instant;
 const ROW_BYTES: usize = 32 * 1024;
 const METADATA_BYTES: usize = 32 * 1024;
 
+/// Public query surface bound into every continuation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordOperation {
+    /// Combined record qualification, including fields and source time.
+    #[default]
+    Records,
+    /// Standalone native text search, sharing record capture and ranking.
+    Text,
+}
+
 /// A complete bounded capture or a continuation with identical query semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordRead {
+    /// Prevent replay through a different operation even with equivalent predicates.
+    pub operation: RecordOperation,
     /// Membership, filters and acceptance interval; limit is the page item ceiling.
     pub scope: crate::QueryScope,
     /// Same-record predicates, source time and optional native text ranking.
@@ -148,6 +160,16 @@ impl Store {
     pub fn records_read(&self, query: &RecordRead, now: u64) -> Result<RecordReadPage, Error> {
         query.scope.validate()?;
         query.query.validate()?;
+        if query.operation == RecordOperation::Text
+            && (query.query.text.is_none()
+                || !query.query.fields.is_empty()
+                || query.query.event_interval.is_some())
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "standalone text capture requires text and admits no record fields or event interval",
+            ));
+        }
         if query
             .cursor
             .as_ref()

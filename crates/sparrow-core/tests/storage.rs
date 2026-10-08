@@ -8338,6 +8338,7 @@ fn record_pages_capture_more_than_the_old_row_ceiling_without_limited_execution(
         )
         .unwrap();
     let mut query = RecordRead {
+        operation: sparrow_core::RecordOperation::Records,
         scope: record_page_scope("pages", 113),
         query: RecordQuery::default(),
         cursor: None,
@@ -8386,6 +8387,7 @@ fn record_pages_keep_pin_capture_after_release_and_retirement_and_expire_absolut
         expected_revision: Some(pin.revision),
     };
     let mut query = RecordRead {
+        operation: sparrow_core::RecordOperation::Records,
         scope,
         query: RecordQuery::default(),
         cursor: None,
@@ -8449,6 +8451,7 @@ fn ranked_record_pages_freeze_native_corpus_scores_and_diagnostic_coverage() {
     )]
     .into();
     let mut query = RecordRead {
+        operation: sparrow_core::RecordOperation::Records,
         scope: scope.clone(),
         query: RecordQuery {
             text: Some("needle".into()),
@@ -8517,6 +8520,7 @@ fn record_pages_admit_variable_byte_boundaries_and_refuse_without_publishing_pre
         ..Default::default()
     };
     let mut query = RecordRead {
+        operation: sparrow_core::RecordOperation::Records,
         scope: record_page_scope("pages", 100),
         query: RecordQuery {
             fields: vec![field.clone(); 4],
@@ -8570,6 +8574,116 @@ fn record_pages_admit_variable_byte_boundaries_and_refuse_without_publishing_pre
         "RESOURCE_LIMIT"
     );
     store.expire(first.lease_expires_at).unwrap();
+    assert_eq!(
+        clone.status(first.lease_expires_at).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn text_pages_capture_all_ranked_matches_and_bind_the_operation() {
+    use sparrow_core::{RecordOperation, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest(
+            "text-pages-large",
+            "pages",
+            "log",
+            b"needle\n".repeat(1005).as_slice(),
+            1,
+        )
+        .unwrap();
+    let mut query = RecordRead {
+        operation: RecordOperation::Text,
+        scope: record_page_scope("pages", 137),
+        query: RecordQuery {
+            text: Some("needle".into()),
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let first = store.records_read(&query, 2).unwrap();
+    assert_eq!(first.total_items, 1005);
+    let original_ranking = first.body.result().unwrap()["ranking"].clone();
+    let mut page = first.clone();
+    let mut ids = std::collections::BTreeSet::new();
+    loop {
+        let value = page.body.result().unwrap();
+        assert_eq!(value["execution"].as_str(), Some("complete"));
+        assert_eq!(value["ranking"], original_ranking);
+        for row in value["rows"].as_array().unwrap() {
+            assert!(ids.insert(row["record_id"].as_str().unwrap().to_owned()));
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        query.cursor = Some(cursor);
+        page = store.records_read(&query, 3).unwrap();
+        assert_eq!(page.snapshot_id, first.snapshot_id);
+    }
+    assert_eq!(ids, artifact.record_ids.into_iter().collect());
+    query.operation = RecordOperation::Records;
+    assert_eq!(store.records_read(&query, 3).unwrap_err().code, "CONFLICT");
+    query.cursor = None;
+    query.operation = RecordOperation::Text;
+    query.query.text = None;
+    assert_eq!(
+        store.records_read(&query, 3).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+}
+
+#[test]
+fn record_and_text_pages_share_handle_admission_and_fixed_expiry() {
+    use sparrow_core::{RecordOperation, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest(
+            "text-pages-shared",
+            "pages",
+            "log",
+            b"needle a\nneedle b\nneedle c\n",
+            1,
+        )
+        .unwrap();
+    let clone = store.clone();
+    let mut query = RecordRead {
+        operation: RecordOperation::Text,
+        scope: record_page_scope("pages", 1),
+        query: RecordQuery {
+            text: Some("needle".into()),
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let first = clone.records_read(&query, 2).unwrap();
+    for index in 1..8 {
+        query.operation = if index % 2 == 0 {
+            RecordOperation::Text
+        } else {
+            RecordOperation::Records
+        };
+        store.records_read(&query, 2).unwrap();
+    }
+    assert_eq!(
+        store.status(2).unwrap()["record_read_handles"].as_str(),
+        Some("8")
+    );
+    assert_eq!(
+        clone.records_read(&query, 2).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    query.operation = RecordOperation::Text;
+    query.cursor = first.next_cursor.clone();
+    assert_eq!(
+        store
+            .records_read(&query, first.lease_expires_at)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
     assert_eq!(
         clone.status(first.lease_expires_at).unwrap()["record_read_handles"].as_str(),
         Some("0")

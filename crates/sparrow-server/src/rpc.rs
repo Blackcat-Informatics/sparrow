@@ -1560,6 +1560,7 @@ impl wire::sparrow::Server for Rpc {
             .work(move |store, now| {
                 let page = store.records_read(
                     &sparrow_core::RecordRead {
+                        operation: sparrow_core::RecordOperation::Records,
                         scope: scope?,
                         query,
                         cursor,
@@ -1664,15 +1665,48 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let input = params.get()?.get_query()?;
         let scope = scope(input.get_scope()?, &self)?;
-        let query = input.get_text()?.to_str()?.to_owned();
+        if input.get_text()?.len() > 65536 {
+            failure(
+                results.get().init_result(),
+                Error::new("RESOURCE_LIMIT", "text query exceeds 64 KiB"),
+            );
+            return Ok(());
+        }
+        if let wire::optional_text::Value(cursor) = input.get_cursor()?.which()?
+            && cursor?.len() > 160
+        {
+            failure(
+                results.get().init_result(),
+                invalid("text cursor exceeds 160 bytes"),
+            );
+            return Ok(());
+        }
+        let query = sparrow_core::RecordQuery {
+            text: Some(input.get_text()?.to_str()?.to_owned()),
+            ..Default::default()
+        };
+        let cursor = optional(input.get_cursor()?)?;
         match self
-            .work(move |store, now| store.text_query(&scope?, &query, now))
+            .work(move |store, now| {
+                let page = store.records_read(
+                    &sparrow_core::RecordRead {
+                        operation: sparrow_core::RecordOperation::Text,
+                        scope: scope?,
+                        query,
+                        cursor,
+                    },
+                    now,
+                )?;
+                let value = page.body.result()?;
+                Ok((page, value))
+            })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
-            Ok(value) => {
-                let out = results.get().init_result().init_ok();
-                text_results(out, &value)?;
+            Ok((page, value)) => {
+                let mut out = results.get().init_result().init_ok();
+                catalog_receipt(out.reborrow().init_page(), &page);
+                text_results(out.init_result(), &value)?;
             }
         }
         Ok(())

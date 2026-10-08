@@ -36,7 +36,7 @@ pub(super) const USAGE: &str = concat!(
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY | keys | values",
+    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N] [--require-complete-index true|false];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
     "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp"
@@ -81,6 +81,7 @@ pub(super) struct Options {
     from: u64,
     before: u64,
     limit: u32,
+    cursor: Option<String>,
     scan_budget: u32,
     path: Option<String>,
     kind: Option<wire::JsonKind>,
@@ -127,6 +128,7 @@ impl Default for Options {
             from: 0,
             before: u64::MAX,
             limit: 100,
+            cursor: None,
             scan_budget: 10000,
             path: None,
             kind: None,
@@ -285,7 +287,7 @@ impl Command {
         };
         let records = args[0] == "records";
         let mut records_text = None;
-        let mut record_cursor = None;
+        let paged = records || text.is_some();
         let mut event_from = None;
         let mut event_before = None;
         let mut record_fields = Vec::new();
@@ -316,8 +318,8 @@ impl Command {
                 "--event-from" if records => event_from = Some(value.clone()),
                 "--event-before" if records => event_before = Some(value.clone()),
                 "--text" if records => records_text = Some(value.clone()),
-                "--cursor" if records => record_cursor = Some(value.clone()),
-                "--page-size" if records => {
+                "--cursor" if paged => options.cursor = Some(value.clone()),
+                "--page-size" if paged => {
                     if seen.iter().any(|flag| flag.as_str() == "--limit") {
                         return Err(invalid("use either --page-size or --limit"));
                     }
@@ -347,7 +349,7 @@ impl Command {
                         sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?
                 }
                 "--limit" => {
-                    if records && seen.iter().any(|flag| flag.as_str() == "--page-size") {
+                    if paged && seen.iter().any(|flag| flag.as_str() == "--page-size") {
                         return Err(invalid("use either --page-size or --limit"));
                     }
                     options.limit = value
@@ -384,7 +386,6 @@ impl Command {
             return Ok(Self::Records(records::Input {
                 options,
                 text: records_text,
-                cursor: record_cursor,
                 event_interval: records::interval(event_from, event_before)?,
                 fields: record_fields,
             }));

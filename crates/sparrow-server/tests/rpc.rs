@@ -6038,3 +6038,217 @@ async fn record_pages_enforce_agent_byte_ceilings_and_scan_refusal() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn standalone_text_pages_freeze_native_ranking_and_refuse_cross_operation_cursors() {
+    use purrdf_lex::json::Object;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            client
+                .ingest(
+                    "wire-text-page-initial",
+                    "text-pages",
+                    wire::Format::Log,
+                    b"needle a\nneedle needle b\nneedle c\n",
+                )
+                .await
+                .unwrap();
+            let first = cli(
+                &socket,
+                &[
+                    "text",
+                    "needle",
+                    "--source",
+                    "text-pages",
+                    "--page-size",
+                    "1",
+                ],
+            );
+            assert_eq!(first["page"]["total_items"].as_str(), Some("3"));
+            assert_eq!(first["receipt"]["execution"].as_str(), Some("complete"));
+            assert_eq!(first["ranking"]["documents"].as_str(), Some("3"));
+            let cursor = first["page"]["next_cursor"].as_str().unwrap();
+            client
+                .ingest(
+                    "wire-text-page-later",
+                    "text-pages",
+                    wire::Format::Log,
+                    b"needle later\n",
+                )
+                .await
+                .unwrap();
+            let second = cli(
+                &socket,
+                &[
+                    "text",
+                    "needle",
+                    "--source",
+                    "text-pages",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    cursor,
+                ],
+            );
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let replay = mcp
+                .tool(
+                    2,
+                    "text_search",
+                    Object::new()
+                        .with("text", "needle")
+                        .with("source", "text-pages")
+                        .with("page_size", 1_u32)
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert!(!replay["isError"].as_bool().unwrap());
+            assert_eq!(replay["structuredContent"], second);
+            assert_eq!(second["ranking"], first["ranking"]);
+            assert_eq!(second["receipt"], first["receipt"]);
+            assert_eq!(second["page"]["snapshot_id"], first["page"]["snapshot_id"]);
+            let last = cli(
+                &socket,
+                &[
+                    "text",
+                    "needle",
+                    "--source",
+                    "text-pages",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    second["page"]["next_cursor"].as_str().unwrap(),
+                ],
+            );
+            let captured_ids = [&first, &second, &last]
+                .iter()
+                .flat_map(|page| {
+                    page["rows"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["record_id"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(captured_ids.len(), 3);
+            assert!(!last["page"]["has_more"].as_bool().unwrap());
+            let current = cli(&socket, &["text", "needle", "--source", "text-pages"]);
+            assert_eq!(current["page"]["total_items"].as_str(), Some("4"));
+            assert_ne!(
+                current["ranking"]["corpus_id"],
+                first["ranking"]["corpus_id"]
+            );
+            let record_page = cli(
+                &socket,
+                &[
+                    "records",
+                    "--text",
+                    "needle",
+                    "--source",
+                    "text-pages",
+                    "--page-size",
+                    "1",
+                ],
+            );
+            let record_cursor = record_page["page"]["next_cursor"].as_str().unwrap();
+            for (arguments, code) in [
+                (
+                    vec![
+                        "records",
+                        "--text",
+                        "needle",
+                        "--source",
+                        "text-pages",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        cursor,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "text",
+                        "needle",
+                        "--source",
+                        "text-pages",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        record_cursor,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "text",
+                        "other",
+                        "--source",
+                        "text-pages",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        cursor,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "text",
+                        "needle",
+                        "--source",
+                        "text-pages",
+                        "--scan-budget",
+                        "1",
+                    ],
+                    "RESOURCE_LIMIT",
+                ),
+                (
+                    vec!["text", "needle", "--limit", "1", "--page-size", "1"],
+                    "INVALID_ARGUMENT",
+                ),
+            ] {
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(arguments)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success() && output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(code),
+                    "{output:?}"
+                );
+            }
+            let mut request = client.capability().text_search_request();
+            let mut query = request.get().init_query();
+            query.set_text("needle");
+            query.init_scope().set_schema_version(28);
+            let response = request.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "UNSUPPORTED"
+                ),
+                wire::result::Ok(_) => panic!("obsolete standalone text schema admitted"),
+            }
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["record_read_handles"].as_str(), Some("2"));
+        })
+        .await;
+}

@@ -306,7 +306,8 @@ struct TextRanking {
   corpusId @7 :Text;
 }
 struct TextCoverage { failedOrIncomplete @0 :UInt64; notApplicable @1 :UInt64; postingVisits @2 :UInt64; }
-struct TextQuery { scope @0 :Scope; text @1 :Text; }
+struct TextQuery { scope @0 :Scope; text @1 :Text; cursor @2 :OptionalText; }
+struct TextSearchPage { page @0 :CatalogReadReceipt; result @1 :TextResults; }
 struct TextResults { receipt @0 :Receipt; ranking @1 :TextRanking; coverage @2 :TextCoverage; rows @3 :List(TextMatch); }
 enum ContextOrder { receivedAtRecordId @0; }
 enum ContextFrontier { requestedCount @0; scopeBoundary @1; scanBudget @2; }
@@ -422,7 +423,7 @@ interface Sparrow {
   pinRelease @6 (request :Release) -> (result :Result(Released));
   keysList @7 (scope :Scope) -> (result :Result(Keys));
   valuesSearch @8 (query :ValueQuery) -> (result :Result(Values));
-  textSearch @9 (query :TextQuery) -> (result :Result(TextResults));
+  textSearch @9 (query :TextQuery) -> (result :Result(TextSearchPage));
   recordsContext @10 (query :ContextQuery) -> (result :Result(Context));
   rdfInspect @11 (record :RecordRef) -> (result :Result(RdfInspection));
   pinRenew @12 (request :Renew) -> (result :Result(Pin));

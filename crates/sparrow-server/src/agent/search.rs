@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::Result;
-use super::{Options, failure, fill_scope, instant, optional_value, receipt, wire};
+use super::{Options, failure, fill_scope, instant, optional, optional_value, receipt, wire};
 use purrdf_lex::json::{Object, Value};
 
 pub(super) async fn execute(
@@ -13,16 +13,19 @@ pub(super) async fn execute(
     let mut request = client.text_search_request();
     let mut input = request.get().init_query();
     input.set_text(text);
+    optional(input.reborrow().init_cursor(), &options.cursor);
     fill_scope(input.init_scope(), options)?;
     let response = request.send().promise.await?;
     let found = match response.get()?.get_result()?.which()? {
         wire::result::Ok(found) => found?,
         wire::result::Error(error) => return Err(failure(error?)),
     };
-    render(found)
+    Ok(render(found.get_result()?)?
+        .with("page", super::catalog::page(found.get_page()?)?)
+        .into())
 }
 
-pub(super) fn render(found: wire::text_results::Reader<'_>) -> Result<Value> {
+pub(super) fn render(found: wire::text_results::Reader<'_>) -> Result<Object> {
     let ranking = found.get_ranking()?;
     let terms = ranking
         .get_terms()?
@@ -99,6 +102,5 @@ pub(super) fn render(found: wire::text_results::Reader<'_>) -> Result<Value> {
         .with("receipt", receipt(found.get_receipt()?)?)
         .with("ranking", ranking)
         .with("text_coverage", coverage)
-        .with("rows", Value::array(rows))
-        .into())
+        .with("rows", Value::array(rows)))
 }

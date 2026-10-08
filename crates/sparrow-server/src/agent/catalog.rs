@@ -35,6 +35,15 @@ pub(super) fn receipt(value: wire::catalog_read_receipt::Reader<'_>) -> Result<O
         .with("stop_reason", Value::Null))
 }
 
+/// Pagination metadata is separate from the query's semantic certainty and coverage.
+pub(super) fn page(value: wire::catalog_read_receipt::Reader<'_>) -> Result<Object> {
+    let mut page = receipt(value)?;
+    page.remove("execution_status");
+    page.remove("answer_certainty");
+    page.remove("coverage");
+    Ok(page)
+}
+
 /// Parse the shared CLI options for bounded catalog captures.
 pub(super) fn option(
     flag: &str,

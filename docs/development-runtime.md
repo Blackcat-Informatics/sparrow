@@ -32,8 +32,34 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 28; the schema sections
+The current source implements schema 29; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 29 standalone text result pages
+
+The production `textSearch` path uses the record result capture and native ranker,
+with typed `TextSearchPage` metadata and original typed text results. CLI and MCP
+accept cursor/page-size options and share their renderer and pagination projection
+with record queries. Page size no longer truncates text execution.
+
+The capture selector binds its operation, so record and standalone text cursors
+cannot cross surfaces even for equivalent predicates. Both use the same eight
+handles, 8 MiB retained ceiling, 2 MiB captures, 256 KiB pages and absolute
+60-second leases. Scope, ranking corpus, native scores and coverage remain frozen.
+Scan/item/byte exhaustion refuses without publishing a prefix. Standalone text
+admits its declared text/scope surface; source-time and same-record field predicates
+remain on record search. Storage formats remain unchanged.
+
+Local qualification passed formatting, release Clippy with warnings denied,
+workspace release tests (116 storage and 35 RPC/daemon/MCP scenarios), seeded
+census self-tests and the pinned cross-workspace gate. All 161 ownership jobs
+hold with zero distinct exceptions. Evidence is
+`/tmp/sparrow-text-pages-gate-20261007.log`. Tests cover complete capture beyond
+1,000 ranked rows, frozen scores/corpus after new ingestion, CLI/MCP replay,
+cross-operation refusal, shared record/text handle admission and absolute expiry.
+Owned runtime adoption is recorded separately after the normal commit gate.
+Standalone key/value pagination and the remaining architecture acceptance work
+remain unfinished.
 
 ## Schema 28 record result pages
 
