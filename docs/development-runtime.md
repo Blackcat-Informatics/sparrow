@@ -9,6 +9,25 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Concurrent typed load qualifier
+
+Signed source `6900752` adds a dev-only `load` executable that coordinates
+durable SDK ingestion and complete agent capture traversal through production
+renderers. [Its report](load-qualification.md#qualified-runs) records frozen
+images, exact source bytes, native count checks, latency observations, sampled
+daemon RSS and closed-store growth for 32 and 64 mixed-format cohorts. The
+larger successful run accepts 17,358,454 bytes and 8,320 records, with 28
+concurrent captures and zero leaked handles/bytes. The full source gate passes
+155 storage tests, 59 RPC tests, all remaining workspace tests and 243 helper
+ownership jobs with zero distinct exceptions.
+
+Attempts beyond the existing 10,000-row broad capture limit refuse explicitly.
+One failed-load shutdown exceeded its observation bound; subsequent reopen and
+repeat probes exit cleanly, but no causal fix or shutdown acceptance is claimed.
+The qualifier does not establish sustained production volume or full latency/
+resource guarantees. The installed public source, PID, store and configuration
+remain unchanged; no service adoption was needed for this dev-only executable.
+
 ## Catalogue capture cancellation
 
 Signed source `8b56d65` extends the existing connection/caller cancellation

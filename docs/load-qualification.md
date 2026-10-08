@@ -50,3 +50,86 @@ and any failed run. The example's internal counters do not measure process RSS
 or physical write amplification. This synthetic finite workload does not alone
 qualify production samples, sustained rates, 30-day density, hard quota recovery,
 reboot behavior or full governed SPARQL.
+
+## Qualified runs
+
+Signed source `6900752` passed the full commit gate: release Clippy with warnings
+denied, 155 storage tests, 59 RPC integration tests, all remaining workspace
+tests, seeded census tests and the pinned cross gate with 243 ledger jobs and
+zero distinct exceptions. The selected example was explicitly rebuilt after
+the gate and frozen as `~/.local/libexec/sparrow/load-schema48-6900752`, SHA-256
+`ecf14355a37e30ec6a0497059933359410ba81f04af40442ada195c9c2ace2ff`.
+The private daemon is a capability-free copy of the installed
+`sparrowd-schema48-8b56d65`; its separate image hash is recorded in each run.
+No runtime source or installed daemon changed for this qualifier.
+
+Both cold stores use Btrfs on the local host, AMD Ryzen AI MAX+ 395 (16 cores,
+32 logical CPUs), a 2 GiB disk budget, 128 MiB maintenance reserve, 16 MiB
+artifact ceiling, four operation slots and sixteen connection slots. Complete
+hardware, kernel, filesystem options, configuration, source identity, both image
+hashes, saved inputs, native report, 100 ms RSS/I/O samples and closed file sizes
+are retained with each run. Resource samples cover the private daemon, not the
+load client's allocation or other host processes. The host was not isolated.
+
+| Cohorts | Evidence directory under `~/.local/state/sparrow/` | Accepted raw bytes | Records | Elapsed seconds | Sampled peak RSS KiB | Closed file bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32 | `typed-load-qualification-cjlepig8` | 8,678,582 | 4,160 | 8.873771 | 190,168 | 16,685,248 |
+| 64 | `typed-load-qualification-gf0bsf51` | 17,358,454 | 8,320 | 23.983617 | 233,436 | 33,220,594 |
+
+Each cohort has 64 JSONL and 64 log records with 2,048 padding bytes, plus
+Markdown and random opaque artifacts. The 32-cohort run completes 128 durable
+intakes and 20 concurrent captures; the 64-cohort run completes 256 intakes and
+28 concurrent captures. Every accepted artifact has exact SDK byte readback.
+Final record/text/key/value counts are independently checked; record captures
+take 29/57 pages and text captures 40/80 pages. Page byte admission can produce
+fewer than the requested 1,000 rows. Both final statuses have zero record
+handles/bytes and no pins. Repeating the qualifier against each nonempty store
+refuses before creating a new input directory and emits no successful report.
+Both private daemons shut down cleanly. The public unit retains PID 1228283,
+source `8b56d65`, all 212 records, and its existing listeners and configuration.
+
+| Operation timing | 32 cohorts | 64 cohorts |
+| --- | --- | --- |
+| Durable intake mean / maximum, ms | 64.129 / 331.958 | 83.999 / 636.051 |
+| Concurrent full capture mean / maximum, ms | 422.684 / 1,574.086 | 802.448 / 7,478.830 |
+| Final warm record traversal, ms | 65.043 | 146.650 |
+| Final warm text traversal, ms | 213.853 | 903.687 |
+| Final warm keys traversal, ms | 66.151 | 215.200 |
+| Final warm selective value traversal, ms | 59.147 | 193.073 |
+
+These finite observations are not latency guarantees or percentile estimates.
+The whole-run rates include fixture generation, readback and final traversals.
+Closed file totals include native indexes and control state, not just compressed
+payloads, and exclude transient files already reclaimed. Pre-shutdown kernel I/O
+counters are preserved; they exclude later shutdown writes and do not establish
+native compaction write amplification. RSS sampling is not a true peak bound.
+
+## Refusals and unresolved shutdown observation
+
+The initial development trial `typed-load-qualification-btf4kgbd` failed because
+the qualifier expected four key rows. Native readback established the root
+object path plus four members; the oracle was corrected. The subsequent
+development trial `typed-load-qualification-ex65cpj_` passed before source
+qualification. The table above uses only the frozen signed-source image.
+
+Two 128-cohort attempts, `typed-load-qualification-8ma6oqis` and
+`typed-load-qualification-ndbq73wh`, explicitly refuse broad record captures at
+the existing native host limit: `RESOURCE_LIMIT: record capture exceeds 10000
+matches; narrow scope`. The example can admit a proposed corpus up to 50,000
+records, but that does not override the runtime's 10,000-row capture limit,
+64 MiB staging allowance, resident admission, scan ceiling or lease. These are
+failed workloads, not successful measurements or partial-success reports.
+No runtime budget was relaxed to obtain either qualified run.
+
+The first failed attempt also exceeded the collector's 120-second SIGINT wait.
+Its final exit status was not collected, and its stale Unix socket remained.
+The original collector consequently did not retain its in-memory RSS samples.
+After authoritative process disappearance, a controlled reopen recovered the
+endpoint and preserved 13,064 records; repeating the same query refusal then
+shut down with exit zero. The second concurrent 128-cohort attempt refused in
+the same way and shut down within the collector's ten-second initial bound.
+The probe and logs are preserved in the first failed directory and
+`/tmp/sparrow-load-shutdown-probe.log`. The timeout was not reproduced or fixed;
+it remains a shutdown-under-failed-load acceptance concern. Later collectors
+save samples before waiting and capture stacks if the owned process remains
+live after ten seconds. No production process was signalled during these runs.
