@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "published-staging-retirement"
+summary = "One finite import reclaimer releases published staging before expiry while preserving accepted evidence and independent durable retry receipts."
+home = "sparrow_core::storage::import::Store::import_reclaim"
+entry_points = ["sparrow_core::storage::publication::reclaim_prepared", "sparrow_core::storage::expiry::Store::expire_bounded"]
+spec = "docs/interfaces.md: published import staging retirement and unchanged upload admission."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(reclaim_completed_imports|release_completed_upload_slots|retire_published_import_copy)$']
+
+[[job]]
 id = "agent-pin-mutation"
 summary = "CLI and MCP protect/release evidence through one typed request owner and canonical receipt renderers."
 home = "sparrow_server::agent::pin::Mutation::execute"

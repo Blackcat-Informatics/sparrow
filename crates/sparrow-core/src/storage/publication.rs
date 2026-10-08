@@ -547,15 +547,39 @@ impl Store {
     }
 }
 
-/// Reclaim at most one private prepared record per invocation. Published
-/// dependencies have transferred to ordinary evidence and must never be decremented.
+/// Reclaim at most one private prepared record, or the supplied finite share of
+/// published catalog copies. Transferred dependencies are never decremented.
 pub(super) fn reclaim_prepared(
     writer: &Writer,
     manifest: &ImportManifest,
-) -> Result<(bool, bool), Error> {
+    limit: u64,
+) -> Result<(bool, u64), Error> {
     let Some(mut progress) = preparation(writer, manifest)? else {
-        return Ok((true, false));
+        return Ok((true, 0));
     };
+    if manifest.published_artifact.is_some() {
+        if progress.raw.is_some() || limit == 0 {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "invalid published staging reclamation state",
+            ));
+        }
+        let start = progress.reclaimed_records;
+        let end = progress.prepared_records.min(start.saturating_add(limit));
+        let mut batch = WriteBatch::default();
+        for index in start..end {
+            batch.delete(record_key(&manifest.id, index));
+        }
+        progress.reclaimed_records = end;
+        let done = end == progress.prepared_records;
+        if done {
+            batch.delete(preparation_key(&manifest.id));
+        } else {
+            put(&mut batch, &preparation_key(&manifest.id), &progress);
+        }
+        writer.commit(batch)?;
+        return Ok((done, (end - start).max(1)));
+    }
     if progress.raw.is_some() {
         if manifest.published_artifact.is_some() {
             return Err(Error::new(
@@ -564,7 +588,7 @@ pub(super) fn reclaim_prepared(
             ));
         }
         raw::reclaim(writer, manifest, &mut progress)?;
-        return Ok((false, true));
+        return Ok((false, 1));
     }
     let mut batch = if progress.reclaimed_records < progress.prepared_records {
         let key = record_key(&manifest.id, progress.reclaimed_records);
@@ -589,5 +613,5 @@ pub(super) fn reclaim_prepared(
         put(&mut batch, &preparation_key(&manifest.id), &progress);
     }
     writer.commit(batch)?;
-    Ok((done, true))
+    Ok((done, 1))
 }

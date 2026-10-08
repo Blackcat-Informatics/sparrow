@@ -608,6 +608,12 @@ impl Store {
     /// End a staging lease durably. Physical cleanup is bounded and resumable.
     pub fn import_cancel(&self, id: &str, now: u64) -> Result<(), Error> {
         let writer = self.lock()?;
+        if super::publication::published(&writer, id, now)?.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "published evidence cannot be canceled as staging",
+            ));
+        }
         let mut manifest: ImportManifest = writer.get(id)?;
         if manifest.consumption {
             return Err(Error::new(
@@ -755,7 +761,7 @@ impl Store {
         })
     }
 
-    /// Reclaim at most 128 expired chunk/page/preparation units per call,
+    /// Reclaim at most 128 published or expired staging units per call,
     /// including at most one private prepared record, and 16 journals.
     /// Each synced batch atomically advances its persistent cleanup cursor.
     pub fn import_reclaim(&self, now: u64) -> Result<u64, Error> {
@@ -767,23 +773,37 @@ impl Store {
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
         let mut batch = WriteBatch::default();
         let mut removed = 0;
-        for mut manifest in writer.imports()? {
-            if manifest.expires_at > now
+        let manifests = writer.imports()?;
+        let mut remaining_manifests = manifests.len() as u64;
+        for mut manifest in manifests {
+            let share = (RECLAIM_CHUNKS - removed) / remaining_manifests;
+            remaining_manifests -= 1;
+            let published = manifest.published_artifact.is_some();
+            let journal_limit = if published {
+                removed + share
+            } else {
+                RECLAIM_CHUNKS
+            };
+            if (!published && manifest.expires_at > now)
                 || (manifest.consumption && manifest.published_artifact.is_none())
             {
                 continue;
             }
-            let preparation_done = if !prepared_reclaimed && removed < RECLAIM_CHUNKS {
-                let (done, reclaimed) = super::publication::reclaim_prepared(&writer, &manifest)?;
-                prepared_reclaimed |= reclaimed;
-                removed += u64::from(reclaimed);
+            // Published preparation contains only transferred catalog copies.
+            // Give every journal a finite share so a large completed file cannot
+            // prevent small completed journals from releasing admission slots.
+            let preparation_done = if (published || !prepared_reclaimed) && share != 0 {
+                let (done, reclaimed) =
+                    super::publication::reclaim_prepared(&writer, &manifest, share)?;
+                prepared_reclaimed |= !published && reclaimed != 0;
+                removed += reclaimed;
                 done
             } else {
                 false
             };
             let end = manifest
                 .chunk_count()
-                .min(manifest.reclaimed_chunks + RECLAIM_CHUNKS - removed);
+                .min(manifest.reclaimed_chunks + journal_limit - removed);
             for chunk in manifest.reclaimed_chunks..end {
                 batch.delete_cf(cf, chunk_key(&manifest.id, chunk * CHUNK as u64));
                 removed += 1;
@@ -791,7 +811,7 @@ impl Store {
             manifest.reclaimed_chunks = end;
             let layout_end = manifest
                 .layout_pages()
-                .min(manifest.reclaimed_layout_pages + RECLAIM_CHUNKS - removed);
+                .min(manifest.reclaimed_layout_pages + journal_limit - removed);
             for page in manifest.reclaimed_layout_pages..layout_end {
                 batch.delete(layout_key(&manifest.id, page));
                 removed += 1;

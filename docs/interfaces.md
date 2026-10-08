@@ -1175,6 +1175,24 @@ name that could identify a replacement collection. Neither command changes
 ordinary evidence retention or opens another database writer. No schema or
 storage-format change is needed for these existing typed operations.
 
+Completed import publication transfers its dependencies into accepted evidence
+and saves an independent durable retry receipt. Maintenance now reclaims those
+published staging chunks, layout pages and prepared catalog copies immediately,
+without waiting for the staging lease to expire. It does not retire evidence,
+alter occurrence IDs, renew retention, cancel consumption authority, or shorten
+the durable retry window. `importGet`, begin and publish retries retain their
+original accepted receipt through the existing receipt owner. Canceling published
+evidence still refuses, including after staging cleanup.
+
+The journal ceiling remains 16. Unpublished recovery leases remain intact until
+their original expiry or explicit cancellation; active consumption staging keeps
+its source-recovery authority. Each maintenance call retains the 128-unit ceiling
+and expensive private retirement admits at most one prepared record. Published
+catalog copies receive finite shares across journals so one large completed file
+cannot monopolize reclamation of smaller completed uploads. Admission can still
+refuse while reclamation is pending; completion does not imply an unbounded upload
+queue. This uses the existing store representation and schema 42 wire contract.
+
 File input/output and immutable-intent preparation use the client's filesystem.
 Producer-finish/handoff preparation therefore requires access to the actual
 producer file; saved-intent replay and progress queries do not recapture paths.

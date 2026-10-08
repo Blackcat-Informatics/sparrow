@@ -5518,6 +5518,25 @@ fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup
         );
     }
     assert_eq!(store.records(30).unwrap().len(), 2);
+    // Publication transfers dependencies and preserves an independent receipt:
+    // its staging can leave admission immediately, before either lease expires.
+    while store.import_reclaim(31).unwrap() != 0 {}
+    assert_eq!(
+        store
+            .import_get(&journal.id, 31)
+            .unwrap()
+            .published_artifact
+            .as_ref(),
+        Some(&artifact.id)
+    );
+    assert_eq!(
+        store.import_publish(&journal.id, 31).unwrap().id,
+        artifact.id
+    );
+    assert_eq!(
+        store.bytes(&artifact.id, 0, input.len(), 31).unwrap(),
+        input
+    );
     assert_eq!(
         store.import_cancel(&journal.id, 30).unwrap_err().code,
         "CONFLICT"
@@ -5567,6 +5586,121 @@ fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup
         store.status(31 * DAY).unwrap()["unique_json_projections"].as_str(),
         Some("0")
     );
+}
+
+#[test]
+fn completed_staging_releases_admission_before_expiry_without_releasing_evidence_or_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"{}\n";
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let mut receipts = Vec::new();
+    for index in 0..32 {
+        let request = format!("completed-admission-{index}");
+        let journal = store
+            .import_begin(
+                &request,
+                "completed",
+                "jsonl",
+                input.len() as u64,
+                &digest,
+                0,
+            )
+            .unwrap();
+        store.import_append(&journal.id, 0, input, 0).unwrap();
+        store.import_seal(&journal.id, 0).unwrap();
+        store.import_prepare_layout(&journal.id, 0).unwrap();
+        store.import_prepare_record(&journal.id, 0, 0).unwrap();
+        let artifact = store.import_publish(&journal.id, 0).unwrap();
+        loop {
+            let units = store.import_reclaim(0).unwrap();
+            assert!(units <= 128);
+            if units == 0 {
+                break;
+            }
+        }
+        receipts.push((request, journal.id, artifact));
+    }
+    assert_eq!(store.records(0).unwrap().len(), 32);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    for (request, journal, artifact) in receipts {
+        assert_eq!(
+            store
+                .import_get(&journal, 1)
+                .unwrap()
+                .published_artifact
+                .as_ref(),
+            Some(&artifact.id)
+        );
+        assert_eq!(
+            store.import_publish(&journal, 1).unwrap().record_ids,
+            artifact.record_ids
+        );
+        assert_eq!(
+            store
+                .import_begin(
+                    &request,
+                    "completed",
+                    "jsonl",
+                    input.len() as u64,
+                    &digest,
+                    1
+                )
+                .unwrap()
+                .published_artifact
+                .as_ref(),
+            Some(&artifact.id)
+        );
+        assert_eq!(
+            store.import_cancel(&journal, 1).unwrap_err().code,
+            "CONFLICT"
+        );
+        assert_eq!(store.bytes(&artifact.id, 0, input.len(), 1).unwrap(), input);
+        assert_eq!(
+            store.rdf_inspect(&artifact.record_ids[0], 1).unwrap()["state"].as_str(),
+            Some("complete")
+        );
+    }
+    // Reclamation cannot convert sixteen still-live unfinished upload leases
+    // into extra admission slots or delete their committed input.
+    let mut active = Vec::new();
+    for index in 0..16 {
+        let journal = store
+            .import_begin(
+                &format!("unfinished-{index}"),
+                "active",
+                "jsonl",
+                input.len() as u64,
+                &digest,
+                1,
+            )
+            .unwrap();
+        store.import_append(&journal.id, 0, input, 1).unwrap();
+        active.push(journal);
+    }
+    assert_eq!(store.import_reclaim(1).unwrap(), 0);
+    assert_eq!(
+        store
+            .import_begin(
+                "unfinished-overflow",
+                "active",
+                "jsonl",
+                input.len() as u64,
+                &digest,
+                1
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    for journal in active {
+        assert_eq!(store.import_read_chunk(&journal.id, 0, 1).unwrap(), input);
+    }
+    assert_eq!(store.records(1).unwrap().len(), 32);
 }
 
 #[test]
