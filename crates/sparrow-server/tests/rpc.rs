@@ -13,6 +13,257 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            let a = client
+                .ingest(
+                    "artifact-scope-wire-a",
+                    "a",
+                    wire::Format::Jsonl,
+                    b"{}\n{}\n",
+                )
+                .await
+                .unwrap();
+            let b = client
+                .ingest("artifact-scope-wire-b", "b", wire::Format::Jsonl, b"{}\n")
+                .await
+                .unwrap();
+            let empty = client
+                .ingest(
+                    "artifact-scope-wire-empty",
+                    "empty",
+                    wire::Format::Jsonl,
+                    b"",
+                )
+                .await
+                .unwrap();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let pin_reply = mcp
+                .tool(
+                    2,
+                    "pin",
+                    Object::new()
+                        .with("request_id", "artifact-scope-wire-pin")
+                        .with("name", "scope")
+                        .with("days", 2_u64)
+                        .with("store_id", store.clone())
+                        .with(
+                            "targets",
+                            Value::array([
+                                a.record_ids[0].as_str(),
+                                b.id.as_str(),
+                                empty.id.as_str(),
+                            ]),
+                        )
+                        .into(),
+                )
+                .await;
+            assert_eq!(pin_reply["isError"].as_bool(), Some(false));
+            let pin = &pin_reply["structuredContent"];
+            let scope = Value::from(
+                Object::new()
+                    .with("kind", "pin")
+                    .with("store_id", store.clone())
+                    .with("pin_id", pin["pin_id"].clone())
+                    .with("expected_revision", pin["revision"].clone()),
+            );
+            let scope_file = dir.path().join("scope.json");
+            std::fs::write(&scope_file, purrdf_lex::json::write_compact(&scope)).unwrap();
+            let path = scope_file.to_str().unwrap();
+            let first = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--scope-file",
+                    path,
+                    "--page-size",
+                    "1",
+                ],
+            );
+            assert_eq!(first["total_items"].as_str(), Some("3"));
+            let released = mcp
+                .tool(
+                    3,
+                    "pin_release",
+                    Object::new()
+                        .with("request_id", "artifact-scope-wire-release")
+                        .with("store_id", store.clone())
+                        .with("pin_id", pin["pin_id"].clone())
+                        .into(),
+                )
+                .await;
+            assert_eq!(released["isError"].as_bool(), Some(false));
+            let mut cursor = first["next_cursor"].as_str().unwrap().to_owned();
+            let mut rows = first["rows"].as_array().unwrap().to_vec();
+            for id in 4..=5 {
+                let page = cli(
+                    &socket,
+                    &[
+                        "artifacts",
+                        &store,
+                        "--scope-file",
+                        path,
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        &cursor,
+                    ],
+                );
+                let response = mcp
+                    .tool(
+                        id,
+                        "artifacts_list",
+                        Object::new()
+                            .with("store_id", store.clone())
+                            .with("scope", scope.clone())
+                            .with("page_size", 1_u64)
+                            .with("cursor", cursor.clone())
+                            .into(),
+                    )
+                    .await;
+                assert_eq!(response["isError"].as_bool(), Some(false));
+                assert_eq!(response["structuredContent"], page);
+                assert_eq!(page["snapshot_id"], first["snapshot_id"]);
+                rows.extend_from_slice(page["rows"].as_array().unwrap());
+                if let Some(next) = page["next_cursor"].as_str() {
+                    cursor = next.to_owned();
+                } else {
+                    assert_eq!(id, 5);
+                }
+            }
+            for (artifact, count) in [(&a.id, "1"), (&b.id, "1"), (&empty.id, "0")] {
+                let row = rows
+                    .iter()
+                    .find(|row| row["artifact_id"].as_str() == Some(artifact.as_str()))
+                    .unwrap();
+                assert_eq!(row["retained_records"].as_str(), Some(count));
+                assert_eq!(row["complete_bytes_available"].as_bool(), Some(true));
+            }
+            let selected = Value::from(
+                Object::new()
+                    .with("kind", "selection")
+                    .with("store_id", store.clone())
+                    .with("artifact_ids", Value::array([a.id.as_str()]))
+                    .with(
+                        "record_ids",
+                        Value::array([a.record_ids[0].as_str(), a.record_ids[0].as_str()]),
+                    ),
+            );
+            let response = mcp
+                .tool(
+                    6,
+                    "artifacts_list",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("scope", selected.clone())
+                        .into(),
+                )
+                .await;
+            assert_eq!(response["isError"].as_bool(), Some(false));
+            assert_eq!(
+                response["structuredContent"]["total_items"].as_str(),
+                Some("1")
+            );
+            assert_eq!(
+                response["structuredContent"]["rows"][0]["retained_records"].as_str(),
+                Some("2")
+            );
+            std::fs::write(&scope_file, purrdf_lex::json::write_compact(&selected)).unwrap();
+            let changed = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
+                    "artifacts",
+                    &store,
+                    "--scope-file",
+                    path,
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    &cursor,
+                ])
+                .output()
+                .unwrap();
+            assert!(!changed.status.success() && changed.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&changed.stderr).contains("CONFLICT"));
+            let missing = Value::from(
+                Object::new()
+                    .with("kind", "selection")
+                    .with("store_id", store.clone())
+                    .with(
+                        "record_ids",
+                        Value::array([a.record_ids[0].as_str(), "record:missing"]),
+                    ),
+            );
+            let foreign = Value::from(
+                Object::new()
+                    .with("kind", "selection")
+                    .with("store_id", "store:foreign")
+                    .with("artifact_ids", Value::array([a.id.as_str()])),
+            );
+            let filtered = Value::from(Object::new().with("kind", "live").with(
+                "filter",
+                Object::new().with("service", Value::array(["worker"])),
+            ));
+            for (input, code) in [
+                (scope, "NOT_FOUND"),
+                (missing, "NOT_FOUND"),
+                (foreign, "STORE_MISMATCH"),
+                (filtered, "INVALID_ARGUMENT"),
+            ] {
+                std::fs::write(&scope_file, purrdf_lex::json::write_compact(&input)).unwrap();
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args([
+                        "artifacts",
+                        &store,
+                        "--scope-file",
+                        path,
+                        "--source",
+                        "excluded",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success() && output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(code),
+                    "{output:?}"
+                );
+            }
+            let mut request = client.capability().artifacts_list_request();
+            let mut query = request.get().init_query();
+            query.set_store_id(&store);
+            query.set_schema_version(25);
+            let response = request.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "UNSUPPORTED"
+                ),
+                wire::result::Ok(_) => panic!("obsolete artifact membership schema admitted"),
+            }
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_shared_agents() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new()

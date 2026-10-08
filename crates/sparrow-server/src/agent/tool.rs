@@ -139,6 +139,13 @@ impl Operation {
                     Self::Query(Command::Artifacts(super::artifacts::Input {
                         store: fields.required("store_id")?,
                         query,
+                        selection: Box::new(
+                            fields
+                                .raw("scope")?
+                                .map(super::selection::decode_membership)
+                                .transpose()?
+                                .unwrap_or_default(),
+                        ),
                     }))
                 }
 

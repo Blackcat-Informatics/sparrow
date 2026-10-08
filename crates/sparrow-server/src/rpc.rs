@@ -508,6 +508,44 @@ fn optional(value: wire::optional_text::Reader<'_>) -> capnp::Result<Option<Stri
     }
 }
 
+/// One generated selection decoder validates store-scoped references for every query owner.
+fn selection(
+    value: wire::query_selection::Reader<'_>,
+    rpc: &Rpc,
+) -> capnp::Result<Result<sparrow_core::QuerySelection, Error>> {
+    let result = match value.which()? {
+        wire::query_selection::Live(()) => Ok(sparrow_core::QuerySelection::Live),
+        wire::query_selection::Evidence(ids) => {
+            let ids = ids?;
+            if ids.is_empty() || ids.len() > 1000 {
+                Err(invalid("explicit selection requires 1..1000 references"))
+            } else {
+                ids.iter()
+                    .map(|id| rpc.scoped_id(id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(sparrow_core::QuerySelection::Evidence)
+            }
+        }
+        wire::query_selection::Pin(pin) => {
+            let pin = pin?;
+            let expected_revision = match pin.get_expected_revision()?.which()? {
+                wire::optional_revision::Absent(()) => None,
+                wire::optional_revision::Value(value) => Some(value),
+            };
+            rpc.reference(
+                pin.get_store_id()?.to_str()?,
+                pin.get_id()?.to_str()?,
+                "pin:",
+            )
+            .map(|id| sparrow_core::QuerySelection::Pin {
+                id,
+                expected_revision,
+            })
+        }
+    };
+    Ok(result)
+}
+
 fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<QueryScope, Error>> {
     if value.get_schema_version() != sparrow_client::SCHEMA_VERSION {
         return Ok(Err(Error {
@@ -572,36 +610,7 @@ fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<Quer
     };
     let received_from = value.get_received_from()?.get_unix_millis();
     let received_before = value.get_received_before()?.get_unix_millis();
-    let selection = match value.get_selection()?.which()? {
-        wire::query_selection::Live(()) => Ok(sparrow_core::QuerySelection::Live),
-        wire::query_selection::Evidence(ids) => {
-            let ids = ids?;
-            if ids.is_empty() || ids.len() > 1000 {
-                Err(invalid("explicit selection requires 1..1000 references"))
-            } else {
-                ids.iter()
-                    .map(|id| rpc.scoped_id(id))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(sparrow_core::QuerySelection::Evidence)
-            }
-        }
-        wire::query_selection::Pin(pin) => {
-            let pin = pin?;
-            let expected_revision = match pin.get_expected_revision()?.which()? {
-                wire::optional_revision::Absent(()) => None,
-                wire::optional_revision::Value(value) => Some(value),
-            };
-            rpc.reference(
-                pin.get_store_id()?.to_str()?,
-                pin.get_id()?.to_str()?,
-                "pin:",
-            )
-            .map(|id| sparrow_core::QuerySelection::Pin {
-                id,
-                expected_revision,
-            })
-        }
-    };
+    let selection = selection(value.get_selection()?, rpc)?;
     Ok(selection.map(|selection| QueryScope {
         selection,
         source,
@@ -2000,8 +2009,16 @@ impl wire::sparrow::Server for Rpc {
                 )
             }
         };
+        let selected = match selection(input.get_selection()?, &self)? {
+            Ok(selection) => selection,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
         let query = sparrow_core::ArtifactRead {
             selector: sparrow_core::ArtifactSelector {
+                selection: selected,
                 source: optional(input.get_source()?)?,
                 received_from,
                 received_before,

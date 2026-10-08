@@ -3,29 +3,120 @@
 
 //! Store-owned query membership, shared by field, text and context reads.
 
-use super::{Artifact, Error, Pin, Record, Writer};
+use super::{Artifact, Catalog, Error, Pin, Record, Writer, catalog_lease::CaptureAdmission};
 use crate::{QueryScope, QuerySelection};
 use rocksdb::IteratorMode;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SELECTION_VISITS: usize = 100_000;
 
+/// Resolved record and whole-artifact occurrence membership, including recordless artifacts.
+#[derive(Default)]
+pub(super) struct SelectionMembers {
+    pub records: BTreeMap<String, u64>,
+    pub artifacts: BTreeSet<String>,
+    pub parents: BTreeSet<String>,
+    visits: usize,
+}
+
+impl SelectionMembers {
+    /// Admit a retained record and its parent through the shared reference law.
+    fn admit_record(
+        &mut self,
+        writer: &Writer,
+        id: &str,
+        artifact: Option<&str>,
+        now: u64,
+        protected: &BTreeSet<String>,
+        admission: &mut Option<&mut CaptureAdmission<'_>>,
+    ) -> Result<(), Error> {
+        if self.visits == MAX_SELECTION_VISITS {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "selection expansion exceeds 100000 record visits",
+            ));
+        }
+        self.visits += 1;
+        if id.len() > 128 || !id.starts_with("record:") {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "invalid selected record identity",
+            ));
+        }
+        let record: Record = writer.selection_catalog(id, admission).map_err(|error| {
+            if artifact.is_some() && error.code == "NOT_FOUND" {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    "selected complete artifact references a missing record",
+                )
+            } else {
+                error
+            }
+        })?;
+        if record.id != id || artifact.is_some_and(|parent| record.artifact_id != parent) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "selected record identity or artifact ownership disagrees",
+            ));
+        }
+        if !writer.live_record(&record, now, protected) {
+            return Err(Error::new(
+                "EVIDENCE_UNAVAILABLE",
+                format!("selected record expired or evicted: {id}"),
+            ));
+        }
+        let key = format!("time:{:020}:{id}", record.received_at);
+        if writer.db.get_pinned(key)?.as_deref() != Some(id.as_bytes()) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "selected record temporal index is missing or inconsistent",
+            ));
+        }
+        self.parents.insert(record.artifact_id.clone());
+        self.records.insert(id.to_owned(), record.received_at);
+        Ok(())
+    }
+}
+
 impl Writer {
-    /// Resolve every reference before filtering. Retain IDs/timestamps, not record bodies.
+    fn selection_catalog<T: Catalog>(
+        &self,
+        key: &str,
+        admission: &mut Option<&mut CaptureAdmission<'_>>,
+    ) -> Result<T, Error> {
+        let Some(admission) = admission else {
+            return self.get(key);
+        };
+        self.get_admitted(key, |bytes| admission.entry(bytes))
+    }
+
+    /// The record-query facade uses the same reference owner as artifact discovery.
     pub(super) fn query_membership(
         &self,
         scope: &QueryScope,
         now: u64,
         protected: &BTreeSet<String>,
     ) -> Result<Option<BTreeMap<String, u64>>, Error> {
-        let members = match &scope.selection {
+        self.query_selection_membership(&scope.selection, now, protected, None)
+            .map(|members| members.map(|members| members.records))
+    }
+
+    /// Validate every selected reference before filters; preserve complete artifact identity.
+    pub(super) fn query_selection_membership(
+        &self,
+        selection: &QuerySelection,
+        now: u64,
+        protected: &BTreeSet<String>,
+        mut admission: Option<&mut CaptureAdmission<'_>>,
+    ) -> Result<Option<SelectionMembers>, Error> {
+        let members = match selection {
             QuerySelection::Live => return Ok(None),
             QuerySelection::Evidence(ids) => ids.iter().cloned().collect::<BTreeSet<_>>(),
             QuerySelection::Pin {
                 id,
                 expected_revision,
             } => {
-                let pin: Pin = self.get(id)?;
+                let pin: Pin = self.selection_catalog(id, &mut admission)?;
                 if pin.id != *id {
                     return Err(Error::new(
                         "STORAGE_FAILURE",
@@ -47,54 +138,7 @@ impl Writer {
                 "selection exceeds 100000 direct members",
             ));
         }
-        let mut records = BTreeMap::new();
-        let mut visits = 0;
-        let mut admit = |id: &str, artifact: Option<&str>| -> Result<(), Error> {
-            if visits == MAX_SELECTION_VISITS {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "selection expansion exceeds 100000 record visits",
-                ));
-            }
-            visits += 1;
-            if id.len() > 128 || !id.starts_with("record:") {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "invalid selected record identity",
-                ));
-            }
-            let record: Record = self.get(id).map_err(|error| {
-                if artifact.is_some() && error.code == "NOT_FOUND" {
-                    Error::new(
-                        "STORAGE_FAILURE",
-                        "selected complete artifact references a missing record",
-                    )
-                } else {
-                    error
-                }
-            })?;
-            if record.id != id || artifact.is_some_and(|parent| record.artifact_id != parent) {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "selected record identity or artifact ownership disagrees",
-                ));
-            }
-            if !self.live_record(&record, now, protected) {
-                return Err(Error::new(
-                    "EVIDENCE_UNAVAILABLE",
-                    format!("selected record expired or evicted: {id}"),
-                ));
-            }
-            let key = format!("time:{:020}:{id}", record.received_at);
-            if self.db.get(key)?.as_deref() != Some(id.as_bytes()) {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "selected record temporal index is missing or inconsistent",
-                ));
-            }
-            records.insert(id.to_owned(), record.received_at);
-            Ok(())
-        };
+        let mut resolved = SelectionMembers::default();
         for member in members {
             if member.len() > 128 {
                 return Err(Error::new(
@@ -103,9 +147,9 @@ impl Writer {
                 ));
             }
             if member.starts_with("record:") {
-                admit(&member, None)?;
+                resolved.admit_record(self, &member, None, now, protected, &mut admission)?;
             } else if member.starts_with("artifact:") {
-                let artifact: Artifact = self.get(&member)?;
+                let artifact: Artifact = self.selection_catalog(&member, &mut admission)?;
                 if artifact.id != member {
                     return Err(Error::new(
                         "STORAGE_FAILURE",
@@ -124,8 +168,17 @@ impl Writer {
                         "selected artifact exceeds 100000 record references",
                     ));
                 }
+                resolved.artifacts.insert(member.clone());
+                resolved.parents.insert(member.clone());
                 for id in &artifact.record_ids {
-                    admit(id, Some(&member))?;
+                    resolved.admit_record(
+                        self,
+                        id,
+                        Some(&member),
+                        now,
+                        protected,
+                        &mut admission,
+                    )?;
                 }
             } else {
                 return Err(Error::new(
@@ -134,7 +187,7 @@ impl Writer {
                 ));
             }
         }
-        Ok(Some(records))
+        Ok(Some(resolved))
     }
 
     /// Live reads stream the time catalog; explicit reads seek only resolved records.

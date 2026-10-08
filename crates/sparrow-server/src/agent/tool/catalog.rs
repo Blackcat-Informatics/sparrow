@@ -135,6 +135,9 @@ pub(crate) fn definitions() -> Value {
                     Object::new().with("type", Value::array(["string", "null"])),
                 );
             }
+            if *name == "artifacts_list" {
+                properties = properties.with("scope", super::super::selection::schema(false));
+            }
             required.push("store_id");
         }
         if *name == "flush" {
@@ -160,7 +163,7 @@ pub(crate) fn definitions() -> Value {
                 );
             }
             properties = properties
-                .with("scope", super::super::selection::schema())
+                .with("scope", super::super::selection::schema(true))
                 .with(
                     "require_complete_index",
                     Object::new().with("type", "boolean"),

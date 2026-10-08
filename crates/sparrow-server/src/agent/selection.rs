@@ -121,6 +121,17 @@ pub(super) fn decode(value: &Value) -> std::result::Result<Input, DecodeError> {
     })
 }
 
+/// Artifact metadata admits the shared membership vocabulary, without silent filter omission.
+pub(super) fn decode_membership(value: &Value) -> std::result::Result<Input, DecodeError> {
+    let result = decode(value)?;
+    if result.sources.is_some() || !result.diagnostics.is_empty() {
+        return Err(DecodeError::custom(
+            "artifact discovery accepts membership-only scope; use outer source and original receipt-time filters",
+        ));
+    }
+    Ok(result)
+}
+
 impl Input {
     pub(super) async fn require_supported(&self, client: &wire::sparrow::Client) -> Result<()> {
         sparrow_client::Discovery::fetch(client).await?;
@@ -148,7 +159,14 @@ impl Input {
                 target.set(index as u32, value);
             }
         }
-        let mut target = scope.init_selection();
+        self.encode_membership(scope.init_selection())
+    }
+
+    /// Shared typed evidence/pin/live codec for record and artifact requests.
+    pub(super) fn encode_membership(
+        &self,
+        mut target: wire::query_selection::Builder<'_>,
+    ) -> Result<()> {
         match &self.membership {
             Membership::Live => target.set_live(()),
             Membership::Evidence { store, ids } => {
@@ -177,7 +195,7 @@ impl Input {
     }
 }
 
-pub(super) fn schema() -> Value {
+pub(super) fn schema(filters: bool) -> Value {
     let string = || Value::from(Object::new().with("type", "string"));
     let alternatives = Value::from(
         Object::new()
@@ -210,12 +228,15 @@ pub(super) fn schema() -> Value {
             .with("minProperties", 1_u64)
             .with("properties", properties),
     );
-    let object = |properties: Object, required: Vec<&str>| {
+    let object = |mut properties: Object, required: Vec<&str>| {
+        if filters {
+            properties = properties.with("filter", filter.clone());
+        }
         Value::from(
             Object::new()
                 .with("type", "object")
                 .with("additionalProperties", false)
-                .with("properties", properties.with("filter", filter.clone()))
+                .with("properties", properties)
                 .with("required", required),
         )
     };
@@ -234,28 +255,30 @@ pub(super) fn schema() -> Value {
             "oneOf",
             Value::array([
                 object(Object::new().with("kind", kind("live")), vec!["kind"]),
-                Value::from(
-                    Object::new()
-                        .with("type", "object")
-                        .with("additionalProperties", false)
-                        .with(
-                            "properties",
-                            Object::new()
-                                .with("kind", kind("selection"))
-                                .with("store_id", string())
-                                .with("artifact_ids", ids())
-                                .with("record_ids", ids())
-                                .with("filter", filter.clone()),
-                        )
-                        .with("required", vec!["kind", "store_id"])
-                        .with(
-                            "anyOf",
-                            Value::array([
-                                Object::new().with("required", vec!["artifact_ids"]),
-                                Object::new().with("required", vec!["record_ids"]),
-                            ]),
-                        ),
-                ),
+                {
+                    let mut properties = Object::new()
+                        .with("kind", kind("selection"))
+                        .with("store_id", string())
+                        .with("artifact_ids", ids())
+                        .with("record_ids", ids());
+                    if filters {
+                        properties = properties.with("filter", filter.clone());
+                    }
+                    Value::from(
+                        Object::new()
+                            .with("type", "object")
+                            .with("additionalProperties", false)
+                            .with("properties", properties)
+                            .with("required", vec!["kind", "store_id"])
+                            .with(
+                                "anyOf",
+                                Value::array([
+                                    Object::new().with("required", vec!["artifact_ids"]),
+                                    Object::new().with("required", vec!["record_ids"]),
+                                ]),
+                            ),
+                    )
+                },
                 object(
                     Object::new()
                         .with("kind", kind("pin"))

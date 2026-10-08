@@ -9,6 +9,7 @@ use purrdf_lex::json::{Object, Value};
 pub(crate) struct Input {
     pub store: String,
     pub query: sparrow_core::ArtifactRead,
+    pub(super) selection: Box<super::selection::Input>,
 }
 
 impl Input {
@@ -18,6 +19,7 @@ impl Input {
             .ok_or_else(|| invalid("artifacts requires STORE_ID"))?
             .clone();
         let mut query = sparrow_core::ArtifactRead::default();
+        let mut selection = Box::<super::selection::Input>::default();
         let mut fields = args[1..].iter();
         while let Some(flag) = fields.next() {
             let value = fields
@@ -34,6 +36,14 @@ impl Input {
                 continue;
             }
             match flag.as_str() {
+                "--scope-file" => {
+                    selection = Box::new(
+                        super::selection::decode_membership(&super::records::read_control_file(
+                            value,
+                        )?)
+                        .map_err(|error| invalid(error.to_string()))?,
+                    )
+                }
                 "--received-from" => {
                     query.selector.received_from =
                         sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?
@@ -45,7 +55,11 @@ impl Input {
                 _ => return Err(invalid(format!("unknown artifact list option: {flag}"))),
             }
         }
-        Ok(Self { store, query })
+        Ok(Self {
+            store,
+            query,
+            selection,
+        })
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
@@ -54,6 +68,8 @@ impl Input {
         let mut query = request.get().init_query();
         query.set_store_id(&self.store);
         query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+        self.selection
+            .encode_membership(query.reborrow().init_selection())?;
         optional(query.reborrow().init_source(), &self.query.selector.source);
         optional(query.reborrow().init_cursor(), &self.query.cursor);
         let mut received = query.reborrow().init_received();

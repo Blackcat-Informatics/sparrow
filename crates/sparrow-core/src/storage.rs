@@ -632,11 +632,20 @@ impl Writer {
     }
 
     fn get_limited<T: Catalog>(&self, key: &str, remaining: &mut usize) -> Result<T, Error> {
+        self.get_admitted(key, |bytes| Self::charge_catalog(remaining, bytes))
+    }
+
+    /// Decode one pinned catalog value only after the caller's admission succeeds.
+    fn get_admitted<T: Catalog>(
+        &self,
+        key: &str,
+        admit: impl FnOnce(usize) -> Result<(), Error>,
+    ) -> Result<T, Error> {
         let bytes = self
             .db
             .get_pinned(key)?
             .ok_or_else(|| Error::new("NOT_FOUND", format!("unknown evidence {key}")))?;
-        Self::charge_catalog(remaining, bytes.len())?;
+        admit(bytes.len())?;
         T::decode(&parse(&bytes)?)
     }
 

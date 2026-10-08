@@ -456,6 +456,40 @@ still validate the evidence they read. Corrupt evidence must produce an
 actionable failure on those paths even when discovery succeeds. Status metadata
 must agree with discovery. This wire revision does not change storage formats.
 
+Schema 26 adds live/evidence/pin membership to typed `artifactsList.selection`.
+CLI artifact reads accept the existing bounded native JSON control file through
+`--scope-file FILE`; MCP `artifacts_list` accepts the same membership object as
+`scope`. The default is live. Explicit selections admit 1..1000 store-scoped
+artifact/record references, including overlaps and duplicate references. Pin
+selection uses its stable ID and optional positive decimal revision. The shared
+membership owner validates every reference before source or original receipt
+filtering. Foreign stores, missing/reclaimed references, expired complete
+artifacts, expired pins and stale revisions retain their existing typed failures.
+
+Whole-artifact membership includes recordless inputs; record membership exposes
+its parent provenance and counts only selected retained record occurrences.
+Thus `retained_records` is exact within the captured membership, while
+`origin.original_records` describes the original complete artifact. An available
+complete parent's byte availability is independent of selecting only one record.
+An expired complete artifact cannot be substituted by its pinned record fragments.
+Selecting a surviving record can report its unavailable or reclaimed parent.
+Overlapping references never duplicate parent rows or record counts.
+
+Selected captures seek only resolved records and parent/whole-artifact metadata;
+they do not scan unrelated artifact/record catalog entries. Reference expansion
+and metadata folding share one aggregate entry/byte/scan/time admission. The
+existing live scan and selected seeks use one collector. Diagnostic/source-array
+`scope.filter` is not yet admitted for artifact metadata: the decoder refuses it
+and the artifact MCP schema does not advertise it. Use the existing outer exact
+source and original receipt interval; record query scope filters remain unchanged.
+Full artifact diagnostic filtering remains required.
+
+Cursors bind the original membership, selector and limits. Continuation serves
+the immutable capture after pin release, collection changes or evidence retirement;
+fresh reads revalidate current evidence. No read renews protection. Current
+discovery schema 26 is required; old clients/daemons are explicitly refused.
+Storage formats and retained evidence encodings are unchanged.
+
 Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`
 and MCP `sources_list`. Its optional exact `source` intake key, `cursor`,
 `page_size` and `scan_budget` bind one immutable source capture. CLI uses

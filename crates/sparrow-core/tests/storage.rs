@@ -5535,6 +5535,7 @@ fn artifact_pages_are_immutable_source_time_scoped_occurrence_discovery() {
             source: Some("source-a".into()),
             received_from: 1,
             received_before: 3,
+            ..Default::default()
         },
         page_size: 1,
         ..Default::default()
@@ -5644,6 +5645,7 @@ fn artifact_discovery_keeps_reclaimed_parent_unknown_and_never_invents_complete_
             source: Some("fragment-source".into()),
             received_from: 0,
             received_before: 1,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -5656,6 +5658,7 @@ fn artifact_discovery_keeps_reclaimed_parent_unknown_and_never_invents_complete_
             source: Some("empty-source".into()),
             received_from: 0,
             received_before: 1,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -5756,6 +5759,260 @@ fn artifact_handles_are_bounded_shared_by_clones_and_preserve_full_source_labels
         Some("0")
     );
     assert!(store.artifact_read(&query, 60_001).is_ok());
+}
+
+#[test]
+fn artifact_selection_shares_record_membership_and_preserves_recordless_artifacts() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector, QueryScope, QuerySelection, RecordQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("artifact-scope-a", "a", "jsonl", b"{}\n{}\n", 0)
+        .unwrap();
+    let b = store
+        .ingest("artifact-scope-b", "b", "jsonl", b"{}\n{}\n", 0)
+        .unwrap();
+    let empty = store
+        .ingest("artifact-scope-empty", "empty", "jsonl", b"", 0)
+        .unwrap();
+    let pin = store
+        .pin(
+            "artifact-scope-pin",
+            "case",
+            &[a.record_ids[0].clone(), b.id.clone(), empty.id.clone()],
+            2,
+            1,
+        )
+        .unwrap();
+    let selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision),
+    };
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            selection: selection.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let page = store.artifact_read(&query, 2).unwrap();
+    assert_eq!(page.total_items, 3);
+    for (id, count) in [(&a.id, 1), (&b.id, 2), (&empty.id, 0)] {
+        let row = page
+            .body
+            .artifacts
+            .iter()
+            .find(|row| &row.id == id)
+            .unwrap();
+        assert_eq!(row.retained_records, count);
+        assert!(row.complete_bytes_available);
+    }
+    let scope = QueryScope {
+        selection,
+        source: None,
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 100,
+        limit: 100,
+        scan_budget: 1000,
+    };
+    assert_eq!(
+        store
+            .records_query(&scope, &RecordQuery::default(), 2)
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        page.body
+            .artifacts
+            .iter()
+            .map(|row| row.retained_records)
+            .sum::<usize>()
+    );
+    query.selector.selection = QuerySelection::Evidence(vec![
+        a.record_ids[0].clone(),
+        a.id.clone(),
+        a.record_ids[0].clone(),
+    ]);
+    let selected = store.artifact_read(&query, 2).unwrap();
+    assert_eq!(selected.total_items, 1);
+    assert_eq!(selected.body.artifacts[0].retained_records, 2);
+    assert_eq!(
+        selected.body.artifacts[0]
+            .origin
+            .as_ref()
+            .unwrap()
+            .original_records,
+        2
+    );
+}
+
+#[test]
+fn artifact_selection_validates_references_before_filters_and_refuses_without_prefixes() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector, QuerySelection};
+    const DAY: u64 = 86400000;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("artifact-scope-old", "source", "jsonl", b"{}\n{}\n", 0)
+        .unwrap();
+    let pin = store
+        .pin(
+            "artifact-scope-record-pin",
+            "record",
+            &a.record_ids[..1],
+            40,
+            0,
+        )
+        .unwrap();
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            source: Some("excluded".into()),
+            selection: QuerySelection::Evidence(vec![
+                a.record_ids[0].clone(),
+                "record:missing".into(),
+            ]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        store.artifact_read(&query, 31 * DAY).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    query.selector.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision + 1),
+    };
+    assert_eq!(
+        store.artifact_read(&query, 31 * DAY).unwrap_err().code,
+        "CONFLICT"
+    );
+    query.selector.selection = QuerySelection::Evidence(vec![a.id.clone()]);
+    assert_eq!(
+        store.artifact_read(&query, 31 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    query.selector.source = None;
+    query.selector.selection = QuerySelection::Evidence(a.record_ids[..1].to_vec());
+    let page = store.artifact_read(&query, 31 * DAY).unwrap();
+    assert_eq!(page.body.artifacts[0].retained_records, 1);
+    assert!(!page.body.artifacts[0].complete_bytes_available);
+    store.expire(31 * DAY).unwrap();
+    let fragment = store.artifact_read(&query, 31 * DAY).unwrap();
+    assert_eq!(fragment.body.artifacts[0].origin, None);
+    query.scan_budget = 1;
+    assert_eq!(
+        store.artifact_read(&query, 31 * DAY).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(31 * DAY).unwrap()["artifact_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn artifact_selection_pages_preserve_pin_capture_after_release_and_retirement() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector, QuerySelection};
+    const DAY: u64 = 86400000;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("artifact-scope-freeze-a", "source", "jsonl", b"{}\n", 0)
+        .unwrap();
+    let b = store
+        .ingest("artifact-scope-freeze-b", "source", "jsonl", b"{}\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("artifact-scope-freeze-pin", "frozen", &[a.id, b.id], 40, 0)
+        .unwrap();
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            selection: QuerySelection::Pin {
+                id: pin.id.clone(),
+                expected_revision: Some(pin.revision),
+            },
+            ..Default::default()
+        },
+        page_size: 1,
+        ..Default::default()
+    };
+    let first = store.artifact_read(&query, 31 * DAY).unwrap();
+    query.cursor = first.next_cursor.clone();
+    let before = store.artifact_read(&query, 31 * DAY).unwrap();
+    store
+        .release_retry("artifact-scope-release", &pin.id, 31 * DAY + 1)
+        .unwrap();
+    let mut fresh = query.clone();
+    fresh.cursor = None;
+    assert_eq!(
+        store.artifact_read(&fresh, 31 * DAY + 1).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    store.expire(31 * DAY + 2).unwrap();
+    let after = store.artifact_read(&query, 31 * DAY + 3).unwrap();
+    assert_eq!(after, before);
+    assert!(after.body.artifacts[0].complete_bytes_available);
+    assert_eq!(
+        store
+            .artifact_read(&query, first.lease_expires_at)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store.status(first.lease_expires_at).unwrap()["artifact_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn artifact_selection_seeks_members_without_reading_unrelated_corrupt_catalog_entries() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector, QuerySelection};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let selected = store
+        .ingest("artifact-scope-seek", "selected", "json", b"{}", 0)
+        .unwrap();
+    let unrelated = store
+        .ingest("artifact-scope-unrelated", "unrelated", "json", b"{}", 0)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put(&unrelated.record_ids[0], b"{broken").unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            selection: QuerySelection::Evidence(vec![selected.id.clone()]),
+            ..Default::default()
+        },
+        scan_budget: 5,
+        ..Default::default()
+    };
+    let page = store.artifact_read(&query, 1).unwrap();
+    assert_eq!(page.total_items, 1);
+    assert_eq!(page.scanned, 5);
+    assert_eq!(page.body.artifacts[0].id, selected.id);
+    assert_eq!(page.body.artifacts[0].retained_records, 1);
+    query.selector.selection = QuerySelection::Evidence(vec![selected.id, unrelated.id]);
+    query.selector.source = Some("selected".into());
+    query.scan_budget = 100;
+    assert_eq!(
+        store.artifact_read(&query, 1).unwrap_err().code,
+        "STORAGE_FAILURE"
+    );
+    assert_eq!(
+        store
+            .artifact_read(&ArtifactRead::default(), 1)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    assert!(store.properties().is_ok());
 }
 
 #[test]

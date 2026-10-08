@@ -45,6 +45,7 @@ struct ArtifactListQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;
   received @3 :OptionalArtifactReceiptInterval;
   cursor @4 :OptionalText; pageSize @5 :UInt32 = 200; scanBudget @6 :UInt32 = 10000;
+  selection @7 :QuerySelection;
 }
 struct ArtifactListPage { receipt @0 :CatalogReadReceipt; rows @1 :List(ArtifactSummary); }
 struct SourceWatchInfo { watchId @0 :Text; revision @1 :UInt64; enabled @2 :Bool; }

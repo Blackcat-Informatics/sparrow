@@ -18,6 +18,31 @@ pub(super) const HANDLE_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const SCAN_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const MAX_ITEMS: usize = 10_000;
+pub(super) const ENTRY_BYTES: usize = 512 * 1024;
+
+/// One aggregate catalog entry/byte/time admission across capture and reference expansion.
+pub(super) struct CaptureAdmission<'a> {
+    pub started: Instant,
+    pub scan_budget: usize,
+    pub scanned: &'a mut usize,
+    pub remaining: &'a mut usize,
+}
+
+impl CaptureAdmission<'_> {
+    pub(super) fn entry(&mut self, bytes: usize) -> Result<(), Error> {
+        if *self.scanned == self.scan_budget
+            || bytes > ENTRY_BYTES
+            || self.started.elapsed() >= Duration::from_millis(LEASE_MS)
+        {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "catalog capture exhausted entry/scan/time admission; no result published",
+            ));
+        }
+        *self.scanned += 1;
+        super::Writer::charge_catalog(self.remaining, bytes)
+    }
+}
 
 pub(super) trait Selector: Clone + PartialEq {
     fn capacity(&self) -> usize;

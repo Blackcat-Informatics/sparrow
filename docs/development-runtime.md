@@ -32,8 +32,52 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 25; the schema sections
+The current source implements schema 26; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 26 artifact membership
+
+Artifact discovery admits the existing store-scoped live/evidence/pin vocabulary
+through typed `ArtifactListQuery.selection`, CLI `artifacts --scope-file FILE`
+and MCP `artifacts_list.scope`. One reference owner serves record queries and
+artifact discovery, preserving whole-artifact and recordless identities alongside
+deduplicated records and parents. Source/receipt filters run after full reference
+validation. Selected reads seek their metadata instead of scanning unrelated
+artifacts and records. Live scans and selected seeks share one metadata collector,
+and artifact/source capture and explicit reference expansion share one aggregate
+catalog admission law. The existing native pinned-value decoder now admits each
+caller before parsing, with one implementation for both bounded lookup paths.
+
+Record-only selection counts retained occurrences within the captured membership;
+complete parent availability and original member counts remain separate facts.
+An expired whole artifact is refused even when its individual records are pinned.
+A retained record can expose a reclaimed parent with unknown original metadata.
+Cursors preserve the original membership and counts after pin release/expiry;
+fresh reads validate current references. Artifact diagnostic/source-array scope
+filters remain unfinished and are explicitly refused rather than ignored. The
+artifact tool schema advertises membership only; record query filters retain
+their existing shared decoder/encoder and behavior.
+
+Focused core scenarios verify shared record-query membership, recordless parents,
+overlap deduplication, selected-reference validation before filters, sparse native
+seeks despite unrelated corrupt catalog entries, admission refusal with no prefix,
+and frozen pages after pin release and physical catalog retirement. A real test
+daemon verifies generated wire selection, CLI/MCP equal replay, scoped counts,
+foreign-store/missing/released-reference and changed-membership refusals, filter
+rejection and obsolete schema refusal.
+
+Local qualification on 2026-10-07: `make check` passed formatting, release Clippy
+with warnings denied, all workspace release tests (108 storage and 31
+RPC/daemon/MCP scenarios), seeded census self-tests and the pinned cross-workspace
+gate. All 155 ownership jobs hold with zero distinct exceptions. Evidence is
+`/tmp/sparrow-artifact-scope-first-check-20261007.log`.
+
+The current client refused status, keys, sources and artifacts against a private
+archived schema-25 daemon with `UNSUPPORTED`, exit 1 and zero stdout bytes.
+Evidence is `/tmp/sparrow-artifact-scope-schema25-compat.as360qne`; the archive
+digest is `51145f2be6894f887324d63f8d1d9c99a2d53b90aef9c3a737647cafefdc336d`.
+That owned child exited cleanly under SIGINT and removed its socket. Development
+runtime adoption remains to be qualified.
 
 ## Schema 25 source discovery
 

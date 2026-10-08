@@ -8,10 +8,7 @@ use super::{
     source_time,
 };
 use catalog_lease::{CAPTURE_BYTES, HANDLE_BYTES, LEASE_MS, MAX_HANDLES, MAX_ITEMS, SCAN_BYTES};
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 
 /// Exact intake key selector. Omitted means all discoverable sources.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -253,6 +250,12 @@ impl Store {
                 "source watch declarations exceed the runtime's eight-watch ceiling",
             ));
         }
+        let mut admission = catalog_lease::CaptureAdmission {
+            started,
+            scan_budget: query.scan_budget,
+            scanned: &mut scanned,
+            remaining: &mut remaining,
+        };
         let mut watch_ids = std::collections::BTreeSet::new();
         for binding in configured {
             if binding.source.is_empty()
@@ -267,14 +270,7 @@ impl Store {
                     "source watch declarations require bounded identities, nonzero revisions and unique watch IDs",
                 ));
             }
-            if scanned == query.scan_budget || started.elapsed() >= Duration::from_millis(LEASE_MS)
-            {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "source declarations exhausted scan/time admission",
-                ));
-            }
-            scanned += 1;
+            admission.entry(0)?;
             if query
                 .selector
                 .source
@@ -310,17 +306,7 @@ impl Store {
                 let bytes = iterator.value().ok_or_else(|| {
                     Error::new("STORAGE_FAILURE", "source registry iterator value missing")
                 })?;
-                if scanned == query.scan_budget
-                    || bytes.len() > 512 * 1024
-                    || started.elapsed() >= Duration::from_millis(LEASE_MS)
-                {
-                    return Err(Error::new(
-                        "RESOURCE_LIMIT",
-                        "source capture exhausted catalog/scan/time admission; no result published",
-                    ));
-                }
-                scanned += 1;
-                super::Writer::charge_catalog(&mut remaining, bytes.len())?;
+                admission.entry(bytes.len())?;
                 let value = super::parse(bytes)?;
                 let (source, id, expected) = if prefix == b"source-time:" {
                     let profile = source_time::SourceTimeProfile::decode(&value)?;

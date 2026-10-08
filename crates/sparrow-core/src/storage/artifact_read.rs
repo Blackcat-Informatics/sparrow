@@ -9,13 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::catalog_lease::{CAPTURE_BYTES, MAX_ITEMS, SCAN_BYTES};
+use super::catalog_lease::{CAPTURE_BYTES, CaptureAdmission, ENTRY_BYTES, MAX_ITEMS, SCAN_BYTES};
 pub(super) use super::catalog_lease::{HANDLE_BYTES, MAX_HANDLES};
-const ENTRY_BYTES: usize = 512 * 1024;
 
 /// Artifact metadata filter, bound into every continuation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactSelector {
+    /// Eligible live evidence, a concrete selection, or an active stable pin.
+    pub selection: crate::QuerySelection,
     /// Exact source label, or all sources.
     pub source: Option<String>,
     /// Inclusive original artifact receipt time, in Unix milliseconds.
@@ -27,6 +28,7 @@ pub struct ArtifactSelector {
 impl Default for ArtifactSelector {
     fn default() -> Self {
         Self {
+            selection: crate::QuerySelection::Live,
             source: None,
             received_from: 0,
             received_before: u64::MAX,
@@ -37,6 +39,14 @@ impl Default for ArtifactSelector {
 impl catalog_lease::Selector for ArtifactSelector {
     fn capacity(&self) -> usize {
         self.source.as_ref().map_or(0, String::capacity)
+            + match &self.selection {
+                crate::QuerySelection::Live => 0,
+                crate::QuerySelection::Evidence(ids) => {
+                    ids.capacity() * std::mem::size_of::<String>()
+                        + ids.iter().map(String::capacity).sum::<usize>()
+                }
+                crate::QuerySelection::Pin { id, .. } => id.capacity(),
+            }
     }
 }
 
@@ -90,7 +100,7 @@ pub struct ArtifactSummary {
     pub origin: Option<ArtifactOrigin>,
     /// Whether the complete artifact was eligible at capture time.
     pub complete_bytes_available: bool,
-    /// Exact number of eligible records at capture time.
+    /// Exact number of retained records within the captured membership.
     pub retained_records: usize,
 }
 
@@ -140,6 +150,7 @@ impl Store {
     /// Discover eligible complete artifacts and surviving records' parent provenance.
     /// No partial capture is published on catalog, resource or coverage failure.
     pub fn artifact_read(&self, query: &ArtifactRead, now: u64) -> Result<ArtifactReadPage, Error> {
+        query.selector.selection.validate()?;
         if !(1..=1000).contains(&query.page_size)
             || !(1..=100000).contains(&query.scan_budget)
             || query.selector.received_from >= query.selector.received_before
@@ -212,6 +223,116 @@ impl Store {
     }
 }
 
+/// One collector owns live and selected artifact/record metadata folding.
+struct ArtifactCapture {
+    rows: BTreeMap<String, ArtifactSummary>,
+    capacity: usize,
+}
+impl ArtifactCapture {
+    /// Fold one admitted native catalog entry without retaining its decoded body.
+    fn push(
+        &mut self,
+        writer: &Writer,
+        key: &[u8],
+        bytes: &[u8],
+        now: u64,
+        protected: &std::collections::BTreeSet<String>,
+        admission: &mut CaptureAdmission<'_>,
+    ) -> Result<(), Error> {
+        admission.entry(bytes.len())?;
+        let value = super::parse(bytes)?;
+        let (summary, retained) = if key.starts_with(b"artifact:") {
+            let artifact = Artifact::decode(&value)?;
+            if artifact.id.as_bytes() != key {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "artifact discovery catalog identity mismatch",
+                ));
+            }
+            super::validate_ingest_labels(&artifact.id, &artifact.source, &artifact.format)
+                .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
+            let complete = writer.live_artifact(&artifact, now, protected);
+            (
+                ArtifactSummary {
+                    id: artifact.id,
+                    source: artifact.source,
+                    origin: Some(ArtifactOrigin {
+                        format: artifact.format,
+                        received_at: artifact.received_at,
+                        expires_at: artifact.expires_at,
+                        byte_length: artifact.byte_length,
+                        original_records: artifact.record_ids.len(),
+                    }),
+                    complete_bytes_available: complete,
+                    retained_records: 0,
+                },
+                false,
+            )
+        } else {
+            let record = Record::decode(&value)?;
+            if record.id.as_bytes() != key {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "artifact discovery record identity mismatch",
+                ));
+            }
+            writer.validate_event_record(&record)?;
+            if !writer.live_record(&record, now, protected) {
+                return Ok(());
+            }
+            (
+                ArtifactSummary {
+                    id: record.artifact_id,
+                    source: record.source,
+                    origin: None,
+                    complete_bytes_available: false,
+                    retained_records: 0,
+                },
+                true,
+            )
+        };
+        if !summary.id.starts_with("artifact:")
+            || summary.id.len() > 128
+            || summary.source.is_empty()
+            || summary.source.len() > 512
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "artifact discovery identity or source provenance is invalid",
+            ));
+        }
+        if summary.capacity() > 4096 {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "artifact summary exceeds row admission",
+            ));
+        }
+        if let Some(existing) = self.rows.get_mut(&summary.id) {
+            if existing.source != summary.source {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "artifact and record source provenance disagree",
+                ));
+            }
+            if retained {
+                existing.retained_records += 1;
+            }
+        } else {
+            if self.rows.len() == MAX_ITEMS || self.capacity + summary.capacity() > CAPTURE_BYTES {
+                return Err(Error::new(
+                    "RESOURCE_LIMIT",
+                    "artifact capture exceeds item/capacity admission",
+                ));
+            }
+            self.capacity += summary.capacity();
+            let mut summary = summary;
+            summary.retained_records = usize::from(retained);
+            self.rows.insert(summary.id.clone(), summary);
+        }
+        Ok(())
+    }
+}
+
 impl Writer {
     pub(super) fn artifact_capture(
         &self,
@@ -240,131 +361,67 @@ impl Writer {
             Some(ENTRY_BYTES),
             Some(remaining),
         )?;
-        let mut rows = BTreeMap::<String, ArtifactSummary>::new();
-        let mut capacity = 4096;
-        for prefix in [b"artifact:".as_slice(), b"record:".as_slice()] {
-            let mut iterator = self.db.raw_iterator();
-            iterator.seek(prefix);
-            while iterator.valid() {
-                let key = iterator.key().ok_or_else(|| {
-                    Error::new("STORAGE_FAILURE", "artifact discovery iterator key missing")
-                })?;
-                if !key.starts_with(prefix) {
-                    break;
+        let mut admission = CaptureAdmission {
+            started,
+            scan_budget,
+            scanned,
+            remaining,
+        };
+        let selection = self.query_selection_membership(
+            &selector.selection,
+            now,
+            &protected,
+            Some(&mut admission),
+        )?;
+        let mut capture = ArtifactCapture {
+            rows: BTreeMap::new(),
+            capacity: 4096,
+        };
+        if let Some(selection) = selection {
+            for id in &selection.parents {
+                if let Some(bytes) = self.db.get_pinned(id)? {
+                    capture.push(self, id.as_bytes(), &bytes, now, &protected, &mut admission)?;
+                } else if selection.artifacts.contains(id) {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "resolved complete artifact disappeared during capture",
+                    ));
                 }
-                let bytes = iterator.value().ok_or_else(|| {
+            }
+            for id in selection.records.keys() {
+                let bytes = self.db.get_pinned(id)?.ok_or_else(|| {
                     Error::new(
                         "STORAGE_FAILURE",
-                        "artifact discovery iterator value missing",
+                        "resolved selected record disappeared during capture",
                     )
                 })?;
-                if *scanned == scan_budget
-                    || bytes.len() > ENTRY_BYTES
-                    || started.elapsed() >= Duration::from_millis(catalog_lease::LEASE_MS)
-                {
-                    return Err(Error::new(
-                        "RESOURCE_LIMIT",
-                        "artifact capture exhausted entry/scan/time admission; no result published",
-                    ));
-                }
-                *scanned += 1;
-                super::Writer::charge_catalog(remaining, bytes.len())?;
-                let value = super::parse(bytes)?;
-                let (summary, retained) = if prefix == b"artifact:" {
-                    let artifact = Artifact::decode(&value)?;
-                    if artifact.id.as_bytes() != key {
-                        return Err(Error::new(
-                            "STORAGE_FAILURE",
-                            "artifact discovery catalog identity mismatch",
-                        ));
-                    }
-                    super::validate_ingest_labels(&artifact.id, &artifact.source, &artifact.format)
-                        .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
-                    let complete = self.live_artifact(&artifact, now, &protected);
-                    (
-                        ArtifactSummary {
-                            id: artifact.id,
-                            source: artifact.source,
-                            origin: Some(ArtifactOrigin {
-                                format: artifact.format,
-                                received_at: artifact.received_at,
-                                expires_at: artifact.expires_at,
-                                byte_length: artifact.byte_length,
-                                original_records: artifact.record_ids.len(),
-                            }),
-                            complete_bytes_available: complete,
-                            retained_records: 0,
-                        },
-                        false,
-                    )
-                } else {
-                    let record = Record::decode(&value)?;
-                    if record.id.as_bytes() != key {
-                        return Err(Error::new(
-                            "STORAGE_FAILURE",
-                            "artifact discovery record identity mismatch",
-                        ));
-                    }
-                    self.validate_event_record(&record)?;
-                    if !self.live_record(&record, now, &protected) {
-                        iterator.next();
-                        continue;
-                    }
-                    (
-                        ArtifactSummary {
-                            id: record.artifact_id,
-                            source: record.source,
-                            origin: None,
-                            complete_bytes_available: false,
-                            retained_records: 0,
-                        },
-                        true,
-                    )
-                };
-                if !summary.id.starts_with("artifact:")
-                    || summary.id.len() > 128
-                    || summary.source.is_empty()
-                    || summary.source.len() > 512
-                {
-                    return Err(Error::new(
-                        "STORAGE_FAILURE",
-                        "artifact discovery identity or source provenance is invalid",
-                    ));
-                }
-                if summary.capacity() > 4096 {
-                    return Err(Error::new(
-                        "RESOURCE_LIMIT",
-                        "artifact summary exceeds row admission",
-                    ));
-                }
-                if let Some(existing) = rows.get_mut(&summary.id) {
-                    if existing.source != summary.source {
-                        return Err(Error::new(
-                            "STORAGE_FAILURE",
-                            "artifact and record source provenance disagree",
-                        ));
-                    }
-                    if retained {
-                        existing.retained_records += 1;
-                    }
-                } else {
-                    if rows.len() == MAX_ITEMS || capacity + summary.capacity() > CAPTURE_BYTES {
-                        return Err(Error::new(
-                            "RESOURCE_LIMIT",
-                            "artifact capture exceeds item/capacity admission",
-                        ));
-                    }
-                    capacity += summary.capacity();
-                    let mut summary = summary;
-                    summary.retained_records = usize::from(retained);
-                    rows.insert(summary.id.clone(), summary);
-                }
-                iterator.next();
+                capture.push(self, id.as_bytes(), &bytes, now, &protected, &mut admission)?;
             }
-            iterator.status()?;
+        } else {
+            for prefix in [b"artifact:".as_slice(), b"record:".as_slice()] {
+                let mut iterator = self.db.raw_iterator();
+                iterator.seek(prefix);
+                while iterator.valid() {
+                    let key = iterator.key().ok_or_else(|| {
+                        Error::new("STORAGE_FAILURE", "artifact discovery iterator key missing")
+                    })?;
+                    if !key.starts_with(prefix) {
+                        break;
+                    }
+                    let bytes = iterator.value().ok_or_else(|| {
+                        Error::new(
+                            "STORAGE_FAILURE",
+                            "artifact discovery iterator value missing",
+                        )
+                    })?;
+                    capture.push(self, key, bytes, now, &protected, &mut admission)?;
+                    iterator.next();
+                }
+                iterator.status()?;
+            }
         }
         let mut artifacts = Vec::new();
-        for (_, summary) in rows {
+        for (_, summary) in capture.rows {
             if !summary.complete_bytes_available && summary.retained_records == 0 {
                 continue;
             }

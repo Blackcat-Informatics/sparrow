@@ -592,8 +592,8 @@ names = ['^(check_claim_upload_stability|check_client_file_stability)$']
 [[job]]
 id = "query-membership"
 summary = "Resolve retained artifact/record/pin membership once, before filters, with revision guards and bounded expansion."
-home = "sparrow_core::storage::Writer::query_membership"
-entry_points = []
+home = "sparrow_core::storage::query_membership::Writer::query_selection_membership"
+entry_points = ["sparrow_core::storage::query_membership::Writer::query_membership", "sparrow_core::storage::query_membership::SelectionMembers::admit_record"]
 spec = "docs/interfaces.md: schema 13 membership scopes."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -621,7 +621,7 @@ names = ['^(json_time_candidates|text_time_candidates)$']
 id = "agent-query-selection"
 summary = "CLI control files and MCP inputs share one closed native JSON scope codec and generated Capnp encoder."
 home = "sparrow_server::agent::selection::decode"
-entry_points = ["sparrow_server::agent::selection::Input::encode"]
+entry_points = ["sparrow_server::agent::selection::Input::encode", "sparrow_server::agent::selection::Input::encode_membership", "sparrow_server::agent::selection::decode_membership"]
 spec = "docs/interfaces.md: scope-file and MCP scope input."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -1464,8 +1464,8 @@ names = ['^(decode_context_time_record|decode_eviction_time_record)$']
 [[job]]
 id = "bounded-catalog-decode"
 summary = "Read one native pinned catalog value and charge its decoded shape before the shared PurRDF decoder."
-home = "sparrow_core::storage::Writer::get_limited"
-entry_points = ["sparrow_core::storage::Writer::charge_catalog"]
+home = "sparrow_core::storage::Writer::get_admitted"
+entry_points = ["sparrow_core::storage::Writer::get_limited", "sparrow_core::storage::Writer::charge_catalog"]
 spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2299,6 +2299,48 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^format_source_iri$']
+
+[[job]]
+id = "catalog-capture-admission"
+summary = "One aggregate native catalog entry, byte, scan and monotonic time admission covers artifact/source capture and explicit reference expansion."
+home = "sparrow_core::storage::catalog_lease::CaptureAdmission::entry"
+entry_points = []
+spec = "docs/interfaces.md: schema 26 scoped artifact captures."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^admit_artifact_selection_entry$']
+
+[[job]]
+id = "artifact-catalog-fold"
+summary = "Live scans and selected native seeks share one eligibility, identity, minimal parent provenance and occurrence count collector."
+home = "sparrow_core::storage::artifact_read::ArtifactCapture::push"
+entry_points = []
+spec = "docs/interfaces.md: source, membership and original receipt-scoped artifact metadata."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^fold_selected_artifact_catalog$']
+
+[[job]]
+id = "query-selection-wire"
+summary = "One generated live/evidence/pin union decoder owns store-scoped reference admission for record and artifact queries."
+home = "sparrow_server::rpc::selection"
+entry_points = []
+spec = "docs/interfaces.md: common typed membership and schema 26 artifact scopes."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^decode_artifact_query_selection$']
 
 [[job]]
 id = "catalog-cli-options"

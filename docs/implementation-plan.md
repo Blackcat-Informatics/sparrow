@@ -19,7 +19,10 @@ daemon, CLI and MCP. Artifact and source discovery share the catalog lease owner
 source inventory includes exact intake keys, mapping IDs, retained occurrence
 counts and configured watch bindings. Producer continuity remains explicitly
 unknown while stream generations and gap tracking are unfinished.
-Broader live/pin/selection query pagination remains required.
+Artifact discovery now admits live, explicit evidence and revision-guarded pin
+membership through the same reference owner as record queries, including
+recordless artifacts and frozen pages after pin release. Artifact diagnostic
+scope filtering and broader record/field/text query pagination remain required.
 The standalone producer client and schema-11 typed event batch operation are
 present. Native event JSONL enters the same occurrence/field/text/time indexes;
 the bounded producer queue now reconnects with immutable pending batches and
