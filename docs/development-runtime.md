@@ -4201,4 +4201,18 @@ Focused release Clippy and the full repository gate passed. Logs are
 /tmp/sparrow-recovery-lint.log, /tmp/sparrow-recovery-build.log and
 /tmp/sparrow-recovery-check.log. Qualification used the explicit selected example
 build, not an unselected volatile target. Installed signed-image qualification
-will be recorded after the normal commit hook and explicit example rebuild.
+follows.
+
+Signed source 65d68b9 passed the normal commit hook; its log is
+/tmp/sparrow-recovery-commit.log. The example was explicitly rebuilt after the
+hook and installed with exclusive creation at
+/home/paudley/.local/libexec/sparrow/recovery-schema41-65d68b9, SHA-256
+22904f6331385572b1feb1690efa7774858e1e59643b2bc5de211e15c31bba1f.
+The installed image and selected release artifact were compared byte-for-byte;
+the build log is /tmp/sparrow-recovery-installed-build.log. The installed image
+reproduced all 247 target rows, 36,005,499 byte checks, native RDF inspections
+and eight refusal cases against the disposable restored copies. Its reports
+and image identity are recorded as installed-recovery-report.json,
+installed-refusals.json and installed-artifacts.json in the same evidence
+directory. Final live status remains schema 41 with 212 records and daemon
+PID 1452634. This offline tool requires no daemon image change or restart.
