@@ -1,5 +1,13 @@
 # Sparrow interfaces
 
+Schema 44 uses anonymous, disk-admitted immutable staging for record and text
+pages, including field filters, source-time ordering and artifact grouping. Each page remains bounded
+and replayable with the original absolute deadline; release removes only the
+query allocation. Host admission profile `sparrow-query-capture/3` advertises a
+64 MiB maximum disk capture for this path, subject to the configured store budget.
+Other captured query families retain the 2 MiB resident ceiling. See
+[query streaming](query-streaming.md) for admission, cleanup and remaining work.
+
 This document specifies the first-version contracts. Implemented schema sections
 describe current typed operations; other design examples retain their required
 target behavior. [Development runtime](development-runtime.md) identifies the
@@ -284,7 +292,7 @@ Keys and values share the existing occurrence predicate and one typed input
 admission owner. JSON query paths admit at most 65,536 UTF-8 bytes before the
 server allocates an owned spelling. The core enforces the same limit for direct
 JSON discovery calls. The updated host capture profile is
-sparrow-query-capture/2; QueryLimits.queryPathBytes reports that ceiling for
+sparrow-query-capture/3; QueryLimits.queryPathBytes reports that ceiling for
 JSON captures and explicit absence for other query phases. Stored evidence,
 native projection identities and storage formats are unchanged.
 
@@ -380,7 +388,7 @@ refusals. The grouping flag is part of cursor identity; changing it refuses
 `CONFLICT`. Cursor-only continuation, lease release and expiry use their existing
 owners. Artifact grouping creates no pin or complete-file download promise;
 retrieve the original artifact or record bytes through its concrete evidence ID.
-Schema discovery requires 43; the storage representation is unchanged.
+Schema discovery now requires 44; the storage representation is unchanged.
 
 ### Cursor-only continuation
 

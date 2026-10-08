@@ -10385,6 +10385,172 @@ fn record_pages_capture_more_than_the_old_row_ceiling_without_limited_execution(
 }
 
 #[test]
+fn disk_record_pages_cross_the_old_capture_bound_and_release_their_charge() {
+    use sparrow_core::{
+        FieldConstraint, JsonPredicate, RecordOperation, RecordQuery, RecordRead, ResultPage,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let source = "s".repeat(512);
+    store
+        .define_time_profile(&source, "/t", sparrow_core::TimeRepresentation::UnixMillis)
+        .unwrap();
+    let input = [
+        b"{\"x\":\"needle value\",\"t\":20}\n".repeat(1500),
+        b"{\"x\":\"needle value\",\"t\":10}\n".repeat(1500),
+    ]
+    .concat();
+    let artifact = store
+        .ingest("broad-disk-rows", &source, "jsonl", &input, 1)
+        .unwrap();
+    let mut scope = record_page_scope(&source, 1000);
+    scope.scan_budget = 100000;
+    let query = RecordRead {
+        operation: RecordOperation::ArtifactGroups,
+        scope,
+        query: RecordQuery {
+            fields: vec![FieldConstraint {
+                predicate: JsonPredicate {
+                    path: Some("/x".into()),
+                    decoded: Some("needle value".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let first = store.records_read(&query, 2).unwrap();
+    assert_eq!(first.total_items, 3000);
+    assert!(first.next_cursor.is_some());
+    assert!(
+        store.status(2).unwrap()["record_read_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            < 256 * 1024
+    );
+    let first_value = first.body.result().unwrap();
+    assert_eq!(
+        first_value["query_evidence"]["limits"]["capture_bytes"].as_u64(),
+        Some(64 * 1024 * 1024)
+    );
+    assert_eq!(
+        first_value["artifact_group_counts"][artifact.id.as_str()].as_u64(),
+        Some(3000)
+    );
+    let replay_cursor = first.next_cursor.clone().unwrap();
+    let replay = store
+        .result_next(&first.store_id, &replay_cursor, 2)
+        .unwrap();
+    let mut event_query = query.clone();
+    event_query.query.event_interval = Some(sparrow_core::EventInterval {
+        from: 10,
+        before: 21,
+    });
+    let event_page = store.records_read(&event_query, 2).unwrap();
+    let mut ranked_query = query.clone();
+    ranked_query.query.text = Some("needle".into());
+    let ranked_page = store.records_read(&ranked_query, 2).unwrap();
+    store
+        .ingest("broad-later", &source, "json", b"{\"x\":\"value\"}", 3)
+        .unwrap();
+    for (mode, mut page) in [
+        ("received", first.clone()),
+        ("event", event_page),
+        ("ranked", ranked_page),
+    ] {
+        let snapshot = page.snapshot_id.clone();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut bytes = 0;
+        let mut event_times = Vec::new();
+        let ranking = page.body.result().unwrap().get("ranking").cloned();
+        loop {
+            let value = page.body.result().unwrap();
+            assert_eq!(value["known_qualified_records"].as_str(), Some("3000"));
+            assert_eq!(value.get("ranking").cloned(), ranking);
+            if mode == "ranked" {
+                assert_eq!(value["ranking"]["documents"].as_str(), Some("3000"));
+            }
+            for row in value["rows"].as_array().unwrap() {
+                bytes += purrdf_lex::json::write_compact(row).len();
+                assert!(ids.insert(row["record_id"].as_str().unwrap().to_owned()));
+                event_times.push(
+                    row["event_time"]["millis"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap(),
+                );
+                if mode == "ranked" {
+                    assert!(row.get("score").is_some());
+                }
+            }
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            let ResultPage::Records(next) = store.result_next(&first.store_id, &cursor, 4).unwrap()
+            else {
+                panic!("wrong operation")
+            };
+            page = next;
+        }
+        assert!(bytes > 2 * 1024 * 1024, "{mode}");
+        assert_eq!(ids, artifact.record_ids.iter().cloned().collect());
+        if mode == "event" {
+            assert_eq!(&event_times[..1500], vec![10; 1500]);
+            assert_eq!(&event_times[1500..], vec![20; 1500]);
+        }
+        if mode != "received" {
+            assert!(store.result_release(&first.store_id, &snapshot, 4).unwrap());
+        }
+    }
+    assert_eq!(
+        store
+            .result_next(&first.store_id, &replay_cursor, 4)
+            .unwrap(),
+        replay
+    );
+    assert!(
+        store
+            .result_release(&first.store_id, &first.snapshot_id, 4)
+            .unwrap()
+    );
+    let after = store.status(4).unwrap();
+    assert_eq!(after["record_read_handles"].as_str(), Some("0"));
+    assert_eq!(after["record_read_bytes"].as_str(), Some("0"));
+    assert_eq!(
+        store
+            .result_next(&first.store_id, &replay_cursor, 4)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    let ballast = dir.path().join("query-pressure-fixture");
+    std::fs::File::create(&ballast)
+        .unwrap()
+        .set_len(config().disk_budget)
+        .unwrap();
+    assert_eq!(
+        store.records_read(&query, 4).unwrap_err().code,
+        "STORAGE_PRESSURE"
+    );
+    assert_eq!(
+        store.status(4).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+    std::fs::remove_file(ballast).unwrap();
+    let recovered = store.records_read(&query, 4).unwrap();
+    assert!(
+        store
+            .result_release(&recovered.store_id, &recovered.snapshot_id, 4)
+            .unwrap()
+    );
+}
+
+#[test]
 fn record_pages_keep_pin_capture_after_release_and_retirement_and_expire_absolutely() {
     use sparrow_core::{QuerySelection, RecordQuery, RecordRead};
     let dir = tempfile::tempdir().unwrap();

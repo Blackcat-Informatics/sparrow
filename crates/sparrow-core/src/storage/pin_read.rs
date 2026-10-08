@@ -118,14 +118,14 @@ impl super::catalog_lease::PageBody for PinPageBody {
             }
         }
     }
-    fn page(&self, start: usize, end: usize) -> Self {
-        match self {
+    fn page(&self, start: usize, end: usize) -> Result<Self, Error> {
+        Ok(match self {
             Self::Collections(rows) => Self::Collections(rows[start..end].to_vec()),
             Self::Members { pin, members } => Self::Members {
                 pin: pin.clone(),
                 members: members[start..end].to_vec(),
             },
-        }
+        })
     }
 }
 

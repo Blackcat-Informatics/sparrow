@@ -164,11 +164,11 @@ impl catalog_lease::PageBody for ArtifactPageBody {
                 .map(ArtifactSummary::capacity)
                 .sum::<usize>()
     }
-    fn page(&self, start: usize, end: usize) -> Self {
-        Self {
+    fn page(&self, start: usize, end: usize) -> Result<Self, Error> {
+        Ok(Self {
             artifacts: self.artifacts[start..end].to_vec(),
             diagnostic_coverage: self.diagnostic_coverage,
-        }
+        })
     }
 }
 

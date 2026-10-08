@@ -249,6 +249,13 @@ investigation pins. Expiry affects subsequent queries immediately; physical
 reclamation waits for those short-lived leases and native engine maintenance.
 Report reclamation lag separately from logical expiry.
 
+Metadata-only record and ranked-text leases may instead stage their complete
+immutable native summaries in bounded anonymous disk files under the same store
+admission. These preserve page replay without retaining original payload or RDF
+versions, creating pins or renewing retention. Their file allocation must be
+charged even though directory enumeration cannot see it, and released with the
+lease. Exact-byte reads remain independently subject to evidence eligibility.
+
 Ordinary cleanup traverses catalog prefixes in finite passes rather than
 collecting resident evidence. Each pass captures current pin protection under
 the writer lock, admits complete record dependency retirement and bounded parent

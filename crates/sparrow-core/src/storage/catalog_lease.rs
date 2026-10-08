@@ -57,7 +57,7 @@ pub(super) trait PageBody: Sized {
     const PAGE_ITEMS: usize;
     fn len(&self) -> usize;
     fn capacity(&self) -> usize;
-    fn page(&self, start: usize, end: usize) -> Self;
+    fn page(&self, start: usize, end: usize) -> Result<Self, Error>;
     fn page_end(&self, start: usize, page_size: usize) -> usize {
         self.len().min(start + page_size.min(Self::PAGE_ITEMS))
     }
@@ -131,7 +131,7 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
                 "cursor is not a captured page boundary",
             ));
         }
-        let page = self.page(start);
+        let page = self.page(start)?;
         if !self.alive(now) {
             return Err(Error::new(
                 "RESULT_EXPIRED",
@@ -140,9 +140,9 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
         }
         Ok(page)
     }
-    fn page(&self, start: usize) -> CatalogReadPage<B> {
+    fn page(&self, start: usize) -> Result<CatalogReadPage<B>, Error> {
         let end = self.body.page_end(start, self.page_size);
-        CatalogReadPage {
+        Ok(CatalogReadPage {
             store_id: self.store_id.clone(),
             snapshot_id: self.id.clone(),
             as_of: self.as_of,
@@ -153,8 +153,8 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
             page_size: self.page_size,
             scan_budget: self.scan_budget,
             scanned: self.scanned,
-            body: self.body.page(start, end),
-        }
+            body: self.body.page(start, end)?,
+        })
     }
 }
 
@@ -266,7 +266,7 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
                 "catalog metadata snapshot capacity is exhausted",
             ));
         }
-        let page = snapshot.page(0);
+        let page = snapshot.page(0)?;
         if !snapshot.alive(now) {
             return Err(Error::new(
                 "RESULT_EXPIRED",

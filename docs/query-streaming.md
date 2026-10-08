@@ -1,10 +1,59 @@
 # Broad query paging
 
-Broad record queries currently capture their complete admitted result metadata
-before paging. They refuse above 10,000 matches or 2 MiB; the 7,058-record copied
-corpus exceeds the chronological byte ceiling. Page size does not reduce this
-capture. Increasing the ceiling or issuing independent narrowed queries does
-not implement one complete, immutable broad traversal.
+Record queries now stage their complete admitted result metadata
+incrementally into an anonymous disk file before publishing a page. This includes
+field qualification, source-time ordering, native ranked text and artifact grouping.
+They retain at most 10,000 compact offset/length pairs in memory; each page reads
+only its admitted rows. JSON discovery still uses the earlier 2 MiB resident
+capture and remains to be migrated. The 10,000-match and scan-work ceilings remain
+explicit admission boundaries.
+
+## Bounded immutable disk staging
+
+The serialized catalog writer fixes membership, protection, diagnostics, field
+witnesses and artifact counts during one scan through the existing matcher. It
+writes one native JSON summary at a time, rather than accumulating a result-size
+row vector. After the complete scan succeeds, an immutable file and bounded
+offsets supply replayable byte-limited pages. Later writes and logical retirement
+do not affect those captured summaries. This supplies metadata paging without
+retaining old RocksDB versions for this operation; RDF reads continue to use
+their separate native snapshot path. The shared native read helpers remain useful
+for those backends.
+
+Source-time captures sort bounded `(millis, record ID, offset ordinal)` keys and
+then keep only reordered offsets; they do not collect complete row bodies. Sort
+admission includes string storage and vector growth, with a 2 MiB ceiling checked
+before admitting each key. Text captures retain their existing bounded native
+membership and global scorer. Once that scorer orders all admitted matches, it
+stages one complete scored row at a time. No page-local corpus or scoring law is
+introduced. Artifact counts accumulate only over final matching rows.
+
+Before staging, reserve the smaller of 64 MiB and one eighth of the configured
+data allowance (disk budget less maintenance reserve), checking it against the
+store's complete admission footprint. Keep 64 KiB of that reservation outside
+the row-data bound for allocation overhead. After capture, replace the reservation
+with the greater of measured allocated blocks and rounded written data plus
+64 KiB allocation overhead, preserving admission during delayed writeback.
+Ingestion and control-write admission
+include this shared staging charge. The reported admission footprint therefore
+includes anonymous query files and in-progress reservations, which directory
+enumeration alone cannot see. A filesystem quota is still required for a hard
+physical ceiling. Row size remains 32 KiB, metadata 32 KiB, resident lease capacity
+2 MiB per result/8 MiB aggregate, eight handles, pages 256 KiB and leases 60 seconds.
+
+Linux `O_TMPFILE` creates no linked query pathname. Closing the last descriptor
+on release, purge, final single-page completion or owner shutdown reclaims its
+allocation; process death also closes it. A filesystem without anonymous-file
+support gives an actionable storage failure, not a resident fallback. The
+existing periodic expiry path purges expired leases. Page I/O is fallible through
+the shared lease contract, and any staging or page failure returns no successful
+prefix. No durable query receipt, evidence pin or renewed retention is created.
+
+Schema 44 and host admission profile `sparrow-query-capture/3` identify this
+change. Record and text receipts advertise a 64 MiB maximum disk capture;
+the configured store allowance can admit less or refuse with storage pressure.
+Other captured query families still advertise 2 MiB. Native ranked membership
+keeps its separate 64 MiB admission; output staging does not remove that bound.
 
 ## Native read foundation
 
@@ -53,21 +102,16 @@ result lease or removal of the broad capture limit.
 
 ## Remaining integration
 
-The next implementation must replace chronological full-row capture with a
-finite native snapshot lease and bounded page staging. It must freeze the
-eligibility clock, selected references and pin revision, protection, diagnostic
-coverage and complete counts; later ingestion, pin changes and retirement must
-not change replayed rows. Snapshot and page buffers, request queues, cursor
-boundaries, decode/scan work and retained native versions need explicit admission.
-An output failure must publish no successful prefix. Cursor-only continuation,
-replay, release, absolute expiry, owner restart and shutdown must all use the
-actual lease owner and join its worker. Read leases do not create pins or renew
-retention. Typed, CLI and MCP rendering must retain their existing contracts.
+Qualify the disk-backed traversal against the real copied corpus,
+including exact replay, release, expiry, owner restart, disk-pressure refusal and
+all transport renderers. The chronological writer remains serialized during
+capture; concurrency and cancellation latency require measurement rather than a
+claim of asynchronous native snapshot execution. Read leases do not create pins
+or renew retention. Typed, CLI and MCP rendering must retain their contracts.
 
-Source-time ordering, native global ranking and artifact counts need their own
-qualified bounded execution strategy through the same helpers. A chronological
-stream must not rescore pages as independent corpora, silently substitute receipt
-time for source time, or claim incomplete counts as exact. The existing captured
-query implementation remains the production path until that integration and
-its complete acceptance scenarios pass. The broad capture limitation remains
-unfinished.
+JSON discovery needs its own qualified bounded execution strategy through its
+native occurrence and aggregation owners. A chronological stream must not
+silently substitute receipt time for source time or claim incomplete counts as
+exact. Other captured query families retain their previous implementation until
+their integration and complete acceptance scenarios pass. Full broad query
+acceptance remains unfinished.

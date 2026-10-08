@@ -33,7 +33,7 @@ names = ['^(qualify_snapshot_fields|qualify_stream_fields)$']
 id = "matched-record-summary"
 summary = "Chronological and native ranked record results share one diagnostic, time, range and field-witness summary; scoring keeps its native owner."
 home = "sparrow_core::storage::record_fields::matched_record_row"
-entry_points = ["sparrow_core::storage::text_index::Store::records_query_capture"]
+entry_points = ["sparrow_core::storage::text_index::Store::records_query_stage"]
 spec = "docs/query-streaming.md: shared row owner."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2624,9 +2624,9 @@ names = []
 
 [[job]]
 id = "record-result-capture"
-summary = "One record matcher and native ranker serves direct reads and operation-bound record/text captures; both paged surfaces share admission and refuse capture exhaustion without a prefix."
-home = "sparrow_core::storage::text_index::Store::records_query_capture"
-entry_points = ["sparrow_core::storage::text_index::Store::records_query", "sparrow_core::storage::Store::records_read"]
+summary = "One record matcher and native ranker serves direct reads and operation-bound staged record/text captures; both paged surfaces share admission and refuse capture exhaustion without a prefix."
+home = "sparrow_core::storage::text_index::Store::records_query_stage"
+entry_points = ["sparrow_core::storage::text_index::Store::records_query_capture", "sparrow_core::storage::record_read::Store::query_read"]
 spec = "docs/interfaces.md: schema 28 record pagination."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2639,7 +2639,7 @@ names = ['^paged_record_matcher$']
 [[job]]
 id = "record-result-page-body"
 summary = "Bounded encoded result ownership uses PurRDF JSON, preserving immutable native receipts and rows without keeping database versions."
-home = "sparrow_core::storage::record_read::RecordPageBody::capture"
+home = "sparrow_core::storage::record_read::RecordPageBody::encode_metadata"
 entry_points = ["sparrow_core::storage::record_read::RecordPageBody::result", "sparrow_core::storage::record_read::RecordPageBody::page_end", "sparrow_core::storage::record_read::RecordPageBody::is_boundary"]
 spec = "docs/interfaces.md: bounded native record result pages and variable byte boundaries."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
@@ -3299,3 +3299,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(decode_tail_byte_reference|decode_generation_read_reference)$']
+
+[[job]]
+id = "anonymous-record-row-staging"
+summary = "One anonymous file owner stages chronological, source-time and native ranked record rows with store disk admission, bounded offsets and allocation release; no query pathname survives a crash."
+home = "sparrow_core::storage::record_spool::Builder::push"
+entry_points = ["sparrow_core::storage::text_index::Store::records_query_stage", "sparrow_core::storage::record_read::Store::query_read"]
+spec = "docs/query-streaming.md: bounded immutable disk staging."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/record_spool.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(stage_record_rows_elsewhere|copy_query_spool)$']

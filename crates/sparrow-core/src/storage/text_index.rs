@@ -105,8 +105,25 @@ impl Store {
         now: u64,
         capture: bool,
     ) -> Result<Value, Error> {
+        self.records_query_stage(scope, query, now, capture, None)
+    }
+
+    pub(super) fn records_query_stage(
+        &self,
+        scope: &crate::QueryScope,
+        query: &crate::RecordQuery,
+        now: u64,
+        capture: bool,
+        mut stage: Option<&mut super::record_spool::Builder>,
+    ) -> Result<Value, Error> {
         scope.validate()?;
         query.validate()?;
+        if stage.is_some() && !capture {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "disk staging requires complete record qualification",
+            ));
+        }
         let row_limit = if capture {
             catalog_lease::MAX_ITEMS
         } else {
@@ -217,6 +234,23 @@ impl Store {
                 ));
             }
             if query.text.is_none() {
+                if let Some(stage) = stage.as_deref_mut() {
+                    let order = if query.event_interval.is_some() {
+                        Some((
+                            record.event_time.millis().ok_or_else(|| {
+                                Error::new("STORAGE_FAILURE", "qualified event time disappeared")
+                            })?,
+                            record.id.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                    stage.push(
+                        record_fields::matched_record_row(&record, fields)?.into(),
+                        order,
+                    )?;
+                    continue;
+                }
                 if query.event_interval.is_some() || chronological.len() < row_limit {
                     let row: Value = record_fields::matched_record_row(&record, fields)?.into();
                     capture_bytes += json::write_compact(&row).len();
@@ -503,6 +537,10 @@ impl Store {
             .with("evidence", Value::array(evidence))
             .with("evidence_limited", evidence_limited)
             .into();
+            if let Some(stage) = stage.as_deref_mut() {
+                stage.push(row, None)?;
+                continue;
+            }
             response_bytes += json::write_compact(&row).len();
             if response_bytes > 2 * 1024 * 1024 {
                 if capture {

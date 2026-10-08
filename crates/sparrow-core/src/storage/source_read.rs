@@ -179,10 +179,10 @@ impl catalog_lease::PageBody for SourcePageBody {
                 .map(SourceSummary::capacity)
                 .sum::<usize>()
     }
-    fn page(&self, start: usize, end: usize) -> Self {
-        Self {
+    fn page(&self, start: usize, end: usize) -> Result<Self, Error> {
+        Ok(Self {
             sources: self.sources[start..end].to_vec(),
-        }
+        })
     }
 }
 /// Complete source capture receipt and bounded page.

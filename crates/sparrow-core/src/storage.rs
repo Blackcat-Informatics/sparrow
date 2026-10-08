@@ -36,6 +36,7 @@ mod rdf_index;
 pub(crate) mod rdf_view;
 mod record_fields;
 pub(crate) mod record_read;
+mod record_spool;
 mod recordless;
 pub(crate) mod result_read;
 mod retire;
@@ -334,6 +335,7 @@ struct Writer {
     pressure: std::cell::RefCell<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
     expiry: std::cell::RefCell<expiry::Cursor>,
+    query_staging: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -910,7 +912,12 @@ impl Writer {
         let mut last = String::new();
         for _ in 0..3 {
             match directory(self.db.path(), self.db.path()) {
-                Ok(bytes) => return Ok(bytes),
+                Ok(bytes) => {
+                    return Ok(bytes.saturating_add(
+                        self.query_staging
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    ));
+                }
                 Err(error) if error.code == "ACCOUNTING_CHANGED" => last = error.message,
                 Err(error) => return Err(error),
             }
@@ -1072,6 +1079,7 @@ impl Store {
                 pressure: std::cell::RefCell::new(pressure::State::default()),
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
+                query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
             rdf_read: Arc::new(Mutex::new(())),

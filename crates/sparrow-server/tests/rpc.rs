@@ -8368,7 +8368,10 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                         receipt["stop_reason"].is_null() && receipt["native_governor"].is_null()
                     );
                     assert_eq!(receipt["limits"]["page_size"].as_u64(), Some(1));
-                    assert_eq!(receipt["limits"]["capture_bytes"].as_str(), Some("2097152"));
+                    assert_eq!(
+                        receipt["limits"]["capture_bytes"].as_str(),
+                        Some(if index < 2 { "67108864" } else { "2097152" })
+                    );
                     assert_eq!(receipt["limits"]["lease_ms"].as_str(), Some("60000"));
                     assert_eq!(
                         receipt["profile_ids"].as_array().unwrap().len(),
