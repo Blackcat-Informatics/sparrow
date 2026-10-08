@@ -68,8 +68,40 @@ Isolated compatibility evidence in
 operations refuse the archived schema-34 daemon with UNSUPPORTED and no stdout.
 That archived executable is SHA-256
 b60962b4d917abee4e9cdc03aa083b4de76c01ef57c960529399cb4641330e14;
-the owned child exits cleanly and removes its socket. Running development-daemon
-adoption and acceptance of schema 35 are pending at this source qualification.
+the owned child exits cleanly and removes its socket.
+
+Qualified functional source is signed commit 734ca96. The owned development
+service adopted schema 35 at 2026-10-08T06:16:25Z (PID 2471270), retaining
+store:46c88e949ccec658600b66c7becd5bb7 and its watch/handoff authority in
+sparrow.store/20. Its private socket remains
+/home/paudley/.local/state/sparrow/development-v5/rpc.sock with directory/socket
+modes 0700/0600. The old PID exited cleanly before this adoption.
+
+Running acceptance in /tmp/sparrow-producer-window-live.wro4yyp_ uses the built
+Rust event client example to publish sequences 1 and 4 under one instance.
+One durable batch and one buffered batch followed by typed flush-through produce
+two independent records and one window, producer-stream:62bad75bb26f0a96dc72f5142198569a.
+The summary reports exactly two unobserved positions, the inclusive gap 2..3,
+and unknown continuity. CLI and MCP summaries agree. Exact retries of both
+batches reuse their artifact and record IDs without advancing counters; a new
+overlapping sequence fails CONFLICT and leaves the checkpoint unchanged.
+Record byte inspection agrees with each normalized producer sequence; historical
+records remain explicitly unpositioned. Foreign-store, absent-window and unknown
+MCP-field refusals are also verified. Final status has 197 retained records,
+zero active pins, zero handles across all four registries and zero pending writes.
+
+Context regression evidence in /tmp/sparrow-context-live.w0z7bd08 preserves
+CLI/MCP row equality, partial scan evidence, unknown diagnostic membership and
+strict refusal. Exact-byte evidence in
+/tmp/sparrow-artifact-filters-raw-regression.phxflk78 preserves the 82-byte
+descriptor, 87-byte CRLF handoff, original IDs, removed handoff phase and
+replacement producer file. Key-path evidence in
+/tmp/sparrow-key-path-live.t6def1kd preserves root/path counts, invalid-pointer
+refusal and unknown-scope coverage. All eight query/result shapes in
+/tmp/sparrow-result-next-live.rljg0in6 preserve frozen original/generic CLI/MCP
+continuations after pin mutation and release. The key cursor deadline
+2026-10-08T06:17:31.957Z and released-pin cursor deadline
+2026-10-08T06:17:32.103Z expire with RESULT_EXPIRED and no stdout.
 Live tailing, syslog, full governed SPARQL and full architecture acceptance
 remain unmet.
 
