@@ -59,8 +59,43 @@ Core evidence also covers released-pin replay, foreign/unknown/previous-owner
 handles, malformed and variable byte-page positions, and fixed absolute expiry.
 The MCP catalog exposes 24 tools; result_next has a closed read-only input.
 
-Source qualification and runtime adoption are separate; the schema 30 section
-below preserves the preceding runtime evidence.
+The feature source commit is `852ccff`; `2db5740` corrects record reply operation
+placement and strengthens the canonical renderer scenario to check root labels
+and field witnesses. Both signed commits passed the full verification hook.
+The owned development unit reopened the corrected build at
+`2026-10-08T04:35:29Z`, PID 1818673, after graceful exit, successful inactive
+state and socket removal of the preceding owned PID 1759754. The same config,
+socket and store identity remain in use: `store:46c88e949ccec658600b66c7becd5bb7`,
+format `sparrow.store/16`, 195 live records; directory/socket modes are 0700/0600.
+
+`/tmp/sparrow-result-next-live.eg1zyfj9` records cursor-only CLI/MCP equality with
+original continuations for record, text, key, value, artifact, source, collection
+and direct-member pages. Captured totals are respectively 3, 3, 7, 3, 2, 16, 2
+and 2. Operation identities, snapshot/as-of, limits, coverage and semantic
+receipts are preserved. A revision-guarded pin captures two message values;
+subsequent expansion and release leave its cursor-only result unchanged.
+Foreign store, malformed cursor, zero position and unknown handle refuse with
+typed errors and empty stdout. All temporary pins are released; the live
+record population is unchanged and pending writes are zero.
+The released-pin result cursor refuses `RESULT_EXPIRED` after its original
+absolute deadline `2026-10-08T04:36:29.837Z`; intervening original and cursor-only
+replays did not renew it. Final status has zero query/artifact/source/pin result
+handles, active pins and pending writes.
+
+`/tmp/sparrow-artifact-scope-schema30-compat.4a9jhcem` verifies current
+result-next/status/key/value/record/text/source/artifact refusal against the
+archived schema-30 daemon: exit 1, `UNSUPPORTED`, empty stdout. Archive SHA-256:
+`2027b82a82b924befb9712f47a4cc9bf43b79f4de520121eb2209f35dcd48af4`.
+The private compatibility child exits cleanly and removes its socket.
+`/tmp/sparrow-artifact-filters-raw-regression.33h_qe_a` verifies exact 82-byte
+descriptor and 87-byte CRLF handoff reconstruction, stable identities, removed
+handoff phase and preserved producer replacement.
+
+Full architecture acceptance remains unmet. Complete scope receipts, indexed
+corpus-scale selection, the recorded upstream governed SPARQL seam, stream/tail/
+syslog generation and gap contracts, and full physical/resource/recovery
+qualification remain required. The schema 30 section below preserves preceding
+runtime evidence.
 
 ## Schema 30 JSON discovery result pages
 

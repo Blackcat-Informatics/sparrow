@@ -585,7 +585,7 @@ decoding, typed coverage encoding and rendering.
 Cursors bind the original membership, selector and limits. Continuation serves
 the immutable capture after pin release, collection changes or evidence retirement;
 fresh reads revalidate current evidence. No read renews protection. Current
-discovery schema 29 is required; old clients/daemons are explicitly refused.
+discovery schema 31 is required; old clients/daemons are explicitly refused.
 Storage formats and retained evidence encodings are unchanged.
 
 Schema 25 adds typed `sourcesList`, CLI `sparrow SOCKET sources STORE_ID`
