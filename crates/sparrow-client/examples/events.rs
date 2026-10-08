@@ -55,17 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
-            let client = match args[0].strip_prefix("tcp://") {
-                Some(address) => {
-                    Client::connect_tcp(address.parse().map_err(|_| {
-                        sparrow_client::Error::InvalidArgument(
-                            "TCP endpoint requires a numeric IP address and port",
-                        )
-                    })?)
-                    .await?
-                }
-                None => Client::connect(std::path::Path::new(&args[0])).await?,
-            };
+            let client =
+                Client::connect_endpoint(&sparrow_client::Endpoint::parse(&args[0])?).await?;
             let receipt = client.events_with_durability(&batch, durability).await?;
             println!(
                 "{} {:?} records={} bytes={}",

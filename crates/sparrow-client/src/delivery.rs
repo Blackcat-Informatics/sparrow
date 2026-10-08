@@ -20,8 +20,8 @@ use std::{
 /// Explicit producer resource and timing bounds.
 #[derive(Debug, Clone)]
 pub struct DeliveryConfig {
-    /// Private daemon socket.
-    pub socket: PathBuf,
+    /// Explicit Unix or public TCP daemon destination.
+    pub endpoint: crate::Endpoint,
     /// Immutable logical event source.
     pub source: String,
     /// Queued plus in-flight event limit.
@@ -42,8 +42,18 @@ pub struct DeliveryConfig {
 impl DeliveryConfig {
     /// Default bounded queue, two-second batching, and finite RPC/retry deadlines.
     pub fn new(socket: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+        Self::for_endpoint(crate::Endpoint::Unix(socket.into()), source)
+    }
+
+    /// Default bounded delivery through a public typed TCP endpoint.
+    pub fn tcp(address: std::net::SocketAddr, source: impl Into<String>) -> Self {
+        Self::for_endpoint(crate::Endpoint::Tcp(address), source)
+    }
+
+    /// One default resource/timing law for every supported transport.
+    pub fn for_endpoint(endpoint: crate::Endpoint, source: impl Into<String>) -> Self {
         Self {
-            socket: socket.into(),
+            endpoint,
             source: source.into(),
             max_queued_events: 1024,
             max_queued_bytes: 4 * 1024 * 1024,
@@ -55,9 +65,9 @@ impl DeliveryConfig {
         }
     }
     fn validate(&self) -> Result<(), Error> {
+        self.endpoint.validate()?;
         if self.source.is_empty()
             || self.source.len() > 512
-            || self.socket.as_os_str().len() > 4096
             || !(1..=16_384).contains(&self.max_queued_events)
             || !(MAX_EVENT_BYTES..=64 * 1024 * 1024).contains(&self.max_queued_bytes)
             || !(1..=MAX_EVENT_BATCH_EVENTS).contains(&self.batch_events)
@@ -279,7 +289,9 @@ impl Delivery {
         config.validate()?;
         // Retain only bounded source/path allocations supplied at setup.
         config.source = config.source.as_str().to_owned();
-        config.socket = config.socket.as_path().to_path_buf();
+        if let crate::Endpoint::Unix(path) = &mut config.endpoint {
+            *path = path.as_path().to_path_buf();
+        }
         let mut instance = [0; 16];
         getrandom::fill(&mut instance).map_err(|error| std::io::Error::other(error.to_string()))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -757,7 +769,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
             Action::Send(batch) => {
                 let attempt = async {
                     if connection.is_none() {
-                        let client = Client::connect(&shared.config.socket).await?;
+                        let client = Client::connect_endpoint(&shared.config.endpoint).await?;
                         shared.bind_store(&client.discovery().store_id)?;
                         connection = Some(client);
                     }
@@ -864,46 +876,52 @@ mod tests {
     }
 
     #[test]
-    fn last_owner_cancels_an_unresponsive_socket_without_waiting_for_rpc_deadline() {
+    fn last_owner_cancels_unresponsive_unix_and_tcp_without_waiting_for_rpc_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("unresponsive.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let mut config = DeliveryConfig::new(socket, "test");
-        config.batch_events = 1;
-        config.rpc_timeout = Duration::from_secs(60);
-        let delivery = Delivery::start(config).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while matches!(
-            delivery.try_send(event()),
-            Admission::Dropped {
-                reason: DropReason::Contended,
-                ..
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        for endpoint in [
+            crate::Endpoint::Unix(socket),
+            crate::Endpoint::Tcp(tcp.local_addr().unwrap()),
+        ] {
+            let mut config = DeliveryConfig::for_endpoint(endpoint, "test");
+            config.batch_events = 1;
+            config.rpc_timeout = Duration::from_secs(60);
+            let delivery = Delivery::start(config).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while matches!(
+                delivery.try_send(event()),
+                Admission::Dropped {
+                    reason: DropReason::Contended,
+                    ..
+                }
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned worker admission remained contended"
+                );
+                std::thread::yield_now();
             }
-        ) {
-            assert!(
-                Instant::now() < deadline,
-                "owned worker admission remained contended"
-            );
-            std::thread::yield_now();
-        }
-        while delivery.pending_batch().unwrap().is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "owned worker did not begin a batch"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let observer = delivery.shared.clone();
-        let sibling = delivery.clone();
-        drop(delivery);
-        assert!(!observer.aborted.load(Ordering::SeqCst));
-        drop(sibling);
-        while !observer.stopped.load(Ordering::SeqCst) {
-            assert!(
-                Instant::now() < deadline,
-                "last-owner cancellation waited for a 60-second RPC deadline"
-            );
-            std::thread::sleep(Duration::from_millis(1));
+            while delivery.pending_batch().unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned worker did not begin a batch"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let observer = delivery.shared.clone();
+            let sibling = delivery.clone();
+            drop(delivery);
+            assert!(!observer.aborted.load(Ordering::SeqCst));
+            drop(sibling);
+            while !observer.stopped.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "last-owner cancellation waited for a 60-second RPC deadline"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 

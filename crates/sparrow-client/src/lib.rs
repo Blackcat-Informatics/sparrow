@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Typed Sparrow producer access over a private Unix socket, without a database dependency.
+//! Typed Sparrow producer access over Unix or public TCP, without a database dependency.
 //!
 //! Run the client inside a Tokio `LocalSet`; Cap'n Proto capabilities stay on its
 //! owning task. A retry must reuse the original request ID, source, format and bytes.
@@ -26,7 +26,7 @@ pub mod sparrow_capnp {
 }
 
 mod transport;
-pub use transport::{Connection, connect, connect_tcp};
+pub use transport::{Connection, Endpoint, connect, connect_tcp};
 mod error;
 pub use error::Error;
 mod receipt;
@@ -145,17 +145,21 @@ impl Client {
     }
     /// Connect and verify discovery before allowing producer mutations.
     pub async fn connect(socket: &std::path::Path) -> Result<Self, Error> {
-        let connection = transport::connect_typed(socket).await?;
-        Self::from_connection(connection).await
+        Self::connect_endpoint(&Endpoint::Unix(socket.into())).await
     }
 
     /// Connect to public Cap'n Proto TCP and verify the same typed discovery contract.
     pub async fn connect_tcp(address: std::net::SocketAddr) -> Result<Self, Error> {
-        let connection = transport::connect_tcp(address).await?;
-        Self::from_connection(connection).await
+        Self::connect_endpoint(&Endpoint::Tcp(address)).await
     }
 
-    async fn from_connection(connection: Connection) -> Result<Self, Error> {
+    /// Connect and validate discovery through the selected typed transport.
+    pub async fn connect_endpoint(endpoint: &Endpoint) -> Result<Self, Error> {
+        endpoint.validate()?;
+        let connection = match endpoint {
+            Endpoint::Unix(socket) => transport::connect_typed(socket).await?,
+            Endpoint::Tcp(address) => transport::connect_tcp(*address).await?,
+        };
         let discovery = Discovery::fetch(&connection.client).await?;
         Ok(Self {
             connection,

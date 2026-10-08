@@ -1918,7 +1918,7 @@ names = ['^(wait_for_logger_flush|wait_for_logger_shutdown)$']
 
 [[job]]
 id = "producer-delivery-worker"
-summary = "The one owned worker drives typed discovery, finite RPC deadlines, immutable retries and automatic batching."
+summary = "The one owned worker drives Unix or TCP typed discovery, finite RPC deadlines, immutable retries and automatic batching."
 home = "sparrow_client::delivery::run"
 entry_points = []
 spec = "docs/development-runtime.md: owned producer transport worker."
@@ -2688,6 +2688,48 @@ summary = "CLI and MCP record/context summaries share one generated syslog evide
 home = "sparrow_server::syslog_wire::render"
 entry_points = ["sparrow_server::agent::context::render_record"]
 spec = "docs/interfaces.md: syslog packet interpretation."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "producer-endpoint-selection"
+summary = "Direct clients and logging workers select one explicit Unix or TCP endpoint and validate discovery through the same client constructor."
+home = "sparrow_client::Client::connect_endpoint"
+entry_points = ["sparrow_client::Client::connect", "sparrow_client::Client::connect_tcp", "sparrow_client::delivery::run"]
+spec = "docs/interfaces.md: public TCP logging."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(connect_tcp_logging_client|discover_tcp_logging_client)$']
+
+[[job]]
+id = "producer-endpoint-spelling"
+summary = "Examples share explicit numeric TCP address or Unix-path interpretation; native SocketAddr owns address parsing."
+home = "sparrow_client::transport::Endpoint::parse"
+entry_points = []
+spec = "docs/interfaces.md: public TCP logging."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "tcp-daemon-test-binding"
+summary = "Real-daemon direct and queued TCP acceptance share one explicit wildcard binding fixture."
+home = "sparrow_server::test_crate::rpc::configure_tcp_listener"
+entry_points = []
+spec = "docs/interfaces.md: public TCP logging."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true

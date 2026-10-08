@@ -12,6 +12,100 @@ use std::{
 
 struct Daemon(Child);
 
+fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, std::net::TcpListener) {
+    let reservation = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    let mut text = std::fs::read_to_string(config).unwrap();
+    text.push_str(&format!("rpc_tcp_address = \"0.0.0.0:{port}\"\n"));
+    std::fs::write(config, text).unwrap();
+    (([127, 0, 0, 1], port).into(), reservation)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_reopen() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let mut settings = sparrow_client::DeliveryConfig::tcp(address, "tcp-logging");
+            settings.batch_events = 1;
+            settings.rpc_timeout = Duration::from_millis(100);
+            settings.retry_interval = Duration::from_millis(20);
+            let delivery = sparrow_client::Delivery::start(settings).unwrap();
+            assert_eq!(
+                admit(&delivery, delivery_event("queued before TCP listener")).await,
+                1
+            );
+            assert!(matches!(
+                delivery_barrier(&delivery, false, Duration::from_millis(150)).await,
+                Err(sparrow_client::FlushError::TimedOut(_))
+            ));
+            let first_pending = delivery.pending_batch().unwrap().unwrap();
+            let daemon = start(&config, &socket).await;
+            let first =
+                reached_delivery(delivery_barrier(&delivery, false, Duration::from_secs(5)).await);
+            assert_eq!(first.durable_sequence, 1);
+            assert_eq!(first.durable_events, 1);
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert_eq!(
+                client.events(&first_pending).await.unwrap(),
+                first.last_receipt.clone().unwrap()
+            );
+            drop(client);
+            drop(daemon);
+            assert_eq!(
+                admit(&delivery, delivery_event("queued during TCP outage")).await,
+                2
+            );
+            assert!(matches!(
+                delivery_barrier(&delivery, false, Duration::from_millis(150)).await,
+                Err(sparrow_client::FlushError::TimedOut(_))
+            ));
+            let second_pending = delivery.pending_batch().unwrap().unwrap();
+            assert_eq!(
+                first_pending.client_instance,
+                second_pending.client_instance
+            );
+            assert_ne!(first_pending.request_id, second_pending.request_id);
+            assert_eq!(second_pending.events[0].sequence, 2);
+            std::fs::remove_file(&socket).unwrap();
+            let daemon = start(&config, &socket).await;
+            let second =
+                reached_delivery(delivery_barrier(&delivery, true, Duration::from_secs(5)).await);
+            assert_eq!(second.durable_sequence, 2);
+            assert_eq!(second.durable_events, 2);
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert_eq!(
+                client.events(&second_pending).await.unwrap(),
+                second.last_receipt.unwrap()
+            );
+            assert_eq!(
+                client.events(&first_pending).await.unwrap(),
+                first.last_receipt.unwrap()
+            );
+            let response = client
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
+                2
+            );
+            assert_eq!(delivery.stats().unwrap().pending_events, 0);
+            drop(delivery);
+            drop(client);
+            drop(daemon);
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix() {
     tokio::task::LocalSet::new()
@@ -20,16 +114,10 @@ async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let reservation = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-            let port = reservation.local_addr().unwrap().port();
-            let mut text = std::fs::read_to_string(&config).unwrap();
-            text.push_str(&format!("rpc_tcp_address = \"0.0.0.0:{port}\"\n"));
-            std::fs::write(&config, text).unwrap();
+            let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
-            let tcp = sparrow_client::Client::connect_tcp(([127, 0, 0, 1], port).into())
-                .await
-                .unwrap();
+            let tcp = sparrow_client::Client::connect_tcp(address).await.unwrap();
             let unix = sparrow_client::Client::connect(&socket).await.unwrap();
             assert_eq!(tcp.discovery().store_id, unix.discovery().store_id);
             let receipt = tcp
@@ -75,9 +163,7 @@ async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix
             drop(daemon);
             std::fs::remove_file(&socket).unwrap();
             let daemon = start(&config, &socket).await;
-            let tcp = sparrow_client::Client::connect_tcp(([127, 0, 0, 1], port).into())
-                .await
-                .unwrap();
+            let tcp = sparrow_client::Client::connect_tcp(address).await.unwrap();
             assert_eq!(
                 tcp.ingest(
                     "tcp-retry",

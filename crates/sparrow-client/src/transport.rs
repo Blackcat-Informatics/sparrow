@@ -9,7 +9,42 @@ use futures::AsyncReadExt;
 use std::path::Path;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-/// An owned local RPC connection; dropping it closes this client's transport.
+/// Explicit typed RPC destination, shared by direct clients and logging workers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    /// Private local Unix socket.
+    Unix(std::path::PathBuf),
+    /// Numeric TCP address; no HTTP envelope or authentication negotiation.
+    Tcp(std::net::SocketAddr),
+}
+
+impl Endpoint {
+    /// Read an example/CLI destination: `tcp://IP:PORT` or a Unix socket path.
+    pub fn parse(value: &str) -> Result<Self, crate::Error> {
+        let endpoint = match value.strip_prefix("tcp://") {
+            Some(address) => Self::Tcp(address.parse().map_err(|_| {
+                crate::Error::InvalidArgument("TCP endpoint requires a numeric IP address and port")
+            })?),
+            None => Self::Unix(value.into()),
+        };
+        endpoint.validate()?;
+        Ok(endpoint)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        if match self {
+            Self::Unix(path) => path.as_os_str().is_empty() || path.as_os_str().len() > 4096,
+            Self::Tcp(address) => address.port() == 0,
+        } {
+            return Err(crate::Error::InvalidArgument(
+                "endpoint requires a Unix path of 1..4096 bytes or a nonzero TCP port",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An owned RPC connection; dropping it closes this client's transport.
 pub struct Connection {
     /// Typed Sparrow capability; no JSON operation dispatch is used on the wire.
     pub client: sparrow::Client,

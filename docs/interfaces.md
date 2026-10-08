@@ -1025,7 +1025,15 @@ facade can compose through tracing. A persistent client spool is a later
 extension; the initial layer does not promise survival of producer-process loss.
 The layer follows the public [tracing subscriber layer contract](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/index.html).
 
-`sparrow_client::TracingLayer::new(delivery.clone())` now composes through
+`DeliveryConfig::tcp(SocketAddr, source)` selects public Cap'n Proto for the
+same bounded logging worker; `DeliveryConfig::new(path, source)` selects Unix.
+The explicit `endpoint: Endpoint` field has one Unix/TCP variant; there is no
+second socket fallback. Direct clients and workers share discovery, retries,
+store identity checks and native field preservation. Both examples use the
+shared `Endpoint::parse` spelling, `tcp://IP:PORT` or a Unix path. The tracing
+example can therefore send to `tcp://192.168.2.4:518`.
+
+`sparrow_client::TracingLayer::new(delivery.clone())` composes through
 `SubscriberExt::with`; it never sets a global subscriber. One Sparrow layer per
 subscriber uses bounded extension snapshots (1024 live spans, 16 KiB conservative
 charge per snapshot). Text/binary field capture and debug/error rendering each

@@ -40,8 +40,12 @@ and response admission; byte exhaustion refuses without a successful prefix.
 The standalone producer client and schema-11 typed event batch operation are
 present. Native event JSONL enters the same occurrence/field/text/time indexes;
 the bounded producer queue now reconnects with immutable pending batches and
-provides durable admitted-input flush/shutdown fences. The tracing layer, span
-capture and explicit server buffered-WAL acknowledgement/flush contracts remain
+provides durable admitted-input flush/shutdown fences. The tracing layer, typed
+span/context capture, explicit buffered-WAL acknowledgements and flush-through,
+and finite producer sequence windows are implemented. Public TCP shares the
+generated service and bounded Rust logging worker with Unix. Bounded syslog
+listeners and packet interpretation are implemented; active-log generations,
+tail checkpoints, rotation/completion and operational qualification remain
 milestone-4 work.
 
 This plan builds on [Architecture](architecture.md) and [Interfaces](interfaces.md).
