@@ -105,6 +105,8 @@ pub struct SourceSummary {
     pub tail_generation_ids: Vec<String>,
     /// Configured syslog listeners, including those with no retained packets.
     pub syslog_listener_ids: Vec<String>,
+    /// Retained durable receiver observation windows, including discard-only sources.
+    pub receiver_window_ids: Vec<String>,
 }
 
 /// The native occurrence metadata IRI for an exact intake key.
@@ -129,6 +131,7 @@ impl SourceSummary {
             producer_stream_ids: Vec::new(),
             tail_generation_ids: Vec::new(),
             syslog_listener_ids: Vec::new(),
+            receiver_window_ids: Vec::new(),
         }
     }
     fn capacity(&self) -> usize {
@@ -136,11 +139,13 @@ impl SourceSummary {
             + self.producer_stream_ids.capacity() * std::mem::size_of::<String>()
             + self.tail_generation_ids.capacity() * std::mem::size_of::<String>()
             + self.syslog_listener_ids.capacity() * std::mem::size_of::<String>()
+            + self.receiver_window_ids.capacity() * std::mem::size_of::<String>()
             + self
                 .producer_stream_ids
                 .iter()
                 .chain(self.tail_generation_ids.iter())
                 .chain(self.syslog_listener_ids.iter())
+                .chain(self.receiver_window_ids.iter())
                 .map(String::capacity)
                 .sum::<usize>()
             + self.rdf_iri.capacity()
@@ -376,6 +381,32 @@ impl Store {
                 row.producer_stream_ids.push(stream.id);
             }
         }
+        admission.entry(
+            writer
+                .db
+                .get(super::receiver_stream::KEY)?
+                .map_or(0, |bytes| bytes.len()),
+        )?;
+        for window in super::receiver_stream::registry(&writer)? {
+            admission.entry(0)?;
+            if window.expires_at > now
+                && query
+                    .selector
+                    .source
+                    .as_ref()
+                    .is_none_or(|wanted| wanted == &window.source)
+            {
+                let row = admit_source(&mut rows, &window.source, &mut capacity)?;
+                capacity += window.id.capacity() + std::mem::size_of::<String>();
+                if capacity > CAPTURE_BYTES {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        "receiver window references exceed source capture capacity",
+                    ));
+                }
+                row.receiver_window_ids.push(window.id);
+            }
+        }
         let tail_registry = writer.db.get(super::tail::KEY)?.ok_or_else(|| {
             Error::new(
                 "STORAGE_FAILURE",
@@ -512,6 +543,7 @@ impl Store {
         for row in rows.values_mut() {
             row.tail_generation_ids.sort();
             row.syslog_listener_ids.sort();
+            row.receiver_window_ids.sort();
             row.watches.sort_by(|a, b| a.watch_id.cmp(&b.watch_id));
         }
         let snapshot = catalog_lease::Snapshot {

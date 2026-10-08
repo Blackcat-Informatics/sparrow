@@ -416,7 +416,11 @@ Support modern RFC 5424 and legacy RFC 3164 syslog messages. TCP listeners use a
 configured RFC 6587 framing mode; octet counting is preferred. UDP ingestion is
 optional and reports drops, truncation, and malformed messages without promising
 acknowledged delivery. Preserve raw messages. Do not silently invent a year or
-time zone for an ambiguous legacy timestamp. [Syslog messages](https://www.rfc-editor.org/rfc/rfc5424.html),
+time zone for an ambiguous legacy timestamp. Durable receiver positions describe
+commit order and classified local discards separately from sender sequences;
+sender/network/kernel and pre-commit continuity remain unknown. Finite receiver
+summaries never extend raw retention and are not renewed by evidence pins.
+[Syslog messages](https://www.rfc-editor.org/rfc/rfc5424.html),
 [TCP framing](https://www.rfc-editor.org/rfc/rfc6587.html).
 
 ## 7. Graph and text query storage

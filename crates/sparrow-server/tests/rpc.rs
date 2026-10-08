@@ -1337,12 +1337,60 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         assert_eq!(observed["listener"]["accepted_messages"].as_str(), Some("4"));
         assert_eq!(observed["listener"]["interpretation_failures"].as_str(), Some("1"));
         assert_eq!(observed["listener"]["framing_failures"].as_str(), Some("1"));
+        let receiver_sources = cli(&endpoint, &["sources", &store_id]);
+        let mut receiver_ids = std::collections::BTreeMap::new();
+        let mut receiver_mcp = Mcp::start(&socket);
+        receiver_mcp.initialize(1).await;
+        for source in receiver_sources["rows"].as_array().unwrap() {
+            let ids = source["receiver_window_ids"].as_array().unwrap();
+            assert_eq!(ids.len(), 1);
+            let id = ids[0].as_str().unwrap();
+            let history = cli(&endpoint, &["receiver-window", &store_id, id]);
+            assert_eq!(history["source"], source["source_id"]);
+            assert_eq!(history["continuity_unknown"].as_bool(), Some(true));
+            assert_eq!(history["pre_commit_loss_unknown"].as_bool(), Some(true));
+            let result = receiver_mcp.tool(2, "receiver_window_get", purrdf_lex::json::Object::new().with("store_id", store_id.clone()).with("window_id", id).into()).await;
+            assert_eq!(result["isError"].as_bool(), Some(false));
+            assert_eq!(history, result["structuredContent"]);
+            if source["source_id"].as_str() == Some("syslog-octets") {
+                assert_eq!(history["observations"].as_str(), Some("6"));
+                assert_eq!(history["accepted"].as_str(), Some("4"));
+                assert_eq!(history["framing_failures"].as_str(), Some("1"));
+                assert_eq!(history["timed_out"].as_str(), Some("1"));
+                assert_eq!(history["gaps"][0]["first"].as_str(), Some("5"));
+            }
+            if source["source_id"].as_str() == Some("syslog-datagrams") {
+                assert_eq!(history["observations"].as_str(), Some("2"));
+                assert_eq!(history["accepted"].as_str(), Some("1"));
+                assert_eq!(history["truncated"].as_str(), Some("1"));
+            }
+            receiver_ids.insert(source["source_id"].as_str().unwrap().to_owned(), id.to_owned());
+        }
+        assert!(receiver_sources["next_cursor"].is_null(), "receiver fixture must fit one source page, whose lease retires automatically");
+        let id = &receiver_ids["syslog-octets"];
+        for (sid, schema, window, code) in [
+            (store_id.as_str(), sparrow_client::SCHEMA_VERSION-1, id.as_str(), "UNSUPPORTED"),
+            ("store:other", sparrow_client::SCHEMA_VERSION, id.as_str(), "STORE_MISMATCH"),
+            (store_id.as_str(), sparrow_client::SCHEMA_VERSION, "syslog-receiver:absent", "NOT_FOUND"),
+            (store_id.as_str(), sparrow_client::SCHEMA_VERSION, "producer-stream:wrong", "INVALID_ARGUMENT"),
+        ] {
+            let mut request = tcp.capability().receiver_window_get_request();
+            let mut query = request.get().init_query(); query.set_store_id(sid); query.set_schema_version(schema); query.set_id(window);
+            let response = request.send().promise.await.unwrap();
+            let wire::result::Error(error) = response.get().unwrap().get_result().unwrap().which().unwrap() else { panic!("invalid receiver lookup accepted") };
+            assert_eq!(error.unwrap().get_code().unwrap().to_str().unwrap(), code);
+        }
+        receiver_mcp.close(true).await;
         drop(idle); drop(excess); drop(tcp); drop(client); drop(daemon);
         let store = sparrow_server::ServerConfig::read(&config).unwrap().open_store().unwrap();
         let now = sparrow_server::now().unwrap();
         let rows: Vec<_> = store.records(now).unwrap().into_iter().filter(|row| row.source == "syslog-octets").collect();
         assert_eq!(rows.len(), 4);
+        assert_eq!(store.receiver_window(&receiver_ids["syslog-octets"], now).unwrap().observations, 6);
         for record in rows {
+            let position = record.receiver.as_ref().unwrap();
+            assert_eq!(position.window_id, receiver_ids["syslog-octets"]);
+            assert!((1..=4).contains(&position.sequence));
             let bytes = store.bytes(&record.artifact_id, record.byte_start, (record.byte_end-record.byte_start) as usize, now).unwrap();
             let snapshot = record.syslog.unwrap();
             if bytes == modern { assert_eq!(snapshot.structured_data[0].parameters.len(), 2); }
@@ -6731,7 +6779,7 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 32);
+    assert_eq!(definitions.len(), 33);
     for (name, read_only) in [
         ("file_finish", false),
         ("file_finish_get", true),
@@ -6739,6 +6787,7 @@ async fn mcp_exercise(
         ("watch_handoff_get", true),
         ("result_release", false),
         ("syslog_listener_get", true),
+        ("receiver_window_get", true),
     ] {
         assert_eq!(
             definitions

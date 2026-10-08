@@ -74,7 +74,12 @@ impl State {
         };
         if !matches!(
             db.get("store_format")?.as_deref(),
-            Some(FORMAT | WATCH_FORMAT)
+            Some(
+                FORMAT
+                    | WATCH_FORMAT
+                    | super::receiver_stream::FORMAT
+                    | super::receiver_stream::WATCH_FORMAT
+            )
         ) {
             return Err(Error::new(
                 "STORAGE_FAILURE",

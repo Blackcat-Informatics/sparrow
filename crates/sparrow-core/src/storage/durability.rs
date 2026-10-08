@@ -134,7 +134,17 @@ impl Writer {
         let mut publication = super::eviction::Publication::default();
         batch.iterate_cf(&mut publication);
         publication.check()?;
-        if publication.pressure_wait
+        if publication.receiver_registry || self.db.get(super::receiver_stream::KEY)?.is_some() {
+            let watch = publication.watch_registry || self.db.get("watch_registry")?.is_some();
+            batch.put(
+                "store_format",
+                if watch {
+                    super::receiver_stream::WATCH_FORMAT
+                } else {
+                    super::receiver_stream::FORMAT
+                },
+            );
+        } else if publication.pressure_wait
             || matches!(
                 self.db.get("store_format")?.as_deref(),
                 Some(super::pressure::FORMAT | super::pressure::WATCH_FORMAT)

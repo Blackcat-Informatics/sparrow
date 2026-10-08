@@ -103,6 +103,7 @@ struct Counts {
 }
 #[derive(Clone)]
 pub(crate) struct Status {
+    receiver: sparrow_core::SyslogReceiver,
     pub definition: SyslogListener,
     pub address: SocketAddr,
     pub active_connections: usize,
@@ -193,6 +194,19 @@ impl SyslogWorker {
                 }
             };
             let metric = Metrics(Arc::new(Mutex::new(Status {
+                receiver: sparrow_core::SyslogReceiver::new(
+                    &definition.id,
+                    match (definition.transport, definition.framing) {
+                        (SyslogTransport::Udp, _) => "udp",
+                        (SyslogTransport::Tcp, Some(SyslogFraming::OctetCounting)) => {
+                            "tcp_octet_counting"
+                        }
+                        (SyslogTransport::Tcp, Some(SyslogFraming::Lf)) => "tcp_lf",
+                        (SyslogTransport::Tcp, Some(SyslogFraming::CrLf)) => "tcp_cr_lf",
+                        _ => return Err(io::Error::other("TCP receiver framing missing")),
+                    },
+                )
+                .map_err(io::Error::other)?,
                 definition: definition.clone(),
                 address,
                 active_connections: 0,
@@ -265,8 +279,22 @@ async fn publish(
     bytes: Vec<u8>,
     metrics: &Metrics,
 ) -> io::Result<bool> {
+    let receiver = metrics.snapshot()?.receiver;
     let result = tokio::task::spawn_blocking(move || {
-        let artifact = store.ingest_syslog(&source, &bytes, crate::now()?)?;
+        let now = crate::now()?;
+        let artifact = match store.ingest_received_syslog(&source, &receiver, &bytes, now) {
+            Ok(artifact) => artifact,
+            Err(error) if matches!(error.code, "RESOURCE_LIMIT" | "STORAGE_PRESSURE") => {
+                store.discard_syslog(
+                    &source,
+                    &receiver,
+                    sparrow_core::ReceiverDiscard::Refused,
+                    now,
+                )?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let record = store.record(artifact.record_ids.first().ok_or_else(|| {
             sparrow_core::Error::new(
                 "STORAGE_FAILURE",
@@ -279,12 +307,12 @@ async fn publish(
                 "syslog publication has no protocol snapshot",
             )
         })?;
-        Ok::<_, sparrow_core::Error>(snapshot.diagnostic.is_some())
+        Ok::<_, sparrow_core::Error>(Some(snapshot.diagnostic.is_some()))
     })
     .await
     .map_err(io::Error::other)?;
     match result {
-        Ok(failed) => {
+        Ok(Some(failed)) => {
             metrics.update(|status| {
                 increment(&mut status.counts.accepted)?;
                 if failed {
@@ -294,15 +322,52 @@ async fn publish(
             })?;
             Ok(true)
         }
-        Err(error) => {
+        Ok(None) => {
             metrics.update(|status| {
                 increment(&mut status.counts.refused)?;
-                status.failure = Some(error.to_string());
+                status.failure = Some("packet refused by storage admission".into());
                 Ok(())
             })?;
             Ok(false)
         }
+        Err(error) => Err(io::Error::other(error)),
     }
+}
+
+/// One bounded waiter per admitted listener/connection; shutdown joins the control write.
+async fn discard(
+    store: &sparrow_core::Store,
+    metrics: &Metrics,
+    operations: &Arc<Semaphore>,
+    reason: sparrow_core::ReceiverDiscard,
+) -> io::Result<()> {
+    let permit = operations
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(io::Error::other)?;
+    let status = metrics.snapshot()?;
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.discard_syslog(
+            &status.definition.source,
+            &status.receiver,
+            reason,
+            crate::now()?,
+        )
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    metrics.update(|status| {
+        increment(match reason {
+            sparrow_core::ReceiverDiscard::Refused => &mut status.counts.refused,
+            sparrow_core::ReceiverDiscard::Truncated => &mut status.counts.truncated,
+            sparrow_core::ReceiverDiscard::FramingFailure => &mut status.counts.framing_failures,
+            sparrow_core::ReceiverDiscard::TimedOut => &mut status.counts.timed_out,
+        })
+    })
 }
 
 async fn listen(
@@ -351,11 +416,23 @@ async fn listen(
                 }
                 let size = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } continue; }, received = socket.recv_from(&mut buffer) => received?.0 };
                 if size > definition.max_message_bytes {
-                    metrics.update(|status| increment(&mut status.counts.truncated))?;
+                    discard(
+                        &store,
+                        &metrics,
+                        &operations,
+                        sparrow_core::ReceiverDiscard::Truncated,
+                    )
+                    .await?;
                     continue;
                 }
                 let Ok(permit) = operations.clone().try_acquire_owned() else {
-                    metrics.update(|status| increment(&mut status.counts.refused))?;
+                    discard(
+                        &store,
+                        &metrics,
+                        &operations,
+                        sparrow_core::ReceiverDiscard::Refused,
+                    )
+                    .await?;
                     continue;
                 };
                 publish(
@@ -395,23 +472,35 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
             Ok(Ok(Some(bytes))) => bytes,
             Ok(Ok(None)) => return Ok(()),
             Ok(Err(error)) => {
+                discard(
+                    &store,
+                    metrics,
+                    &operations,
+                    sparrow_core::ReceiverDiscard::FramingFailure,
+                )
+                .await?;
                 metrics.update(|status| {
-                    increment(&mut status.counts.framing_failures)?;
                     status.failure = Some(error.to_string());
                     Ok(())
                 })?;
                 return Ok(());
             }
             Err(_) => {
+                discard(
+                    &store,
+                    metrics,
+                    &operations,
+                    sparrow_core::ReceiverDiscard::TimedOut,
+                )
+                .await?;
                 metrics.update(|status| {
-                    increment(&mut status.counts.timed_out)?;
                     status.failure = Some("TCP frame deadline expired; continuity unknown".into());
                     Ok(())
                 })?;
                 return Ok(());
             }
         };
-        let permit = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; metrics.update(|status| increment(&mut status.counts.refused))?; return Ok(()); }, permit = operations.clone().acquire_owned() => permit.map_err(io::Error::other)? };
+        let permit = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; discard(&store, metrics, &operations, sparrow_core::ReceiverDiscard::Refused).await?; return Ok(()); }, permit = operations.clone().acquire_owned() => permit.map_err(io::Error::other)? };
         let accepted = publish(store.clone(), definition.source.clone(), bytes, metrics).await?;
         drop(permit);
         if !accepted {

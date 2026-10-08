@@ -307,6 +307,7 @@ mod tests {
             event_time: source_time::EventTime::unknown("no_profile", None),
             diagnostics: Default::default(),
             producer: None,
+            receiver: None,
             syslog: None,
             tail: None,
             chunks: Vec::new(),

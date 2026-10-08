@@ -12,9 +12,16 @@ use std::collections::BTreeMap;
 pub(super) enum Origin<'a> {
     Ordinary,
     Producer(&'a super::producer_stream::ProducerBatch),
+    Receiver(&'a super::receiver_stream::SyslogReceiver),
     Tail(super::tail::Append<'a>),
 }
 impl<'a> Origin<'a> {
+    pub(super) fn receiver(self) -> Option<&'a super::receiver_stream::SyslogReceiver> {
+        match self {
+            Self::Receiver(value) => Some(value),
+            _ => None,
+        }
+    }
     pub(super) fn producer(self) -> Option<&'a super::producer_stream::ProducerBatch> {
         match self {
             Self::Producer(value) => Some(value),
@@ -51,6 +58,7 @@ pub(super) struct RecordInput<'a> {
     pub source_time_profile: &'a Option<source_time::SourceTimeProfile>,
     pub diagnostic_profile: Option<&'a super::diagnostic::DiagnosticProfile>,
     pub producer: Option<super::producer_stream::ProducerPosition>,
+    pub receiver: Option<super::receiver_stream::ReceiverPosition>,
     pub tail: Option<super::tail::TailPosition>,
 }
 
@@ -254,6 +262,7 @@ impl<'a> RecordBatch<'a> {
             )?,
         };
         let record = Record {
+            receiver: input.receiver,
             tail: input.tail,
             syslog,
             producer: input.producer,
@@ -487,6 +496,11 @@ impl Writer {
                         .map(super::producer_stream::ProducerBatch::encode)
                     || saved.get("tail").filter(|value| !value.is_null()).cloned()
                         != origin.tail().map(|input| input.encode())
+                    || saved
+                        .get("receiver")
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        != origin.receiver().map(|input| input.encode())
                 {
                     return Err(Error::new(
                         "CONFLICT",
@@ -546,6 +560,7 @@ impl Writer {
                     .map(super::producer_stream::ProducerBatch::encode),
             )
             .with("tail", origin.tail().map(|input| input.encode()))
+            .with("receiver", origin.receiver().map(|input| input.encode()))
             .into();
         batch.put(
             format!("request:ingest:{request_id}"),

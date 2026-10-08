@@ -3495,3 +3495,87 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(abort_syslog_publications|join_syslog_children_elsewhere)$']
+
+[[job]]
+id = "finite-sequence-registry"
+summary = "Producer and receiver windows share encoded/item admission, native catalog decoding and identity uniqueness; no second registry reader."
+home = "sparrow_core::storage::sequence_window::registry"
+entry_points = ["sparrow_core::storage::producer_stream::registry", "sparrow_core::storage::receiver_stream::registry"]
+spec = "docs/interfaces.md: finite producer and receiver windows."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_receiver_registry_elsewhere|decode_producer_registry_elsewhere)$']
+
+[[job]]
+id = "finite-sequence-gap-accounting"
+summary = "Inclusive gap arithmetic and bounded recent intervals have one implementation; producer unobserved gaps and receiver known discards retain separate contracts."
+home = "sparrow_core::storage::sequence_window::record_gap"
+entry_points = ["sparrow_core::storage::producer_stream::prepare", "sparrow_core::storage::receiver_stream::prepare"]
+spec = "docs/interfaces.md: structured producer and durable receiver observation windows."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(count_receiver_gap_elsewhere|count_producer_gap_elsewhere)$']
+
+[[job]]
+id = "durable-receiver-observation"
+summary = "One bounded storage owner publishes packet positions and known local discard observations; shared ingestion commits accepted bytes and receiver metadata together."
+home = "sparrow_core::storage::receiver_stream::prepare"
+entry_points = ["sparrow_core::storage::receiver_stream::Store::ingest_received_syslog", "sparrow_core::storage::receiver_stream::Store::discard_syslog"]
+spec = "docs/interfaces.md: durable syslog receiver observations."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(assign_receiver_position_elsewhere|publish_receiver_registry_elsewhere)$']
+
+[[job]]
+id = "receiver-window-agent-read"
+summary = "CLI and closed read-only MCP use one generated receiver lookup and renderer with explicit unknown loss and finite summary retention."
+home = "sparrow_server::agent::receiver::Input::execute"
+entry_points = ["sparrow_server::agent::Command::execute", "sparrow_server::agent::tool::Operation::parse"]
+spec = "docs/interfaces.md: durable syslog receiver observations."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_receiver_window_elsewhere|decode_receiver_tool_elsewhere)$']
+
+[[job]]
+id = "syslog-durable-discard-admission"
+summary = "UDP and TCP classify local discard observations through one bounded permit owner and joined control write; runtime counters follow durable completion."
+home = "sparrow_server::syslog_listener::discard"
+entry_points = ["sparrow_server::syslog_listener::listen", "sparrow_server::syslog_listener::receive_tcp"]
+spec = "docs/interfaces.md: durable syslog receiver observations."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(record_udp_discard_elsewhere|record_tcp_discard_elsewhere)$']
+
+[[job]]
+id = "finite-sequence-window-lookup"
+summary = "Producer and receiver lookups share bounded opaque ID validation and finite expiry selection; summaries never renew record positions."
+home = "sparrow_core::storage::sequence_window::retained"
+entry_points = ["sparrow_core::storage::Store::producer_stream", "sparrow_core::storage::Store::receiver_window"]
+spec = "docs/interfaces.md: finite producer and receiver windows."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(lookup_receiver_window_elsewhere|lookup_producer_window_elsewhere)$']

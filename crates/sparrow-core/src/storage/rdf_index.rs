@@ -666,6 +666,17 @@ pub(super) fn metadata(
         ));
         builder.push_quad(subject, predicate, object, None);
     }
+    if let Some(position) = &record.receiver {
+        let predicate = builder.intern_iri(&format!("{NS}receiverWindow"));
+        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.window_id));
+        builder.push_quad(subject, predicate, object, None);
+        let predicate = builder.intern_iri(&format!("{NS}receiverSequence"));
+        let object = builder.intern_literal(RdfLiteral::typed(
+            position.sequence.to_string(),
+            "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+        ));
+        builder.push_quad(subject, predicate, object, None);
+    }
     if let crate::EventTime::Known {
         millis, profile_id, ..
     } = &record.event_time

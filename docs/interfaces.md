@@ -1070,8 +1070,53 @@ renderer is also used by status. CLI/MCP wrap it with `store_id`, operation
 `syslog_listener_get` and `listener`. This lookup reads current runtime
 observations, not the source capture's historical counters. Counters reset on
 restart; continuity remains unknown, and UDP kernel/network loss remains
-unknown. Durable syslog observation windows, per-record receiver positions and
-their gap/correlation contracts remain unfinished.
+unknown. Durable observations are separate from these process-lifetime counters.
+
+### Durable syslog receiver observations (schema 48)
+
+Configured listeners publish each accepted packet, its immutable `receiver`
+position and its receiver window in one synchronized WAL batch. The position's
+`window_id` and one-based `sequence` name **durable observation commit order**,
+not network arrival order or a sender sequence. Concurrent TCP connections may
+commit in a different order than their read timestamps. Failed protocol
+interpretation still accepts the complete raw packet and a position. Ordinary
+typed syslog uploads have no fabricated receiver position.
+
+Known local refused packets, oversized UDP datagrams, TCP framing failures and
+TCP frame deadlines publish classified observations without a packet occurrence.
+The listener waits for the same bounded global operation admission before these
+control writes; there is at most one waiter per admitted listener/connection.
+Shutdown joins admitted control writes. Storage admission refusals may be
+classified; an uncertain storage failure stops the intake group without claiming
+a known discarded packet. Failed history publication is a visible intake
+failure, never a successful counter update. Rejected TCP connections are runtime
+counts, since no message observation exists.
+
+`ReceiverWindow` exposes exact observations, accepted/discarded totals, counts
+for the four local discard classes, at most 16 recent inclusive discard ordinal
+ranges and `gaps_complete`. Trimming older ranges preserves aggregate counts.
+Every reply has `continuity_unknown=true` and `pre_commit_loss_unknown=true`:
+there is no sender receipt, and sender/network/kernel or observations lost before
+their durable commit cannot be reconstructed. These ranges identify known local
+discard observations, not unobserved sender sequence gaps.
+
+Each listener startup creates a fresh opaque instance. The registry admits 64
+windows and 128 KiB of encoded metadata, with a deadline 30 days after its latest
+observation timestamp. Pins protect record positions and bytes but never renew
+receiver summaries. A still-running instance after summary expiry receives a
+new window ID and starts at ordinal one. Empty listeners remain discoverable
+through current bindings without creating invented durable observations.
+
+Sources freeze sorted `receiver_window_ids`, including discard-only sources.
+Resolve them with typed `receiverWindowGet`, CLI `receiver-window STORE_ID
+WINDOW_ID`, or closed read-only MCP `receiver_window_get` using `store_id` and
+`window_id`. Current schema and exact store identity are required; stale schemas,
+wrong stores, wrong ID kinds and absent/expired windows refuse explicitly.
+References are not pins and do not guarantee a later lookup. Native occurrence
+RDF adds `receiverWindow` and typed `receiverSequence` through PurRDF's builder.
+The first receiver publication fences the store at format 40, or 41 with watch
+state; older writers refuse. Stores without receiver observations keep their
+existing fence. Subsequent writes preserve this fence and existing pressure state.
 
 ### Structured producer sequence windows (schema 35)
 

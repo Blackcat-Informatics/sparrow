@@ -343,6 +343,7 @@ impl Store {
         let mut builder = ingest::RecordBatch::new(&writer)?;
         let record = builder.record(ingest::RecordInput {
             producer: None,
+            receiver: None,
             tail: None,
             id: random_id("record")?,
             artifact_id: &progress.artifact_id,

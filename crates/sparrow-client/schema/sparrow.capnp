@@ -61,6 +61,7 @@ struct SourceSummary {
   producerStreamIds @9 :List(Text);
   tailGenerationIds @10 :List(Text);
   syslogListenerIds @11 :List(Text);
+  receiverWindowIds @12 :List(Text);
 }
 struct SourceListQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;
@@ -77,6 +78,7 @@ struct Record {
   producer @10 :OptionalProducerPosition;
   syslog @11 :OptionalSyslogSnapshot;
   tail @12 :OptionalTailPosition;
+  receiver @13 :OptionalReceiverPosition;
 }
 struct TailDeclaration {
   requestId @0 :Text; watch @1 :Text; watchRevision @2 :UInt64;
@@ -141,6 +143,18 @@ struct ProducerStream {
   continuityUnknown @13 :Bool;
 }
 struct ProducerStreamQuery { storeId @0 :Text; schemaVersion @1 :UInt32; id @2 :Text; }
+struct ReceiverPosition { windowId @0 :Text; sequence @1 :UInt64; }
+struct OptionalReceiverPosition { union { absent @0 :Void; value @1 :ReceiverPosition; } }
+enum ReceiverTransport { udp @0; tcpOctetCounting @1; tcpLf @2; tcpCrLf @3; }
+struct ReceiverWindow {
+  storeId @0 :Text; id @1 :Text; source @2 :Text; listener @3 :Text; instance @4 :Text;
+  transport @5 :ReceiverTransport; observations @6 :UInt64; accepted @7 :UInt64; discarded @8 :UInt64;
+  refused @9 :UInt64; truncated @10 :UInt64; framingFailures @11 :UInt64; timedOut @12 :UInt64;
+  gaps @13 :List(ProducerGap); gapsComplete @14 :Bool;
+  firstReceivedAt @15 :Instant; lastReceivedAt @16 :Instant; expiresAt @17 :Instant;
+  continuityUnknown @18 :Bool; preCommitLossUnknown @19 :Bool;
+}
+struct ReceiverWindowQuery { storeId @0 :Text; schemaVersion @1 :UInt32; id @2 :Text; }
 struct ProducerLimits {
   maxStreams @0 :UInt32; maxGapIntervals @1 :UInt32; maxRegistryBytes @2 :UInt64;
   metadataRetentionSeconds @3 :UInt64;
@@ -588,4 +602,5 @@ interface Sparrow {
   tailFinishGet @41 (request :TailFinishIntent) -> (result :Result(TailGeneration));
   resultRelease @42 (query :ResultReleaseQuery) -> (result :Result(ResultReleased));
   syslogListenerGet @43 (query :SyslogListenerQuery) -> (result :Result(SyslogListenerStatus));
+  receiverWindowGet @44 (query :ReceiverWindowQuery) -> (result :Result(ReceiverWindow));
 }

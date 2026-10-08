@@ -148,6 +148,7 @@ pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
         || format == super::handoff::FORMAT
         || format == super::consumption::TAIL_FORMAT
         || format == super::pressure::WATCH_FORMAT
+        || format == super::receiver_stream::WATCH_FORMAT
 }
 
 /// Startup is unavailable until this persistent index is complete. Each page is durable.

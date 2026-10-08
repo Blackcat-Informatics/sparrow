@@ -39,12 +39,16 @@ const TOOLS: &[(&str, &str)] = &[
         "Read a finite accepted producer window, exact aggregate unobserved positions and bounded recent gaps; prefix and trailing continuity remain unknown.",
     ),
     (
+        "receiver_window_get",
+        "Read durable syslog receiver commit order and known local discard counts/ranges. Sender, kernel/network and pre-commit loss remain unknown; summary retention is independent of pins.",
+    ),
+    (
         "result_next",
         "Resume the captured operation, scope and limits from an immutable cursor; reading never renews its lease or evidence retention.",
     ),
     (
         "sources_list",
-        "Page an immutable capture of exact intake keys, retained occurrence counts, mapping IDs, producer windows, file-generation checkpoint IDs and configured watch/syslog listener bindings; continuity remains explicitly unknown.",
+        "Page an immutable capture of exact intake keys, retained occurrence counts, mapping IDs, producer and receiver windows, file-generation checkpoint IDs and configured watch/syslog listener bindings; continuity remains explicitly unknown.",
     ),
     (
         "artifacts_list",
@@ -232,6 +236,12 @@ pub(crate) fn definitions() -> Value {
                 .with("store_id", string())
                 .with("stream_id", string());
             required.extend(["store_id", "stream_id"]);
+        }
+        if *name == "receiver_window_get" {
+            properties = properties
+                .with("store_id", string())
+                .with("window_id", string());
+            required.extend(["store_id", "window_id"]);
         }
         if *name == "result_next" {
             properties = properties

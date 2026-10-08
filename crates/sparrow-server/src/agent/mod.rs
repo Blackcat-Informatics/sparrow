@@ -19,6 +19,7 @@ mod producer;
 mod query_receipt;
 mod rdf;
 mod read;
+mod receiver;
 mod records;
 mod result;
 mod retry_file;
@@ -42,7 +43,7 @@ pub(super) const USAGE: &str = concat!(
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | producer-stream STORE_ID STREAM_ID | syslog-listener STORE_ID SOURCE LISTENER_ID | file-generation STORE_ID GENERATION_ID | file-finish-prepare REQUEST_ID STORE_ID GENERATION_ID FINAL_FILE INTENT.capnp | file-finish INTENT.capnp | file-finish-status INTENT.capnp",
+    " | producer-stream STORE_ID STREAM_ID | receiver-window STORE_ID WINDOW_ID | syslog-listener STORE_ID SOURCE LISTENER_ID | file-generation STORE_ID GENERATION_ID | file-finish-prepare REQUEST_ID STORE_ID GENERATION_ID FINAL_FILE INTENT.capnp | file-finish INTENT.capnp | file-finish-status INTENT.capnp",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID... | pin-release REQUEST_ID STORE_ID PIN_ID | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--group-by-artifact true|false] [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR | result-release STORE_ID SNAPSHOT_ID",
@@ -77,6 +78,7 @@ pub(super) enum Command {
     Artifacts(artifacts::Input),
     Sources(sources::Input),
     Producer(producer::Input),
+    Receiver(receiver::Input),
     Syslog(syslog::Input),
     Tail(tail::Input),
     TailFinish(tail_finish::Input),
@@ -265,6 +267,15 @@ impl Command {
                 store: args[1].clone(),
                 source: args[2].clone(),
                 id: args[3].clone(),
+            }));
+        }
+        if args.first().is_some_and(|arg| arg == "receiver-window") {
+            if args.len() != 3 {
+                return Err(invalid("receiver-window requires STORE_ID WINDOW_ID"));
+            }
+            return Ok(Self::Receiver(receiver::Input {
+                store: args[1].clone(),
+                id: args[2].clone(),
             }));
         }
         if args.first().is_some_and(|arg| arg == "producer-stream") {
@@ -538,6 +549,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Syslog(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::Receiver(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Producer(input) = self {

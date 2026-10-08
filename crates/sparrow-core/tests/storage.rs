@@ -9,6 +9,307 @@ use sparrow_test_support::{catalog_db, remove_tail_range_index};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins() {
+    use sparrow_core::{ReceiverDiscard, SourceRead, SyslogReceiver};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let receiver = SyslogReceiver::new("udp", "udp").unwrap();
+    let raw = b"<999>uninterpretable packet";
+    let first = store
+        .ingest_received_syslog("receiver", &receiver, raw, 10)
+        .unwrap();
+    let position = store
+        .record(&first.record_ids[0])
+        .unwrap()
+        .receiver
+        .unwrap();
+    assert_eq!(position.sequence, 1);
+    let discard = store
+        .discard_syslog("receiver", &receiver, ReceiverDiscard::Truncated, 9)
+        .unwrap();
+    assert_eq!(discard.window_id, position.window_id);
+    assert_eq!(discard.sequence, 2);
+    let second = store
+        .ingest_received_syslog("receiver", &receiver, raw, 11)
+        .unwrap();
+    let record = store.record(&second.record_ids[0]).unwrap();
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.payload_id, second.payload_id);
+    assert_eq!(record.receiver.as_ref().unwrap().sequence, 3);
+    store.with_rdf_record_layers(&[first.record_ids[0].clone(), second.record_ids[0].clone()], sparrow_core::RdfGraphLayers { metadata: true, diagnostic: false, content: false }, 11, sparrow_core::RdfReadLimits::default(), |view| {
+        let result = purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
+            purrdf::SparqlRequest { query: "SELECT ?record ?window ?sequence WHERE { ?record <urn:sparrow:vocab:receiverWindow> ?window . ?record <urn:sparrow:vocab:receiverSequence> ?sequence }", base_iri: None, substitutions: &[] },
+            purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(100000).with_max_answers(10).with_max_intermediate_cells(1000).with_max_scratch_bytes(1024*1024).with_max_remote_requests(0)).unwrap().result;
+        let purrdf::SparqlResult::Solutions { rows, .. } = result else { panic!("receiver metadata did not produce solutions") };
+        assert_eq!(rows.len(), 2);
+    }).unwrap();
+    assert!(record.producer.is_none());
+    assert!(record.syslog.unwrap().diagnostic.is_some());
+    let history = store.receiver_window(&position.window_id, 11).unwrap();
+    assert_eq!(
+        (
+            history.observations,
+            history.accepted,
+            history.discarded,
+            history.truncated
+        ),
+        (3, 2, 1, 1)
+    );
+    assert_eq!((history.gaps[0].first, history.gaps[0].last), (2, 2));
+    assert_eq!(
+        (history.first_received_at, history.last_received_at),
+        (9, 11)
+    );
+    let captured = store.source_read(&SourceRead::default(), 11, &[]).unwrap();
+    assert_eq!(
+        captured.body.sources[0].receiver_window_ids,
+        std::slice::from_ref(&position.window_id)
+    );
+    store
+        .result_release(&captured.store_id, &captured.snapshot_id, 11)
+        .unwrap();
+    store
+        .watch_registry_replace(None, b"receiver-watch")
+        .unwrap();
+    let pin = store
+        .pin(
+            "receiver-pin",
+            "receiver-pin",
+            &[first.record_ids[0].clone()],
+            40,
+            12,
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.status(12).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/41")
+    );
+    assert_eq!(
+        store.watch_registry().unwrap().as_deref(),
+        Some(b"receiver-watch".as_slice())
+    );
+    assert_eq!(
+        store
+            .receiver_window(&position.window_id, 12)
+            .unwrap()
+            .observations,
+        3
+    );
+    assert_eq!(
+        store.bytes(&first.record_ids[0], 0, raw.len(), 12).unwrap(),
+        raw
+    );
+    let deadline = 30 * DAY + 11;
+    assert_eq!(
+        store
+            .receiver_window(&position.window_id, deadline)
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+    store.expire(deadline).unwrap();
+    assert_eq!(
+        store.record(&first.record_ids[0]).unwrap().receiver,
+        Some(position.clone())
+    );
+    assert_eq!(
+        store
+            .bytes(&first.record_ids[0], 0, raw.len(), deadline)
+            .unwrap(),
+        raw
+    );
+    let resumed = store
+        .ingest_received_syslog("receiver", &receiver, raw, deadline)
+        .unwrap();
+    let fresh = store
+        .record(&resumed.record_ids[0])
+        .unwrap()
+        .receiver
+        .unwrap();
+    assert_ne!(fresh.window_id, position.window_id);
+    assert_eq!(fresh.sequence, 1);
+    store
+        .release_retry("receiver-release", &pin.id, deadline)
+        .unwrap();
+}
+
+#[test]
+fn receiver_concurrent_commits_have_unique_positions_and_finite_discard_history() {
+    use sparrow_core::{ReceiverDiscard, SyslogReceiver};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let receiver = SyslogReceiver::new("tcp", "tcp_lf").unwrap();
+    let mut threads = Vec::new();
+    for index in 0..8 {
+        let store = store.clone();
+        let receiver = receiver.clone();
+        threads.push(std::thread::spawn(move || {
+            let receipt = store
+                .ingest_received_syslog(
+                    "concurrent",
+                    &receiver,
+                    b"<13>1 - host app - - - same",
+                    20 - index,
+                )
+                .unwrap();
+            store
+                .record(&receipt.record_ids[0])
+                .unwrap()
+                .receiver
+                .unwrap()
+        }));
+    }
+    let mut positions = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    positions.sort_by_key(|position| position.sequence);
+    assert_eq!(
+        positions
+            .iter()
+            .map(|position| position.sequence)
+            .collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
+    );
+    assert!(
+        positions
+            .iter()
+            .all(|position| position.window_id == positions[0].window_id)
+    );
+    for _ in 0..20 {
+        store
+            .discard_syslog("concurrent", &receiver, ReceiverDiscard::FramingFailure, 21)
+            .unwrap();
+    }
+    let state = store.receiver_window(&positions[0].window_id, 21).unwrap();
+    assert_eq!(
+        (
+            state.observations,
+            state.accepted,
+            state.discarded,
+            state.framing_failures
+        ),
+        (28, 8, 20, 20)
+    );
+    assert_eq!(state.gaps.len(), sparrow_core::MAX_PRODUCER_GAPS);
+    assert!(!state.gaps_complete);
+    assert_eq!(
+        (state.gaps[0].first, state.gaps.last().unwrap().last),
+        (13, 28)
+    );
+    assert_eq!((state.first_received_at, state.last_received_at), (13, 21));
+    let restarted = SyslogReceiver::new("tcp", "tcp_lf").unwrap();
+    let restart = store
+        .discard_syslog("concurrent", &restarted, ReceiverDiscard::TimedOut, 22)
+        .unwrap();
+    assert_ne!(restart.window_id, state.id);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.receiver_window(&state.id, 22).unwrap().observations,
+        28
+    );
+    assert_eq!(
+        store
+            .receiver_window(&restart.window_id, 22)
+            .unwrap()
+            .timed_out,
+        1
+    );
+}
+
+#[test]
+fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
+    use sparrow_core::{MAX_RECEIVER_WINDOWS, ReceiverDiscard, SyslogReceiver};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for _ in 0..MAX_RECEIVER_WINDOWS {
+        store
+            .discard_syslog(
+                "only-discards",
+                &SyslogReceiver::new("udp", "udp").unwrap(),
+                ReceiverDiscard::Refused,
+                1,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .discard_syslog(
+                "only-discards",
+                &SyslogReceiver::new("udp", "udp").unwrap(),
+                ReceiverDiscard::Refused,
+                2
+            )
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(store.status(2).unwrap()["live_records"].as_str(), Some("0"));
+    let sources = store
+        .source_read(&sparrow_core::SourceRead::default(), 2, &[])
+        .unwrap();
+    assert_eq!(sources.body.sources[0].source_id, "only-discards");
+    assert_eq!(sources.body.sources[0].retained_records, 0);
+    assert_eq!(
+        sources.body.sources[0].receiver_window_ids.len(),
+        MAX_RECEIVER_WINDOWS
+    );
+    store
+        .result_release(&sources.store_id, &sources.snapshot_id, 2)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let intact = db.get("syslog-receiver-registry").unwrap().unwrap();
+    assert_eq!(
+        db.get("store_format").unwrap().as_deref(),
+        Some(b"sparrow.store/40".as_slice())
+    );
+    db.delete("syslog-receiver-registry").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("syslog-receiver-registry", &intact).unwrap();
+    db.put("store_format", b"sparrow.store/36").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("store_format", b"sparrow.store/40").unwrap();
+    let value = purrdf_lex::json::read_slice(&intact, purrdf_lex::json::Limits::DEFAULT).unwrap();
+    let mut rows = value.as_array().unwrap().clone();
+    rows[1] = rows[0].clone();
+    db.put(
+        "syslog-receiver-registry",
+        purrdf_lex::json::write_compact(&purrdf_lex::json::Value::array(rows)),
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+    let db = catalog_db(dir.path()).unwrap();
+    db.put(
+        "syslog-receiver-registry",
+        vec![b' '; sparrow_core::MAX_RECEIVER_REGISTRY_BYTES + 1],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+}
+
+#[test]
 fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
     use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery};
     let dir = tempfile::tempdir().unwrap();

@@ -410,7 +410,11 @@ impl Writer {
         if journal.tail.is_some()
             && !matches!(
                 self.db.get("store_format")?.as_deref(),
-                Some(TAIL_FORMAT | super::pressure::WATCH_FORMAT)
+                Some(
+                    TAIL_FORMAT
+                        | super::pressure::WATCH_FORMAT
+                        | super::receiver_stream::WATCH_FORMAT
+                )
             )
         {
             return Err(Error::new(

@@ -46,6 +46,7 @@ pub(super) struct Publication {
     pub(super) earliest: Option<Vec<u8>>,
     pub(super) pressure_wait: bool,
     pub(super) watch_registry: bool,
+    pub(super) receiver_registry: bool,
     invalid: bool,
 }
 
@@ -67,6 +68,7 @@ impl WriteBatchIteratorCf for Publication {
         if cf_id == 0 {
             self.pressure_wait |= key == super::pressure::WAIT_KEY.as_bytes();
             self.watch_registry |= key == b"watch_registry";
+            self.receiver_registry |= key == super::receiver_stream::KEY.as_bytes();
         }
         if cf_id == 0
             && let Some(key) = key

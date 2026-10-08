@@ -93,6 +93,10 @@ impl Operation {
                     store: fields.required("store_id")?,
                     id: fields.required("stream_id")?,
                 })),
+                "receiver_window_get" => Self::Query(Command::Receiver(super::receiver::Input {
+                    store: fields.required("store_id")?,
+                    id: fields.required("window_id")?,
+                })),
                 "status" => Self::Status,
                 "flush" => Self::Query(Command::Flush(sparrow_client::DurabilityWatermark {
                     store_id: fields.required("store_id")?,

@@ -34,12 +34,14 @@ pub(crate) mod publication;
 mod query_membership;
 mod rdf_index;
 pub(crate) mod rdf_view;
+pub(crate) mod receiver_stream;
 mod record_fields;
 pub(crate) mod record_read;
 mod record_spool;
 mod recordless;
 pub(crate) mod result_read;
 mod retire;
+mod sequence_window;
 pub(crate) mod source_read;
 pub(crate) mod source_time;
 pub(crate) mod syslog;
@@ -260,6 +262,8 @@ pub struct Record {
     pub diagnostics: diagnostic::DiagnosticSnapshot,
     /// Immutable accepted position in a producer sequence window, when declared.
     pub producer: Option<producer_stream::ProducerPosition>,
+    /// Immutable durable syslog receiver observation, never a sender sequence.
+    pub receiver: Option<receiver_stream::ReceiverPosition>,
     /// Immutable syslog packet interpretation; raw bytes remain authoritative.
     pub syslog: Option<syslog::SyslogSnapshot>,
     /// Immutable original file-generation byte position, when tailed.
@@ -490,6 +494,7 @@ impl Catalog for Record {
             .with("event_time", self.event_time.encode())
             .with("diagnostics", self.diagnostics.encode())
             .with("producer", self.producer.as_ref().map(Catalog::encode))
+            .with("receiver", self.receiver.as_ref().map(Catalog::encode))
             .with("syslog", self.syslog.as_ref().map(Catalog::encode))
             .with("tail", self.tail.as_ref().map(Catalog::encode))
             .with("chunks", self.chunks.clone())
@@ -529,6 +534,11 @@ impl Catalog for Record {
                 .filter(|value| !value.is_null())
                 .map(producer_stream::ProducerPosition::decode)
                 .transpose()?,
+            receiver: v
+                .get("receiver")
+                .filter(|value| !value.is_null())
+                .map(receiver_stream::ReceiverPosition::decode)
+                .transpose()?,
             tail: v
                 .get("tail")
                 .filter(|value| !value.is_null())
@@ -558,6 +568,14 @@ impl Catalog for Record {
         }
         if let Some(snapshot) = &record.syslog {
             snapshot.validate_record(&record)?;
+        }
+        if record.receiver.is_some()
+            && (record.syslog.is_none() || record.producer.is_some() || record.tail.is_some())
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "receiver position disagrees with record intake kind",
+            ));
         }
         if let Some(position) = &record.tail
             && (record.producer.is_some()
@@ -980,6 +998,8 @@ impl Store {
                     || format == consumption::TAIL_FORMAT
                     || format == pressure::FORMAT
                     || format == pressure::WATCH_FORMAT
+                    || format == receiver_stream::FORMAT
+                    || format == receiver_stream::WATCH_FORMAT
                     || recordless::legacy_format(&format).is_some() =>
             {
                 if recordless::requires_watch_registry(&format)
@@ -1094,6 +1114,7 @@ impl Store {
         };
         let writer = store.lock()?;
         producer_stream::registry(&writer)?;
+        receiver_stream::registry(&writer)?;
         tail::registry(&writer)?;
         drop(writer);
         Ok(store)
@@ -1258,6 +1279,21 @@ impl Store {
         let stream = producer
             .map(|input| producer_stream::prepare(&writer, source, input, now))
             .transpose()?;
+        let receiver = origin
+            .receiver()
+            .map(|input| {
+                if format != "syslog"
+                    || record_count != 1
+                    || mode != durability::Durability::Durable
+                {
+                    return Err(Error::new(
+                        "INVALID_ARGUMENT",
+                        "receiver observation requires one durably published syslog packet",
+                    ));
+                }
+                receiver_stream::prepare(&writer, source, input, None, now)
+            })
+            .transpose()?;
         let tail_checkpoint = origin
             .tail()
             .map(|input| tail::prepare(&writer, source, format, input, record_count, now))
@@ -1284,6 +1320,7 @@ impl Store {
                         sequence: input.sequences[ordinal],
                     }
                 }),
+                receiver: receiver.as_ref().map(|prepared| prepared.position.clone()),
                 tail: tail_checkpoint
                     .as_ref()
                     .map(|checkpoint| tail::TailPosition {
@@ -1324,11 +1361,17 @@ impl Store {
         if let Some(stream) = stream {
             stream.publish(&mut batch);
         }
+        if let Some(receiver) = receiver {
+            receiver.publish(&mut batch);
+        }
         if batch.size_in_bytes() > 128 * 1024 * 1024 {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "atomic ingestion batch exceeds 128 MiB; split the import into smaller complete artifacts",
             ));
+        }
+        if origin.receiver().is_some() {
+            writer.admit_import_batch(&batch)?;
         }
         writer.apply(
             batch,

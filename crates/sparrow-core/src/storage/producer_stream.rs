@@ -6,7 +6,6 @@
 use super::{Catalog, DAY, Error, Store, Writer, integer, json, random_id, read_field};
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
-use std::collections::BTreeSet;
 
 /// Maximum simultaneously retained producer windows; expired windows can be replaced.
 pub const MAX_PRODUCER_STREAMS: usize = 64;
@@ -241,44 +240,18 @@ impl Catalog for ProducerStream {
 }
 
 pub(super) fn registry(writer: &Writer) -> Result<Vec<ProducerStream>, Error> {
-    let bytes = writer.db.get(KEY)?.ok_or_else(|| {
-        Error::new(
-            "STORAGE_FAILURE",
-            "producer registry missing; restore the fenced catalog",
-        )
-    })?;
-    if bytes.len() > MAX_PRODUCER_REGISTRY_BYTES {
-        return Err(Error::new(
-            "STORAGE_FAILURE",
-            "producer registry exceeds encoded admission",
-        ));
-    }
-    let value = super::parse(&bytes)?;
-    let rows = value
-        .as_array()
-        .ok_or_else(|| Error::new("STORAGE_FAILURE", "producer registry is not an array"))?;
-    if rows.len() > MAX_PRODUCER_STREAMS {
-        return Err(Error::new(
-            "STORAGE_FAILURE",
-            "producer registry exceeds stream bound",
-        ));
-    }
-    let mut ids = BTreeSet::new();
-    let mut identities = BTreeSet::new();
-    rows.iter()
-        .map(|row| {
-            let stream = ProducerStream::decode(row)?;
-            if !ids.insert(stream.id.clone())
-                || !identities.insert((stream.source.clone(), stream.instance.clone()))
-            {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "duplicate producer registry identity",
-                ));
-            }
-            Ok(stream)
-        })
-        .collect()
+    super::sequence_window::registry(
+        writer,
+        KEY,
+        MAX_PRODUCER_REGISTRY_BYTES,
+        MAX_PRODUCER_STREAMS,
+        |stream: &ProducerStream| {
+            (
+                stream.id.clone(),
+                (stream.source.clone(), stream.instance.clone()),
+            )
+        },
+    )
 }
 
 pub(super) struct PreparedStream {
@@ -343,20 +316,13 @@ pub(super) fn prepare(
     for sequence in &input.sequences {
         let missing = sequence - state.last_sequence - 1;
         if missing > 0 {
-            state.unobserved_sequences = state
-                .unobserved_sequences
-                .checked_add(missing)
-                .ok_or_else(|| {
-                    Error::new("RESOURCE_LIMIT", "producer missing sequence count overflow")
-                })?;
-            state.gaps.push(ProducerGap {
-                first: state.last_sequence + 1,
-                last: sequence - 1,
-            });
-            if state.gaps.len() > MAX_PRODUCER_GAPS {
-                state.gaps.remove(0);
-                state.gaps_complete = false;
-            }
+            super::sequence_window::record_gap(
+                &mut state.unobserved_sequences,
+                &mut state.gaps,
+                &mut state.gaps_complete,
+                state.last_sequence + 1,
+                sequence - 1,
+            )?;
         }
         state.last_sequence = *sequence;
         state.accepted_events = state
@@ -381,17 +347,16 @@ pub(super) fn prepare(
     Ok(PreparedStream { id, encoded })
 }
 
+impl super::sequence_window::Window for ProducerStream {
+    const PREFIX: &'static str = "producer-stream:";
+    fn metadata(&self) -> (&str, u64) {
+        (&self.id, self.expires_at)
+    }
+}
+
 impl Store {
     /// Read one retained producer window; record positions survive summary expiry.
     pub fn producer_stream(&self, id: &str, now: u64) -> Result<ProducerStream, Error> {
-        if !id.starts_with("producer-stream:") || id.len() > 128 {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "producer stream requires an opaque producer-stream ID",
-            ));
-        }
-        let writer = self.lock()?;
-        registry(&writer)?.into_iter().find(|stream| stream.id == id && stream.expires_at > now)
-            .ok_or_else(|| Error::new("NOT_FOUND", "producer stream summary absent or expired; record positions remain authoritative"))
+        super::sequence_window::retained::<ProducerStream>(self, id, now, registry)
     }
 }

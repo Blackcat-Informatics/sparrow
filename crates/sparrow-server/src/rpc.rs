@@ -608,6 +608,12 @@ fn sources_page(
         for (index, id) in summary.syslog_listener_ids.iter().enumerate() {
             listeners.set(index as u32, id);
         }
+        let mut receivers = row
+            .reborrow()
+            .init_receiver_window_ids(summary.receiver_window_ids.len() as u32);
+        for (index, id) in summary.receiver_window_ids.iter().enumerate() {
+            receivers.set(index as u32, id);
+        }
         let mut watches = row.init_watches(summary.watches.len() as u32);
         for (index, binding) in summary.watches.iter().enumerate() {
             let mut watch = watches.reborrow().get(index as u32);
@@ -873,6 +879,14 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> cap
     crate::diagnostics::snapshot(out.reborrow().init_diagnostics(), &value.diagnostics);
     crate::syslog_wire::snapshot(out.reborrow().init_syslog(), value.syslog.as_ref())?;
     crate::tail_wire::position(out.reborrow().init_tail(), value.tail.as_ref())?;
+    match value.receiver {
+        Some(position) => {
+            let mut receiver = out.reborrow().init_receiver().init_value();
+            receiver.set_window_id(&position.window_id);
+            receiver.set_sequence(position.sequence);
+        }
+        None => out.reborrow().init_receiver().set_absent(()),
+    }
     match value.producer {
         Some(position) => {
             let mut producer = out.init_producer().init_value();
@@ -2803,6 +2817,93 @@ impl wire::sparrow::Server for Rpc {
                     ),
                 ),
             },
+        }
+        Ok(())
+    }
+
+    async fn receiver_window_get(
+        self: Rc<Self>,
+        params: wire::sparrow::ReceiverWindowGetParams,
+        mut results: wire::sparrow::ReceiverWindowGetResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(query.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "receiver window reads require the current discovered schema",
+                ),
+            );
+            return Ok(());
+        }
+        let id = query.get_id()?;
+        if id.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("receiver window ID exceeds 128 bytes"),
+            );
+            return Ok(());
+        }
+        let id = id.to_str()?.to_owned();
+        match self
+            .work(move |store, now| store.receiver_window(&id, now))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(window) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(
+                    &self
+                        .store
+                        .store_id()
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?,
+                );
+                out.set_id(&window.id);
+                out.set_source(&window.source);
+                out.set_listener(&window.listener);
+                out.set_instance(&window.instance);
+                out.set_transport(match window.transport.as_str() {
+                    "udp" => wire::ReceiverTransport::Udp,
+                    "tcp_octet_counting" => wire::ReceiverTransport::TcpOctetCounting,
+                    "tcp_lf" => wire::ReceiverTransport::TcpLf,
+                    "tcp_cr_lf" => wire::ReceiverTransport::TcpCrLf,
+                    _ => {
+                        return Err(capnp::Error::failed(
+                            "validated receiver transport changed".into(),
+                        ));
+                    }
+                });
+                out.set_observations(window.observations);
+                out.set_accepted(window.accepted);
+                out.set_discarded(window.discarded);
+                out.set_refused(window.refused);
+                out.set_truncated(window.truncated);
+                out.set_framing_failures(window.framing_failures);
+                out.set_timed_out(window.timed_out);
+                out.set_gaps_complete(window.gaps_complete);
+                out.set_continuity_unknown(true);
+                out.set_pre_commit_loss_unknown(true);
+                out.reborrow()
+                    .init_first_received_at()
+                    .set_unix_millis(window.first_received_at);
+                out.reborrow()
+                    .init_last_received_at()
+                    .set_unix_millis(window.last_received_at);
+                out.reborrow()
+                    .init_expires_at()
+                    .set_unix_millis(window.expires_at);
+                let mut gaps = out.init_gaps(window.gaps.len() as u32);
+                for (index, gap) in window.gaps.iter().enumerate() {
+                    let mut row = gaps.reborrow().get(index as u32);
+                    row.set_first(gap.first);
+                    row.set_last(gap.last);
+                }
+            }
         }
         Ok(())
     }
