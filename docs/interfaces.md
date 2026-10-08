@@ -1081,6 +1081,8 @@ not network arrival order or a sender sequence. Concurrent TCP connections may
 commit in a different order than their read timestamps. Failed protocol
 interpretation still accepts the complete raw packet and a position. Ordinary
 typed syslog uploads have no fabricated receiver position.
+Use full typed record/context metadata, including CLI `context STORE_ID
+RECORD_ID --before 0 --after 0`, to resolve a search result's receiver position.
 
 Known local refused packets, oversized UDP datagrams, TCP framing failures and
 TCP frame deadlines publish classified observations without a packet occurrence.

@@ -2,12 +2,87 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 47 and store format 37. The stable installed
+private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`5bdc775`; see [MCP notification cancellation](#mcp-notification-cancellation) for
+`32b288a`; see [durable receiver history](#durable-receiver-history) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Durable receiver history
+
+Signed source `32b288a` adds finite durable syslog receiver windows, immutable
+per-record receiver positions, sorted source references and typed
+`receiverWindowGet`. CLI `receiver-window STORE_ID WINDOW_ID` and the closed
+read-only MCP `receiver_window_get` share one generated lookup and renderer.
+Full record/context metadata exposes positions; use CLI `context STORE_ID
+RECORD_ID --before 0 --after 0` to resolve a search result's occurrence metadata.
+Positions identify durable observation commit order, never sender or network
+arrival order. Accepted bytes and positions publish in one synchronized WAL
+batch. Known local refusals, UDP truncation, TCP framing failures and frame
+deadlines publish classified observations without raw packet occurrences.
+Sender/network/kernel and pre-commit loss remain explicitly unknown. Failed
+history publication stops intake with a visible failure rather than reporting
+a durable counter update. Rejected connections do not invent message positions.
+
+Producer and receiver windows share bounded native registry decoding, inclusive
+gap arithmetic and retained-window lookup. Their semantics remain separate.
+The registry admits 64 receiver windows and 128 KiB, retaining 16 recent discard
+intervals while preserving exact aggregate counts. Summaries expire 30 days
+after their latest observed timestamp; record pins never renew them. Listener
+restart and post-expiry reuse create new window identities. A first receiver
+publication fences a store at format 40, or 41 with watch state; later writes
+preserve that fence and pressure state. Production has no syslog listeners or
+receiver observations and retains format 37.
+
+The source gate passed formatting, release Clippy with warnings denied, 154
+storage tests, 59 RPC tests, all remaining workspace tests, seeded census tests
+and the pinned cross gate: 242 ledger jobs and zero distinct exceptions. Tests
+cover concurrent unique commit positions, exact raw bytes and independent
+occurrences, native RDF receiver metadata, discard totals and interval trimming,
+restart/reopen, pinned bytes after summary expiry, watch-fence preservation,
+bounded registry admission, duplicate identities, missing/fence-mismatched and
+oversized registry failures. Real TCP/UDP integration verifies typed store/schema
+refusals and canonical CLI/MCP replies. Initial gate failures identified an
+unnecessary test clone and duplicate lookup logic; both were corrected, including
+shared locking/ID/expiry ownership. No gate or detector was bypassed.
+
+All five selected executables were built after the gate and frozen with exact
+source identity and SHA-256 hashes under
+`~/.local/state/sparrow/receiver-history-images-8kqfpif3`. Private qualification
+`receiver-history-qual-gl0iavii` uses an owned Btrfs store and actual loopback
+TCP/UDP ingestion. Two complete TCP packets, one framing failure and one frame
+timeout produce four TCP observations; two UDP packets, including malformed
+protocol input, and one oversized datagram produce three UDP observations.
+Frozen empty source continuation omits later windows while fresh inventory
+discovers them. Context readback certifies each immutable position and exact
+bytes. Reopening preserves summaries and positions, a new listener instance
+creates a third window at ordinal one, and removing bindings retains all five
+accepted records and historical references. The previous schema 47 daemon
+refuses format 41. Clean shutdowns complete and the public unit remains unchanged
+during qualification. An earlier driver run `receiver-history-qual-1jai15h5`
+stopped because it incorrectly expected full occurrence metadata in projected
+search rows; the final driver reads it through the existing context operation.
+
+Controlled public adoption evidence is
+`/tmp/sparrow-receiver-history-live.cn4rlmk7`. The enabled active user unit runs
+PID 978606 from `sparrowd-schema48-32b288a`; stable CLI
+`~/.local/bin/sparrow` resolves to `sparrow-schema48-32b288a`. Installed and alias
+hashes match the frozen images, with `cap_net_bind_service=ep` on the daemon and
+an observed `0.0.0.0:518` listener. Native LAN TCP and Unix readback preserve
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37, 212 records, zero pins/read
+leases and healthy watch state. Saved intents preserve original receipts, exact
+bytes, clocks and replacement files with no new intake or retirement. All 21
+sources preserve their previous fields, with empty receiver/listener references;
+five file-generation checkpoints, grouped queries, temporal/field witnesses,
+native text scores, four JSON keys and twenty values remain exact. MCP declares
+33 closed tools, including read-only receiver lookup with typed `NOT_FOUND`.
+Syslog configuration, runtime dependencies and the PurRDF pin are unchanged.
+
+This qualifies finite receiver observation/history behavior. Sender continuity,
+production syslog bursts, worst-case discard admission latency, external network
+loss, power loss and reboot acceptance are not established by these scenarios.
+Complete governed SPARQL admission/egress and correlation remain unfinished.
 
 ## MCP notification cancellation
 
