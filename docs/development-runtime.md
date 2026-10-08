@@ -57,7 +57,43 @@ hold with zero distinct exceptions. Evidence is
 `/tmp/sparrow-text-pages-gate-20261007.log`. Tests cover complete capture beyond
 1,000 ranked rows, frozen scores/corpus after new ingestion, CLI/MCP replay,
 cross-operation refusal, shared record/text handle admission and absolute expiry.
-Owned runtime adoption is recorded separately after the normal commit gate.
+Signed implementation `2549dde` passed the normal full commit hook; evidence is
+`/tmp/sparrow-text-pages-commit-20261007.log`.
+
+The owned schema-28 unit exited successfully under SIGINT, with PID zero and
+socket removal, before the same unit/config/store reopened under schema 29 at
+2026-10-08 03:49:15 UTC (observed PID 1445461). Executable, config and private
+socket remain `target/release/sparrowd`, `config/development.toml` and
+`/home/paudley/.local/state/sparrow/development-v5/rpc.sock`. Store identity is
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`; all 195 live
+records remain, with zero active pins and no pending writes. Directory/socket
+modes remain 0700/0600.
+
+`/tmp/sparrow-text-pages-live.tn_4xjte` verifies all three ranked source records
+through one-item text pages, identical CLI/MCP continuation, native score/corpus
+equality with record search, and cross-operation refusal in both directions.
+Unknown diagnostic membership remains visible with null semantic counts; strict
+and scan refusal produce no stdout. Text capture of a revision-1 two-record pin
+keeps its original receipt and ranking after revision-2 expansion and release.
+The text cursor subsequently expires with `RESULT_EXPIRED`, exit 1 and no stdout;
+reading pages does not renew the lease.
+
+`/tmp/sparrow-record-pages-live.9ercgw2x` requalifies record pagination, pin
+mutation/release, diagnostic coverage and CLI/MCP replay. Source inventory in
+`/tmp/sparrow-source-wire-live.9f47wila` preserves all 16 sources and mapping/watch
+counts. Artifact filters and frozen replay pass in
+`/tmp/sparrow-artifact-filters-live.nilkho7o`. Raw regressions in
+`/tmp/sparrow-artifact-filters-raw-regression.831w637k` preserve stable descriptor
+and handoff identities, exact 82/87-byte exports, removed phase and producer
+replacement. `/tmp/sparrow-text-pages-regression.tc2qluel` preserves native text,
+record and context diagnostic coverage, strict refusal, CLI/MCP agreement and
+exact 104-byte stable retry/export.
+
+The current client refuses status, keys, records, text, sources and artifacts
+against the private archived schema-28 daemon with `UNSUPPORTED`, exit 1 and zero
+stdout. That owned child exits cleanly and removes its socket. Evidence is
+`/tmp/sparrow-artifact-scope-schema28-compat.9cqbf0lb`; archive SHA-256 is
+`8adb2cc0dc6b509f3e4e41e9e955a52844f335cb6c52b13f2a6f4dbfb095901d`.
 Standalone key/value pagination and the remaining architecture acceptance work
 remain unfinished.
 
