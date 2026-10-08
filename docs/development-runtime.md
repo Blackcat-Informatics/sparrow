@@ -56,8 +56,38 @@ catalog admission over skipped sources. The new RPC scenario checks generated
 capture fields, a partial scan frontier, CLI/MCP byte refusals without rows and
 an accepted reply within the shared output ceiling.
 
-Owned daemon qualification remains separate from these source checks. Full
-architecture acceptance remains unmet.
+The signed feature commit `d238b43` passed the complete verification hook.
+`f24d3ed` makes the frontier acceptance scenario independent of same-millisecond
+clock ties and also passes the full hook; production sources are unchanged. The
+owned development unit reopened the feature build at `2026-10-08T05:09:24Z`, PID
+2028003, after graceful exit, successful inactive state and socket removal of
+owned PID 1973781. The same private Unix socket, config and persistent store
+remain in use: `store:46c88e949ccec658600b66c7becd5bb7`, format
+`sparrow.store/16`, with 195 live records.
+
+Live context evidence in `/tmp/sparrow-context-live.ckls7731` compares CLI/MCP
+rows, ordering and continuity. Both report distinct single-capture identities,
+matching eligibility times, typed host limits and explicit governor absence.
+A one-visit directional frontier reports partial execution and its stop reason.
+Unknown diagnostic membership retains its original incomplete certainty;
+strict mode refuses INDEX_NOT_READY with no stdout. Context creates no handles
+or pins and leaves all 195 records intact.
+
+Compatibility evidence in `/tmp/sparrow-artifact-scope-schema32-compat.gyid0l7n`
+checks nine operations against the archived schema-32 daemon, SHA-256
+`d83a2728e22c7cab0cd2cc69ec853714ec4ceed4a95ddfb907795ad8ab60ce68`.
+Every current-client operation refuses UNSUPPORTED with empty stdout; the
+isolated daemon exits cleanly and removes its socket. Raw regression evidence in
+`/tmp/sparrow-artifact-filters-raw-regression.ory4yles` compares exact 82-byte
+descriptor and 87-byte CRLF handoff downloads, stable artifact identity, removed
+handoff phase and preserved producer replacement. Query regression evidence in
+`/tmp/sparrow-result-next-live.4lg3d1az` compares all eight existing leased page
+shapes through original continuation and CLI/MCP cursor-only replay, including
+frozen receipts after pin expansion and release. After the absolute deadline
+`2026-10-08T05:10:39.037Z`, the released-pin cursor refuses RESULT_EXPIRED
+without stdout. All four read registries report zero handles; pins and pending
+writes are zero and all 195 records remain. Directory/socket modes are 0700/0600.
+Full architecture acceptance remains unmet.
 
 ## Schema 32 frozen query capture provenance
 
