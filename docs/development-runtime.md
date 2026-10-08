@@ -3,8 +3,10 @@
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 41 and store format 37. The stable installed
-client is `~/.local/bin/sparrow`. See [persistent service adoption](#persistent-service-adoption)
-for image identities, configuration and qualified live evidence. Earlier
+client is `~/.local/bin/sparrow`. The latest installed daemon source is
+`008cd78`; see [temporal bounds](#native-half-open-temporal-query-bounds) for
+its adoption evidence and [persistent service adoption](#persistent-service-adoption)
+for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
 ## Oldest-unpinned logical retirement
@@ -4243,3 +4245,29 @@ unit, existing store, native installed lexicons and the schema-41 client after
 signed-hook qualification and an explicitly selected daemon build. Full
 architecture acceptance remains unmet; native forced reclamation and full
 SPARQL still require the documented upstream seams.
+
+Signed source `008cd78` and its normal hook passed formatting, release Clippy,
+140 storage scenarios, 51 RPC scenarios, 16 SDK tests, remaining workspace
+tests and census gates: 211 ownership jobs, no distinct exceptions. The hook
+log is `/tmp/sparrow-temporal-bound-commit.log`. After that hook, the daemon was
+explicitly rebuilt with `--bin sparrowd`; its build log is
+`/tmp/sparrow-temporal-bound-bins.log`. The installed image is
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema41-008cd78`, SHA-256
+`cd6aca0d425ffb4b57f401bf07538bdaf95517052979548aaf3d482eb834513b`.
+Its bytes match the selected release artifact. Its sole file capability remains
+`cap_net_bind_service=ep`; the stable daemon alias now selects this image.
+
+Live evidence is `/tmp/sparrow-temporal-bound-live.r0ho_rx2`: before/after unit
+and status, closed-store snapshot, image identity, configured process invocation,
+listener observation, exact saved handoff retries and query comparisons.
+The persistent unit stopped PID 1452634 through SIGINT; its Unix socket was
+confirmed absent before snapshotting and switching the alias. The new owner is
+PID 1710023. Store identity, schema 41, format 37, native profiles, 212 records,
+213 payload chunks and 208 JSON projections are unchanged. TCP/Unix
+record/text/key/value/temporal rows match prior evidence, and saved CLI/MCP/SDK
+tail-retirement retries preserve their original receipts, bytes, clocks and
+replacement file. The public listener remains `0.0.0.0:518`, and watches report
+no failure or pending claims. No new intake or source mutation was needed.
+The new closed-store snapshot has not separately been restored; the earlier
+isolated restoration qualification remains recorded above. Full architecture
+acceptance is still unmet.
