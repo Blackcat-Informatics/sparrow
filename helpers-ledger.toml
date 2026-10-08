@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "rpc-connection-default"
+summary = "One daemon configuration default supplies independent finite transport admission for Unix and TCP."
+home = "sparrow_server::config::default_rpc_connections"
+entry_points = ["sparrow_server::config::ServerConfig::read"]
+spec = "docs/deployment.md: separate transport and storage budgets."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(default_connection_limit|default_rpc_capacity)$']
+
+[[job]]
 id = "artifact-match-capture-counts"
 summary = "Artifact grouping counts the existing complete native record capture once; predicates, ranking, witnesses and row order remain owned by their existing helpers."
 home = "sparrow_core::storage::record_read::Store::query_read"

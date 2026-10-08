@@ -38,6 +38,14 @@ revisions during migration. Consume entries seed only a missing catalog;
 typed watch administration controls later changes. Never add production sample
 directories as destructive watches merely because they were sample inputs.
 
+`max_concurrent_requests` admits simultaneous storage work, including intake
+workers (1..64). `max_rpc_connections` independently admits Unix and TCP RPC
+streams from one shared ceiling (1..256, default 16). An idle agent capability
+holds a transport lease without consuming a storage permit. The existing
+60-second connection lease still applies. Peers beyond the connection ceiling
+are disconnected before capability admission; storage saturation returns the
+existing typed operation refusal. These are separate finite resource budgets.
+
 Port 518 requires the daemon image to have `cap_net_bind_service=ep`, or another
 explicitly configured host privilege arrangement. Apply a file capability to the
 final installed image, not the symlink or a volatile build artifact; copying an

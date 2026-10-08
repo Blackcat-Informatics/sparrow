@@ -1234,6 +1234,109 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_storage_work() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let original = std::fs::read_to_string(&config).unwrap();
+            assert_eq!(
+                sparrow_server::ServerConfig::read(&config)
+                    .unwrap()
+                    .max_rpc_connections,
+                16
+            );
+            for invalid in [0, 257] {
+                std::fs::write(
+                    &config,
+                    format!("{original}\nmax_rpc_connections = {invalid}\n"),
+                )
+                .unwrap();
+                assert!(
+                    sparrow_server::ServerConfig::read(&config)
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("max_rpc_connections must be 1..256")
+                );
+            }
+            std::fs::write(
+                &config,
+                original.replace("max_concurrent_requests = 4", "max_concurrent_requests = 1")
+                    + "\nmax_rpc_connections = 6\n",
+            )
+            .unwrap();
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let daemon = start(&config, &socket).await;
+            let mut idle = Vec::new();
+            for index in 0..5 {
+                let client = if index % 2 == 0 {
+                    sparrow_client::Client::connect_tcp(address).await.unwrap()
+                } else {
+                    sparrow_client::Client::connect(&socket).await.unwrap()
+                };
+                let response = client
+                    .capability()
+                    .status_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap();
+                rpc_ok(response.get().unwrap().get_result().unwrap());
+                idle.push(client);
+            }
+            // Five idle capabilities leave the single storage permit available to a sixth peer.
+            assert_eq!(
+                cli(&socket, &["status"])["live_records"].as_str(),
+                Some("0")
+            );
+            let sixth = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let response = sixth
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            rpc_ok(response.get().unwrap().get_result().unwrap());
+            // Unix and TCP share six transport leases; neither can over-admit a seventh peer.
+            assert!(sparrow_client::Client::connect(&socket).await.is_err());
+            assert!(sparrow_client::Client::connect_tcp(address).await.is_err());
+            drop(sixth);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let recovered = loop {
+                match sparrow_client::Client::connect(&socket).await {
+                    Ok(client) => break client,
+                    Err(error) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "transport lease not returned: {error}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            let receipt = recovered
+                .ingest(
+                    "idle-budget",
+                    "idle-test",
+                    wire::Format::Log,
+                    b"one storage operation\n",
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.record_ids.len(), 1);
+            drop(recovered);
+            drop(idle);
+            drop(daemon);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new()

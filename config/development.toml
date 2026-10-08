@@ -12,6 +12,7 @@ max_artifact_bytes = 16777216
 max_records = 100000
 max_pin_members = 10000
 max_concurrent_requests = 4
+max_rpc_connections = 16
 buffered_flush_interval_ms = 2000
 text_lexicon_dir = "/home/paudley/Active/purrdf/crates/text/lexicons/artifacts"
 

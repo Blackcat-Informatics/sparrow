@@ -42,8 +42,11 @@ pub struct ServerConfig {
     pub max_records: usize,
     /// Maximum direct members in a pin collection.
     pub max_pin_members: usize,
-    /// Bound on simultaneous RPC work and connections.
+    /// Bound on simultaneous storage operations, shared with intake workers.
     pub max_concurrent_requests: usize,
+    /// Independent bound on admitted Unix and TCP RPC connections.
+    #[serde(default = "default_rpc_connections")]
+    pub max_rpc_connections: usize,
     /// Required native analyzer artifact directory.
     pub text_lexicon_dir: PathBuf,
 }
@@ -97,6 +100,10 @@ fn default_flush_interval() -> u32 {
     sparrow_core::DEFAULT_FLUSH_INTERVAL_MS
 }
 
+fn default_rpc_connections() -> usize {
+    16
+}
+
 impl ServerConfig {
     /// Read and validate the same typed configuration used by the production daemon.
     pub fn read(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -104,11 +111,14 @@ impl ServerConfig {
         if !(1..=64).contains(&config.max_concurrent_requests) {
             return Err("max_concurrent_requests must be 1..64".into());
         }
+        if !(1..=256).contains(&config.max_rpc_connections) {
+            return Err("max_rpc_connections must be 1..256".into());
+        }
         if config.socket_path.parent() != Some(config.data_dir.as_path()) {
             return Err("socket_path must be directly inside the private data_dir".into());
         }
         if !config.consume.is_empty() && config.max_concurrent_requests < 2 {
-            return Err("consume requires at least two RPC connections".into());
+            return Err("consume requires at least two concurrent storage operations".into());
         }
         ConsumeWatch::validate_fields(&config.consume)?;
         crate::syslog_listener::validate(&config.syslog)?;

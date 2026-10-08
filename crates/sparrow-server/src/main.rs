@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Validate the watch catalog before publishing an endpoint, and refuse an existing socket.
     let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
     std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
-    let connections = Arc::new(Semaphore::new(config.max_concurrent_requests));
+    let connections = Arc::new(Semaphore::new(config.max_rpc_connections));
     let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
     let mut syslog = if config.syslog.is_empty() {
         None
@@ -68,10 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let client: sparrow::Client = capnp_rpc::new_client(rpc);
     eprintln!(
-        "sparrowd: store={} capnp={} data={}",
+        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={}",
         store.store_id()?,
         config.socket_path.display(),
-        config.data_dir.display()
+        config.data_dir.display(),
+        config.max_rpc_connections,
+        config.max_concurrent_requests
     );
     let local = tokio::task::LocalSet::new();
     let serving = local.run_until(async {
