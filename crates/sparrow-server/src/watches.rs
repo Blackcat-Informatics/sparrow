@@ -183,9 +183,7 @@ impl Owner {
     fn claim(&self) -> Result<&ClaimRoot, Error> {
         match self {
             Self::Consume(owner) => Ok(owner),
-            Self::Tail(_) => Err(Error::State(
-                "tail completed handoff is unfinished; active files cannot enter ordinary consumption",
-            )),
+            Self::Tail(owner) => owner.claim(),
         }
     }
 }
@@ -695,6 +693,12 @@ fn admit_handoff(
             "handoff requires the current enabled watch revision",
         )));
     }
+    if matches!(detector.owner, Owner::Tail(_)) != intent.tail_generation_id.is_some() {
+        return Err(AdminFailure::Refused(watch_admin::failure(
+            "CONFLICT",
+            "active-file handoff must name its original finished tail generation; completed-file watches require ordinary handoff",
+        )));
+    }
     detector
         .owner
         .root_binding(&detector.config.root)
@@ -992,31 +996,23 @@ async fn run(
             continue;
         }
         retry.retain(|id, _| pending.iter().any(|journal| journal.import_id == *id));
-        if client.is_none() && Instant::now() >= connect_after {
-            tokio::select! {
-                _ = stopped(&stop) => break,
-                result = tokio::time::timeout(Duration::from_secs(10), Client::connect(&socket)) => {
-                    match result {
-                        Ok(Ok(connected)) => client = Some(connected),
-                        Ok(Err(error)) => eprintln!("sparrowd: consume RPC discovery failed: {error}"),
-                        Err(_) => eprintln!("sparrowd: consume RPC discovery timed out; sources remain owned"),
-                    }
-                    connect_after = Instant::now() + Duration::from_secs(1);
-                }
-            }
-        }
-        let Some(connected) = client.as_ref() else {
-            tokio::time::sleep(TICK).await;
-            continue;
-        };
         let mut work = pending
             .iter()
-            .find(|journal| {
+            .filter(|journal| {
                 retry
                     .get(&journal.import_id)
                     .is_none_or(|at| *at <= Instant::now())
             })
-            .map(|journal| (journal.watch.clone(), journal.import_id.clone()));
+            // A failed ordinary upload connection must not block checkpoint
+            // acknowledgement, which has no transport dependency.
+            .min_by_key(|journal| journal.tail.is_none())
+            .map(|journal| {
+                (
+                    journal.watch.clone(),
+                    journal.import_id.clone(),
+                    journal.tail.is_some(),
+                )
+            });
         if work.is_none() && pending.len() < sparrow_core::MAX_CONSUMPTION_JOURNALS {
             for detector in &mut detectors {
                 if !detector.enabled {
@@ -1034,7 +1030,7 @@ async fn run(
                     ) {
                         Ok(journal) => {
                             detector.candidates.remove(&path);
-                            work = Some((detector.config.id.clone(), journal.import_id));
+                            work = Some((detector.config.id.clone(), journal.import_id, false));
                         }
                         Err(error) => {
                             detector.failure = Some(error.to_string().chars().take(1024).collect());
@@ -1055,7 +1051,43 @@ async fn run(
                 }
             }
         }
-        if let Some((watch, id)) = work {
+        if let Some((watch, id, is_tail)) = work {
+            if !is_tail {
+                if client.is_none() && Instant::now() >= connect_after {
+                    tokio::select! {
+                        _ = stopped(&stop) => break,
+                        result = tokio::time::timeout(Duration::from_secs(10), Client::connect(&socket)) => {
+                            match result {
+                                Ok(Ok(connected)) => client = Some(connected),
+                                Ok(Err(error)) => eprintln!("sparrowd: consume RPC discovery failed: {error}"),
+                                Err(_) => eprintln!("sparrowd: consume RPC discovery timed out; sources remain owned"),
+                            }
+                            connect_after = Instant::now() + Duration::from_secs(1);
+                        }
+                    }
+                }
+                if client.is_none() {
+                    retry.insert(id, Instant::now() + TICK);
+                    tokio::time::sleep(TICK).await;
+                    continue;
+                }
+            }
+            let _permit = if is_tail {
+                match control.operations.try_acquire() {
+                    Ok(permit) => Some(permit),
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        tokio::time::sleep(TICK).await;
+                        continue;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => {
+                        return Err(Error::State(
+                            "tail claim operation budget closed unexpectedly",
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             let detector = detectors
                 .iter_mut()
                 .find(|detector| detector.config.id == watch)
@@ -1066,11 +1098,20 @@ async fn run(
                 if let Recovery::Claimed(mut claimed) =
                     detector.owner.claim()?.recover(&id, crate::now()?)?
                 {
-                    detector
-                        .owner
-                        .claim()?
-                        .publish(connected, &mut claimed)
-                        .await?;
+                    if is_tail {
+                        detector.owner.claim()?.publish_tail(&mut claimed)?;
+                    } else {
+                        detector
+                            .owner
+                            .claim()?
+                            .publish(
+                                client
+                                    .as_ref()
+                                    .ok_or(Error::State("consume RPC connection absent"))?,
+                                &mut claimed,
+                            )
+                            .await?;
+                    }
                     detector.owner.claim()?.remove(&claimed, crate::now()?)?;
                 }
                 Ok::<_, Error>(())
@@ -1083,7 +1124,9 @@ async fn run(
                 detector.failure = Some(error.to_string().chars().take(1024).collect());
                 eprintln!("sparrowd: watch={watch} claim={id} pending: {error}");
                 retry.insert(id, Instant::now() + Duration::from_secs(5));
-                client = None;
+                if !is_tail {
+                    client = None;
+                }
             } else {
                 detector.failure = None;
                 detector.completed = detector.completed.saturating_add(1);

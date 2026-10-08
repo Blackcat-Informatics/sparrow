@@ -2,6 +2,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "shared-claimed-descriptor-validation"
+summary = "Ordinary uploads and terminal tail acknowledgement certify the same rooted namespace and exact claimed descriptor before publication."
+home = "sparrow_server::consumption::ClaimRoot::validate_claim"
+entry_points = ["sparrow_server::consumption::ClaimRoot::publish", "sparrow_server::consumption::ClaimRoot::publish_tail"]
+spec = "docs/development-runtime.md: completed-tail filesystem retirement worker."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_tail_claim_descriptor|validate_upload_claim_descriptor)$']
+
+[[job]]
+id = "tail-root-claim-ownership"
+summary = "Lazily create the existing claim namespace owner from the original tail root descriptor, preserving one lock, rooted move, synchronization and deletion implementation."
+home = "sparrow_server::tailing::TailRoot::claim"
+entry_points = ["sparrow_server::consumption::ClaimRoot::from_root", "sparrow_server::watches::Owner::claim"]
+spec = "docs/development-runtime.md: completed-tail filesystem retirement worker."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(move_completed_tail|delete_completed_tail_source|lock_tail_claim_namespace)$']
+
+[[job]]
 id = "completed-tail-claim-publication"
 summary = "Seal an original terminal checkpoint into consumption identity and acknowledge its publication without reimporting bytes or refreshing record clocks; ordinary imports and tail claims share removal and retry ownership."
 home = "sparrow_core::storage::consumption::Store::consumption_publish_tail"

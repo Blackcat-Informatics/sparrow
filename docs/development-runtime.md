@@ -3884,9 +3884,10 @@ read, and altered or missing checkpoint proof fails its reservation identity.
 Reservations leave 512 bytes under the 8 KiB journal ceiling for the subsequent
 claimed observation, removal clock, and completed receipt wrapper.
 
-This is a core storage foundation. Public RPC/SDK/CLI/MCP handoff selection and
-the filesystem claim/deletion worker still need to be wired to this mode. The
-running schema-40 development service has not been changed by this work.
+The storage foundation was committed as `c68cc36`. Public RPC/SDK/CLI/MCP
+handoff selection remains unfinished. Filesystem-worker integration is recorded
+below. The running schema-40 development service has not been changed by this
+work.
 
 Qualification includes a release storage scenario covering incomplete-finish
 refusal, exact-clock/revision/root conflicts, checkpoint tampering and missing
@@ -3898,3 +3899,40 @@ tests, remaining workspace tests, seeded census self-tests, and the pinned cross
 gate with 206 ownership jobs and no distinct exceptions. Gate and normal signed
 commit verification logs are `/tmp/sparrow-tail-claim-check.log` and
 `/tmp/sparrow-tail-claim-commit.log`.
+
+## Completed-tail filesystem retirement worker
+
+The consumption worker now recovers and retires sealed completed-tail claims
+through the existing `ClaimRoot` namespace, original descriptor validation,
+no-overwrite move, directory synchronization, and deletion recovery. Its tail
+owner lazily creates that same claim coordinator from a clone of the already
+admitted root descriptor, without reopening the configured path. A retain watch
+alone still creates no private claim directory and authorizes no deletion.
+
+Ordinary inputs use the existing typed uploader. A terminal tail claim instead
+acknowledges its sealed checkpoint directly, without connecting to an upload
+socket. Both paths share claimed-descriptor validation and removal. A published
+tail whose private source was already unlinked is recovered through the same
+directory-sync and removal-confirmation path. Tail acknowledgement and retirement
+require a permit from the shared daemon operation budget. Ready tail claims take
+precedence over ordinary upload connections, and a tail failure does not discard
+an unrelated upload connection.
+
+Admission requires a tail-generation target for active-file watches and ordinary
+handoff for completed-file watches. The current public intent codec cannot yet
+name the tail target; those RPC/SDK/CLI/MCP changes and live adoption remain
+unfinished. This worker change is not deployed in the running development unit.
+
+A release acceptance scenario runs the actual worker without any RPC listener,
+recovering reserved, claimed, published, and already-unlinked sources. It verifies
+operation-budget blocking, private-directory laziness, original record/checkpoint
+clocks, no duplicate occurrences, preserved replacement paths, and hard refusal
+of a late writer mutation with the original bytes and journal still owned.
+Focused evidence is `/tmp/sparrow-tail-worker-focused.log`; repository and signed
+commit verification logs are `/tmp/sparrow-tail-worker-check.log` and
+`/tmp/sparrow-tail-worker-commit.log`.
+
+The repository gate passed with 139 storage scenarios, 49 RPC scenarios, 15 SDK
+tests, remaining workspace tests, seeded census self-tests, and the pinned cross
+gate with 208 ownership jobs and no distinct exceptions. Public tail handoff
+qualification and live deployment remain unrun.

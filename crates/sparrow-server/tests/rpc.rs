@@ -3275,6 +3275,227 @@ fn anchored_claim_open_refuses_fifos_and_replaced_coordination_locks() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn completed_tail_claim_worker_recovers_without_upload_and_preserves_replacements() {
+    use sparrow_core::{
+        ConsumptionDirectories, ConsumptionGeneration, ConsumptionHandoff, TailFinishIntent,
+        TailStart,
+    };
+    use sparrow_server::{
+        ServerConfig,
+        consumption::{ClaimRoot, Recovery},
+        watches::{ConsumeWorker, WatchRegistry},
+    };
+    use std::sync::Arc;
+    for phase in ["reserved", "claimed", "published", "unlinked", "changed"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("active");
+        std::fs::create_dir(&root).unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("absent-rpc.sock");
+        let config_path = write_server_config(dir.path(), &data, &socket);
+        append_tail_config(&config_path, &root, "log");
+        let config = ServerConfig::read(&config_path).unwrap();
+        let store = config.open_store().unwrap();
+        let registry = WatchRegistry::default();
+        let operations = Arc::new(tokio::sync::Semaphore::new(0));
+        let worker = ConsumeWorker::start(
+            store.clone(),
+            &config.consume,
+            socket.clone(),
+            registry.clone(),
+            operations.clone(),
+        )
+        .unwrap();
+        assert!(!root.join(".sparrow-inflight").exists());
+        worker.shutdown().await.unwrap();
+        let path = root.join("finished.log");
+        std::fs::write(&path, b"first\nlast").unwrap();
+        let observed = sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap());
+        let directory = sparrow_client::CompletedFileIdentity::capture(&root.metadata().unwrap());
+        let generation = store
+            .tail_start(
+                &TailStart {
+                    request_id: "worker-tail-start".into(),
+                    watch: "completed".into(),
+                    watch_revision: 1,
+                    directories: ConsumptionDirectories {
+                        root_device: directory.device,
+                        root_inode: directory.inode,
+                        parent_device: directory.device,
+                        parent_inode: directory.inode,
+                    },
+                    path: b"finished.log".to_vec(),
+                    source: "consume-acceptance".into(),
+                    format: "log".into(),
+                    device: observed.device,
+                    inode: observed.inode,
+                },
+                sparrow_server::now().unwrap(),
+            )
+            .unwrap();
+        let first = store
+            .tail_append(
+                &generation.id,
+                0,
+                b"first\n",
+                false,
+                sparrow_server::now().unwrap(),
+            )
+            .unwrap()
+            .artifact
+            .unwrap();
+        let record = store.record(&first.record_ids[0]).unwrap();
+        let finish = TailFinishIntent {
+            request_id: "worker-tail-finish".into(),
+            generation_id: generation.id.clone(),
+            watch_revision: 1,
+            observed: ConsumptionGeneration {
+                device: observed.device,
+                inode: observed.inode,
+                byte_length: observed.length,
+                modified: (observed.modified_seconds, observed.modified_nanos as u32),
+                changed: (observed.changed_seconds, observed.changed_nanos as u32),
+            },
+        };
+        store
+            .tail_finish_start(&finish, sparrow_server::now().unwrap())
+            .unwrap();
+        store
+            .tail_append(
+                &generation.id,
+                6,
+                b"last",
+                true,
+                sparrow_server::now().unwrap(),
+            )
+            .unwrap();
+        let terminal = store.tail_generation(&generation.id).unwrap();
+        let intent = ConsumptionHandoff {
+            request_id: "worker-tail-handoff".into(),
+            watch: "completed".into(),
+            watch_revision: 1,
+            relative_path: b"finished.log".to_vec(),
+            observed: finish.observed,
+            tail_generation_id: Some(generation.id.clone()),
+        };
+        let reserved = store
+            .consumption_handoff_reserve(
+                &intent,
+                "consume-acceptance",
+                "log",
+                generation.declaration.directories.clone(),
+                sparrow_server::now().unwrap(),
+            )
+            .unwrap();
+        let owner = ClaimRoot::open(store.clone(), "completed", &root).unwrap();
+        let private = root.join(".sparrow-inflight").join(&reserved.import_id);
+        if phase != "reserved" {
+            let Recovery::Claimed(mut claim) = owner
+                .recover(&reserved.import_id, sparrow_server::now().unwrap())
+                .unwrap()
+            else {
+                panic!("unpublished source must be claimed")
+            };
+            assert!(
+                owner
+                    .remove(&claim, sparrow_server::now().unwrap())
+                    .is_err()
+            );
+            std::fs::write(&path, b"replacement stays independent").unwrap();
+            if ["published", "unlinked"].contains(&phase) {
+                owner.publish_tail(&mut claim).unwrap();
+            }
+            if phase == "unlinked" {
+                std::fs::remove_file(&private).unwrap();
+                std::fs::File::open(private.parent().unwrap())
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+            }
+            if phase == "changed" {
+                std::fs::write(&private, b"late writer changes claimed bytes").unwrap();
+            }
+        }
+        drop(owner);
+        let pending = store.consumption_get(&reserved.import_id).unwrap();
+        let worker = ConsumeWorker::start(
+            store.clone(),
+            &config.consume,
+            socket.clone(),
+            registry.clone(),
+            operations.clone(),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(store.consumption_get(&reserved.import_id).unwrap(), pending);
+        assert!(
+            !socket.exists(),
+            "tail retirement must not need an upload server"
+        );
+        operations.add_permits(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(!worker.is_finished(), "tail claim worker failed");
+            let states = registry.snapshot().unwrap();
+            if phase == "changed" {
+                if states[0]
+                    .failure
+                    .as_ref()
+                    .is_some_and(|message| message.contains("changed"))
+                {
+                    break;
+                }
+            } else if store
+                .consumption_get(&reserved.import_id)
+                .unwrap()
+                .removed_at
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tail claim recovery stalled in {phase}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        worker.shutdown().await.unwrap();
+        let completed = store.consumption_get(&reserved.import_id).unwrap();
+        if phase == "changed" {
+            assert!(completed.removed_at.is_none());
+            assert!(!completed.tail_published);
+            assert_eq!(
+                std::fs::read(&private).unwrap(),
+                b"late writer changes claimed bytes"
+            );
+        } else {
+            assert!(completed.removed_at.is_some());
+            assert_eq!(completed.published_id(), Some(generation.id.as_str()));
+            assert!(!private.exists());
+        }
+        if phase != "reserved" {
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"replacement stays independent"
+            );
+        } else {
+            assert!(!path.exists());
+        }
+        assert!(completed.published_artifact.is_none());
+        assert_eq!(store.tail_generation(&generation.id).unwrap(), terminal);
+        let unchanged = store.record(&record.id).unwrap();
+        assert_eq!(unchanged.received_at, record.received_at);
+        assert_eq!(unchanged.expires_at, record.expires_at);
+        assert_eq!(unchanged.tail, record.tail);
+        assert_eq!(
+            store.records(sparrow_server::now().unwrap()).unwrap().len(),
+            2
+        );
+        assert!(!socket.exists());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_replacements() {
     tokio::task::LocalSet::new()
         .run_until(async {

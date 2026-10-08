@@ -200,6 +200,12 @@ impl ClaimRoot {
             ));
         }
         let root = crate::source_file::root(&store, path)?;
+        Self::from_root(store, watch, root)
+    }
+
+    /// Share an already admitted rooted descriptor with a tail owner; never reopen
+    /// a pathname that could now identify a replacement directory.
+    pub(crate) fn from_root(store: Store, watch: &str, root: File) -> Result<Self, Error> {
         let root_identity = CompletedFileIdentity::capture(&root.metadata()?);
         let pending = store
             .consumption_pending()?
@@ -421,7 +427,7 @@ impl ClaimRoot {
         let file = match open(&self.inflight, private_name, OFlags::RDONLY, BENEATH) {
             Ok(file) => file,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                if journal.published_artifact.is_some() {
+                if journal.published_id().is_some() {
                     let artifact = self.publication(&journal, now)?;
                     self.inflight.sync_all()?;
                     return Ok(Recovery::Removed(
@@ -507,20 +513,17 @@ impl ClaimRoot {
         client: &Client,
         claim: &mut ClaimedFile,
     ) -> Result<ArtifactReceipt, Error> {
-        self.namespace(&claim.journal)?;
+        self.validate_claim(claim)?;
+        if claim.journal.tail.is_some() {
+            return Err(Error::State(
+                "completed tail claims must acknowledge their original checkpoint without uploading",
+            ));
+        }
         if client.discovery().store_id != self.store.store_id()? {
             return Err(Error::State(
                 "producer connection belongs to a different store",
             ));
         }
-        require(
-            &claim.file,
-            claim
-                .journal
-                .claimed
-                .as_ref()
-                .ok_or(Error::State("claim observation absent"))?,
-        )?;
         let receipt = client
             .import_open_file(
                 &claim.journal.request_id,
@@ -540,17 +543,48 @@ impl ClaimRoot {
         Ok(receipt)
     }
 
+    fn validate_claim(&self, claim: &ClaimedFile) -> Result<(), Error> {
+        self.namespace(&claim.journal)?;
+        require(
+            &claim.file,
+            claim
+                .journal
+                .claimed
+                .as_ref()
+                .ok_or(Error::State("claim observation absent"))?,
+        )
+    }
+
+    /// Acknowledge the sealed terminal checkpoint, using the same exact claim
+    /// validation and deletion recovery as completed-file uploads.
+    pub fn publish_tail(&self, claim: &mut ClaimedFile) -> Result<ConsumptionJournal, Error> {
+        self.validate_claim(claim)?;
+        let saved = self.store.consumption_publish_tail(
+            &claim.journal.import_id,
+            claim
+                .journal
+                .claimed
+                .as_ref()
+                .ok_or(Error::State("claim observation absent"))?,
+        )?;
+        claim.journal = saved.clone();
+        Ok(saved)
+    }
+
     fn publication(&self, journal: &ConsumptionJournal, now: u64) -> Result<String, Error> {
-        let original = journal.published_artifact.as_ref().ok_or(Error::State(
+        let original = journal.published_id().ok_or(Error::State(
             "source has no durable publication; unlink refused",
         ))?;
+        if journal.tail.is_some() {
+            return Ok(original.to_owned());
+        }
         let receipt = self.store.import_publish(&journal.import_id, now)?;
-        if &receipt.id != original {
+        if receipt.id != original {
             return Err(Error::State(
                 "publication proof contradicts the source journal",
             ));
         }
-        Ok(original.clone())
+        Ok(original.to_owned())
     }
 
     /// Remove only the private exact claimed generation after verifying its

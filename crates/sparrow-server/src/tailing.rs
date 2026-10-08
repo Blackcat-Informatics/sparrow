@@ -24,7 +24,9 @@ struct Held {
 
 pub(crate) struct TailRoot {
     store: Store,
+    watch: String,
     root: File,
+    claim: std::cell::OnceCell<crate::consumption::ClaimRoot>,
     held: BTreeMap<(u64, u64), Held>,
     read_bytes: usize,
     next: Option<(u64, u64)>,
@@ -59,7 +61,9 @@ impl TailRoot {
             .map_err(|_| Error::State("storage read limit invalid"))?;
         Ok(Self {
             store,
+            watch: config.id.clone(),
             root,
+            claim: std::cell::OnceCell::new(),
             held: BTreeMap::new(),
             read_bytes: READ_BYTES.min(limit),
             next: None,
@@ -83,6 +87,23 @@ impl TailRoot {
 
     pub(crate) fn directory(&self, relative: &Path) -> Result<File, Error> {
         source_file::directory(&self.root, relative)
+    }
+
+    pub(crate) fn claim(&self) -> Result<&crate::consumption::ClaimRoot, Error> {
+        if let Some(claim) = self.claim.get() {
+            return Ok(claim);
+        }
+        let claim = crate::consumption::ClaimRoot::from_root(
+            self.store.clone(),
+            &self.watch,
+            self.root.try_clone()?,
+        )?;
+        self.claim
+            .set(claim)
+            .map_err(|_| Error::State("tail claim owner initialized twice"))?;
+        self.claim
+            .get()
+            .ok_or(Error::State("tail claim owner initialization missing"))
     }
     pub(crate) fn root_binding(&self, path: &Path) -> Result<(), Error> {
         source_file::root_binding(&self.root, path)
