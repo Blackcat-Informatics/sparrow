@@ -4107,6 +4107,32 @@ fn buffered_ledger_refuses_the_next_write_without_publishing_a_prefix() {
 fn buffered_batch_byte_charge_refuses_new_unique_payloads_before_the_write_bound() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
+    // Native compaction may invalidate a complete physical measurement. Retry
+    // only that documented refusal, with the unchanged request and bytes;
+    // buffered capacity and every other refusal remain immediately observable.
+    let ingest = |request: &str, bytes: &[u8]| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result = store.ingest_with_durability(
+                request,
+                "byte-queue",
+                "opaque",
+                bytes,
+                0,
+                sparrow_core::Durability::Buffered,
+            );
+            let retry = result.as_ref().is_err_and(|error| {
+                error.code == "STORAGE_PRESSURE"
+                    && error.message.starts_with(
+                        "database footprint stayed unstable across 3 complete measurements",
+                    )
+            });
+            if !retry || std::time::Instant::now() >= deadline {
+                break result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
     let mut input = vec![b'x'; 512 * 1024];
     let mut accepted = 0;
     let mut first = None;
@@ -4120,14 +4146,7 @@ fn buffered_batch_byte_charge_refuses_new_unique_payloads_before_the_write_bound
             chunk[..8].copy_from_slice(&(accepted as u64).to_le_bytes());
             chunk[8..16].copy_from_slice(&(index as u64).to_le_bytes());
         }
-        match store.ingest_with_durability(
-            &format!("bytes-{accepted}"),
-            "byte-queue",
-            "opaque",
-            &input,
-            0,
-            sparrow_core::Durability::Buffered,
-        ) {
+        match ingest(&format!("bytes-{accepted}"), &input) {
             Ok(artifact) => {
                 first.get_or_insert(artifact);
                 accepted += 1;
@@ -4153,19 +4172,13 @@ fn buffered_batch_byte_charge_refuses_new_unique_payloads_before_the_write_bound
         .unwrap();
     assert_eq!(store.durability_status().unwrap().pending_bytes, 0);
     assert!(
-        store
-            .ingest_with_durability(
-                &format!("bytes-{accepted}"),
-                "byte-queue",
-                "opaque",
-                &input,
-                0,
-                sparrow_core::Durability::Buffered
-            )
+        ingest(&format!("bytes-{accepted}"), &input)
             .unwrap()
             .buffered
             .is_some()
     );
+    assert_eq!(store.artifacts(0).unwrap().len(), accepted + 1);
+    assert_eq!(store.durability_status().unwrap().pending_writes, 1);
 }
 
 #[test]

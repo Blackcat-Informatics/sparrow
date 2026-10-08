@@ -47,9 +47,9 @@ share the existing record/index WAL batch. Admission alone is not completion.
 This source uses storage formats 29..32. Existing 25..28 registries are validated
 and preserved during upgrade; missing checkpoints or unfenced completion
 metadata refuse startup. Older executables cannot safely open the new formats.
-The deployed schema-38 process below still uses format 28; this source foundation
-has not been adopted into that process. No source file was finalized or removed
-by that storage-only change. Schema 39 adds typed retained completion coordination
+The schema-38 deployment used format 28 when this foundation shipped. No source
+file was finalized or removed by that storage-only change. Schema 39 adds typed
+retained completion coordination
 as described below. Retained final-file byte coverage and the completed-tail
 claim/deletion handoff remain unfinished.
 
@@ -85,9 +85,7 @@ it cannot prevent another missing generation from receiving its gap. Source
 files remain retained; completed-tail claim/deletion and whole-file retained
 byte-cover assembly remain unfinished. Full architecture acceptance remains unmet.
 
-The deployed process remains the schema-38 service described below while the
-schema-39 service changes undergo qualification. No schema-39 adoption is claimed
-by this source description.
+The schema-39 service has since been adopted and verified as described below.
 
 The full `CARGO_BUILD_JOBS=4 make check` gate passed release Clippy with warnings
 denied, 135 storage scenarios, 48 RPC scenarios, 14 client unit scenarios and
@@ -100,9 +98,73 @@ no completed-file reimport, multi-read pending recovery and independent
 changed/missing/empty generation outcomes. Publication uses the existing
 operation-budget gate, separately exercised by the tail waiting scenario.
 
+## Schema 39 daemon adoption and retained completion acceptance
+
+The current `sparrow-development.service` runs PID **136502**, started at
+2026-10-08T10:29:10Z, from the signed functional source **818e020**.
+Its immutable executable is
+`/home/paudley/.local/libexec/sparrow/sparrowd-schema39-818e020`, SHA-256
+`fffaf556ee318d71ae14258f3399a0a96532237a7919deaf2e395d5dcb85464f`.
+Its sole file capability is `cap_net_bind_service=ep`. The public Cap'n Proto
+listener is **0.0.0.0:518**, with the existing private Unix endpoint at
+`/home/paudley/.local/state/sparrow/development-v5/rpc.sock`.
+The matching installed CLI is `sparrow-schema39-818e020`, SHA-256
+`463c3875e51a4bfe4f5559970ae8acbc65efd9aa014729483a359bf77735fbd0`.
+The installed SDK events example is `events-schema39-818e020`, SHA-256
+`2ed0e6a1c559f995583419b70f237dce9193efc2c0752452cd8444691ace3204`.
+All installed hashes were compared with the explicit all-bin/example build after
+the signed commit hook completed.
+
+The owned schema-38 process exited successfully, released port 518 and removed
+its Unix endpoint before a closed-store snapshot and upgrade. Store
+`store:46c88e949ccec658600b66c7becd5bb7`, all 208 previous records, watch revisions
+and original generation IDs survived the 28-to-32 migration. The closed snapshot
+is `/tmp/sparrow-schema39-live.LdQoqu/store-before-schema39`; restoration was not
+exercised, so this is a backup rather than a qualified rollback claim.
+
+The owned watch `development-tail-8a45378`, revision 7, completed its rotated
+generation `file-generation:29c37bd9fec7ae98cd412024c061694b` at an already
+accepted EOF of 107 bytes/three occurrences. This added no occurrence and did
+not change original acceptance clocks. A new owned synthetic JSONL file then
+accepted its CRLF-terminated prefix and deferred its final unterminated record
+until explicit completion. Generation
+`file-generation:e73fa22b7fa8b7ac71bf4012f528e0e2` completed at 52 bytes/two
+occurrences. CLI/MCP completion receipts, exact-byte reads, file provenance and
+record context agree. Both source files remain intact; no private claim directory
+or source removal occurred.
+
+The matching schema-39 SDK retried the original schema-38 public event over
+`192.168.2.4:518` twice and then Unix. Every retry returned the original
+`artifact:6a81f30ff545ca344c0d579cbffcfdce`, one record/375 bytes. A graceful
+schema-39 reopen then recovered both completion receipts with unchanged original
+admission/terminal clocks and occurrence IDs. The first read-only verification
+started before its Unix socket was ready; after confirming the same new process
+active and listening, verification passed without another restart or intake.
+Final status remains **210 records**, with one current active held generation,
+no tail failure or admission waiting and zero record-read handles.
+
+Live artifacts, saved immutable intents, CLI/MCP inputs and outputs, byte reads,
+public retry receipts and service status are in
+`/tmp/sparrow-schema39-live.LdQoqu`. `accept.py` creates the owned file and must
+not be rerun; `verify.py` only reads and retries the original accepted intents
+and event. Evidence does not qualify whole-file retained byte-cover assembly,
+completed-tail deletion, forced reclamation, complete SPARQL/correlation/query
+contracts, full representative-corpus performance or full architecture acceptance.
+The following schema-38 section is historical deployment evidence.
+
+The first evidence commit hook encountered transient native compaction churn in
+the existing buffered-byte-limit scenario: admission correctly returned its
+documented unstable-footprint `STORAGE_PRESSURE` instead of a partial accounting
+sum. That scenario now retries only this exact refusal for at most two seconds,
+with the unchanged request and bytes. Capacity and every other failure remain
+immediately observable. It additionally asserts one new artifact and one pending
+write after synchronization releases capacity. The focused release scenario
+passed (`/tmp/sparrow-accounting-test.log`); production accounting and admission
+limits were not changed. No hook bypass was used.
+
 ## Schema 38 daemon adoption and active file capture
 
-The current service is `sparrow-development.service`, PID **3844123**, started
+The previous schema-38 service was `sparrow-development.service`, PID **3844123**, started
 at 2026-10-08T09:16:37Z. It runs
 `/home/paudley/.local/libexec/sparrow/sparrowd-schema38-8a45378`, SHA-256
 `12cd4812d65a214e4582997749e71e49907d7280252a4757868fec338616bdeb`, with
