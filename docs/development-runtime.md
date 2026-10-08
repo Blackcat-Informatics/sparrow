@@ -4,10 +4,64 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`b8a9a6c`; see [persistent interrupt subscription](#persistent-interrupt-subscription) for
+`c7e3960`; see [final RPC admission drain](#final-rpc-admission-drain) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Final RPC admission drain
+
+Signed source `c7e3960` joins owned intake workers, then reserves the complete
+native RPC operation budget before the final WAL flush. Tokio's fair semaphore
+reservation prevents fresh work from overtaking that drain. Each admitted
+blocking worker retains its permit through completion even if its caller
+disappears. Once the reservation succeeds, admission closes and its guard stays
+held through flush and endpoint cleanup. Closed dispatch returns retryable
+`SHUTTING_DOWN`; callers retry the same intent after reconnecting. Intake joins
+retain RPC availability for their own unfinished imports. If draining fails,
+teardown reports the failure and withholds the final flush rather than presenting
+a fence over potentially active writes. No schema, storage format, dependency,
+or PurRDF revision changed.
+
+The signed source commit's full gate passes formatting, release Clippy with
+warnings denied, 155 storage tests, 60 RPC integration tests, seven RPC unit
+tests, three daemon unit tests, all remaining workspace tests, seeded census
+tests, and the pinned cross gate (243 ledger jobs, zero distinct exceptions).
+Two new daemon tests exercise fair full-budget reservation and the actual
+teardown owner. The latter cancels an admitted worker's caller, releases its
+paused buffered write, checks the final durable watermark, and reopens the store
+for exact byte readback. The RPC cancellation test also checks that closed
+admission rejects a real mutation without publication and renders a retryable
+typed failure.
+
+All five selected images were explicitly rebuilt after the gate and frozen at
+`~/.local/state/sparrow/receiver-history-images-x2lfe272`, with complete source
+identity and SHA-256 evidence. Private qualification
+`~/.local/state/sparrow/rpc-drain-traffic-ctqm4kiw` sends SIGINT during the actual
+typed load workload after observing a nonempty native anonymous staging file
+below its owned store. It distinguishes that file from deleted table files by
+the Linux temporary-file name. Shutdown exits zero in an observed 0.214 seconds
+and removes the owned endpoint. The interrupted workload reports a transport
+failure and emits no successful qualification report. Reopening preserves its
+store identity and 194 retained records; SDK reads match every byte of all five
+accepted artifacts against their saved inputs. Final pending writes/bytes,
+read handles and pins are zero. The public unit remains unchanged throughout
+this private probe. This is a bounded observation, not a worst-case shutdown
+deadline or a claim that every request sent before interruption was admitted.
+
+Public adoption evidence is `/tmp/sparrow-drain-live.ac9jj07r`, including a
+closed-store backup before switching aliases. The enabled active unit runs
+PID 1518105 from `sparrowd-schema48-c7e3960`; the stable CLI resolves to
+`sparrow-schema48-c7e3960`. Frozen, installed and alias hashes match, the daemon
+has `cap_net_bind_service=ep`, and its listener is `0.0.0.0:518`.
+TCP/Unix/CLI/MCP checks preserve store
+`store:46c88e949ccec658600b66c7becd5bb7`, format 37, 212 records, healthy watches,
+zero pins and read leases. Saved intents preserve receipts, bytes, clocks and
+replacement files without new intake or retirement. All 21 sources, five
+generation checkpoints, grouped pages, temporal/field witnesses, native text
+scores, four JSON keys and twenty values remain exact. Syslog listeners remain
+unconfigured. Complete governed SPARQL, correlation, sustained resource/latency
+acceptance and reboot qualification remain unfinished.
 
 ## Persistent interrupt subscription
 
