@@ -170,7 +170,6 @@ pub(super) fn render(found: wire::records_results::Reader<'_>) -> Result<Value> 
                         wire::optional_occurrence::Value(value) => Value::from(value.to_string()),
                     };
                     Ok(Object::new()
-                        .with("operation", "records_search")
                         .with("predicate_index", field.get_predicate_index().to_string())
                         .with("occurrence", field.get_occurrence().to_string())
                         .with("path", field.get_path()?.to_str()?)
@@ -207,6 +206,7 @@ pub(super) fn render(found: wire::records_results::Reader<'_>) -> Result<Value> 
     let coverage = found.get_event_coverage()?;
     let page = super::catalog::page(found.get_page()?)?;
     Ok(Object::new()
+        .with("operation", "records_search")
         .with("page", page)
         .with(
             "event_coverage",

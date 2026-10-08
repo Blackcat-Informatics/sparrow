@@ -6513,8 +6513,26 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 )
                 .await;
             assert!(!second_pin["isError"].as_bool().unwrap());
+            let where_file = dir.path().join("where.json");
+            std::fs::write(
+                &where_file,
+                purrdf_lex::json::write_compact(&Value::array([Value::from(
+                    Object::new()
+                        .with("path", "/message")
+                        .with("kind", "string"),
+                )])),
+            )
+            .unwrap();
             let commands = [
-                vec!["records", "--source", "next-source", "--page-size", "1"],
+                vec![
+                    "records",
+                    "--source",
+                    "next-source",
+                    "--page-size",
+                    "1",
+                    "--where-file",
+                    where_file.to_str().unwrap(),
+                ],
                 vec![
                     "text",
                     "needle",
@@ -6551,6 +6569,28 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 let expected = cli(&socket, &repeat);
                 let resumed = cli(&socket, &["result-next", id, cursor]);
                 assert_eq!(resumed, expected, "{}", args[0]);
+                assert_eq!(
+                    resumed["operation"].as_str(),
+                    Some(
+                        [
+                            "records_search",
+                            "text_search",
+                            "keys_list",
+                            "values_search",
+                            "artifacts_list",
+                            "sources_list",
+                            "pins_list",
+                            "pin_get",
+                        ][index]
+                    )
+                );
+                if index == 0 {
+                    for reply in [&first, &resumed] {
+                        let fields = reply["rows"][0]["fields"].as_array().unwrap();
+                        assert_eq!(fields.len(), 1);
+                        assert!(fields[0].get("operation").is_none());
+                    }
+                }
                 let replay = mcp
                     .tool(
                         index as u64 + 4,
