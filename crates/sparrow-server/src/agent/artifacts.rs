@@ -1,0 +1,120 @@
+// SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! One artifact-list client and renderer shared by CLI and MCP.
+
+use super::{Result, failure, instant, invalid, optional, wire};
+use purrdf_lex::json::{Object, Value};
+
+pub(crate) struct Input {
+    pub store: String,
+    pub query: sparrow_core::ArtifactRead,
+}
+
+impl Input {
+    pub(super) fn parse(args: &[String]) -> Result<Self> {
+        let store = args
+            .first()
+            .ok_or_else(|| invalid("artifacts requires STORE_ID"))?
+            .clone();
+        let mut query = sparrow_core::ArtifactRead::default();
+        let mut fields = args[1..].iter();
+        while let Some(flag) = fields.next() {
+            let value = fields
+                .next()
+                .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
+            match flag.as_str() {
+                "--source" => query.selector.source = Some(value.clone()),
+                "--received-from" => {
+                    query.selector.received_from =
+                        sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?
+                }
+                "--received-before" => {
+                    query.selector.received_before =
+                        sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?
+                }
+                "--cursor" => query.cursor = Some(value.clone()),
+                "--page-size" => {
+                    query.page_size = value
+                        .parse()
+                        .map_err(|_| invalid("page-size requires an integer"))?
+                }
+                "--scan-budget" => {
+                    query.scan_budget = value
+                        .parse()
+                        .map_err(|_| invalid("scan-budget requires an integer"))?
+                }
+                _ => return Err(invalid(format!("unknown artifact list option: {flag}"))),
+            }
+        }
+        Ok(Self { store, query })
+    }
+
+    pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
+        sparrow_client::Discovery::fetch(client).await?;
+        let mut request = client.artifacts_list_request();
+        let mut query = request.get().init_query();
+        query.set_store_id(&self.store);
+        query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+        optional(query.reborrow().init_source(), &self.query.selector.source);
+        optional(query.reborrow().init_cursor(), &self.query.cursor);
+        let mut received = query.reborrow().init_received();
+        if self.query.selector.received_from == 0 && self.query.selector.received_before == u64::MAX
+        {
+            received.set_unfiltered(());
+        } else {
+            let mut interval = received.init_interval();
+            interval
+                .reborrow()
+                .init_from()
+                .set_unix_millis(self.query.selector.received_from);
+            interval
+                .init_before()
+                .set_unix_millis(self.query.selector.received_before);
+        }
+        query.set_page_size(
+            u32::try_from(self.query.page_size).map_err(|_| invalid("page-size exceeds UInt32"))?,
+        );
+        query.set_scan_budget(
+            u32::try_from(self.query.scan_budget)
+                .map_err(|_| invalid("scan-budget exceeds UInt32"))?,
+        );
+        let response = request.send().promise.await?;
+        let page = match response.get()?.get_result()?.which()? {
+            wire::result::Ok(value) => value?,
+            wire::result::Error(error) => return Err(failure(error?)),
+        };
+        let mut rows = Vec::new();
+        for row in page.get_rows()? {
+            let origin = match row.get_origin()?.which()? {
+                wire::optional_artifact_origin::Absent(()) => Value::Null,
+                wire::optional_artifact_origin::Value(value) => {
+                    let value = value?;
+                    Object::new()
+                        .with("format", sparrow_client::format_label(value.get_format()?))
+                        .with("received_at", instant(value.get_received_at()?)?)
+                        .with("expires_at", instant(value.get_expires_at()?)?)
+                        .with("byte_length", value.get_byte_length().to_string())
+                        .with("original_records", value.get_original_records().to_string())
+                        .into()
+                }
+            };
+            rows.push(Value::from(
+                Object::new()
+                    .with("artifact_id", row.get_id()?.to_str()?)
+                    .with("source", row.get_source()?.to_str()?)
+                    .with("origin", origin)
+                    .with(
+                        "complete_bytes_available",
+                        row.get_complete_bytes_available(),
+                    )
+                    .with("retained_records", row.get_retained_records().to_string()),
+            ));
+        }
+        Ok(super::catalog::receipt(page.get_receipt()?)?
+            .with("operation", "artifacts_list")
+            .with("rows", Value::array(rows))
+            .with("profile_ids", Value::array(["sparrow-artifact-catalog-v1"]))
+            .into())
+    }
+}

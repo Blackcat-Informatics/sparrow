@@ -28,6 +28,25 @@ struct Artifact {
   bufferedThrough @10 :OptionalDurabilityWatermark;
 }
 struct ArtifactRef { storeId @0 :Text; id @1 :Text; }
+struct ArtifactOrigin {
+  format @0 :Format; receivedAt @1 :Instant; expiresAt @2 :Instant;
+  byteLength @3 :UInt64; originalRecords @4 :UInt64;
+}
+struct OptionalArtifactOrigin { union { absent @0 :Void; value @1 :ArtifactOrigin; } }
+struct ArtifactSummary {
+  id @0 :Text; source @1 :Text; origin @2 :OptionalArtifactOrigin;
+  completeBytesAvailable @3 :Bool; retainedRecords @4 :UInt64;
+}
+struct ArtifactReceiptInterval { from @0 :Instant; before @1 :Instant; }
+struct OptionalArtifactReceiptInterval {
+  union { unfiltered @0 :Void; interval @1 :ArtifactReceiptInterval; }
+}
+struct ArtifactListQuery {
+  storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;
+  received @3 :OptionalArtifactReceiptInterval;
+  cursor @4 :OptionalText; pageSize @5 :UInt32 = 200; scanBudget @6 :UInt32 = 10000;
+}
+struct ArtifactListPage { receipt @0 :CatalogReadReceipt; rows @1 :List(ArtifactSummary); }
 struct RecordRef { storeId @0 :Text; id @1 :Text; }
 struct Record {
   storeId @0 :Text; id @1 :Text; artifactId @2 :Text; source @3 :Text;
@@ -89,6 +108,9 @@ struct Status {
   durabilityStatus @24 :DurabilityStatus;
   consumeWatches @25 :List(ConsumeWatchStatus);
   pressureStatus @26 :PressureStatus;
+  artifactReadHandles @27 :UInt64; artifactReadBytes @28 :UInt64;
+  maxArtifactReadHandles @29 :UInt64; maxArtifactReadBytes @30 :UInt64;
+  artifactReadLeaseMs @31 :UInt64;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
@@ -294,14 +316,14 @@ struct PinSummary {
   id @0 :Text; name @1 :Text; expiresAt @2 :Instant;
   revision @3 :UInt64; directMemberCount @4 :UInt64;
 }
-struct PinReadReceipt {
+struct CatalogReadReceipt {
   storeId @0 :Text; snapshotId @1 :Text; asOf @2 :Instant; leaseExpiresAt @3 :Instant;
   totalItems @4 :UInt64; pageStart @5 :UInt64; nextCursor @6 :OptionalText;
   pageSize @7 :UInt32; scanBudget @8 :UInt32; scanned @9 :UInt64;
 }
 struct PinMembers { pin @0 :PinSummary; members @1 :List(Evidence); }
 struct PinReadPage {
-  receipt @0 :PinReadReceipt;
+  receipt @0 :CatalogReadReceipt;
   union { collections @1 :List(PinSummary); members @2 :PinMembers; }
 }
 struct JsonPredicate {
@@ -401,4 +423,5 @@ interface Sparrow {
   diagnosticDefine @32 (definition :DiagnosticDefinition) -> (result :Result(DiagnosticProfile));
   diagnosticGet @33 (source :Text) -> (result :Result(OptionalDiagnosticProfile));
   discover @34 () -> (result :Result(Discovery));
+  artifactsList @35 (query :ArtifactListQuery) -> (result :Result(ArtifactListPage));
 }

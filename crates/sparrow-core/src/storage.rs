@@ -16,7 +16,7 @@ use rocksdb::{
 };
 
 pub(crate) mod artifact_read;
-mod catalog_lease;
+pub(crate) mod catalog_lease;
 pub(crate) mod consumption;
 pub(crate) mod context;
 pub(crate) mod diagnostic;

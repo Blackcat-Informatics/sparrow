@@ -456,6 +456,29 @@ still validate the evidence they read. Corrupt evidence must produce an
 actionable failure on those paths even when discovery succeeds. Status metadata
 must agree with discovery. This wire revision does not change storage formats.
 
+Schema 24 adds typed `artifactsList`, CLI `sparrow SOCKET artifacts STORE_ID`
+and MCP `artifacts_list`. The initial selector accepts an exact source label and
+half-open original artifact receipt interval, plus `cursor`, `page_size` and
+`scan_budget`. CLI uses `--source`, `--received-from`, `--received-before`,
+`--cursor`, `--page-size` and `--scan-budget`; MCP uses their snake-case names and
+required `store_id`. RPC requests declare the current discovered schema.
+
+Pages use the shared `CatalogReadReceipt` with fixed store/snapshot/as-of,
+absolute lease deadline, total items, page position, scan evidence and limits.
+Continuation must retain its original selector and limits. Reading later pages
+does not renew the lease or pin any evidence. Summaries carry original artifact
+metadata in an explicit optional union, complete-byte availability at capture
+time and exact retained record count. Reclaimed parent catalogs return absent
+origin metadata while surviving records retain parent ID/source. Receipt-time
+filtering on an applicable unknown origin refuses with `INDEX_NOT_READY`.
+Complete-byte availability is an observation at `as_of`; byte reads independently
+check current retention. All counts render as decimal strings in agent output.
+
+Status now carries typed artifact catalog handle/byte counts, limits and lease
+duration. Artifact and pin pages share both their receipt wire codec and agent
+renderer. This surface still requires full live/pin/selection and diagnostic
+scope support and corpus-scale indexed selection; source discovery is unfinished.
+
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity
 uses the configured upload source. Format selects the interpretation profile;

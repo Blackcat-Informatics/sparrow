@@ -168,5 +168,26 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "pin_read_lease_ms",
             value.get_pin_read_lease_ms().to_string(),
         );
+    let output = output
+        .with(
+            "artifact_read_handles",
+            value.get_artifact_read_handles().to_string(),
+        )
+        .with(
+            "artifact_read_bytes",
+            value.get_artifact_read_bytes().to_string(),
+        )
+        .with(
+            "max_artifact_read_handles",
+            value.get_max_artifact_read_handles().to_string(),
+        )
+        .with(
+            "max_artifact_read_bytes",
+            value.get_max_artifact_read_bytes().to_string(),
+        )
+        .with(
+            "artifact_read_lease_ms",
+            value.get_artifact_read_lease_ms().to_string(),
+        );
     Ok(output.into())
 }

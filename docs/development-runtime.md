@@ -32,8 +32,38 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 23; the schema sections
+The current source implements schema 24; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 24 typed artifact pages
+
+`artifactsList` connects the shared catalog reader below to the private Cap'n
+Proto daemon. CLI `artifacts STORE_ID` and MCP `artifacts_list` use one generated
+client and renderer. Receipt-time selection is an explicit unfiltered/interval
+union with typed `Instant` bounds. The request declares the current discovered
+schema; obsolete/absent versions and foreign stores are refused before capture.
+Source/cursor lengths are checked before owned copies. Status carries typed
+artifact handle/byte counts, ceilings and lease duration. Pin/artifact receipt
+wire encoding and agent rendering each have one implementation.
+
+Local qualification on 2026-10-07: final `make check` passed formatting, release
+Clippy with warnings denied, all workspace release tests (100 storage and 29
+RPC/daemon/MCP scenarios), seeded census self-tests and the pinned cross-workspace
+gate. All 149 ownership jobs hold with no distinct exceptions. Evidence is
+`/tmp/sparrow-artifact-wire-final-check-20261007.log`. The real-daemon scenario
+verifies immutable continuation after later ingestion, CLI/MCP equal replay,
+explicit unknown origin after parent reclamation, retained record counts,
+strict unknown-origin receipt filtering and no successful rows on resource,
+store, schema or changed-scope refusal. MCP exposes 22 implemented tools and marks
+artifact listing read-only. Existing pin pages pass through the shared codecs.
+
+A private schema 23 daemon captured from the owned development process (SHA256
+`57f3a26268b16b811c79c0e68d3e47cba91018a134e3b7891a00002743f988de`)
+was refused by the schema 24 CLI for status, keys and artifact listing with
+`UNSUPPORTED`, exit 1 and zero stdout bytes. Evidence is
+`/tmp/sparrow-artifact-wire-compat.39mlsatd`; the private child stopped cleanly on
+SIGINT and removed its socket. No HTTP transport, runtime dependency, store
+format or PurRDF pin changed. Full architecture acceptance remains unmet.
 
 ## Schema 23 bounded typed discovery
 
@@ -1876,10 +1906,12 @@ availability independently. Captures neither pin bytes nor retain database
 versions. Expiry maintenance and status purge expired handles even when clients
 stop reading. Core status exposes artifact handle/byte counts and limits.
 
-The artifact reader is currently a core API. Cap'n Proto, CLI and MCP wiring,
-full live/pin/selection and diagnostic scope support, source discovery and
-corpus-scale indexed selection remain unfinished requirements. No artifact list
-tool is advertised yet.
+Schema 24 now connects this reader to typed `artifactsList`, CLI `artifacts
+STORE_ID` and MCP `artifacts_list`. CLI and MCP share one native client and
+renderer. Pin/artifact receipt encoding and rendering also each have one owner.
+Typed status includes artifact handle counts, capacity ceilings and lease
+duration. Full live/pin/selection and diagnostic scope support, source discovery
+and corpus-scale indexed selection remain unfinished requirements.
 
 Local qualification on 2026-10-07: final `make check` passed formatting,
 release Clippy with warnings denied, all workspace release tests (100 storage

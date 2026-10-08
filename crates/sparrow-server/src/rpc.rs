@@ -16,6 +16,29 @@ fn invalid(error: impl std::fmt::Display) -> Error {
     Error::new("INVALID_ARGUMENT", error.to_string())
 }
 
+fn catalog_receipt<B>(
+    mut out: wire::catalog_read_receipt::Builder<'_>,
+    page: &sparrow_core::CatalogReadPage<B>,
+) {
+    out.set_store_id(&page.store_id);
+    out.set_snapshot_id(&page.snapshot_id);
+    out.reborrow().init_as_of().set_unix_millis(page.as_of);
+    out.reborrow()
+        .init_lease_expires_at()
+        .set_unix_millis(page.lease_expires_at);
+    out.set_total_items(page.total_items as u64);
+    out.set_page_start(page.page_start as u64);
+    out.set_page_size(page.page_size as u32);
+    out.set_scan_budget(page.scan_budget as u32);
+    out.set_scanned(page.scanned as u64);
+    sparrow_client::encode_optional(
+        out.init_next_cursor(),
+        page.next_cursor.as_deref(),
+        |mut out, value| out.set_value(value),
+        |mut out| out.set_absent(()),
+    );
+}
+
 fn encode_durability(
     mut state: wire::durability_status::Builder<'_>,
     durability: &sparrow_core::DurabilityStatus,
@@ -1723,6 +1746,11 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_pin_read_handles(number(&value, "max_pin_read_handles")?);
                 out.set_max_pin_read_bytes(number(&value, "max_pin_read_bytes")?);
                 out.set_pin_read_lease_ms(number(&value, "pin_read_lease_ms")?);
+                out.set_artifact_read_handles(number(&value, "artifact_read_handles")?);
+                out.set_artifact_read_bytes(number(&value, "artifact_read_bytes")?);
+                out.set_max_artifact_read_handles(number(&value, "max_artifact_read_handles")?);
+                out.set_max_artifact_read_bytes(number(&value, "max_artifact_read_bytes")?);
+                out.set_artifact_read_lease_ms(number(&value, "artifact_read_lease_ms")?);
             }
         }
         Ok(())
@@ -1926,6 +1954,96 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn artifacts_list(
+        self: Rc<Self>,
+        params: wire::sparrow::ArtifactsListParams,
+        mut results: wire::sparrow::ArtifactsListResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(input.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        if input.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "artifact listing requires the current discovered schema",
+                ),
+            );
+            return Ok(());
+        }
+        for (value, maximum) in [(input.get_source()?, 512), (input.get_cursor()?, 160)] {
+            if let wire::optional_text::Value(value) = value.which()?
+                && value?.len() > maximum
+            {
+                failure(
+                    results.get().init_result(),
+                    invalid("artifact selector or cursor exceeds its admission bound"),
+                );
+                return Ok(());
+            }
+        }
+        let (received_from, received_before) = match input.get_received()?.which()? {
+            wire::optional_artifact_receipt_interval::Unfiltered(()) => (0, u64::MAX),
+            wire::optional_artifact_receipt_interval::Interval(value) => {
+                let value = value?;
+                (
+                    value.get_from()?.get_unix_millis(),
+                    value.get_before()?.get_unix_millis(),
+                )
+            }
+        };
+        let query = sparrow_core::ArtifactRead {
+            selector: sparrow_core::ArtifactSelector {
+                source: optional(input.get_source()?)?,
+                received_from,
+                received_before,
+            },
+            cursor: optional(input.get_cursor()?)?,
+            page_size: input.get_page_size() as usize,
+            scan_budget: input.get_scan_budget() as usize,
+        };
+        match self
+            .work(move |store, now| store.artifact_read(&query, now))
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(page) => {
+                let mut out = results.get().init_result().init_ok();
+                catalog_receipt(out.reborrow().init_receipt(), &page);
+                let mut rows = out.init_rows(page.body.artifacts.len() as u32);
+                for (index, summary) in page.body.artifacts.iter().enumerate() {
+                    let mut row = rows.reborrow().get(index as u32);
+                    row.set_id(&summary.id);
+                    row.set_source(&summary.source);
+                    row.set_complete_bytes_available(summary.complete_bytes_available);
+                    row.set_retained_records(summary.retained_records as u64);
+                    let mut original = row.init_origin();
+                    match &summary.origin {
+                        None => original.set_absent(()),
+                        Some(origin) => {
+                            let mut original = original.init_value();
+                            original.set_format(stored_format(&origin.format)?);
+                            original
+                                .reborrow()
+                                .init_received_at()
+                                .set_unix_millis(origin.received_at);
+                            original
+                                .reborrow()
+                                .init_expires_at()
+                                .set_unix_millis(origin.expires_at);
+                            original.set_byte_length(origin.byte_length);
+                            original.set_original_records(origin.original_records as u64);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn pin_read(
         self: Rc<Self>,
         params: wire::sparrow::PinReadParams,
@@ -1980,24 +2098,7 @@ impl wire::sparrow::Server for Rpc {
             Err(error) => failure(results.get().init_result(), error),
             Ok(page) => {
                 let mut out = results.get().init_result().init_ok();
-                let mut receipt = out.reborrow().init_receipt();
-                receipt.set_store_id(&page.store_id);
-                receipt.set_snapshot_id(&page.snapshot_id);
-                receipt.reborrow().init_as_of().set_unix_millis(page.as_of);
-                receipt
-                    .reborrow()
-                    .init_lease_expires_at()
-                    .set_unix_millis(page.lease_expires_at);
-                receipt.set_total_items(page.total_items as u64);
-                receipt.set_page_start(page.page_start as u64);
-                receipt.set_page_size(page.page_size as u32);
-                receipt.set_scan_budget(page.scan_budget as u32);
-                receipt.set_scanned(page.scanned as u64);
-                let mut cursor = receipt.init_next_cursor();
-                match &page.next_cursor {
-                    Some(value) => cursor.set_value(value),
-                    None => cursor.set_absent(()),
-                }
+                catalog_receipt(out.reborrow().init_receipt(), &page);
                 match &page.body {
                     PinPageBody::Collections(rows) => {
                         let mut list = out.init_collections(rows.len() as u32);

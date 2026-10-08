@@ -1,0 +1,36 @@
+// SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Shared rendering of immutable catalog receipts.
+
+use super::{Result, instant, optional_value, wire};
+use purrdf_lex::json::{Object, Value};
+
+pub(super) fn receipt(value: wire::catalog_read_receipt::Reader<'_>) -> Result<Object> {
+    let next = optional_value(value.get_next_cursor()?)?;
+    Ok(Object::new()
+        .with("store_id", value.get_store_id()?.to_str()?)
+        .with("snapshot_id", value.get_snapshot_id()?.to_str()?)
+        .with("as_of", instant(value.get_as_of()?)?)
+        .with("lease_expires_at", instant(value.get_lease_expires_at()?)?)
+        .with("total_items", value.get_total_items().to_string())
+        .with("page_start", value.get_page_start().to_string())
+        .with("has_more", next != Value::Null)
+        .with("next_cursor", next)
+        .with("execution_status", "complete")
+        .with("answer_certainty", "exact")
+        .with(
+            "coverage",
+            Object::new()
+                .with("catalog_complete", true)
+                .with("scanned", value.get_scanned().to_string()),
+        )
+        .with(
+            "limits",
+            Object::new()
+                .with("page_size", u64::from(value.get_page_size()))
+                .with("scan_budget", u64::from(value.get_scan_budget()))
+                .with("page_bytes", sparrow_core::PIN_READ_PAGE_BYTES as u64),
+        )
+        .with("stop_reason", Value::Null))
+}

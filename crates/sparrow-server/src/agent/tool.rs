@@ -93,6 +93,36 @@ impl Operation {
                     id: fields.required("id")?,
                 }),
                 "capabilities" => Self::Capabilities,
+                "artifacts_list" => {
+                    let mut query = sparrow_core::ArtifactRead::default();
+                    query.selector.source = fields.optional("source")?;
+                    query.cursor = fields.optional("cursor")?;
+                    let from: Option<String> = fields.optional("received_from")?;
+                    let before: Option<String> = fields.optional("received_before")?;
+                    if let Some(value) = from {
+                        query.selector.received_from =
+                            sparrow_core::parse_instant(&value).map_err(DecodeError::custom)?;
+                    }
+                    if let Some(value) = before {
+                        query.selector.received_before =
+                            sparrow_core::parse_instant(&value).map_err(DecodeError::custom)?;
+                    }
+                    query.page_size = fields
+                        .raw("page_size")?
+                        .map(u32::from_json)
+                        .transpose()?
+                        .unwrap_or(200) as usize;
+                    query.scan_budget = fields
+                        .raw("scan_budget")?
+                        .map(u32::from_json)
+                        .transpose()?
+                        .unwrap_or(10000) as usize;
+                    Self::Query(Command::Artifacts(super::artifacts::Input {
+                        store: fields.required("store_id")?,
+                        query,
+                    }))
+                }
+
                 "keys_list" | "values_search" | "text_search" | "records_context"
                 | "records_search" => {
                     let mut options = Options {

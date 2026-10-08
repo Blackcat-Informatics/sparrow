@@ -13,6 +13,201 @@ use std::{
 struct Daemon(Child);
 
 #[tokio::test(flavor = "current_thread")]
+async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let configuration = sparrow_server::ServerConfig::read(&config).unwrap();
+            let owner = configuration.open_store().unwrap();
+            let clock = sparrow_server::now().unwrap();
+            let old = clock - 31 * 86400000;
+            let fragment = owner
+                .ingest("wire-fragment", "wire-fragments", "jsonl", b"{}\n{}\n", old)
+                .unwrap();
+            owner
+                .pin(
+                    "wire-fragment-pin",
+                    "wire-fragment",
+                    &fragment.record_ids[..1],
+                    40,
+                    old,
+                )
+                .unwrap();
+            owner.expire(clock).unwrap();
+            drop(owner);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            client
+                .ingest(
+                    "wire-list-a",
+                    "wire-catalog",
+                    wire::Format::Jsonl,
+                    b"{}\n{}\n",
+                )
+                .await
+                .unwrap();
+            client
+                .ingest(
+                    "wire-list-b",
+                    "wire-catalog",
+                    wire::Format::Jsonl,
+                    b"{}\n{}\n",
+                )
+                .await
+                .unwrap();
+            let first = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--source",
+                    "wire-catalog",
+                    "--page-size",
+                    "1",
+                ],
+            );
+            assert_eq!(first["total_items"].as_str(), Some("2"));
+            assert_eq!(first["rows"][0]["retained_records"].as_str(), Some("2"));
+            assert_eq!(
+                first["rows"][0]["complete_bytes_available"].as_bool(),
+                Some(true)
+            );
+            let cursor = first["next_cursor"].as_str().unwrap();
+            client
+                .ingest("wire-list-c", "wire-catalog", wire::Format::Jsonl, b"{}\n")
+                .await
+                .unwrap();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let second = mcp
+                .tool(
+                    2,
+                    "artifacts_list",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("source", "wire-catalog")
+                        .with("page_size", 1_u64)
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert!(!second["isError"].as_bool().unwrap());
+            let again = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--source",
+                    "wire-catalog",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    cursor,
+                ],
+            );
+            assert_eq!(second["structuredContent"], again);
+            assert_eq!(again["snapshot_id"], first["snapshot_id"]);
+            assert_eq!(again["total_items"].as_str(), Some("2"));
+            assert_eq!(again["has_more"].as_bool(), Some(false));
+            assert_ne!(
+                again["rows"][0]["artifact_id"],
+                first["rows"][0]["artifact_id"]
+            );
+            let fragments = cli(
+                &socket,
+                &["artifacts", &store, "--source", "wire-fragments"],
+            );
+            assert_eq!(
+                fragments["rows"][0]["artifact_id"].as_str(),
+                Some(fragment.id.as_str())
+            );
+            assert_eq!(fragments["rows"][0]["origin"], Value::Null);
+            assert_eq!(
+                fragments["rows"][0]["complete_bytes_available"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(fragments["rows"][0]["retained_records"].as_str(), Some("1"));
+            for (args, code) in [
+                (
+                    vec!["artifacts", &store, "--scan-budget", "1"],
+                    "RESOURCE_LIMIT",
+                ),
+                (vec!["artifacts", "store:foreign"], "STORE_MISMATCH"),
+                (
+                    vec![
+                        "artifacts",
+                        &store,
+                        "--source",
+                        "changed",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        cursor,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "artifacts",
+                        &store,
+                        "--source",
+                        "wire-fragments",
+                        "--received-from",
+                        "1970-01-01T00:00:00Z",
+                    ],
+                    "INDEX_NOT_READY",
+                ),
+            ] {
+                let mut args = args;
+                if code == "INDEX_NOT_READY" {
+                    args.extend(["--received-before", "2099-01-01T00:00:00Z"]);
+                }
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success() && output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(code),
+                    "{:?}",
+                    output
+                );
+            }
+            for version in [0, 23] {
+                let mut request = client.capability().artifacts_list_request();
+                let mut query = request.get().init_query();
+                query.set_store_id(&store);
+                query.set_schema_version(version);
+                let response = request.send().promise.await.unwrap();
+                match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
+                    wire::result::Error(error) => assert_eq!(
+                        error.unwrap().get_code().unwrap().to_str().unwrap(),
+                        "UNSUPPORTED"
+                    ),
+                    wire::result::Ok(_) => panic!("obsolete artifact-list schema admitted"),
+                }
+            }
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["max_artifact_read_handles"].as_str(), Some("8"));
+            assert_eq!(status["artifact_read_handles"].as_str(), Some("1"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn bounded_discovery_does_not_read_corrupt_evidence_or_disguise_status_failure() {
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -3935,7 +4130,15 @@ async fn mcp_exercise(socket: &Path, store: &str, artifact: &str, record: &str, 
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 21);
+    assert_eq!(definitions.len(), 22);
+    assert_eq!(
+        definitions
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("artifacts_list"))
+            .unwrap()["annotations"]["readOnlyHint"]
+            .as_bool(),
+        Some(true)
+    );
     assert!(
         !definitions
             .iter()

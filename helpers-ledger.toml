@@ -1002,15 +1002,43 @@ names = ['^resume_artifact_cursor$', '^resume_pin_cursor$']
 id = "artifact-catalog-discovery"
 summary = "Discover complete eligible artifacts and surviving record parents without inventing missing origin metadata or complete bytes."
 home = "sparrow_core::Store::artifact_read"
-entry_points = []
+entry_points = ["sparrow_server::rpc::Rpc::artifacts_list", "sparrow_server::agent::artifacts::Input::execute"]
 spec = "docs/architecture.md: artifact identity, minimal parent provenance and pin-aware retention."
-vectors = ["crates/sparrow-core/tests/storage.rs"]
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true
 [job.forbidden]
 constants = []
 fingerprints = []
 names = ['^capture_artifact_catalog$']
+
+[[job]]
+id = "catalog-receipt-wire"
+summary = "One wire codec carries exact immutable catalog receipt identities, limits and cursors for pin and artifact pages."
+home = "sparrow_server::rpc::catalog_receipt"
+entry_points = []
+spec = "docs/interfaces.md: schema 24 catalog pages."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "catalog-receipt-render"
+summary = "Pin and artifact CLI/MCP pages share one exact catalog receipt renderer."
+home = "sparrow_server::agent::catalog::receipt"
+entry_points = []
+spec = "docs/interfaces.md: shared catalog receipt rendering."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
 
 [[job]]
 id = "pin-lifetime"

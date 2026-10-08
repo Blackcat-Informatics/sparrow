@@ -3,7 +3,7 @@
 
 //! One generated-client catalog read and renderer for CLI and MCP.
 
-use super::super::{Result, failure, instant, invalid, optional, optional_value, wire};
+use super::super::{Result, failure, instant, invalid, optional, wire};
 use purrdf_lex::json::{Object, Value};
 use sparrow_core::PinSelector;
 
@@ -88,35 +88,7 @@ impl Read {
             wire::result::Error(error) => return Err(failure(error?)),
         };
         let receipt = page.get_receipt()?;
-        let next = optional_value(receipt.get_next_cursor()?)?;
-        let mut out = Object::new()
-            .with("store_id", receipt.get_store_id()?.to_str()?)
-            .with("snapshot_id", receipt.get_snapshot_id()?.to_str()?)
-            .with("as_of", instant(receipt.get_as_of()?)?)
-            .with(
-                "lease_expires_at",
-                instant(receipt.get_lease_expires_at()?)?,
-            )
-            .with("total_items", receipt.get_total_items().to_string())
-            .with("page_start", receipt.get_page_start().to_string())
-            .with("has_more", next != Value::Null)
-            .with("next_cursor", next)
-            .with("execution_status", "complete")
-            .with("answer_certainty", "exact")
-            .with(
-                "coverage",
-                Object::new()
-                    .with("catalog_complete", true)
-                    .with("scanned", receipt.get_scanned().to_string()),
-            )
-            .with(
-                "limits",
-                Object::new()
-                    .with("page_size", u64::from(receipt.get_page_size()))
-                    .with("scan_budget", u64::from(receipt.get_scan_budget()))
-                    .with("page_bytes", sparrow_core::PIN_READ_PAGE_BYTES as u64),
-            )
-            .with("stop_reason", Value::Null)
+        let mut out = super::super::catalog::receipt(receipt)?
             .with("profile_ids", Value::array(["sparrow-pin-catalog-v1"]));
         match page.which()? {
             wire::pin_read_page::Collections(rows) => {
