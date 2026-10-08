@@ -62,6 +62,22 @@ exit 1 and zero stdout bytes, without falling back to status. Evidence is in
 SIGINT and removed its socket. Full query leases/snapshots/pagination remain
 unfinished.
 
+Verified development adoption on 2026-10-07: signed functional commit `0790356`
+passed the additive pre-commit gate. The owned schema 22 development unit stopped
+cleanly on SIGINT and removed its socket; the same unit/config/store reopened
+under schema 23 (observed PID 883173). Store identity remains
+`store:46c88e949ccec658600b66c7becd5bb7`, format `sparrow.store/16`, with 195 live
+records and no pending writes. Directory/socket modes remain 0700/0600.
+
+Live evidence in `/tmp/sparrow-discovery-live.p0d031bl` verifies CLI/MCP equal
+proven rows and unknown coverage, incomplete native text/context coverage,
+strict `INDEX_NOT_READY` refusal, and the original 104-byte artifact retry/export.
+Descriptor and handoff retries retain their original identities and exact 82/87
+bytes; the producer replacement remains preserved. The acceptance harness's
+final record-count assertion initially compared its decimal string with an
+integer; checking the documented string representation passed without another
+ingest or daemon restart. Full architecture acceptance remains unmet.
+
 ## Schema 22 diagnostic scope coverage
 
 The shared diagnostic membership owner distinguishes certain matches, certain
