@@ -104,6 +104,8 @@ text analysis, scoring, and query governors.
 - [Helper census](docs/helper-census.md): PurRDF reuse and local duplication gates.
 - [Development runtime](docs/development-runtime.md): implemented surfaces,
   verification evidence and unfinished server acceptance.
+- [Deployment](docs/deployment.md): persistent Linux user-service installation,
+  runtime asset ownership and cutover verification.
 
 The first useful agent query surfaces are full-text log and JSONL searches,
 temporal/field filtering, key listing, and value search. Results lead back to

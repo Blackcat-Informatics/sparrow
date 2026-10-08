@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[Unit]
+Description=Sparrow typed diagnostic evidence server
+
+[Service]
+Type=simple
+ExecStart=%h/.local/libexec/sparrow/sparrowd --config %h/.config/sparrow/server.toml
+WorkingDirectory=%h
+UMask=0077
+# The daemon drains workers, synchronizes the WAL and removes its Unix socket
+# through its SIGINT path. SIGTERM currently has no equivalent drain handler.
+KillSignal=SIGINT
+TimeoutStopSec=120
+# A crash may leave a Unix socket requiring diagnosis before another writer.
+# Do not loop on a failed store open or silently remove an existing endpoint.
+Restart=no
+
+[Install]
+WantedBy=default.target

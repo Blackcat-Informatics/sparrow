@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 .DEFAULT_GOAL := check
-.PHONY: all check tools-check fmt fmt-check lint test census census-cross census-check install-hooks
+.PHONY: all check tools-check fmt fmt-check lint test census census-cross census-check install-hooks build-runtime
 
 all: check
 check: tools-check fmt-check lint test census-check
+
+# Select both executable artifacts explicitly after verification hooks. Some
+# managed Cargo targets may republish unselected artifacts from another lease.
+build-runtime: tools-check
+	cargo build --locked --release -p sparrow-server --bins
 
 tools-check:
 	@command -v cargo >/dev/null || { echo "error: cargo is required (Rust 1.98 or newer)"; exit 1; }
