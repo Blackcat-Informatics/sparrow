@@ -194,6 +194,11 @@ impl<S, B> Default for Reads<S, B> {
 }
 
 impl<S: Selector, B: PageBody> Reads<S, B> {
+    pub(super) fn release(&mut self, id: &str, now: u64) -> bool {
+        self.purge(now);
+        self.snapshots.remove(id).is_some()
+    }
+
     pub(super) fn purge(&mut self, now: u64) {
         self.snapshots.retain(|_, value| value.alive(now));
     }

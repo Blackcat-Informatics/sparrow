@@ -2920,6 +2920,44 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn result_release(
+        self: Rc<Self>,
+        params: wire::sparrow::ResultReleaseParams,
+        mut results: wire::sparrow::ResultReleaseResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new("UNSUPPORTED", "result release requires the current schema"),
+            );
+            return Ok(());
+        }
+        if query.get_store_id()?.len() > 128 || query.get_snapshot_id()?.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("result release identity exceeds admission"),
+            );
+            return Ok(());
+        }
+        let store_id = query.get_store_id()?.to_str()?.to_owned();
+        let snapshot_id = query.get_snapshot_id()?.to_str()?.to_owned();
+        let (store, snapshot) = (store_id.clone(), snapshot_id.clone());
+        match self
+            .work(move |owner, now| owner.result_release(&store, &snapshot, now))
+            .await
+        {
+            Ok(released) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(&store_id);
+                out.set_snapshot_id(&snapshot_id);
+                out.set_released(released);
+            }
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
+
     async fn result_next(
         self: Rc<Self>,
         params: wire::sparrow::ResultNextParams,

@@ -10950,6 +10950,63 @@ fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_o
             .code,
         "RESULT_EXPIRED"
     );
+    let pins_before = store
+        .pins(5)
+        .unwrap()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect::<Vec<_>>();
+    for (cursor, _) in cases.iter().skip(1) {
+        let snapshot = cursor.split_once('/').unwrap().0;
+        assert_eq!(
+            store
+                .result_release("store:foreign", snapshot, 5)
+                .unwrap_err()
+                .code,
+            "STORE_MISMATCH"
+        );
+        assert!(store.result_next(&id, cursor, 5).is_ok());
+        assert!(store.result_release(&id, snapshot, 5).unwrap());
+        assert!(!store.result_release(&id, snapshot, 5).unwrap());
+        assert_eq!(
+            store.result_next(&id, cursor, 5).unwrap_err().code,
+            "RESULT_EXPIRED"
+        );
+    }
+    assert_eq!(
+        store
+            .pins(5)
+            .unwrap()
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>(),
+        pins_before
+    );
+    for snapshot in [String::new(), cases[0].0.clone(), "x".repeat(129)] {
+        assert_eq!(
+            store.result_release(&id, &snapshot, 5).unwrap_err().code,
+            "INVALID_ARGUMENT"
+        );
+    }
+    assert!(!store.result_release(&id, "unknown", 5).unwrap());
+    // More than eight sequential captures remain possible without expiry or
+    // relaxing admission, when each consumer explicitly relinquishes replay.
+    for _ in 0..20 {
+        let page = store
+            .records_read(
+                &RecordRead {
+                    operation: RecordOperation::Records,
+                    scope: scope.clone(),
+                    query: RecordQuery::default(),
+                    cursor: None,
+                },
+                5,
+            )
+            .unwrap();
+        assert!(page.next_cursor.is_some());
+        assert!(store.result_release(&id, &page.snapshot_id, 5).unwrap());
+    }
+    assert_eq!(store.records(5).unwrap().len(), 3);
     for (cursor, _) in &cases {
         assert_eq!(
             store.result_next(&id, cursor, 60_003).unwrap_err().code,
@@ -10958,6 +11015,7 @@ fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_o
     }
     drop(store);
     let reopened = Store::open(dir.path(), config()).unwrap();
+    assert!(!reopened.result_release(&id, handle, 5).unwrap());
     assert_eq!(
         reopened.result_next(&id, &cases[0].0, 5).unwrap_err().code,
         "RESULT_EXPIRED"

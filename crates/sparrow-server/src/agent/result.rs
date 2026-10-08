@@ -6,6 +6,21 @@
 use super::{Result, failure, wire};
 use purrdf_lex::json::Value;
 
+pub(crate) struct ReleaseInput {
+    pub store: String,
+    pub snapshot: String,
+}
+impl ReleaseInput {
+    pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
+        let receipt = sparrow_client::release_result(client, &self.store, &self.snapshot).await?;
+        Ok(purrdf_lex::json::Object::new()
+            .with("store_id", receipt.store_id)
+            .with("snapshot_id", receipt.snapshot_id)
+            .with("released", receipt.released)
+            .into())
+    }
+}
+
 pub(crate) struct Input {
     pub store: String,
     pub cursor: String,

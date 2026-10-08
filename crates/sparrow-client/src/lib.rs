@@ -30,6 +30,8 @@ pub use transport::{Connection, Endpoint, connect, connect_tcp};
 mod error;
 pub use error::Error;
 mod bytes;
+mod result_release;
+pub use result_release::{ResultReleaseReceipt, release_result};
 mod receipt;
 pub use bytes::{encode_evidence, read_bytes};
 pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through};
@@ -55,7 +57,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 41;
+pub const SCHEMA_VERSION: u32 = 42;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -117,6 +119,11 @@ pub struct Client {
 }
 
 impl Client {
+    /// Release a captured result's replay lease; never releases evidence pins.
+    pub async fn release_result(&self, snapshot_id: &str) -> Result<ResultReleaseReceipt, Error> {
+        release_result(self.capability(), &self.discovery.store_id, snapshot_id).await
+    }
+
     /// Read an exact artifact, record, or complete retained file-generation range.
     pub async fn bytes(&self, id: &str, offset: u64, length: u32) -> Result<Vec<u8>, Error> {
         read_bytes(

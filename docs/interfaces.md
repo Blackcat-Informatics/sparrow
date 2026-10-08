@@ -502,6 +502,7 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 | `sparql_explain` | Query and scope | Native plan/explanation with applicable limits and scope information. |
 | `correlate` | Scope and seed IDs or trace/span/source/time selector | Relationships and their supporting evidence; implemented through prepared queries/retrieval. |
 | `result_next` | Store ID, result cursor | Next page from the same leased result; an expired handle refuses continuation. |
+| `result_release` | Store ID, snapshot ID | Release the captured replay lease and memory; never releases evidence pins. |
 | `ingest_get` | Import/request ID | Raw acceptance/durability, projection states, source checkpoint, and deletion state. |
 | `pins_list` | Store ID, cursor, page size, scan budget | Active named collections and deadlines under one finite captured metadata lease. |
 | `pin_get` | Store ID, exactly one pin name or ID, cursor, page size, scan budget | Collection identity, deadline, revision, and captured members; continuations preserve the captured name resolution. |
@@ -1119,6 +1120,35 @@ qualification, and whole-process crash injection at every filesystem boundary
 remain unfinished. Ordinary upload continues to preserve every caller source.
 
 ## 6. CLI
+
+Schema 42 adds `resultRelease(ResultReleaseQuery) -> Result(ResultReleased)`.
+The query contains store ID, current schema version and snapshot ID, never a
+page cursor. The receipt certifies the same store/snapshot and `released`: true
+when an active retained capture was removed, false when expired, unknown,
+single-page (not retained), already released or from a previous store owner.
+This is an ephemeral state-idempotent operation; retries can change true to
+false and do not have a durable request journal. Wrong store or inadmissible
+identity refuses before retirement. Storage/registry failures remain failures.
+
+The shared registry owner covers records, text, keys, values, artifacts, sources
+and pin discovery/member pages. Existing replay and its original expiry stay
+valid until explicitly released. Subsequent continuation after release returns
+`RESULT_EXPIRED`; a request that already staged an owned page may finish.
+Evidence, retention deadlines, pin membership and all disk budgets are unchanged.
+The SDK certifies exact receipt identity and discovery compatibility. CLI and
+MCP use that same SDK operation and renderer:
+
+```text
+sparrow ENDPOINT result-release STORE_ID SNAPSHOT_ID
+result_release {"store_id":"STORE_ID","snapshot_id":"SNAPSHOT_ID"}
+```
+
+Consumers that need replay must keep the lease. Consumers finished with an
+investigation page set may explicitly release its `snapshot_id` to immediately
+reclaim capture admission. CLI does not silently release snapshots during page
+traversal. MCP marks this operation as an idempotent mutation that destroys the
+ephemeral replay result. It does not delete stored evidence. The schema changes
+to 42; storage format and helper-census/runtime dependency revisions are unchanged.
 
 The implemented client takes an endpoint as its first argument: a Unix socket
 path or `tcp://IP:PORT`. Numeric IPv4 and bracketed IPv6 addresses use the SDK's

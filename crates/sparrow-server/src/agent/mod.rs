@@ -44,7 +44,7 @@ pub(super) const USAGE: &str = concat!(
     " | producer-stream STORE_ID STREAM_ID | file-generation STORE_ID GENERATION_ID | file-finish-prepare REQUEST_ID STORE_ID GENERATION_ID FINAL_FILE INTENT.capnp | file-finish INTENT.capnp | file-finish-status INTENT.capnp",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR",
+    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR | result-release STORE_ID SNAPSHOT_ID",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N] [--require-complete-index true|false];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
     "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp"
@@ -62,6 +62,7 @@ pub(super) enum Command {
     Flush(sparrow_client::DurabilityWatermark),
     Status,
     Result(result::Input),
+    ReleaseResult(result::ReleaseInput),
     Watch(watch::Input),
     SourceTime(source_time::Input),
     Diagnostic(diagnostic::Input),
@@ -179,6 +180,15 @@ fn parse_kind(
 
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
+        if args.first().is_some_and(|arg| arg == "result-release") {
+            if args.len() != 3 {
+                return Err(invalid("result-release requires STORE_ID SNAPSHOT_ID"));
+            }
+            return Ok(Self::ReleaseResult(result::ReleaseInput {
+                store: args[1].clone(),
+                snapshot: args[2].clone(),
+            }));
+        }
         if args.first().is_some_and(|arg| arg == "result-next") {
             if args.len() != 3 {
                 return Err(invalid("result-next requires STORE_ID CURSOR"));
@@ -464,6 +474,9 @@ impl Command {
             return Ok(Some(durability::execute(client, through).await?));
         }
         if let Self::Result(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::ReleaseResult(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::SourceTime(input) = self {

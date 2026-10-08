@@ -522,6 +522,8 @@ struct OptionalRawPreparation { union { absent @0 :Void; value @1 :RawPreparatio
 struct ImportCanceled { import @0 :ImportRef; durability @1 :Durability = durable; }
 
 struct ResultNextQuery { storeId @0 :Text; schemaVersion @1 :UInt32; cursor @2 :Text; }
+struct ResultReleaseQuery { storeId @0 :Text; schemaVersion @1 :UInt32; snapshotId @2 :Text; }
+struct ResultReleased { storeId @0 :Text; snapshotId @1 :Text; released @2 :Bool; }
 struct ResultPage {
   union {
     records @0 :RecordsResults;
@@ -576,4 +578,5 @@ interface Sparrow {
   tailGenerationGet @39 (query :TailGenerationQuery) -> (result :Result(TailGeneration));
   tailFinish @40 (request :TailFinishIntent) -> (result :Result(TailGeneration));
   tailFinishGet @41 (request :TailFinishIntent) -> (result :Result(TailGeneration));
+  resultRelease @42 (query :ResultReleaseQuery) -> (result :Result(ResultReleased));
 }

@@ -2,6 +2,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "result-lease-retirement"
+summary = "One generic registry removal retires replay memory for every captured result family; the store-scoped dispatcher leaves evidence and pins unchanged."
+home = "sparrow_core::storage::catalog_lease::Reads::release"
+entry_points = ["sparrow_core::storage::result_read::Store::result_release", "sparrow_server::rpc::Rpc::result_release"]
+spec = "docs/interfaces.md: schema 42 explicit result lease release."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(release_record_result|release_artifact_result|release_source_result|release_pin_result)$']
+
+[[job]]
+id = "result-release-receipt-certificate"
+summary = "SDK, CLI and MCP share one result-release request and exact store/snapshot receipt certificate."
+home = "sparrow_client::result_release::certify"
+entry_points = ["sparrow_client::result_release::release_result", "sparrow_client::Client::release_result", "sparrow_server::agent::result::ReleaseInput::execute"]
+spec = "docs/interfaces.md: schema 42 result retirement certificate."
+vectors = ["crates/sparrow-client/src/result_release.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(certify_agent_result_release|release_mcp_result|release_cli_result)$']
+
+[[job]]
 id = "offline-restored-evidence-probe"
 summary = "The recovery example coordinates explicit offline evidence checks through the existing configuration, store byte reader, RDF inspection and native hash/JSON owners; it never starts watchers or transport."
 home = "sparrow_server::example_crate::recovery::main"

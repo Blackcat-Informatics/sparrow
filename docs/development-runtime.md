@@ -4287,3 +4287,21 @@ the next query-lifecycle work and does not establish full performance acceptance
 Signed evidence source `49923fe` passed the normal full hook; its log is
 `/tmp/sparrow-performance-baseline-commit.log`. No daemon rebuild or lifecycle
 change was needed for this measurement/documentation step.
+
+## Explicit result lease release
+
+Schema 42 adds `resultRelease` to the typed service, `Client::release_result`
+to the SDK, `result-release STORE_ID SNAPSHOT_ID` to the CLI, and
+`result_release` to MCP. One generic registry removal serves record, artifact,
+source and pin result captures. Consumers can release a completed investigation's
+replay memory immediately rather than waiting for expiry. Earlier page cursors
+remain replayable until release or expiry; releasing a lease leaves evidence,
+pins and retention unchanged. Single-page results already avoid retained leases.
+
+The existing core and RPC result-family scenarios now exercise explicit release,
+repeat release, foreign-store rejection and continuation refusal after release.
+The core scenario also checks twenty successive captures and releases at one
+clock value without raising budgets. SDK certification checks exact receipt
+identity and both release outcomes. Deployment and disk qualification for this
+new schema are recorded below once performed; the earlier measurements remain
+schema 41 evidence.

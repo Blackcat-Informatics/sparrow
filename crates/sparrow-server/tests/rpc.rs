@@ -6088,12 +6088,13 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 30);
+    assert_eq!(definitions.len(), 31);
     for (name, read_only) in [
         ("file_finish", false),
         ("file_finish_get", true),
         ("watch_handoff", false),
         ("watch_handoff_get", true),
+        ("result_release", false),
     ] {
         assert_eq!(
             definitions
@@ -8202,6 +8203,55 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                     wire::result_page::Pins(_) => args[0],
                 };
                 assert_eq!(kind, args[0]);
+                let snapshot = cursor.split_once('/').unwrap().0;
+                let wrong_store = mcp
+                    .tool(
+                        index as u64 + 100,
+                        "result_release",
+                        Object::new()
+                            .with("store_id", "store:foreign")
+                            .with("snapshot_id", snapshot)
+                            .into(),
+                    )
+                    .await;
+                assert!(wrong_store["isError"].as_bool().unwrap());
+                assert_eq!(cli(&socket, &["result-next", id, cursor]), expected);
+                let released = match index % 3 {
+                    0 => cli(&socket, &["result-release", id, snapshot]),
+                    1 => {
+                        let out = mcp
+                            .tool(
+                                index as u64 + 200,
+                                "result_release",
+                                Object::new()
+                                    .with("store_id", id)
+                                    .with("snapshot_id", snapshot)
+                                    .into(),
+                            )
+                            .await;
+                        assert!(!out["isError"].as_bool().unwrap());
+                        out["structuredContent"].clone()
+                    }
+                    _ => {
+                        let out = client.release_result(snapshot).await.unwrap();
+                        Object::new()
+                            .with("store_id", out.store_id)
+                            .with("snapshot_id", out.snapshot_id)
+                            .with("released", out.released)
+                            .into()
+                    }
+                };
+                assert_eq!(released["store_id"].as_str(), Some(id));
+                assert_eq!(released["snapshot_id"].as_str(), Some(snapshot));
+                assert_eq!(released["released"].as_bool(), Some(true));
+                assert!(!client.release_result(snapshot).await.unwrap().released);
+                let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(["result-next", id, cursor])
+                    .admitted_output()
+                    .unwrap();
+                assert!(!out.status.success() && out.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&out.stderr).contains("RESULT_EXPIRED"));
             }
             for (store, cursor, code) in [
                 ("store:foreign", "record-read:unknown/1", "STORE_MISMATCH"),

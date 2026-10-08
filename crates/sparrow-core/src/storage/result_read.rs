@@ -26,6 +26,46 @@ pub enum ResultPage {
 }
 
 impl Store {
+    /// Retire an ephemeral result capture, never its underlying evidence or pins.
+    /// Unknown, expired and already released captures return false. Existing
+    /// cursor replay remains valid until this operation or the original expiry.
+    pub fn result_release(
+        &self,
+        store_id: &str,
+        snapshot_id: &str,
+        now: u64,
+    ) -> Result<bool, Error> {
+        if self.lock()?.id != store_id {
+            return Err(Error::new(
+                "STORE_MISMATCH",
+                "result release requires its original store identity",
+            ));
+        }
+        if snapshot_id.is_empty() || snapshot_id.len() > 128 || snapshot_id.contains('/') {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "result release requires a bounded snapshot ID, not a page cursor",
+            ));
+        }
+        macro_rules! release {
+            ($registry:ident, $message:literal) => {
+                if self
+                    .$registry
+                    .lock()
+                    .map_err(|_| Error::new("STORAGE_FAILURE", $message))?
+                    .release(snapshot_id, now)
+                {
+                    return Ok(true);
+                }
+            };
+        }
+        release!(record_reads, "query read registry poisoned");
+        release!(artifact_reads, "artifact read registry poisoned");
+        release!(source_reads, "source read registry poisoned");
+        release!(pin_reads, "pin read registry poisoned");
+        Ok(false)
+    }
+
     /// Resume the cursor's captured operation, selector and limits without renewing its lease.
     pub fn result_next(&self, store_id: &str, cursor: &str, now: u64) -> Result<ResultPage, Error> {
         if self.lock()?.id != store_id {

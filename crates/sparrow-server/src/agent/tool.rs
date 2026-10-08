@@ -140,6 +140,12 @@ impl Operation {
                     store: fields.required("store_id")?,
                     cursor: fields.required("cursor")?,
                 })),
+                "result_release" => {
+                    Self::Query(Command::ReleaseResult(super::result::ReleaseInput {
+                        store: fields.required("store_id")?,
+                        snapshot: fields.required("snapshot_id")?,
+                    }))
+                }
                 "rdf_inspect" => Self::Query(Command::Rdf {
                     store: fields.required("store_id")?,
                     id: fields.required("id")?,

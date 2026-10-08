@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "result_release",
+        "Release a captured result replay lease and its memory; future continuations expire. Does not release evidence pins or remove stored records.",
+    ),
+    (
         "watch_handoff",
         "Admit an immutable completed source for durable claim and deletion; a tail target acknowledges its original producer-finished checkpoint without reimporting records.",
     ),
@@ -223,6 +227,12 @@ pub(crate) fn definitions() -> Value {
                 .with("store_id", string())
                 .with("cursor", string());
             required.extend(["store_id", "cursor"]);
+        }
+        if *name == "result_release" {
+            properties = properties
+                .with("store_id", string())
+                .with("snapshot_id", string());
+            required.extend(["store_id", "snapshot_id"]);
         }
         if ["artifacts_list", "sources_list"].contains(name) {
             properties = properties
@@ -524,6 +534,7 @@ pub(crate) fn definitions() -> Value {
                         ![
                             "pin",
                             "pin_release",
+                            "result_release",
                             "pin_renew",
                             "source_time_define",
                             "diagnostic_define",
@@ -535,7 +546,7 @@ pub(crate) fn definitions() -> Value {
                     )
                     .with(
                         "destructiveHint",
-                        ["pin_release", "watch_handoff"].contains(name),
+                        ["pin_release", "watch_handoff", "result_release"].contains(name),
                     )
                     .with("idempotentHint", true)
                     .with("openWorldHint", false),
