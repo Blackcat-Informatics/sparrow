@@ -45,6 +45,7 @@ impl Drop for Charge {
 
 /// Incremental staging owner; an error drops every private row and its charge.
 pub(super) struct Builder {
+    pub(super) cancellation: super::record_read::QueryCancellation,
     file: File,
     offsets: Vec<(u64, usize)>,
     written: u64,
@@ -82,6 +83,7 @@ impl Builder {
         // The last descriptor closes it on release, absolute expiry or owner shutdown.
         let file = staging_file(writer.db.path())?;
         Ok(Self {
+            cancellation: Default::default(),
             file,
             offsets: Vec::new(),
             written: 0,
@@ -95,6 +97,7 @@ impl Builder {
     }
 
     pub(super) fn push(&mut self, row: Value, order: Option<(u64, String)>) -> Result<(), Error> {
+        self.checkpoint()?;
         if self.order.is_some() != order.is_some() {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -149,6 +152,7 @@ impl Builder {
     }
 
     pub(super) fn finish(mut self) -> Result<Finished, Error> {
+        self.checkpoint()?;
         if let Some(mut order) = self.order.take() {
             let bytes = order.capacity() * std::mem::size_of::<(u64, String, usize)>()
                 + order.iter().map(|(_, id, _)| id.capacity()).sum::<usize>()
@@ -165,6 +169,7 @@ impl Builder {
                 .map(|(_, _, position)| self.offsets[position])
                 .collect();
         }
+        self.checkpoint()?;
         // Queries are ephemeral, so no fsync or durability claim is appropriate.
         let allocated = self
             .file
@@ -197,6 +202,10 @@ impl Builder {
             groups: self.groups,
         })
     }
+
+    pub(super) fn checkpoint(&self) -> Result<(), Error> {
+        self.cancellation.checkpoint()
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +217,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let counter = Arc::new(AtomicU64::new(DISK_BYTES));
         let mut builder = Builder {
+            cancellation: Default::default(),
             file: staging_file(dir.path()).unwrap(),
             offsets: Vec::new(),
             written: 0,

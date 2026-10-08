@@ -115,13 +115,14 @@ for ownership checks, preserved names and the unchanged service restart policy.
 
 The chronological writer remains serialized during capture. Mixed finite
 concurrency is measured in the [performance baseline](performance-baseline.md).
-Private Unix and TCP client interruptions during partially written captures
-show that admitted work finishes and abandoned result leases retain their staging
-until owner maintenance purges them at the sixty-second deadline; see
+Earlier private Unix and TCP client interruptions during partially written captures
+showed that admitted work finished and abandoned result leases retained their staging
+until owner maintenance purged them at the sixty-second deadline; see
 [abandoned query cleanup](development-runtime.md#abandoned-query-capture-cleanup).
-This is bounded lease cleanup, not prompt in-flight cancellation or asynchronous
-native snapshot execution. Cancellation resource/latency bounds and sustained
-abandonment remain unfinished. Read leases do not create pins or renew retention.
+That evidence qualifies the predecessor's bounded lease cleanup. Cooperative
+in-flight cancellation is described below; asynchronous native snapshot execution
+and production cancellation resource/latency qualification remain unfinished.
+Read leases do not create pins or renew retention.
 Typed, CLI and MCP rendering must retain their contracts.
 
 JSON discovery uses the same anonymous staging owner. The native fact matcher
@@ -148,3 +149,29 @@ silently substitute receipt time for source time or claim incomplete counts as
 exact. Other captured query families retain their previous implementation until
 their integration and complete acceptance scenarios pass. Full broad query
 acceptance remains unfinished.
+
+## Cooperative query cancellation
+
+Each admitted production TCP or Unix connection has its own cancellation owner.
+Connection completion, failure, lease expiry or task teardown cancels its child
+record/text/key/value captures. Each RPC also has an independent caller lifetime;
+cancelling one child does not cancel sibling operations. A worker keeps its
+concurrency permit until it exits. Mutation workers still finish admitted work,
+and cancellation does not establish non-delivery of an intake or pin mutation.
+
+The native storage read and spool share one host cancellation token. Checkpoints
+precede capture admission/publication and occur at candidate records, JSON facts,
+text postings, corpus identity/scoring entries, staged rows and sort completion.
+Cancellation returns `CANCELLED` without a successful prefix, drops private
+staging and releases its disk reservation. It does not interrupt an individual
+native database call, codec/projection call, sort, or a wait for a storage mutex;
+the next host checkpoint observes it. PurRDF still owns analysis and scoring.
+
+A completed capture has a reply guard until typed response rendering finishes.
+If the blocking worker's result is abandoned or rendering fails, that guard
+releases the snapshot through the existing result owner. Cleanup failures are
+reported, not swallowed. Successfully rendered captures keep their ordinary
+replayable lease: rendering is not proof that the peer received the response,
+and a later disconnect does not revoke a cursor intended for reconnect/retry.
+Explicit cancellation-message propagation through every adapter and production
+tail-latency/resource bounds remain separate acceptance work.

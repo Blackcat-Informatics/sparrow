@@ -15,6 +15,16 @@ installed and verified surfaces, and [broad query paging](query-streaming.md)
 records the remaining capture limitation. Lifecycle, storage and recovery
 requirements are in [Architecture](architecture.md).
 
+Admitted production TCP and Unix connections own cooperative lifetimes for their
+record/text/key/value captures. Disconnect, connection failure/expiry or serving
+task teardown cancels those children at host scan/staging checkpoints. A worker
+retains its permit until exit; private files and reservations are dropped, and
+completed captures abandoned before response rendering are released. Successfully
+rendered cursors retain their ordinary replayable lease. Cancellation does not
+establish non-delivery of a mutation, interrupt individual native calls or mutex
+waits, or qualify explicit cancellation-message propagation through every adapter.
+See [cooperative query cancellation](query-streaming.md#cooperative-query-cancellation).
+
 MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not
 implement separate filtering, retention, pin, or query semantics. The daemon
 owns the database; the local CLI and stdio MCP adapter connect to it.

@@ -3385,6 +3385,20 @@ fingerprints = []
 names = ['^(stage_record_rows_elsewhere|copy_query_spool)$']
 
 [[job]]
+id = "query-cancellation-owner"
+summary = "One connection/caller-scoped cooperative host read lifetime stops candidate/fact/posting/scoring/staging work, preserves worker admission until exit and releases completed captures abandoned before reply rendering; mutations retain their delivery semantics."
+home = "sparrow_core::QueryCancellation::checkpoint"
+entry_points = ["sparrow_core::Store::records_read_cancellable", "sparrow_core::Store::json_read_cancellable", "sparrow_core::storage::record_spool::Builder::checkpoint", "sparrow_server::rpc::Rpc::query_work", "sparrow_server::rpc::Rpc::for_connection", "sparrow_server::transport::admit_connection"]
+spec = "docs/query-streaming.md: cooperative query cancellation."
+vectors = ["crates/sparrow-server/src/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(cancel_capture_elsewhere|release_abandoned_query_elsewhere)$']
+
+[[job]]
 id = "owned-local-endpoint"
 summary = "Under exclusive store ownership, recover only a refused socket with unchanged device/inode, preserve live or unproven endpoints and non-sockets, and remove only the original owned name on shutdown."
 home = "sparrowd::local_endpoint::LocalEndpoint::bind"

@@ -132,6 +132,9 @@ impl Store {
         let strict = scope.require_complete_index || query.require_complete_index;
         let mut diagnostics = super::diagnostic::DiagnosticCoverage::default();
         let writer = self.lock()?;
+        if let Some(stage) = stage.as_deref() {
+            stage.checkpoint()?;
+        }
         let mut terms = match &query.text {
             Some(input) => writer
                 .config
@@ -171,6 +174,9 @@ impl Store {
         let mut total = 0_u128;
         let mut limited = false;
         for record in writer.query_candidates(scope, now, &protected)? {
+            if let Some(stage) = stage.as_deref() {
+                stage.checkpoint()?;
+            }
             let record = record?;
             let id = &record.id;
             if record.received_at >= scope.received_before {
@@ -411,6 +417,9 @@ impl Store {
             purrdf_hash::frame::frame_le(&mut corpus_identity, part);
         }
         for (id, (_, length)) in &documents {
+            if let Some(stage) = stage.as_deref() {
+                stage.checkpoint()?;
+            }
             purrdf_hash::frame::frame_le(&mut corpus_identity, id.as_bytes());
             purrdf_hash::frame::frame_le(&mut corpus_identity, &length.to_be_bytes());
         }
@@ -421,6 +430,9 @@ impl Store {
         for (ordinal, term) in terms.iter().enumerate() {
             let prefix = term_key("post", term, "");
             for entry in writer.db.prefix_iterator(&prefix) {
+                if let Some(stage) = stage.as_deref() {
+                    stage.checkpoint()?;
+                }
                 let (key, bytes) = entry?;
                 if !key.starts_with(prefix.as_bytes()) {
                     break;
@@ -462,6 +474,9 @@ impl Store {
             .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
         let mut scored = Vec::new();
         for (id, matches) in &candidates {
+            if let Some(stage) = stage.as_deref() {
+                stage.checkpoint()?;
+            }
             let (_, length) = &documents[id];
             let fields = (0..terms.len())
                 .map(|ordinal| {

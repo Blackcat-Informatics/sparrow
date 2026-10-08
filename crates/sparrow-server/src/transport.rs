@@ -30,7 +30,7 @@ where
 /// Apply the same connection ceiling and lease to Unix and public TCP streams.
 pub fn admit_connection<S>(
     stream: S,
-    client: crate::sparrow_capnp::sparrow::Client,
+    rpc: crate::Rpc,
     connections: std::sync::Arc<tokio::sync::Semaphore>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
@@ -40,6 +40,8 @@ pub fn admit_connection<S>(
     };
     tokio::task::spawn_local(async move {
         let _permit = permit;
+        let (rpc, _lifetime) = rpc.for_connection();
+        let client = capnp_rpc::new_client(rpc);
         match tokio::time::timeout(
             std::time::Duration::from_secs(60),
             serve_connection(stream, client),

@@ -6,6 +6,49 @@
 use super::{Error, Store, Value, catalog_lease, json, parse, random_id};
 use std::time::Instant;
 
+/// Cooperative lifetime of one read-only capture, shared with its RPC owner.
+/// Cancellation does not imply that a mutation was not delivered.
+#[derive(Clone, Debug, Default)]
+pub struct QueryCancellation(std::sync::Arc<CancellationState>);
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: std::sync::atomic::AtomicBool,
+    owner: Option<std::sync::Arc<CancellationState>>,
+}
+
+impl QueryCancellation {
+    /// Request cancellation; the next host checkpoint refuses further capture work.
+    pub fn cancel(&self) {
+        self.0
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Scope a fresh operation to this owner's lifetime without cancelling siblings.
+    pub fn child(&self) -> Self {
+        Self(std::sync::Arc::new(CancellationState {
+            cancelled: Default::default(),
+            owner: Some(self.0.clone()),
+        }))
+    }
+
+    /// Refuse cancelled work without returning a successful result prefix.
+    pub fn checkpoint(&self) -> Result<(), Error> {
+        let mut state = Some(self.0.as_ref());
+        while let Some(owner) = state {
+            if owner.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Error::new(
+                    "CANCELLED",
+                    "query capture was cancelled; no page published",
+                ));
+            }
+            state = owner.owner.as_deref();
+        }
+        Ok(())
+    }
+}
+
 pub(super) const ROW_BYTES: usize = 32 * 1024;
 pub(super) const METADATA_BYTES: usize = 32 * 1024;
 
@@ -340,6 +383,16 @@ pub(super) type Reads = catalog_lease::Reads<Selector, RecordPageBody>;
 impl Store {
     /// Capture all admitted record matches once, then replay immutable bounded pages.
     pub fn records_read(&self, query: &RecordRead, now: u64) -> Result<RecordReadPage, Error> {
+        self.records_read_cancellable(query, now, &QueryCancellation::default())
+    }
+
+    /// Capture through the same reader with cooperative caller cancellation.
+    pub fn records_read_cancellable(
+        &self,
+        query: &RecordRead,
+        now: u64,
+        cancellation: &QueryCancellation,
+    ) -> Result<RecordReadPage, Error> {
         query.scope.validate()?;
         query.query.validate()?;
         if query.operation == RecordOperation::Text
@@ -352,17 +405,33 @@ impl Store {
                 "standalone text capture requires text and admits no record fields or event interval",
             ));
         }
-        self.query_read(Selector::Records(query.clone()), now)
+        self.query_read(Selector::Records(query.clone()), now, cancellation)
     }
 
     /// Capture complete native JSON discovery through the shared bounded lease owner.
     pub fn json_read(&self, query: &JsonRead, now: u64) -> Result<RecordReadPage, Error> {
-        query.scope.validate()?;
-        query.query.predicate()?.validate()?;
-        self.query_read(Selector::Json(query.clone()), now)
+        self.json_read_cancellable(query, now, &QueryCancellation::default())
     }
 
-    fn query_read(&self, mut selector: Selector, now: u64) -> Result<RecordReadPage, Error> {
+    /// Native JSON capture with cooperative caller cancellation and unchanged semantics.
+    pub fn json_read_cancellable(
+        &self,
+        query: &JsonRead,
+        now: u64,
+        cancellation: &QueryCancellation,
+    ) -> Result<RecordReadPage, Error> {
+        query.scope.validate()?;
+        query.query.predicate()?.validate()?;
+        self.query_read(Selector::Json(query.clone()), now, cancellation)
+    }
+
+    fn query_read(
+        &self,
+        mut selector: Selector,
+        now: u64,
+        cancellation: &QueryCancellation,
+    ) -> Result<RecordReadPage, Error> {
+        cancellation.checkpoint()?;
         let cursor = selector.cursor().take();
         if cursor.as_ref().is_some_and(|c| c.len() > 160) {
             return Err(Error::new(
@@ -376,6 +445,7 @@ impl Store {
             .lock()
             .map_err(|_| Error::new("STORAGE_FAILURE", "query read registry poisoned"))?;
         reads.purge(now);
+        cancellation.checkpoint()?;
         if let Some(cursor) = &cursor {
             return reads.resume(&selector, cursor, scope.limit, scope.scan_budget, now);
         }
@@ -390,6 +460,8 @@ impl Store {
             matches!(&selector, Selector::Records(q) if q.operation == RecordOperation::ArtifactGroups),
             matches!(&selector, Selector::Records(q) if q.query.text.is_none() && q.query.event_interval.is_some()),
         )?;
+        staged.cancellation = cancellation.clone();
+        staged.checkpoint()?;
         let mut value = match &selector {
             Selector::Records(q) => {
                 self.records_query_stage(&q.scope, &q.query, now, true, Some(&mut staged))?
@@ -431,6 +503,7 @@ impl Store {
                 rows: RowStorage::Spool(rows),
             }
         };
+        cancellation.checkpoint()?;
         reads.publish(
             catalog_lease::Snapshot {
                 bytes: 0,

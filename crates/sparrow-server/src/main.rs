@@ -3,7 +3,7 @@
 
 //! One database owner, serving typed Cap'n Proto RPC over Unix and configured TCP sockets.
 
-use sparrow_server::{Rpc, ServerConfig, sparrow_capnp::sparrow};
+use sparrow_server::{Rpc, ServerConfig};
 use std::{path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 
@@ -85,7 +85,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .controller(),
         );
     }
-    let client: sparrow::Client = capnp_rpc::new_client(rpc);
     eprintln!(
         "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={}",
         store_id,
@@ -141,12 +140,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 accepted = endpoint.listener.accept() => {
                     let (stream, _) = accepted?;
-                    sparrow_server::admit_connection(stream, client.clone(), connections.clone());
+                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone());
                 }
                 accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if tcp_listener.is_some() => {
                     let (stream, _) = accepted?;
                     stream.set_nodelay(true)?;
-                    sparrow_server::admit_connection(stream, client.clone(), connections.clone());
+                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone());
                 }
             }
         }

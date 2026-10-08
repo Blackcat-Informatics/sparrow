@@ -1392,6 +1392,9 @@ impl Store {
         mut stage: Option<&mut record_spool::Builder>,
     ) -> Result<Value, Error> {
         let capture = stage.is_some();
+        if let Some(stage) = stage.as_deref() {
+            stage.checkpoint()?;
+        }
         let row_limit = if capture {
             catalog_lease::MAX_ITEMS
         } else {
@@ -1416,6 +1419,9 @@ impl Store {
         let mut response_bytes = 0_usize;
         let mut matched_values = 0_usize;
         for record in writer.query_candidates(scope, now, &protected)? {
+            if let Some(stage) = stage.as_deref() {
+                stage.checkpoint()?;
+            }
             let record = record?;
             if record.received_at >= scope.received_before {
                 break;
@@ -1461,6 +1467,9 @@ impl Store {
                 Error::new("STORAGE_FAILURE", "projection values must be an array")
             })?;
             for fact in values {
+                if let Some(stage) = stage.as_deref() {
+                    stage.checkpoint()?;
+                }
                 if value_visits == scope.scan_budget {
                     limited = true;
                     break;
