@@ -32,8 +32,33 @@ an earlier retirement commits no successful prefix.
 
 Implementation is in progress in `/home/paudley/Active/sparrow`, on
 `implementation/helper-census`. Full architecture acceptance remains unmet.
-The current source implements schema 29; the schema sections
+The current source implements schema 30; the schema sections
 below retain their historical qualification evidence.
+
+## Schema 30 JSON discovery result pages
+
+Keys and values now capture complete admitted native JSON discovery through the
+same immutable query lease/body owner as records and text. Schema 30 carries
+typed cursors and page receipts; CLI and MCP expose cursor/page-size and refuse
+both limit aliases together. Counts, occurrence order and coverage remain frozen
+after ingestion, membership changes or retention; cursors bind the operation
+and all selectors. Scan, row, capture and aggregate handle exhaustion refuse
+before publication. Native PurRDF JSON projection, occurrence predicates and
+codecs remain the semantic owners. The storage format remains unchanged.
+
+`CARGO_BUILD_JOBS=4 make check` passes release Clippy with warnings denied,
+119 core storage scenarios, 36 RPC/daemon scenarios, seeded census self-tests
+and the pinned cross-workspace gate (164 ledger jobs, zero distinct exceptions).
+The new scenarios cover more than 1,000 keys/values, complete key counts,
+duplicate members, frozen CLI/MCP replay, cross-operation/predicate refusal,
+shared handle ceilings and fixed expiry, and replay after pin release and native
+projection retirement. Pagination changes the old limit-truncation scenario to
+require complete execution plus a continuation. Equal receipt timestamps are
+ordered by record ID; the test verifies occurrence identity rather than assuming
+line order across records.
+
+Source validation and running daemon qualification are separate; the following
+schema 29 section records the preceding daemon evidence.
 
 ## Schema 29 standalone text result pages
 

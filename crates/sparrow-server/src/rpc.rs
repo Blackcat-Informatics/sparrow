@@ -240,6 +240,15 @@ fn json_kind(kind: &str) -> capnp::Result<wire::JsonKind> {
     }
 }
 
+fn query_cursor(value: wire::optional_text::Reader<'_>) -> Result<Option<String>, Error> {
+    if let wire::optional_text::Value(text) = value.which().map_err(invalid)?
+        && text.map_err(invalid)?.len() > 160
+    {
+        return Err(invalid("query cursor exceeds 160 bytes"));
+    }
+    optional(value).map_err(invalid)
+}
+
 fn optional_kind(value: wire::optional_kind::Reader<'_>) -> capnp::Result<Option<String>> {
     match value.which()? {
         wire::optional_kind::Absent(()) => Ok(None),
@@ -1546,16 +1555,7 @@ impl wire::sparrow::Server for Rpc {
             require_complete_index: input.get_require_complete_index(),
         };
         let has_text = query.text.is_some();
-        if let wire::optional_text::Value(cursor) = input.get_cursor()?.which()?
-            && cursor?.len() > 160
-        {
-            failure(
-                results.get().init_result(),
-                invalid("record cursor exceeds 160 bytes"),
-            );
-            return Ok(());
-        }
-        let cursor = optional(input.get_cursor()?)?;
+        let cursor = query_cursor(input.get_cursor()?);
         match self
             .work(move |store, now| {
                 let page = store.records_read(
@@ -1563,7 +1563,7 @@ impl wire::sparrow::Server for Rpc {
                         operation: sparrow_core::RecordOperation::Records,
                         scope: scope?,
                         query,
-                        cursor,
+                        cursor: cursor?,
                     },
                     now,
                 )?;
@@ -1672,20 +1672,11 @@ impl wire::sparrow::Server for Rpc {
             );
             return Ok(());
         }
-        if let wire::optional_text::Value(cursor) = input.get_cursor()?.which()?
-            && cursor?.len() > 160
-        {
-            failure(
-                results.get().init_result(),
-                invalid("text cursor exceeds 160 bytes"),
-            );
-            return Ok(());
-        }
         let query = sparrow_core::RecordQuery {
             text: Some(input.get_text()?.to_str()?.to_owned()),
             ..Default::default()
         };
-        let cursor = optional(input.get_cursor()?)?;
+        let cursor = query_cursor(input.get_cursor()?);
         match self
             .work(move |store, now| {
                 let page = store.records_read(
@@ -1693,7 +1684,7 @@ impl wire::sparrow::Server for Rpc {
                         operation: sparrow_core::RecordOperation::Text,
                         scope: scope?,
                         query,
-                        cursor,
+                        cursor: cursor?,
                     },
                     now,
                 )?;
@@ -2450,13 +2441,29 @@ impl wire::sparrow::Server for Rpc {
         params: wire::sparrow::KeysListParams,
         mut results: wire::sparrow::KeysListResults,
     ) -> capnp::Result<()> {
-        let scope = scope(params.get()?.get_scope()?, &self)?;
+        let input = params.get()?;
+        let scope = scope(input.get_scope()?, &self)?;
+        let cursor = query_cursor(input.get_cursor()?);
         match self
-            .work(move |store, now| store.json_query(&scope?, &JsonQuery::Keys, now))
+            .work(move |store, now| {
+                store.json_read(
+                    &sparrow_core::JsonRead {
+                        scope: scope?,
+                        query: JsonQuery::Keys,
+                        cursor: cursor?,
+                    },
+                    now,
+                )
+            })
             .await
         {
-            Ok(value) => {
+            Ok(page) => {
+                let value = page
+                    .body
+                    .result()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
                 let mut out = results.get().init_result().init_ok();
+                catalog_receipt(out.reborrow().init_page(), &page);
                 receipt(out.reborrow().init_receipt(), &value)?;
                 let source = rows(&value)?;
                 let mut target = out.init_rows(source.len() as u32);
@@ -2480,6 +2487,7 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let input = params.get()?.get_query()?;
         let scope = scope(input.get_scope()?, &self)?;
+        let cursor = query_cursor(input.get_cursor()?);
         let query = JsonQuery::Values {
             path: optional(input.get_path()?)?,
             kind: optional_kind(input.get_kind()?)?,
@@ -2487,11 +2495,25 @@ impl wire::sparrow::Server for Rpc {
             decoded: optional(input.get_decoded()?)?,
         };
         match self
-            .work(move |store, now| store.json_query(&scope?, &query, now))
+            .work(move |store, now| {
+                store.json_read(
+                    &sparrow_core::JsonRead {
+                        scope: scope?,
+                        query,
+                        cursor: cursor?,
+                    },
+                    now,
+                )
+            })
             .await
         {
-            Ok(value) => {
+            Ok(page) => {
+                let value = page
+                    .body
+                    .result()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
                 let mut out = results.get().init_result().init_ok();
+                catalog_receipt(out.reborrow().init_page(), &page);
                 receipt(out.reborrow().init_receipt(), &value)?;
                 let source = rows(&value)?;
                 let mut target = out.init_rows(source.len() as u32);

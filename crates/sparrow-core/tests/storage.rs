@@ -8689,3 +8689,201 @@ fn record_and_text_pages_share_handle_admission_and_fixed_expiry() {
         Some("0")
     );
 }
+
+#[test]
+fn json_pages_capture_complete_counts_occurrences_and_frozen_receipts() {
+    use sparrow_core::{JsonQuery, JsonRead, RecordOperation, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let object = format!(
+        "{{{}}}",
+        (0..1005)
+            .map(|i| format!("\"k{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    store
+        .ingest("json-pages", "pages", "json", object.as_bytes(), 1)
+        .unwrap();
+    let mut query = JsonRead {
+        scope: record_page_scope("pages", 113),
+        query: JsonQuery::Keys,
+        cursor: None,
+    };
+    let first = store.json_read(&query, 2).unwrap();
+    assert_eq!(first.total_items, 1006);
+    let original = first.body.result().unwrap();
+    assert_eq!(original["execution"].as_str(), Some("complete"));
+    store
+        .ingest(
+            "json-pages-later",
+            "pages",
+            "json",
+            br#"{"k0":0,"k0":1,"later":null}"#,
+            3,
+        )
+        .unwrap();
+    let mut paths = std::collections::BTreeSet::new();
+    let mut page = first.clone();
+    loop {
+        let value = page.body.result().unwrap();
+        assert_eq!(value["coverage"], original["coverage"]);
+        for row in value["rows"].as_array().unwrap() {
+            assert!(paths.insert(row["path"].as_str().unwrap().to_owned()));
+            assert_eq!(row["occurrences"].as_str(), Some("1"));
+            assert_eq!(row["records"].as_str(), Some("1"));
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        query.cursor = Some(cursor);
+        page = store.json_read(&query, 4).unwrap();
+        assert_eq!(page.snapshot_id, first.snapshot_id);
+    }
+    assert_eq!(paths.len(), 1006);
+    query.cursor = first.next_cursor.clone();
+    query.query = JsonQuery::Values {
+        path: None,
+        kind: None,
+        lexical: None,
+        decoded: None,
+    };
+    assert_eq!(store.json_read(&query, 4).unwrap_err().code, "CONFLICT");
+    let record = RecordRead {
+        scope: query.scope.clone(),
+        operation: RecordOperation::Records,
+        query: RecordQuery::default(),
+        cursor: query.cursor.clone(),
+    };
+    assert_eq!(store.records_read(&record, 4).unwrap_err().code, "CONFLICT");
+    query.cursor = None;
+    let values = store.json_read(&query, 4).unwrap();
+    assert_eq!(values.total_items, 1010);
+    query.cursor = values.next_cursor.clone();
+    query.scope.limit = 112;
+    assert_eq!(store.json_read(&query, 4).unwrap_err().code, "CONFLICT");
+    query.scope.limit = 113;
+    assert_eq!(
+        store
+            .json_read(&query, values.lease_expires_at)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    query.cursor = None;
+    query.scope.scan_budget = 1;
+    assert_eq!(
+        store.json_read(&query, 4).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(values.lease_expires_at).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn json_capture_counts_duplicate_keys_and_shares_query_handle_admission() {
+    use sparrow_core::{JsonQuery, JsonRead, RecordOperation, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest(
+            "json-pages-duplicates",
+            "pages",
+            "jsonl",
+            br#"{"x":1,"x":2}
+{"x":1}
+"#,
+            1,
+        )
+        .unwrap();
+    let query = JsonRead {
+        scope: record_page_scope("pages", 1),
+        query: JsonQuery::Keys,
+        cursor: None,
+    };
+    let first = store.json_read(&query, 2).unwrap();
+    let mut next = query.clone();
+    next.cursor = first.next_cursor.clone();
+    let result = store.json_read(&next, 2).unwrap().body.result().unwrap();
+    assert_eq!(result["rows"][0]["path"].as_str(), Some("/x"));
+    assert_eq!(result["rows"][0]["occurrences"].as_str(), Some("3"));
+    assert_eq!(result["rows"][0]["records"].as_str(), Some("2"));
+    let mut values = query.clone();
+    values.query = JsonQuery::Values {
+        path: Some("/x".into()),
+        kind: None,
+        lexical: None,
+        decoded: None,
+    };
+    assert_eq!(store.json_read(&values, 2).unwrap().total_items, 3);
+    let record = RecordRead {
+        scope: query.scope.clone(),
+        operation: RecordOperation::Records,
+        query: RecordQuery::default(),
+        cursor: None,
+    };
+    for _ in 2..8 {
+        store.clone().records_read(&record, 2).unwrap();
+    }
+    assert_eq!(
+        store.json_read(&query, 2).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(first.lease_expires_at).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn json_pages_keep_released_pin_membership_after_native_projection_retirement() {
+    use sparrow_core::{JsonQuery, JsonRead, QuerySelection};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest(
+            "json-retired-pages",
+            "pages",
+            "json",
+            br#"{"x":1,"x":2}"#,
+            0,
+        )
+        .unwrap();
+    let pin = store
+        .pin("json-pages-pin", "json-pages", &[artifact.id], 40, 0)
+        .unwrap();
+    let mut scope = record_page_scope("pages", 1);
+    scope.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision),
+    };
+    let mut query = JsonRead {
+        scope,
+        query: JsonQuery::Values {
+            path: Some("/x".into()),
+            kind: None,
+            lexical: None,
+            decoded: None,
+        },
+        cursor: None,
+    };
+    let first = store.json_read(&query, 31 * DAY).unwrap();
+    query.cursor = first.next_cursor.clone();
+    let second = store.json_read(&query, 31 * DAY).unwrap();
+    store
+        .release_retry("json-pages-unpin", &pin.id, 31 * DAY + 1)
+        .unwrap();
+    store.expire(31 * DAY + 2).unwrap();
+    assert_eq!(store.json_read(&query, 31 * DAY + 3).unwrap(), second);
+    assert_eq!(
+        second.body.result().unwrap()["rows"][0]["value"]["lexical"].as_str(),
+        Some("2")
+    );
+    query.cursor = None;
+    assert_eq!(
+        store.json_read(&query, 31 * DAY + 3).unwrap_err().code,
+        "NOT_FOUND"
+    );
+}

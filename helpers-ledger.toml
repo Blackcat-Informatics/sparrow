@@ -2440,3 +2440,45 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^standalone_text_ranker$']
+
+[[job]]
+id = "native-json-result-capture"
+summary = "One persisted native JSON fact matcher serves direct reads and complete key/value captures; key counts precede paging and exhaustion refuses a successful prefix."
+home = "sparrow_core::storage::Store::json_query_capture"
+entry_points = ["sparrow_core::storage::Store::json_query", "sparrow_core::storage::Store::json_read", "sparrow_core::query::JsonQuery::capacity"]
+spec = "docs/interfaces.md: schema 30 key/value pagination."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^paged_json_matcher$']
+
+[[job]]
+id = "shared-query-result-lease"
+summary = "Record, text, key and value surfaces share one operation-bound result capture, native page codec, finite lease and aggregate handle admission."
+home = "sparrow_core::storage::record_read::Store::query_read"
+entry_points = ["sparrow_core::storage::Store::records_read", "sparrow_core::storage::Store::json_read", "sparrow_core::storage::record_read::Selector::scope", "sparrow_core::storage::record_read::Selector::cursor"]
+spec = "docs/interfaces.md: shared immutable query capture."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "query-cursor-admission"
+summary = "All paged query RPC adapters admit a bounded typed cursor before allocating its owned spelling."
+home = "sparrow_server::rpc::query_cursor"
+entry_points = ["sparrow_server::rpc::Rpc::records_search", "sparrow_server::rpc::Rpc::text_search", "sparrow_server::rpc::Rpc::keys_list", "sparrow_server::rpc::Rpc::values_search"]
+spec = "docs/interfaces.md: operation-bound query cursors."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []

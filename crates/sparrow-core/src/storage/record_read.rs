@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Immutable pages from the single record matcher and native ranker.
+//! Immutable pages from native JSON discovery, record matching and text ranking.
 
 use super::{Error, Store, Value, catalog_lease, json, parse, random_id};
 use std::time::Instant;
@@ -15,7 +15,7 @@ pub enum RecordOperation {
     /// Combined record qualification, including fields and source time.
     #[default]
     Records,
-    /// Standalone native text search, sharing record capture and ranking.
+    /// Standalone native text search, sharing query capture and ranking.
     Text,
 }
 
@@ -32,11 +32,45 @@ pub struct RecordRead {
     pub cursor: Option<String>,
 }
 
-impl catalog_lease::Selector for RecordRead {
+/// Immutable native JSON key/value discovery request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonRead {
+    /// Membership and acceptance-time filters; limit is the page ceiling.
+    pub scope: crate::QueryScope,
+    /// Native occurrence predicate or key aggregation.
+    pub query: crate::JsonQuery,
+    /// Opaque continuation, or a fresh complete capture.
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Selector {
+    Records(RecordRead),
+    Json(JsonRead),
+}
+impl Selector {
+    fn scope(&self) -> &crate::QueryScope {
+        match self {
+            Self::Records(q) => &q.scope,
+            Self::Json(q) => &q.scope,
+        }
+    }
+    fn cursor(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Records(q) => &mut q.cursor,
+            Self::Json(q) => &mut q.cursor,
+        }
+    }
+}
+impl catalog_lease::Selector for Selector {
     fn capacity(&self) -> usize {
-        self.scope.capacity()
-            + self.query.capacity()
-            + self.cursor.as_ref().map_or(0, String::capacity)
+        self.scope().capacity()
+            + match self {
+                Self::Records(q) => {
+                    q.query.capacity() + q.cursor.as_ref().map_or(0, String::capacity)
+                }
+                Self::Json(q) => q.query.capacity() + q.cursor.as_ref().map_or(0, String::capacity),
+            }
     }
 }
 
@@ -51,19 +85,19 @@ impl RecordPageBody {
     fn capture(mut result: Value) -> Result<Self, Error> {
         let object = result
             .as_object_mut()
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "record capture is not an object"))?;
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query capture is not an object"))?;
         let mut values = object
             .remove("rows")
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "record capture rows are missing"))?;
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query capture rows are missing"))?;
         let values = values
             .as_array_mut()
             .map(std::mem::take)
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "record capture rows are not an array"))?;
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query capture rows are not an array"))?;
         let metadata = json::write_compact(&result).into_bytes();
         if metadata.len() > METADATA_BYTES || values.len() > catalog_lease::MAX_ITEMS {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
-                "record capture metadata/items exceed admission; narrow query",
+                "query capture metadata/items exceed admission; narrow query",
             ));
         }
         let mut bytes = metadata.len();
@@ -74,7 +108,7 @@ impl RecordPageBody {
             if row.len() > ROW_BYTES || bytes > catalog_lease::CAPTURE_BYTES {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
-                    "record capture exceeds row/byte admission; narrow query; no page published",
+                    "query capture exceeds row/byte admission; narrow query; no page published",
                 ));
             }
             rows.push(row);
@@ -95,7 +129,7 @@ impl RecordPageBody {
             .ok_or_else(|| {
                 Error::new(
                     "STORAGE_FAILURE",
-                    "captured record metadata is not an object",
+                    "captured query metadata is not an object",
                 )
             })?
             .insert("rows", Value::array(rows));
@@ -153,7 +187,7 @@ impl catalog_lease::PageBody for RecordPageBody {
 
 /// Captured query receipt and one page. Reading does not renew retention or the lease.
 pub type RecordReadPage = catalog_lease::CatalogReadPage<RecordPageBody>;
-pub(super) type Reads = catalog_lease::Reads<RecordRead, RecordPageBody>;
+pub(super) type Reads = catalog_lease::Reads<Selector, RecordPageBody>;
 
 impl Store {
     /// Capture all admitted record matches once, then replay immutable bounded pages.
@@ -170,42 +204,48 @@ impl Store {
                 "standalone text capture requires text and admits no record fields or event interval",
             ));
         }
-        if query
-            .cursor
-            .as_ref()
-            .is_some_and(|cursor| cursor.len() > 160)
-        {
+        self.query_read(Selector::Records(query.clone()), now)
+    }
+
+    /// Capture complete native JSON discovery through the shared bounded lease owner.
+    pub fn json_read(&self, query: &JsonRead, now: u64) -> Result<RecordReadPage, Error> {
+        query.scope.validate()?;
+        if let Some(predicate) = query.query.predicate() {
+            predicate.validate()?;
+        }
+        self.query_read(Selector::Json(query.clone()), now)
+    }
+
+    fn query_read(&self, mut selector: Selector, now: u64) -> Result<RecordReadPage, Error> {
+        let cursor = selector.cursor().take();
+        if cursor.as_ref().is_some_and(|c| c.len() > 160) {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "record cursor exceeds 160 bytes",
+                "query cursor exceeds 160 bytes",
             ));
         }
-        let mut selector = query.clone();
-        selector.cursor = None;
+        let scope = selector.scope().clone();
         let mut reads = self
             .record_reads
             .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "record read registry poisoned"))?;
+            .map_err(|_| Error::new("STORAGE_FAILURE", "query read registry poisoned"))?;
         reads.purge(now);
-        if let Some(cursor) = &query.cursor {
-            return reads.resume(
-                &selector,
-                cursor,
-                query.scope.limit,
-                query.scope.scan_budget,
-                now,
-            );
+        if let Some(cursor) = &cursor {
+            return reads.resume(&selector, cursor, scope.limit, scope.scan_budget, now);
         }
         let started = Instant::now();
         let expires_at = now
             .checked_add(catalog_lease::LEASE_MS)
-            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "record read deadline overflow"))?;
+            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "query read deadline overflow"))?;
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
-        let value = self.records_query_capture(&query.scope, &query.query, now, true)?;
+        let value = match &selector {
+            Selector::Records(q) => self.records_query_capture(&q.scope, &q.query, now, true)?,
+            Selector::Json(q) => self.json_query_capture(&q.scope, &q.query, now, true)?,
+        };
         let store_id = super::read_field::<String>(&value, "store_id")?;
         let scanned = usize::try_from(super::integer(&value["coverage"], "visited")?)
-            .map_err(|_| Error::new("STORAGE_FAILURE", "record capture scan count overflow"))?;
+            .map_err(|_| Error::new("STORAGE_FAILURE", "query capture scan count overflow"))?;
         let body = RecordPageBody::capture(value)?;
         reads.publish(
             catalog_lease::Snapshot {
@@ -216,8 +256,8 @@ impl Store {
                 as_of: now,
                 expires_at,
                 started,
-                page_size: query.scope.limit,
-                scan_budget: query.scope.scan_budget,
+                page_size: scope.limit,
+                scan_budget: scope.scan_budget,
                 scanned,
                 body,
             },
@@ -232,7 +272,7 @@ impl Store {
         let mut reads = self
             .record_reads
             .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "record read registry poisoned"))?;
+            .map_err(|_| Error::new("STORAGE_FAILURE", "query read registry poisoned"))?;
         reads.purge(now);
         Ok((reads.snapshots.len(), reads.capacity()))
     }

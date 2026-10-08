@@ -287,7 +287,7 @@ impl Command {
         };
         let records = args[0] == "records";
         let mut records_text = None;
-        let paged = records || text.is_some();
+        let paged = !["context"].contains(&args[0].as_str());
         let mut event_from = None;
         let mut event_before = None;
         let mut record_fields = Vec::new();
@@ -472,6 +472,7 @@ impl Command {
             let mut request = client.values_search_request();
             let mut query = request.get().init_query();
             fill_scope(query.reborrow().init_scope(), options)?;
+            optional(query.reborrow().init_cursor(), &options.cursor);
             optional(query.reborrow().init_path(), &options.path);
             optional(query.reborrow().init_lexical(), &options.lexical);
             optional(query.reborrow().init_decoded(), &options.decoded);
@@ -509,12 +510,14 @@ impl Command {
             Ok(Some(
                 Object::new()
                     .with("receipt", receipt(found.get_receipt()?)?)
+                    .with("page", catalog::page(found.get_page()?)?)
                     .with("rows", Value::array(rows))
                     .into(),
             ))
         } else {
             let mut request = client.keys_list_request();
             fill_scope(request.get().init_scope(), options)?;
+            optional(request.get().init_cursor(), &options.cursor);
             let response = request.send().promise.await?;
             let result = response.get()?.get_result()?;
             let found = match result.which()? {
@@ -537,6 +540,7 @@ impl Command {
             Ok(Some(
                 Object::new()
                     .with("receipt", receipt(found.get_receipt()?)?)
+                    .with("page", catalog::page(found.get_page()?)?)
                     .with("rows", Value::array(rows))
                     .into(),
             ))

@@ -257,10 +257,10 @@ and reporting a scan frontier when the budget is exhausted. The writer lock
 holds membership stable throughout each operation. Schema 28 adds immutable
 result captures and cursors for `recordsSearch`, including its same-record field,
 source-time and native ranked-text forms. Schema 29 routes standalone text search
-through that same capture. Standalone key/value pagination and the remaining
-complete scope receipt fields remain unfinished.
+through that same capture. Schema 30 routes native key/value discovery through the same result lease and
+bounded native JSON page body. Complete scope receipt fields remain unfinished.
 
-### Record and text result pagination
+### Record, text and JSON result pagination
 
 Typed `RecordQuery.cursor`, CLI `records --cursor CURSOR --page-size N`, and MCP
 `records_search.cursor/page_size` use one captured result. `Scope.limit`, CLI
@@ -268,13 +268,21 @@ Typed `RecordQuery.cursor`, CLI `records --cursor CURSOR --page-size N`, and MCP
 adapters refuse supplying both page-size spellings. Schema 29 gives `textSearch`
 the same page item semantics through typed `TextQuery.cursor`, CLI
 `text QUERY --cursor CURSOR --page-size N`, and MCP `text_search.cursor/page_size`.
-Key/value operations retain their existing limit semantics. The daemon uses the complete-capture mode of the
+Schema 30 adds typed cursors and page receipts to keysList and valuesSearch.
+CLI keys/values and MCP keys_list/values_search accept the same cursor and
+page-size options; their limit is also a page ceiling. Key counts aggregate the
+entire admitted membership before pagination, preserving duplicate occurrence
+counts separately from record presence. Values retain every matching native
+occurrence, including duplicate members. JSON capture uses the existing native
+fact matcher, with independent bounded record and value visits; exhausting either
+scan budget refuses before publishing a page.
+The daemon uses the complete-capture mode of the
 existing record matcher and native ranker, rather than paging a truncated prefix.
 Candidate scan exhaustion, more than 10,000 matches, and result capacity exhaustion
 refuse with `RESOURCE_LIMIT` before a page or handle is published. Diagnostic and
 applicable index uncertainty remains explicit in the original query receipt.
 
-`RecordsResults.page` and `TextSearchPage.page` use the shared typed catalog
+`Keys.page`, `Values.page`, `RecordsResults.page` and `TextSearchPage.page` use the shared typed catalog
 capture receipt; `TextSearchPage.result` carries the original typed text results.
 Agent output
 keeps it in `page` alongside the original semantic `receipt`; its store/snapshot,
@@ -291,13 +299,13 @@ codec owns encoding and page reconstruction; no database snapshot versions are
 retained. Pages conservatively charge duplicated typed record/text rendering and
 may return fewer than the requested 1..1000 items to fit 256 KiB. Variable byte
 boundaries are verified by the shared lease owner. Eight handles and 8 MiB retained
-result capacity are shared by record and standalone text reads across Store clones,
+result capacity are shared by record, standalone text, key and value reads across Store clones,
 with fixed 60-second wall/monotonic
 expiry. Status exposes record result handle counts, retained bytes and ceilings.
 
 Cursors bind the operation as well as every membership, predicate, text query,
-time interval, strictness and limit. A text cursor cannot be replayed through
-record search, or the reverse, even when their predicates otherwise agree.
+time interval, strictness and limit. Cursors cannot cross record, text, key or value operations, even when their
+predicates otherwise agree.
 Continuations replay captured rows after pin mutation/release and evidence
 retirement; fresh reads revalidate current evidence. A changed query refuses with
 `CONFLICT`, an invalid page boundary with `INVALID_ARGUMENT`, and expired, unknown

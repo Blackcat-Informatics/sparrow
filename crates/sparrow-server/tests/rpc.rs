@@ -4246,8 +4246,11 @@ async fn exercise(socket: &Path) -> (String, String, String) {
             .get("execution")
             .unwrap()
             .as_str(),
-        Some("limited")
+        Some("complete")
     );
+    assert_eq!(limited["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["page"]["has_more"].as_bool(), Some(true));
+    assert!(limited["page"]["next_cursor"].as_str().is_some());
     let excluded = cli(socket, &["keys", "--source", "unrelated-source"]);
     assert!(excluded.get("rows").unwrap().as_array().unwrap().is_empty());
     let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
@@ -6246,6 +6249,201 @@ async fn standalone_text_pages_freeze_native_ranking_and_refuse_cross_operation_
                     "UNSUPPORTED"
                 ),
                 wire::result::Ok(_) => panic!("obsolete standalone text schema admitted"),
+            }
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["record_read_handles"].as_str(), Some("2"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn json_pages_replay_cli_mcp_counts_and_occurrences_and_bind_operations() {
+    use purrdf_lex::json::Object;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            client
+                .ingest(
+                    "wire-json-pages",
+                    "json-pages",
+                    wire::Format::Jsonl,
+                    br#"{"x":"a","x":"b"}
+{"x":"c"}
+"#,
+                )
+                .await
+                .unwrap();
+            let keys = cli(
+                &socket,
+                &["keys", "--source", "json-pages", "--page-size", "1"],
+            );
+            assert_eq!(keys["page"]["total_items"].as_str(), Some("2"));
+            let kc = keys["page"]["next_cursor"].as_str().unwrap();
+            let values = cli(
+                &socket,
+                &[
+                    "values",
+                    "--source",
+                    "json-pages",
+                    "--path",
+                    "/x",
+                    "--page-size",
+                    "1",
+                ],
+            );
+            assert_eq!(values["page"]["total_items"].as_str(), Some("3"));
+            let vc = values["page"]["next_cursor"].as_str().unwrap();
+            client
+                .ingest(
+                    "wire-json-pages-later",
+                    "json-pages",
+                    wire::Format::Json,
+                    br#"{"x":"d","later":true}"#,
+                )
+                .await
+                .unwrap();
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            for (id, command, tool, first, cursor) in [
+                (2, "keys", "keys_list", &keys, kc),
+                (3, "values", "values_search", &values, vc),
+            ] {
+                let mut args = vec![
+                    command,
+                    "--source",
+                    "json-pages",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    cursor,
+                ];
+                let mut input = Object::new()
+                    .with("source", "json-pages")
+                    .with("page_size", 1_u32)
+                    .with("cursor", cursor);
+                if command == "values" {
+                    args.extend(["--path", "/x"]);
+                    input = input.with("path", "/x");
+                }
+                let page = cli(&socket, &args);
+                let replay = mcp.tool(id, tool, input.into()).await;
+                assert!(!replay["isError"].as_bool().unwrap());
+                assert_eq!(replay["structuredContent"], page);
+                assert_eq!(page["receipt"], first["receipt"]);
+                assert_eq!(page["page"]["snapshot_id"], first["page"]["snapshot_id"]);
+                assert_eq!(page["receipt"]["execution"].as_str(), Some("complete"));
+                if command == "keys" {
+                    assert_eq!(page["rows"][0]["occurrences"].as_str(), Some("3"));
+                    assert_eq!(page["rows"][0]["records"].as_str(), Some("2"));
+                } else {
+                    let third = cli(
+                        &socket,
+                        &[
+                            "values",
+                            "--source",
+                            "json-pages",
+                            "--path",
+                            "/x",
+                            "--page-size",
+                            "1",
+                            "--cursor",
+                            page["page"]["next_cursor"].as_str().unwrap(),
+                        ],
+                    );
+                    let captured = [first, &page, &third]
+                        .into_iter()
+                        .map(|p| p["rows"][0]["decoded"].as_str().unwrap())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    assert_eq!(captured, ["a", "b", "c"].into_iter().collect());
+                    assert!(!third["page"]["has_more"].as_bool().unwrap());
+                }
+            }
+            for (args, code) in [
+                (
+                    vec![
+                        "keys",
+                        "--source",
+                        "json-pages",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        vc,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "values",
+                        "--source",
+                        "json-pages",
+                        "--path",
+                        "/x",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        kc,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec![
+                        "values",
+                        "--source",
+                        "json-pages",
+                        "--path",
+                        "/later",
+                        "--page-size",
+                        "1",
+                        "--cursor",
+                        vc,
+                    ],
+                    "CONFLICT",
+                ),
+                (
+                    vec!["keys", "--source", "json-pages", "--scan-budget", "1"],
+                    "RESOURCE_LIMIT",
+                ),
+                (
+                    vec!["keys", "--limit", "1", "--page-size", "1"],
+                    "INVALID_ARGUMENT",
+                ),
+                (
+                    vec!["values", "--page-size", "1", "--limit", "1"],
+                    "INVALID_ARGUMENT",
+                ),
+            ] {
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success() && output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(code),
+                    "{output:?}"
+                );
+            }
+            let mut request = client.capability().keys_list_request();
+            request.get().init_scope().set_schema_version(29);
+            let response = request.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "UNSUPPORTED"
+                ),
+                wire::result::Ok(_) => panic!("obsolete JSON pagination schema admitted"),
             }
             let status = cli(&socket, &["status"]);
             assert_eq!(status["record_read_handles"].as_str(), Some("2"));

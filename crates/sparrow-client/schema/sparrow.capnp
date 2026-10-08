@@ -263,7 +263,7 @@ struct PinScope { storeId @0 :Text; id @1 :Text; expectedRevision @2 :OptionalRe
 struct QuerySelection { union { live @0 :Void; evidence @1 :List(Evidence); pin @2 :PinScope; } }
 struct ValueQuery {
   scope @0 :Scope; path @1 :OptionalText; kind @2 :OptionalKind;
-  lexical @3 :OptionalText; decoded @4 :OptionalText;
+  lexical @3 :OptionalText; decoded @4 :OptionalText; cursor @5 :OptionalText;
 }
 enum Execution { complete @0; limited @1; }
 enum Certainty { exact @0; incomplete @1; }
@@ -282,13 +282,13 @@ struct Receipt {
   certainty @3 :Certainty; coverage @4 :Coverage;
 }
 struct Key { path @0 :Text; kind @1 :JsonKind; occurrences @2 :UInt64; records @3 :UInt64; }
-struct Keys { receipt @0 :Receipt; rows @1 :List(Key); }
+struct Keys { receipt @0 :Receipt; rows @1 :List(Key); page @2 :CatalogReadReceipt; }
 struct ValueMatch {
   recordId @0 :Text; artifactId @1 :Text; source @2 :Text; receivedAt @3 :Instant;
   sourceStart @4 :UInt64; sourceEnd @5 :UInt64; occurrence @6 :UInt64;
   path @7 :Text; kind @8 :JsonKind; lexical @9 :OptionalText; decoded @10 :OptionalText;
 }
-struct Values { receipt @0 :Receipt; rows @1 :List(ValueMatch); }
+struct Values { receipt @0 :Receipt; rows @1 :List(ValueMatch); page @2 :CatalogReadReceipt; }
 enum TextBasis { rawRecord @0; decodedJsonScalar @1; }
 struct SourceRange { start @0 :UInt64; end @1 :UInt64; }
 struct TextEvidence {
@@ -421,7 +421,7 @@ interface Sparrow {
   bytesRead @4 (request :ReadBytes) -> (result :Result(Bytes));
   pin @5 (request :PinRequest) -> (result :Result(Pin));
   pinRelease @6 (request :Release) -> (result :Result(Released));
-  keysList @7 (scope :Scope) -> (result :Result(Keys));
+  keysList @7 (scope :Scope, cursor :OptionalText) -> (result :Result(Keys));
   valuesSearch @8 (query :ValueQuery) -> (result :Result(Values));
   textSearch @9 (query :TextQuery) -> (result :Result(TextSearchPage));
   recordsContext @10 (query :ContextQuery) -> (result :Result(Context));

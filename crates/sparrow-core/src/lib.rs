@@ -46,7 +46,9 @@ pub use storage::publication::{ImportPreparation, RawPreparation};
 pub use storage::rdf_view::{
     RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
 };
-pub use storage::record_read::{RecordOperation, RecordPageBody, RecordRead, RecordReadPage};
+pub use storage::record_read::{
+    JsonRead, RecordOperation, RecordPageBody, RecordRead, RecordReadPage,
+};
 pub use storage::source_read::{
     SourcePageBody, SourceRead, SourceReadPage, SourceSelector, SourceSummary, SourceWatchBinding,
     SourceWatchInfo,

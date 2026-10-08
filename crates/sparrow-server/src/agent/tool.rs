@@ -175,7 +175,13 @@ impl Operation {
                             sparrow_core::parse_instant(&value).map_err(DecodeError::custom)?;
                     }
                     let limit = fields.raw("limit")?.map(u32::from_json).transpose()?;
-                    let paged = ["records_search", "text_search"].contains(&name);
+                    let paged = [
+                        "records_search",
+                        "text_search",
+                        "keys_list",
+                        "values_search",
+                    ]
+                    .contains(&name);
                     let page_size = if paged {
                         fields.raw("page_size")?.map(u32::from_json).transpose()?
                     } else {

@@ -1201,6 +1201,21 @@ impl Store {
         query: &crate::JsonQuery,
         now: u64,
     ) -> Result<Value, Error> {
+        self.json_query_capture(scope, query, now, false)
+    }
+
+    pub(super) fn json_query_capture(
+        &self,
+        scope: &crate::QueryScope,
+        query: &crate::JsonQuery,
+        now: u64,
+        capture: bool,
+    ) -> Result<Value, Error> {
+        let row_limit = if capture {
+            catalog_lease::MAX_ITEMS
+        } else {
+            scope.limit
+        };
         scope.validate()?;
         let predicate = query.predicate();
         if let Some(predicate) = &predicate {
@@ -1217,6 +1232,7 @@ impl Store {
         let mut limited = false;
         let mut rows = Vec::new();
         let mut keys = BTreeMap::<(String, String), (u64, u64, String)>::new();
+        let mut key_bytes = 0_usize;
         let mut value_visits = 0_usize;
         let mut response_bytes = 0_usize;
         for record in writer.query_candidates(scope, now, &protected)? {
@@ -1274,6 +1290,16 @@ impl Store {
                 let kind: String = read_field(fact, "kind")?;
                 match query {
                     crate::JsonQuery::Keys => {
+                        if capture && !keys.contains_key(&(path.clone(), kind.clone())) {
+                            key_bytes = key_bytes
+                                .saturating_add(path.len() + kind.len() + record.id.len() + 256);
+                            if keys.len() >= row_limit || key_bytes > catalog_lease::CAPTURE_BYTES {
+                                return Err(Error::new(
+                                    "RESOURCE_LIMIT",
+                                    "key capture exceeds admission; narrow scope",
+                                ));
+                            }
+                        }
                         let entry = keys.entry((path, kind)).or_default();
                         entry.0 += 1;
                         if entry.2 != record.id {
@@ -1291,17 +1317,11 @@ impl Store {
                         {
                             continue;
                         }
-                        if rows.len() == scope.limit {
+                        if rows.len() == row_limit {
                             limited = true;
                             break;
                         }
-                        response_bytes =
-                            response_bytes.saturating_add(json::write_compact(fact).len() + 2048);
-                        if response_bytes > 2 * 1024 * 1024 {
-                            limited = true;
-                            break;
-                        }
-                        rows.push(Value::from(
+                        let row = Value::from(
                             Object::new()
                                 .with("record_id", record.id.clone())
                                 .with("artifact_id", record.artifact_id.clone())
@@ -1316,7 +1336,17 @@ impl Store {
                                     (record.byte_start + integer(fact, "end")?).to_string(),
                                 )
                                 .with("value", fact.clone()),
-                        ));
+                        );
+                        response_bytes = response_bytes.saturating_add(if capture {
+                            json::write_compact(&row).len() + std::mem::size_of::<Vec<u8>>()
+                        } else {
+                            json::write_compact(fact).len() + 2048
+                        });
+                        if response_bytes > catalog_lease::CAPTURE_BYTES {
+                            limited = true;
+                            break;
+                        }
+                        rows.push(row);
                     }
                 }
             }
@@ -1324,11 +1354,17 @@ impl Store {
                 break;
             }
         }
+        if capture && limited {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "JSON capture exhausted scan, occurrence, row or byte admission; narrow scope; no page published",
+            ));
+        }
         if matches!(query, crate::JsonQuery::Keys) {
-            limited |= keys.len() > scope.limit;
+            limited |= keys.len() > row_limit;
             rows = keys
                 .into_iter()
-                .take(scope.limit)
+                .take(row_limit)
                 .map(|((path, kind), (occurrences, records, _))| {
                     Value::from(
                         Object::new()

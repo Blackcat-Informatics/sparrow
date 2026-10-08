@@ -150,7 +150,7 @@ impl QueryScope {
 }
 
 /// An exact selector over native ordered JSON occurrences.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JsonQuery {
     /// Aggregate concrete RFC 6901 pointers and native kinds.
     Keys,
@@ -222,6 +222,22 @@ impl JsonPredicate {
 }
 
 impl JsonQuery {
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::Keys => 0,
+            Self::Values {
+                path,
+                kind,
+                lexical,
+                decoded,
+            } => [path, kind, lexical, decoded]
+                .into_iter()
+                .flatten()
+                .map(String::capacity)
+                .sum(),
+        }
+    }
+
     pub(crate) fn predicate(&self) -> Option<JsonPredicate> {
         match self {
             Self::Keys => None,

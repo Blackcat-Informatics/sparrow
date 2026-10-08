@@ -176,7 +176,14 @@ pub(crate) fn definitions() -> Value {
                 .with("limit", integer(1000))
                 .with("scan_budget", integer(100000));
         }
-        if ["records_search", "text_search"].contains(name) {
+        if [
+            "records_search",
+            "text_search",
+            "keys_list",
+            "values_search",
+        ]
+        .contains(name)
+        {
             properties = properties.with("page_size", integer(1000)).with(
                 "cursor",
                 Object::new().with("type", Value::array(["string", "null"])),
