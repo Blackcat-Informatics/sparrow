@@ -4,10 +4,43 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`2f1f8ff`; see [joined maintenance scheduling](#joined-maintenance-scheduling) for
+`e28431f`; see [actionable JSON capture budgets](#actionable-json-capture-budgets) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Actionable JSON capture budgets
+
+Real sample investigation reached the default native JSON occurrence ceiling
+without a published page. The previous error conflated record, occurrence, row
+and byte admission. It now names the exhausted budget and its effective ceiling,
+and directs agents to an explicit admitted `scan_budget` or narrower scope.
+Default/maximum budgets, paging and refusal semantics remain unchanged. Focused
+tests distinguish record visits from occurrences, prove failed captures leave
+zero handles/bytes, and then admit the same requests with an explicit budget.
+The sample investigation and its actual broad-query/context refusals are recorded
+in [local corpus qualification](real-corpus-qualification.md).
+
+Signed source `e28431f` passes `make check` and the normal pre-commit gate:
+159 storage scenarios, 60 RPC integration scenarios, remaining workspace tests,
+release Clippy and 247 helper ownership jobs with zero distinct exceptions.
+Gate/commit/build logs are `/tmp/sparrow-json-budget-gate.log`,
+`/tmp/sparrow-json-budget-commit.log` and
+`/tmp/sparrow-json-budget-selected-build.log`. All five runtime executables were
+explicitly selected after the hook and frozen with source/SHA-256 evidence at
+`~/.local/state/sparrow/receiver-history-images-emk0v_7a`.
+
+Public adoption evidence is `/tmp/sparrow-json-budget-live.6kscmjie`, including a
+closed-store backup that has not independently been restored. The active enabled
+unit runs PID 2341427 from `sparrowd-schema48-e28431f`, SHA-256
+`f57d5da4292984396d2a9c577d1c74bff2c589e9db7197c8683642f550cce432`.
+The stable CLI selects `sparrow-schema48-e28431f`; installed/frozen/alias hashes
+agree. The daemon retains `cap_net_bind_service=ep` and serves `0.0.0.0:518`
+with schema 48, format 37 and unchanged store identity, 212 records, healthy
+owned watches, zero pins and result leases. Saved TCP/Unix/CLI/MCP handoffs,
+exact bytes, all 21 sources, five generations, grouped pages, native text scores,
+temporal/field witnesses, four keys and twenty values pass readback without new
+public intake or source retirement. Full architecture acceptance remains unmet.
 
 ## Joined maintenance scheduling
 
