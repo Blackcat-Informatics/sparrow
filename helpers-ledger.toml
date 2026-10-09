@@ -2821,9 +2821,9 @@ names = []
 
 [[job]]
 id = "frozen-query-capture-provenance"
-summary = "One capture owner freezes native JSON/text profile identities and actual host phase ceilings; original certainty and coverage are preserved without inventing native governor evidence."
+summary = "One capture owner freezes native JSON/text profile identities and actual host phase ceilings; the shared disk item admission derives chronological and JSON ceilings from requested scan work while ranked/source-time phases retain their independent bounds, without inventing native governor evidence."
 home = "sparrow_core::storage::record_read::query_evidence"
-entry_points = ["sparrow_server::rpc::query_capture", "sparrow_server::agent::query_receipt::apply", "sparrow_server::agent::query_receipt::limit"]
+entry_points = ["sparrow_server::rpc::query_capture", "sparrow_server::agent::query_receipt::apply", "sparrow_server::agent::query_receipt::limit", "sparrow_core::storage::record_read::disk_capture_items", "sparrow_core::storage::Store::json_query_stage"]
 spec = "docs/interfaces.md: schema 32 query capture provenance."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []

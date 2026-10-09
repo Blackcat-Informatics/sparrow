@@ -126,7 +126,7 @@ impl Store {
         }
         let row_limit = if capture {
             if stage.is_some() {
-                super::record_read::disk_capture_items(query, scope.scan_budget)
+                super::record_read::disk_capture_items(Some(query), scope.scan_budget)
             } else {
                 catalog_lease::MAX_ITEMS
             }

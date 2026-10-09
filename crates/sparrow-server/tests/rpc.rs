@@ -9131,7 +9131,7 @@ async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
             drop(reservation);
             let _daemon = start(&config, &socket).await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();
-            let (input, _) = sparrow_test_support::wide_jsonl_keys(100, 50, 900);
+            let (input, _) = sparrow_test_support::wide_jsonl_keys(250, 50, 200);
             let path = dir.path().join("wide.jsonl");
             std::fs::write(&path, &input).unwrap();
             let receipt = client
@@ -9143,7 +9143,7 @@ async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
                 let mut mcp = Mcp::start(endpoint);
                 mcp.initialize(1).await;
                 let mut request_id = 2;
-                for (command, total) in [("keys", 5001), ("values", 5000)] {
+                for (command, total) in [("keys", 12501), ("values", 12500)] {
                     let mut args = vec![
                         command,
                         "--source",
@@ -9168,6 +9168,10 @@ async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
                     assert_eq!(
                         first["receipt"]["limits"]["capture_bytes"].as_str(),
                         Some("67108864")
+                    );
+                    assert_eq!(
+                        first["receipt"]["limits"]["capture_items"].as_str(),
+                        Some("100000")
                     );
                     let aggregation = &first["receipt"]["limits"]["key_aggregation_bytes"];
                     if command == "keys" {

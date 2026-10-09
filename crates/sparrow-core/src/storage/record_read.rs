@@ -194,13 +194,13 @@ impl RowStorage {
 }
 
 /// Host-owned query admission profile; native semantic profiles remain separate.
-pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/5";
+pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/6";
 
-pub(super) fn disk_capture_items(query: &crate::RecordQuery, scan_budget: usize) -> usize {
-    if query.text.is_none() && query.event_interval.is_none() {
-        scan_budget
-    } else {
+pub(super) fn disk_capture_items(query: Option<&crate::RecordQuery>, scan_budget: usize) -> usize {
+    if query.is_some_and(|query| query.text.is_some() || query.event_interval.is_some()) {
         catalog_lease::MAX_ITEMS
+    } else {
+        scan_budget
     }
 }
 
@@ -326,8 +326,8 @@ fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
                     super::query_membership::MAX_SELECTION_VISITS as u64,
                 )
                 .with("capture_items", match selector {
-                    Selector::Records(q) => disk_capture_items(&q.query, q.scope.scan_budget),
-                    Selector::Json(_) => catalog_lease::MAX_ITEMS,
+                    Selector::Records(q) => disk_capture_items(Some(&q.query), q.scope.scan_budget),
+                    Selector::Json(q) => disk_capture_items(None, q.scope.scan_budget),
                 } as u64)
                 .with("capture_bytes", super::record_spool::DISK_BYTES)
                 .with("row_bytes", ROW_BYTES as u64)

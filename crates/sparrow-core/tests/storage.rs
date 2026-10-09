@@ -12652,18 +12652,22 @@ fn disk_json_pages_preserve_large_native_counts_spans_and_replay_after_retiremen
     settings.disk_budget = 1024 * 1024 * 1024;
     settings.maintenance_reserve = 64 * 1024 * 1024;
     let store = Store::open(dir.path(), settings).unwrap();
-    let (mut input, expected_paths) = sparrow_test_support::wide_jsonl_keys(100, 50, 900);
+    let (mut input, expected_paths) = sparrow_test_support::wide_jsonl_keys(250, 50, 200);
     input.extend_from_slice(b"{\"dup\":\"needle\",\"dup\":\"needle\"}\n");
-    let artifact = store
-        .ingest("wide-json-pages", "wide", "jsonl", &input, 0)
-        .unwrap();
-    assert_eq!(artifact.record_ids.len(), 101);
+    let manifest = stage_fixture(&store, "wide-json-pages", "jsonl", &input);
+    for ordinal in 0..manifest.layout_records {
+        store
+            .import_prepare_record(&manifest.id, ordinal, 0)
+            .unwrap();
+    }
+    let artifact = store.import_publish(&manifest.id, 0).unwrap();
+    assert_eq!(artifact.record_ids.len(), 251);
     let mut record_order = artifact.record_ids.iter().enumerate().collect::<Vec<_>>();
     record_order.sort_unstable_by(|a, b| a.1.cmp(b.1));
     let expected_values = record_order
         .into_iter()
         .flat_map(|(position, _)| {
-            if position == 100 {
+            if position == 250 {
                 vec!["/dup".to_owned(); 2]
             } else {
                 expected_paths[position * 50..(position + 1) * 50].to_vec()
@@ -12679,7 +12683,7 @@ fn disk_json_pages_preserve_large_native_counts_spans_and_replay_after_retiremen
             0,
         )
         .unwrap();
-    let mut scope = record_page_scope("wide", 1000);
+    let mut scope = record_page_scope("oversized", 1000);
     scope.scan_budget = 100000;
     scope.selection = QuerySelection::Pin {
         id: pin.id.clone(),
@@ -12701,10 +12705,19 @@ fn disk_json_pages_preserve_large_native_counts_spans_and_replay_after_retiremen
         cursor: None,
     };
     let admitted = 31 * DAY;
+    let mut refused = values.clone();
+    refused.scope.scan_budget = 10000;
+    let refusal = store.json_read(&refused, admitted).unwrap_err();
+    assert_eq!(refusal.code, "RESOURCE_LIMIT");
+    assert!(refusal.message.contains("json_occurrence_budget=10000"));
+    assert_eq!(
+        store.status(admitted).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
     let key_page = store.json_read(&keys, admitted).unwrap();
     let value_page = store.json_read(&values, admitted).unwrap();
-    assert_eq!(key_page.total_items, 5002);
-    assert_eq!(value_page.total_items, 5002);
+    assert_eq!(key_page.total_items, 12502);
+    assert_eq!(value_page.total_items, 12502);
     let cursor = value_page.next_cursor.clone().unwrap();
     let frozen = store
         .result_next(&value_page.store_id, &cursor, admitted)
@@ -12733,6 +12746,7 @@ fn disk_json_pages_preserve_large_native_counts_spans_and_replay_after_retiremen
             assert_eq!(result["coverage"], receipt);
             assert_eq!(result["execution"].as_str(), Some("complete"));
             let limits = &result["query_evidence"]["limits"];
+            assert_eq!(limits["capture_items"].as_u64(), Some(100000));
             assert_eq!(limits["capture_bytes"].as_u64(), Some(64 * 1024 * 1024));
             if key_query {
                 assert_eq!(
@@ -12749,12 +12763,12 @@ fn disk_json_pages_preserve_large_native_counts_spans_and_replay_after_retiremen
                     paths.push(path.to_owned());
                     assert_eq!(
                         row["records"].as_str(),
-                        Some(if path.is_empty() { "101" } else { "1" })
+                        Some(if path.is_empty() { "251" } else { "1" })
                     );
                     assert_eq!(
                         row["occurrences"].as_str(),
                         Some(if path.is_empty() {
-                            "101"
+                            "251"
                         } else if path == "/dup" {
                             "2"
                         } else {

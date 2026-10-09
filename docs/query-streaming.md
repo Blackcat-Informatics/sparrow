@@ -6,8 +6,8 @@ field qualification, source-time ordering, native ranked text and artifact group
 Row bodies and offset/length pairs live in separate anonymous disk files. Each
 page reads only its admitted index entries and rows. A charged resident map
 stores page boundaries rather than an offset pair for every result. Chronological
-record captures use the requested scan budget as their item ceiling; ranked,
-source-time and JSON captures retain the separate 10,000-item admission.
+record and JSON captures use the requested scan budget as their item ceiling;
+ranked and source-time captures retain the separate 10,000-item admission.
 
 ## Bounded immutable disk staging
 
@@ -52,7 +52,7 @@ the shared lease contract, and any staging or page failure returns no successful
 prefix. No durable query receipt, evidence pin or renewed retention is created.
 
 Schema 45 introduced disk row staging. Host admission profile
-`sparrow-query-capture/5` identifies the current disk index/page-map path. Record,
+`sparrow-query-capture/6` identifies the current disk index/page-map path. Record,
 text, key and value receipts advertise a 64 MiB maximum disk capture;
 the configured store allowance can admit less or refuse with storage pressure.
 Native ranked membership

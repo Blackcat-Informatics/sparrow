@@ -3,11 +3,11 @@
 Schema 45 uses anonymous, disk-admitted immutable staging for record, text, key
 and value pages, including field filters, source-time ordering and artifact grouping. Each page remains bounded
 and replayable with the original absolute deadline; release removes only the
-query allocation. Host admission profile `sparrow-query-capture/5` advertises a
+query allocation. Host admission profile `sparrow-query-capture/6` advertises a
 64 MiB maximum disk capture for this path, subject to the configured store budget.
 Row offsets are disk-backed; a bounded resident page map preserves replay.
-Chronological record captures report the requested scan budget as their item
-ceiling. Source-time sorting, ranking and JSON captures retain 10,000 items and
+Chronological record and JSON captures report the requested scan budget as their
+item ceiling. Source-time sorting and ranking retain 10,000 items and
 their separate resident working bounds. Key aggregation has a separate 32 MiB
 charged working allowance. See
 [query streaming](query-streaming.md) for admission, cleanup and remaining work.
@@ -407,7 +407,7 @@ Keys and values share the existing occurrence predicate and one typed input
 admission owner. JSON query paths admit at most 65,536 UTF-8 bytes before the
 server allocates an owned spelling. The core enforces the same limit for direct
 JSON discovery calls. The updated host capture profile is
-sparrow-query-capture/5; QueryLimits.queryPathBytes reports that ceiling for
+sparrow-query-capture/6; QueryLimits.queryPathBytes reports that ceiling for
 JSON captures and explicit absence for other query phases. Stored evidence,
 native projection identities and storage formats are unchanged.
 

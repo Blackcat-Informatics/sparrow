@@ -1509,7 +1509,7 @@ impl Store {
             stage.checkpoint()?;
         }
         let row_limit = if capture {
-            catalog_lease::MAX_ITEMS
+            record_read::disk_capture_items(None, scope.scan_budget)
         } else {
             scope.limit
         };
@@ -1603,10 +1603,12 @@ impl Store {
                 let kind: String = read_field(fact, "kind")?;
                 match query {
                     crate::JsonQuery::Keys { .. } => {
-                        if capture && !keys.contains_key(&(path.clone(), kind.clone())) {
+                        if !keys.contains_key(&(path.clone(), kind.clone())) {
                             key_bytes = key_bytes
                                 .saturating_add(path.len() + kind.len() + record.id.len() + 256);
-                            if keys.len() >= row_limit || key_bytes > catalog_lease::SCAN_BYTES {
+                            if (capture && keys.len() >= row_limit)
+                                || key_bytes > catalog_lease::SCAN_BYTES
+                            {
                                 return Err(Error::new(
                                     "RESOURCE_LIMIT",
                                     "key capture exceeds admission; narrow scope",
