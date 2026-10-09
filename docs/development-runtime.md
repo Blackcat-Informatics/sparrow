@@ -2,16 +2,60 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 48 and store format 37. The stable installed
+private Unix socket. It uses schema 49 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`83095eb`; see [agent upload checkpoints](#agent-upload-checkpoints) for
+`218bf5f`; see [combined ingestion status](#combined-ingestion-status) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Combined ingestion status
+
+Signed source `218bf5f` supplies one bounded read of raw staging, private
+preparation, original acceptance, JSON/RDF/text coverage and synchronized source
+retirement. The typed `ingestStatus` operation, certified SDK response, CLI
+`ingest-get` and MCP `ingest_get` share the same implementation. Select exactly
+one import ID, original intake request ID or original handoff request ID.
+Direct intake has no import identity. Tail-only acknowledgement reports the
+original terminal generation and zero newly ingested records. Inspection never
+advances intake, flushes buffered acceptance, removes a source or extends
+retention. Status admission defaults to 10,000 record/pin visits and 32 MiB of
+catalog construction, with an explicit maximum of 100,000 visits. Exceeding
+admission or encountering contradictory native state refuses the whole read.
+
+Private tests cover preparation, buffered acceptance without synchronization,
+corrupt publication/projection state, managed ownership and removal, expired
+evidence, tail-only completion, direct intake and upload crash/restart. SDK,
+CLI and MCP compare the same immutable state. The full gate and normal signed
+commit hook pass 165 storage scenarios, 60 RPC scenarios, 19 SDK tests, the
+remaining workspace tests, release Clippy, seeded census and 255 ownership jobs
+with zero distinct exceptions. Logs are
+`/tmp/sparrow-combined-ingest-gate-v4.log` and
+`/tmp/sparrow-combined-ingest-commit.log`; the commit hook includes the final
+PurRDF canonical-hex decoder adoption. Five explicitly selected images are frozen
+at `~/.local/state/sparrow/receiver-history-images-x8qrxyy1`.
+
+Adoption evidence is `/tmp/sparrow-combined-ingest-live.ptuxy2jn`, including a
+closed-store backup that has not independently been restored. The enabled active
+unit runs PID 3844791 from `sparrowd-schema49-218bf5f`, SHA-256
+`38d9b4cfd87252368dd6ad0e051fb4c38c060cd9ae75322566ab8ac3a16275ee`,
+with `cap_net_bind_service=ep`. The stable CLI selects
+`sparrow-schema49-218bf5f`, SHA-256
+`10a1d542196b64e90bfb17f08f8ed5fef2bbbb15be948c4f79f85045f399149c`.
+Frozen, installed and alias hashes agree. Saved intents and seven subsequent
+readback flows pass without new public intake or retirement. Combined status
+agrees over LAN/Unix CLI/MCP across all three namespaces, retaining the original
+tail checkpoint, clocks and removal receipt. Strict ambiguous/null/unknown input,
+missing identities and wrong stores refuse. The exact 34-tool inventory retains
+read-only status annotations. Live queries preserve source inventories, temporal
+field witnesses and native text scores. Final readback preserves store identity,
+format 37, 212 records and zero pins/result leases. Logs use
+`/tmp/sparrow-combined-ingest-*.log`. Complete governed SPARQL admission,
+bounded physical reclamation and production operational acceptance remain unmet.
+
 ## Agent upload checkpoints
 
-Signed source `83095eb` exposes the existing typed `importGet` operation through
+Historical signed source `83095eb` exposes the existing typed `importGet` operation through
 `sparrow_client::get_import_progress`, CLI `ingest-get STORE_ID IMPORT_ID` and
 MCP `ingest_get`. One SDK decoder certifies durable offsets and the consistency
 of sealing, layout and publication; resumable uploads use that same owner.
