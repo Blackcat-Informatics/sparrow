@@ -2,12 +2,62 @@
 
 The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 49 and store format 37. The stable installed
+private Unix socket. It uses schema 50 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`218bf5f`; see [combined ingestion status](#combined-ingestion-status) for
+`28e3915`; see [logical retention accounting](#logical-retention-accounting) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Logical retention accounting
+
+Signed implementation `982f105` and CLI usage follow-up `28e3915` expose native
+logical retention accounting through typed `retentionMetrics`, the certified
+SDK, CLI `retention-metrics STORE_ID` and MCP `retention_metrics`. The complete
+admitted read reports eligible records/artifacts, oldest surviving receipt,
+effective window and unique raw payload ownership. Pins, ordinary eligibility,
+private preparation and partial manifest retirement retain their existing native
+owners. Shared chunks are counted once; a live, pinned or unclassified owner
+prevents a chunk from being reported as logically retirable. The shared payload
+reader admits borrowed bytes before hashing and checks native size/digest before
+creating a caller-owned copy. Physical files and index bytes remain separate
+from this logical raw-payload account. See the
+[metric contract](interfaces.md#bounded-logical-retention-metrics) for exact
+categories, overlap and admission limits.
+
+Private qualification covers shared content, record-only and empty-artifact
+pins, thirty-day expiry, release, restart, unpublished private preparation,
+reference/payload corruption, independent work/byte refusals and
+cancellation. CLI/MCP compare certified results and strict store/input/budget
+errors. The full gate and both normal signed-commit hooks pass 167 storage
+scenarios, 60 RPC scenarios, 20 SDK tests, the remaining workspace tests, release
+Clippy, seeded census and 258 ownership jobs with zero distinct exceptions.
+Logs are `/tmp/sparrow-retention-metrics-gate.log`,
+`/tmp/sparrow-retention-metrics-commit.log` and
+`/tmp/sparrow-retention-metrics-usage-commit.log`. Five explicitly selected runtime
+images are frozen at `~/.local/state/sparrow/receiver-history-images-xolyszjx`.
+
+Adoption evidence is `/tmp/sparrow-retention-metrics-live.uxc9qyp9`, including a
+closed-store backup that has not independently been restored. The enabled active
+unit runs PID 4081797 from `sparrowd-schema50-28e3915`, SHA-256
+`d71f06fb4018df986cfd424ee2096e4c4f9c8af3fa216f383a11b205a8e2453f`,
+with `cap_net_bind_service=ep`. The stable CLI selects
+`sparrow-schema50-28e3915`, SHA-256
+`4a7b071727c3457acee7ec30d177cb97896e4fbcf98a81305d649b4d71ef5ed8`.
+Frozen, installed and alias hashes agree. Saved intents and eight subsequent
+live readback flows pass without new public intake or retirement. Metrics agree
+over LAN/Unix CLI/MCP with 212 records, 32 artifacts, 213 unique chunks and
+307,808 owned/live raw bytes; pin-held, retirable and unclassified raw bytes are
+zero. The sampled oldest eligible receipt is `2026-10-07T06:16:07.367Z`;
+the account at `2026-10-09T05:32:13.868Z` reports a 170,166,501 ms window and
+1,426 admitted visits. This is a finite development-store observation, not a
+thirty-day production density or reclamation measurement. Native budget/store/
+input refusals, unchanged payload references/projections, saved combined intake
+status, original tail clocks, query witnesses, text scores and the exact
+35-tool inventory are qualified. Final readback retains format 37, 212 records
+and zero pins/result leases. Logs use `/tmp/sparrow-retention-metrics-*.log`.
+Complete governed SPARQL admission, forced bounded physical reclamation,
+remaining operational metrics and production qualification remain unmet.
 
 ## Combined ingestion status
 
