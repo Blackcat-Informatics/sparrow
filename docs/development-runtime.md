@@ -4,10 +4,53 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`af09657`; see [JSON capture admission](#json-capture-admission) for
+`83095eb`; see [agent upload checkpoints](#agent-upload-checkpoints) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Agent upload checkpoints
+
+Signed source `83095eb` exposes the existing typed `importGet` operation through
+`sparrow_client::get_import_progress`, CLI `ingest-get STORE_ID IMPORT_ID` and
+MCP `ingest_get`. One SDK decoder certifies durable offsets and the consistency
+of sealing, layout and publication; resumable uploads use that same owner.
+Handoff and upload publication references share the existing bounded optional
+identity decoder. One agent renderer serves CLI and MCP. The upload checkpoint
+neither advances intake nor certifies source deletion. The combined request-ID,
+projection-state and deletion-status contract remains unfinished, as described
+in [interfaces](interfaces.md#read-only-upload-progress).
+
+The existing private crash/restart scenario now compares SDK, Unix/TCP CLI and
+MCP checkpoints at empty, partial, reopened, laid-out and published stages.
+Committed prefixes and original deadlines survive daemon crashes, publication
+references the original receipt, reads do not change progress, and the original
+source bytes remain intact. Wrong-store, unknown canonical import IDs and unknown
+tool fields refuse; tool inventory and read-only annotations are checked.
+SDK tests also reject inconsistent offsets, seal/layout/publication states and
+changed response identities. The final full gate and normal signed-commit hook
+pass 162 storage scenarios, 60 RPC scenarios, 18 SDK tests, remaining workspace
+tests, release Clippy, seeded census and 250 ownership jobs with zero distinct
+exceptions. Logs are `/tmp/sparrow-import-status-gate-v3.log` and
+`/tmp/sparrow-import-status-commit.log`. Five explicitly selected images are
+frozen at `~/.local/state/sparrow/receiver-history-images-dzl0g7zv`.
+
+Adoption evidence is `/tmp/sparrow-import-status-live.qqlmkccd`, including a
+closed-store backup that has not independently been restored. The enabled active
+unit runs PID 3185010 from `sparrowd-schema48-83095eb`, SHA-256
+`c936646c75dd9cb50628380c18114974f05f3634a008cb7bc7ee97e1b9f64684`,
+with `cap_net_bind_service=ep`. The stable CLI selects
+`sparrow-schema48-83095eb`, SHA-256
+`112d50e5ba56de88eb2cd4a3d8ff3a2fd145eb775925012f958618e67ed09458`.
+Frozen, installed and alias hashes agree. Saved intents and seven further live
+readback flows pass without new public intake or retirement. The new checkpoint
+flow verifies TCP/Unix CLI/MCP native missing-import/store-mismatch failures,
+strict input and the exact 34-tool inventory. Positive checkpoint stages are
+qualified on private daemon instances, not by adding public data. Final LAN
+readback preserves store identity, schema 48, format 37, 212 records and zero
+pins/result leases. Logs use `/tmp/sparrow-import-status-*.log`. Full graph-query
+integration, bounded physical reclamation, combined ingestion status and
+production operational acceptance remain unfinished.
 
 ## JSON capture admission
 
