@@ -40,10 +40,46 @@ impl Operation {
         let decode = || -> std::result::Result<Self, DecodeError> {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
-                "ingest_get" => Self::Query(Command::IngestStatus(super::ingest_status::Input {
-                    store: fields.required("store_id")?,
-                    id: fields.required("import_id")?,
-                })),
+                "ingest_get" => {
+                    let request = fields
+                        .raw("request_id")?
+                        .map(String::from_json)
+                        .transpose()?;
+                    let import = fields
+                        .raw("import_id")?
+                        .map(String::from_json)
+                        .transpose()?;
+                    let handoff = fields
+                        .raw("handoff_request_id")?
+                        .map(String::from_json)
+                        .transpose()?;
+                    let selector = match (request, import, handoff) {
+                        (Some(id), None, None) => sparrow_client::IngestSelector::Request(id),
+                        (None, Some(id), None) => sparrow_client::IngestSelector::Import(id),
+                        (None, None, Some(id)) => sparrow_client::IngestSelector::Handoff(id),
+                        _ => {
+                            return Err(DecodeError::custom(
+                                "ingest_get requires exactly one of request_id, import_id or handoff_request_id",
+                            ));
+                        }
+                    };
+                    Self::Query(Command::IngestStatus(super::ingest_status::Input {
+                        store: fields.required("store_id")?,
+                        selector,
+                        limits: sparrow_client::IngestReadLimits {
+                            scan_budget: fields
+                                .raw("scan_budget")?
+                                .map(u32::from_json)
+                                .transpose()?
+                                .unwrap_or(10000),
+                            catalog_bytes: fields
+                                .raw("catalog_bytes")?
+                                .map(u32::from_json)
+                                .transpose()?
+                                .unwrap_or(33554432),
+                        },
+                    }))
+                }
                 "file_finish" | "file_finish_get" => {
                     let observed: Value = fields.required("observed")?;
                     let intent = sparrow_client::TailFinishIntent {

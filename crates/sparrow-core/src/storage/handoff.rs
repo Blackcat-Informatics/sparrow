@@ -61,6 +61,26 @@ struct Binding {
 }
 
 impl Binding {
+    fn validate_journal(&self, journal: &ConsumptionJournal) -> Result<(), Error> {
+        let intent = &self.intent;
+        if journal.import_id != self.import_id
+            || journal.watch != intent.watch
+            || journal.relative_path != intent.relative_path
+            || journal.observed != intent.observed
+            || journal.tail.as_ref().map(|tail| &tail.id) != intent.tail_generation_id.as_ref()
+            || journal
+                .tail
+                .as_ref()
+                .is_some_and(|tail| tail.declaration.watch_revision != intent.watch_revision)
+            || self.completed != journal.removed_at.is_some()
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "handoff binding contradicts its consumption journal",
+            ));
+        }
+        Ok(())
+    }
     fn read(key: &[u8], bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > 8192 {
             return Err(Error::new(
@@ -128,6 +148,33 @@ impl Catalog for Binding {
 }
 
 impl Writer {
+    pub(super) fn handoff_status_import(
+        &self,
+        request: &str,
+        now: u64,
+        remaining: &mut usize,
+    ) -> Result<Option<String>, Error> {
+        let key = format!("{PREFIX}{request}");
+        let Some(bytes) = self.db.get_pinned(&key)? else {
+            return Ok(None);
+        };
+        Self::charge_catalog_shape(remaining, &bytes)?;
+        let binding = Binding::read(key.as_bytes(), &bytes)?;
+        if binding.completed && binding.expires_at <= now {
+            return Ok(None);
+        }
+        let journal = self
+            .consumption_admitted(&binding.import_id, Some(remaining))?
+            .ok_or_else(|| {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    "handoff status lost its ownership journal",
+                )
+            })?;
+        binding.validate_journal(&journal)?;
+        Ok(Some(binding.import_id))
+    }
+
     pub(super) fn handoff(
         &self,
         intent: &ConsumptionHandoff,
@@ -156,21 +203,7 @@ impl Writer {
                 "handoff lost its consumption ownership journal",
             )
         })?;
-        if journal.watch != intent.watch
-            || journal.relative_path != intent.relative_path
-            || journal.observed != intent.observed
-            || journal.tail.as_ref().map(|tail| &tail.id) != intent.tail_generation_id.as_ref()
-            || journal
-                .tail
-                .as_ref()
-                .is_some_and(|tail| tail.declaration.watch_revision != intent.watch_revision)
-            || binding.completed != journal.removed_at.is_some()
-        {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "handoff binding contradicts its consumption journal",
-            ));
-        }
+        binding.validate_journal(&journal)?;
         Ok(Some(journal))
     }
 

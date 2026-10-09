@@ -41,6 +41,9 @@ pub use storage::import::{
     IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,
     ImportRecordSpan, ImportStart,
 };
+pub use storage::ingest_status::{
+    IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus,
+};
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};
 pub use storage::pressure::{PressurePhase, PressureStatus};

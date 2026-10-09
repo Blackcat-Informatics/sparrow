@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 rocksdb.workspace = true
 purrdf-lex.workspace = true
+sparrow-client = { path = "../sparrow-client" }
+capnp.workspace = true
 
 [dev-dependencies]
 rustix.workspace = true

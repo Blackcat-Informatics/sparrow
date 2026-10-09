@@ -386,6 +386,14 @@ pub fn validate_consumption_path(watch: &str, path: &[u8]) -> Result<(), Error> 
 
 impl Writer {
     pub(super) fn consumption(&self, id: &str) -> Result<Option<ConsumptionJournal>, Error> {
+        self.consumption_admitted(id, None)
+    }
+
+    pub(super) fn consumption_admitted(
+        &self,
+        id: &str,
+        remaining: Option<&mut usize>,
+    ) -> Result<Option<ConsumptionJournal>, Error> {
         if id
             .strip_prefix("import:")
             .and_then(hex::decode_32_canonical)
@@ -404,6 +412,9 @@ impl Writer {
                 "STORAGE_FAILURE",
                 "consumption journal exceeds 8 KiB",
             ));
+        }
+        if let Some(remaining) = remaining {
+            Self::charge_catalog_shape(remaining, &bytes)?;
         }
         let value = parse(&bytes)?;
         let journal = ConsumptionJournal::decode(value.get("journal").unwrap_or(&value))?;
@@ -440,10 +451,21 @@ impl Writer {
         format: &str,
         length: u64,
     ) -> Result<bool, Error> {
+        self.require_consumption_admitted(request, source, format, length, None)
+    }
+
+    pub(super) fn require_consumption_admitted(
+        &self,
+        request: &str,
+        source: &str,
+        format: &str,
+        length: u64,
+        remaining: Option<&mut usize>,
+    ) -> Result<bool, Error> {
         if !request.starts_with("consume:") {
             return Ok(false);
         }
-        let journal = self.consumption(&super::import::import_id(request))?.ok_or_else(|| Error::new("CONFLICT", "consumption request has no recovery journal; reserve the source generation first"))?;
+        let journal = self.consumption_admitted(&super::import::import_id(request), remaining)?.ok_or_else(|| Error::new("CONFLICT", "consumption request has no recovery journal; reserve the source generation first"))?;
         if journal.tail.is_some() {
             return Err(Error::new(
                 "CONFLICT",

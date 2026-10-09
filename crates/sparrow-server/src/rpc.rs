@@ -4,6 +4,7 @@
 //! Typed adapters over the shared evidence owner; no transport JSON envelopes.
 
 use crate::sparrow_capnp as wire;
+mod ingest_status;
 use purrdf_lex::json::{Value, record::Record as JsonRecord};
 use sparrow_core::{
     Artifact, Error, JsonQuery, Pin, PinPageBody, PinRead, PinSelector, PinSummary, QueryScope,
@@ -857,6 +858,37 @@ fn import_progress(
         None => out.init_published_artifact().set_absent(()),
     }
     Ok(())
+}
+
+fn import_preparation(
+    mut out: wire::import_preparation::Builder<'_>,
+    value: sparrow_core::ImportPreparation,
+    store: &str,
+) {
+    out.set_store_id(store);
+    out.set_import_id(&value.import_id);
+    out.set_reserved_artifact_id(&value.artifact_id);
+    out.set_prepared_records(value.prepared_records);
+    out.set_total_records(value.total_records);
+    out.reborrow()
+        .init_received_at()
+        .set_unix_millis(value.received_at);
+    out.reborrow()
+        .init_expires_at()
+        .set_unix_millis(value.expires_at);
+    if let Some(raw) = value.raw {
+        let mut raw_out = out.reborrow().init_raw().init_value();
+        raw_out.set_record_index(raw.record_index);
+        raw_out.set_reserved_record_id(raw.record_id);
+        raw_out.set_prepared_chunks(raw.prepared_chunks);
+        raw_out.set_total_chunks(raw.total_chunks);
+    }
+    if let Some(id) = value.source_time_profile {
+        out.reborrow().init_source_time_profile().set_value(id);
+    }
+    if let Some(id) = value.diagnostic_profile {
+        out.init_diagnostic_profile().set_value(id);
+    }
 }
 
 fn producer_limits(
@@ -1774,6 +1806,65 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn ingest_status(
+        self: Rc<Self>,
+        params: wire::sparrow::IngestStatusParams,
+        mut results: wire::sparrow::IngestStatusResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        let input = || -> Result<_, Error> {
+            self.check_store(
+                query
+                    .get_store_id()
+                    .map_err(invalid)?
+                    .to_str()
+                    .map_err(invalid)?,
+            )?;
+            if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+                return Err(Error::new(
+                    "UNSUPPORTED",
+                    "ingestion status requires the current discovered schema",
+                ));
+            }
+            let selector =
+                sparrow_client::IngestSelector::decode(query.get_selector().map_err(invalid)?)
+                    .map_err(invalid)?;
+            let selector = match selector {
+                sparrow_client::IngestSelector::Request(id) => {
+                    sparrow_core::IngestSelector::Request(id)
+                }
+                sparrow_client::IngestSelector::Import(id) => {
+                    sparrow_core::IngestSelector::Import(id)
+                }
+                sparrow_client::IngestSelector::Handoff(id) => {
+                    sparrow_core::IngestSelector::Handoff(id)
+                }
+            };
+            Ok((
+                selector,
+                sparrow_core::IngestReadLimits {
+                    scan_budget: query.get_scan_budget() as usize,
+                    catalog_bytes: query.get_catalog_bytes() as usize,
+                },
+            ))
+        };
+        let (selector, limits) = match input() {
+            Ok(input) => input,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
+        match self
+            .work(move |store, now| store.ingest_status(&selector, limits, now))
+            .await
+        {
+            Ok(status) => ingest_status::encode(results.get().init_result().init_ok(), status)?,
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
+
     async fn import_get(
         self: Rc<Self>,
         params: wire::sparrow::ImportGetParams,
@@ -1870,35 +1961,7 @@ impl wire::sparrow::Server for Rpc {
             .await
         {
             Ok((value, store)) => {
-                let mut out = results.get().init_result().init_ok();
-                out.set_store_id(store);
-                out.set_import_id(&value.import_id);
-                out.set_reserved_artifact_id(&value.artifact_id);
-                out.set_prepared_records(value.prepared_records);
-                out.set_total_records(value.total_records);
-                out.reborrow()
-                    .init_received_at()
-                    .set_unix_millis(value.received_at);
-                out.reborrow()
-                    .init_expires_at()
-                    .set_unix_millis(value.expires_at);
-                match value.raw {
-                    None => out.reborrow().init_raw().set_absent(()),
-                    Some(raw) => {
-                        let mut raw_out = out.reborrow().init_raw().init_value();
-                        raw_out.set_record_index(raw.record_index);
-                        raw_out.set_reserved_record_id(raw.record_id);
-                        raw_out.set_prepared_chunks(raw.prepared_chunks);
-                        raw_out.set_total_chunks(raw.total_chunks);
-                    }
-                }
-                match value.source_time_profile {
-                    Some(id) => out.reborrow().init_source_time_profile().set_value(id),
-                    None => out.reborrow().init_source_time_profile().set_absent(()),
-                }
-                if let Some(id) = value.diagnostic_profile {
-                    out.init_diagnostic_profile().set_value(id);
-                }
+                import_preparation(results.get().init_result().init_ok(), value, &store);
             }
             Err(e) => failure(results.get().init_result(), e),
         }

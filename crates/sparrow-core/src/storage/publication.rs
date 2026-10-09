@@ -145,7 +145,7 @@ impl ImportPreparation {
 fn preparation_key(id: &str) -> String {
     format!("import-preparation:{id}")
 }
-fn record_key(id: &str, index: u64) -> String {
+pub(super) fn record_key(id: &str, index: u64) -> String {
     format!("import-record:{id}:{index:020}")
 }
 fn receipt_key(id: &str) -> String {
@@ -156,6 +156,14 @@ fn preparation(
     writer: &Writer,
     manifest: &ImportManifest,
 ) -> Result<Option<ImportPreparation>, Error> {
+    preparation_admitted(writer, manifest, None)
+}
+
+pub(super) fn preparation_admitted(
+    writer: &Writer,
+    manifest: &ImportManifest,
+    remaining: Option<&mut usize>,
+) -> Result<Option<ImportPreparation>, Error> {
     let Some(bytes) = writer.db.get(preparation_key(&manifest.id))? else {
         return Ok(None);
     };
@@ -164,6 +172,9 @@ fn preparation(
             "STORAGE_FAILURE",
             "import preparation checkpoint exceeds its bound",
         ));
+    }
+    if let Some(remaining) = remaining {
+        Writer::charge_catalog_shape(remaining, &bytes)?;
     }
     let progress = ImportPreparation::decode(&parse(&bytes)?)?;
     if progress.import_id != manifest.id || progress.total_records != manifest.layout_records {
@@ -180,16 +191,29 @@ pub(super) fn published(
     id: &str,
     now: u64,
 ) -> Result<Option<(ImportManifest, Artifact)>, Error> {
-    let managed = writer.consumption(id)?;
+    published_admitted(writer, id, now, None)
+}
+
+pub(super) fn published_admitted(
+    writer: &Writer,
+    id: &str,
+    now: u64,
+    mut remaining: Option<&mut usize>,
+) -> Result<Option<(ImportManifest, Artifact)>, Error> {
+    let managed = writer.consumption_admitted(id, remaining.as_deref_mut())?;
     let saved = if managed
         .as_ref()
         .is_some_and(|journal| journal.published_artifact.is_some())
     {
-        Some(parse(&writer.db.get(receipt_key(id))?.ok_or_else(
-            || Error::new("STORAGE_FAILURE", "consumption publication receipt missing"),
-        )?)?)
+        let bytes = writer.db.get_pinned(receipt_key(id))?.ok_or_else(|| {
+            Error::new("STORAGE_FAILURE", "consumption publication receipt missing")
+        })?;
+        if let Some(remaining) = remaining.as_deref_mut() {
+            Writer::charge_catalog_shape(remaining, &bytes)?;
+        }
+        Some(parse(&bytes)?)
     } else {
-        writer.retry(&receipt_key(id), now)?
+        writer.retry_admitted(&receipt_key(id), now, remaining.as_deref_mut())?
     };
     let Some(saved) = saved else {
         return Ok(None);
@@ -199,13 +223,20 @@ pub(super) fn published(
     integer(&saved, "expires_at")?;
     if manifest.consumption {
         writer
-            .require_consumption(
+            .require_consumption_admitted(
                 &manifest.request_id,
                 &manifest.source,
                 &manifest.format,
                 manifest.byte_length,
+                remaining,
             )
-            .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+            .map_err(|e| {
+                if e.code == "RESOURCE_LIMIT" {
+                    e
+                } else {
+                    Error::new("STORAGE_FAILURE", e.to_string())
+                }
+            })?;
     }
     if manifest.id != id
         || (manifest.consumption

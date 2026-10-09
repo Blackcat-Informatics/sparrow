@@ -760,6 +760,18 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
     assert_eq!(published.published_id(), Some(generation.id.as_str()));
     assert!(published.published_artifact.is_none());
     assert_eq!(published.tail, Some(terminal));
+    let selector = sparrow_core::IngestSelector::Handoff(intent.request_id.clone());
+    let progress = store
+        .ingest_status(&selector, Default::default(), 32 * DAY)
+        .unwrap();
+    assert_eq!(progress.deletion, sparrow_core::IngestDeletion::Published);
+    assert!(progress.accepted.is_none());
+    assert!(progress.staging.is_none());
+    assert_eq!(progress.tail, published.tail);
+    assert_eq!(progress.total_records, Some(0));
+    assert_eq!(progress.inspected_records, 0);
+    assert_eq!(progress.text, Default::default());
+    assert_eq!(progress.consumption.as_ref(), Some(&published));
     assert_eq!(
         store
             .consumption_publish_tail(&claim.import_id, &claimed)
@@ -780,6 +792,13 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         .consumption_removed(&claim.import_id, &generation.id, &claimed, 32 * DAY)
         .unwrap();
     assert_eq!(removed.removed_at, Some(32 * DAY));
+    let progress = store
+        .ingest_status(&selector, Default::default(), 32 * DAY)
+        .unwrap();
+    assert_eq!(progress.deletion, sparrow_core::IngestDeletion::Removed);
+    assert_eq!(progress.removed_at, Some(32 * DAY));
+    assert_eq!(progress.tail, removed.tail);
+    assert_eq!(progress.total_records, Some(0));
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store
@@ -4812,7 +4831,7 @@ fn physical_accounting_handles_directory_churn_with_bounded_measurement_failures
 
 #[test]
 fn consumption_recovery_preserves_original_publication_beyond_retry_and_retention() {
-    use sparrow_core::{ConsumptionGeneration, ImportStart};
+    use sparrow_core::{ConsumptionGeneration, ImportStart, IngestDeletion, IngestSelector};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let input = b"one\n";
@@ -4882,6 +4901,15 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         Some("sparrow.store/36")
     );
     // Catalog updates must never downgrade the handoff writer fence.
+    let selector = IngestSelector::Handoff(handoff.request_id.clone());
+    let progress = store
+        .ingest_status(&selector, Default::default(), 0)
+        .unwrap();
+    assert_eq!(progress.deletion, IngestDeletion::Reserved);
+    assert_eq!(progress.consumption.as_ref(), Some(&reserved));
+    assert!(progress.accepted.is_none());
+    assert_eq!(progress.total_records, None);
+    assert_eq!(progress.request_id, reserved.request_id);
     store
         .watch_registry_replace(Some(b"registered-watch"), b"changed-watch")
         .unwrap();
@@ -4911,6 +4939,15 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let manifest = store
         .import_begin(&reserved.request_id, "source", "log", 4, &digest, 0)
         .unwrap();
+    let progress = store
+        .ingest_status(&selector, Default::default(), 0)
+        .unwrap();
+    assert_eq!(progress.deletion, IngestDeletion::Claimed);
+    assert_eq!(
+        progress.consumption.as_ref().unwrap().claimed.as_ref(),
+        Some(&claimed)
+    );
+    assert!(progress.accepted.is_none());
     assert!(manifest.consumption);
     store.import_append(&manifest.id, 0, input, 0).unwrap();
     assert_eq!(
@@ -4942,6 +4979,16 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         "CONFLICT"
     );
     let artifact = store.import_publish(&manifest.id, 3 * DAY).unwrap();
+    let progress = store
+        .ingest_status(&selector, Default::default(), 3 * DAY)
+        .unwrap();
+    assert_eq!(progress.deletion, IngestDeletion::Published);
+    assert_eq!(progress.accepted.as_ref().unwrap().id, artifact.id);
+    assert_eq!(progress.total_records, Some(1));
+    assert_eq!(progress.text.complete, 1);
+    assert_eq!(progress.json.not_applicable, 1);
+    assert_eq!(progress.rdf.not_applicable, 1);
+    assert_eq!(progress.removed_at, None);
     assert_eq!(store.bytes(&artifact.id, 0, 4, 3 * DAY).unwrap(), input);
     assert_eq!(
         store
@@ -4960,6 +5007,17 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .consumption_handoff_get(&handoff, 40 * DAY)
         .unwrap()
         .unwrap();
+    let progress = store
+        .ingest_status(&selector, Default::default(), 40 * DAY)
+        .unwrap();
+    assert_eq!(progress.deletion, IngestDeletion::Published);
+    assert_eq!(progress.accepted.as_ref().unwrap().id, artifact.id);
+    assert_eq!(
+        progress.accepted.as_ref().unwrap().received_at,
+        artifact.received_at
+    );
+    assert_eq!(progress.text.unavailable, 1);
+    assert_eq!(progress.text.complete, 0);
     assert_eq!(recovered_handoff.import_id, manifest.id);
     assert_eq!(
         recovered_handoff.published_artifact.as_deref(),
@@ -5017,6 +5075,19 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let removed = store
         .consumption_removed(&manifest.id, &artifact.id, &claimed, 40 * DAY)
         .unwrap();
+    for selected in [&selector, &IngestSelector::Import(manifest.id.clone())] {
+        let progress = store
+            .ingest_status(selected, Default::default(), 40 * DAY)
+            .unwrap();
+        assert_eq!(progress.deletion, IngestDeletion::Removed);
+        assert_eq!(progress.removed_at, Some(40 * DAY));
+        assert_eq!(progress.consumption.as_ref(), Some(&removed));
+        assert_eq!(
+            progress.accepted.as_ref().unwrap().expires_at,
+            artifact.expires_at
+        );
+        assert_eq!(progress.text.unavailable, 1);
+    }
     assert!(store.consumption_pending().unwrap().is_empty());
     store.expire(41 * DAY).unwrap();
     assert_eq!(
@@ -5037,6 +5108,13 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         "NOT_FOUND"
     );
     let mut expired_alias = handoff.clone();
+    assert_eq!(
+        store
+            .ingest_status(&selector, Default::default(), 43 * DAY)
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
     expired_alias.request_id = "expired-completion-alias".into();
     assert_eq!(
         store
@@ -10452,6 +10530,209 @@ fn standard_text_lexicons_are_required() {
             .code,
         "INVALID_ARGUMENT"
     );
+}
+
+#[test]
+fn combined_ingest_status_reads_private_preparation_and_original_publication_without_advancing() {
+    use sparrow_core::{IngestDeletion, IngestReadLimits, IngestSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"{\"message\":\"ready\"}\nnot-json\n";
+    let manifest = stage_fixture(&store, "inspect-upload", "jsonl", input);
+    let by_request = IngestSelector::Request(manifest.request_id.clone());
+    let by_import = IngestSelector::Import(manifest.id.clone());
+    let private = store
+        .ingest_status(&by_request, Default::default(), 1)
+        .unwrap();
+    assert!(private.accepted.is_none());
+    assert_eq!(private.total_records, Some(2));
+    assert_eq!(private.inspected_records, 0);
+    assert_eq!(private.json.pending, 2);
+    assert_eq!(private.deletion, IngestDeletion::NotManaged);
+    assert_eq!(private.staging.as_ref().unwrap(), &manifest);
+    assert!(private.preparation.is_none());
+    let first = store.import_prepare_record(&manifest.id, 0, 1).unwrap();
+    let prepared = store
+        .ingest_status(&by_import, Default::default(), 2)
+        .unwrap();
+    assert_eq!(prepared.selector, by_import);
+    assert_eq!(prepared.preparation.as_ref().unwrap(), &first);
+    assert!(prepared.accepted.is_none());
+    assert_eq!(prepared.inspected_records, 1);
+    assert_eq!(prepared.json.complete, 1);
+    assert_eq!(prepared.rdf.complete, 1);
+    assert_eq!(prepared.text.complete, 1);
+    assert_eq!(prepared.json.pending, 1);
+    assert_eq!(
+        store.artifact(&first.artifact_id).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    store.import_prepare_record(&manifest.id, 1, 1).unwrap();
+    let receipt = store.import_publish(&manifest.id, 1).unwrap();
+    for selector in [&by_request, &by_import] {
+        let accepted = store
+            .ingest_status(selector, Default::default(), 2)
+            .unwrap();
+        assert_eq!(accepted.selector, *selector);
+        assert_eq!(accepted.total_records, Some(2));
+        assert_eq!(accepted.inspected_records, 2);
+        assert!(accepted.preparation.is_none());
+        assert_eq!(accepted.accepted.as_ref().unwrap().id, receipt.id);
+        assert_eq!(
+            accepted.accepted.as_ref().unwrap().received_at,
+            receipt.received_at
+        );
+        assert_eq!(accepted.json.complete, 1);
+        assert_eq!(accepted.json.failed, 1);
+        assert_eq!(accepted.rdf.complete, 1);
+        assert_eq!(accepted.rdf.failed, 1);
+        assert_eq!(accepted.text.complete, 1);
+        assert_eq!(accepted.text.incomplete, 1);
+        assert_eq!(accepted.json.pending, 0);
+        assert_eq!(accepted.removed_at, None);
+    }
+    for limits in [
+        IngestReadLimits {
+            scan_budget: 1,
+            ..Default::default()
+        },
+        IngestReadLimits {
+            catalog_bytes: 1,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            store
+                .ingest_status(&by_request, limits, 2)
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT"
+        );
+    }
+    assert_eq!(store.bytes(&receipt.id, 0, input.len(), 2).unwrap(), input);
+    assert_eq!(
+        store.import_get(&manifest.id, 2).unwrap().expires_at,
+        manifest.expires_at
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .ingest_status(&by_request, Default::default(), 3)
+            .unwrap()
+            .accepted
+            .unwrap()
+            .record_ids,
+        receipt.record_ids
+    );
+    assert_eq!(
+        store
+            .ingest_status(
+                &IngestSelector::Request("missing".into()),
+                Default::default(),
+                3
+            )
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+}
+
+#[test]
+fn combined_ingest_status_preserves_buffered_ack_and_does_not_flush() {
+    use sparrow_core::{Durability, IngestDeletion, IngestSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let receipt = store
+        .ingest_with_durability(
+            "peek-buffered",
+            "source",
+            "json",
+            b"{}",
+            1,
+            Durability::Buffered,
+        )
+        .unwrap();
+    let before = store.durability_status().unwrap();
+    let selector = IngestSelector::Request("peek-buffered".into());
+    let status = store
+        .ingest_status(&selector, Default::default(), 2)
+        .unwrap();
+    assert_eq!(status.deletion, IngestDeletion::NotManaged);
+    assert!(status.staging.is_none());
+    assert!(status.import_id.is_none());
+    assert_eq!(status.accepted.unwrap().buffered, receipt.buffered);
+    let after = store.durability_status().unwrap();
+    assert!(before.pending_writes > 0);
+    assert_eq!(after.pending_writes, before.pending_writes);
+    assert_eq!(after.pending_bytes, before.pending_bytes);
+    assert_eq!(after.durable_through, before.durable_through);
+    store
+        .flush_through(receipt.buffered.as_ref().unwrap())
+        .unwrap();
+    assert!(
+        store
+            .ingest_status(&selector, Default::default(), 3)
+            .unwrap()
+            .accepted
+            .unwrap()
+            .buffered
+            .is_none()
+    );
+}
+
+#[test]
+fn combined_ingest_status_refuses_corrupt_live_membership_and_projection_state() {
+    use purrdf_lex::json::{self, Value};
+    use sparrow_core::IngestSelector;
+    for fault in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let manifest = stage_fixture(&store, "corrupt-inspection", "json", b"{}");
+        store.import_prepare_record(&manifest.id, 0, 1).unwrap();
+        let receipt = store.import_publish(&manifest.id, 1).unwrap();
+        let record = store.record(&receipt.record_ids[0]).unwrap();
+        let selector = IngestSelector::Import(manifest.id.clone());
+        drop(store);
+        {
+            let db = catalog_db(dir.path()).unwrap();
+            let key = match fault {
+                2 => format!("rdf:state:{}", record.rdf_projection_id),
+                3 => format!("text-record:{}", record.id),
+                _ => record.id.clone(),
+            };
+            if fault == 0 || fault == 2 {
+                db.delete(&key).unwrap();
+            } else {
+                let bytes = db.get(&key).unwrap().unwrap();
+                let mut value = json::record::read_document(&bytes).unwrap();
+                let Value::Object(object) = &mut value else {
+                    panic!("native catalog object");
+                };
+                match fault {
+                    1 => {
+                        object.insert("artifact_id", Value::String("artifact:another".into()));
+                    }
+                    3 => {
+                        object.insert("state", Value::String("unknown".into()));
+                    }
+                    _ => {
+                        object.insert("source", Value::String("another-source".into()));
+                    }
+                }
+                db.put(&key, json::write_compact(&value)).unwrap();
+            }
+        }
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store
+                .ingest_status(&selector, Default::default(), 2)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE",
+            "fault {fault}"
+        );
+    }
 }
 
 fn config() -> Config {

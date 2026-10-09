@@ -363,21 +363,8 @@ mod tests {
     #[test]
     fn acceptance_refuses_unrelated_content_scope_durability_and_membership() {
         use super::*;
-        let discovery = Discovery {
-            durability_session: "session:test".into(),
-            max_buffered_writes: 256,
-            max_buffered_bytes: 64 * 1024 * 1024,
-            flush_interval_ms: 2000,
-            store_id: "store:test".into(),
-            schema_version: crate::SCHEMA_VERSION,
-            max_artifact_bytes: 1024,
-            max_records_per_artifact: 2,
-            text_analyzer: "native".into(),
-            text_profile: "text".into(),
-            rdf_profile: "rdf".into(),
-            max_event_batch_bytes: crate::MAX_EVENT_BATCH_BYTES as u32,
-            max_event_batch_events: crate::MAX_EVENT_BATCH_EVENTS as u32,
-        };
+        let message = sparrow_test_support::client_discovery();
+        let discovery = Discovery::decode(message.get_root_as_reader().unwrap()).unwrap();
         let expected = ExpectedArtifact::bytes(
             &discovery,
             "source",

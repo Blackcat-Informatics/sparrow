@@ -355,7 +355,7 @@ names = ['^(write_watch_handoff_receipt|write_claim_handoff_receipt)$']
 id = "explicit-handoff-recovery"
 summary = "Recover the original generation without probing a replacement path, with one bounded native binding reader and hard ownership invariant failures."
 home = "sparrow_core::storage::handoff::Writer::handoff"
-entry_points = ["sparrow_core::storage::handoff::Binding::read", "sparrow_core::storage::handoff::Store::consumption_handoff_get"]
+entry_points = ["sparrow_core::storage::handoff::Binding::read", "sparrow_core::storage::handoff::Binding::validate_journal", "sparrow_core::storage::handoff::Writer::handoff_status_import", "sparrow_core::storage::handoff::Store::consumption_handoff_get"]
 spec = "docs/development-runtime.md: explicit handoff storage foundation."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -774,8 +774,8 @@ names = ['^(validate_reserved_file_generation|validate_claimed_file_generation)$
 [[job]]
 id = "consumption-recovery-journal"
 summary = "One bounded native catalog reader recovers active and completed ownership, outside the ordinary publication retry lease."
-home = "sparrow_core::storage::Writer::consumption"
-entry_points = ["sparrow_core::storage::Writer::require_consumption", "sparrow_core::storage::Store::consumption_get", "sparrow_core::storage::Store::consumption_pending"]
+home = "sparrow_core::storage::Writer::consumption_admitted"
+entry_points = ["sparrow_core::storage::Writer::consumption", "sparrow_core::storage::Writer::require_consumption_admitted", "sparrow_core::storage::Store::consumption_get", "sparrow_core::storage::Store::consumption_pending"]
 spec = "docs/development-runtime.md: durable completed-input ownership."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -1745,7 +1745,7 @@ names = ['^(decode_eviction_catalog|decode_pressure_catalog)$']
 id = "stored-catalog-structural-admission"
 summary = "Price owned stored-catalog decode and retirement encoding before allocation through PurRDF's borrowed JSON events; charge fixed reader, encoded copies and per-event scaffolding without changing pass byte ceilings or aggregate capture admission."
 home = "sparrow_core::storage::Writer::charge_catalog_shape"
-entry_points = ["sparrow_core::storage::Writer::get_limited", "sparrow_core::storage::Writer::protected_matching", "sparrow_core::storage::expiry::Writer::expire_bounded"]
+entry_points = ["sparrow_core::storage::Writer::get_limited", "sparrow_core::storage::Writer::optional_catalog_value", "sparrow_core::storage::Writer::retry_admitted", "sparrow_core::storage::Writer::protected_matching", "sparrow_core::storage::publication::preparation_admitted", "sparrow_core::storage::publication::published_admitted", "sparrow_core::storage::expiry::Writer::expire_bounded"]
 spec = "docs/development-runtime.md: structural stored-catalog admission."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage.rs"]
 bench = []
@@ -3680,7 +3680,7 @@ names = ['^(decode_import_progress_elsewhere|certify_upload_offset_elsewhere)$']
 
 [[job]]
 id = "agent-upload-progress-renderer"
-summary = "CLI and MCP read durable native upload checkpoints through the same SDK certificate and agent renderer; no adapter advances intake, renews staging or asserts deletion authority."
+summary = "CLI and MCP render the same certified combined ingestion read: original staging, preparation, acceptance, index coverage and synchronized source removal, without advancing intake or renewing evidence."
 home = "sparrow_server::agent::ingest_status::Input::execute"
 entry_points = ["sparrow_server::agent::Command::execute", "sparrow_server::agent::tool::Operation::parse"]
 spec = "docs/interfaces.md: read-only upload progress."
@@ -3691,3 +3691,73 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(render_import_progress_elsewhere|read_upload_status_elsewhere)$']
+
+[[job]]
+id = "combined-ingestion-status"
+summary = "One bounded catalog instant resolves explicit original request namespaces and native ownership, publication, preparation and projection state; original receipts and source removal remain separate."
+home = "sparrow_core::storage::ingest_status::Store::ingest_status"
+entry_points = ["sparrow_core::storage::handoff::Writer::handoff_status_import", "sparrow_core::storage::ingest_status::IngestStatus::inspect", "sparrow_server::rpc::ingest_status::encode"]
+spec = "docs/interfaces.md: read-only upload progress."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(count_ingestion_projection_elsewhere|infer_source_removal_elsewhere)$']
+
+[[job]]
+id = "combined-ingestion-status-certificate"
+summary = "One SDK certificate bounds the typed status message and verifies identities, original publication, projection count agreement, ownership phase and synchronization before CLI or MCP rendering."
+home = "sparrow_client::ingest_status::IngestStatus::certify"
+entry_points = ["sparrow_client::ingest_status::get_ingest_status", "sparrow_client::ingest_status::IngestSelector::decode"]
+spec = "docs/interfaces.md: read-only upload progress."
+vectors = ["crates/sparrow-client/src/ingest_status.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(certify_ingestion_summary_elsewhere|decode_ingestion_selector_elsewhere)$']
+
+[[job]]
+id = "native-preparation-wire-encoding"
+summary = "One generated encoder exposes original native private record and raw-chunk preparation for mutation replies and read-only combined ingestion status."
+home = "sparrow_server::rpc::import_preparation"
+entry_points = ["sparrow_server::rpc::Rpc::import_prepare", "sparrow_server::rpc::ingest_status::encode"]
+spec = "docs/interfaces.md: read-only upload progress."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_import_preparation_elsewhere|render_private_prepare_wire_elsewhere)$']
+
+[[job]]
+id = "ingestion-status-agent-test-parity"
+summary = "One dev-only RPC fixture certifies SDK status and CLI/MCP equivalence across upload checkpoints, ordinary source retirement and tail-only acknowledgement; only independently captured status clocks differ."
+home = "sparrow_server::test_crate::rpc::agent_ingestion_status"
+entry_points = ["sparrow_server::test_crate::rpc::agent_import_checkpoint", "sparrow_server::test_crate::rpc::typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_through_cli_mcp_and_reopen", "sparrow_server::test_crate::rpc::explicit_handoff_consumes_exact_generations_and_replays_after_removal_and_restart"]
+spec = "docs/interfaces.md: read-only upload progress."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(repeat_ingestion_status_agent_fixture|copy_ingestion_status_parity)$']
+
+[[job]]
+id = "sdk-discovery-test-fixture"
+summary = "One dev-only discovered-store fixture supplies SDK acceptance and ingestion status certificate tests."
+home = "sparrow_test_support::client_discovery"
+entry_points = []
+spec = "AGENTS.md: shared dev-only scaffolding."
+vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-client/src/ingest_status.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(another_sdk_discovery_fixture|copy_discovery_test_store)$']

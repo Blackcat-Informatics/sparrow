@@ -3,6 +3,27 @@
 
 //! Dev-only shared native storage fixtures. Runtime crates must not depend on this crate.
 
+/// One discovered store for SDK acceptance and ingestion status certificates.
+pub fn client_discovery() -> capnp::message::Builder<capnp::message::HeapAllocator> {
+    let mut message = capnp::message::Builder::new_default();
+    let mut out = message.init_root::<sparrow_client::sparrow_capnp::discovery::Builder<'_>>();
+    out.set_store_id("store:test");
+    out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+    out.set_max_artifact_bytes(1024);
+    out.set_max_records_per_artifact(2);
+    out.set_text_analyzer("native");
+    out.set_text_profile("text");
+    out.set_rdf_profile("rdf");
+    out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
+    out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
+    let mut durability = out.init_durability_status();
+    durability.set_session_id("session:test");
+    durability.set_max_pending_writes(256);
+    durability.set_max_pending_bytes(64 * 1024 * 1024);
+    durability.set_flush_interval_ms(2000);
+    message
+}
+
 /// Observe anonymous query allocations in an owned, uncapped Linux test daemon.
 /// Disappearing descriptors are normal races; other inspection failures remain errors.
 pub fn anonymous_query_files(

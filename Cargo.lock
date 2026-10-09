@@ -1257,6 +1257,7 @@ dependencies = [
  "purrdf-hash",
  "purrdf-lex",
  "rustix",
+ "sparrow-test-support",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1315,9 +1316,11 @@ dependencies = [
 name = "sparrow-test-support"
 version = "0.1.0"
 dependencies = [
+ "capnp",
  "purrdf-lex",
  "rocksdb",
  "rustix",
+ "sparrow-client",
  "tempfile",
 ]
 

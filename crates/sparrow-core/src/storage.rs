@@ -27,6 +27,7 @@ pub(crate) mod expiry;
 pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
+pub(crate) mod ingest_status;
 mod manifest_retire;
 pub(crate) mod pin_read;
 pub(crate) mod pressure;
@@ -826,11 +827,37 @@ impl Writer {
     }
 
     fn retry(&self, key: &str, now: u64) -> Result<Option<Value>, Error> {
-        let Some(bytes) = self.db.get(key)? else {
+        self.retry_admitted(key, now, None)
+    }
+
+    fn retry_admitted(
+        &self,
+        key: &str,
+        now: u64,
+        remaining: Option<&mut usize>,
+    ) -> Result<Option<Value>, Error> {
+        let Some(bytes) = self.db.get_pinned(key)? else {
             return Ok(None);
         };
+        if let Some(remaining) = remaining {
+            Self::charge_catalog_shape(remaining, &bytes)?;
+        }
         let value = parse(&bytes)?;
         Ok((integer(&value, "expires_at")? > now).then_some(value))
+    }
+
+    fn optional_catalog_value(
+        &self,
+        key: &str,
+        remaining: &mut usize,
+    ) -> Result<Option<Value>, Error> {
+        self.db
+            .get_pinned(key)?
+            .map(|bytes| {
+                Self::charge_catalog_shape(remaining, &bytes)?;
+                parse(&bytes)
+            })
+            .transpose()
     }
 
     fn release_batch(&self, id: &str, batch: &mut WriteBatch) -> Result<(), Error> {

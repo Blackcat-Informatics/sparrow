@@ -188,13 +188,7 @@ fn parse_kind(
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
         if args.first().is_some_and(|arg| arg == "ingest-get") {
-            if args.len() != 3 {
-                return Err(invalid("ingest-get requires STORE_ID IMPORT_ID"));
-            }
-            return Ok(Self::IngestStatus(ingest_status::Input {
-                store: args[1].clone(),
-                id: args[2].clone(),
-            }));
+            return Ok(Self::IngestStatus(ingest_status::Input::parse(&args[1..])?));
         }
         if args.first().is_some_and(|arg| arg == "result-release") {
             if args.len() != 3 {

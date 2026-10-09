@@ -1406,27 +1406,47 @@ remain unfinished. Ordinary upload continues to preserve every caller source.
 
 ### Read-only upload progress
 
-`sparrow ENDPOINT ingest-get STORE_ID IMPORT_ID` and MCP `ingest_get` with
-`store_id`/`import_id` call the existing typed `importGet` operation through
-`sparrow_client::get_import_progress`. The opaque import ID comes from
-`importBegin`; callers do not derive IDs from request spelling. Replies retain
-the original request/source/format/payload identities, declared size, durably
-committed contiguous `received_bytes`, original absolute staging deadline,
-`sealed`, `layout_complete`, `layout_records` and `published_artifact`.
-Private bytes, sealing and layout do not establish accepted evidence. Only the
-published artifact reference names the original accepted artifact; retrieve its
-receipt and record projections through their typed evidence operations.
+Schema 49 adds typed `ingestStatus`, used by
+`sparrow_client::get_ingest_status`, CLI `ingest-get` and MCP `ingest_get`.
+Supply `store_id` and exactly one `import_id`, `request_id` or
+`handoff_request_id`. CLI accepts `ingest-get STORE_ID IMPORT_ID`, or
+`ingest-get STORE_ID --request-id REQUEST_ID` / `--handoff-request-id REQUEST_ID`.
+Import identities come from native admission; clients do not derive them. Explicit
+request namespaces prevent a handoff label from aliasing an upload label.
+Direct-ingest status returns a null `import_id`, because that intake has no admitted
+upload or consumption import object.
 
-Reads do not append, seal, prepare, publish, cancel or renew staging. Unknown,
-corrupt and wrong-store checkpoints, and expired ordinary upload leases, fail
-explicitly. Managed consumption retains its separate durable ownership law. The shared SDK
-certificate refuses impossible offsets, sealing/layout/publication combinations
-and changed store/import identities. Resumable upload uses the same decoder.
-Upload progress does not certify source deletion: completed-source retirement is
-queried with the exact saved handoff intent using `watch_handoff_get`.
-The original combined request-ID lookup, bounded projection-state reporting and
-deletion-status contract remains integration work; this surface exposes the
-existing authoritative upload checkpoint without inventing those states.
+One catalog lock captures `as_of`, the resolved original identities, optional
+`staging`, private `preparation`, original `accepted` receipt summary, terminal
+`tail` checkpoint, source `ownership`, `deletion` and `removed_at`. The acceptance
+summary names the artifact and original record count; retrieve its ordered evidence
+membership with `artifact_get`. Tail acknowledgement creates zero new records and
+preserves the original generation's accepted offset and count. Private staging and
+preparation are inaccessible evidence identities until complete publication.
+
+`json`, `rdf` and `text` classify inspected record occurrences as `complete`,
+`failed`, `incomplete` (text only), `not_applicable` or `unavailable`, and report
+known unprepared records as `pending`. `total_records` is null until native layout
+establishes the total. Failed native projection is distinct from missing or corrupt
+catalog state, which refuses the whole read. Retired evidence is unavailable while
+the original managed publication receipt remains recoverable; recovery is no pin.
+
+Deletion is `not_managed`, `reserved`, `claimed`, `published` or `removed`.
+Acceptance alone never proves source removal; only the original synchronized
+ownership journal supplies `removed_at`. Completed handoff lookup follows its
+existing finite retry lifetime. `watch_handoff_get` continues to certify the exact
+saved producer intent when that authority is needed.
+
+The default scan budget is 10,000 (maximum 100,000) records and pin collections;
+aggregate native catalog construction defaults to and is capped at 32 MiB.
+MCP accepts integer `scan_budget` / `catalog_bytes`; CLI accepts `--scan-budget` /
+`--catalog-bytes`. Over-budget reads fail without a partial summary. SDK status
+messages are capped at 64 KiB and certified for identity, count, phase and current
+durability-fence agreement. CLI and MCP share that certificate and renderer.
+Reads never append, prepare, publish, renew, remove sources or flush writes.
+Ordinary expired leases, unknown identities and wrong stores fail explicitly.
+The SDK's `get_import_progress` and resumable upload still share the native
+`importGet` checkpoint decoder.
 
 Schema 42 adds `resultRelease(ResultReleaseQuery) -> Result(ResultReleased)`.
 The query contains store ID, current schema version and snapshot ID, never a

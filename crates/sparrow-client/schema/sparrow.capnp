@@ -543,6 +543,45 @@ struct RawPreparation {
 struct OptionalRawPreparation { union { absent @0 :Void; value @1 :RawPreparation; } }
 struct ImportCanceled { import @0 :ImportRef; durability @1 :Durability = durable; }
 
+# One read-only membership instant; acceptance never implies source removal.
+struct IngestSelector { union { request @0 :Text; import @1 :Text; handoff @2 :Text; } }
+struct IngestStatusQuery {
+  storeId @0 :Text; schemaVersion @1 :UInt32; selector @2 :IngestSelector;
+  scanBudget @3 :UInt32 = 10000; catalogBytes @4 :UInt32 = 33554432;
+}
+struct IngestIndexCounts {
+  complete @0 :UInt64; failed @1 :UInt64; incomplete @2 :UInt64;
+  notApplicable @3 :UInt64; unavailable @4 :UInt64; pending @5 :UInt64;
+}
+enum IngestDeletion { notManaged @0; reserved @1; claimed @2; published @3; removed @4; }
+struct IngestAcceptance {
+  artifactId @0 :Text; source @1 :Text; format @2 :Format;
+  receivedAt @3 :Instant; expiresAt @4 :Instant; byteLength @5 :UInt64;
+  payloadId @6 :Text; recordCount @7 :UInt64;
+  durability @8 :Durability = durable; bufferedThrough @9 :OptionalDurabilityWatermark;
+}
+struct IngestOwnership {
+  watch @0 :Text; relativePath @1 :Data; source @2 :Text; format @3 :Format;
+  observed @4 :FileGeneration; claimed @5 :OptionalFileGeneration;
+}
+struct OptionalFileGeneration { union { absent @0 :Void; value @1 :FileGeneration; } }
+struct OptionalIngestOwnership { union { absent @0 :Void; value @1 :IngestOwnership; } }
+struct OptionalIngestAcceptance { union { absent @0 :Void; value @1 :IngestAcceptance; } }
+struct OptionalImportProgress { union { absent @0 :Void; value @1 :ImportProgress; } }
+struct OptionalImportPreparation { union { absent @0 :Void; value @1 :ImportPreparation; } }
+struct OptionalTailGeneration { union { absent @0 :Void; value @1 :TailGeneration; } }
+struct OptionalRecordCount { union { unknown @0 :Void; known @1 :UInt64; } }
+struct IngestStatus {
+  storeId @0 :Text; selector @1 :IngestSelector; asOf @2 :Instant;
+  requestId @3 :Text; importId @4 :OptionalText;
+  staging @5 :OptionalImportProgress; preparation @6 :OptionalImportPreparation;
+  accepted @7 :OptionalIngestAcceptance; tail @8 :OptionalTailGeneration;
+  deletion @9 :IngestDeletion; removedAt @10 :OptionalInstant;
+  ownership @11 :OptionalIngestOwnership; totalRecords @12 :OptionalRecordCount;
+  inspectedRecords @13 :UInt64; json @14 :IngestIndexCounts;
+  rdf @15 :IngestIndexCounts; text @16 :IngestIndexCounts;
+}
+
 struct ResultNextQuery { storeId @0 :Text; schemaVersion @1 :UInt32; cursor @2 :Text; }
 struct ResultReleaseQuery { storeId @0 :Text; schemaVersion @1 :UInt32; snapshotId @2 :Text; }
 struct ResultReleased { storeId @0 :Text; snapshotId @1 :Text; released @2 :Bool; }
@@ -603,4 +642,5 @@ interface Sparrow {
   resultRelease @42 (query :ResultReleaseQuery) -> (result :Result(ResultReleased));
   syslogListenerGet @43 (query :SyslogListenerQuery) -> (result :Result(SyslogListenerStatus));
   receiverWindowGet @44 (query :ReceiverWindowQuery) -> (result :Result(ReceiverWindow));
+  ingestStatus @45 (query :IngestStatusQuery) -> (result :Result(IngestStatus));
 }

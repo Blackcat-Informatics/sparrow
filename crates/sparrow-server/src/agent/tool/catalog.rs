@@ -8,7 +8,7 @@ use purrdf_lex::json::{Object, Value};
 const TOOLS: &[(&str, &str)] = &[
     (
         "ingest_get",
-        "Read the durable upload prefix, original staging deadline, sealing/layout and published artifact reference. Private staging is not accepted evidence; this read neither advances intake nor certifies source deletion.",
+        "Read one bounded catalog instant for an original upload/direct request, opaque import or producer handoff: staging, preparation, native index coverage, original acceptance and synchronized source removal. Exactly one selector is required. This read never advances intake, renews evidence or flushes buffered writes.",
     ),
     (
         "result_release",
@@ -225,8 +225,12 @@ pub(crate) fn definitions() -> Value {
         if *name == "ingest_get" {
             properties = properties
                 .with("store_id", string())
-                .with("import_id", string());
-            required.extend(["store_id", "import_id"]);
+                .with("import_id", string())
+                .with("request_id", string())
+                .with("handoff_request_id", string())
+                .with("scan_budget", integer(100000))
+                .with("catalog_bytes", integer(33554432));
+            required.push("store_id");
         }
         if *name == "file_generation_get" {
             properties = properties
@@ -551,6 +555,18 @@ pub(crate) fn definitions() -> Value {
                 Value::array([
                     Value::from(Object::new().with("required", Value::array(["pin_id"]))),
                     Value::from(Object::new().with("required", Value::array(["name"]))),
+                ]),
+            );
+        }
+        if *name == "ingest_get" {
+            schema = schema.with(
+                "oneOf",
+                Value::array([
+                    Value::from(Object::new().with("required", Value::array(["import_id"]))),
+                    Value::from(Object::new().with("required", Value::array(["request_id"]))),
+                    Value::from(
+                        Object::new().with("required", Value::array(["handoff_request_id"])),
+                    ),
                 ]),
             );
         }

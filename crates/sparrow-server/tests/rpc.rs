@@ -154,6 +154,13 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(completed.import_id, admitted.import_id);
         assert!(completed.artifact_id.is_none());
         assert_eq!(completed.tail_generation_id.as_deref(), Some(generation.as_str()));
+        let ingestion = agent_ingestion_status(&socket, client.capability(), &intent.store_id, &sparrow_client::IngestSelector::Handoff(intent.request_id.clone())).await;
+        assert_eq!(ingestion["deletion"].as_str(), Some("removed"));
+        assert_eq!(ingestion["total_records"].as_str(), Some("0"));
+        assert_eq!(ingestion["inspected_records"].as_str(), Some("0"));
+        assert_eq!(ingestion["tail"]["generation_id"].as_str(), Some(generation.as_str()));
+        assert!(ingestion["accepted"].is_null());
+        assert!(!ingestion["removed_at"].is_null());
         assert!(!input.exists());
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         std::fs::write(&input, b"replacement stays independent").unwrap();
@@ -2996,6 +3003,13 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(completed.import_id, admitted["import_id"].as_str().unwrap());
         assert!(!input.exists());
         let artifact = completed.artifact_id.as_ref().unwrap();
+        let ingestion = agent_ingestion_status(&socket, client.capability(), &intent.store_id, &sparrow_client::IngestSelector::Handoff(intent.request_id.clone())).await;
+        assert_eq!(ingestion["deletion"].as_str(), Some("removed"));
+        assert_eq!(ingestion["accepted"]["artifact_id"].as_str(), Some(artifact.as_str()));
+        assert_eq!(ingestion["json"]["complete"].as_str(), Some("1"));
+        assert_eq!(ingestion["rdf"]["complete"].as_str(), Some("1"));
+        assert_eq!(ingestion["text"]["complete"].as_str(), Some("1"));
+        assert!(!ingestion["removed_at"].is_null());
         let export = dir.path().join("original-export.jsonl");
         cli(&socket, &["bytes", &intent.store_id, artifact, "0", &original.len().to_string(), export.to_str().unwrap()]);
         assert_eq!(std::fs::read(export).unwrap(), original);
@@ -5918,9 +5932,24 @@ async fn agent_import_checkpoint(
     let progress = sparrow_client::get_import_progress(client, store, id)
         .await
         .unwrap();
-    let observed = cli(endpoint.as_ref(), &["ingest-get", store, id]);
+    let observed = agent_ingestion_status(
+        endpoint.as_ref(),
+        client,
+        store,
+        &sparrow_client::IngestSelector::Import(id.into()),
+    )
+    .await;
+    let requested = agent_ingestion_status(
+        endpoint.as_ref(),
+        client,
+        store,
+        &sparrow_client::IngestSelector::Request(progress.request_id.clone()),
+    )
+    .await;
+    assert_eq!(requested["staging"], observed["staging"]);
+    assert_eq!(requested["accepted"], observed["accepted"]);
     assert_eq!(
-        observed["received_bytes"].as_str(),
+        observed["staging"]["received_bytes"].as_str(),
         Some(progress.received_bytes.to_string().as_str())
     );
     assert_eq!(
@@ -5928,15 +5957,30 @@ async fn agent_import_checkpoint(
         Some(progress.request_id.as_str())
     );
     assert_eq!(
-        observed["published_artifact"].as_str(),
+        observed["staging"]["published_artifact"].as_str(),
         progress.published_artifact.as_deref()
     );
     let mut mcp = Mcp::start(endpoint);
     mcp.initialize(1).await;
     let args = Object::new().with("store_id", store).with("import_id", id);
-    let result = mcp.tool(2, "ingest_get", args.clone().into()).await;
-    assert_eq!(result["isError"].as_bool(), Some(false));
-    assert_eq!(result["structuredContent"], observed);
+    let certified = sparrow_client::get_ingest_status(
+        client,
+        store,
+        &sparrow_client::IngestSelector::Import(id.into()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let status = certified.reader().unwrap();
+    assert_eq!(
+        status.get_request_id().unwrap().to_str().unwrap(),
+        progress.request_id
+    );
+    assert_eq!(
+        status.get_deletion().unwrap(),
+        wire::IngestDeletion::NotManaged
+    );
+    assert_eq!(observed["deletion"].as_str(), Some("not_managed"));
     let invalid = mcp
         .tool(3, "ingest_get", args.with("advance", true).into())
         .await;
@@ -5983,6 +6027,17 @@ async fn agent_import_checkpoint(
         .find(|tool| tool["name"].as_str() == Some("ingest_get"))
         .unwrap();
     assert_eq!(
+        declaration["inputSchema"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        declaration["inputSchema"]["required"],
+        purrdf_lex::json::Value::array(["store_id"])
+    );
+    assert_eq!(
         declaration["annotations"]["readOnlyHint"].as_bool(),
         Some(true)
     );
@@ -5994,6 +6049,93 @@ async fn agent_import_checkpoint(
         progress
     );
     progress
+}
+
+async fn agent_ingestion_status(
+    endpoint: impl AsRef<std::ffi::OsStr>,
+    client: &wire::sparrow::Client,
+    store: &str,
+    selector: &sparrow_client::IngestSelector,
+) -> purrdf_lex::json::Value {
+    use purrdf_lex::json::{Object, Value};
+    let (flag, field, id) = match selector {
+        sparrow_client::IngestSelector::Import(id) => ("--import-id", "import_id", id),
+        sparrow_client::IngestSelector::Request(id) => ("--request-id", "request_id", id),
+        sparrow_client::IngestSelector::Handoff(id) => {
+            ("--handoff-request-id", "handoff_request_id", id)
+        }
+    };
+    let certified = sparrow_client::get_ingest_status(client, store, selector, Default::default())
+        .await
+        .unwrap();
+    let native = certified.reader().unwrap();
+    let mut obsolete = client.ingest_status_request();
+    let mut query = obsolete.get().init_query();
+    query.set_store_id(store);
+    query.set_schema_version(sparrow_client::SCHEMA_VERSION - 1);
+    selector.encode(query.init_selector()).unwrap();
+    let rejected = obsolete.send().promise.await.unwrap();
+    assert!(
+        matches!(rejected.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(error) if error.as_ref().unwrap().get_code().unwrap().to_str().unwrap() == "UNSUPPORTED")
+    );
+    let observed = cli(endpoint.as_ref(), &["ingest-get", store, flag, id]);
+    assert_eq!(
+        observed["request_id"].as_str(),
+        Some(native.get_request_id().unwrap().to_str().unwrap())
+    );
+    assert_eq!(
+        observed["import_id"].as_str(),
+        match native.get_import_id().unwrap().which().unwrap() {
+            wire::optional_text::Value(id) => Some(id.unwrap().to_str().unwrap()),
+            wire::optional_text::Absent(()) => None,
+        }
+    );
+    assert_eq!(
+        observed["inspected_records"].as_str(),
+        Some(native.get_inspected_records().to_string().as_str())
+    );
+    let mut mcp = Mcp::start(endpoint);
+    mcp.initialize(1).await;
+    let result = mcp
+        .tool(
+            2,
+            "ingest_get",
+            Object::new()
+                .with("store_id", store)
+                .with(field, id.clone())
+                .into(),
+        )
+        .await;
+    assert_eq!(result["isError"].as_bool(), Some(false));
+    let mut actual = result["structuredContent"].clone();
+    let mut expected = observed.clone();
+    for value in [&mut actual, &mut expected] {
+        let Value::Object(object) = value else {
+            panic!("status object");
+        };
+        assert!(object.remove("as_of").is_some());
+    }
+    assert_eq!(actual, expected);
+    let invalid = mcp
+        .tool(
+            3,
+            "ingest_get",
+            Object::new()
+                .with("store_id", store)
+                .with("request_id", "ambiguous")
+                .with(
+                    "import_id",
+                    "import:0000000000000000000000000000000000000000000000000000000000000000",
+                )
+                .into(),
+        )
+        .await;
+    assert_eq!(
+        invalid["structuredContent"]["error"]["code"].as_str(),
+        Some("INVALID_ARGUMENT")
+    );
+    mcp.close(true).await;
+    observed
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -6378,6 +6520,23 @@ async fn exercise(endpoint: impl AsRef<std::ffi::OsStr>) -> (String, String, Str
         wire::result::Error(e) => panic!("ingest: {:?}", e.unwrap().get_message()),
     };
     let id = artifact.get_id().unwrap().to_str().unwrap().to_owned();
+    let progress = agent_ingestion_status(
+        endpoint,
+        client,
+        &store,
+        &sparrow_client::IngestSelector::Request("rpc-acceptance-v1".into()),
+    )
+    .await;
+    assert!(progress["import_id"].is_null());
+    assert!(progress["staging"].is_null());
+    assert_eq!(
+        progress["accepted"]["artifact_id"].as_str(),
+        Some(id.as_str())
+    );
+    assert_eq!(progress["total_records"].as_str(), Some("2"));
+    assert_eq!(progress["json"]["complete"].as_str(), Some("1"));
+    assert_eq!(progress["json"]["failed"].as_str(), Some("1"));
+    assert_eq!(progress["text"]["incomplete"].as_str(), Some("1"));
     assert_eq!(artifact.get_store_id().unwrap().to_str().unwrap(), store);
     assert_eq!(artifact.get_byte_length(), bytes.len() as u64);
     assert_eq!(
