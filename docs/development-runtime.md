@@ -9,6 +9,39 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Independent backup restoration
+
+The closed predecessor backup from the schema-50 adoption was independently
+copied and opened with the existing offline recovery example built from signed
+source `a42009f`. Qualification evidence is
+`~/.local/state/sparrow/schema50-restored-backup-5bcy8s11`, including the restored
+store, exact image, configuration, driver, captured live inventory, original
+backup fingerprints, native report and syscall trace. The recovery image has
+SHA-256 `ab2ba61a3b4b577bc5f72eafdfc449def3972e34086b7592c5c5088725d4969b`.
+Build/run logs are `/tmp/sparrow-schema50-recovery-build.log` and
+`/tmp/sparrow-schema50-restore-qualification.log`.
+
+At the explicit eligibility clock `2026-10-09T05:39:11.059Z`, the checker verifies
+all 212 retained records, 32 complete artifacts and three producer-finished file
+generations. Its 247 unique evidence targets cover 36,005,499 original bytes;
+overlapping record, artifact and generation views deliberately count their reads
+separately. Native chunk size/digest checks cover every read, artifact digests
+match original receipts, byte lengths match the captured live inventory and every
+record's native RDF inspection succeeds with its original store/record identity.
+The two unfinished generations are excluded from complete-file recovery targets.
+This is restoration of the recorded closed backup, not a new crash/power-loss
+experiment or a proof that every internal catalog invariant has been audited.
+
+The configuration points only to the private restored store. The example creates
+no intake worker, daemon, maintenance loop or socket. The syscall trace confirms
+no bind/listen/connect operations and confines native unlink/rename activity to
+the restored directory. Full SHA-256 fingerprints prove the backup remains
+unchanged. Complete public inventory captures are released; the enabled active
+service retains PID 4081797, store identity, 212 records, payload references,
+projections, pins and zero result leases. No public intake or source retirement
+occurs. This qualification leaves the original backup intact and does not certify
+a live service rollback or the older historical backups below.
+
 ## Logical retention accounting
 
 Signed implementation `982f105` and CLI usage follow-up `28e3915` expose native
@@ -37,8 +70,9 @@ Logs are `/tmp/sparrow-retention-metrics-gate.log`,
 `/tmp/sparrow-retention-metrics-usage-commit.log`. Five explicitly selected runtime
 images are frozen at `~/.local/state/sparrow/receiver-history-images-xolyszjx`.
 
-Adoption evidence is `/tmp/sparrow-retention-metrics-live.uxc9qyp9`, including a
-closed-store backup that has not independently been restored. The enabled active
+Adoption evidence is `/tmp/sparrow-retention-metrics-live.uxc9qyp9`, including the
+closed-store backup qualified by [independent restoration](#independent-backup-restoration).
+The enabled active
 unit runs PID 4081797 from `sparrowd-schema50-28e3915`, SHA-256
 `d71f06fb4018df986cfd424ee2096e4c4f9c8af3fa216f383a11b205a8e2453f`,
 with `cap_net_bind_service=ep`. The stable CLI selects
