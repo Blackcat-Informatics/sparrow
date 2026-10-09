@@ -9,6 +9,48 @@ use sparrow_test_support::{catalog_db, remove_tail_range_index};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn json_capture_refusals_identify_the_exhausted_request_budget_without_publishing() {
+    use sparrow_core::{JsonQuery, JsonRead};
+    for (format, bytes, reason) in [
+        (
+            "json",
+            br#"{"nested":{"a":1,"b":2},"flag":true}"#.as_slice(),
+            "json_occurrence_budget",
+        ),
+        ("log", b"first\nsecond\n".as_slice(), "record_visit_budget"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        store
+            .ingest("budget-diagnostic", "budget-diagnostic", format, bytes, 1)
+            .unwrap();
+        let mut read = JsonRead {
+            scope: record_page_scope("budget-diagnostic", 1),
+            query: JsonQuery::Keys { path: None },
+            cursor: None,
+        };
+        read.scope.scan_budget = 1;
+        let failure = store.json_read(&read, 2).unwrap_err();
+        assert_eq!(failure.code, "RESOURCE_LIMIT");
+        assert!(
+            failure.message.contains(&format!("{reason}=1")),
+            "{failure}"
+        );
+        assert!(failure.message.contains("raise scan_budget"));
+        assert!(failure.message.contains("no page published"));
+        let status = store.status(2).unwrap();
+        assert_eq!(status["record_read_handles"].as_str(), Some("0"));
+        assert_eq!(status["record_read_bytes"].as_str(), Some("0"));
+        read.scope.scan_budget = 10;
+        let admitted = store.json_read(&read, 2).unwrap();
+        assert_eq!(
+            admitted.body.result().unwrap()["execution"].as_str(),
+            Some("complete")
+        );
+    }
+}
+
+#[test]
 fn cancelled_catalogue_reads_preserve_original_cursors_and_evidence() {
     use sparrow_core::{ArtifactRead, QueryCancellation, SourceRead};
     let dir = tempfile::tempdir().unwrap();

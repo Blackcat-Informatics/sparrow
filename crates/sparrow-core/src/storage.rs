@@ -1522,7 +1522,7 @@ impl Store {
         let mut not_applicable = 0_u64;
         let mut decoding_failures = 0_u64;
         let mut diagnostics = diagnostic::DiagnosticCoverage::default();
-        let mut limited = false;
+        let mut limit = None;
         let mut rows = Vec::new();
         let mut keys = BTreeMap::<(String, String), (u64, u64, String)>::new();
         let mut key_bytes = 0_usize;
@@ -1538,7 +1538,11 @@ impl Store {
                 break;
             }
             if visited >= scope.scan_budget {
-                limited = true;
+                limit = Some((
+                    "record_visit_budget",
+                    scope.scan_budget,
+                    "narrow source/time/evidence scope or raise scan_budget (at most 100000)",
+                ));
                 break;
             }
             visited += 1;
@@ -1582,7 +1586,11 @@ impl Store {
                     stage.checkpoint()?;
                 }
                 if value_visits == scope.scan_budget {
-                    limited = true;
+                    limit = Some((
+                        "json_occurrence_budget",
+                        scope.scan_budget,
+                        "narrow source/time/evidence scope or raise scan_budget (at most 100000)",
+                    ));
                     break;
                 }
                 value_visits += 1;
@@ -1612,7 +1620,11 @@ impl Store {
                     }
                     crate::JsonQuery::Values { .. } => {
                         if matched_values == row_limit {
-                            limited = true;
+                            limit = Some((
+                                "result_item_budget",
+                                row_limit,
+                                "narrow source/time/evidence scope",
+                            ));
                             break;
                         }
                         let row = Value::from(
@@ -1639,7 +1651,11 @@ impl Store {
                         response_bytes =
                             response_bytes.saturating_add(json::write_compact(fact).len() + 2048);
                         if response_bytes > catalog_lease::CAPTURE_BYTES {
-                            limited = true;
+                            limit = Some((
+                                "response_byte_budget",
+                                catalog_lease::CAPTURE_BYTES,
+                                "narrow source/time/evidence scope",
+                            ));
                             break;
                         }
                         rows.push(row);
@@ -1647,16 +1663,17 @@ impl Store {
                     }
                 }
             }
-            if limited {
+            if limit.is_some() {
                 break;
             }
         }
-        if capture && limited {
+        if let Some((reason, ceiling, action)) = limit.filter(|_| capture) {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
-                "JSON capture exhausted scan, occurrence, row or byte admission; narrow scope; no page published",
+                format!("JSON capture exhausted {reason}={ceiling}; {action}; no page published"),
             ));
         }
+        let mut limited = limit.is_some();
         if matches!(query, crate::JsonQuery::Keys { .. }) {
             limited |= keys.len() > row_limit;
             for row in

@@ -547,6 +547,11 @@ and record visits; text membership, text input/terms and compiled field admissio
 and result item, row, metadata, byte, page, registry and lease ceilings.
 Numeric UInt64 ceilings use exact decimal strings; requested page_size remains
 a bounded integer. These are phase-specific ceilings, not an all-I/O or RSS claim.
+JSON capture refusals identify the exhausted record-visit or native JSON
+occurrence budget and its effective ceiling. Both use the requested
+`scan_budget`; callers can narrow scope or explicitly raise that request up to
+100,000. Result-item and response-byte refusals require narrower scope. No failed
+capture publishes a page or a partial-success receipt.
 
 Semantic receipts remain frozen across pages; page position and cursor stay in
 the existing separate page object. QueryCapture reuses the typed catalog page
