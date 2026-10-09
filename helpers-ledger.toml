@@ -199,9 +199,9 @@ names = ['^(restore_payload_parser|restore_rdf_projector|restore_content_hash)$'
 
 [[job]]
 id = "handoff-bounded-identity-decoding"
-summary = "One generated optional-text reader bounds owned handoff target and publication identities before allocation; the receipt certificate owns their mode and phase agreement."
-home = "sparrow_client::handoff::optional_identity"
-entry_points = ["sparrow_client::handoff::CompletedHandoff::decode", "sparrow_client::handoff::HandoffReceipt::certify"]
+summary = "One generated optional-text reader bounds owned handoff and upload publication identities before allocation; each receipt certificate owns its mode and phase agreement."
+home = "sparrow_client::receipt::optional_identity"
+entry_points = ["sparrow_client::handoff::CompletedHandoff::decode", "sparrow_client::handoff::HandoffReceipt::certify", "sparrow_client::import_progress::ImportProgress::decode"]
 spec = "docs/interfaces.md: schema 41 completed-tail source retirement."
 vectors = ["crates/sparrow-client/src/handoff.rs"]
 bench = []
@@ -3663,3 +3663,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(stage_manifest_fence_elsewhere|decode_retirement_features_elsewhere)$']
+
+[[job]]
+id = "durable-upload-progress-certificate"
+summary = "One SDK checkpoint decoder validates committed offsets and seal/layout/publication consistency for resumable upload and read-only progress inspection; identity certification rejects changed stores/imports."
+home = "sparrow_client::import_progress::ImportProgress::decode"
+entry_points = ["sparrow_client::import_progress::get_import_progress", "sparrow_client::imports::upload"]
+spec = "docs/interfaces.md: read-only upload progress."
+vectors = ["crates/sparrow-client/src/import_progress.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_import_progress_elsewhere|certify_upload_offset_elsewhere)$']
+
+[[job]]
+id = "agent-upload-progress-renderer"
+summary = "CLI and MCP read durable native upload checkpoints through the same SDK certificate and agent renderer; no adapter advances intake, renews staging or asserts deletion authority."
+home = "sparrow_server::agent::ingest_status::Input::execute"
+entry_points = ["sparrow_server::agent::Command::execute", "sparrow_server::agent::tool::Operation::parse"]
+spec = "docs/interfaces.md: read-only upload progress."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_import_progress_elsewhere|read_upload_status_elsewhere)$']

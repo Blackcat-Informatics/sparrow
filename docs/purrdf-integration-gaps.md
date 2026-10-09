@@ -23,6 +23,8 @@ explicit datasets and extension contexts also require native workspace pricing.
 The live sibling's corresponding admission implementation was read again on
 2026-10-08 from committed source at `341ad5ae2cecc5de026047f86dcd1194aff25f10`; it retains the same
 limitation. Runtime and census pins are unchanged. No sibling source was changed.
+Read-only verification at `aab23cbf20b68483ae58bf8440cd882bf1e1897b`
+again finds this restriction; the admission file matches its committed source.
 
 The upstream task is to extend certified workspace admission through the existing
 fallible/governed execution path for these required forms and operators. It must

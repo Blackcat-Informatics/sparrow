@@ -1404,6 +1404,30 @@ remain unfinished. Ordinary upload continues to preserve every caller source.
 
 ## 6. CLI
 
+### Read-only upload progress
+
+`sparrow ENDPOINT ingest-get STORE_ID IMPORT_ID` and MCP `ingest_get` with
+`store_id`/`import_id` call the existing typed `importGet` operation through
+`sparrow_client::get_import_progress`. The opaque import ID comes from
+`importBegin`; callers do not derive IDs from request spelling. Replies retain
+the original request/source/format/payload identities, declared size, durably
+committed contiguous `received_bytes`, original absolute staging deadline,
+`sealed`, `layout_complete`, `layout_records` and `published_artifact`.
+Private bytes, sealing and layout do not establish accepted evidence. Only the
+published artifact reference names the original accepted artifact; retrieve its
+receipt and record projections through their typed evidence operations.
+
+Reads do not append, seal, prepare, publish, cancel or renew staging. Unknown,
+corrupt and wrong-store checkpoints, and expired ordinary upload leases, fail
+explicitly. Managed consumption retains its separate durable ownership law. The shared SDK
+certificate refuses impossible offsets, sealing/layout/publication combinations
+and changed store/import identities. Resumable upload uses the same decoder.
+Upload progress does not certify source deletion: completed-source retirement is
+queried with the exact saved handoff intent using `watch_handoff_get`.
+The original combined request-ID lookup, bounded projection-state reporting and
+deletion-status contract remains integration work; this surface exposes the
+existing authoritative upload checkpoint without inventing those states.
+
 Schema 42 adds `resultRelease(ResultReleaseQuery) -> Result(ResultReleased)`.
 The query contains store ID, current schema version and snapshot ID, never a
 page cursor. The receipt certifies the same store/snapshot and `released`: true

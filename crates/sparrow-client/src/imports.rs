@@ -118,24 +118,21 @@ pub(crate) async fn upload(
         }
         wire::import_start::Staging(value) => value?,
     };
-    let store = progress.get_store_id()?.to_str()?.to_owned();
+    let progress = crate::ImportProgress::decode(progress)?;
+    let store = progress.store_id.clone();
     if store != discovery.store_id
-        || progress.get_byte_length() != length
-        || progress.get_payload_id()?.to_str()? != payload
-        || progress.get_source()?.to_str()? != source
-        || progress.get_format()? != format
+        || progress.byte_length != length
+        || progress.payload_id != payload
+        || progress.source != source
+        || progress.request_id != request_id
+        || progress.format != format
     {
         return Err(Error::Protocol(
             "import staging contradicts the discovered store or requested input",
         ));
     }
-    let id = progress.get_id()?.to_str()?.to_owned();
-    let mut offset = progress.get_received_bytes();
-    if offset > length || (offset != length && !offset.is_multiple_of(buffer.len() as u64)) {
-        return Err(Error::Protocol(
-            "daemon returned an invalid durable import offset",
-        ));
-    }
+    let id = progress.id;
+    let mut offset = progress.received_bytes;
     while offset < length {
         let count = (length - offset).min(buffer.len() as u64) as usize;
         file.read_exact_at(&mut buffer[..count], offset)?;
@@ -150,7 +147,9 @@ pub(crate) async fn upload(
             wire::result::Error(error) => return Err(Error::domain(error?)),
         };
         offset += count as u64;
-        if value.get_received_bytes() != offset {
+        let value = crate::ImportProgress::decode(value)?;
+        value.certify_identity(&store, &id)?;
+        if value.received_bytes != offset {
             return Err(Error::Protocol(
                 "daemon returned an unexpected durable append offset",
             ));

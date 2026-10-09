@@ -13,6 +13,7 @@ mod diagnostic;
 mod durability;
 mod error;
 mod ingest;
+mod ingest_status;
 mod json;
 mod pin;
 mod producer;
@@ -39,7 +40,7 @@ type Result<T> = AgentResult<T>;
 pub(crate) mod tool;
 
 pub(super) const USAGE: &str = concat!(
-    "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | flush STORE_ID SESSION_ID SEQUENCE",
+    "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
@@ -70,6 +71,7 @@ pub(super) enum Command {
     Diagnostic(diagnostic::Input),
     Records(records::Input),
     Ingest(ingest::Input),
+    IngestStatus(ingest_status::Input),
     Bytes(read::Input),
     Context(context::Input),
     Renew(pin::Renewal),
@@ -185,6 +187,15 @@ fn parse_kind(
 
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
+        if args.first().is_some_and(|arg| arg == "ingest-get") {
+            if args.len() != 3 {
+                return Err(invalid("ingest-get requires STORE_ID IMPORT_ID"));
+            }
+            return Ok(Self::IngestStatus(ingest_status::Input {
+                store: args[1].clone(),
+                id: args[2].clone(),
+            }));
+        }
         if args.first().is_some_and(|arg| arg == "result-release") {
             if args.len() != 3 {
                 return Err(invalid("result-release requires STORE_ID SNAPSHOT_ID"));
@@ -528,6 +539,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Ingest(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::IngestStatus(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Bytes(input) = self {

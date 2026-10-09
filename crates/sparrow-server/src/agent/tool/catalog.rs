@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "ingest_get",
+        "Read the durable upload prefix, original staging deadline, sealing/layout and published artifact reference. Private staging is not accepted evidence; this read neither advances intake nor certifies source deletion.",
+    ),
+    (
         "result_release",
         "Release a captured result replay lease and its memory; future continuations expire. Does not release evidence pins or remove stored records.",
     ),
@@ -217,6 +221,12 @@ pub(crate) fn definitions() -> Value {
                     .with("tail_generation_id", string());
                 required.extend(["watch", "relative_path_hex"]);
             }
+        }
+        if *name == "ingest_get" {
+            properties = properties
+                .with("store_id", string())
+                .with("import_id", string());
+            required.extend(["store_id", "import_id"]);
         }
         if *name == "file_generation_get" {
             properties = properties

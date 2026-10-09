@@ -40,6 +40,10 @@ impl Operation {
         let decode = || -> std::result::Result<Self, DecodeError> {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
+                "ingest_get" => Self::Query(Command::IngestStatus(super::ingest_status::Input {
+                    store: fields.required("store_id")?,
+                    id: fields.required("import_id")?,
+                })),
                 "file_finish" | "file_finish_get" => {
                     let observed: Value = fields.required("observed")?;
                     let intent = sparrow_client::TailFinishIntent {

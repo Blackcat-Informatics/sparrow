@@ -5908,6 +5908,94 @@ fn upload_ref(mut out: wire::import_ref::Builder<'_>, store: &str, id: &str) {
     out.set_id(id);
 }
 
+async fn agent_import_checkpoint(
+    endpoint: impl AsRef<std::ffi::OsStr>,
+    client: &wire::sparrow::Client,
+    store: &str,
+    id: &str,
+) -> sparrow_client::ImportProgress {
+    use purrdf_lex::json::Object;
+    let progress = sparrow_client::get_import_progress(client, store, id)
+        .await
+        .unwrap();
+    let observed = cli(endpoint.as_ref(), &["ingest-get", store, id]);
+    assert_eq!(
+        observed["received_bytes"].as_str(),
+        Some(progress.received_bytes.to_string().as_str())
+    );
+    assert_eq!(
+        observed["request_id"].as_str(),
+        Some(progress.request_id.as_str())
+    );
+    assert_eq!(
+        observed["published_artifact"].as_str(),
+        progress.published_artifact.as_deref()
+    );
+    let mut mcp = Mcp::start(endpoint);
+    mcp.initialize(1).await;
+    let args = Object::new().with("store_id", store).with("import_id", id);
+    let result = mcp.tool(2, "ingest_get", args.clone().into()).await;
+    assert_eq!(result["isError"].as_bool(), Some(false));
+    assert_eq!(result["structuredContent"], observed);
+    let invalid = mcp
+        .tool(3, "ingest_get", args.with("advance", true).into())
+        .await;
+    assert_eq!(
+        invalid["structuredContent"]["error"]["code"].as_str(),
+        Some("INVALID_ARGUMENT")
+    );
+    let wrong = mcp
+        .tool(
+            4,
+            "ingest_get",
+            Object::new()
+                .with("store_id", "store:other")
+                .with("import_id", id)
+                .into(),
+        )
+        .await;
+    assert_eq!(
+        wrong["structuredContent"]["error"]["code"].as_str(),
+        Some("STORE_MISMATCH")
+    );
+    let missing = mcp
+        .tool(
+            5,
+            "ingest_get",
+            Object::new()
+                .with("store_id", store)
+                .with(
+                    "import_id",
+                    "import:0000000000000000000000000000000000000000000000000000000000000000",
+                )
+                .into(),
+        )
+        .await;
+    assert_eq!(
+        missing["structuredContent"]["error"]["code"].as_str(),
+        Some("NOT_FOUND")
+    );
+    let tools = mcp.call(6, "tools/list", Object::new().into()).await;
+    let declaration = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"].as_str() == Some("ingest_get"))
+        .unwrap();
+    assert_eq!(
+        declaration["annotations"]["readOnlyHint"].as_bool(),
+        Some(true)
+    );
+    mcp.close(true).await;
+    assert_eq!(
+        sparrow_client::get_import_progress(client, store, id)
+            .await
+            .unwrap(),
+        progress
+    );
+    progress
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes() {
     tokio::task::LocalSet::new().run_until(async {
@@ -5915,6 +6003,9 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         let store_path = dir.path().join("store");
         let socket = store_path.join("rpc.sock");
         let config = write_server_config(dir.path(), &store_path, &socket);
+        let (address, reservation) = configure_tcp_listener(&config);
+        let tcp = format!("tcp://{address}");
+        drop(reservation);
         let daemon = start(&config, &socket).await;
         let connection = connect(&socket).await.unwrap();
         let client = &connection.client;
@@ -5939,12 +6030,19 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         };
         let id = progress.get_id().unwrap().to_str().unwrap().to_owned();
         assert_eq!(progress.get_received_bytes(), 0);
+        let initial = agent_import_checkpoint(&tcp, client, &store, &id).await;
+        assert_eq!(initial.received_bytes, 0);
+        assert!(!initial.sealed && !initial.layout_complete);
+        assert!(initial.published_artifact.is_none());
         let mut request = client.import_append_request();
         let mut chunk = request.get().init_request();
         upload_ref(chunk.reborrow().init_import(), &store, &id);
         chunk.set_bytes(&input[..sparrow_core::IMPORT_CHUNK_BYTES]);
         let response = request.send().promise.await.unwrap();
         assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_received_bytes(), sparrow_core::IMPORT_CHUNK_BYTES as u64);
+        let prefix = agent_import_checkpoint(&socket, client, &store, &id).await;
+        assert_eq!(prefix.received_bytes, sparrow_core::IMPORT_CHUNK_BYTES as u64);
+        assert_eq!(prefix.expires_at, initial.expires_at);
         drop(connection);
         drop(daemon);
         std::fs::remove_file(&socket).unwrap();
@@ -5955,6 +6053,7 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         upload_ref(request.get().init_import(), &store, &id);
         let response = request.send().promise.await.unwrap();
         assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_received_bytes(), sparrow_core::IMPORT_CHUNK_BYTES as u64);
+        assert_eq!(agent_import_checkpoint(&tcp, client, &store, &id).await, prefix);
         // Wrong-store and oversized payloads fail before private mutation.
         let mut request = client.import_append_request();
         let mut chunk = request.get().init_request();
@@ -5985,6 +6084,12 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         upload_ref(request.get().init_import(), &store, &id);
         let response = request.send().promise.await.unwrap();
         assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_layout_records(), 3);
+        let laid_out = agent_import_checkpoint(&tcp, client, &store, &id).await;
+        assert_eq!(laid_out.received_bytes, input.len() as u64);
+        assert!(laid_out.sealed && laid_out.layout_complete);
+        assert_eq!(laid_out.layout_records, 3);
+        assert!(laid_out.published_artifact.is_none());
+        assert_eq!(laid_out.expires_at, initial.expires_at);
         let mut request = client.import_prepare_request();
         upload_ref(request.get().init_request().init_import(), &store, &id);
         let response = request.send().promise.await.unwrap();
@@ -6019,6 +6124,9 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         let producer = sparrow_client::Client::connect(&socket).await.unwrap();
         assert_eq!(producer.discovery().store_id, store);
         let accepted = producer.import_file("crash-upload", "streamed", wire::Format::Log, &copied).await.unwrap();
+        let published = agent_import_checkpoint(&tcp, producer.capability(), &store, &id).await;
+        assert_eq!(published.published_artifact.as_deref(), Some(accepted.id.as_str()));
+        assert_eq!(published.expires_at, initial.expires_at);
         assert_eq!(accepted.id, reserved);
         assert_eq!(accepted.payload_id, payload);
         assert_eq!(accepted.byte_length, input.len() as u64);
@@ -6847,8 +6955,9 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 33);
+    assert_eq!(definitions.len(), 34);
     for (name, read_only) in [
+        ("ingest_get", true),
         ("file_finish", false),
         ("file_finish_get", true),
         ("watch_handoff", false),

@@ -3,6 +3,21 @@
 
 use crate::{Error, sparrow_capnp as wire};
 
+pub(crate) fn optional_identity(
+    value: wire::optional_text::Reader<'_>,
+) -> Result<Option<String>, Error> {
+    match value.which()? {
+        wire::optional_text::Absent(()) => Ok(None),
+        wire::optional_text::Value(value) => {
+            let value = value?.to_str()?;
+            if value.len() > 128 {
+                return Err(Error::Protocol("optional identity exceeds 128 bytes"));
+            }
+            Ok(Some(value.to_owned()))
+        }
+    }
+}
+
 pub(crate) fn certify_result<'a, T: capnp::traits::Owned, R>(
     value: wire::result::Reader<'a, T>,
     certify: impl FnOnce(T::Reader<'a>) -> Result<R, Error>,

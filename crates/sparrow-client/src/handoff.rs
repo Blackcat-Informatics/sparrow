@@ -101,7 +101,7 @@ impl CompletedHandoff {
             watch_revision: value.get_watch_revision(),
             relative_path: path.into(),
             generation: CompletedFileIdentity::decode(value.get_generation()?)?,
-            tail_generation_id: optional_identity(value.get_tail_generation_id()?)?,
+            tail_generation_id: crate::receipt::optional_identity(value.get_tail_generation_id()?)?,
         };
         intent.validate()?;
         Ok(intent)
@@ -159,19 +159,6 @@ pub struct HandoffReceipt {
     pub tail_generation_id: Option<String>,
 }
 
-fn optional_identity(value: wire::optional_text::Reader<'_>) -> Result<Option<String>, Error> {
-    match value.which()? {
-        wire::optional_text::Absent(()) => Ok(None),
-        wire::optional_text::Value(value) => {
-            let value = value?.to_str()?;
-            if value.len() > 128 {
-                return Err(Error::Protocol("handoff identity exceeds 128 bytes"));
-            }
-            Ok(Some(value.to_owned()))
-        }
-    }
-}
-
 impl HandoffReceipt {
     fn certify(
         value: wire::handoff_receipt::Reader<'_>,
@@ -179,8 +166,9 @@ impl HandoffReceipt {
     ) -> Result<Self, Error> {
         let request = CompletedHandoff::decode(value.get_request()?)?;
         let phase = value.get_phase()?;
-        let artifact_id = optional_identity(value.get_artifact_id()?)?;
-        let tail_generation_id = optional_identity(value.get_tail_generation_id()?)?;
+        let artifact_id = crate::receipt::optional_identity(value.get_artifact_id()?)?;
+        let tail_generation_id =
+            crate::receipt::optional_identity(value.get_tail_generation_id()?)?;
         let published = matches!(
             phase,
             wire::HandoffPhase::Published | wire::HandoffPhase::Removed
