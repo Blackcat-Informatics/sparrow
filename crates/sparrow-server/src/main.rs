@@ -8,6 +8,7 @@ use std::{path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 
 mod local_endpoint;
+mod maintenance;
 mod shutdown;
 
 #[tokio::main(flavor = "current_thread")]
@@ -46,8 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => {
             return shutdown::finish(
                 Err(error.into()),
-                consumer.take(),
-                None,
+                shutdown::Workers {
+                    consumer: consumer.take(),
+                    ..Default::default()
+                },
                 &store,
                 None,
                 &operations,
@@ -73,8 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => {
                 return shutdown::finish(
                     Err(error.into()),
-                    consumer.take(),
-                    None,
+                    shutdown::Workers {
+                        consumer: consumer.take(),
+                        ..Default::default()
+                    },
                     &store,
                     Some(&endpoint),
                     &operations,
@@ -110,16 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
+        let mut maintenance = Some(maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms))));
         let serving = async {
         let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
-        let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
-        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut pressure = tokio::time::interval(std::time::Duration::from_secs(1));
-        pressure.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut synchronize = tokio::time::interval(std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)));
-        synchronize.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Consume interval's immediate first tick; the intended delay starts now.
-        synchronize.tick().await;
         loop {
             tokio::select! {
                 signal = interrupt.recv() => {
@@ -135,25 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         syslog.take().expect("worker checked above").shutdown().await?;
                         return Err("syslog intake worker terminated unexpectedly".into());
                     }
-                }
-                _ = synchronize.tick() => {
-                    let owner = store.clone();
-                    if let Err(error) = tokio::task::spawn_blocking(move || owner.flush_buffered()).await? {
-                        eprintln!("sparrowd: buffered WAL synchronization failed: {error}");
-                    }
-                }
-                _ = maintenance.tick() => {
-                    let owner = store.clone();
-                    if let Err(e) = tokio::task::spawn_blocking(move || owner.expire_bounded(
-                        sparrow_server::now()?, sparrow_core::EvictionLimits::default())).await? {
-                        eprintln!("sparrowd: retention maintenance failed: {e}");
-                    }
-                }
-                _ = pressure.tick() => {
-                    let owner = store.clone();
-                    if let Err(error) = tokio::task::spawn_blocking(move || owner.pressure_maintain(
-                        sparrow_server::now()?, sparrow_core::EvictionLimits::default())).await? {
-                        eprintln!("sparrowd: pressure maintenance failed: {error}");
+                    if maintenance.as_ref().is_some_and(maintenance::Worker::is_finished) {
+                        return Err("maintenance worker terminated unexpectedly".into());
                     }
                 }
                 accepted = endpoint.listener.accept() => {
@@ -169,6 +150,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), Box<dyn std::error::Error>>(())
         }.await;
-        shutdown::finish(serving, consumer.take(), syslog.take(), &store, Some(&endpoint), &operations, operation_slots).await
+        shutdown::finish(serving, shutdown::Workers { consumer: consumer.take(), syslog: syslog.take(), maintenance: maintenance.take() }, &store, Some(&endpoint), &operations, operation_slots).await
     }).await
 }

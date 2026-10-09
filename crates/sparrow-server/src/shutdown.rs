@@ -7,6 +7,13 @@ use crate::local_endpoint::LocalEndpoint;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[derive(Default)]
+pub(super) struct Workers {
+    pub consumer: Option<sparrow_server::watches::ConsumeWorker>,
+    pub syslog: Option<sparrow_server::syslog_listener::SyslogWorker>,
+    pub maintenance: Option<super::maintenance::Worker>,
+}
+
 /// Reserve the complete native admission budget, waiting for every owned worker.
 /// Tokio's fair queue blocks fresh try-acquires while the full reservation waits.
 async fn drain(operations: Arc<Semaphore>, slots: u32) -> Result<OwnedSemaphorePermit, String> {
@@ -21,20 +28,22 @@ async fn drain(operations: Arc<Semaphore>, slots: u32) -> Result<OwnedSemaphoreP
 
 pub(super) async fn finish(
     initial: Result<(), Box<dyn std::error::Error>>,
-    consumer: Option<sparrow_server::watches::ConsumeWorker>,
-    syslog: Option<sparrow_server::syslog_listener::SyslogWorker>,
+    workers: Workers,
     store: &sparrow_core::Store,
     endpoint: Option<&LocalEndpoint>,
     operations: &Arc<Semaphore>,
     slots: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut errors = Vec::with_capacity(5);
+    let mut errors = Vec::with_capacity(6);
     record_failure(&mut errors, "daemon", initial);
-    if let Some(worker) = consumer {
+    if let Some(worker) = workers.consumer {
         record_failure(&mut errors, "consume shutdown", worker.shutdown().await);
     }
-    if let Some(worker) = syslog {
+    if let Some(worker) = workers.syslog {
         record_failure(&mut errors, "syslog shutdown", worker.shutdown().await);
+    }
+    if let Some(worker) = workers.maintenance {
+        record_failure(&mut errors, "maintenance shutdown", worker.shutdown().await);
     }
     // Intake workers may need their owned RPC transport to finish an admitted import.
     // Once joined, reserve all slots and retain them through the final WAL fence.
@@ -135,7 +144,7 @@ mod tests {
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         {
-            let teardown = finish(Ok(()), None, None, &store, None, &operations, 2);
+            let teardown = finish(Ok(()), Workers::default(), &store, None, &operations, 2);
             tokio::pin!(teardown);
             tokio::select! {
                 biased;

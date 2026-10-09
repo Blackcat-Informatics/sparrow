@@ -3470,7 +3470,7 @@ names = ['^(unlink_stale_socket_elsewhere|replace_local_endpoint)$']
 
 [[job]]
 id = "complete-daemon-teardown"
-summary = "One teardown owner joins intake workers, reserves and closes the complete native RPC admission budget before the final flush, and cleans only the owned endpoint while retaining primary and cleanup failures; main retains one native interrupt subscription through startup and awaited maintenance."
+summary = "One teardown owner joins intake and maintenance workers, reserves and closes the complete native operation admission budget before the final flush, and cleans only the owned endpoint while retaining primary and cleanup failures; main retains one native interrupt subscription through startup and serving."
 home = "sparrowd::shutdown::finish"
 entry_points = ["sparrowd::shutdown::record_failure", "sparrowd::shutdown::drain", "sparrowd::main"]
 spec = "docs/interfaces.md: daemon teardown."
@@ -3607,6 +3607,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(lookup_receiver_window_elsewhere|lookup_producer_window_elsewhere)$']
+
+[[job]]
+id = "joined-daemon-maintenance"
+summary = "One joined serial worker schedules bounded expiry continuations, pressure and buffered synchronization fairly. Native jobs run one at a time under existing storage limits; stop prevents further work and joins the current job before final RPC drain and flush."
+home = "sparrowd::maintenance::run"
+entry_points = ["sparrowd::maintenance::Worker::start", "sparrowd::maintenance::Worker::shutdown", "sparrowd::maintenance::Job::execute", "sparrowd::main", "sparrowd::shutdown::finish"]
+spec = "docs/interfaces.md: daemon maintenance scheduling."
+vectors = ["crates/sparrow-server/src/maintenance.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(run_retention_worker_elsewhere|flush_daemon_wal_elsewhere)$']
 
 [[job]]
 id = "bounded-artifact-retirement-envelope"

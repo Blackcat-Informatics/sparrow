@@ -50,13 +50,14 @@ The public TCP bind still happens before opening or migrating the store.
 ### Daemon teardown
 
 One native SIGINT subscription is registered before opening storage or starting
-workers and retained through serving, including awaited maintenance branches.
-A signal during startup or maintenance remains pending until the serving loop
-can request teardown. It does not interrupt an individual native operation or
+workers and retained through serving. Maintenance runs in its joined owner, so
+the serving loop can select the signal while a native maintenance pass runs.
+A signal during startup remains pending until serving can request teardown.
+It does not interrupt an individual native operation or
 certify a shutdown latency bound.
 
 Socket-bind refusal, syslog-start refusal, terminal serving/worker failure and
-graceful shutdown route through one teardown owner. It attempts both intake joins
+graceful shutdown route through one teardown owner. It attempts intake and maintenance joins
 and owned socket-name cleanup even when an earlier step fails; the final store
 flush requires the successful RPC drain described below. Errors retain their
 original cause and label each cleanup failure;
@@ -65,6 +66,29 @@ normal serving teardown the RPC LocalSet remains active while intake workers
 join. Endpoint cleanup preserves replacement names under the ownership rules
 above. Failed startup returns a failure after cleanup, allowing a corrected
 configuration to reopen the same store.
+
+### Daemon maintenance scheduling
+
+One joined worker owns retention, pressure and periodic buffered synchronization.
+It admits exactly one native job at a time, awaiting complete blocking execution
+before selecting the next duty. Existing finite storage pass limits remain in
+force. RPC and intake retain their request budget independently, as with the
+previous serial maintenance path. Socket acceptance, worker health checks and
+SIGINT selection continue on the serving loop.
+
+Expiry retains its bounded pass limits and resumes an explicit continuation
+after yielding, without waiting one second between every pass. Exhausted
+traversals start again on the ordinary one-second tick. Pressure keeps its
+one-second tick, and buffered synchronization keeps its configured interval.
+Eligible duties are selected fairly, including when a short flush interval
+remains due; stop admission takes priority. An expiry refusal reports its error
+and returns to the ordinary tick rather than repeatedly retrying a busy loop.
+
+Shutdown prevents further maintenance admission and joins an already admitted
+native job. Teardown joins intake and maintenance before reserving the complete
+operation budget for the final WAL fence. An admitted native job is never aborted
+because its worker caller disappears. This scheduling contract is not a bound
+on sustained turnover, query latency or native shutdown duration.
 
 After intake workers join, teardown reserves all configured operation slots
 through Tokio's fair admission queue. Fresh storage dispatch cannot overtake

@@ -9,6 +9,35 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Joined maintenance scheduling
+
+The implementation branch moves retention, pressure and periodic buffered
+synchronization into one joined serial worker. The previous serving loop awaited
+each maintenance branch, blocking socket acceptance and signal selection during
+that job. It also discarded expiry continuation and waited one second before
+every subsequent bounded pass. The worker now awaits one complete native job at
+a time, yields between passes, drains expiry continuation and selects eligible
+duties fairly. Stop has priority over fresh work. Per-pass storage limits and the
+independent RPC/intake request budget remain unchanged. Native writes are joined
+before the final RPC drain and WAL fence.
+
+The 1,024-record fixture requires over thirty bounded expiry passes. It completes
+under its ten-second functional deadline while retaining the original pinned
+record and new buffered bytes, even with a one-millisecond flush interval. Stop
+before worker admission leaves buffered work for the final store fence. These
+checks establish progress and ownership, not sustained production throughput or
+latency bounds. An earlier attempted shared RPC-slot design failed the one-slot
+idle-connection contract and was removed; request-budget and connection tests now
+pass without changing their acceptance criteria.
+
+Full release verification passes 158 storage scenarios, 14 core unit tests,
+60 RPC integration scenarios, seven RPC and five daemon unit tests, SDK and
+remaining workspace tests, seeded census self-tests and the pinned cross gate:
+247 ownership jobs with no distinct exceptions. Evidence is
+`/tmp/sparrow-maintenance-gate-final.log`; the normal signed commit hook is
+`/tmp/sparrow-maintenance-commit.log`. Runtime qualification and deployment remain
+in progress. The installed public server remains the source documented above.
+
 ## Bounded manifest retirement
 
 The current implementation branch extends maintenance beyond the earlier
