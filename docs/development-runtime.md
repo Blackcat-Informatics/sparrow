@@ -4,7 +4,7 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`ba0bd39`; see [bounded manifest retirement](#bounded-manifest-retirement) for
+`2f1f8ff`; see [joined maintenance scheduling](#joined-maintenance-scheduling) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
@@ -35,8 +35,37 @@ Full release verification passes 158 storage scenarios, 14 core unit tests,
 remaining workspace tests, seeded census self-tests and the pinned cross gate:
 247 ownership jobs with no distinct exceptions. Evidence is
 `/tmp/sparrow-maintenance-gate-final.log`; the normal signed commit hook is
-`/tmp/sparrow-maintenance-commit.log`. Runtime qualification and deployment remain
-in progress. The installed public server remains the source documented above.
+`/tmp/sparrow-maintenance-commit.log`. Signed source `2f1f8ff` passes the normal
+hook. All five executables were explicitly rebuilt and frozen with source and
+SHA-256 evidence at `~/.local/state/sparrow/receiver-history-images-5mocitfl`.
+
+Private typed-load qualification
+`~/.local/state/sparrow/typed-load-qualification-plug6kp6` completes 32 mixed-format
+cohorts with 4,160 records, 8,678,582 original bytes, complete query traversals,
+exact-byte checks and released captures. Observed workload time is 10.800230
+seconds, sampled high-water RSS 189,608 KiB, closed native files 16,686,057 bytes
+and clean SIGINT teardown 0.113505 seconds. Separate active-work evidence at
+`~/.local/state/sparrow/rpc-drain-traffic-dr0em_hr` interrupts real typed traffic
+after observing native anonymous staging. Shutdown returns success in an observed
+0.169069 seconds; same-store reopen verifies 128 records across two complete
+artifacts and their exact original bytes. The public service remains unchanged
+during both private runs. These observations establish neither sustained
+production performance nor worst-case shutdown bounds.
+
+Adoption evidence `/tmp/sparrow-maintenance-live.pweuz1bu` includes a closed-store
+backup that has not separately been restored. The enabled active public unit
+runs PID 2129972 from `sparrowd-schema48-2f1f8ff`, SHA-256
+`e8885b468eb71a2efd6326b3424f3705530c82c15e3f5329a59d7ff5e124e476`.
+The stable CLI selects `sparrow-schema48-2f1f8ff`; installed, frozen and alias
+hashes agree. The daemon retains `cap_net_bind_service=ep`, serves
+`0.0.0.0:518`, and preserves store identity, schema 48, format 37, 212 records,
+healthy owned watches, zero pins and read leases. TCP/Unix/CLI/MCP saved intents
+preserve receipts, bytes, clocks and replacement files without new public intake
+or retirement. All 21 sources, five generation checkpoints, grouped pages,
+temporal/field witnesses, native text scores, four keys and twenty values remain
+exact. Syslog listeners remain unconfigured. Full governed SPARQL, correlation,
+maximum-capacity and sustained turnover, physical reclamation and reboot
+acceptance remain unfinished.
 
 ## Bounded manifest retirement
 
