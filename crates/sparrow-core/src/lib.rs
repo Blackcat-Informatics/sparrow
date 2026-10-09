@@ -64,6 +64,7 @@ pub use storage::record_read::{
     RecordRead, RecordReadPage,
 };
 pub use storage::result_read::ResultPage;
+pub use storage::retention_metrics::{RetentionMetrics, RetentionReadLimits};
 pub use storage::source_read::{
     SourcePageBody, SourceRead, SourceReadPage, SourceSelector, SourceSummary, SourceSyslogBinding,
     SourceWatchBinding, SourceWatchInfo,

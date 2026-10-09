@@ -582,6 +582,23 @@ struct IngestStatus {
   rdf @15 :IngestIndexCounts; text @16 :IngestIndexCounts;
 }
 
+# Complete logical raw-payload account; physical files and indexes are excluded.
+struct RetentionMetricsQuery {
+  storeId @0 :Text; schemaVersion @1 :UInt32;
+  maxVisits @2 :UInt32 = 10000; catalogBytes @3 :UInt32 = 33554432;
+  payloadBytes @4 :UInt32 = 67108864;
+}
+struct RetentionMetrics {
+  storeId @0 :Text; asOf @1 :Instant;
+  liveRecords @2 :UInt64; liveArtifacts @3 :UInt64;
+  pinnedRecords @4 :UInt64; pinnedArtifacts @5 :UInt64;
+  oldestReceivedAt @6 :OptionalInstant; retainedWindowMs @7 :UInt64;
+  ownedPayloadBytes @8 :UInt64; livePayloadBytes @9 :UInt64;
+  pinHeldPayloadBytes @10 :UInt64; retirablePayloadBytes @11 :UInt64;
+  unclassifiedPayloadBytes @12 :UInt64; payloadChunks @13 :UInt64;
+  visits @14 :UInt64;
+}
+
 struct ResultNextQuery { storeId @0 :Text; schemaVersion @1 :UInt32; cursor @2 :Text; }
 struct ResultReleaseQuery { storeId @0 :Text; schemaVersion @1 :UInt32; snapshotId @2 :Text; }
 struct ResultReleased { storeId @0 :Text; snapshotId @1 :Text; released @2 :Bool; }
@@ -643,4 +660,5 @@ interface Sparrow {
   syslogListenerGet @43 (query :SyslogListenerQuery) -> (result :Result(SyslogListenerStatus));
   receiverWindowGet @44 (query :ReceiverWindowQuery) -> (result :Result(ReceiverWindow));
   ingestStatus @45 (query :IngestStatusQuery) -> (result :Result(IngestStatus));
+  retentionMetrics @46 (query :RetentionMetricsQuery) -> (result :Result(RetentionMetrics));
 }

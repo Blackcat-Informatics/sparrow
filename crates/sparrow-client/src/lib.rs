@@ -40,7 +40,9 @@ pub use imports::{CompletedFileIdentity, import_file, import_open_file, open_com
 mod import_progress;
 pub use import_progress::{ImportProgress, get_import_progress};
 mod ingest_status;
+mod retention_metrics;
 pub use ingest_status::{IngestReadLimits, IngestSelector, IngestStatus, get_ingest_status};
+pub use retention_metrics::{RetentionMetrics, RetentionReadLimits, get_retention_metrics};
 mod handoff;
 pub use handoff::{CompletedHandoff, HandoffReceipt, completed_handoff};
 mod intent_file;
@@ -61,7 +63,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 49;
+pub const SCHEMA_VERSION: u32 = 50;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 

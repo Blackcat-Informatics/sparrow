@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "retention_metrics",
+        "Read a complete admitted logical raw-payload account: oldest retained receipt, effective window, unique live/pin-held/retirable/private-owner bytes. Counts share one catalog instant. No maintenance, pin renewal or physical reclamation is performed or certified. Admission and integrity failures return no partial account.",
+    ),
+    (
         "ingest_get",
         "Read one bounded catalog instant for an original upload/direct request, opaque import or producer handoff: staging, preparation, native index coverage, original acceptance and synchronized source removal. Exactly one selector is required. This read never advances intake, renews evidence or flushes buffered writes.",
     ),
@@ -221,6 +225,14 @@ pub(crate) fn definitions() -> Value {
                     .with("tail_generation_id", string());
                 required.extend(["watch", "relative_path_hex"]);
             }
+        }
+        if *name == "retention_metrics" {
+            properties = properties
+                .with("store_id", string())
+                .with("max_visits", integer(100000))
+                .with("catalog_bytes", integer(33554432))
+                .with("payload_bytes", integer(1073741824));
+            required.push("store_id");
         }
         if *name == "ingest_get" {
             properties = properties

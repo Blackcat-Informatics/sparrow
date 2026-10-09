@@ -9,6 +9,201 @@ use sparrow_test_support::{catalog_db, remove_tail_range_index};
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn retention_metrics_account_shared_pinned_expired_empty_and_private_ownership() {
+    use sparrow_core::{QueryCancellation, RetentionReadLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let empty = store
+        .ingest("metrics-empty", "metrics", "log", b"", 0)
+        .unwrap();
+    assert!(empty.record_ids.is_empty());
+    let old = store
+        .ingest("metrics-old", "metrics", "log", b"old\n", 1)
+        .unwrap();
+    let a = store
+        .ingest("metrics-a", "metrics", "log", b"same\n", 2)
+        .unwrap();
+    store
+        .ingest("metrics-b", "metrics", "log", b"same\n", 3)
+        .unwrap();
+    let pin = store
+        .pin(
+            "metrics-pin",
+            "metrics",
+            &[a.record_ids[0].clone(), empty.id.clone()],
+            40,
+            4,
+        )
+        .unwrap();
+    let now = 31 * DAY;
+    let report = store
+        .retention_metrics(now, RetentionReadLimits::default())
+        .unwrap();
+    assert_eq!((report.live_records, report.live_artifacts), (1, 1));
+    assert_eq!((report.pinned_records, report.pinned_artifacts), (1, 1));
+    assert_eq!(report.oldest_received_at, Some(0));
+    assert_eq!(report.retained_window_ms, now);
+    assert_eq!(
+        (
+            report.owned_payload_bytes,
+            report.live_payload_bytes,
+            report.pin_held_payload_bytes,
+            report.retirable_payload_bytes,
+            report.unclassified_payload_bytes,
+            report.payload_chunks
+        ),
+        (9, 5, 5, 4, 0, 2)
+    );
+    // Exact raw-byte admission is checked before hashing, independently of catalog/visits.
+    for limits in [
+        RetentionReadLimits {
+            max_visits: 1,
+            ..Default::default()
+        },
+        RetentionReadLimits {
+            catalog_bytes: 1,
+            ..Default::default()
+        },
+        RetentionReadLimits {
+            payload_bytes: 8,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            store.retention_metrics(now, limits).unwrap_err().code,
+            "RESOURCE_LIMIT"
+        );
+    }
+    let cancelled = QueryCancellation::default();
+    cancelled.cancel();
+    assert_eq!(
+        store
+            .retention_metrics_cancellable(now, RetentionReadLimits::default(), &cancelled)
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+    assert_eq!(
+        store.bytes(&old.id, 0, 0, now).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    store.expire(now).unwrap();
+    let report = store
+        .retention_metrics(now, RetentionReadLimits::default())
+        .unwrap();
+    assert_eq!(
+        (
+            report.owned_payload_bytes,
+            report.live_payload_bytes,
+            report.retirable_payload_bytes
+        ),
+        (5, 5, 0)
+    );
+    assert_eq!((report.live_records, report.live_artifacts), (1, 1));
+    store
+        .release_retry("metrics-release", &pin.id, now)
+        .unwrap();
+    let report = store
+        .retention_metrics(now, RetentionReadLimits::default())
+        .unwrap();
+    assert_eq!(
+        (
+            report.live_records,
+            report.live_artifacts,
+            report.retained_window_ms
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(report.oldest_received_at, None);
+    assert_eq!(
+        (report.owned_payload_bytes, report.retirable_payload_bytes),
+        (5, 5)
+    );
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store
+            .retention_metrics(now, RetentionReadLimits::default())
+            .unwrap()
+            .retirable_payload_bytes,
+        5
+    );
+    store.expire(now).unwrap();
+    assert_eq!(
+        store
+            .retention_metrics(now, RetentionReadLimits::default())
+            .unwrap()
+            .owned_payload_bytes,
+        0
+    );
+    let input = b"private\n";
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let stage = store
+        .import_begin(
+            "metrics-private",
+            "metrics",
+            "log",
+            input.len() as u64,
+            &digest,
+            now,
+        )
+        .unwrap();
+    store.import_append(&stage.id, 0, input, now).unwrap();
+    store.import_seal(&stage.id, now).unwrap();
+    store.import_prepare_layout(&stage.id, now).unwrap();
+    store.import_prepare_record(&stage.id, 0, now).unwrap();
+    let report = store
+        .retention_metrics(now, RetentionReadLimits::default())
+        .unwrap();
+    assert_eq!(
+        (
+            report.owned_payload_bytes,
+            report.unclassified_payload_bytes,
+            report.live_payload_bytes,
+            report.retirable_payload_bytes
+        ),
+        (8, 8, 0, 0)
+    );
+    assert_eq!((report.live_records, report.live_artifacts), (0, 0));
+}
+
+#[test]
+fn retention_metrics_refuse_native_reference_and_payload_corruption() {
+    use sparrow_core::RetentionReadLimits;
+    for corruption in ["counter", "payload", "missing"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        store
+            .ingest("metrics-corrupt", "metrics", "log", b"one\n", 1)
+            .unwrap();
+        drop(store);
+        let db = catalog_db(dir.path()).unwrap();
+        let digest = purrdf_hash::hex::encode(purrdf_hash::blake3::hash(b"one\n").as_bytes());
+        match corruption {
+            "counter" => db
+                .put(format!("ref:{digest}"), 1_u64.to_be_bytes())
+                .unwrap(),
+            "missing" => db.delete(format!("ref:{digest}")).unwrap(),
+            _ => db
+                .put_cf(db.cf_handle("payload").unwrap(), digest, b"wrong")
+                .unwrap(),
+        }
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store
+                .retention_metrics(2, RetentionReadLimits::default())
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+    }
+}
+
+#[test]
 fn json_capture_refusals_identify_the_exhausted_request_budget_without_publishing() {
     use sparrow_core::{JsonQuery, JsonRead};
     for (format, bytes, reason) in [

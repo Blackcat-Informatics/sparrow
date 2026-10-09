@@ -268,6 +268,23 @@ impl Rpc {
         })?
     }
 
+    async fn read_work<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Store, u64, sparrow_core::QueryCancellation) -> Result<T, Error>
+        + Send
+        + 'static,
+    ) -> Result<T, Error> {
+        let cancellation = self.connection.child();
+        let _caller = CancelQuery(cancellation.clone());
+        self.work(move |store, now| {
+            cancellation.checkpoint()?;
+            let reply = operation(store, now, cancellation.clone())?;
+            cancellation.checkpoint()?;
+            Ok(reply)
+        })
+        .await
+    }
+
     async fn query_work<B: Send + 'static>(
         &self,
         owns_capture: bool,
@@ -279,10 +296,7 @@ impl Rpc {
         + Send
         + 'static,
     ) -> Result<QueryReply<B>, Error> {
-        let cancellation = self.connection.child();
-        let _caller = CancelQuery(cancellation.clone());
-        self.work(move |store, now| {
-            cancellation.checkpoint()?;
+        self.read_work(move |store, now, cancellation| {
             let page = operation(store.clone(), now, cancellation.clone())?;
             let reply = QueryReply {
                 page,
@@ -290,7 +304,6 @@ impl Rpc {
                 delivered: false,
                 owns_capture,
             };
-            cancellation.checkpoint()?;
             Ok(reply)
         })
         .await
@@ -1802,6 +1815,67 @@ impl wire::sparrow::Server for Rpc {
                 import_progress(results.get().init_result().init_ok(), value, &store)?
             }
             Err(e) => failure(results.get().init_result(), e),
+        }
+        Ok(())
+    }
+
+    async fn retention_metrics(
+        self: Rc<Self>,
+        params: wire::sparrow::RetentionMetricsParams,
+        mut results: wire::sparrow::RetentionMetricsResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        if let Err(error) = self.check_store(query.get_store_id()?.to_str()?) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
+        if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "retention metrics require the current discovered schema",
+                ),
+            );
+            return Ok(());
+        }
+        let limits = sparrow_core::RetentionReadLimits {
+            max_visits: query.get_max_visits() as usize,
+            catalog_bytes: query.get_catalog_bytes() as usize,
+            payload_bytes: u64::from(query.get_payload_bytes()),
+        };
+        match self
+            .read_work(move |store, now, cancellation| {
+                store.retention_metrics_cancellable(now, limits, &cancellation)
+            })
+            .await
+        {
+            Err(error) => failure(results.get().init_result(), error),
+            Ok(value) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(&value.store_id);
+                out.reborrow().init_as_of().set_unix_millis(value.as_of);
+                out.set_live_records(value.live_records);
+                out.set_live_artifacts(value.live_artifacts);
+                out.set_pinned_records(value.pinned_records);
+                out.set_pinned_artifacts(value.pinned_artifacts);
+                match value.oldest_received_at {
+                    Some(clock) => out
+                        .reborrow()
+                        .init_oldest_received_at()
+                        .init_value()
+                        .set_unix_millis(clock),
+                    None => out.reborrow().init_oldest_received_at().set_absent(()),
+                }
+                out.set_retained_window_ms(value.retained_window_ms);
+                out.set_owned_payload_bytes(value.owned_payload_bytes);
+                out.set_live_payload_bytes(value.live_payload_bytes);
+                out.set_pin_held_payload_bytes(value.pin_held_payload_bytes);
+                out.set_retirable_payload_bytes(value.retirable_payload_bytes);
+                out.set_unclassified_payload_bytes(value.unclassified_payload_bytes);
+                out.set_payload_chunks(value.payload_chunks);
+                out.set_visits(value.visits);
+            }
         }
         Ok(())
     }

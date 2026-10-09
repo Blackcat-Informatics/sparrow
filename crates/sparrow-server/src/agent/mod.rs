@@ -23,6 +23,7 @@ mod read;
 mod receiver;
 mod records;
 mod result;
+mod retention;
 mod retry_file;
 mod search;
 mod selection;
@@ -72,6 +73,7 @@ pub(super) enum Command {
     Records(records::Input),
     Ingest(ingest::Input),
     IngestStatus(ingest_status::Input),
+    Retention(retention::Input),
     Bytes(read::Input),
     Context(context::Input),
     Renew(pin::Renewal),
@@ -189,6 +191,9 @@ impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
         if args.first().is_some_and(|arg| arg == "ingest-get") {
             return Ok(Self::IngestStatus(ingest_status::Input::parse(&args[1..])?));
+        }
+        if args.first().is_some_and(|arg| arg == "retention-metrics") {
+            return Ok(Self::Retention(retention::Input::parse(&args[1..])?));
         }
         if args.first().is_some_and(|arg| arg == "result-release") {
             if args.len() != 3 {
@@ -536,6 +541,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::IngestStatus(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::Retention(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Bytes(input) = self {

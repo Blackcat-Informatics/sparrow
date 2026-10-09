@@ -7114,8 +7114,9 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 34);
+    assert_eq!(definitions.len(), 35);
     for (name, read_only) in [
+        ("retention_metrics", true),
         ("ingest_get", true),
         ("file_finish", false),
         ("file_finish_get", true),
@@ -7132,6 +7133,89 @@ async fn mcp_exercise(
                 .unwrap()["annotations"]["readOnlyHint"]
                 .as_bool(),
             Some(read_only)
+        );
+    }
+    let metrics = mcp
+        .tool(
+            30,
+            "retention_metrics",
+            Object::new().with("store_id", store).into(),
+        )
+        .await;
+    assert_eq!(metrics["isError"].as_bool(), Some(false));
+    let metrics = &metrics["structuredContent"];
+    let cli_metrics = cli(socket, &["retention-metrics", store]);
+    for field in [
+        "store_id",
+        "live_records",
+        "live_artifacts",
+        "pinned_records",
+        "pinned_artifacts",
+        "oldest_received_at",
+        "owned_payload_bytes",
+        "live_payload_bytes",
+        "pin_held_payload_bytes",
+        "retirable_payload_bytes",
+        "unclassified_payload_bytes",
+        "payload_chunks",
+        "visits",
+    ] {
+        assert_eq!(metrics[field], cli_metrics[field], "{field}");
+    }
+    assert_eq!(metrics["retirable_payload_bytes"].as_str(), Some("0"));
+    assert_eq!(metrics["unclassified_payload_bytes"].as_str(), Some("0"));
+    for (index, arguments, code) in [
+        (
+            31,
+            Object::new().with("store_id", "store:other"),
+            "STORE_MISMATCH",
+        ),
+        (
+            32,
+            Object::new()
+                .with("store_id", store)
+                .with("max_visits", 1_u32),
+            "RESOURCE_LIMIT",
+        ),
+        (
+            33,
+            Object::new()
+                .with("store_id", store)
+                .with("catalog_bytes", 1_u32),
+            "RESOURCE_LIMIT",
+        ),
+        (
+            34,
+            Object::new()
+                .with("store_id", store)
+                .with("payload_bytes", 1_u32),
+            "RESOURCE_LIMIT",
+        ),
+        (
+            35,
+            Object::new()
+                .with("store_id", store)
+                .with("max_visits", 0_u32),
+            "INVALID_ARGUMENT",
+        ),
+        (
+            36,
+            Object::new()
+                .with("store_id", store)
+                .with("catalog_bytes", Value::Null),
+            "INVALID_ARGUMENT",
+        ),
+        (
+            37,
+            Object::new().with("store_id", store).with("advance", true),
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        let refused = mcp.tool(index, "retention_metrics", arguments.into()).await;
+        assert_eq!(refused["isError"].as_bool(), Some(true));
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"].as_str(),
+            Some(code)
         );
     }
     assert_eq!(

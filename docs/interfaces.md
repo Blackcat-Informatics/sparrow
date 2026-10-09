@@ -1798,3 +1798,53 @@ renderer. Arguments are `store_id`, `request_id`, `watch`, `watch_revision`
 (the same exact descriptor fields as `file_finish`), and optional
 `tail_generation_id`. Mutation is marked destructive; progress lookup is read
 only. Unknown fields and oversized/noncanonical raw paths are refused.
+
+## Bounded logical retention metrics
+
+Schema 50 adds `retentionMetrics` through the certified SDK
+`get_retention_metrics`, CLI `retention-metrics STORE_ID` and read-only MCP
+`retention_metrics`. The query requires the discovered store/schema identity.
+Optional admission is `max_visits` (default 10,000, maximum 100,000),
+`catalog_bytes` (default/maximum 32 MiB), and `payload_bytes` (default 64 MiB,
+maximum 1 GiB). CLI spells those as `--max-visits`, `--catalog-bytes` and
+`--payload-bytes`. Integer values must be positive and within their limits;
+unknown fields, null limits and repeated CLI options refuse. No partial account,
+lease or successful prefix is returned when admission is insufficient.
+
+One serialized read counts eligible published records and complete artifacts,
+including empty inputs and evidence protected past ordinary expiry. It reports
+the oldest eligible receipt clock and elapsed `retained_window_ms`; both are
+independent of source event time. An empty live catalog has absent
+`oldest_received_at` and a zero window. Active pins can extend this observed
+window beyond thirty days; early eviction can shorten it. The window describes
+the oldest surviving occurrence, not uninterrupted coverage of every instant.
+
+Raw payload accounting follows native reference counters and the current
+artifact-manifest retirement checkpoint. Each chunk is content-verified once
+and counted once, even if multiple records/files share it. `owned_payload_bytes`
+covers all chunks with native payload reference counters. `live_payload_bytes`
+covers any eligible published owner. `pin_held_payload_bytes` covers any actively
+pinned eligible owner and overlaps live bytes, including bytes whose ordinary
+retention remains active. `retirable_payload_bytes` covers chunks exclusively
+owned by ineligible published artifacts/records. A pinned/live/private owner
+prevents a shared chunk from entering that count. `unclassified_payload_bytes`
+covers chunks with additional native references outside the published catalogs,
+such as private preparation, and may overlap live bytes. These are not additive
+categories. Encoded upload staging, projections, indexes, WAL, compression and
+physical files are excluded; physical usage remains a separate status sample.
+
+`pinned_records` and `pinned_artifacts` count eligible occurrences under explicit
+active protection. `payload_chunks` is the number of unique referenced chunks;
+`visits` counts admitted catalog rows, payload ownership references and terminal
+pin seeks. Catalog construction and ownership maps are charged before ownership;
+payload admission is checked before hashing borrowed native input. Missing or
+contradictory reference counts, corrupt payloads and invalid catalog identities
+produce `STORAGE_FAILURE`. Cancellation shares the connection/caller read lifetime
+and preserves worker admission through retirement. The SDK checks store identity,
+wire size, counts, ownership bounds and clock/window agreement before agents
+render the result. UInt64 counters use decimal strings in CLI/MCP JSON.
+
+This read does not advance intake, synchronize buffered writes, retire evidence,
+renew pins or run compaction. Logical retirement eligibility never certifies
+physical bytes freed or recovery of storage admission. Forced bounded physical
+reclamation and sustained operational qualification remain separate requirements.

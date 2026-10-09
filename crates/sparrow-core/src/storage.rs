@@ -42,6 +42,7 @@ pub(crate) mod record_read;
 mod record_spool;
 mod recordless;
 pub(crate) mod result_read;
+pub(crate) mod retention_metrics;
 mod retire;
 mod sequence_window;
 mod source_context;
@@ -680,15 +681,37 @@ impl Writer {
 
 impl Writer {
     fn payload_chunk(&self, digest: &str) -> Result<Vec<u8>, Error> {
+        Ok(self.payload_chunk_view(digest, None)?.to_vec())
+    }
+
+    fn payload_chunk_view(
+        &self,
+        digest: &str,
+        remaining: Option<&mut u64>,
+    ) -> Result<rocksdb::DBPinnableSlice<'_>, Error> {
         let cf = self
             .db
             .cf_handle("payload")
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
         let bytes = self
             .db
-            .get_cf(cf, digest)?
+            .get_pinned_cf(cf, digest)?
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "referenced payload missing"))?;
-        if bytes.len() > CHUNK || hex::encode(blake3::hash(&bytes).as_bytes()) != digest {
+        if bytes.is_empty() || bytes.len() > CHUNK {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "invalid native payload chunk size",
+            ));
+        }
+        if let Some(remaining) = remaining {
+            *remaining = remaining.checked_sub(bytes.len() as u64).ok_or_else(|| {
+                Error::new(
+                    "RESOURCE_LIMIT",
+                    "payload verification exceeds operation admission",
+                )
+            })?;
+        }
+        if hex::encode(blake3::hash(&bytes).as_bytes()) != digest {
             return Err(Error::new(
                 "STORAGE_FAILURE",
                 "payload size or digest mismatch",

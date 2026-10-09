@@ -40,6 +40,29 @@ impl Operation {
         let decode = || -> std::result::Result<Self, DecodeError> {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {
+                "retention_metrics" => {
+                    let defaults = sparrow_client::RetentionReadLimits::default();
+                    Self::Query(Command::Retention(super::retention::Input {
+                        store: fields.required("store_id")?,
+                        limits: sparrow_client::RetentionReadLimits {
+                            max_visits: fields
+                                .raw("max_visits")?
+                                .map(u32::from_json)
+                                .transpose()?
+                                .unwrap_or(defaults.max_visits),
+                            catalog_bytes: fields
+                                .raw("catalog_bytes")?
+                                .map(u32::from_json)
+                                .transpose()?
+                                .unwrap_or(defaults.catalog_bytes),
+                            payload_bytes: fields
+                                .raw("payload_bytes")?
+                                .map(u32::from_json)
+                                .transpose()?
+                                .unwrap_or(defaults.payload_bytes),
+                        },
+                    }))
+                }
                 "ingest_get" => {
                     let request = fields
                         .raw("request_id")?

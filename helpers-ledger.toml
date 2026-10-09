@@ -1829,8 +1829,8 @@ names = ['^(publish_import_artifact|commit_staged_artifact)$']
 [[job]]
 id = "checked-payload-chunk"
 summary = "Read normalized exact-byte chunks with native digest and size verification for byte export or final publication."
-home = "sparrow_core::storage::Writer::payload_chunk"
-entry_points = []
+home = "sparrow_core::storage::Writer::payload_chunk_view"
+entry_points = ["sparrow_core::storage::Writer::payload_chunk", "sparrow_core::Store::retention_metrics_cancellable"]
 spec = "docs/development-runtime.md: final complete-byte identity verification through the shared normalized payload reader."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -3430,7 +3430,7 @@ names = ['^(stage_record_rows_elsewhere|copy_query_spool)$']
 id = "query-cancellation-owner"
 summary = "One connection/caller-scoped cooperative host read lifetime stops candidate/fact/posting/scoring/metadata/staging work, preserves worker admission until exit and releases fresh captures abandoned before reply rendering while retaining previously delivered continuation leases; mutations retain their delivery semantics."
 home = "sparrow_core::QueryCancellation::checkpoint"
-entry_points = ["sparrow_core::Store::records_read_cancellable", "sparrow_core::Store::json_read_cancellable", "sparrow_core::Store::artifact_read_cancellable", "sparrow_core::Store::source_read_with_syslog_cancellable", "sparrow_core::Store::pin_read_cancellable", "sparrow_core::storage::catalog_lease::CaptureAdmission::entry", "sparrow_core::storage::catalog_lease::Reads::publish", "sparrow_core::storage::record_spool::Builder::checkpoint", "sparrow_server::rpc::Rpc::query_work", "sparrow_server::rpc::Rpc::for_connection", "sparrow_server::transport::admit_connection"]
+entry_points = ["sparrow_core::Store::records_read_cancellable", "sparrow_core::Store::json_read_cancellable", "sparrow_core::Store::artifact_read_cancellable", "sparrow_core::Store::source_read_with_syslog_cancellable", "sparrow_core::Store::pin_read_cancellable", "sparrow_core::storage::catalog_lease::CaptureAdmission::entry", "sparrow_core::storage::catalog_lease::Reads::publish", "sparrow_core::storage::record_spool::Builder::checkpoint", "sparrow_server::rpc::Rpc::read_work", "sparrow_server::rpc::Rpc::query_work", "sparrow_core::Store::retention_metrics_cancellable", "sparrow_server::rpc::Rpc::for_connection", "sparrow_server::transport::admit_connection"]
 spec = "docs/query-streaming.md: cooperative query cancellation."
 vectors = ["crates/sparrow-server/src/rpc.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/catalog_lease.rs"]
 bench = []
@@ -3750,14 +3750,56 @@ names = ['^(repeat_ingestion_status_agent_fixture|copy_ingestion_status_parity)$
 
 [[job]]
 id = "sdk-discovery-test-fixture"
-summary = "One dev-only discovered-store fixture supplies SDK acceptance and ingestion status certificate tests."
+summary = "One dev-only discovered-store fixture supplies SDK acceptance, ingestion status and retention account certificate tests."
 home = "sparrow_test_support::client_discovery"
 entry_points = []
 spec = "AGENTS.md: shared dev-only scaffolding."
-vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-client/src/ingest_status.rs"]
+vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-client/src/ingest_status.rs", "crates/sparrow-client/src/retention_metrics.rs"]
 bench = []
 enforced = true
 [job.forbidden]
 constants = []
 fingerprints = []
 names = ['^(another_sdk_discovery_fixture|copy_discovery_test_store)$']
+
+[[job]]
+id = "logical-retention-account"
+summary = "Account published native ownership and unique referenced raw bytes once; pins, ordinary eligibility, private owners and manifest retirement retain their existing owners."
+home = "sparrow_core::Store::retention_metrics_cancellable"
+entry_points = ["sparrow_core::Store::retention_metrics", "sparrow_server::rpc::Rpc::retention_metrics"]
+spec = "docs/interfaces.md: bounded logical retention metrics."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(recompute_retention_account_elsewhere|estimate_reclaimable_payloads)$']
+
+[[job]]
+id = "retention-account-certificate"
+summary = "Certify the bounded generated logical retention contract once for every SDK and agent caller."
+home = "sparrow_client::retention_metrics::RetentionMetrics::certify"
+entry_points = ["sparrow_client::get_retention_metrics"]
+spec = "docs/interfaces.md: bounded logical retention metrics."
+vectors = ["crates/sparrow-client/src/retention_metrics.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(certify_retention_account_elsewhere|trust_retention_counts_without_certificate)$']
+
+[[job]]
+id = "retention-account-agent"
+summary = "CLI and MCP use one certified SDK operation and one retention account renderer."
+home = "sparrow_server::agent::retention::Input::execute"
+entry_points = ["sparrow_server::agent::Command::execute", "sparrow_server::agent::tool::Operation::execute"]
+spec = "docs/interfaces.md: bounded logical retention metrics."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_retention_account_again|read_metrics_outside_sdk)$']
