@@ -4,10 +4,64 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`4bcc201`; see [source-local context](#source-local-context) for
+`e4b9500`; see [disk-backed capture indexes](#disk-backed-capture-indexes) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Disk-backed capture indexes
+
+Signed source `e4b9500` persists each result's offset/length pair alongside its
+anonymous row data, instead of retaining all offsets in memory. One bounded
+page map freezes byte/item boundaries once; replay uses that map and reads only
+the admitted page's index entries and rows. The same page admission owner serves
+memory replies and the disk map. Index I/O and invalid ranges fail without a
+successful response. Source-time ordering rewrites this index under its existing
+charged sort admission; native scoring and JSON semantics remain unchanged.
+
+Chronological record captures now use the requested candidate scan budget as
+their item ceiling. The maximum scan budget stays 100,000. Ranked, source-time
+and JSON captures retain their separate 10,000-item boundary. Disk staging stays
+at most 64 MiB, resident result admission 2 MiB per capture/8 MiB aggregate,
+eight handles, 256 KiB pages and 60-second absolute leases. Both anonymous files
+are charged together, including 128 KiB allocation overhead within that disk
+reservation. Host capture profile `/5` identifies the changed execution path;
+schema 48 and catalog format 37 remain unchanged.
+
+The full gate and normal signed-commit hook pass 162 storage scenarios, 60 RPC
+integration scenarios, remaining workspace tests, release Clippy, seeded census
+tests and 248 helper ownership jobs without distinct exceptions. The new large
+fixture uses the production streaming import owner: 12,003 IDs replay exactly
+after retirement and later intake; invalid page boundaries and a smaller scan
+budget still refuse. Anonymous staging tests also inject truncated/out-of-range
+indexes and failed row reads. Source logs are
+`/tmp/sparrow-disk-index-gate-v2.log`, `/tmp/sparrow-disk-index-commit.log` and
+`/tmp/sparrow-disk-index-selected-build.log`. All five explicitly selected runtime
+images are frozen at `~/.local/state/sparrow/receiver-history-images-4_2bwoa1`.
+
+The retained real corpus now qualifies full chronological traversal of 13,720
+pacman records in 94 pages and all 13,868 records in 95 pages, with exact durable
+receipt ID membership, immutable receipts and identical CLI/MCP continuations.
+Resident lease metadata is respectively 3,876 and 3,858 bytes. The default
+10,000-visit request still refuses without a result. Native selective text rows/
+scores, complete artifact match counts and unrestricted singleton context also
+pass. The private daemon closes cleanly; detailed method and resource limits are
+in [sample qualification](real-corpus-qualification.md).
+
+Adoption evidence is `/tmp/sparrow-disk-index-live.71d4n9h4`, including a closed
+backup that has not independently been restored. The enabled active unit runs
+PID 2527002 from `sparrowd-schema48-e4b9500`, SHA-256
+`7145b0a790431ee9b7a164b6830e5be31dd97aa5d6355c8ff888c45c12a93867`,
+retaining `cap_net_bind_service=ep`. The CLI alias selects
+`sparrow-schema48-e4b9500`, SHA-256
+`ea4eff97482d373e2ee1abb80d57b4a7050df17a2a40feee40595923efdb028b`.
+Installed, frozen and alias hashes agree. Saved TCP/Unix/CLI/MCP intents, 21
+sources, five generations, grouped captures, native scores and temporal/field/
+key/value witnesses pass readback without new public intake or retirement.
+Final LAN status preserves store identity, schema 48, format 37, 212 records and
+zero pins/result leases. Readback logs use `/tmp/sparrow-disk-index-*.log`.
+Full SPARQL, larger ranked/JSON workloads and production operational acceptance
+remain unfinished.
 
 ## Source-local context
 

@@ -35,6 +35,40 @@ including client startup and durable acceptance, without a throughput claim.
 
 ## Verified investigations
 
+### Complete broad chronological capture follow-up
+
+Frozen signed source `e4b9500` reopens the same store with disk-backed result
+indexes and host capture profile `/5`. The explicit 100,000-visit request now
+captures the entire 13,720-record pacman source in 94 pages, and the entire
+13,868-record mixed store in 95 pages, without per-ID selection or an acceptance
+time workaround. Every record ID matches the independent original durable
+import receipts, including the later 30-record historical event-time import.
+Each continuation preserves its initial receipt and exactly matches across CLI
+and MCP. Release leaves zero handles/bytes; no corpus evidence or pins change.
+
+The respective resident lease charges are 3,876 and 3,858 bytes. A default-budget
+pacman request still refuses at candidate scan admission, with empty stdout and
+zero handles. Separate follow-up confirms the original seven native error-text
+rows and scores, a complete 13,720-match artifact count with correct page indices,
+and all four unrestricted singleton contexts. Evidence is the corpus directory's
+`disk-index-qualification/`, including frozen collectors, source/images, native
+replies, transcript, reports and kernel observations. Logs are
+`/tmp/sparrow-disk-index-corpus.log` and `/tmp/sparrow-disk-index-extra.log`.
+An initial auxiliary collector assertion omitted the documented group
+`page_indices`; it was corrected against the actual response, then verified
+explicitly, without changing the server or suppressing a server refusal.
+
+Before clean SIGINT exit, the private daemon reports VmHWM 135,208 KiB and
+`write_bytes` 174,530,560. Closed file lengths are 52,803,777 bytes and allocated
+blocks 52,838,400 bytes. These observations include cold reconstruction, query
+staging and native maintenance, rather than isolated amplification or a sampled
+production peak. Chronological capture remains subject to scan, staging bytes,
+resident page-map capacity, response bytes and absolute time admission. Ranked,
+source-time and JSON captures still have their independent 10,000-item ceiling.
+This qualifies these complete chronological captures, not arbitrary larger
+queries, full native governed SPARQL or production-volume performance. The
+preceding broad refusal below remains historical evidence of its old executable.
+
 ### Unrestricted source-local context follow-up
 
 Frozen signed source `4bcc201`, schema 48 and unchanged catalog format 37, reopened
