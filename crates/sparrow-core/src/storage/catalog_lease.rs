@@ -60,11 +60,11 @@ pub(super) trait PageBody: Sized {
     fn len(&self) -> usize;
     fn capacity(&self) -> usize;
     fn page(&self, start: usize, end: usize) -> Result<Self, Error>;
-    fn page_end(&self, start: usize, page_size: usize) -> usize {
-        self.len().min(start + page_size.min(Self::PAGE_ITEMS))
+    fn page_end(&self, start: usize, page_size: usize) -> Result<usize, Error> {
+        Ok(self.len().min(start + page_size.min(Self::PAGE_ITEMS)))
     }
-    fn is_boundary(&self, start: usize, page_size: usize) -> bool {
-        start.is_multiple_of(page_size.min(Self::PAGE_ITEMS))
+    fn is_boundary(&self, start: usize, page_size: usize) -> Result<bool, Error> {
+        Ok(start.is_multiple_of(page_size.min(Self::PAGE_ITEMS)))
     }
 }
 
@@ -127,7 +127,10 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
                 "catalog read lease ended before page staging",
             ));
         }
-        if start == 0 || start >= self.body.len() || !self.body.is_boundary(start, self.page_size) {
+        if start == 0
+            || start >= self.body.len()
+            || !self.body.is_boundary(start, self.page_size)?
+        {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "cursor is not a captured page boundary",
@@ -143,7 +146,7 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
         Ok(page)
     }
     fn page(&self, start: usize) -> Result<CatalogReadPage<B>, Error> {
-        let end = self.body.page_end(start, self.page_size);
+        let end = self.body.page_end(start, self.page_size)?;
         Ok(CatalogReadPage {
             store_id: self.store_id.clone(),
             snapshot_id: self.id.clone(),

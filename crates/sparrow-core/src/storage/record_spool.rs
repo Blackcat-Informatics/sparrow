@@ -17,6 +17,15 @@ use std::{
 };
 
 pub(super) const DISK_BYTES: u64 = 64 * 1024 * 1024;
+const INDEX_BYTES: u64 = 16;
+const FILE_OVERHEAD: u64 = 2 * 65536;
+
+fn index_entry(offset: u64, length: usize) -> [u8; INDEX_BYTES as usize] {
+    let mut entry = [0; INDEX_BYTES as usize];
+    entry[..8].copy_from_slice(&offset.to_le_bytes());
+    entry[8..].copy_from_slice(&(length as u64).to_le_bytes());
+    entry
+}
 
 fn io_error(error: impl std::fmt::Display) -> Error {
     Error::new("STORAGE_FAILURE", format!("record query staging: {error}"))
@@ -47,13 +56,14 @@ impl Drop for Charge {
 pub(super) struct Builder {
     pub(super) cancellation: super::record_read::QueryCancellation,
     file: File,
-    offsets: Vec<(u64, usize)>,
+    index: File,
+    count: usize,
     written: u64,
     charge: Charge,
     started: Instant,
     groups: Option<BTreeMap<String, u64>>,
     data_bytes: u64,
-    order: Option<Vec<(u64, String, usize)>>,
+    order: Option<Vec<(u64, String, u64, usize)>>,
     sort_bytes: usize,
 }
 
@@ -66,7 +76,9 @@ impl Builder {
     pub(super) fn new(writer: &Writer, grouped: bool, event_order: bool) -> Result<Self, Error> {
         let allowance = writer.config.disk_budget - writer.config.maintenance_reserve;
         let disk_bytes = DISK_BYTES.min(allowance / catalog_lease::MAX_HANDLES as u64);
-        if disk_bytes <= 65536 || writer.physical_bytes()?.saturating_add(disk_bytes) > allowance {
+        if disk_bytes <= FILE_OVERHEAD
+            || writer.physical_bytes()?.saturating_add(disk_bytes) > allowance
+        {
             return Err(Error::new(
                 "STORAGE_PRESSURE",
                 "record query staging would cross its store allowance or maintenance reserve",
@@ -82,15 +94,17 @@ impl Builder {
         // Linux O_TMPFILE has no linked pathname, including if the process is killed.
         // The last descriptor closes it on release, absolute expiry or owner shutdown.
         let file = staging_file(writer.db.path())?;
+        let index = staging_file(writer.db.path())?;
         Ok(Self {
             cancellation: Default::default(),
             file,
-            offsets: Vec::new(),
+            index,
+            count: 0,
             written: 0,
             charge,
             started: Instant::now(),
             groups: grouped.then(BTreeMap::new),
-            data_bytes: disk_bytes - 65536,
+            data_bytes: disk_bytes - FILE_OVERHEAD,
             order: event_order.then(Vec::new),
             sort_bytes: 0,
         })
@@ -105,8 +119,10 @@ impl Builder {
             ));
         }
         if let Some((_, id)) = &order {
-            // Include geometric vector growth and both old/new offset buffers.
-            let bytes = id.capacity().saturating_add(112);
+            // Include geometric vector growth and the sort's owned identity.
+            let bytes = id
+                .capacity()
+                .saturating_add(3 * std::mem::size_of::<(u64, String, u64, usize)>());
             if self.sort_bytes.saturating_add(bytes) > catalog_lease::CAPTURE_BYTES {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
@@ -117,13 +133,16 @@ impl Builder {
         }
         let encoded = json::write_compact(&row);
         if encoded.len() > super::record_read::ROW_BYTES
-            || self.offsets.len() == catalog_lease::MAX_ITEMS
-            || self.written.saturating_add(encoded.len() as u64) > self.data_bytes
+            || self
+                .written
+                .saturating_add(encoded.len() as u64)
+                .saturating_add((self.count as u64 + 1).saturating_mul(INDEX_BYTES))
+                > self.data_bytes
             || self.started.elapsed() >= Duration::from_millis(catalog_lease::LEASE_MS)
         {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
-                "record query exhausted row/item/disk/time staging admission; no page published",
+                "record query exhausted row/disk/time staging admission; no page published",
             ));
         }
         if let Some(groups) = &mut self.groups {
@@ -138,15 +157,18 @@ impl Builder {
             }
         }
         self.file.write_all(encoded.as_bytes()).map_err(io_error)?;
+        self.index
+            .write_all(&index_entry(self.written, encoded.len()))
+            .map_err(io_error)?;
         if let Some((millis, id)) = order {
             self.order
                 .as_mut()
                 .ok_or_else(|| {
                     Error::new("STORAGE_FAILURE", "record staging sort owner disappeared")
                 })?
-                .push((millis, id, self.offsets.len()));
+                .push((millis, id, self.written, encoded.len()));
         }
-        self.offsets.push((self.written, encoded.len()));
+        self.count += 1;
         self.written += encoded.len() as u64;
         Ok(())
     }
@@ -154,9 +176,11 @@ impl Builder {
     pub(super) fn finish(mut self) -> Result<Finished, Error> {
         self.checkpoint()?;
         if let Some(mut order) = self.order.take() {
-            let bytes = order.capacity() * std::mem::size_of::<(u64, String, usize)>()
-                + order.iter().map(|(_, id, _)| id.capacity()).sum::<usize>()
-                + self.offsets.capacity() * std::mem::size_of::<(u64, usize)>();
+            let bytes = order.capacity() * std::mem::size_of::<(u64, String, u64, usize)>()
+                + order
+                    .iter()
+                    .map(|(_, id, _, _)| id.capacity())
+                    .sum::<usize>();
             if bytes > catalog_lease::CAPTURE_BYTES {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
@@ -164,10 +188,11 @@ impl Builder {
                 ));
             }
             order.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            self.offsets = order
-                .into_iter()
-                .map(|(_, _, position)| self.offsets[position])
-                .collect();
+            for (position, (_, _, offset, length)) in order.into_iter().enumerate() {
+                self.index
+                    .write_all_at(&index_entry(offset, length), position as u64 * INDEX_BYTES)
+                    .map_err(io_error)?;
+            }
         }
         self.checkpoint()?;
         // Queries are ephemeral, so no fsync or durability claim is appropriate.
@@ -177,10 +202,22 @@ impl Builder {
             .map_err(io_error)?
             .blocks()
             .saturating_mul(512)
+            .saturating_add(
+                self.index
+                    .metadata()
+                    .map_err(io_error)?
+                    .blocks()
+                    .saturating_mul(512),
+            )
             // Delayed allocation can report fewer blocks before writeback.
             // Retain the complete data/overhead charge without making the
             // ephemeral file a durable query artifact.
-            .max(self.written.saturating_add(65536).next_multiple_of(4096));
+            .max(
+                self.written
+                    .saturating_add(self.count as u64 * INDEX_BYTES)
+                    .saturating_add(FILE_OVERHEAD)
+                    .next_multiple_of(4096),
+            );
         if allocated > self.charge.bytes {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -194,7 +231,10 @@ impl Builder {
         let rows = Arc::new(Rows {
             id: random_id("query-spool")?,
             file: self.file,
-            offsets: self.offsets,
+            index: self.index,
+            count: self.count,
+            written: self.written,
+            boundaries: Vec::new(),
             _charge: self.charge,
         });
         Ok(Finished {
@@ -219,7 +259,8 @@ mod tests {
         let mut builder = Builder {
             cancellation: Default::default(),
             file: staging_file(dir.path()).unwrap(),
-            offsets: Vec::new(),
+            index: staging_file(dir.path()).unwrap(),
+            count: 0,
             written: 0,
             charge: Charge {
                 counter: counter.clone(),
@@ -227,7 +268,7 @@ mod tests {
             },
             started: Instant::now(),
             groups: None,
-            data_bytes: DISK_BYTES - 65536,
+            data_bytes: DISK_BYTES - FILE_OVERHEAD,
             order: None,
             sort_bytes: 0,
         };
@@ -251,6 +292,14 @@ mod tests {
             super::super::parse(&page[0]).unwrap()["row"].as_str(),
             Some("original")
         );
+        let length = page[0].len();
+        held.index
+            .write_all_at(&index_entry(held.written + 1, length), 0)
+            .unwrap();
+        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
+        held.index.set_len(0).unwrap();
+        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
+        held.index.write_all_at(&index_entry(0, length), 0).unwrap();
         held.file.set_len(0).unwrap();
         assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
         drop(held);
@@ -262,7 +311,10 @@ mod tests {
 pub(super) struct Rows {
     id: String,
     file: File,
-    offsets: Vec<(u64, usize)>,
+    index: File,
+    count: usize,
+    written: u64,
+    boundaries: Vec<usize>,
     _charge: Charge,
 }
 impl PartialEq for Rows {
@@ -274,18 +326,111 @@ impl Eq for Rows {}
 
 impl Rows {
     pub(super) fn len(&self) -> usize {
-        self.offsets.len()
+        self.count
     }
     pub(super) fn capacity(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.id.capacity()
-            + self.offsets.capacity() * std::mem::size_of::<(u64, usize)>()
+            + self.boundaries.capacity() * std::mem::size_of::<usize>()
     }
-    pub(super) fn lengths(&self) -> impl Iterator<Item = usize> + '_ {
-        self.offsets.iter().map(|(_, bytes)| *bytes)
+    fn offsets(&self, start: usize, end: usize) -> Result<Vec<(u64, usize)>, Error> {
+        if start > end || end > self.count || end - start > super::record_read::PAGE_ITEMS {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "record spool index range exceeds admitted page",
+            ));
+        }
+        let mut bytes = vec![0; (end - start) * INDEX_BYTES as usize];
+        self.index
+            .read_exact_at(&mut bytes, start as u64 * INDEX_BYTES)
+            .map_err(io_error)?;
+        bytes
+            .as_chunks::<{ INDEX_BYTES as usize }>()
+            .0
+            .iter()
+            .map(|entry| {
+                let offset = u64::from_le_bytes(entry[..8].try_into().expect("fixed index width"));
+                let length = u64::from_le_bytes(entry[8..].try_into().expect("fixed index width"));
+                if length > super::record_read::ROW_BYTES as u64
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|end| end > self.written)
+                {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "record spool index points outside admitted row data",
+                    ));
+                }
+                Ok((offset, length as usize))
+            })
+            .collect()
+    }
+    pub(super) fn configure_pages(
+        mut self: Arc<Self>,
+        metadata_bytes: usize,
+        page_size: usize,
+        cancellation: &super::record_read::QueryCancellation,
+    ) -> Result<Arc<Self>, Error> {
+        let rows = Arc::get_mut(&mut self).ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "record spool pagination must precede shared publication",
+            )
+        })?;
+        let mut admission = super::record_read::PageAdmission::new(metadata_bytes, page_size);
+        rows.boundary(0)?;
+        for start in (0..rows.count).step_by(super::record_read::PAGE_ITEMS) {
+            cancellation.checkpoint()?;
+            let offsets = rows.offsets(
+                start,
+                rows.count.min(start + super::record_read::PAGE_ITEMS),
+            )?;
+            for (position, (_, length)) in offsets.into_iter().enumerate() {
+                if !admission.admit(length)? {
+                    rows.boundary(start + position)?;
+                    admission = super::record_read::PageAdmission::new(metadata_bytes, page_size);
+                    if !admission.admit(length)? {
+                        return Err(Error::new(
+                            "STORAGE_FAILURE",
+                            "record spool cannot admit its first page row",
+                        ));
+                    }
+                }
+            }
+        }
+        if rows.count != 0 {
+            rows.boundary(rows.count)?;
+        }
+        cancellation.checkpoint()?;
+        Ok(self)
+    }
+    fn boundary(&mut self, position: usize) -> Result<(), Error> {
+        // Price geometric growth before allocating, including any live old buffer.
+        if self.boundaries.len().saturating_add(1).saturating_mul(24) > catalog_lease::CAPTURE_BYTES
+        {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "record spool page map exceeds resident admission",
+            ));
+        }
+        self.boundaries.push(position);
+        Ok(())
+    }
+    pub(super) fn page_end(&self, start: usize) -> Result<usize, Error> {
+        let position = self.boundaries.binary_search(&start).map_err(|_| {
+            Error::new("INVALID_ARGUMENT", "cursor is not a captured page boundary")
+        })?;
+        Ok(self
+            .boundaries
+            .get(position + 1)
+            .copied()
+            .unwrap_or(self.count))
+    }
+    pub(super) fn is_boundary(&self, start: usize) -> bool {
+        self.boundaries.binary_search(&start).is_ok()
     }
     pub(super) fn page(&self, start: usize, end: usize) -> Result<Vec<Vec<u8>>, Error> {
-        self.offsets[start..end]
+        self.offsets(start, end)?
             .iter()
             .map(|(offset, len)| {
                 let mut bytes = vec![0; *len];

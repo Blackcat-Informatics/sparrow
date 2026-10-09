@@ -11812,6 +11812,112 @@ fn record_pages_capture_more_than_the_old_row_ceiling_without_limited_execution(
 }
 
 #[test]
+fn disk_indexed_record_capture_crosses_ten_thousand_with_bounded_replay() {
+    use sparrow_core::{RecordOperation, RecordQuery, RecordRead, ResultPage};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.max_records = 20000;
+    settings.disk_budget = 2 * 1024 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let input = b"catalog row\n".repeat(12003);
+    let manifest = stage_fixture(&store, "wide-index", "log", &input);
+    for ordinal in 0..manifest.layout_records {
+        store
+            .import_prepare_record(&manifest.id, ordinal, 1)
+            .unwrap();
+    }
+    let artifact = store.import_publish(&manifest.id, 1).unwrap();
+    let mut scope = record_page_scope("oversized", 1000);
+    scope.scan_budget = 100000;
+    let mut query = RecordRead {
+        operation: RecordOperation::Records,
+        scope,
+        query: RecordQuery::default(),
+        cursor: None,
+    };
+    let first = store.records_read(&query, 2).unwrap();
+    assert_eq!(first.total_items, 12003);
+    let metadata = first.body.result().unwrap();
+    assert_eq!(
+        metadata["query_evidence"]["limits"]["capture_items"].as_u64(),
+        Some(100000)
+    );
+    assert_eq!(
+        metadata["query_evidence"]["limits"]["capture_bytes"].as_u64(),
+        Some(64 * 1024 * 1024)
+    );
+    assert!(
+        store.status(2).unwrap()["record_read_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            < 64 * 1024
+    );
+    let cursor = first.next_cursor.clone().unwrap();
+    let replay = store.result_next(&first.store_id, &cursor, 2).unwrap();
+    store
+        .evict_oldest(
+            2,
+            sparrow_core::EvictionLimits {
+                max_records: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .ingest("wide-index-later", "oversized", "log", b"later\n", 3)
+        .unwrap();
+    assert_eq!(
+        store.result_next(&first.store_id, &cursor, 4).unwrap(),
+        replay
+    );
+    assert_eq!(
+        store
+            .result_next(&first.store_id, &format!("{}/1", first.snapshot_id), 4)
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    let mut page = first.clone();
+    loop {
+        let result = page.body.result().unwrap();
+        assert_eq!(result["known_qualified_records"].as_str(), Some("12003"));
+        for row in result["rows"].as_array().unwrap() {
+            assert!(ids.insert(row["record_id"].as_str().unwrap().to_owned()));
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        let ResultPage::Records(next) = store.result_next(&first.store_id, &cursor, 4).unwrap()
+        else {
+            panic!("wrong captured operation")
+        };
+        page = next;
+    }
+    assert_eq!(ids, artifact.record_ids.iter().cloned().collect());
+    assert!(
+        store
+            .result_release(&first.store_id, &first.snapshot_id, 4)
+            .unwrap()
+    );
+    assert_eq!(
+        store.status(4).unwrap()["record_read_bytes"].as_str(),
+        Some("0")
+    );
+    query.scope.scan_budget = 10000;
+    assert_eq!(
+        store.records_read(&query, 4).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        store.status(4).unwrap()["record_read_handles"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
 fn disk_record_pages_cross_the_old_capture_bound_and_release_their_charge() {
     use sparrow_core::{
         FieldConstraint, JsonPredicate, RecordOperation, RecordQuery, RecordRead, ResultPage,

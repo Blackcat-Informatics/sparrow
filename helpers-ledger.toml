@@ -3414,9 +3414,9 @@ names = ['^(decode_tail_byte_reference|decode_generation_read_reference)$']
 
 [[job]]
 id = "anonymous-record-row-staging"
-summary = "One anonymous file owner stages chronological, source-time, native ranked record and JSON key/value rows with store disk admission, bounded offsets and allocation release; no query pathname survives a crash."
+summary = "One anonymous staging owner persists row bodies and their offset index within store disk admission; one charged page map supports immutable replay and allocation release without a result-sized resident offset vector or linked query pathname."
 home = "sparrow_core::storage::record_spool::Builder::push"
-entry_points = ["sparrow_core::storage::text_index::Store::records_query_stage", "sparrow_core::storage::Store::json_query_stage", "sparrow_core::storage::record_read::Store::query_read"]
+entry_points = ["sparrow_core::storage::text_index::Store::records_query_stage", "sparrow_core::storage::Store::json_query_stage", "sparrow_core::storage::record_read::Store::query_read", "sparrow_core::storage::record_spool::Rows::configure_pages", "sparrow_core::storage::record_spool::Rows::offsets", "sparrow_core::storage::record_read::PageAdmission::admit", "sparrow_core::storage::record_read::disk_capture_items"]
 spec = "docs/query-streaming.md: bounded immutable disk staging."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/record_spool.rs"]
 bench = []

@@ -125,7 +125,11 @@ impl Store {
             ));
         }
         let row_limit = if capture {
-            catalog_lease::MAX_ITEMS
+            if stage.is_some() {
+                super::record_read::disk_capture_items(query, scope.scan_budget)
+            } else {
+                catalog_lease::MAX_ITEMS
+            }
         } else {
             scope.limit
         };
@@ -236,7 +240,7 @@ impl Store {
             if capture && query.text.is_none() && qualified > row_limit {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
-                    "record capture exceeds 10000 matches; narrow scope",
+                    format!("record capture exceeds {row_limit} matches; narrow scope"),
                 ));
             }
             if query.text.is_none() {

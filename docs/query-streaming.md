@@ -3,9 +3,11 @@
 Record, text, key and value queries stage their complete admitted result metadata
 incrementally into an anonymous disk file before publishing a page. This includes
 field qualification, source-time ordering, native ranked text and artifact grouping.
-They retain at most 10,000 compact offset/length pairs in memory; each page reads
-only its admitted rows. The 10,000-match and scan-work ceilings remain
-explicit admission boundaries.
+Row bodies and offset/length pairs live in separate anonymous disk files. Each
+page reads only its admitted index entries and rows. A charged resident map
+stores page boundaries rather than an offset pair for every result. Chronological
+record captures use the requested scan budget as their item ceiling; ranked,
+source-time and JSON captures retain the separate 10,000-item admission.
 
 ## Bounded immutable disk staging
 
@@ -13,14 +15,14 @@ The serialized catalog writer fixes membership, protection, diagnostics, field
 witnesses and artifact counts during one scan through the existing matcher. It
 writes one native JSON summary at a time, rather than accumulating a result-size
 row vector. After the complete scan succeeds, an immutable file and bounded
-offsets supply replayable byte-limited pages. Later writes and logical retirement
+disk index and charged page map supply replayable byte-limited pages. Later writes and logical retirement
 do not affect those captured summaries. This supplies metadata paging without
 retaining old RocksDB versions for this operation; RDF reads continue to use
 their separate native snapshot path. The shared native read helpers remain useful
 for those backends.
 
 Source-time captures sort bounded `(millis, record ID, offset ordinal)` keys and
-then keep only reordered offsets; they do not collect complete row bodies. Sort
+then rewrite the disk index in that order; they do not collect complete row bodies. Sort
 admission includes string storage and vector growth, with a 2 MiB ceiling checked
 before admitting each key. Text captures retain their existing bounded native
 membership and global scorer. Once that scorer orders all admitted matches, it
@@ -29,10 +31,11 @@ introduced. Artifact counts accumulate only over final matching rows.
 
 Before staging, reserve the smaller of 64 MiB and one eighth of the configured
 data allowance (disk budget less maintenance reserve), checking it against the
-store's complete admission footprint. Keep 64 KiB of that reservation outside
-the row-data bound for allocation overhead. After capture, replace the reservation
-with the greater of measured allocated blocks and rounded written data plus
-64 KiB allocation overhead, preserving admission during delayed writeback.
+store's complete admission footprint. Keep 128 KiB of that reservation outside
+the row-data/index bound for the two files' allocation overhead. After capture,
+replace the reservation with the greater of their combined measured allocated
+blocks and rounded written data/index bytes plus 128 KiB allocation overhead,
+preserving admission during delayed writeback.
 Ingestion and control-write admission
 include this shared staging charge. The reported admission footprint therefore
 includes anonymous query files and in-progress reservations, which directory
@@ -48,8 +51,9 @@ existing periodic expiry path purges expired leases. Page I/O is fallible throug
 the shared lease contract, and any staging or page failure returns no successful
 prefix. No durable query receipt, evidence pin or renewed retention is created.
 
-Schema 45 and host admission profile `sparrow-query-capture/4` identify this
-path. Record, text, key and value receipts advertise a 64 MiB maximum disk capture;
+Schema 45 introduced disk row staging. Host admission profile
+`sparrow-query-capture/5` identifies the current disk index/page-map path. Record,
+text, key and value receipts advertise a 64 MiB maximum disk capture;
 the configured store allowance can admit less or refuse with storage pressure.
 Native ranked membership
 keeps its separate 64 MiB admission; output staging does not remove that bound.

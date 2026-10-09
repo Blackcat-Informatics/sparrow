@@ -51,6 +51,44 @@ impl QueryCancellation {
 
 pub(super) const ROW_BYTES: usize = 32 * 1024;
 pub(super) const METADATA_BYTES: usize = 32 * 1024;
+pub(super) const PAGE_ITEMS: usize = 1000;
+
+pub(super) struct PageAdmission {
+    reserve: usize,
+    bytes: usize,
+    items: usize,
+    maximum: usize,
+}
+
+impl PageAdmission {
+    pub(super) fn new(metadata_bytes: usize, page_size: usize) -> Self {
+        let reserve = metadata_bytes.saturating_mul(2).saturating_add(4096);
+        Self {
+            reserve,
+            bytes: reserve,
+            items: 0,
+            maximum: page_size.min(PAGE_ITEMS),
+        }
+    }
+
+    pub(super) fn admit(&mut self, length: usize) -> Result<bool, Error> {
+        let charge = catalog_lease::response_row_bytes(length);
+        if self.reserve.saturating_add(charge) > catalog_lease::PAGE_BYTES {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "record row cannot fit a bounded response page",
+            ));
+        }
+        if self.items == self.maximum
+            || self.bytes.saturating_add(charge) > catalog_lease::PAGE_BYTES
+        {
+            return Ok(false);
+        }
+        self.bytes += charge;
+        self.items += 1;
+        Ok(true)
+    }
+}
 
 /// Public query surface bound into every continuation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -138,12 +176,6 @@ impl RowStorage {
             Self::Spool(rows) => rows.len(),
         }
     }
-    fn lengths(&self) -> Box<dyn Iterator<Item = usize> + '_> {
-        match self {
-            Self::Memory(rows) => Box::new(rows.iter().map(Vec::len)),
-            Self::Spool(rows) => Box::new(rows.lengths()),
-        }
-    }
     fn capacity(&self) -> usize {
         match self {
             Self::Memory(rows) => {
@@ -162,7 +194,15 @@ impl RowStorage {
 }
 
 /// Host-owned query admission profile; native semantic profiles remain separate.
-pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/4";
+pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/5";
+
+pub(super) fn disk_capture_items(query: &crate::RecordQuery, scan_budget: usize) -> usize {
+    if query.text.is_none() && query.event_interval.is_none() {
+        scan_budget
+    } else {
+        catalog_lease::MAX_ITEMS
+    }
+}
 
 fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
     use purrdf_lex::json::Object;
@@ -285,7 +325,10 @@ fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
                     "membership_record_visits",
                     super::query_membership::MAX_SELECTION_VISITS as u64,
                 )
-                .with("capture_items", catalog_lease::MAX_ITEMS as u64)
+                .with("capture_items", match selector {
+                    Selector::Records(q) => disk_capture_items(&q.query, q.scope.scan_budget),
+                    Selector::Json(_) => catalog_lease::MAX_ITEMS,
+                } as u64)
                 .with("capture_bytes", super::record_spool::DISK_BYTES)
                 .with("row_bytes", ROW_BYTES as u64)
                 .with("metadata_bytes", METADATA_BYTES as u64)
@@ -331,7 +374,7 @@ impl RecordPageBody {
 }
 
 impl catalog_lease::PageBody for RecordPageBody {
-    const PAGE_ITEMS: usize = 1000;
+    const PAGE_ITEMS: usize = PAGE_ITEMS;
     fn len(&self) -> usize {
         self.rows.len()
     }
@@ -344,35 +387,39 @@ impl catalog_lease::PageBody for RecordPageBody {
             rows: RowStorage::Memory(self.rows.page(start, end)?),
         })
     }
-    fn page_end(&self, start: usize, page_size: usize) -> usize {
-        // Typed replies render record rows and ranked evidence separately.
-        let mut bytes = self.metadata.len() * 2 + 4096;
+    fn page_end(&self, start: usize, page_size: usize) -> Result<usize, Error> {
+        let rows = match &self.rows {
+            RowStorage::Memory(rows) => rows,
+            RowStorage::Spool(rows) => return rows.page_end(start),
+        };
+        let mut admission = PageAdmission::new(self.metadata.len(), page_size);
         let mut end = start;
-        for length in self
-            .rows
-            .lengths()
+        for length in rows
+            .iter()
+            .map(Vec::len)
             .skip(start)
             .take(page_size.min(Self::PAGE_ITEMS))
         {
-            let charge = catalog_lease::response_row_bytes(length);
-            if bytes + charge > catalog_lease::PAGE_BYTES {
+            if !admission.admit(length)? {
                 break;
             }
-            bytes += charge;
             end += 1;
         }
-        end
+        Ok(end)
     }
-    fn is_boundary(&self, start: usize, page_size: usize) -> bool {
+    fn is_boundary(&self, start: usize, page_size: usize) -> Result<bool, Error> {
+        if let RowStorage::Spool(rows) = &self.rows {
+            return Ok(rows.is_boundary(start));
+        }
         let mut position = 0;
         while position < start {
-            let next = self.page_end(position, page_size);
+            let next = self.page_end(position, page_size)?;
             if next <= position {
-                return false;
+                return Ok(false);
             }
             position = next;
         }
-        position == start
+        Ok(position == start)
     }
 }
 
@@ -498,6 +545,7 @@ impl Store {
                     Error::new("STORAGE_FAILURE", "staged record rows marker missing")
                 })?;
             let metadata = RecordPageBody::encode_metadata(&value)?;
+            let rows = rows.configure_pages(metadata.len(), scope.limit, cancellation)?;
             RecordPageBody {
                 metadata,
                 rows: RowStorage::Spool(rows),
