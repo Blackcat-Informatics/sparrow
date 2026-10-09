@@ -35,6 +35,27 @@ including client startup and durable acceptance, without a throughput claim.
 
 ## Verified investigations
 
+### Unrestricted source-local context follow-up
+
+Frozen signed source `4bcc201`, schema 48 and unchanged catalog format 37, reopened
+this same closed private store. Its rebuilt source timeline permits unrestricted
+context for each of the four singleton Brainstem artifacts with the default
+scope and scan budget: before/after counts two, zero neighbor visits, empty sides,
+complete execution and source-local capture admission profile `/2`. CLI and MCP
+anchor/neighborhood rows agree; bounded exact-byte downloads match each frozen
+input digest. The store remains at 13,868 records with zero pins and result
+leases. Evidence is the corpus directory's `source-context-qualification/`,
+including images/source identity, structured replies, MCP transcript, byte copies
+and independent assertions. The collector log is
+`/tmp/sparrow-source-context-corpus.log`.
+
+The private daemon reported VmHWM 101,984 KiB and `write_bytes` 32,624,640 before
+clean SIGINT exit. This includes cold cache reconstruction, native maintenance
+and these reads, rather than isolated cache amplification or startup timing.
+Production density, startup latency, disk headroom and sustained memory costs
+remain unqualified. The earlier failure and its narrow-interval workaround below
+remain historical evidence of the preceding executable.
+
 The daemon and CLI initially used frozen source `2f1f8ff`, schema 48, with only
 a private Unix socket and a new store. Exact artifact downloads reconstruct every
 saved input through bounded reads and match its independent saved digest.

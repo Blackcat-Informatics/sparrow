@@ -4,10 +4,51 @@ The current installed server is the enabled persistent user unit
 `sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
 private Unix socket. It uses schema 48 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`e28431f`; see [actionable JSON capture budgets](#actionable-json-capture-budgets) for
+`4bcc201`; see [source-local context](#source-local-context) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Source-local context
+
+Signed source `4bcc201` indexes context by source and chronological identity
+instead of decoding unrelated records during neighborhood traversal. The source
+timeline is reconstructed with the shared bounded catalog pager on every open,
+and maintained in the original atomic record/time publication batch. It remains
+a derivative of the existing format 37 catalog. Capture admission profile `/2`
+charges same-source visits, including skipped scope members, while preserving
+the existing decoding and response ceilings. Corrupt reconstruction disables
+context with an actionable failure; unrelated evidence reads remain available.
+
+`make check` and the normal signed-commit hook pass: 161 storage scenarios,
+60 RPC integration scenarios, the remaining workspace tests, release Clippy,
+seeded census tests and 248 helper ownership jobs with zero distinct exceptions.
+Logs are `/tmp/sparrow-source-context-gate-v3.log`,
+`/tmp/sparrow-source-context-commit.log` and
+`/tmp/sparrow-source-context-selected-build.log`. All five explicitly selected
+runtime executables are frozen at
+`~/.local/state/sparrow/receiver-history-images-onf5kej2`.
+
+The private 13,868-record corpus now admits unrestricted singleton context for
+all four selected Brainstem JSON artifacts without the former time-interval
+workaround. CLI/MCP neighborhoods agree and exact bytes match the frozen inputs;
+see [sample qualification](real-corpus-qualification.md). The private daemon
+exited cleanly after SIGINT. Production-scale cache and startup costs remain
+unqualified.
+
+Adoption evidence is `/tmp/sparrow-source-context-live.fauiz3kd`, including a
+closed-store backup that has not independently been restored. The active enabled
+unit runs PID 2447537 from `sparrowd-schema48-4bcc201`, SHA-256
+`3ab58fb2c31b33c7bbb82ff427756f71be28ca72b7428cf3ae23c5de5f102de1`.
+The stable CLI selects `sparrow-schema48-4bcc201`; its SHA-256 is
+`ea4eff97482d373e2ee1abb80d57b4a7050df17a2a40feee40595923efdb028b`.
+Installed/frozen/alias hashes agree, and the daemon retains
+`cap_net_bind_service=ep`. Saved TCP/Unix/CLI/MCP intents, all 21 sources, five
+generations, grouped pages, native scores and temporal/field/key/value readbacks
+pass without new public intake or retirement. Final LAN TCP status preserves
+schema 48, format 37, store identity, 212 records and zero pins/result leases.
+Readback logs use `/tmp/sparrow-source-context-*.log`. Full architecture
+acceptance remains unmet.
 
 ## Actionable JSON capture budgets
 
