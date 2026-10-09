@@ -120,3 +120,76 @@ All final files are SST/control files with no WAL; final allocated bytes are
 4,702,208, 4,710,400 and 3,121,152 respectively. Zero logical ownership still
 leaves measurable physical bytes. Forced bounded reclamation, quota-pressure
 admission and sustained physical recovery remain unqualified.
+
+## Streaming and larger-profile qualification
+
+Signed source `7461947` passed `make check` and its normal pre-commit gate:
+158 storage scenarios, 60 RPC integration scenarios, remaining workspace tests,
+release Clippy and 247 helper ownership rules with zero distinct exceptions.
+After the hook, the selected example was explicitly rebuilt and frozen as
+`~/.local/libexec/sparrow/turnover-schema48-7461947`, SHA-256
+`2db6f2bc1b14e8785cf8731cdf18ca6b0d959c0df2c817468bc1270a55a04dbd`.
+The build used Rust `1.100.0-nightly (4b6d04e70 2026-09-13)`. This offline image
+requires no capability and is separate from the installed daemon.
+
+The streaming default-size run is
+`~/.local/state/sparrow/turnover-v2-qualified-0jpuil7h`. All three modes passed,
+each with 3,000 independently specified records and 4,046,020 accepted raw bytes.
+Sampled peak RSS was 134,784 / 129,836 / 132,344 KiB for none / sparse / dense;
+elapsed times were 9.729 / 8.292 / 7.555 seconds. This qualifies report format
+`turnover/2`; historical evidence above retains its original format.
+
+The larger run is `~/.local/state/sparrow/turnover-v2-qualified-ixqru6f_`.
+Its profile is 128 repeated JSONL records, 128 changing JSONL records plus one
+malformed record, 1,024 CRLF log records and one 1 MiB random opaque record per
+day: 1,282 records per cohort, 76,920 records and 65,642,380 accepted raw bytes
+per mode. Each mode used a new Btrfs store with a 2 GiB disk budget and 128 MiB
+maintenance reserve. Production admission and expiry pass limits were unchanged.
+The collector declared a 600-second deadline per mode and an 8 GiB host
+free-space delta ceiling; neither was reached.
+
+| Pin mode | Records at day 59 | Sampled peak RSS KiB | Maximum daily sampled file bytes | Closed final file bytes | Elapsed seconds | Final expiry passes |
+| --- | --- | --- | --- | --- | --- | --- |
+| None | 38,460 | 171,868 | 317,536,221 | 44,609,148 | 96.324 | 1,212 |
+| Sparse record | 38,461 | 182,340 | 319,677,940 | 50,555,601 | 91.662 | 1,212 |
+| Dense all artifacts | 76,920 | 208,664 | 323,791,172 | 72,217,653 | 111.440 | 2,423 |
+
+The independent frozen collector validates all 60 daily counts against the
+fixture specification and checks receipt record counts, source lengths and
+line counts. It records SHA-256 input manifests alongside native BLAKE3 content
+identities. Every mode has 240 distinct artifact occurrences, one repeated JSONL
+content identity, one repeated log identity, 60 changing JSONL identities and
+60 random opaque identities. Native first-cohort RDF results remain identical
+except for `membership_at`: 60 inspections for the sparse record and 76,920
+inspections for the dense first cohort, including the explicit malformed JSONL
+projection failure. Exact-byte checks span multiple 64 KiB reads for each opaque
+artifact. Boundary eligibility, expired-parent refusal, sparse-record survival,
+four reopens, pin release and expired-target refusal pass. Final records, pins,
+payload and JSON projection ownership, and read leases are zero; final reopening
+does not resurrect records. Existing stores refuse before opening and produce
+no successful stdout. Six invalid/oversized fixture cases refuse before creating
+either the store or input directory; evidence is
+`~/.local/state/sparrow/turnover-v2-refusals-alzbu_oq`.
+
+Final expiry needed more than the preceding qualifier's fixed 1,024 passes.
+The new workload-derived ceiling permits these finite traversals without
+increasing a production pass budget. Final stores identify format 42 after
+native manifest-retirement fencing. Remaining physical files include unreferenced
+blobs and SST/control files, with zero WAL bytes. Final allocated bytes are
+44,658,688 / 50,610,176 / 72,273,920. This is direct evidence of physical
+reclamation lag after logical ownership reaches zero.
+
+The last sampled process `write_bytes` values are 4,527,529,984 / 4,536,995,840 /
+5,209,219,072 bytes. These include native WAL, indexes, retirement, compaction,
+generated source files and evidence reports. They are sampled process I/O,
+not an isolated engine write-amplification measurement or a bound on steady-state
+cost. RSS/HWM is sampled every 100 ms and file sizes once per completed day;
+neither proves a true peak or worst-case bound. The clock-injected synthetic
+profile does not qualify 10 GiB/day, representative corpus density, concurrent
+query/intake bursts, quota pressure, power loss or forced physical reclamation.
+
+Both evidence directories preserve collectors, configurations, source/gate/
+selected-build identity, hardware/filesystem evidence, reports and generated
+inputs. The live daemon remained source `2f1f8ff`, PID 2129972, during both runs;
+a read-only status check reported the same store identity, 212 records and zero
+pins. No service lifecycle action or public ingestion was needed.
