@@ -6,14 +6,98 @@
 use purrdf_lex::json::{Object, Value};
 use sparrow_core::EvictionLimits;
 use sparrow_server::ServerConfig;
-use std::{io::Read, path::Path, time::Instant};
+use std::{
+    io::{BufWriter, Read, Write},
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+struct Profile {
+    json_rows: usize,
+    log_rows: usize,
+    opaque_bytes: usize,
+}
+
+impl Profile {
+    fn records(&self, index: usize) -> usize {
+        match index {
+            0 => self.json_rows,
+            1 => self.json_rows + 1,
+            2 => self.log_rows,
+            3 => 1,
+            _ => unreachable!("four specified artifact kinds"),
+        }
+    }
+}
+
+struct Evidence {
+    day: u64,
+    index: usize,
+    id: String,
+    path: PathBuf,
+    bytes: usize,
+}
+
+fn verify_bytes(
+    store: &sparrow_core::Store,
+    evidence: &Evidence,
+    now: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = std::fs::File::open(&evidence.path)?;
+    if file.metadata()?.len() != evidence.bytes as u64 {
+        return Err("saved input length changed".into());
+    }
+    let mut original = [0_u8; 64 * 1024];
+    let mut offset = 0;
+    while offset < evidence.bytes {
+        let count = original.len().min(evidence.bytes - offset);
+        file.read_exact(&mut original[..count])?;
+        if store.bytes(&evidence.id, offset as u64, count, now)? != original[..count] {
+            return Err("retained whole-artifact bytes differ".into());
+        }
+        offset += count;
+    }
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 2 || !["none", "sparse", "dense"].contains(&args[1].as_str()) {
-        return Err("usage: turnover CONFIG none|sparse|dense (new offline store only)".into());
+    if ![2, 5].contains(&args.len()) || !["none", "sparse", "dense"].contains(&args[1].as_str()) {
+        return Err("usage: turnover CONFIG none|sparse|dense [JSON_ROWS LOG_ROWS OPAQUE_BYTES] (new offline store only)".into());
     }
     let config = ServerConfig::read(Path::new(&args[0]))?;
+    let profile = if args.len() == 5 {
+        Profile {
+            json_rows: args[2].parse()?,
+            log_rows: args[3].parse()?,
+            opaque_bytes: args[4].parse()?,
+        }
+    } else {
+        Profile {
+            json_rows: 8,
+            log_rows: 32,
+            opaque_bytes: 64 * 1024,
+        }
+    };
+    if profile.json_rows == 0
+        || profile.json_rows >= config.max_records
+        || profile.log_rows == 0
+        || profile.log_rows > config.max_records
+        || profile.opaque_bytes == 0
+        || profile.opaque_bytes > config.max_artifact_bytes
+    {
+        return Err(
+            "fixture sizes must be positive and fit configured artifact/record admission".into(),
+        );
+    }
+    let daily_records = (0..4)
+        .map(|i| profile.records(i))
+        .try_fold(0_usize, |sum, count| sum.checked_add(count))
+        .ok_or("fixture record count overflow")?;
+    let max_passes = daily_records
+        .checked_mul(120)
+        .and_then(|n| n.checked_add(2048))
+        .ok_or("fixture expiry ceiling overflow")?;
     if config.data_dir.exists()
         || !config.consume.is_empty()
         || !config.syslog.is_empty()
@@ -30,14 +114,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = config.open_store()?;
     let identity = store.store_id()?;
     let mut inputs = Vec::new();
-    let mut daily = Vec::new();
+    let daily_path = input_dir.join("daily.jsonl");
+    let rdf_path = input_dir.join("pinned-rdf.jsonl");
+    let mut daily = BufWriter::new(std::fs::File::create_new(&daily_path)?);
+    let mut rdf = BufWriter::new(std::fs::File::create_new(&rdf_path)?);
+    let mut first_ids = Vec::new();
     let mut pin = None;
     let mut raw_bytes = 0_u64;
     let mut random = std::fs::File::open("/dev/urandom")?;
     for day in 0..60_u64 {
         let now = day * day_millis;
         let mut maintenance = Vec::new();
-        for pass in 0..1024 {
+        for pass in 0..max_passes {
             let report = store.expire_bounded(now, EvictionLimits::default())?;
             maintenance.push(Value::from(
                 Object::new()
@@ -49,13 +137,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !report.continuation {
                 break;
             }
-            if pass == 1023 {
+            if pass + 1 == max_passes {
                 return Err("finite expiry traversal failed to complete".into());
             }
         }
-        let repeated = b"{\"message\":\"repeated turnover content\",\"value\":1.00}\n".repeat(8);
+        let repeated_row = b"{\"message\":\"repeated turnover content\",\"value\":1.00}\n";
+        let repeated = repeated_row.repeat(profile.json_rows);
         let mut changing = Vec::new();
-        for index in 0..8_u32 {
+        for index in 0..profile.json_rows {
             changing.extend_from_slice(
                 purrdf_lex::json::write_compact(
                     &Object::new()
@@ -69,8 +158,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             changing.push(b'\n');
         }
         changing.extend_from_slice(b"{malformed turnover record\n");
-        let log = b"repeated turnover log record\r\n".repeat(32);
-        let mut opaque = vec![0_u8; 64 * 1024];
+        let log = b"repeated turnover log record\r\n".repeat(profile.log_rows);
+        let mut opaque = vec![0_u8; profile.opaque_bytes];
         random.read_exact(&mut opaque)?;
         let day_started = Instant::now();
         let mut accepted = Vec::new();
@@ -83,7 +172,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .enumerate()
         {
-            std::fs::write(input_dir.join(format!("{day}-{index}")), &bytes)?;
+            let path = input_dir.join(format!("{day}-{index}"));
+            std::fs::write(&path, &bytes)?;
             let receipt = store.ingest(
                 &format!("turnover-{day}-{index}"),
                 "turnover",
@@ -95,8 +185,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if receipt.expires_at != now + 30 * day_millis {
                 return Err("ordinary retention deadline differs from 30 days".into());
             }
-            if store.bytes(&receipt.id, 0, bytes.len(), now)? != bytes {
-                return Err("accepted artifact bytes differ".into());
+            if receipt.record_ids.len() != profile.records(index) {
+                return Err("accepted record count differs from fixture specification".into());
             }
             let digest = format!(
                 "blake3:{}",
@@ -111,17 +201,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with("payload_id", digest)
                     .with("format", format)
                     .with("bytes", bytes.len().to_string())
-                    .with("records", receipt.record_ids.len()),
+                    .with("records", profile.records(index)),
             ));
-            inputs.push((day, index, receipt, bytes));
+            if day == 0 {
+                first_ids.extend(receipt.record_ids);
+            }
+            let evidence = Evidence {
+                day,
+                index,
+                id: receipt.id,
+                path,
+                bytes: bytes.len(),
+            };
+            verify_bytes(&store, &evidence, now)?;
+            inputs.push(evidence);
         }
         if args[1] == "dense" || (day == 0 && args[1] == "sparse") {
             let targets = if args[1] == "sparse" {
-                vec![inputs[0].2.record_ids[0].clone()]
+                vec![first_ids[0].clone()]
             } else {
                 inputs[inputs.len() - 4..]
                     .iter()
-                    .map(|(_, _, receipt, _)| receipt.id.clone())
+                    .map(|evidence| evidence.id.clone())
                     .collect()
             };
             pin = Some(store.pin(
@@ -134,10 +235,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let expected: usize = inputs
             .iter()
-            .map(|(accepted_day, index, receipt, _)| {
-                if day < accepted_day + 30 || args[1] == "dense" {
-                    receipt.record_ids.len()
-                } else if *accepted_day == 0 && *index == 0 && args[1] == "sparse" {
+            .map(|evidence| {
+                if day < evidence.day + 30 || args[1] == "dense" {
+                    profile.records(evidence.index)
+                } else if evidence.day == 0 && evidence.index == 0 && args[1] == "sparse" {
                     1
                 } else {
                     0
@@ -151,54 +252,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        for (accepted_day, index, receipt, bytes) in &inputs {
-            let whole = day < accepted_day + 30 || args[1] == "dense";
-            let result = store.bytes(&receipt.id, 0, bytes.len(), now);
+        for evidence in &inputs {
+            let whole = day < evidence.day + 30 || args[1] == "dense";
             if whole {
-                if result? != *bytes {
-                    return Err("retained whole-artifact bytes differ".into());
-                }
-            } else if !matches!(result, Err(ref e) if e.code == "EVIDENCE_UNAVAILABLE" || e.code == "NOT_FOUND")
+                verify_bytes(&store, evidence, now)?;
+            } else if !matches!(store.bytes(&evidence.id, 0, 1, now), Err(ref e) if e.code == "EVIDENCE_UNAVAILABLE" || e.code == "NOT_FOUND")
             {
                 return Err("expired parent remains downloadable".into());
             }
-            if *accepted_day == 0 && *index == 0 && args[1] == "sparse" {
-                let record = store.record(&receipt.record_ids[0])?;
-                if store.bytes(
-                    &record.id,
-                    0,
-                    (record.byte_end - record.byte_start) as usize,
-                    now,
-                )? != bytes[record.byte_start as usize..record.byte_end as usize]
-                {
-                    return Err("sparse pinned record lost original bytes".into());
-                }
-                store.rdf_inspect(&record.id, now)?;
+            if evidence.day == 0
+                && evidence.index == 0
+                && args[1] == "sparse"
+                && store.bytes(&first_ids[0], 0, repeated_row.len(), now)? != repeated_row
+            {
+                return Err("sparse pinned record lost original bytes".into());
             }
         }
-        let mut pinned_rdf = Vec::new();
         if args[1] != "none" {
-            for (_, _, receipt, _) in &inputs[..4] {
-                for id in &receipt.record_ids {
-                    if args[1] == "dense" || id == &inputs[0].2.record_ids[0] {
-                        pinned_rdf.push(store.rdf_inspect(id, now)?);
-                    }
+            for id in &first_ids {
+                if args[1] == "dense" || id == &first_ids[0] {
+                    writeln!(
+                        rdf,
+                        "{}",
+                        purrdf_lex::json::write_compact(
+                            &Object::new()
+                                .with("day", day)
+                                .with("record_id", id.as_str())
+                                .with("inspection", store.rdf_inspect(id, now)?)
+                                .into()
+                        )
+                    )?;
                 }
             }
         }
-        daily.push(Value::from(
-            Object::new()
-                .with("day", day)
-                .with("expected_records", expected)
-                .with("accepted", Value::array(accepted))
-                .with("maintenance", Value::array(maintenance))
-                .with("pinned_rdf", Value::array(pinned_rdf))
-                .with(
-                    "ingest_and_verify_seconds",
-                    day_started.elapsed().as_secs_f64(),
-                )
-                .with("status", status),
-        ));
+        writeln!(
+            daily,
+            "{}",
+            purrdf_lex::json::write_compact(&Value::from(
+                Object::new()
+                    .with("day", day)
+                    .with("expected_records", expected)
+                    .with("accepted", Value::array(accepted))
+                    .with("maintenance", Value::array(maintenance))
+                    .with(
+                        "ingest_and_verify_seconds",
+                        day_started.elapsed().as_secs_f64(),
+                    )
+                    .with("status", status),
+            ))
+        )?;
+        daily.flush()?;
+        rdf.flush()?;
         if day == 29 || day == 30 || day == 59 {
             store.flush()?;
             drop(store);
@@ -215,7 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pin) = pin {
         store.release(&pin.id)?;
     }
-    let expired = &inputs[0].2.record_ids[0];
+    let expired = &first_ids[0];
     if !matches!(store.bytes(expired, 0, 1, 60 * day_millis), Err(ref e) if e.code == "EVIDENCE_UNAVAILABLE" || e.code == "NOT_FOUND")
     {
         return Err("released expired evidence remains eligible".into());
@@ -231,7 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !report.continuation {
             break;
         }
-        if final_passes >= 1024 {
+        if final_passes >= max_passes {
             return Err("final finite expiry traversal failed to complete".into());
         }
     }
@@ -241,6 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "live_records",
         "active_pins",
         "unique_payload_chunks",
+        "unique_json_projections",
         "record_read_handles",
         "record_read_bytes",
     ] {
@@ -256,10 +361,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("final reopen resurrected retired evidence".into());
     }
     println!("{}", purrdf_lex::json::write_compact(&Object::new()
+        .with("complete", true).with("report_format", "turnover/2")
+        .with("json_rows", profile.json_rows).with("log_rows", profile.log_rows).with("opaque_bytes", profile.opaque_bytes).with("records_per_day", daily_records).with("max_expiry_passes", max_passes)
         .with("method", "60 simulated daily cohorts; native retention/pins/bytes/RDF; no listeners; bounded expiry passes; reopen at days 29,30,59 and90; random opaque input; physical reclamation not certified")
         .with("pin_mode", args[1].as_str()).with("store_id", identity)
         .with("accepted_raw_bytes", raw_bytes.to_string()).with("elapsed_seconds", started.elapsed().as_secs_f64())
-        .with("daily", Value::array(daily)).with("before_release", before_release)
+        .with("daily_path", daily_path.to_str().ok_or("non-UTF8 report path")?).with("pinned_rdf_path", rdf_path.to_str().ok_or("non-UTF8 report path")?).with("before_release", before_release)
         .with("final_expiry_passes", final_passes).with("final_status", final_status).into()));
     Ok(())
 }

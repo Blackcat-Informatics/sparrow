@@ -6,6 +6,8 @@ using an injected UTC clock. It accepts a configuration and one pin mode:
 ```bash
 cargo build --locked --release -p sparrow-server --example turnover
 target/release/examples/turnover /absolute/path/config.toml none > report.json
+# Optional fixture sizes: repeated/changing JSON rows, log rows, opaque bytes.
+target/release/examples/turnover /another/config.toml dense 128 1024 1048576 > report.json
 ```
 
 The configuration must select a nonexistent data directory with no consume,
@@ -14,26 +16,37 @@ Existing stores are refused before opening. Run each mode against its own new
 store. Configuration errors, storage failures and failed assertions terminate
 with nonzero status; partial output is not a successful report.
 
-Sixty simulated daily cohorts each contain eight repeated JSONL records, eight
+By default, sixty simulated daily cohorts each contain eight repeated JSONL records, eight
 changing JSONL records plus one deliberately malformed record, 32 repeated CRLF
 log records and one 64 KiB OS-random opaque record. Native JSON serialization,
 ingestion, projection, hashing, exact bytes, pin protection and dependency
 retirement retain their existing owners. Generated inputs are saved beside the
 store in `store.inputs`; each accepted artifact identity, native content hash and
-byte length is recorded. No tokenizer, projector or retention implementation is
+byte length is recorded. Optional sizes must be positive and fit configured
+artifact/record admission; production storage limits still apply. No tokenizer, projector or retention implementation is
 copied into the qualifier.
 
 `none` protects no evidence. `sparse` protects one record from the first JSONL
 artifact. `dense` adds all four artifacts from every daily cohort to a named
 pin. Each pin mutation requests 90 days and uses its own stable request identity.
-The independent count oracle expects 50 records per cohort, a 30-day ordinary
-window, and the concrete selected protection. Every daily traversal uses finite
-production expiry passes, with a hard 1,024-pass qualification ceiling.
+The independent count oracle derives records from the fixture specification
+(`2 * JSON_ROWS + LOG_ROWS + 2`, default 50), verifies each receipt against that
+count, and applies a 30-day ordinary window and the selected protection. It does
+not derive expected counts from returned receipts. Every daily traversal uses
+finite production expiry passes. The qualification ceiling is twice the total
+specified record count plus 2,048 passes; production per-pass limits are unchanged.
 
 Daily verification checks exact bytes for every retained whole artifact,
 unavailability of expired parents, sparse record bytes after its parent expires,
 and native RDF inspection of the first protected cohort. The report preserves
-those native inspection results for comparison across days. Stores reopen at days
+those native inspection results for comparison across days. Report format
+`turnover/2` streams daily rows to `store.inputs/daily.jsonl` and individual native
+inspections to `store.inputs/pinned-rdf.jsonl`; the final stdout summary names
+both paths and carries `complete: true` only after all checks succeed. A partial
+JSONL file is diagnostic evidence, not a successful qualification. Exact-byte
+comparison uses 64 KiB file-backed reads. The tool retains occurrence metadata
+and first-cohort record IDs, rather than all sixty input bodies or RDF reports.
+Stores reopen at days
 29, 30 and 59, retaining identity and membership. At day 60 pins are released;
 expired first-cohort bytes and attempts to pin them must refuse. Day 90 cleanup
 and another reopen must leave zero records, active pins, payload ownership and
@@ -48,7 +61,11 @@ subject to the [native binding gap](native-reclamation.md). This does not qualif
 production-volume throughput, steady-state density, quota pressure or full
 architecture acceptance.
 
-## Qualified run
+## Historical default-size qualified run
+
+The evidence below uses the preceding report format, which embeds daily and RDF
+rows in the final JSON document. It does not qualify the optional larger profile
+or the streaming report implementation.
 
 Signed source `c5e776c` passed the full source gate and normal commit hook:
 142 storage scenarios, 52 RPC scenarios, 17 SDK tests, remaining workspace
