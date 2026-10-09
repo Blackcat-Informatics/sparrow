@@ -16,7 +16,10 @@ const PAGE_BYTES: usize = 32 * 1024 * 1024;
 const PAGE_ENTRIES: usize = 512;
 
 pub(super) fn key(artifact: &Artifact) -> String {
-    format!("empty-time:{:020}:{}", artifact.received_at, artifact.id)
+    key_parts(artifact.received_at, &artifact.id)
+}
+pub(super) fn key_parts(received_at: u64, id: &str) -> String {
+    format!("empty-time:{received_at:020}:{id}")
 }
 
 pub(super) fn publish(batch: &mut WriteBatch, artifact: &Artifact) -> Result<(), Error> {
@@ -149,6 +152,7 @@ pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
         || format == super::consumption::TAIL_FORMAT
         || format == super::pressure::WATCH_FORMAT
         || format == super::receiver_stream::WATCH_FORMAT
+        || format == super::manifest_retire::WATCH_FORMAT
 }
 
 /// Startup is unavailable until this persistent index is complete. Each page is durable.

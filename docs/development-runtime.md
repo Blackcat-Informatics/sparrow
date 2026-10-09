@@ -9,6 +9,51 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Bounded manifest retirement
+
+The current implementation branch extends maintenance beyond the earlier
+8,000-record structural-admission fix. PurRDF's borrowed JSON reader validates
+the original artifact catalog and its string arrays. Sparrow retains the encoded
+row, scalar metadata and a finite payload prefix rather than building an owned
+tree for both large arrays. The existing artifact codec still owns scalar field
+semantics. Retry-row expiry uses the same borrowed manifest validation; agent
+retries retain their original complete receipt.
+
+Retirement commits a 17-byte original-count, retired-prefix and eviction-state
+checkpoint atomically with payload reference changes. Original artifact catalogs
+are unchanged. Stored catalog reads resolve effective ownership and availability
+through that checkpoint, including artifact discovery. Reopen resumes ownership
+retirement without relying on an ephemeral traversal cursor. A refused batch
+publishes neither the checkpoint nor the cursor advance. Logical reclamation
+does not certify native physical reclamation.
+
+The first checkpoint fences the store at format 42, or 43 with a watch registry.
+An explicit feature byte records whether the receiver registry is required.
+The shared writer appends this fence after observing native batch publication,
+so later watch, receiver, pressure and ingestion writes cannot downgrade it.
+Missing or malformed feature/registry state fails. Older installed daemons cannot
+open a store after this fence is committed. Wire schema 48 and the PurRDF revision
+are unchanged. Existing finite pass limits remain in force; encoded rows and
+bounded retained prefixes must fit catalog admission.
+
+The staged 30,000-record fixture passes bounded live traversal, pressure eviction
+and expiry while preserving one record pin's exact bytes, followed by complete
+logical payload cleanup after release. Its focused run is
+`/tmp/sparrow-manifest-large-after.log` (44.14 seconds). Direct publication of this
+fixture refuses the existing 64 MiB RDF write-staging ceiling; staged record
+preparation exercises an accepted artifact without relaxing that limit. Release
+verification covers 158 storage scenarios, 14 core unit tests, 60 RPC integration
+scenarios, SDK and remaining workspace tests, seeded census self-tests and the
+pinned cross gate: 246 ownership jobs with no distinct exceptions. Checkpoint
+tests cover partial retirement across reopen, original root/receipt preservation,
+atomic batch refusal, corrupt widths/counts/offsets/flags and registry loss.
+Native JSON fixtures cover escaped strings, reordered members and invalid arrays.
+Full verification is recorded in `/tmp/sparrow-manifest-gate-complete.log` and the
+normal signed commit hook in `/tmp/sparrow-manifest-commit.log`. Deployment remains
+in progress. The enabled public
+server remains the installed source documented above. Maximum-size manifests,
+sustained turnover throughput and physical reclamation acceptance remain unproven.
+
 ## Structural stored-catalog admission
 
 An accepted 8,000-record manifest exposed a retention failure: multiplying every

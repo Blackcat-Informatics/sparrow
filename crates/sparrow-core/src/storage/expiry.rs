@@ -4,9 +4,7 @@
 //! Finite catalog expiry, sharing all dependency retirement with eviction.
 
 use super::eviction::EvictionLimits;
-use super::{
-    Artifact, Catalog, DAY, Error, Pin, Record, Store, Writer, integer, parse, put, retire,
-};
+use super::{Catalog, DAY, Error, Pin, Record, Store, Writer, parse, put, retire};
 use rocksdb::{Direction, IteratorMode};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -156,6 +154,84 @@ impl Writer {
                         "expiry catalog key exceeds its bounded identity contract",
                     ));
                 }
+                if position.phase == Phase::Artifacts {
+                    let id = std::str::from_utf8(&key)
+                        .map_err(|error| Error::new("STORAGE_FAILURE", error.to_string()))?;
+                    let mut artifact = match super::manifest_retire::Envelope::read(
+                        self,
+                        id,
+                        &bytes,
+                        limits.max_payload_refs - report.payload_refs,
+                        &mut catalog,
+                    ) {
+                        Ok(artifact) => artifact,
+                        Err(error) if error.code == "RESOURCE_LIMIT" && report.visited != 0 => {
+                            report.frontier = ExpiryFrontier::CatalogBudget;
+                            break 'phases;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    report.visited += 1;
+                    if !Self::artifact_eligible(
+                        &artifact.id,
+                        artifact.evicted(),
+                        artifact.expires_at,
+                        now,
+                        &protected,
+                    ) {
+                        if artifact.pending() != 0 {
+                            if report.records + report.artifacts == limits.max_records as u64 {
+                                report.frontier = ExpiryFrontier::UnitLimit;
+                                break 'phases;
+                            }
+                            let remaining = limits.max_payload_refs - report.payload_refs;
+                            if remaining == 0 {
+                                report.frontier = ExpiryFrontier::PayloadBudget;
+                                break 'phases;
+                            }
+                            report.payload_refs += retirement.artifact(&mut artifact, remaining)?;
+                            report.artifacts += 1;
+                            if artifact.pending() != 0 {
+                                position.next = Some((key.to_vec(), true));
+                                report.frontier = ExpiryFrontier::PayloadBudget;
+                                break 'phases;
+                            }
+                        }
+                        if artifact.expires_at.saturating_add(DAY) <= now {
+                            retirement.batch.delete(&key);
+                            retirement.batch.delete(super::recordless::key_parts(
+                                artifact.received_at,
+                                &artifact.id,
+                            ));
+                            super::manifest_retire::remove(&mut retirement.batch, &artifact.id);
+                            report.deleted += 1;
+                        }
+                    }
+                    position.next = Some((key.to_vec(), false));
+                    continue;
+                }
+                if position.phase == Phase::Requests {
+                    let (expires_at, managed) = match super::manifest_retire::request_expiry(
+                        self,
+                        &key,
+                        &bytes,
+                        &mut catalog,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) if error.code == "RESOURCE_LIMIT" && report.visited != 0 => {
+                            report.frontier = ExpiryFrontier::CatalogBudget;
+                            break 'phases;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    report.visited += 1;
+                    if !managed && expires_at <= now {
+                        retirement.batch.delete(&key);
+                        report.deleted += 1;
+                    }
+                    position.next = Some((key.to_vec(), false));
+                    continue;
+                }
                 match Self::charge_catalog_shape(&mut catalog, &bytes) {
                     Ok(()) => {}
                     Err(error) if error.code == "RESOURCE_LIMIT" && report.visited != 0 => {
@@ -167,42 +243,6 @@ impl Writer {
                 let value = parse(&bytes)?;
                 report.visited += 1;
                 match position.phase {
-                    Phase::Artifacts => {
-                        let mut artifact = Artifact::decode(&value)?;
-                        if key.as_ref() != artifact.id.as_bytes() {
-                            return Err(Error::new(
-                                "STORAGE_FAILURE",
-                                "expiry artifact catalog identity mismatch",
-                            ));
-                        }
-                        if !self.live_artifact(&artifact, now, &protected) {
-                            if !artifact.chunks.is_empty() {
-                                if report.records + report.artifacts == limits.max_records as u64 {
-                                    report.frontier = ExpiryFrontier::UnitLimit;
-                                    break 'phases;
-                                }
-                                let remaining = limits.max_payload_refs - report.payload_refs;
-                                if remaining == 0 {
-                                    report.frontier = ExpiryFrontier::PayloadBudget;
-                                    break 'phases;
-                                }
-                                report.payload_refs +=
-                                    retirement.artifact(&mut artifact, remaining)?;
-                                report.artifacts += 1;
-                                put(&mut retirement.batch, &artifact.id, &artifact);
-                                if !artifact.chunks.is_empty() {
-                                    position.next = Some((key.to_vec(), true));
-                                    report.frontier = ExpiryFrontier::PayloadBudget;
-                                    break 'phases;
-                                }
-                            }
-                            if artifact.expires_at.saturating_add(DAY) <= now {
-                                retirement.batch.delete(&key);
-                                retirement.batch.delete(super::recordless::key(&artifact));
-                                report.deleted += 1;
-                            }
-                        }
-                    }
                     Phase::Records => {
                         let mut record = Record::decode(&value)?;
                         if key.as_ref() != record.id.as_bytes() {
@@ -254,13 +294,8 @@ impl Writer {
                             report.deleted += 1;
                         }
                     }
-                    Phase::Requests => {
-                        if !self.managed_consumption_request(&key, &value)?
-                            && integer(&value, "expires_at")? <= now
-                        {
-                            retirement.batch.delete(&key);
-                            report.deleted += 1;
-                        }
+                    Phase::Artifacts | Phase::Requests => {
+                        unreachable!("streamed phases handled above")
                     }
                 }
                 position.next = Some((key.to_vec(), false));
@@ -272,7 +307,8 @@ impl Writer {
             position.next = None;
         }
         let batch = retirement.finish()?;
-        if batch.size_in_bytes() > limits.max_batch_bytes {
+        // The shared writer appends the bounded format and feature fence.
+        if batch.size_in_bytes().saturating_add(256) > limits.max_batch_bytes {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "expiry batch exceeds native write admission",

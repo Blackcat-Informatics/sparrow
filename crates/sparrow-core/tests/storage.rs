@@ -1006,6 +1006,7 @@ fn complete_file_reads_refuse_missing_and_foreign_range_members_without_returnin
 
 #[test]
 fn retained_tail_ranges_follow_pins_and_upgrade_without_resurrecting_retired_bytes() {
+    use purrdf_lex::json::record::ToJson;
     use sparrow_core::{ConsumptionGeneration, TailFinishIntent, TailStart};
     for legacy in 29..=32 {
         let dir = tempfile::tempdir().unwrap();
@@ -1076,6 +1077,10 @@ fn retained_tail_ranges_follow_pins_and_upgrade_without_resurrecting_retired_byt
         let store = Store::open(dir.path(), config()).unwrap();
         store.expire(31 * DAY).unwrap();
         assert_eq!(store.bytes(&original.id, 0, 2, 31 * DAY).unwrap(), b"b\n");
+        // Construct the actual legacy encoding: its root carries effective
+        // ownership directly and has no retirement checkpoint or feature fence.
+        let legacy_artifact =
+            purrdf_lex::json::write_compact(&store.artifact(&artifact.id).unwrap().to_json());
         drop(store);
         {
             let db = catalog_db(dir.path()).unwrap();
@@ -1086,6 +1091,10 @@ fn retained_tail_ranges_follow_pins_and_upgrade_without_resurrecting_retired_byt
                 1
             );
             remove_tail_range_index(&db).unwrap();
+            db.put(&artifact.id, &legacy_artifact).unwrap();
+            db.delete(format!("artifact-retirement:{}", artifact.id))
+                .unwrap();
+            db.delete("manifest-retirement-features").unwrap();
             db.put("store_format", format!("sparrow.store/{legacy}"))
                 .unwrap();
         }
@@ -3503,16 +3512,208 @@ fn bounded_expiry_batch_and_catalog_refusal_preserve_dependencies_and_position()
 }
 
 #[test]
-fn bounded_expiry_traverses_large_accepted_manifest_and_preserves_record_pin() {
+fn manifest_retirement_survives_reopen_without_rewriting_original_catalog_or_receipt() {
     use purrdf_lex::json::record::ToJson;
     use sparrow_core::EvictionLimits;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    let input = b"needle\n".repeat(8000);
-    let artifact = store
-        .ingest("expiry-large", "large", "log", &input, 0)
+    let input = b"needle\n".repeat(130);
+    let original = store
+        .ingest("manifest-resume", "source", "log", &input, 0)
         .unwrap();
-    assert_eq!(artifact.record_ids.len(), 8000);
+    let limits = EvictionLimits {
+        max_payload_refs: 4,
+        ..EvictionLimits::default()
+    };
+    let first = store.evict_oldest(1, limits).unwrap();
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(first.payload_refs, 4);
+    assert_eq!(first.pending_manifest_refs, 127);
+    assert_eq!(
+        store.artifact(&original.id).unwrap().to_json()["chunks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        127
+    );
+    assert_eq!(
+        store
+            .ingest("manifest-resume", "source", "log", &input, 1)
+            .unwrap()
+            .to_json(),
+        original.to_json()
+    );
+    assert_eq!(
+        store.bytes(&original.id, 0, 1, 1).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    drop(store);
+    let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+    let root = db.get(&original.id).unwrap().unwrap();
+    assert_eq!(
+        db.get("store_format").unwrap().as_deref(),
+        Some(b"sparrow.store/42".as_slice())
+    );
+    let position = db
+        .get(format!("artifact-retirement:{}", original.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(position.len(), 17);
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let refused = store
+        .evict_oldest(
+            2,
+            EvictionLimits {
+                max_batch_bytes: 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert_eq!(
+        store.artifact(&original.id).unwrap().to_json()["chunks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        127
+    );
+    let next = store.evict_oldest(2, limits).unwrap();
+    assert_eq!(next.pending_manifest_refs, 123);
+    assert_eq!(next.payload_refs, 4);
+    drop(store);
+    let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+    assert_eq!(db.get(&original.id).unwrap().unwrap(), root);
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    for _ in 0..200 {
+        if !store.expire_bounded(30 * DAY, limits).unwrap().continuation {
+            break;
+        }
+    }
+    assert!(
+        store.artifact(&original.id).unwrap().to_json()["chunks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.status(30 * DAY).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+}
+
+#[test]
+fn manifest_retirement_fences_later_writers_and_rejects_corrupt_state() {
+    use sparrow_core::{EvictionLimits, ReceiverDiscard, SyslogReceiver};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("manifest-fence", "source", "log", b"one\ntwo\n", 0)
+        .unwrap();
+    store
+        .evict_oldest(
+            1,
+            EvictionLimits {
+                max_payload_refs: 1,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    store.watch_registry_replace(None, b"watch-state").unwrap();
+    let receiver = SyslogReceiver::new("udp", "udp").unwrap();
+    store
+        .discard_syslog("receiver", &receiver, ReceiverDiscard::Truncated, 2)
+        .unwrap();
+    store
+        .ingest("later-write", "source", "log", b"later", 3)
+        .unwrap();
+    assert_eq!(
+        store.status(3).unwrap()["store_format"].as_str(),
+        Some("sparrow.store/43")
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let key = format!("artifact-retirement:{}", artifact.id);
+    let intact = db.get(&key).unwrap().unwrap();
+    let registry = db.get("syslog-receiver-registry").unwrap().unwrap();
+    assert_eq!(
+        db.get("manifest-retirement-features").unwrap().as_deref(),
+        Some([1].as_slice())
+    );
+    drop(db);
+    // Width, count, offset and flag corruption are never accepted as empty ownership.
+    for invalid in [
+        vec![0; 16],
+        {
+            let mut bytes = intact.clone();
+            bytes[..8].copy_from_slice(&3_u64.to_be_bytes());
+            bytes
+        },
+        {
+            let mut bytes = intact.clone();
+            bytes[8..16].copy_from_slice(&3_u64.to_be_bytes());
+            bytes
+        },
+        {
+            let mut bytes = intact.clone();
+            bytes[16] = 2;
+            bytes
+        },
+    ] {
+        let db = catalog_db(dir.path()).unwrap();
+        db.put(&key, invalid).unwrap();
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            store.artifact(&artifact.id).unwrap_err().code,
+            "STORAGE_FAILURE"
+        );
+        assert_eq!(
+            store
+                .evict_oldest(4, EvictionLimits::default())
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        drop(store);
+    }
+    let db = catalog_db(dir.path()).unwrap();
+    db.put(&key, &intact).unwrap();
+    db.delete("syslog-receiver-registry").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("syslog-receiver-registry", registry).unwrap();
+    db.put("manifest-retirement-features", [2]).unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+}
+
+#[test]
+fn bounded_expiry_traverses_large_accepted_manifest_and_preserves_record_pin() {
+    use purrdf_lex::json::record::ToJson;
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.max_records = 100000;
+    settings.disk_budget = 2 * 1024 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let input = b"needle\n".repeat(30000);
+    let manifest = stage_fixture(&store, "expiry-large", "log", &input);
+    for ordinal in 0..manifest.layout_records {
+        store
+            .import_prepare_record(&manifest.id, ordinal, 0)
+            .unwrap();
+    }
+    let artifact = store.import_publish(&manifest.id, 0).unwrap();
+    assert_eq!(artifact.record_ids.len(), 30000);
     let limits = EvictionLimits::default();
     assert!(
         purrdf_lex::json::write_compact(&artifact.to_json()).len() * 64 > limits.max_catalog_bytes
@@ -3557,7 +3758,7 @@ fn bounded_expiry_traverses_large_accepted_manifest_and_preserves_record_pin() {
         }
     }
     assert!(exhausted);
-    assert_eq!(retired, 7999);
+    assert_eq!(retired, 29999);
     assert_eq!(
         store
             .bytes(&artifact.record_ids[0], 0, 7, 30 * DAY)
@@ -3892,7 +4093,7 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     // Force a strictly larger linked footprint: this is no native recovery observation.
     assert_eq!(
         store.status(4).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/38")
+        Some("sparrow.store/42")
     );
     file.set_len(15 * 1024 * 1024).unwrap();
     drop(file);
@@ -3930,21 +4131,21 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/38".as_slice())
+        Some(b"sparrow.store/42".as_slice())
     );
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/39")
+        Some("sparrow.store/43")
     );
     store
         .watch_registry_replace(Some(b"registered"), b"updated")
         .unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/39")
+        Some("sparrow.store/43")
     );
 }
 

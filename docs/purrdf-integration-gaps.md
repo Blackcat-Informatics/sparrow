@@ -21,7 +21,7 @@ ASK, CONSTRUCT and DESCRIBE refuse with
 `native-sparql-workspace-unpriced`; modifiers, paths, expressions, aggregates,
 explicit datasets and extension contexts also require native workspace pricing.
 The live sibling's corresponding admission implementation was read again on
-2026-10-08 at `df2cec88b0f8e05e05ef3d01d14714474be6bbb1`; it retains the same
+2026-10-08 from committed source at `341ad5ae2cecc5de026047f86dcd1194aff25f10`; it retains the same
 limitation. Runtime and census pins are unchanged. No sibling source was changed.
 
 The upstream task is to extend certified workspace admission through the existing

@@ -414,6 +414,8 @@ impl Writer {
                     TAIL_FORMAT
                         | super::pressure::WATCH_FORMAT
                         | super::receiver_stream::WATCH_FORMAT
+                        | super::manifest_retire::FORMAT
+                        | super::manifest_retire::WATCH_FORMAT
                 )
             )
         {

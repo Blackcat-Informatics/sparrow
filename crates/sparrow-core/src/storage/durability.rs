@@ -134,7 +134,34 @@ impl Writer {
         let mut publication = super::eviction::Publication::default();
         batch.iterate_cf(&mut publication);
         publication.check()?;
-        if publication.receiver_registry || self.db.get(super::receiver_stream::KEY)?.is_some() {
+        let manifest_features = super::manifest_retire::features(&self.db)?;
+        if publication.manifest_retirement || manifest_features.is_some() {
+            let receiver_present = self.db.get(super::receiver_stream::KEY)?.is_some();
+            if manifest_features == Some(true)
+                && !receiver_present
+                && !publication.receiver_registry
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "manifest store lost its required receiver registry",
+                ));
+            }
+            let receiver = publication.receiver_registry
+                || receiver_present
+                || manifest_features == Some(true);
+            let watch = publication.watch_registry || self.db.get("watch_registry")?.is_some();
+            batch.put(super::manifest_retire::FEATURES, [u8::from(receiver)]);
+            batch.put(
+                "store_format",
+                if watch {
+                    super::manifest_retire::WATCH_FORMAT
+                } else {
+                    super::manifest_retire::FORMAT
+                },
+            );
+        } else if publication.receiver_registry
+            || self.db.get(super::receiver_stream::KEY)?.is_some()
+        {
             let watch = publication.watch_registry || self.db.get("watch_registry")?.is_some();
             batch.put(
                 "store_format",

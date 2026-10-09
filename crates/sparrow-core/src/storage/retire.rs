@@ -3,7 +3,7 @@
 
 //! Shared dependency retirement for ordinary expiry and abandoned preparation.
 
-use super::{Artifact, Error, Record, Writer, parse, rdf_index, read_field};
+use super::{Error, Record, Writer, parse, rdf_index, read_field};
 use rocksdb::WriteBatch;
 use std::collections::BTreeMap;
 
@@ -66,12 +66,19 @@ impl<'a> Retirement<'a> {
 
     pub(super) fn artifact(
         &mut self,
-        artifact: &mut Artifact,
+        artifact: &mut super::manifest_retire::Envelope,
         maximum: usize,
     ) -> Result<usize, Error> {
-        let count = artifact.chunks.len().min(maximum);
-        self.payloads(&artifact.chunks[..count], 1)?;
-        artifact.chunks.drain(..count);
+        let count = artifact.prefix.len().min(maximum);
+        if count == 0 && maximum > 0 && artifact.pending() > 0 {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "manifest retirement has no admitted payload prefix",
+            ));
+        }
+        self.payloads(&artifact.prefix[..count], 1)?;
+        artifact.advance(count)?;
+        artifact.stage(&mut self.batch);
         Ok(count)
     }
 

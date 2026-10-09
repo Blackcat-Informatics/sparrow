@@ -294,7 +294,7 @@ impl ArtifactCapture {
         admission.entry(bytes.len())?;
         let value = super::parse(bytes)?;
         let (summary, retained) = if key.starts_with(b"artifact:") {
-            let artifact = Artifact::decode(&value)?;
+            let artifact = Artifact::decode(&value)?.stored(writer)?;
             if artifact.id.as_bytes() != key {
                 return Err(Error::new(
                     "STORAGE_FAILURE",

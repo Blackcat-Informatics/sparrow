@@ -1716,8 +1716,8 @@ names = ['^(decode_context_time_record|decode_eviction_time_record)$']
 [[job]]
 id = "bounded-catalog-decode"
 summary = "Read one native pinned catalog value and admit its encoded slice before the shared PurRDF decoder; aggregate captures keep their separate opaque-row charge."
-home = "sparrow_core::storage::Writer::get_admitted"
-entry_points = ["sparrow_core::storage::Writer::get_limited", "sparrow_core::storage::Writer::charge_catalog"]
+home = "sparrow_core::storage::Writer::read_catalog"
+entry_points = ["sparrow_core::storage::Writer::get_admitted", "sparrow_core::storage::Writer::get_limited", "sparrow_core::storage::manifest_retire::Envelope::read"]
 spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2258,7 +2258,7 @@ names = ['^(retry_claim_lock|wait_for_claim_lock)$']
 id = 'recordless-time-publication'
 summary = 'Publish one native receipt-time entry for recordless artifacts from direct ingestion, staged publication or upgrade; expiry uses the same key owner.'
 home = 'sparrow_core::storage::recordless::publish'
-entry_points = ['sparrow_core::storage::recordless::key', 'sparrow_core::storage::recordless::Writer::indexed_recordless']
+entry_points = ['sparrow_core::storage::recordless::key', 'sparrow_core::storage::recordless::key_parts', 'sparrow_core::storage::recordless::Writer::indexed_recordless']
 spec = "docs/development-runtime.md: schema 19 recordless artifact eviction."
 vectors = ["crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -3607,3 +3607,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(lookup_receiver_window_elsewhere|lookup_producer_window_elsewhere)$']
+
+[[job]]
+id = "bounded-artifact-retirement-envelope"
+summary = "PurRDF borrowed JSON events validate unchanged artifact arrays; Sparrow retains only a bounded payload prefix and the existing scalar codec owns field semantics. Stored catalogs resolve one durable ownership checkpoint, while original retry receipts remain unchanged."
+home = "sparrow_core::storage::manifest_retire::Envelope::read"
+entry_points = ["sparrow_core::storage::manifest_retire::resolve", "sparrow_core::storage::manifest_retire::request_expiry", "sparrow_core::storage::retire::Retirement::artifact", "sparrow_core::storage::Writer::artifact_eligible"]
+spec = "docs/development-runtime.md: bounded manifest retirement."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_artifact_retirement_elsewhere|rewrite_retry_manifest_for_expiry)$']
+
+[[job]]
+id = "manifest-retirement-writer-fence"
+summary = "One native batch publication observer and shared writer append the retirement format and required-registry feature fence atomically with ownership changes."
+home = "sparrow_core::storage::manifest_retire::features"
+entry_points = ["sparrow_core::storage::durability::Writer::apply", "sparrow_core::storage::receiver_stream::registry", "sparrow_core::storage::eviction::Publication::put_cf"]
+spec = "docs/development-runtime.md: bounded manifest retirement."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(stage_manifest_fence_elsewhere|decode_retirement_features_elsewhere)$']

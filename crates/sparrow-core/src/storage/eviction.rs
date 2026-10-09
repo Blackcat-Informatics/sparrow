@@ -3,7 +3,7 @@
 
 //! Serialized oldest-unpinned logical retirement. Physical reclamation is separate.
 
-use super::{Artifact, DAY, Error, Store, Writer, put, recordless, retire};
+use super::{DAY, Error, Store, Writer, put, recordless, retire};
 use rocksdb::{Direction, IteratorMode, WriteBatchIteratorCf};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +47,7 @@ pub(super) struct Publication {
     pub(super) pressure_wait: bool,
     pub(super) watch_registry: bool,
     pub(super) receiver_registry: bool,
+    pub(super) manifest_retirement: bool,
     invalid: bool,
 }
 
@@ -69,6 +70,7 @@ impl WriteBatchIteratorCf for Publication {
             self.pressure_wait |= key == super::pressure::WAIT_KEY.as_bytes();
             self.watch_registry |= key == b"watch_registry";
             self.receiver_registry |= key == super::receiver_stream::KEY.as_bytes();
+            self.manifest_retirement |= key.starts_with(super::manifest_retire::PREFIX);
         }
         if cf_id == 0
             && let Some(key) = key
@@ -232,7 +234,7 @@ impl Writer {
         };
         let mut next = start.clone();
         let mut retirement = retire::Retirement::new(writer)?;
-        let mut parents = BTreeMap::<String, Artifact>::new();
+        let mut parents = BTreeMap::<String, super::manifest_retire::Envelope>::new();
         let mut report = EvictionReport::default();
         for entry in writer.eviction_entries(start.as_ref().map(|(key, _)| key.as_slice())) {
             let (key, value) = entry?;
@@ -272,6 +274,7 @@ impl Writer {
                     break;
                 }
                 retirement.batch.delete(&artifact.id);
+                super::manifest_retire::remove(&mut retirement.batch, &artifact.id);
                 retirement.batch.delete(&key);
                 report.artifacts.push(artifact.id);
                 report.recordless_artifacts += 1;
@@ -293,14 +296,16 @@ impl Writer {
                 continue;
             }
             if !parents.contains_key(&record.artifact_id) {
-                match writer.get_limited::<Artifact>(&record.artifact_id, &mut catalog) {
+                match writer.read_catalog(&record.artifact_id, |bytes| {
+                    super::manifest_retire::Envelope::read(
+                        writer,
+                        &record.artifact_id,
+                        bytes,
+                        limits.max_payload_refs,
+                        &mut catalog,
+                    )
+                }) {
                     Ok(parent) => {
-                        if parent.id != record.artifact_id {
-                            return Err(Error::new(
-                                "STORAGE_FAILURE",
-                                "eviction parent catalog identity mismatch",
-                            ));
-                        }
                         parents.insert(parent.id.clone(), parent);
                     }
                     Err(error)
@@ -313,9 +318,8 @@ impl Writer {
                     Err(error) => return Err(error),
                 }
             }
-            if parents
-                .get(&record.artifact_id)
-                .is_some_and(|parent| !parent.record_ids.contains(&record.id))
+            if let Some(parent) = parents.get(&record.artifact_id)
+                && !parent.contains(&record.id, &mut catalog)?
             {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
@@ -337,19 +341,19 @@ impl Writer {
                 put(&mut retirement.batch, &record.id, &record);
                 report.records.push(record.id);
                 if let Some(parent) = parents.get_mut(&record.artifact_id)
-                    && !parent.evicted
+                    && !parent.evicted()
                 {
-                    parent.evicted = true;
+                    parent.evict();
                     report.artifacts.push(parent.id.clone());
                 }
             }
             if let Some(parent) = parents
                 .get_mut(&record.artifact_id)
-                .filter(|parent| parent.evicted)
+                .filter(|parent| parent.evicted())
             {
                 report.payload_refs +=
                     retirement.artifact(parent, limits.max_payload_refs - report.payload_refs)?;
-                if !parent.chunks.is_empty() {
+                if parent.pending() != 0 {
                     next = Some((position.to_vec(), true));
                     report.frontier = if report.records.len() + report.recordless_artifacts
                         == limits.max_records
@@ -363,9 +367,9 @@ impl Writer {
             }
             next = Some((position.to_vec(), false));
         }
-        for parent in parents.values().filter(|parent| parent.evicted) {
-            report.pending_manifest_refs += parent.chunks.len();
-            put(&mut retirement.batch, &parent.id, parent);
+        for parent in parents.values().filter(|parent| parent.evicted()) {
+            report.pending_manifest_refs += parent.pending() as usize;
+            parent.stage(&mut retirement.batch);
         }
         let mut batch = retirement.finish()?;
         if let Some((physical, requested)) = pressure
@@ -376,7 +380,7 @@ impl Writer {
             super::pressure::stage_wait(&mut batch, physical, requested);
         }
         // The shared publication owner may add the bounded pressure format fence.
-        if batch.size_in_bytes().saturating_add(128) > limits.max_batch_bytes {
+        if batch.size_in_bytes().saturating_add(256) > limits.max_batch_bytes {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "eviction batch exceeds native write admission",

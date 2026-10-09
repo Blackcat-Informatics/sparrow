@@ -250,7 +250,8 @@ pub(super) fn registry(writer: &Writer) -> Result<Vec<ReceiverWindow>, Error> {
         .db
         .get("store_format")?
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "receiver store format missing"))?;
-    let fenced = format.as_slice() == FORMAT || format.as_slice() == WATCH_FORMAT;
+    let fenced = super::manifest_retire::features(&writer.db)?
+        .unwrap_or(format.as_slice() == FORMAT || format.as_slice() == WATCH_FORMAT);
     match (fenced, writer.db.get(KEY)?.is_some()) {
         (false, false) => Ok(Vec::new()),
         (true, true) => super::sequence_window::registry(

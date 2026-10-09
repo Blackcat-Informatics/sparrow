@@ -79,6 +79,8 @@ impl State {
                     | WATCH_FORMAT
                     | super::receiver_stream::FORMAT
                     | super::receiver_stream::WATCH_FORMAT
+                    | super::manifest_retire::FORMAT
+                    | super::manifest_retire::WATCH_FORMAT
             )
         ) {
             return Err(Error::new(

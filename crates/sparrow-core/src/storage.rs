@@ -27,6 +27,7 @@ pub(crate) mod expiry;
 pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
+mod manifest_retire;
 pub(crate) mod pin_read;
 pub(crate) mod pressure;
 pub(crate) mod producer_stream;
@@ -402,6 +403,9 @@ fn integer(value: &Value, name: &'static str) -> Result<u64, Error> {
 trait Catalog: Sized {
     fn encode(&self) -> Value;
     fn decode(value: &Value) -> Result<Self, Error>;
+    fn stored(self, _writer: &Writer) -> Result<Self, Error> {
+        Ok(self)
+    }
 }
 
 trait EvidenceCatalog: Catalog {
@@ -474,6 +478,10 @@ impl Catalog for Artifact {
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             evicted: read_field(v, "evicted")?,
         })
+    }
+    fn stored(mut self, writer: &Writer) -> Result<Self, Error> {
+        manifest_retire::resolve(writer, &mut self)?;
+        Ok(self)
     }
 }
 
@@ -722,12 +730,22 @@ impl Writer {
         key: &str,
         admit: impl FnOnce(&[u8]) -> Result<(), Error>,
     ) -> Result<T, Error> {
+        self.read_catalog(key, |bytes| {
+            admit(bytes)?;
+            T::decode(&parse(bytes)?)?.stored(self)
+        })
+    }
+
+    fn read_catalog<T>(
+        &self,
+        key: &str,
+        read: impl FnOnce(&[u8]) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let bytes = self
             .db
             .get_pinned(key)?
             .ok_or_else(|| Error::new("NOT_FOUND", format!("unknown evidence {key}")))?;
-        admit(&bytes)?;
-        T::decode(&parse(&bytes)?)
+        read(&bytes)
     }
 
     fn charge_catalog(remaining: &mut usize, bytes: usize) -> Result<(), Error> {
@@ -838,12 +856,12 @@ impl Writer {
             })
             .map(|entry| {
                 let (key, bytes) = entry?;
-                Self::decode_evidence(&key, &bytes)
+                self.decode_evidence(&key, &bytes)
             })
     }
 
-    fn decode_evidence<T: EvidenceCatalog>(key: &[u8], bytes: &[u8]) -> Result<T, Error> {
-        let row = T::decode(&parse(bytes)?)?;
+    fn decode_evidence<T: EvidenceCatalog>(&self, key: &[u8], bytes: &[u8]) -> Result<T, Error> {
+        let row = T::decode(&parse(bytes)?)?.stored(self)?;
         if row.identity().as_bytes() != key {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -909,7 +927,7 @@ impl Writer {
             if let Some(remaining) = remaining.as_deref_mut() {
                 Self::charge_catalog_shape(remaining, &bytes)?;
             }
-            let pin: Pin = Self::decode_evidence(&key, &bytes)?;
+            let pin: Pin = self.decode_evidence(&key, &bytes)?;
             if pin.expires_at > now {
                 protected.extend(pin.members.into_iter().filter(|member| include(member)));
             }
@@ -925,7 +943,23 @@ impl Writer {
     }
 
     fn live_artifact(&self, artifact: &Artifact, now: u64, protected: &BTreeSet<String>) -> bool {
-        !artifact.evicted && (now < artifact.expires_at || protected.contains(&artifact.id))
+        Self::artifact_eligible(
+            &artifact.id,
+            artifact.evicted,
+            artifact.expires_at,
+            now,
+            protected,
+        )
+    }
+
+    fn artifact_eligible(
+        id: &str,
+        evicted: bool,
+        expires_at: u64,
+        now: u64,
+        protected: &BTreeSet<String>,
+    ) -> bool {
+        !evicted && (now < expires_at || protected.contains(id))
     }
 
     fn physical_bytes(&self) -> Result<u64, Error> {
@@ -1030,6 +1064,8 @@ impl Store {
                     || format == pressure::WATCH_FORMAT
                     || format == receiver_stream::FORMAT
                     || format == receiver_stream::WATCH_FORMAT
+                    || format == manifest_retire::FORMAT
+                    || format == manifest_retire::WATCH_FORMAT
                     || recordless::legacy_format(&format).is_some() =>
             {
                 if recordless::requires_watch_registry(&format)
@@ -1124,6 +1160,7 @@ impl Store {
             random_id("session")?,
             db.latest_sequence_number(),
         ));
+        manifest_retire::features(&db)?;
         let pressure = pressure::State::load(&db)?;
         let store = Self {
             id: Arc::from(id.as_str()),
