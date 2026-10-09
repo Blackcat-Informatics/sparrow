@@ -43,6 +43,7 @@ mod recordless;
 pub(crate) mod result_read;
 mod retire;
 mod sequence_window;
+mod source_context;
 pub(crate) mod source_read;
 pub(crate) mod source_time;
 pub(crate) mod syslog;
@@ -1162,6 +1163,7 @@ impl Store {
         ));
         manifest_retire::features(&db)?;
         let pressure = pressure::State::load(&db)?;
+        source_context::rebuild(&db)?;
         let store = Self {
             id: Arc::from(id.as_str()),
             inner: Arc::new(Mutex::new(Writer {

@@ -570,14 +570,16 @@ contract, native governor certification, remaining query surfaces remain first-v
 
 Schema 33 adds a typed ContextCapture to records_context. Each successful
 operation has a fresh snapshot_id and captured as_of, the host admission
-profile sparrow-context-capture/1, explicit native governor absence, and
+profile sparrow-context-capture/2, explicit native governor absence, and
 ContextLimits. Context is one complete reply without a continuation or retained
 result handle. CLI/MCP receipts report has_more=false and next_cursor=null;
 there is no read lease deadline to renew. Original execution, certainty,
 directional frontiers, diagnostic coverage and continuity_unknown remain visible.
 
-Chronological visits remain independently bounded per direction. Catalog decoding
-now charges the anchor and every visited neighbor, including skipped sources,
+Chronological visits remain independently bounded per direction. The source
+timeline excludes unrelated sources before catalog decoding or visit admission.
+Catalog decoding charges the anchor and every visited same-source neighbor,
+including members skipped by the requested membership or diagnostic scope,
 against one 32 MiB conservative allowance across both scans. The shared catalog
 owner charges encoded catalog bytes at its established expansion factor before
 decoding. One 256 KiB response allowance includes the anchor, both directional
@@ -586,6 +588,20 @@ conservative typed/agent envelope charge as paged searches. Byte exhaustion is
 RESOURCE_LIMIT with no successful result; it never publishes a byte-limited
 prefix. Request fewer neighbors or narrow the acceptance interval to reduce work.
 These are host admission allowances, not a measured RSS or all-I/O guarantee.
+
+The source timeline is a disk-backed derivative of the authoritative record and
+primary time catalogs. Every store open clears and rebuilds it with the shared
+bounded catalog pager before serving requests. This permits preceding binaries
+to write the unchanged catalog format without leaving stale context answers.
+Production record and time mutations maintain the derivative in their original
+atomic batch. Selected entries must agree with the primary time index and the
+record's source; disagreement refuses the capture without a global scan fallback.
+Corrupt record metadata found during reconstruction disables all context captures
+with an actionable storage failure until catalog repair and reopen; it does not
+publish a partial timeline or prevent unrelated evidence reads. Storage I/O and
+reconstruction admission failures still fail startup.
+Reconstruction adds startup writes and catalog reads; production-scale startup
+latency, disk headroom and write amplification remain unqualified.
 
 Limits report direction_visits, catalog_bytes, response_bytes, output_records,
 requested_before, requested_after and independent membership member/record visit

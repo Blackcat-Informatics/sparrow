@@ -473,6 +473,15 @@ fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
     };
     let query = RecordQuery::default();
     let rows = store.records_query(&scope, &query, 40).unwrap();
+    let context_error = store
+        .records_context(&inside.record_ids[0], &scope, 0, 0, 40)
+        .unwrap_err();
+    assert_eq!(context_error.code, "STORAGE_FAILURE");
+    assert!(
+        context_error
+            .message
+            .contains("repair the authoritative catalog and reopen")
+    );
     assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
     assert_eq!(
         rows["rows"][0]["record_id"].as_str(),
@@ -9927,7 +9936,7 @@ fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers()
         vec![ordered[2].as_str(), latest.record_ids[0].as_str()]
     );
     assert_eq!(context.before.frontier, ContextFrontier::ScopeBoundary);
-    assert_eq!(context.after.visited, 3);
+    assert_eq!(context.after.visited, 2);
     scope.scan_budget = 1;
     let limited = store
         .records_context(&ordered[1], &scope, 1, 2, 20)
@@ -10031,7 +10040,7 @@ fn context_admits_catalog_and_output_bytes_across_both_directions() {
 }
 
 #[test]
-fn context_catalog_admission_charges_skipped_sources_without_resetting_per_row() {
+fn context_source_index_skips_unrelated_catalogs_without_spending_visits() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let anchor = store
@@ -10060,12 +10069,53 @@ fn context_catalog_admission_charges_skipped_sources_without_resetting_per_row()
     let partial = store
         .records_context(&anchor.record_ids[0], &scope, 0, 1, 2)
         .unwrap();
-    assert_eq!(partial.after.visited, 1);
+    assert_eq!(partial.after.visited, 0);
     assert!(partial.after.records.is_empty());
+    assert_eq!(
+        partial.after.frontier,
+        sparrow_core::ContextFrontier::ScopeBoundary
+    );
+    scope.scan_budget = 1000;
+    let bounded = store
+        .records_context(&anchor.record_ids[0], &scope, 0, 1, 2)
+        .unwrap();
+    assert_eq!(bounded.after.visited, 0);
+    assert!(bounded.after.records.is_empty());
+    assert_eq!(
+        store.bytes(&anchor.record_ids[0], 0, 7, 2).unwrap(),
+        b"anchor\n"
+    );
+}
+
+#[test]
+fn context_catalog_admission_still_charges_skipped_same_source_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let source = "s".repeat(512);
+    let anchor = store
+        .ingest("same-source-anchor", &source, "log", b"anchor\n", 0)
+        .unwrap();
+    store
+        .ingest(
+            "same-source-noise",
+            &source,
+            "log",
+            &b"noise\n".repeat(900),
+            1,
+        )
+        .unwrap();
+    let mut scope = record_page_scope(&source, 10);
+    scope.selection = sparrow_core::QuerySelection::Evidence(vec![anchor.record_ids[0].clone()]);
+    scope.scan_budget = 1;
+    let partial = store
+        .records_context(&anchor.record_ids[0], &scope, 0, 1, 2)
+        .unwrap();
+    assert_eq!(partial.after.visited, 1);
     assert_eq!(
         partial.after.frontier,
         sparrow_core::ContextFrontier::ScanBudget
     );
+    assert!(partial.after.records.is_empty());
     scope.scan_budget = 1000;
     let refused = store
         .records_context(&anchor.record_ids[0], &scope, 0, 1, 2)
@@ -10076,6 +10126,60 @@ fn context_catalog_admission_charges_skipped_sources_without_resetting_per_row()
         store.bytes(&anchor.record_ids[0], 0, 7, 2).unwrap(),
         b"anchor\n"
     );
+}
+
+#[test]
+fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let anchor = store
+        .ingest("cache-anchor", "cache", "log", b"anchor\n", 1)
+        .unwrap();
+    let neighbor = store
+        .ingest("cache-neighbor", "cache", "log", b"neighbor\n", 2)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let mut entries = Vec::new();
+    for entry in db.prefix_iterator(b"source-context-v1:") {
+        let (key, _) = entry.unwrap();
+        if !key.starts_with(b"source-context-v1:") {
+            break;
+        }
+        entries.push(key);
+    }
+    assert_eq!(entries.len(), 2);
+    // Simulate a derivative left stale by a preceding catalog writer.
+    db.delete(&entries[0]).unwrap();
+    db.put(&entries[1], b"record:missing").unwrap();
+    db.put(b"source-context-v1:obsolete", b"record:missing")
+        .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let scope = sparrow_core::QueryScope {
+        selection: sparrow_core::QuerySelection::Live,
+        source: None,
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 3,
+        limit: 100,
+        scan_budget: 100,
+    };
+    let context = store
+        .records_context(&anchor.record_ids[0], &scope, 1, 1, 3)
+        .unwrap();
+    assert!(context.before.records.is_empty());
+    assert_eq!(context.after.records[0].id, neighbor.record_ids[0]);
+    assert_eq!(context.after.visited, 1);
+    assert_eq!(
+        store.bytes(&neighbor.record_ids[0], 0, 9, 3).unwrap(),
+        b"neighbor\n"
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    assert!(db.get(b"source-context-v1:obsolete").unwrap().is_none());
 }
 
 #[test]

@@ -9,7 +9,7 @@ use rocksdb::{Direction, IteratorMode};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Host-owned context admission; record interpretation profiles remain in each row.
-pub const CONTEXT_CAPTURE_PROFILE: &str = "sparrow-context-capture/1";
+pub const CONTEXT_CAPTURE_PROFILE: &str = "sparrow-context-capture/2";
 
 /// Effective ceilings bound into one context capture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +62,7 @@ pub enum ContextFrontier {
 pub struct ContextSide {
     /// Chronologically sorted retained neighbors, excluding the anchor.
     pub records: Vec<Record>,
-    /// Catalog entries examined, including other sources and retired entries.
+    /// Source timeline entries examined, including retired entries.
     pub visited: u64,
     /// Observed expired/evicted entries from the anchor's source.
     pub retired: u64,
@@ -115,6 +115,7 @@ impl Store {
         }
         crate::format_instant(now)?;
         let writer = self.lock()?;
+        super::source_context::ready(&writer)?;
         let mut admission = Admission {
             catalog: catalog_lease::SCAN_BYTES,
             response: catalog_lease::PAGE_BYTES - 4096,
@@ -148,6 +149,17 @@ impl Store {
             return Err(Error::new(
                 "STORAGE_FAILURE",
                 "context anchor time index is missing or inconsistent",
+            ));
+        }
+        if writer
+            .db
+            .get(super::source_context::key(&anchor))?
+            .as_deref()
+            != Some(anchor.id.as_bytes())
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "context anchor source index is missing or inconsistent",
             ));
         }
         admission.output(&anchor)?;
@@ -215,13 +227,14 @@ fn scan_context_neighbors(
         result.frontier = ContextFrontier::RequestedCount;
         return Ok(result);
     }
-    let start = format!("time:{:020}:{}", anchor.received_at, anchor.id);
+    let prefix = super::source_context::prefix(&anchor.source);
+    let start = super::source_context::key(anchor);
     for entry in writer
         .db
         .iterator(IteratorMode::From(start.as_bytes(), direction))
     {
         let (key, value) = entry?;
-        if !key.starts_with(b"time:") {
+        if !key.starts_with(prefix.as_bytes()) {
             break;
         }
         if key.as_ref() == start.as_bytes() {
@@ -231,7 +244,13 @@ fn scan_context_neighbors(
             result.frontier = ContextFrontier::ScanBudget;
             break;
         }
-        let record = writer.time_record(&key, &value, &mut admission.catalog)?;
+        let record = super::source_context::indexed(
+            writer,
+            &anchor.source,
+            &key,
+            &value,
+            &mut admission.catalog,
+        )?;
         if record.received_at < scope.received_from || record.received_at >= scope.received_before {
             break;
         }

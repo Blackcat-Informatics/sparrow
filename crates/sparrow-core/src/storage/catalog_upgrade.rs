@@ -6,13 +6,15 @@
 use super::{Catalog, Error, json, parse, read_field};
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch, WriteOptions};
 
+type Publish = fn(&DB, &str, &[u8], usize, &mut WriteBatch) -> Result<(), Error>;
+
 pub(super) struct Job {
     pub checkpoint: &'static str,
     pub source: &'static str,
     pub target: &'static [u8],
     pub page_bytes: usize,
     pub charge: fn(&[u8]) -> Result<usize, Error>,
-    pub publish: fn(&str, &[u8], usize, &mut WriteBatch) -> Result<(), Error>,
+    pub publish: Publish,
 }
 
 #[derive(Default)]
@@ -162,7 +164,7 @@ pub(super) fn step(
             break;
         }
         remaining -= charge;
-        (job.publish)(identity, &bytes, charge, &mut batch)?;
+        (job.publish)(db, identity, &bytes, charge, &mut batch)?;
         progress.after = Some(identity.to_owned());
         visited += 1;
     }
@@ -183,7 +185,7 @@ mod tests {
         target: b"test-range:",
         page_bytes: 4,
         charge: |bytes| Ok(bytes.len()),
-        publish: |identity, bytes, _, batch| {
+        publish: |_, identity, bytes, _, batch| {
             if bytes == b"bad" {
                 return Err(Error::new("STORAGE_FAILURE", "invalid test catalog row"));
             }

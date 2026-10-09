@@ -9655,7 +9655,7 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
             client
                 .ingest(
                     "wire-context-noise",
-                    "noise",
+                    "target",
                     wire::Format::Log,
                     b"noise\nnoise\nnoise\n",
                 )
@@ -9670,6 +9670,16 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
                     Object::new()
                         .with("store_id", store.clone())
                         .with("id", anchor.record_ids[0].clone())
+                        .with(
+                            "scope",
+                            Object::new()
+                                .with("kind", "selection")
+                                .with("store_id", store.clone())
+                                .with(
+                                    "record_ids",
+                                    purrdf_lex::json::Value::array([anchor.record_ids[0].as_str()]),
+                                ),
+                        )
                         .with("before", 1_u32)
                         .with("after", 1_u32)
                         .with("limit", 3_u32)
@@ -9679,7 +9689,7 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
                 .await;
             assert_eq!(partial["isError"].as_bool(), Some(false));
             let partial = &partial["structuredContent"];
-            // Three skipped-source records guarantee at least two on one side,
+            // Three skipped same-source members guarantee at least two on one side,
             // including when acceptance times tie and opaque IDs break the tie.
             assert!(
                 ["before", "after"]

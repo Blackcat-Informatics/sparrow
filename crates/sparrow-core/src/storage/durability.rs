@@ -134,6 +134,7 @@ impl Writer {
         let mut publication = super::eviction::Publication::default();
         batch.iterate_cf(&mut publication);
         publication.check()?;
+        super::source_context::update(self, &mut batch)?;
         let manifest_features = super::manifest_retire::features(&self.db)?;
         if publication.manifest_retirement || manifest_features.is_some() {
             let receiver_present = self.db.get(super::receiver_stream::KEY)?.is_some();

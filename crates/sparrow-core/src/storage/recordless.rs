@@ -210,6 +210,7 @@ fn upgrade_charge(bytes: &[u8]) -> Result<usize, Error> {
 }
 
 fn upgrade_publish(
+    _db: &DB,
     identity: &str,
     bytes: &[u8],
     charge: usize,
