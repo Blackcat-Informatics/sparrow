@@ -1888,6 +1888,32 @@ power loss, startup directory/lock creation, automatic inotify discovery or
 forced overflow, or arbitrary filesystem errors. Those remaining acceptance
 requirements must not be inferred from this finite matrix.
 
+
+### Watcher coverage-loss qualification
+
+`watches::tests::kernel_overflow_and_directory_exhaustion_require_fresh_coverage`
+uses the production detector with a real temporary producer root and RocksDB
+store. It reads the host's current inotify queue capacity without changing it,
+and generates alternating opens and read-only closes beyond that capacity.
+An independent owned inotify queue must report a real `IN_Q_OVERFLOW`; the
+bounded fixture refuses queue capacities above 65,536 rather than skipping.
+
+The production detector's 4,096-event processing ceiling can reset its queue
+before reaching the kernel overflow marker. The test therefore qualifies that
+conservative reset as well: coverage becomes uncertain, old readiness and rename
+evidence are cleared, the visible loss counter advances and no claim is ready.
+A new bounded recursive scan restores coverage with a fresh quiet interval;
+previously aged candidates cannot become immediately consumable. Exact source
+bytes remain present, with no import journals or published records.
+
+The same test exhausts the configured directory budget while scanning a real
+subdirectory. Discovery must return an actionable coverage-limit error and
+refuse readiness. Explicitly repairing that fixture budget and reconciling
+restores both directory watches and fresh candidates. It does not exhaust the
+host's shared kernel watch quota, alter sysctls or touch the running daemon.
+This is detector-level Linux acceptance, independent of the process-crash matrix;
+it does not prove every watcher scheduling or host power-loss scenario.
+
 ## 6. CLI
 
 ### Read-only upload progress

@@ -32,6 +32,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+mod tests;
+
 const SCAN_QUANTUM: usize = 64;
 const EVENT_QUANTUM: usize = 4096;
 const TICK: Duration = Duration::from_millis(50);

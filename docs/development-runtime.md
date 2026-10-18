@@ -21,7 +21,27 @@ production store, recovers through the SDK/RPC path, verifies exact bytes and
 stable accepted identities, preserves a replacement producer path and reopens
 again to verify idempotence. The checkpoints exist only in the test library.
 No installed image, service configuration or producer source changed for this
-qualification. Power-loss and watcher/overflow acceptance remain separate.
+qualification. Power-loss and watcher scheduling acceptance remain separate.
+
+## Watcher coverage-loss qualification
+
+The [watcher loss test](interfaces.md#watcher-coverage-loss-qualification) fills a
+real owned kernel queue beyond its observed capacity and independently verifies
+`IN_Q_OVERFLOW`. It exercises the production detector's conservative event-budget
+reset, uncertain status, readiness invalidation, fresh recursive reconciliation
+and quiet interval. It also verifies hard failure at a configured directory
+limit, source preservation and recovery after explicit budget repair. This uses
+only temporary owned roots, without changing host limits or the live service.
+It does not qualify host-wide kernel watch exhaustion or all daemon scheduling
+and power-loss scenarios.
+
+The focused release run on 2026-10-18 observed a queue capacity of 16,384 and
+16,385 witness events including one overflow marker. The production reset reason
+was `event processing limit`, and its loss counter became one. The complete
+fixture passed in 2.07 seconds. The pinned census check passed 293 ownership jobs
+with zero distinct exceptions. Source evidence is retained under
+`.stage/native-graph-integration/watch-loss-*`; live runtime adoption is unnecessary
+because the added detector test compiles only into the unit-test library.
 
 ## Current-source turnover and logical graph closure
 
