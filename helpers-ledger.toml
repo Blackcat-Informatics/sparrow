@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "agent-capability-document"
+summary = "CLI and MCP share one capability document and certified status owner. Native Cap'n Proto enum introspection and the existing format label owner supply formats; metadata and capability vocabulary share one namespace constant. Transport labels describe supported protocol kinds."
+home = "sparrow_server::agent::capabilities::execute"
+entry_points = ["sparrow_server::agent::Command::execute", "sparrow_server::agent::tool::Operation::parse"]
+spec = "docs/interfaces.md: CLI and MCP capability discovery."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_capabilities_elsewhere|mcp_capabilities_separately)$']
+
+[[job]]
 id = "native-log-pattern-engine"
 summary = "Native dated XPath compilation, capture matching, finite work/storage refusal and single-program cache stay in PurRDF's public kernel API; no local regex engine or parser."
 home = "purrdf:purrdf_core::xsd_regex::xpath::compile::compile"

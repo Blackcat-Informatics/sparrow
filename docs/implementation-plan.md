@@ -64,9 +64,11 @@ provides durable admitted-input flush/shutdown fences. The tracing layer, typed
 span/context capture, explicit buffered-WAL acknowledgements and flush-through,
 and finite producer sequence windows are implemented. Public TCP shares the
 generated service and bounded Rust logging worker with Unix. Bounded syslog
-listeners and packet interpretation are implemented; active-log generations,
-tail checkpoints, rotation/completion and operational qualification remain
-milestone-4 work.
+listeners and packet interpretation, active-log generations, durable tail
+checkpoints, observed rotation/gaps, producer-finish completion and explicit
+completed-tail handoff are implemented. Production operational qualification
+remains milestone-4 work; source/runtime evidence is recorded separately in
+Development runtime.
 
 This plan builds on [Architecture](architecture.md) and [Interfaces](interfaces.md).
 It records the initial query priorities and sample discovery supplied on

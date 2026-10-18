@@ -84,7 +84,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "source_time_define",
-        "Durably bind an immutable source timestamp pointer and representation for future ingestions; identical retries are idempotent and conflicting mappings are refused.",
+        "Durably bind one immutable source timestamp extraction: an explicit JSON pointer or a bounded native whole-record log capture, with a declared representation. Applies to future ingestions; identical retries are idempotent and conflicting mappings are refused.",
     ),
     (
         "source_time_get",

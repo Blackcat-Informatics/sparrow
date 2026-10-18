@@ -1025,20 +1025,19 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 
 | Tool | Principal input | Output |
 | --- | --- | --- |
-| `capabilities` | None | API/store versions, supported formats/profiles, vocabulary and tool descriptions, limits, retention, and durability settings. |
+| `capabilities` | None | Certified status/profile identities, accepted formats, occurrence vocabulary, implemented tools/input schemas, limits, retention and clock bases. |
 | `status` | None | Bounded storage/queue/projection/ingestion/pin metrics and pressure state. |
 | `flush` | Store ID, current session ID, decimal sequence | Typed synchronization through that fence; reached sequence, or stale/future/store refusal. |
 | `sources_list` | Filter, cursor, page size | Sources, active stream state, and known gaps. |
 | `artifacts_list` | Scope, cursor, page size | Artifact summaries with byte availability and projection state. |
 | `records_search` | Scope, text and/or filters, cursor, page size | Matching record summaries, text evidence, scores when applicable, and read receipt. |
 | `keys_list` | Scope, field/path restriction, cursor, page size | Observed diagnostic fields and JSON pointers, kinds, record-presence counts, and read receipt. |
-| `values_search` | Scope, optional field/path, explicit match operator/value/kind, cursor, page size | Matching value occurrences and parent evidence IDs/spans, with read receipt. |
+| `values_search` | Scope, optional JSON pointer/kind/lexical/decoded text, cursor, page size | Exact matching value occurrences and parent evidence IDs/spans, with read receipt. |
 | `records_context` | Record ID, scope, ordering basis, bounded before/after counts | Retained source-local neighbors, gap information, and read receipt. |
 | `artifact_get` | Artifact ID | Metadata and availability, including retained-record-only provenance after parent expiry. |
 | `record_get` | Record ID | Record metadata, parsed fields, projection/profile references, and source spans. |
-| `bytes_read` | Exactly one artifact/record ID, offset, length, encoding | Exact bounded bytes and next offset. Refuse an expired complete artifact rather than substitute partial retained bytes. |
+| `bytes_read` | Artifact/record/completed-generation ID, offset, length, encoding | Exact bounded bytes with original offset/length. Refuse an unavailable complete representation rather than substitute surviving partial bytes. |
 | `sparql_query` | Query, scope, graph layers, bindings, limits, coverage requirement | Typed native query result, result handle/page, and receipt. |
-| `sparql_explain` | Query and scope | Native plan/explanation with applicable limits and scope information. |
 | `correlate` | Scope and seed IDs or trace/span/source/time selector | Relationships and their supporting evidence; implemented through prepared queries/retrieval. |
 | `result_next` | Store ID, result cursor | Next page from the same leased result; an expired handle refuses continuation. |
 | `result_release` | Store ID, snapshot ID | Release the captured replay lease and memory; never releases evidence pins. |
@@ -1048,6 +1047,32 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 | `pin` | Request ID, name, concrete targets, days | Durably created/extended collection and actual expiry. |
 | `pin_renew` | Request ID, pin ID, days | Durably extended deadline. |
 | `pin_release` | Request ID, pin ID | Durable removal of that collection's protection; ordinary retention still applies. |
+| `text_search` | Text, scope, cursor, limits | Native ranked postings, corpus/profile identity, source spans and coverage. |
+| `rdf_inspect` | Store ID, record ID | Persisted native projection state, graph references and stream counts. |
+| `source_time_define`, `source_time_get` | Source and optional explicit extraction/representation | Immutable JSON-pointer or bounded whole-log timestamp profile; no reinterpretation of existing evidence. |
+| `diagnostic_define`, `diagnostic_get` | Source and optional pointer mappings | Immutable normalized diagnostic interpretation profile. |
+| `retention_metrics` | Store ID and finite catalog/payload/visit limits | Logical retained window and shared payload ownership; no physical reclamation certificate. |
+| `producer_stream_get`, `receiver_window_get` | Store ID and exact stream/window ID | Finite producer/receiver ordering, observed gaps and explicit unknown continuity. |
+| `syslog_listener_get` | Store, source and listener IDs | Actual binding, framing, limits and process-scoped counters. |
+| `file_generation_get` | Store ID and generation ID | Original file declaration, durable checkpoint and terminal/completion evidence. |
+| `file_finish`, `file_finish_get` | Immutable original completion intent | Retained producer-finish admission/progress; no source deletion. |
+| `watch_handoff`, `watch_handoff_get` | Immutable original handoff intent | Durable claim/publication/removal progress for completed files or producer-finished tail generations. |
+
+`sparrow ENDPOINT capabilities` and the MCP `capabilities` tool share one
+document and the certified status renderer. `transport="capnp"` identifies
+the protocol; `transports=["unix","tcp"]` lists supported endpoint kinds,
+not enabled listeners or the current connection. The document includes the
+implemented tool catalog and its closed input schemas, accepted `formats`,
+`vocabulary.occurrence_namespace`, retention basis and record clock choices.
+Formats come from native generated enum introspection through the shared SDK
+label owner; the vocabulary namespace is shared with occurrence RDF generation.
+Its nested `status` is a current operational read, with
+the same integrity checks and cost as explicit status; it is not the catalog-free
+typed `discover` operation used internally for compatibility admission.
+
+`sparql_explain` remains required but is not advertised or callable until the
+[governed native integration gap](purrdf-integration-gaps.md#retained-operational-sparql-integration)
+is resolved. Native text/SPARQL integration remains independently required.
 
 The query interface supports read forms such as SELECT, ASK, CONSTRUCT, and
 DESCRIBE through PurRDF. Preserve RDF term kind, datatype, language, base
@@ -1324,8 +1349,9 @@ path. Inputs contain `store_id`, `request_id`, `generation_id`, decimal-string
 inputs; do not recapture replacement files. Generation reads also expose the
 original completion observation and clocks.
 
-Schema 40 adds retained byte-cover reads as specified below. Completed-tail
-claim/deletion handoff remains unfinished. Completion grants no deletion authority
+Schema 40 adds retained byte-cover reads as specified below. Schema 41 adds the
+explicit [completed-tail claim/deletion handoff](#schema-41-completed-tail-source-retirement).
+Completion alone grants no deletion authority
 and never reimports retired prefixes to manufacture a complete downloadable file.
 
 Schema 37 exposes `tailGenerationGet` as a finite metadata read guarded by the
@@ -1369,8 +1395,8 @@ counts accepted occurrences across currently known checkpoints rather than live
 retention membership. Kernel coverage and producer continuity remain separate.
 Active generations bind their watch revision and refuse definition changes or
 removal until resolved. Schema 39 provides explicit retained-generation
-completion as above; completed-tail destructive handoff remains unfinished and
-is explicitly refused by ordinary consumption admission.
+completion as above. Schema 41 adds the separately admitted completed-tail
+handoff; ordinary consumption admission cannot supply that authority.
 
 ### Public TCP and syslog packet interpretation
 
@@ -1432,8 +1458,8 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `artifactGet`, `recordGet`, `bytesRead` | Store-scoped metadata and exact bounded ranges. |
 | `pin`, `pinRenew`, `pinRelease` | Durable all-or-nothing protection with stable retry identities; renewal optionally checks the current collection revision. |
 | `pinRead` | Typed active-list/name/ID selector, finite catalog capture and store-scoped continuation pages. |
-| `keysList`, `valuesSearch` and planned text/record/graph operations | Shared native semantics, typed results and query coverage. |
-| `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume administration; removal stops new admission while preserving existing claims. Tail administration remains unfinished. |
+| `keysList`, `valuesSearch`, `recordsSearch`, `recordsContext`, `sparqlQuery` | Shared native semantics, typed results, scope and query coverage; stored-text SPARQL relations remain required. |
+| `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume/tail administration; removal preserves existing claims and active tail generations guard definition changes/removal. |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Schema 23 adds `discover`: store identity, schema version, native text/RDF profile
@@ -1702,8 +1728,8 @@ check current retention. All counts render as decimal strings in agent output.
 Status now carries typed artifact catalog handle/byte counts, limits and lease
 duration. Artifact and pin pages share both their receipt wire codec and agent
 renderer. Schema 27 supersedes this initial scope with membership and diagnostic
-filtering. Corpus-scale indexed selection and producer stream discovery remain
-unfinished.
+filtering. Producer stream discovery now uses `producerStreamGet` and source
+summaries; corpus-scale operational selection remains unqualified.
 
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity
@@ -1827,8 +1853,8 @@ uses the durable claim journal and the SDK descriptor upload path before retirin
 the exact private source. Schema 15 `status.consumeWatches` reports coverage,
 bounded candidates/deferral, pending claims, completion counts and failures;
 the CLI and stdio MCP share its rendering. No live producer roots are configured
-in the development daemon. Completed tail handoff, forced-overflow
-qualification, and whole-process crash injection at every filesystem boundary
+in the development daemon. Completed-tail handoff is implemented through schema
+41. Forced-overflow qualification and whole-process crash injection at every filesystem boundary
 remain unfinished. Ordinary upload continues to preserve every caller source.
 
 ## 6. CLI
@@ -1954,51 +1980,58 @@ Producer-finish/handoff preparation therefore requires access to the actual
 producer file; saved-intent replay and progress queries do not recapture paths.
 MCP keeps its bounded framing, four-call admission, cancellation and 30-second
 tool deadline over both transports. Connection refusal produces a failed tool
-result with `RPC_FAILURE`; CLI failures leave stdout empty and exit nonzero.
+result with `RPC_FAILURE`. CLI argument/RPC/storage refusals exit nonzero without
+a result. A governed query failure can emit its typed failed receipt on stdout
+and also exit nonzero; consumers must inspect the receipt and exit status.
 
-The planned binary names are `sparrowd` for the daemon and `sparrow` for its
-client. Read/analysis commands default to JSON envelopes with the same receipts
-as MCP; human formatting is an explicit option. `--raw` is only available on byte
-reads. Errors and diagnostics go to stderr; failures use a nonzero exit code.
+The binaries are `sparrowd` for the daemon and `sparrow` for its client.
+Every client invocation takes an endpoint first: a Unix socket path or
+`tcp://IP:PORT`. Commands emit JSON envelopes through the same owners as MCP.
+Byte reads save the exact range to an exclusively created output file and return
+its JSON receipt. Errors and diagnostics go to stderr.
 
 ```bash
 sparrowd --config /etc/sparrow/config.toml
-sparrow capabilities
-sparrow status
+ENDPOINT=tcp://127.0.0.1:518
+sparrow "$ENDPOINT" capabilities
+sparrow "$ENDPOINT" status
 
-sparrow import /srv/dumps/run.jsonl --durability durable
-sparrow SOCKET_PATH watch list
-sparrow SOCKET_PATH watch put REQUEST_ID 0 completed-watch.toml
-sparrow SOCKET_PATH watch put REQUEST_ID CURRENT_REVISION updated-watch.toml
-sparrow SOCKET_PATH watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
-sparrow SOCKET_PATH watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID]
-sparrow SOCKET_PATH watch handoff INTENT.capnp
-sparrow SOCKET_PATH watch handoff-status INTENT.capnp
+sparrow "$ENDPOINT" ingest REQUEST_ID SOURCE jsonl /srv/dumps/run.jsonl
+sparrow "$ENDPOINT" watch list
+sparrow "$ENDPOINT" watch put REQUEST_ID 0 completed-watch.toml
+sparrow "$ENDPOINT" watch put REQUEST_ID CURRENT_REVISION updated-watch.toml
+sparrow "$ENDPOINT" watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
+sparrow "$ENDPOINT" watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp
+sparrow "$ENDPOINT" watch handoff INTENT.capnp
+sparrow "$ENDPOINT" watch handoff-status INTENT.capnp
 # Save intents outside consumption roots; retry the same intent after uncertain delivery.
-# Completed tail handoff remains unfinished.
+# For a producer-finished tail, append TAIL_GENERATION_ID to handoff-prepare.
 
-sparrow records search --service worker --severity ERROR --text timeout
-sparrow record get record:42
-sparrow bytes read --record record:42 --offset 0 --length 4096 --raw
+sparrow "$ENDPOINT" records --source SOURCE --text timeout --page-size 100
+sparrow "$ENDPOINT" context STORE_ID RECORD_ID --before 2 --after 2
+sparrow "$ENDPOINT" bytes STORE_ID RECORD_ID 0 BYTE_LENGTH evidence.bin
 
-sparrow pin create --name problem_investigation_1 --for 10d --record record:42
-sparrow pin add --name problem_investigation_1 --for 10d --artifact artifact:17
-sparrow pin get --name problem_investigation_1
-sparrow pin renew pin:8 --for 10d
-sparrow pin release pin:8
+sparrow "$ENDPOINT" pin REQUEST_ID STORE_ID problem_investigation_1 10 RECORD_ID
+sparrow "$ENDPOINT" pin ANOTHER_REQUEST_ID STORE_ID problem_investigation_1 10 ARTIFACT_ID
+sparrow "$ENDPOINT" pin-get STORE_ID --name problem_investigation_1
+sparrow "$ENDPOINT" pin-renew REQUEST_ID STORE_ID PIN_ID 10 EXPECTED_REVISION
+sparrow "$ENDPOINT" pin-release REQUEST_ID STORE_ID PIN_ID
 
-sparrow sparql --query-file investigation.rq --pin pin:8
-sparrow mcp --stdio
+sparrow "$ENDPOINT" sparql investigation.json
+sparrow "$ENDPOINT" mcp --stdio
 ```
 
-The CLI generates request IDs for new mutations and accepts an explicit request
-ID for reproducible retries. Pin create/add both use the `pin` union-and-extension
+Uppercase IDs, clocks, paths and lengths above are caller-supplied values from
+the applicable receipts/configuration. Use a fresh request ID per mutation and
+preserve it for retries; the CLI does not generate one. Pin create/add use the
+`pin` union-and-extension
 operation; an existing name is reported in the receipt, not silently replaced.
-The query file is a local client input; its path is not an evidence ID.
+The SPARQL request file is the JSON object documented above, including store,
+query text and optional scope/bindings/limits; its path is a local client input.
 
 ## 7. Rust client and logging integration
 
-Plan a separate `sparrow-client` crate so producers do not depend on the database
+The separate `sparrow-client` crate keeps producers independent of the database
 or semantic engine. The public surface includes:
 
 - A client for artifact/event ingestion, receipt inspection, and explicit flush.

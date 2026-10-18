@@ -17,7 +17,6 @@ pub(crate) use catalog::{definitions, known};
 
 pub(crate) enum Operation {
     Status,
-    Capabilities,
     Query(Command),
     Metadata {
         store: String,
@@ -215,7 +214,7 @@ impl Operation {
                     store: fields.required("store_id")?,
                     id: fields.required("id")?,
                 }),
-                "capabilities" => Self::Capabilities,
+                "capabilities" => Self::Query(Command::Capabilities),
                 "sources_list" => {
                     let mut query = sparrow_core::SourceRead::default();
                     query.selector.source = fields.optional("source")?;
@@ -488,18 +487,6 @@ impl Operation {
     pub(crate) async fn execute(self, client: &wire::sparrow::Client) -> Result<Value> {
         match self {
             Self::Status => status::execute(client).await,
-            Self::Capabilities => Ok(Object::new()
-                .with("status", status::execute(client).await?)
-                .with("tools", definitions())
-                .with("transport", "capnp-unix")
-                .with("retention_days", 30_u64)
-                .with("time_basis", "received_at")
-                .with(
-                    "records_time_bases",
-                    Value::array(["received_at", "event_time"]),
-                )
-                .with("mcp_protocol", "2025-11-25")
-                .into()),
             Self::Query(command) => command
                 .execute(client)
                 .await?

@@ -3,6 +3,9 @@
 
 //! Persistent evidence ownership and typed Sparrow operations.
 
+/// Namespace shared by occurrence RDF generation and agent vocabulary discovery.
+pub const RDF_VOCABULARY_NAMESPACE: &str = "urn:sparrow:vocab:";
+
 mod instant;
 mod projection;
 mod query;

@@ -16,6 +16,168 @@ static PROCESS_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
 type TcpReservation = (std::net::TcpListener, std::sync::MutexGuard<'static, ()>);
 
 #[tokio::test(flavor = "current_thread")]
+async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
+    use purrdf_lex::json::{Object, Value};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let _daemon = start(&config, &socket).await;
+            let baseline = cli(&socket, &["capabilities"]);
+            assert_eq!(baseline["transport"].as_str(), Some("capnp"));
+            assert_eq!(baseline["transports"], Value::array(["unix", "tcp"]));
+            assert_eq!(
+                baseline["formats"],
+                Value::array(["jsonl", "log", "json", "markdown", "opaque", "syslog"])
+            );
+            for format in baseline["formats"].as_array().unwrap() {
+                let label = format.as_str().unwrap();
+                assert_eq!(
+                    sparrow_client::format_label(sparrow_client::parse_format(label).unwrap()),
+                    label
+                );
+            }
+            let namespace = baseline["vocabulary"]["occurrence_namespace"]
+                .as_str()
+                .unwrap();
+            let payload = dir.path().join("evidence.jsonl");
+            std::fs::write(&payload, b"{\"message\":\"timeout\"}\n").unwrap();
+            let artifact = cli(
+                &socket,
+                &[
+                    "ingest",
+                    "capability-evidence",
+                    "capability-fixture",
+                    "jsonl",
+                    payload.to_str().unwrap(),
+                ],
+            );
+            let request = Object::new()
+                .with("store_id", baseline["status"]["store_id"].clone())
+                .with(
+                    "query",
+                    format!("SELECT ?record WHERE {{ ?record a <{namespace}Record> }}"),
+                )
+                .with(
+                    "layers",
+                    Object::new()
+                        .with("metadata", true)
+                        .with("content", false)
+                        .with("diagnostic", false),
+                );
+            let request_file = dir.path().join("query.json");
+            std::fs::write(
+                &request_file,
+                purrdf_lex::json::write_compact(&request.into()),
+            )
+            .unwrap();
+            let result = cli(&socket, &["sparql", request_file.to_str().unwrap()]);
+            assert_eq!(result["execution_status"].as_str(), Some("complete"));
+            let rows = result["rows"]["native_result"]["results"]["bindings"]
+                .as_array()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0]["record"]["value"].as_str().unwrap(),
+                format!(
+                    "urn:sparrow:{}",
+                    artifact["record_ids"][0].as_str().unwrap()
+                )
+            );
+            cli(
+                &socket,
+                &[
+                    "result-release",
+                    baseline["status"]["store_id"].as_str().unwrap(),
+                    result["snapshot_id"].as_str().unwrap(),
+                ],
+            );
+            assert_eq!(baseline["retention_days"].as_u64(), Some(30));
+            assert_eq!(baseline["time_basis"].as_str(), Some("received_at"));
+            assert_eq!(
+                baseline["records_time_bases"],
+                Value::array(["received_at", "event_time"])
+            );
+            assert_eq!(
+                baseline["status"]["schema_version"].as_u64(),
+                Some(u64::from(sparrow_client::SCHEMA_VERSION))
+            );
+            assert!(
+                !baseline["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"].as_str() == Some("sparql_explain"))
+            );
+            for endpoint in [
+                socket.to_str().unwrap().to_owned(),
+                format!("tcp://{address}"),
+            ] {
+                let command = cli(&endpoint, &["capabilities"]);
+                let mut mcp = Mcp::start(&endpoint);
+                mcp.initialize(1).await;
+                let tool = mcp.tool(2, "capabilities", Object::new().into()).await;
+                assert_eq!(tool["isError"].as_bool(), Some(false));
+                let list = mcp.call(3, "tools/list", Object::new().into()).await;
+                assert_eq!(tool["structuredContent"]["tools"], list["result"]["tools"]);
+                for document in [&command, &tool["structuredContent"]] {
+                    for key in [
+                        "transport",
+                        "transports",
+                        "tools",
+                        "formats",
+                        "vocabulary",
+                        "retention_days",
+                        "time_basis",
+                        "records_time_bases",
+                        "mcp_protocol",
+                    ] {
+                        assert_eq!(document[key], baseline[key], "{endpoint}: {key}");
+                    }
+                    for key in [
+                        "store_id",
+                        "schema_version",
+                        "text_analyzer",
+                        "rdf_profile",
+                        "max_event_batch_bytes",
+                        "max_event_batch_events",
+                    ] {
+                        assert_eq!(
+                            document["status"][key], baseline["status"][key],
+                            "{endpoint}: {key}"
+                        );
+                    }
+                }
+                let invalid = mcp
+                    .tool(
+                        4,
+                        "capabilities",
+                        Object::new().with("unsupported", true).into(),
+                    )
+                    .await;
+                assert_eq!(invalid["isError"].as_bool(), Some(true));
+                assert_eq!(
+                    invalid["structuredContent"]["error"]["code"].as_str(),
+                    Some("INVALID_ARGUMENT")
+                );
+                mcp.close(true).await;
+                let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&endpoint)
+                    .args(["capabilities", "unsupported"])
+                    .admitted_output()
+                    .unwrap();
+                assert!(!invalid.status.success());
+                assert!(invalid.stdout.is_empty());
+            }
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture() {
     use purrdf_lex::json::{self, Object};
     tokio::task::LocalSet::new()

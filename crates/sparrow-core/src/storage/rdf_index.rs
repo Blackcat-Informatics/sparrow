@@ -612,8 +612,8 @@ fn occurrence_metadata(
     ),
     Error,
 > {
+    use crate::RDF_VOCABULARY_NAMESPACE as NS;
     use purrdf::{RdfDatasetBuilder, RdfLiteral};
-    const NS: &str = "urn:sparrow:vocab:";
     let mut builder = RdfDatasetBuilder::new();
     let subject = builder.intern_iri(&format!("urn:sparrow:{id}"))?;
     let source_node = source_metadata(&mut builder, source)?;
@@ -730,8 +730,8 @@ pub(super) fn metadata(
     state: Option<&Value>,
     facts: Option<&Value>,
 ) -> Result<std::sync::Arc<RdfDataset>, Error> {
+    use crate::RDF_VOCABULARY_NAMESPACE as NS;
     use purrdf::RdfLiteral;
-    const NS: &str = "urn:sparrow:vocab:";
     let (mut builder, subject, source) = occurrence_metadata(
         &record.id,
         &record.source,
