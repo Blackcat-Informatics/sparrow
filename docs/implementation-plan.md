@@ -18,7 +18,7 @@ integration state is recorded in
 [PurRDF integration gaps](purrdf-integration-gaps.md).
 Independent Artifact-class metadata for populated artifacts and persisted
 Source/Stream class declarations are implemented and deployed in schema 57.
-Source schema 59 adds occurrence-owned tracing relationships from the existing
+Deployed schema 59 adds occurrence-owned tracing relationships from the existing
 native JSON facts, including lifecycle observations, producer-scoped span IDs,
 ordered context, declared parent/follows-from evidence and exact context spans.
 Its bounded metadata backfill preserves existing authority families and retention.

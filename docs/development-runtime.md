@@ -3,13 +3,74 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-58 adoption below. It uses
-schema 58 and store format 70. The stable installed
+after the approved checkpoint recovery and schema-59 adoption below. It uses
+schema 59 and store format 81. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`4aadf2c`; see [schema-58 live adoption](#schema-58-live-adoption) for
+`293b495`; see [schema-59 live adoption](#schema-59-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Schema-59 live adoption
+
+Signed source `293b495fbf4e22bcf4054a632807aa8110777baf` passed the complete
+normal commit hook. Explicit default daemon/client builds report
+`core_features=[]`. Exclusive versioned copies were hash-verified before adoption:
+
+- `~/.local/libexec/sparrow/sparrowd-schema59-293b495`, SHA-256
+  `15f22baf1f18b09f4eb22d4f176e158449db5b3b3769d048b42aa0319fb8ed2c`.
+- `~/.local/libexec/sparrow/sparrow-schema59-293b495`, SHA-256
+  `b20e93445b5d33452d8adc8146fae47398c5dbb68631ef811dea150446ee0bc3`.
+
+The private default-image fixture passed the existing scope, pin revision/release,
+native continuation, correlation and CLI/MCP checks. The actual `TracingLayer`
+example then delivered five lifecycle/log observations; all five yielded complete
+native tracing interpretations, the expected kinds and one producer-scoped span
+identity, with matching CLI/MCP rows. The fixture ended with eight records,
+no pins or retained query handles and clean shutdown.
+
+A separate 113-file closed schema-58 backup was copied and hash-verified before
+opening only the copy. The offline verifier upgraded it to format 81 without
+starting intake and checked all 253 evidence targets: 36,005,590 bytes retained
+their full BLAKE3 identities. Only the nine producer metadata graphs changed:
+four gained seven rows and five gained eighteen, matching their original source
+observations. Other metadata/content/diagnostic inspection fields were unchanged.
+The offline verifier has `core_features=["test-support"]`; source inspection
+confirms that feature only exposes the legacy-fixture helper. Its result is kept
+separate from the default-image qualification above. The original backup remains
+unopened and hash-identical. The schema-58 daemon refuses the upgraded copy before
+intake activation.
+
+Configuration, unit and old-image hashes matched the previous receipts. The new
+daemon received only `cap_net_bind_service=ep`. After clean shutdown, the native
+store lock was held while creating and verifying the 111-file
+`schema59-pre-adoption-closed-backup-20261018`. Stable aliases were replaced
+atomically. The enabled persistent unit started at 2026-10-18 07:48:01 MDT
+(13:48:01 UTC), PID 826365, on the unchanged TCP and Unix endpoints.
+No checkpoint recovery was repeated.
+
+Live TCP, Unix and MCP return exact native tracing results for all nine original
+producer observations. All five context ranges decode to the exact original
+context objects, with producer-instance span identity and unchanged scope across
+adapters. Correlation, continuation and both original recovered generation
+receipts pass unchanged. Live format is 81 with the original store ID, 217 records
+and healthy watches. All 253 targets were independently fetched again over typed
+TCP and matched the previous full byte hashes; retained query handles return to
+zero. The closed backup remains hash-identical, and the old client refuses the
+new schema.
+
+A supplementary all-content-triples export over the nine producer records was
+refused by schema 58's live workspace governor at its existing 128 MiB ceiling.
+That refusal is retained as evidence, not a completed content-parity check. The
+byte checks and unchanged content inspection fields above do not establish
+unrestricted graph export, production resource bounds, bounded physical
+reclamation, turnover or host-reboot acceptance.
+
+Evidence is under `.stage/native-graph-integration/schema59-*`: separate runtime,
+producer and offline-verifier build receipts; private scope/tracing fixture;
+closed-copy qualification; old-writer refusal; adoption prerequisites and closed
+backup manifest; live tracing CLI/Unix/MCP, correlation and byte verification;
+and post-adoption integrity readback. Source gates remain under `tracing-*`.
 
 ## Schema-59 tracing source qualification
 
@@ -41,8 +102,8 @@ Typed producer RPC coverage compares TCP CLI and Unix MCP native graph results.
 Early gate attempts and the final normal commit hook are retained under
 `.stage/native-graph-integration/tracing-*`.
 
-The installed service remains schema 58. Default-image build, closed-copy
-migration and runtime adoption remain separate from this source qualification.
+Default-image build, closed-copy migration and live adoption are recorded
+separately above; source qualification alone does not establish them.
 
 ## Schema-58 live adoption
 

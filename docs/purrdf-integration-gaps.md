@@ -5,11 +5,11 @@ scope. Sparrow must retain native semantics and bounded reads while resolving th
 
 ## Current integration state
 
-Schema 58 is deployed on format 70 with native SELECT, ASK, CONSTRUCT and
+Schema 59 is deployed on format 81 with native SELECT, ASK, CONSTRUCT and
 DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
-[Development runtime](development-runtime.md#schema-58-live-adoption).
+[Development runtime](development-runtime.md#schema-59-live-adoption).
 Native text relations, public measured explanation, bounded physical
 reclamation and production resource/turnover acceptance remain required. The
 earlier qualification evidence below records how the deployed graph surface grew.
@@ -31,15 +31,18 @@ certainty remains independent. This source implementation does not resolve the
 borrowed text producer or operational EXPLAIN gaps below. Default-image private
 qualification and live adoption are recorded separately in Development runtime.
 
-Source schema 59 adds the normalized tracing observation view through the
+Deployed schema 59 adds the normalized tracing observation view through the
 existing metadata graph and query paths. It consumes native ordered JSON facts,
 preserves producer-instance span identity and occurrence-specific parent/context
 evidence, and uses the shared catalog pager/native dictionary owner for backfill.
 Invalid claimed observations expose interpretation diagnostics without partial
 relationships. Required projection/profile corruption remains a hard failure.
 This is independent of the borrowed text producer, governed explanation and
-physical reclamation gaps below; the installed service remains schema 58 until
-separate runtime qualification and adoption are recorded.
+physical reclamation gaps below. Default-image, closed-copy and live qualification
+are separately recorded in Development runtime. A supplementary unbound content
+export over the nine original producer records was refused by the existing
+schema-58 workspace ceiling; complete content-export/resource acceptance is not
+claimed from the successful byte or metadata migration checks.
 
 ## Query-scoped stored text producers
 
