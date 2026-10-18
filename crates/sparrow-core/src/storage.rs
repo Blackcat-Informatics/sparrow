@@ -24,6 +24,7 @@ pub(crate) mod catalog_lease;
 mod catalog_upgrade;
 pub(crate) mod consumption;
 pub(crate) mod context;
+pub(crate) mod correlation;
 pub(crate) mod diagnostic;
 pub(crate) mod durability;
 pub(crate) mod eviction;

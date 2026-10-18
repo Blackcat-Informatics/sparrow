@@ -31,6 +31,8 @@ pub struct ScopedSparqlResult {
     pub store_id: String,
     /// Frozen logical scope and resolved pin revision, independent of native certainty.
     pub scope: crate::storage::Value,
+    /// Fixed native correlation recipe and parameters, absent for raw SPARQL.
+    pub correlation: Option<crate::CorrelationCapture>,
     _scope_admission: OwnedWorkspaceReservation<ReadError>,
     /// Native storage sequence of the captured membership and graph indexes.
     pub sequence: u64,
@@ -52,6 +54,7 @@ impl std::fmt::Debug for ScopedSparqlResult {
         f.debug_struct("ScopedSparqlResult")
             .field("store_id", &self.store_id)
             .field("scope", &self.scope)
+            .field("correlation", &self.correlation)
             .field("sequence", &self.sequence)
             .field("as_of", &self.as_of)
             .field("layers", &self.layers)
@@ -72,16 +75,17 @@ impl Store {
         now: u64,
         cancellation: &QueryCancellation,
     ) -> Result<ScopedSparqlResult, ReadError> {
-        self.with_sparql_result(read, now, cancellation, |_, result| result)
+        self.with_sparql_result((read, None), now, cancellation, |_, result| result)
     }
 
     pub(super) fn with_sparql_result<T>(
         &self,
-        read: &SparqlRead<'_>,
+        query: (&SparqlRead<'_>, Option<&crate::CorrelationCapture>),
         now: u64,
         cancellation: &QueryCancellation,
         publish: impl FnOnce(&StoredRdfView<'_>, ScopedSparqlResult) -> T,
     ) -> Result<T, ReadError> {
+        let (read, correlation) = query;
         if read.request.query.len() > crate::query::RECORD_QUERY_TEXT_BYTES {
             return Err(Arc::new(Error::new(
                 "RESOURCE_LIMIT",
@@ -89,13 +93,16 @@ impl Store {
             )));
         }
         let store_id = self.store_id().map_err(Arc::new)?;
-        self.with_rdf_scope(
-            read.scope,
+        self.capture_rdf_scope(
+            (read.scope, correlation),
             read.layers,
             now,
             read.limits,
             cancellation,
             |view, coverage| {
+                if read.scope.require_complete_index && correlation.is_some_and(|capture| !capture.complete(coverage)) {
+                    return Err(view.budget.fail(Error::new("INDEX_NOT_READY", "correlation requires known diagnostic/event-time interpretations throughout its selected scope")));
+                }
                 let scope_admission = view
                     .budget
                     .reserve_owned(crate::QUERY_SCOPE_WORKSPACE_BYTES as u64, &view._scope)?;
@@ -121,6 +128,7 @@ impl Store {
                 let result = ScopedSparqlResult {
                     store_id,
                     scope,
+                    correlation: correlation.cloned(),
                     _scope_admission: scope_admission,
                     sequence: view.snapshot_sequence_number(),
                     as_of: now,

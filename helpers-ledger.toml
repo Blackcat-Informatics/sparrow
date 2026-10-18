@@ -2,6 +2,62 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "native-correlation-recipes"
+summary = "One fixed recipe owner normalizes selector parameters, fingerprints the recipe and supplies typed substitutions to native governed SPARQL; the original snapshot, result leases and interpretation coverage remain shared. No local relationship evaluator or interpolated user query text."
+home = "sparrow_core::storage::correlation::prepare"
+entry_points = ["sparrow_core::storage::correlation::Store::correlate_read", "sparrow_core::storage::correlation::time_clause", "sparrow_core::storage::correlation::CorrelationCapture::validate", "sparrow_core::storage::correlation::CorrelationCapture::descriptor", "sparrow_core::storage::rdf_view::scope::Store::capture_rdf_scope", "sparrow_core::storage::rdf_view::pages::Store::capture_sparql", "sparrow_server::rpc::correlation::query"]
+spec = "docs/interfaces.md: schema 58 native correlation."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(evaluate_correlation_locally|join_correlation_rows_locally|interpolate_correlation_parameter)$']
+
+[[job]]
+id = "native-correlation-control-codec"
+summary = "RPC requests, frozen recipe descriptors and adapters share one typed selector/relation codec; metadata is checked against the same core recipe fingerprint before rendering."
+home = "sparrow_server::correlation_wire::selector"
+entry_points = ["sparrow_server::correlation_wire::interval", "sparrow_server::correlation_wire::relation", "sparrow_server::correlation_wire::encode_selector", "sparrow_server::correlation_wire::encode_relation", "sparrow_server::correlation_wire::encode", "sparrow_server::correlation_wire::decode", "sparrow_server::agent::correlation::Input::execute"]
+spec = "docs/interfaces.md: schema 58 native correlation."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_correlation_again|decode_correlation_again)$']
+
+[[job]]
+id = "native-query-controls"
+summary = "Raw SPARQL and correlation use one JSON control decoder and limit encoder, and one RPC scope/source/governor admission owner and captured-reply delivery path."
+home = "sparrow_server::agent::sparql::Controls::decode"
+entry_points = ["sparrow_server::agent::sparql::Controls::require", "sparrow_server::agent::sparql::Controls::fill_limits", "sparrow_server::rpc::sparql::query_scope", "sparrow_server::rpc::sparql::query_limits", "sparrow_server::rpc::sparql::deliver"]
+spec = "docs/interfaces.md: native governed query controls."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(correlation_specific_governors|correlation_specific_query_delivery)$']
+
+[[job]]
+id = "bounded-occurrence-reference-codec"
+summary = "One SDK union decoder checks bounded artifact/record reference kinds for all RPC scope readers and correlation metadata; store ownership stays with the original RPC owner."
+home = "sparrow_client::bytes::decode_evidence"
+entry_points = ["sparrow_client::bytes::encode_evidence", "sparrow_server::rpc::Rpc::scoped_id", "sparrow_server::correlation_wire::selector"]
+spec = "docs/interfaces.md: store-scoped evidence references."
+vectors = ["crates/sparrow-client/src/bytes.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^decode_occurrence_union_again$']
+
+[[job]]
 id = "frozen-query-scope"
 summary = "One membership resolution captures pin revision/deadline and compact logical scope identity using native PurRDF streaming framing and hashing; record/text/key/value staging, native graph results and context captures share one typed transport and agent decoder, with retained native workspace ownership for graph receipts."
 home = "sparrow_core::storage::scope_receipt::capture"

@@ -11,6 +11,33 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-58 correlation source qualification
+
+Source schema 58 implements fixed native correlation recipes through the shared
+typed RPC, CLI and MCP paths. It selects seeds by evidence, diagnostic value,
+source or explicit receipt/event interval, and relates occurrences by declared
+trace/span equality, recorded Source identity or co-occurrence in an explicit
+interval. Native typed substitutions, governors, certainty, cancellation, frozen
+scope receipts and retained pages keep their existing owners. Missing required
+interpretations degrade coverage; strict requests refuse incomplete coverage.
+This does not infer causality or a globally unique span identity.
+
+Release regressions cover all recipe families, injection as a literal value,
+distinct occurrences, incomplete/strict interpretation coverage, deterministic
+recipe fingerprints, missing evidence, expired whole-artifact seeds with pinned
+child records, and continuation after pin release and record retirement. Typed
+TCP CLI and Unix MCP checks preserve native partial certificates, replay and
+pin scopes, reject foreign-store seeds and release every captured handle.
+
+The release gate includes 27 core unit, 186 storage and 65 RPC tests, the other
+workspace tests, formatting, Clippy with warnings denied, seeded census tests
+and 285 pinned ownership jobs with no distinct exceptions. The census identified
+the duplicated diagnostic-name/predicate mapping during development; both now
+read one vocabulary table. Earlier failed gate attempts remain in
+`.stage/native-graph-integration/correlation-*` alongside the final commit gate.
+The installed service remains schema 57; source qualification does not establish
+default-image adoption or production resource/reclamation acceptance.
+
 ## Schema-57 live adoption
 
 Signed source `974160f2d397977f10b6e06e1898a153793203c4` includes the shared

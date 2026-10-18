@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "correlate",
+        "Run fixed native governed correlation recipes over one immutable scope: equal declared trace/span values, shared sources or co-occurrence in an explicit receipt/event-time interval. Returns both supporting record IDs, source byte spans and the original native certainty/coverage receipt. Equal identifiers and temporal co-occurrence do not establish causality or global span identity. Missing interpretations degrade coverage; strict mode refuses them. Resume with result_next without recapturing seeds.",
+    ),
+    (
         "sparql_query",
         "Execute native read-only SELECT, ASK, CONSTRUCT or DESCRIBE over an admitted immutable retained record scope. Typed bindings use PurRDF canonical term JSON. Native complete/certain/at-most/unknown certificates and source coverage remain separate from paging. Remote requests are disabled. Resume using result_next; reading never renews the one-minute result lease.",
     ),
@@ -169,11 +173,18 @@ fn integer(maximum: u64) -> Value {
 
 pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
-        if *name == "sparql_query" {
+        if *name == "sparql_query" || *name == "correlate" {
             return Object::new()
                 .with("name", *name)
                 .with("description", *description)
-                .with("inputSchema", super::super::sparql::schema())
+                .with(
+                    "inputSchema",
+                    if *name == "correlate" {
+                        super::super::correlation::schema()
+                    } else {
+                        super::super::sparql::schema()
+                    },
+                )
                 .with("outputSchema", Object::new().with("type", "object"))
                 .with(
                     "annotations",

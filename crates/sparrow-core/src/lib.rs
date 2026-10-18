@@ -27,6 +27,10 @@ pub use storage::consumption::{
 pub use storage::context::{
     CONTEXT_CAPTURE_PROFILE, Context, ContextFrontier, ContextLimits, ContextSide,
 };
+pub use storage::correlation::{
+    CORRELATION_PROFILE, CorrelateRead, CorrelationCapture, CorrelationClock, CorrelationInterval,
+    CorrelationRelation, CorrelationSelector,
+};
 pub use storage::diagnostic::{
     DiagnosticCoverage, DiagnosticDimension, DiagnosticProfile, DiagnosticSnapshot, DiagnosticValue,
 };

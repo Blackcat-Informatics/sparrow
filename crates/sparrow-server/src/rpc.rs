@@ -4,6 +4,7 @@
 //! Typed adapters over the shared evidence owner; no transport JSON envelopes.
 
 use crate::sparrow_capnp as wire;
+mod correlation;
 mod ingest_status;
 mod sparql;
 use purrdf_lex::json::{Value, record::Record as JsonRecord};
@@ -339,21 +340,9 @@ impl Rpc {
     }
 
     fn scoped_id(&self, evidence: wire::evidence::Reader<'_>) -> Result<String, Error> {
-        let store = evidence
-            .get_store_id()
-            .map_err(invalid)?
-            .to_str()
-            .map_err(invalid)?;
-        match evidence.which().map_err(invalid)? {
-            wire::evidence::Artifact(id) => {
-                let id = id.map_err(invalid)?.to_str().map_err(invalid)?;
-                self.reference(store, id, "artifact:")
-            }
-            wire::evidence::Record(id) => {
-                let id = id.map_err(invalid)?.to_str().map_err(invalid)?;
-                self.reference(store, id, "record:")
-            }
-        }
+        let (store, id) = sparrow_client::decode_evidence(evidence).map_err(invalid)?;
+        self.check_store(&store)?;
+        Ok(id)
     }
 
     fn reference(&self, store: &str, id: &str, prefix: &str) -> Result<String, Error> {
@@ -3562,6 +3551,14 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::SparqlQueryResults,
     ) -> capnp::Result<()> {
         sparql::query(&self, params, &mut results).await
+    }
+
+    async fn correlate(
+        self: Rc<Self>,
+        params: wire::sparrow::CorrelateParams,
+        mut results: wire::sparrow::CorrelateResults,
+    ) -> capnp::Result<()> {
+        correlation::query(&self, params, &mut results).await
     }
 
     async fn keys_list(

@@ -11,12 +11,14 @@ SELECT, ASK, CONSTRUCT and DESCRIBE through the Rust core API, with native typed
 substitutions, retained outcomes and scoped membership/coverage. The CLI/MCP and
 typed RPC graph surface is implemented and deployed. Recordless
 artifact RDF and independent artifact coverage are deployed in schema 52;
-text relations, correlation and public explanations remain required. The
+native correlation is implemented in source schema 58 through the same governed
+query and retained-result owners. Text relations and public explanations remain
+required. The
 integration state is recorded in
 [PurRDF integration gaps](purrdf-integration-gaps.md).
 Independent Artifact-class metadata for populated artifacts and persisted
-Source/Stream class declarations remain required. Record-backed provenance
-links alone do not establish those graph contracts.
+Source/Stream class declarations are implemented and deployed in schema 57.
+Normalized tracing relationships remain required beyond JSON context retrieval.
 The full server acceptance criteria remain unmet. Current executable surfaces
 and verification are recorded in [Development runtime](development-runtime.md).
 Stable-ID pin renewal is implemented through the core, typed daemon, CLI and MCP,

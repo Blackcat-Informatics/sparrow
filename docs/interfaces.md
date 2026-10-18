@@ -455,8 +455,9 @@ and diagnostic/failure outcomes retain native ownership and certainty. UPDATE is
 refused by native read preparation; federation is disabled. These are core
 integration surfaces. Schema 51 exposes the same native read through typed
 `Sparrow.sparqlQuery`, CLI `sparrow ENDPOINT sparql REQUEST.json`, and MCP
-`sparql_query`. Text relations, correlation and public explanation contracts
-remain unfinished. Recordless artifact metadata is implemented and deployed in
+`sparql_query`. Text relations and public explanation contracts remain unfinished.
+Native correlation is implemented in source schema 58, as specified below.
+Recordless artifact metadata is implemented and deployed in
 schema 52, as qualified below.
 
 The core `sparql_read`/`sparql_read_next` pair publishes immutable native captures
@@ -877,6 +878,78 @@ and explanation operations return supporting IDs/spans and receipts, so an agent
 can inspect evidence for each asserted relationship.
 
 ## 3. MCP operations
+
+### Native correlation (schema 58)
+
+`correlate` is a typed Cap'n Proto operation with shared CLI/MCP controls. CLI
+uses `correlate REQUEST.json`. It runs fixed native governed SELECT recipes;
+callers supply typed selector parameters, never interpolated query fragments.
+Example:
+
+```json
+{
+  "store_id": "store:...",
+  "scope": {"kind": "live"},
+  "selector": {"kind": "evidence", "ids": ["record:..."]},
+  "relation": {
+    "kind": "cooccurs_in_interval",
+    "interval": {
+      "clock": "event",
+      "from": "2026-10-18T10:00:00Z",
+      "before": "2026-10-18T10:05:00Z"
+    }
+  },
+  "page_size": 100
+}
+```
+
+Selectors are `evidence` (1..32 record/complete-artifact IDs), `diagnostic`
+(`dimension` and exact decoded string `value`), `source` (exact label `value`),
+or `time` (an `interval` with receipt or event clock). Diagnostic dimensions use
+the existing service/host/severity/trace_id/span_id vocabulary. All seed evidence
+references are checked for retention and complete-artifact availability through
+the original selection owner before filters. Both endpoints must belong to the
+same captured outer scope. An eligible seed excluded by its filters produces no
+relationship; a missing/unavailable reference fails before native evaluation.
+
+Relations are `shared_trace_id`, `shared_span_id`, `shared_source`, or
+`cooccurs_in_interval`. The first two compare known declared strings exactly;
+they do not establish a global trace/span identity or causal link. Shared source
+means the same recorded Source entity. Co-occurrence requires both known times
+in the explicit half-open interval; it is not a guessed relative window or a
+producer-order claim. Event-time unknowns never use receipt time as a fallback.
+
+Native rows are directed `(seed, related)` pairs, exclude self-edges, and preserve
+distinct occurrences with equal payloads. Reverse pairs may both appear when
+both records are seeds. Native SRJ bindings contain `seed_id`, `record_id`, both
+occurrence/parent/source IRIs, exact source labels, receipt instants and original
+source byte ranges (`seed_start/end`, `related_start/end`). Shared-value recipes
+also return `relationship_value`; interval recipes return both window-clock
+instants. Rows sort by seed receipt/ID then related receipt/ID. The IDs and spans
+support original-byte inspection; a result lease does not retain those bytes.
+
+The native result envelope, governor certificate and all partial/failure laws are
+the same as raw SPARQL. `operation=correlate` and a frozen `correlation` descriptor
+survive `result_next`. Its `sparrow-correlation/1` profile and
+`correlation-query:<BLAKE3>` key cover recipe text and normalized typed parameters;
+scope and snapshot identities remain separate. A descriptor is validated through
+the same recipe owner before rendering. Source, scope, page and governor controls
+share their original decoders/admission/delivery owners; remote reads stay disabled.
+Content projection is not needed: correlation reads metadata and diagnostics.
+
+All native graph replies additionally expose `interpretations`: known/unknown
+event-time and per-dimension diagnostic counts among known selected occurrences.
+Outer diagnostic-membership unknowns remain separate in the existing coverage.
+For correlation, `coverage.complete` also requires known interpretations for all
+selector/relation fields throughout that selected scope, not only matching rows.
+Strict `require_complete_index=true` refuses an incomplete interpretation with
+`INDEX_NOT_READY`. In permissive mode, available relationships retain their native
+certainty while incomplete coverage prevents an empty result proving absence.
+Governor at-most results remain candidates and unknown outcomes expose no rows.
+Raw SPARQL keeps its existing readiness law and has `correlation=null`.
+
+Schema discovery advances to 58. Persistent storage and native RDF vocabulary
+are unchanged; the running version is tracked separately in Development runtime.
 
 Use the standard stdio MCP transport. The adapter translates MCP messages into
 generated typed Cap'n Proto client calls over the selected Unix or public TCP endpoint.

@@ -359,9 +359,19 @@ impl Store {
         now: u64,
         cancellation: &QueryCancellation,
     ) -> Result<SparqlReadPage, ReadError> {
+        self.capture_sparql(read, None, now, cancellation)
+    }
+
+    pub(in crate::storage) fn capture_sparql(
+        &self,
+        read: &SparqlRead<'_>,
+        correlation: Option<&crate::CorrelationCapture>,
+        now: u64,
+        cancellation: &QueryCancellation,
+    ) -> Result<SparqlReadPage, ReadError> {
         let started = Instant::now();
         let body = self.with_sparql_result(
-            read,
+            (read, correlation),
             now,
             cancellation,
             |view, run| -> Result<_, ReadError> {
@@ -402,7 +412,13 @@ impl Store {
                 let scope_bytes = catalog_lease::response_row_bytes(
                     crate::storage::json::write_compact(&run.scope).len(),
                 );
+                let correlation_bytes = run.correlation.as_ref().map_or(0, |capture| {
+                    catalog_lease::response_row_bytes(
+                        crate::storage::json::write_compact(&capture.descriptor()).len(),
+                    )
+                });
                 let metadata = 8192usize
+                    .saturating_add(correlation_bytes)
                     .saturating_add(scope_bytes)
                     .saturating_add(size_of::<Published>())
                     .saturating_add(size_of::<

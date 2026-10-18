@@ -10,7 +10,7 @@ DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained nati
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
 [Development runtime](development-runtime.md#schema-57-live-adoption).
-Native text relations, correlation, public measured explanation, bounded physical
+Native text relations, public measured explanation, bounded physical
 reclamation and production resource/turnover acceptance remain required. The
 earlier qualification evidence below records how the deployed graph surface grew.
 
@@ -20,6 +20,16 @@ existing native owned-workspace seam; query certainty and coverage retain their
 original owners. [Source qualification](development-runtime.md#schema-57-graphcontext-scope-source-qualification)
 and [default-image live adoption](development-runtime.md#schema-57-live-adoption)
 are separately recorded; the remaining requirements listed above are still open.
+
+Source schema 58 adds native correlation through fixed SELECT recipes and typed
+substitutions, sharing the same immutable scope, governor, cancellation and
+retained-page owners. Selectors cover concrete evidence, diagnostic fields,
+source labels and explicit receipt/event intervals. Relationships cover shared
+trace ID, span ID, Source entity and co-occurrence within an explicit interval.
+Unknown interpretations reduce coverage and strict requests refuse them; native
+certainty remains independent. This source implementation does not resolve the
+borrowed text producer or operational EXPLAIN gaps below. The installed service
+remains schema 57 until a separately qualified runtime adoption is recorded.
 
 ## Query-scoped stored text producers
 
@@ -180,7 +190,7 @@ The shared registry accounting now gives status and maintenance the same expiry
 path. These core pages still require typed graph RPC, generic `result_next`
 dispatch and CLI/MCP integration; the installed daemon cannot create them.
 
-The remaining text/correlation surfaces must reuse native prepared bindings,
+The remaining text surfaces must reuse native prepared bindings,
 typed Cap'n Proto publication, retained-page dispatch, cancellation and CLI/MCP
 parity. Complete, certain, at-most, unknown and operational failure outcomes must
 retain the native distinction. A missing or failed source checkpoint must never

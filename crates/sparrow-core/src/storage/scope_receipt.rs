@@ -76,13 +76,7 @@ pub(super) fn capture(
         values.len()
     };
     let source_count = alternatives(scope.sources.as_ref());
-    for dimension in [
-        crate::DiagnosticDimension::Service,
-        crate::DiagnosticDimension::Host,
-        crate::DiagnosticDimension::Severity,
-        crate::DiagnosticDimension::TraceId,
-        crate::DiagnosticDimension::SpanId,
-    ] {
+    for dimension in crate::DiagnosticDimension::ALL {
         alternatives(scope.diagnostics.get(&dimension));
     }
     part(&scope.received_from.to_le_bytes());

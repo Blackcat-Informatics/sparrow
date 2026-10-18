@@ -8,12 +8,16 @@ use purrdf::{SparqlResult, TermFactory, ir::RdfDatasetBuilder};
 use purrdf_lex::json::{self, Object, Value};
 
 pub(crate) struct Input {
-    store: String,
+    controls: Controls,
     query: String,
     base: Option<String>,
-    options: super::Options,
     layers: [bool; 3],
     bindings: Vec<(String, purrdf::TermValue)>,
+}
+
+pub(super) struct Controls {
+    pub store: String,
+    pub options: super::Options,
     limits: [Option<u64>; 9],
 }
 
@@ -35,34 +39,9 @@ impl Input {
         let invalid = |e: json::record::DecodeError| super::invalid(e.to_string());
         let decode = || -> std::result::Result<Self, json::record::DecodeError> {
             let mut fields = Record::new(value, "SPARQL request")?;
-            let store = fields.required("store_id")?;
+            let controls = Controls::decode(&mut fields)?;
             let query = fields.required("query")?;
             let base = fields.optional("base_iri")?;
-            let mut options = super::Options::default();
-            if let Some(value) = fields.raw("scope")? {
-                options.selection = Box::new(super::selection::decode(value)?);
-            }
-            options.source = fields.optional("source")?;
-            for (name, target) in [
-                ("received_from", &mut options.from),
-                ("received_before", &mut options.before),
-            ] {
-                if let Some(value) = fields.optional::<String>(name)? {
-                    *target = sparrow_core::parse_instant(&value)
-                        .map_err(json::record::DecodeError::custom)?;
-                }
-            }
-            if let Some(value) = fields.optional::<u32>("page_size")? {
-                options.limit = value;
-            }
-            if let Some(value) = fields.optional::<u32>("scan_budget")? {
-                options.scan_budget = value;
-            }
-            options.require_complete_index =
-                fields.optional("require_complete_index")?.unwrap_or(false);
-            options
-                .validate()
-                .map_err(json::record::DecodeError::custom)?;
             let mut layers = [true; 3];
             if let Some(value) = fields.raw("layers")? {
                 let mut layer = Record::new(value, "RDF layers")?;
@@ -75,14 +54,6 @@ impl Input {
                     }
                 }
                 layer.deny_unknown()?;
-            }
-            let mut limits = [None; 9];
-            if let Some(value) = fields.raw("limits")? {
-                let mut input = Record::new(value, "SPARQL limits")?;
-                for (index, name) in LIMIT_NAMES.into_iter().enumerate() {
-                    limits[index] = input.raw(name)?.map(super::decimal_u64).transpose()?;
-                }
-                input.deny_unknown()?;
             }
             let mut bindings = Vec::new();
             if let Some(value) = fields.raw("bindings")? {
@@ -127,28 +98,25 @@ impl Input {
             }
             fields.deny_unknown()?;
             Ok(Self {
-                store,
+                controls,
                 query,
                 base,
-                options,
                 layers,
                 bindings,
-                limits,
             })
         };
         decode().map_err(invalid)
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
-        self.options.selection.require_supported(client).await?;
-        sparrow_client::Discovery::fetch(client).await?;
+        self.controls.require(client).await?;
         let mut call = client.sparql_query_request();
         let mut query = call.get().init_query();
-        query.set_store_id(&self.store);
+        query.set_store_id(&self.controls.store);
         query.set_schema_version(sparrow_client::SCHEMA_VERSION);
         query.set_query(&self.query);
         super::optional(query.reborrow().init_base_iri(), &self.base);
-        super::fill_scope(query.reborrow().init_scope(), &self.options)?;
+        super::fill_scope(query.reborrow().init_scope(), &self.controls.options)?;
         let mut layers = query.reborrow().init_layers();
         layers.set_metadata(self.layers[0]);
         layers.set_diagnostic(self.layers[1]);
@@ -166,7 +134,67 @@ impl Input {
             binding.set_name(name);
             binding.set_term(ids[index]);
         }
-        let mut limits = query.init_limits();
+        self.controls.fill_limits(query.init_limits());
+        let response = call.send().promise.await?;
+        match response.get()?.get_result()?.which()? {
+            wire::result::Ok(value) => render(value?),
+            wire::result::Error(error) => Err(failure(error?)),
+        }
+    }
+}
+
+impl Controls {
+    pub(super) fn decode(
+        fields: &mut json::record::Record<'_>,
+    ) -> std::result::Result<Self, json::record::DecodeError> {
+        let store = fields.required("store_id")?;
+        let mut options = super::Options::default();
+        if let Some(value) = fields.raw("scope")? {
+            options.selection = Box::new(super::selection::decode(value)?);
+        }
+        options.source = fields.optional("source")?;
+        for (name, target) in [
+            ("received_from", &mut options.from),
+            ("received_before", &mut options.before),
+        ] {
+            if let Some(value) = fields.optional::<String>(name)? {
+                *target = sparrow_core::parse_instant(&value)
+                    .map_err(json::record::DecodeError::custom)?;
+            }
+        }
+        if let Some(value) = fields.optional::<u32>("page_size")? {
+            options.limit = value;
+        }
+        if let Some(value) = fields.optional::<u32>("scan_budget")? {
+            options.scan_budget = value;
+        }
+        options.require_complete_index =
+            fields.optional("require_complete_index")?.unwrap_or(false);
+        options
+            .validate()
+            .map_err(json::record::DecodeError::custom)?;
+        let mut limits = [None; 9];
+        if let Some(value) = fields.raw("limits")? {
+            let mut input = json::record::Record::new(value, "native query limits")?;
+            for (index, name) in LIMIT_NAMES.into_iter().enumerate() {
+                limits[index] = input.raw(name)?.map(super::decimal_u64).transpose()?;
+            }
+            input.deny_unknown()?;
+        }
+        Ok(Self {
+            store,
+            options,
+            limits,
+        })
+    }
+
+    pub(super) async fn require(&self, client: &wire::sparrow::Client) -> Result<()> {
+        self.options.selection.require_supported(client).await?;
+        sparrow_client::Discovery::fetch(client).await?;
+        Ok(())
+    }
+
+    pub(super) fn fill_limits(&self, mut limits: wire::sparql_limits::Builder<'_>) {
         for (index, value) in self.limits.into_iter().enumerate() {
             if let Some(value) = value {
                 match index {
@@ -182,11 +210,6 @@ impl Input {
                     _ => unreachable!(),
                 }
             }
-        }
-        let response = call.send().promise.await?;
-        match response.get()?.get_result()?.which()? {
-            wire::result::Ok(value) => render(value?),
-            wire::result::Error(error) => Err(failure(error?)),
         }
     }
 }
@@ -640,7 +663,52 @@ fn dimension(value: wire::GovernorDimension) -> &'static str {
 }
 
 pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
+    let host = value.get_limits()?;
+    let source_profile = host.get_source_profile()?.to_str()?;
+    if source_profile != sparrow_core::RDF_SOURCE_ADMISSION_PROFILE
+        || host.get_scope_receipt_bytes() != sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES as u64
+    {
+        return Err(protocol("unsupported RDF source admission profile"));
+    }
     let c = value.get_coverage()?;
+    let selected = c.get_known_selected_records();
+    let unknown = |known: u64| {
+        selected
+            .checked_sub(known)
+            .ok_or_else(|| protocol("interpretation counts exceed selected records"))
+    };
+    let mut diagnostic_known = Object::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in c.get_diagnostic_known()? {
+        let dimension = crate::diagnostics::dimension(row.get_dimension()?);
+        if !seen.insert(dimension) {
+            return Err(protocol("duplicate diagnostic interpretation counter"));
+        }
+        diagnostic_known.insert(
+            dimension.name(),
+            Object::new()
+                .with("known", row.get_known().to_string())
+                .with("unknown", unknown(row.get_known())?.to_string()),
+        );
+    }
+    if seen.len() != sparrow_core::DiagnosticDimension::ALL.len() {
+        return Err(protocol("missing diagnostic interpretation counters"));
+    }
+    let interpretations = Object::new()
+        .with(
+            "event_time",
+            Object::new()
+                .with("known", c.get_event_time_known().to_string())
+                .with("unknown", unknown(c.get_event_time_known())?.to_string()),
+        )
+        .with("diagnostics", diagnostic_known);
+    let correlation = match value.get_correlation()?.which()? {
+        wire::optional_correlation_capture::Absent(()) => None,
+        wire::optional_correlation_capture::Value(capture) => Some(
+            crate::correlation_wire::decode(capture?, value.get_page()?.get_store_id()?.to_str()?)
+                .map_err(|error| protocol(error.to_string()))?,
+        ),
+    };
     let d = c.get_diagnostics()?;
     let coverage = Object::new()
         .with("visited", c.get_visited().to_string())
@@ -681,13 +749,6 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     let g = governor(value.get_governors()?)?;
     let stop = g["stop"].clone();
     let e = value.get_evidence()?;
-    let host = value.get_limits()?;
-    let source_profile = host.get_source_profile()?.to_str()?;
-    if source_profile != sparrow_core::RDF_SOURCE_ADMISSION_PROFILE
-        || host.get_scope_receipt_bytes() != sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES as u64
-    {
-        return Err(protocol("unsupported RDF source admission profile"));
-    }
     let limits = host.get_source()?;
     let layers = value.get_layers()?;
     let mut result = super::catalog::page(value.get_page()?)?
@@ -698,7 +759,19 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
                 value.get_page()?.get_as_of()?.get_unix_millis(),
             )?,
         )
-        .with("operation", "sparql_query")
+        .with(
+            "operation",
+            if correlation.is_some() {
+                "correlate"
+            } else {
+                "sparql_query"
+            },
+        )
+        .with(
+            "correlation",
+            correlation.map_or(Value::Null, |capture| capture.descriptor()),
+        )
+        .with("interpretations", interpretations)
         .with("sequence", value.get_sequence().to_string())
         .with("coverage", coverage)
         .with("native_governor", g)

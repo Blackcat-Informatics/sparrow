@@ -106,6 +106,10 @@ pub struct RdfScopeCoverage {
     pub diagnostics: DiagnosticCoverage,
     /// Catalog reads admitted across reference expansion and candidate loading.
     pub catalog_entries: usize,
+    /// Known source-event times among selected occurrences, independently of RDF readiness.
+    pub event_time_known: u64,
+    /// Known declared diagnostic values among selected occurrences, by dimension.
+    pub diagnostic_known: std::collections::BTreeMap<crate::DiagnosticDimension, u64>,
 }
 
 impl RdfScopeCoverage {
@@ -211,6 +215,14 @@ impl StoredRdfView<'_> {
         strict: bool,
         coverage: &mut RdfScopeCoverage,
     ) -> Result<(), ReadError> {
+        if matches!(record.event_time, crate::EventTime::Known { .. }) {
+            coverage.event_time_known += 1;
+        }
+        for (dimension, value) in &record.diagnostics.fields {
+            if matches!(value, crate::DiagnosticValue::Known { .. }) {
+                *coverage.diagnostic_known.entry(*dimension).or_default() += 1;
+            }
+        }
         if layers.metadata {
             self.include_owner(&record.id)?;
         }
@@ -294,6 +306,19 @@ impl Store {
         cancellation: &QueryCancellation,
         operation: impl FnOnce(&StoredRdfView<'_>, &RdfScopeCoverage) -> T,
     ) -> Result<T, ReadError> {
+        self.capture_rdf_scope((scope, None), layers, now, limits, cancellation, operation)
+    }
+
+    pub(super) fn capture_rdf_scope<T>(
+        &self,
+        selection: (&QueryScope, Option<&crate::CorrelationCapture>),
+        layers: RdfGraphLayers,
+        now: u64,
+        limits: RdfReadLimits,
+        cancellation: &QueryCancellation,
+        operation: impl FnOnce(&StoredRdfView<'_>, &RdfScopeCoverage) -> T,
+    ) -> Result<T, ReadError> {
+        let (scope, correlation) = selection;
         scope.validate().map_err(Arc::new)?;
         cancellation.checkpoint().map_err(Arc::new)?;
         let _lease = self.rdf_read_lease()?;
@@ -338,6 +363,20 @@ impl Store {
         let selection = writer
             .query_selection_membership(&scope.selection, now, &protected, Some(&mut admission))
             .map_err(|e| budget.fail(e))?;
+        if let Some(crate::CorrelationCapture {
+            selector: crate::CorrelationSelector::Evidence(ids),
+            ..
+        }) = correlation
+        {
+            writer
+                .query_selection_membership(
+                    &crate::QuerySelection::Evidence(ids.clone()),
+                    now,
+                    &protected,
+                    Some(&mut admission),
+                )
+                .map_err(|error| budget.fail(error))?;
+        }
         Arc::get_mut(&mut view._scope)
             .expect("scope capture precedes owned query admission")
             .grow(crate::QUERY_SCOPE_WORKSPACE_BYTES as u64)?;

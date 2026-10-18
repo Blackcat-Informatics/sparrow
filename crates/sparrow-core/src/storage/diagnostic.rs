@@ -24,14 +24,30 @@ pub enum DiagnosticDimension {
 }
 
 impl DiagnosticDimension {
+    /// Closed diagnostic vocabulary, in the stable scope-fingerprint order.
+    pub const ALL: [Self; 5] = [
+        Self::Service,
+        Self::Host,
+        Self::Severity,
+        Self::TraceId,
+        Self::SpanId,
+    ];
+
+    pub(crate) fn predicate_iri(self) -> &'static str {
+        self.vocabulary().1
+    }
     /// Closed vocabulary spelling used in profiles, filters and diagnostic RDF.
     pub fn name(self) -> &'static str {
+        self.vocabulary().0
+    }
+
+    fn vocabulary(self) -> (&'static str, &'static str) {
         match self {
-            Self::Service => "service",
-            Self::Host => "host",
-            Self::Severity => "severity",
-            Self::TraceId => "trace_id",
-            Self::SpanId => "span_id",
+            Self::Service => ("service", "urn:sparrow:vocab:service"),
+            Self::Host => ("host", "urn:sparrow:vocab:host"),
+            Self::Severity => ("severity", "urn:sparrow:vocab:severity"),
+            Self::TraceId => ("trace_id", "urn:sparrow:vocab:traceId"),
+            Self::SpanId => ("span_id", "urn:sparrow:vocab:spanId"),
         }
     }
 
@@ -415,14 +431,7 @@ pub(super) fn rdf(record: &Record) -> Result<std::sync::Arc<purrdf::RdfDataset>,
         builder.push_quad(subject, predicate, evidence, None)?;
         if let DiagnosticValue::Known { value, .. } = value {
             let literal = builder.intern_literal(RdfLiteral::simple(value))?;
-            let predicate = builder.intern_iri(&format!(
-                "urn:sparrow:vocab:{}",
-                match dimension {
-                    DiagnosticDimension::TraceId => "traceId",
-                    DiagnosticDimension::SpanId => "spanId",
-                    _ => dimension.name(),
-                }
-            ))?;
+            let predicate = builder.intern_iri(dimension.predicate_iri())?;
             builder.push_quad(subject, predicate, literal, None)?;
         }
         let mut facts = vec![(

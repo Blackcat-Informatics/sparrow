@@ -7127,8 +7127,9 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 36);
+    assert_eq!(definitions.len(), 37);
     for (name, read_only) in [
+        ("correlate", true),
         ("retention_metrics", true),
         ("ingest_get", true),
         ("file_finish", false),
@@ -8616,6 +8617,210 @@ fn cli(socket: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> purrdf_lex::json::
         String::from_utf8_lossy(&output.stderr)
     );
     purrdf_lex::json::read_slice(&output.stdout, purrdf_lex::json::Limits::default()).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_scopes() {
+    use purrdf_lex::json::{self, Object};
+    use sparrow_core::DiagnosticDimension;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let owner = sparrow_server::ServerConfig::read(&config)
+                .unwrap()
+                .open_store()
+                .unwrap();
+            let old = sparrow_server::now().unwrap() - 31 * 86400000;
+            let mut targets = Vec::new();
+            for source in ["correlate-a", "correlate-b"] {
+                owner
+                    .define_diagnostic_profile(
+                        source,
+                        [(DiagnosticDimension::TraceId, "/trace".into())]
+                            .into_iter()
+                            .collect(),
+                    )
+                    .unwrap();
+                targets.push(
+                    owner
+                        .ingest(source, source, "jsonl", b"{\"trace\":\"shared\"}\n", old)
+                        .unwrap()
+                        .id,
+                );
+            }
+            targets.push(
+                owner
+                    .ingest(
+                        "correlate-unprofiled",
+                        "correlate-unprofiled",
+                        "log",
+                        b"unknown trace\n",
+                        old,
+                    )
+                    .unwrap()
+                    .id,
+            );
+            let pin = owner
+                .pin("correlate-pin", "correlation", &targets, 40, old)
+                .unwrap();
+            drop(owner);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let _daemon = start(&config, &socket).await;
+            let endpoint = format!("tcp://{address}");
+            let client = sparrow_client::Client::connect_endpoint(
+                &sparrow_client::Endpoint::parse(&endpoint).unwrap(),
+            )
+            .await
+            .unwrap();
+            let store = client.discovery().store_id.clone();
+            let args = Object::new()
+                .with("store_id", store.clone())
+                .with(
+                    "scope",
+                    Object::new()
+                        .with("kind", "pin")
+                        .with("store_id", store.clone())
+                        .with("pin_id", pin.id.clone()),
+                )
+                .with(
+                    "selector",
+                    Object::new()
+                        .with("kind", "diagnostic")
+                        .with("dimension", "trace_id")
+                        .with("value", "shared"),
+                )
+                .with("relation", "shared_trace_id")
+                .with("page_size", 1_u32);
+            let path = dir.path().join("correlate.json");
+            std::fs::write(&path, json::write_compact(&args.clone().into())).unwrap();
+            let first = cli(&endpoint, &["correlate", path.to_str().unwrap()]);
+            assert_eq!(first["operation"].as_str(), Some("correlate"));
+            assert_eq!(first["execution_status"].as_str(), Some("complete"));
+            assert_eq!(first["answer_certainty"].as_str(), Some("exact"));
+            assert_eq!(first["coverage"]["complete"].as_bool(), Some(false));
+            assert_eq!(
+                first["interpretations"]["diagnostics"]["trace_id"]["unknown"].as_str(),
+                Some("1")
+            );
+            assert_eq!(
+                first["correlation"]["profile"].as_str(),
+                Some(sparrow_core::CORRELATION_PROFILE)
+            );
+            assert_eq!(first["scope"]["pin"]["revision"].as_str(), Some("1"));
+            assert!(first["has_more"].as_bool().unwrap());
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let captured = mcp.tool(2, "correlate", args.clone().into()).await;
+            assert_eq!(captured["isError"].as_bool(), Some(false), "{captured:?}");
+            let captured = &captured["structuredContent"];
+            assert_eq!(captured["scope"], first["scope"]);
+            assert_eq!(captured["correlation"], first["correlation"]);
+            assert_eq!(captured["rows"], first["rows"]);
+            let strict = mcp
+                .tool(
+                    3,
+                    "correlate",
+                    args.clone().with("require_complete_index", true).into(),
+                )
+                .await;
+            assert_eq!(strict["isError"].as_bool(), Some(true));
+            assert_eq!(
+                strict["structuredContent"]["error"]["code"].as_str(),
+                Some("INDEX_NOT_READY")
+            );
+            let mut partials = 0;
+            for (index, fuel) in [0_u64, 1, 3, 10, 25].into_iter().enumerate() {
+                let value = mcp
+                    .tool(
+                        10 + index as u64,
+                        "correlate",
+                        args.clone()
+                            .with("limits", Object::new().with("fuel", fuel.to_string()))
+                            .into(),
+                    )
+                    .await;
+                assert_eq!(value["isError"].as_bool(), Some(false), "{value:?}");
+                let value = &value["structuredContent"];
+                assert_eq!(value["operation"].as_str(), Some("correlate"));
+                assert_eq!(value["correlation"], first["correlation"]);
+                if value["execution_status"].as_str() == Some("partial") {
+                    partials += 1;
+                    match value["answer_certainty"].as_str().unwrap() {
+                        "at_most" => {
+                            assert!(value.get("rows").is_none());
+                            assert!(value.get("candidates").is_some());
+                        }
+                        "unknown" => {
+                            assert!(value.get("rows").is_none());
+                            assert!(value.get("candidates").is_none());
+                        }
+                        "certain" => assert!(value.get("rows").is_some()),
+                        _ => panic!("native partial certificate required"),
+                    }
+                }
+                if value["has_more"].as_bool() == Some(true) {
+                    client
+                        .release_result(value["snapshot_id"].as_str().unwrap())
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(partials > 0);
+            cli(
+                &endpoint,
+                &["pin-release", "correlate-release", &store, &pin.id],
+            );
+            let cursor = first["next_cursor"].as_str().unwrap();
+            let second = cli(&endpoint, &["result-next", &store, cursor]);
+            let replay = mcp
+                .tool(
+                    30,
+                    "result_next",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert_eq!(replay["structuredContent"], second);
+            assert_eq!(second["scope"], first["scope"]);
+            assert_eq!(second["correlation"], first["correlation"]);
+            assert_eq!(second["operation"].as_str(), Some("correlate"));
+            client
+                .release_result(first["snapshot_id"].as_str().unwrap())
+                .await
+                .unwrap();
+            client
+                .release_result(captured["snapshot_id"].as_str().unwrap())
+                .await
+                .unwrap();
+            // Direct typed callers use the same validated store and finite governors.
+            let mut call = client.capability().correlate_request();
+            let mut query = call.get().init_query();
+            query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+            query.set_store_id(&store);
+            {
+                let mut scope = query.reborrow().init_scope();
+                scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                scope.init_received_before().set_unix_millis(u64::MAX);
+            }
+            let mut ids = query.reborrow().init_selector().init_evidence(1);
+            let mut id = ids.reborrow().get(0);
+            id.set_store_id("store:foreign");
+            id.set_record("record:unknown");
+            query.init_relation().set_source(());
+            let response = call.send().promise.await.unwrap();
+            assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(error) if error.as_ref().unwrap().get_code().unwrap().to_str().unwrap() == "STORE_MISMATCH"));
+            assert_eq!(
+                cli(&endpoint, &["status"])["sparql_read_handles"].as_str(),
+                Some("0")
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

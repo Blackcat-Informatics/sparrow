@@ -5,6 +5,7 @@
 
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
 mod config;
+mod correlation_wire;
 mod diagnostics;
 mod source_file;
 pub mod syslog_listener;

@@ -5,6 +5,26 @@
 
 use crate::{Error, sparrow_capnp as wire};
 
+/// Decode one bounded occurrence reference, preserving its union's evidence kind.
+/// Store equality remains the caller's store-ownership check.
+pub fn decode_evidence(value: wire::evidence::Reader<'_>) -> capnp::Result<(String, String)> {
+    let store = value.get_store_id()?;
+    let (id, prefix) = match value.which()? {
+        wire::evidence::Artifact(id) => (id?, "artifact:"),
+        wire::evidence::Record(id) => (id?, "record:"),
+    };
+    if store.len() > 128
+        || id.len() > 128
+        || id.len() <= prefix.len()
+        || !id.to_str()?.starts_with(prefix)
+    {
+        return Err(capnp::Error::failed(
+            "require a bounded store-scoped reference with the matching evidence kind".into(),
+        ));
+    }
+    Ok((store.to_str()?.to_owned(), id.to_str()?.to_owned()))
+}
+
 /// Encode an artifact or record reference; investigation targets remain concrete occurrences.
 pub fn encode_evidence(
     mut target: wire::evidence::Builder<'_>,
@@ -73,6 +93,39 @@ fn certify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_reference_codec_round_trips_and_refuses_kind_mismatch_and_oversized_ids() {
+        for id in ["artifact:example", "record:example"] {
+            let mut message = capnp::message::Builder::new_default();
+            encode_evidence(
+                message.init_root::<wire::evidence::Builder<'_>>(),
+                "store:example",
+                id,
+            )
+            .unwrap();
+            assert_eq!(
+                decode_evidence(
+                    message
+                        .get_root_as_reader::<wire::evidence::Reader<'_>>()
+                        .unwrap()
+                )
+                .unwrap(),
+                ("store:example".into(), id.into())
+            );
+        }
+        let mut message = capnp::message::Builder::new_default();
+        let mut reference = message.init_root::<wire::evidence::Builder<'_>>();
+        reference.set_store_id("store:example");
+        for id in [
+            "artifact:wrong",
+            "record:",
+            &format!("record:{}", "x".repeat(128)),
+        ] {
+            reference.set_record(id);
+            assert!(decode_evidence(reference.reborrow_as_reader()).is_err());
+        }
+    }
 
     #[test]
     fn exact_byte_receipts_refuse_foreign_stores_and_short_or_long_ranges() {

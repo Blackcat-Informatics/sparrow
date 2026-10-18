@@ -26,19 +26,32 @@ struct Request {
     governors: QueryGovernors,
 }
 
-fn request(rpc: &Rpc, input: wire::sparql_query::Reader<'_>) -> Result<Request, Error> {
-    if input.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+pub(super) fn query_scope(
+    rpc: &Rpc,
+    version: u32,
+    store: capnp::text::Reader<'_>,
+    input: wire::scope::Reader<'_>,
+) -> Result<QueryScope, Error> {
+    if version != sparrow_client::SCHEMA_VERSION {
         return Err(Error::new(
             "UNSUPPORTED",
             "native queries require the current discovered schema",
         ));
     }
-    let store = input.get_store_id().map_err(invalid)?;
     if store.len() > 128 {
         return Err(invalid("store identity exceeds 128 bytes"));
     }
     rpc.check_store(store.to_str().map_err(invalid)?)?;
-    let scope = super::scope(input.get_scope().map_err(invalid)?, rpc).map_err(invalid)??;
+    super::scope(input, rpc).map_err(invalid)?
+}
+
+fn request(rpc: &Rpc, input: wire::sparql_query::Reader<'_>) -> Result<Request, Error> {
+    let scope = query_scope(
+        rpc,
+        input.get_schema_version(),
+        input.get_store_id().map_err(invalid)?,
+        input.get_scope().map_err(invalid)?,
+    )?;
     let text = input.get_query().map_err(invalid)?;
     if text.len() > 65536 {
         return Err(Error::new("RESOURCE_LIMIT", "SPARQL query exceeds 64 KiB"));
@@ -75,7 +88,21 @@ fn request(rpc: &Rpc, input: wire::sparql_query::Reader<'_>) -> Result<Request, 
     }
     let values = crate::rdf_wire::decode(input.get_terms().map_err(invalid)?, &roots, true)?;
     let bindings = names.into_iter().zip(values).collect();
-    let limits = input.get_limits().map_err(invalid)?;
+    let (source, governors) = query_limits(input.get_limits().map_err(invalid)?)?;
+    Ok(Request {
+        scope,
+        text,
+        base,
+        layers,
+        bindings,
+        source,
+        governors,
+    })
+}
+
+pub(super) fn query_limits(
+    limits: wire::sparql_limits::Reader<'_>,
+) -> Result<(RdfReadLimits, QueryGovernors), Error> {
     let source = RdfReadLimits {
         live_bytes: limits.get_live_bytes(),
         requests: limits.get_requests(),
@@ -104,15 +131,7 @@ fn request(rpc: &Rpc, input: wire::sparql_query::Reader<'_>) -> Result<Request, 
         .with_max_intermediate_cells(limits.get_intermediate_cells())
         .with_max_scratch_bytes(limits.get_scratch_bytes())
         .with_max_remote_requests(0);
-    Ok(Request {
-        scope,
-        text,
-        base,
-        layers,
-        bindings,
-        source,
-        governors,
-    })
+    Ok((source, governors))
 }
 
 pub(super) async fn query(
@@ -127,7 +146,7 @@ pub(super) async fn query(
             return Ok(());
         }
     };
-    match rpc
+    let reply = rpc
         .query_work(true, move |store, now, cancellation| {
             store
                 .sparql_read(
@@ -147,15 +166,22 @@ pub(super) async fn query(
                 )
                 .map_err(|e| Error::new(e.code, e.message.clone()))
         })
-        .await
-    {
-        Err(error) => failure(results.get().init_result(), error),
-        Ok(mut reply) => match page(results.get().init_result().init_ok(), &reply.page) {
+        .await;
+    deliver(results.get().init_result(), reply);
+    Ok(())
+}
+
+pub(super) fn deliver(
+    mut out: wire::result::Builder<'_, wire::sparql_page::Owned>,
+    reply: Result<QueryReply<sparrow_core::SparqlPageBody>, Error>,
+) {
+    match reply {
+        Err(error) => failure(out, error),
+        Ok(mut reply) => match page(out.reborrow().init_ok(), &reply.page) {
             Ok(()) => reply.delivered = true,
-            Err(error) => failure(results.get().init_result(), error),
+            Err(error) => failure(out, error),
         },
     }
-    Ok(())
 }
 
 fn dimension(value: ResourceDimension) -> wire::GovernorDimension {
@@ -402,6 +428,15 @@ pub(super) fn page(
     page: &SparqlReadPage,
 ) -> Result<(), Error> {
     let run = page.body.captured();
+    match &run.correlation {
+        Some(capture) => crate::correlation_wire::encode(
+            out.reborrow().init_correlation().init_value(),
+            capture,
+            &run.store_id,
+        )
+        .map_err(|error| Error::new("STORAGE_FAILURE", error.to_string()))?,
+        None => out.reborrow().init_correlation().set_absent(()),
+    }
     query_scope_receipt(out.reborrow().init_scope(), &run.scope)
         .map_err(|error| Error::new("STORAGE_FAILURE", format!("frozen graph scope: {error}")))?;
     match &run.outcome {
@@ -432,7 +467,23 @@ pub(super) fn page(
     coverage.set_content_failed(c.content_failed);
     coverage.set_content_not_applicable(c.content_not_applicable);
     coverage.set_catalog_entries(c.catalog_entries as u64);
-    coverage.set_complete(c.complete());
+    coverage.set_complete(
+        run.correlation
+            .as_ref()
+            .map_or_else(|| c.complete(), |capture| capture.complete(c)),
+    );
+    coverage.set_event_time_known(c.event_time_known);
+    let mut known = coverage
+        .reborrow()
+        .init_diagnostic_known(sparrow_core::DiagnosticDimension::ALL.len() as u32);
+    for (index, dimension) in sparrow_core::DiagnosticDimension::ALL
+        .into_iter()
+        .enumerate()
+    {
+        let mut target = known.reborrow().get(index as u32);
+        target.set_dimension(crate::diagnostics::wire_dimension(dimension));
+        target.set_known(c.diagnostic_known.get(&dimension).copied().unwrap_or(0));
+    }
     if c.diagnostics.complete(false) {
         coverage
             .reborrow()

@@ -15617,3 +15617,287 @@ fn graph_context_and_record_scopes_share_frozen_pin_evidence_through_renewal_and
         Some("0")
     );
 }
+
+#[test]
+fn native_correlation_recipes_bind_selectors_preserve_occurrences_and_report_unknown_interpretations()
+ {
+    use purrdf::{TermValue, sparql::QueryGovernors};
+    use sparrow_core::{
+        CorrelateRead, CorrelationClock, CorrelationInterval, CorrelationRelation as Relation,
+        CorrelationSelector as Selector, DiagnosticDimension as Dimension, QueryCancellation,
+        RdfReadLimits, SparqlItem, TimeRepresentation,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for source in ["correlation-a", "correlation-b"] {
+        store
+            .define_diagnostic_profile(
+                source,
+                [
+                    (Dimension::TraceId, "/trace".into()),
+                    (Dimension::SpanId, "/span".into()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        store
+            .define_time_profile(source, "/time", TimeRepresentation::UnixMillis)
+            .unwrap();
+    }
+    let a = store
+        .ingest(
+            "correlation-a",
+            "correlation-a",
+            "jsonl",
+            b"{\"trace\":\"t\",\"span\":\"7\",\"time\":1000}\n",
+            10,
+        )
+        .unwrap();
+    let b = store
+        .ingest(
+            "correlation-b",
+            "correlation-b",
+            "jsonl",
+            b"{\"trace\":\"t\",\"span\":\"7\",\"time\":1000}\n",
+            20,
+        )
+        .unwrap();
+    let c = store
+        .ingest(
+            "correlation-c",
+            "correlation-b",
+            "jsonl",
+            b"{\"trace\":\"different\",\"span\":\"8\",\"time\":2000}\n",
+            30,
+        )
+        .unwrap();
+    store
+        .ingest(
+            "correlation-unknown",
+            "correlation-unknown",
+            "log",
+            b"no declared interpretations\n",
+            15,
+        )
+        .unwrap();
+    let mut scope = record_page_scope("unused", 1000);
+    scope.source = None;
+    let governors = QueryGovernors::METERED.with_fuel(1_000_000);
+    let run = |scope: &sparrow_core::QueryScope, selector: &Selector, relation| {
+        store.correlate_read(
+            &CorrelateRead {
+                scope,
+                selector,
+                relation,
+                governors: &governors,
+                limits: RdfReadLimits::default(),
+            },
+            40,
+            &QueryCancellation::default(),
+        )
+    };
+    let selector = Selector::Evidence(vec![a.record_ids[0].clone()]);
+    let first = run(&scope, &selector, Relation::TraceId).unwrap();
+    assert_eq!(first.total_items, 1);
+    assert!(
+        first.body.captured().outcome.is_ok(),
+        "{:?}",
+        first.body.captured().outcome
+    );
+    let Some(SparqlItem::Solution(row)) = first.body.items().next() else {
+        panic!("native correlation solution expected")
+    };
+    assert_eq!(
+        row[0],
+        Some(TermValue::simple_literal(a.record_ids[0].clone()))
+    );
+    assert_eq!(
+        row[1],
+        Some(TermValue::simple_literal(b.record_ids[0].clone()))
+    );
+    assert_eq!(
+        row[12],
+        Some(TermValue::typed_literal(
+            "0",
+            "http://www.w3.org/2001/XMLSchema#nonNegativeInteger"
+        ))
+    );
+    let capture = first.body.captured().correlation.as_ref().unwrap();
+    assert!(!capture.complete(&first.body.captured().coverage));
+    assert_eq!(first.body.captured().coverage.event_time_known, 3);
+    assert_eq!(
+        first.body.captured().coverage.diagnostic_known[&Dimension::TraceId],
+        3
+    );
+    for (selector, relation, expected) in [
+        (Selector::Evidence(vec![a.id.clone()]), Relation::SpanId, 1),
+        (
+            Selector::Diagnostic(Dimension::TraceId, "t".into()),
+            Relation::TraceId,
+            2,
+        ),
+        (
+            Selector::Source("correlation-a".into()),
+            Relation::SpanId,
+            1,
+        ),
+        (
+            Selector::Evidence(vec![b.record_ids[0].clone()]),
+            Relation::Source,
+            1,
+        ),
+        (
+            Selector::Time(CorrelationInterval {
+                clock: CorrelationClock::Received,
+                from: 10,
+                before: 21,
+            }),
+            Relation::TraceId,
+            2,
+        ),
+        (
+            Selector::Evidence(vec![a.record_ids[0].clone()]),
+            Relation::Time(CorrelationInterval {
+                clock: CorrelationClock::Received,
+                from: 10,
+                before: 21,
+            }),
+            2,
+        ),
+        (
+            Selector::Evidence(vec![a.record_ids[0].clone()]),
+            Relation::Time(CorrelationInterval {
+                clock: CorrelationClock::Event,
+                from: 1000,
+                before: 2000,
+            }),
+            1,
+        ),
+        (
+            Selector::Diagnostic(Dimension::TraceId, "t\" } UNION { ?record ?p ?o } #".into()),
+            Relation::TraceId,
+            0,
+        ),
+    ] {
+        let page = run(&scope, &selector, relation).unwrap();
+        assert!(
+            page.body.captured().outcome.is_ok(),
+            "{:?}",
+            page.body.captured().outcome
+        );
+        assert_eq!(page.total_items, expected, "{selector:?} {relation:?}");
+    }
+    scope.require_complete_index = true;
+    assert_eq!(
+        run(&scope, &selector, Relation::TraceId).unwrap_err().code,
+        "INDEX_NOT_READY"
+    );
+    scope.selection = sparrow_core::QuerySelection::Evidence(vec![
+        a.record_ids[0].clone(),
+        b.record_ids[0].clone(),
+        c.record_ids[0].clone(),
+    ]);
+    let ready = run(&scope, &selector, Relation::TraceId).unwrap();
+    assert!(
+        ready
+            .body
+            .captured()
+            .correlation
+            .as_ref()
+            .unwrap()
+            .complete(&ready.body.captured().coverage)
+    );
+    let one = run(
+        &scope,
+        &Selector::Evidence(vec![
+            a.record_ids[0].clone(),
+            b.record_ids[0].clone(),
+            a.record_ids[0].clone(),
+        ]),
+        Relation::TraceId,
+    )
+    .unwrap();
+    let two = run(
+        &scope,
+        &Selector::Evidence(vec![b.record_ids[0].clone(), a.record_ids[0].clone()]),
+        Relation::TraceId,
+    )
+    .unwrap();
+    assert_eq!(
+        one.body.captured().correlation,
+        two.body.captured().correlation
+    );
+    assert_eq!(one.total_items, 2);
+    assert_eq!(
+        run(
+            &scope,
+            &Selector::Evidence(vec!["record:unknown".into()]),
+            Relation::Source
+        )
+        .unwrap_err()
+        .code,
+        "NOT_FOUND"
+    );
+    let pin = store
+        .pin(
+            "correlation-retain-records",
+            "correlation-records",
+            &[a.record_ids[0].clone(), b.record_ids[0].clone()],
+            40,
+            40,
+        )
+        .unwrap();
+    scope.selection = sparrow_core::QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: None,
+    };
+    scope.limit = 1;
+    let selector = Selector::Diagnostic(Dimension::TraceId, "t".into());
+    let now = 31 * DAY;
+    let captured = store
+        .correlate_read(
+            &CorrelateRead {
+                scope: &scope,
+                selector: &selector,
+                relation: Relation::TraceId,
+                governors: &governors,
+                limits: RdfReadLimits::default(),
+            },
+            now,
+            &QueryCancellation::default(),
+        )
+        .unwrap();
+    assert_eq!(captured.total_items, 2);
+    let cursor = captured.next_cursor.as_ref().unwrap();
+    let invalid_parent = store.correlate_read(
+        &CorrelateRead {
+            scope: &scope,
+            selector: &Selector::Evidence(vec![a.id]),
+            relation: Relation::TraceId,
+            governors: &governors,
+            limits: RdfReadLimits::default(),
+        },
+        now,
+        &QueryCancellation::default(),
+    );
+    assert_eq!(invalid_parent.unwrap_err().code, "EVIDENCE_UNAVAILABLE");
+    store
+        .release_retry("correlation-release-records", &pin.id, now + 1)
+        .unwrap();
+    store.expire(now + 2).unwrap();
+    let replay = store
+        .sparql_read_next(&captured.store_id, cursor, now + 3)
+        .unwrap();
+    assert_eq!(
+        replay.body.captured().correlation,
+        captured.body.captured().correlation
+    );
+    assert_eq!(replay.body.captured().scope, captured.body.captured().scope);
+    assert_eq!(replay.body.items().count(), 1);
+    assert!(
+        store
+            .result_release(&captured.store_id, &captured.snapshot_id, now + 4)
+            .unwrap()
+    );
+}

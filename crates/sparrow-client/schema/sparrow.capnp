@@ -681,6 +681,7 @@ interface Sparrow {
   ingestStatus @45 (query :IngestStatusQuery) -> (result :Result(IngestStatus));
   retentionMetrics @46 (query :RetentionMetricsQuery) -> (result :Result(RetentionMetrics));
   sparqlQuery @47 (query :SparqlQuery) -> (result :Result(SparqlPage));
+  correlate @48 (query :CorrelateQuery) -> (result :Result(SparqlPage));
 }
 
 # Page-local, child-before-parent term nodes. IDs never identify persisted terms.
@@ -722,7 +723,20 @@ struct SparqlCoverage {
   diagnostics @6 :DiagnosticCoverage; catalogEntries @7 :UInt64; complete @8 :Bool;
   artifactsVisited @9 :UInt64; knownSelectedArtifacts @10 :UInt64;
   artifactDiagnosticUnknown @11 :UInt64;
+  eventTimeKnown @12 :UInt64;
+  diagnosticKnown @13 :List(DiagnosticKnownCount);
 }
+struct DiagnosticKnownCount { dimension @0 :DiagnosticDimension; known @1 :UInt64; }
+enum CorrelationClock { received @0; event @1; }
+struct CorrelationInterval { clock @0 :CorrelationClock; from @1 :Instant; before @2 :Instant; }
+struct CorrelationDiagnostic { dimension @0 :DiagnosticDimension; value @1 :Text; }
+struct CorrelationSelector {
+  union { evidence @0 :List(Evidence); diagnostic @1 :CorrelationDiagnostic; source @2 :Text; time @3 :CorrelationInterval; }
+}
+struct CorrelationRelation { union { traceId @0 :Void; spanId @1 :Void; source @2 :Void; time @3 :CorrelationInterval; } }
+struct CorrelateQuery { storeId @0 :Text; scope @1 :Scope; selector @2 :CorrelationSelector; relation @3 :CorrelationRelation; limits @4 :SparqlLimits; schemaVersion @5 :UInt32; }
+struct CorrelationCapture { profile @0 :Text; queryId @1 :Text; selector @2 :CorrelationSelector; relation @3 :CorrelationRelation; }
+struct OptionalCorrelationCapture { union { absent @0 :Void; value @1 :CorrelationCapture; } }
 struct SparqlHostLimits {
   source @0 :SparqlLimits; pageBytes @1 :UInt64; metadataBytes @2 :UInt64;
   resultHandles @3 :UInt64; resultBytes @4 :UInt64; resultLeaseMs @5 :UInt64;
@@ -747,6 +761,7 @@ struct SparqlPage {
   evidence @5 :RdfReadEvidence; limits @6 :SparqlHostLimits; outcome @7 :SparqlOutcome;
   diagnostic @8 :OptionalNativeDiagnostic;
   scope @9 :QueryScopeReceipt;
+  correlation @10 :OptionalCorrelationCapture;
 }
 enum NativeSeverity { error @0; warning @1; note @2; info @3; }
 enum NativeStorageFailure { absent @0; capacity @1; sizeOverflow @2; allocationFailed @3; admissionFailed @4; formattingFailed @5; }
