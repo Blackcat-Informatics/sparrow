@@ -547,11 +547,11 @@ pub(super) fn metadata(
     use purrdf::{RdfDatasetBuilder, RdfLiteral};
     const NS: &str = "urn:sparrow:vocab:";
     let mut builder = RdfDatasetBuilder::new();
-    let subject = builder.intern_iri(&format!("urn:sparrow:{}", record.id));
+    let subject = builder.intern_iri(&format!("urn:sparrow:{}", record.id))?;
     for (predicate, object) in [
         (
             format!("{NS}payload"),
-            builder.intern_iri(&format!("urn:sparrow:payload:{payload}")),
+            builder.intern_iri(&format!("urn:sparrow:payload:{payload}"))?,
         ),
         (
             format!("{NS}projectionState"),
@@ -560,141 +560,141 @@ pub(super) fn metadata(
                     .and_then(|s| s.get("state"))
                     .and_then(Value::as_str)
                     .unwrap_or("not_applicable"),
-            )),
+            ))?,
         ),
         (
             "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_owned(),
-            builder.intern_iri(&format!("{NS}Record")),
+            builder.intern_iri(&format!("{NS}Record"))?,
         ),
         (
             format!("{NS}artifact"),
-            builder.intern_iri(&format!("urn:sparrow:{}", record.artifact_id)),
+            builder.intern_iri(&format!("urn:sparrow:{}", record.artifact_id))?,
         ),
         (
             format!("{NS}source"),
-            builder.intern_iri(&super::source_read::source_iri(&record.source)),
+            builder.intern_iri(&super::source_read::source_iri(&record.source))?,
         ),
         (
             format!("{NS}sourceName"),
-            builder.intern_literal(RdfLiteral::simple(&record.source)),
+            builder.intern_literal(RdfLiteral::simple(&record.source))?,
         ),
         (
             format!("{NS}receivedAt"),
             builder.intern_literal(RdfLiteral::typed(
                 crate::format_instant(record.received_at)?,
                 "http://www.w3.org/2001/XMLSchema#dateTime",
-            )),
+            ))?,
         ),
         (
             format!("{NS}expiresAt"),
             builder.intern_literal(RdfLiteral::typed(
                 crate::format_instant(record.expires_at)?,
                 "http://www.w3.org/2001/XMLSchema#dateTime",
-            )),
+            ))?,
         ),
         (
             format!("{NS}sourceByteStart"),
             builder.intern_literal(RdfLiteral::typed(
                 record.byte_start.to_string(),
                 "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-            )),
+            ))?,
         ),
         (
             format!("{NS}sourceByteEnd"),
             builder.intern_literal(RdfLiteral::typed(
                 record.byte_end.to_string(),
                 "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-            )),
+            ))?,
         ),
     ] {
-        let predicate = builder.intern_iri(&predicate);
-        builder.push_quad(subject, predicate, object, None);
+        let predicate = builder.intern_iri(&predicate)?;
+        builder.push_quad(subject, predicate, object, None)?;
     }
     if let Some(position) = &record.tail {
-        let predicate = builder.intern_iri(&format!("{NS}fileGeneration"));
-        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.generation_id));
-        builder.push_quad(subject, predicate, object, None);
+        let predicate = builder.intern_iri(&format!("{NS}fileGeneration"))?;
+        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.generation_id))?;
+        builder.push_quad(subject, predicate, object, None)?;
         for (name, value) in [
             ("fileByteStart", position.source_start),
             ("fileByteEnd", position.source_end),
         ] {
-            let predicate = builder.intern_iri(&format!("{NS}{name}"));
+            let predicate = builder.intern_iri(&format!("{NS}{name}"))?;
             let object = builder.intern_literal(RdfLiteral::typed(
                 value.to_string(),
                 "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-            ));
-            builder.push_quad(subject, predicate, object, None);
+            ))?;
+            builder.push_quad(subject, predicate, object, None)?;
         }
     }
     if let Some(snapshot) = &record.syslog {
-        let predicate = builder.intern_iri(&format!("{NS}syslogProfile"));
-        let object = builder.intern_iri(&format!("urn:sparrow:{}", snapshot.profile_id));
-        builder.push_quad(subject, predicate, object, None);
+        let predicate = builder.intern_iri(&format!("{NS}syslogProfile"))?;
+        let object = builder.intern_iri(&format!("urn:sparrow:{}", snapshot.profile_id))?;
+        builder.push_quad(subject, predicate, object, None)?;
         if let Some(priority) = snapshot.priority {
             for (name, value) in [
                 ("syslogPriority", priority),
                 ("syslogFacility", priority / 8),
                 ("syslogSeverity", priority % 8),
             ] {
-                let predicate = builder.intern_iri(&format!("{NS}{name}"));
+                let predicate = builder.intern_iri(&format!("{NS}{name}"))?;
                 let object = builder.intern_literal(RdfLiteral::typed(
                     value.to_string(),
                     "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-                ));
-                builder.push_quad(subject, predicate, object, None);
+                ))?;
+                builder.push_quad(subject, predicate, object, None)?;
             }
         }
         for field in &snapshot.fields {
-            let predicate = builder.intern_iri(&format!("{NS}syslogHeader:{}", field.kind));
-            let object = builder.intern_literal(RdfLiteral::simple(&field.value));
-            builder.push_quad(subject, predicate, object, None);
+            let predicate = builder.intern_iri(&format!("{NS}syslogHeader:{}", field.kind))?;
+            let object = builder.intern_literal(RdfLiteral::simple(&field.value))?;
+            builder.push_quad(subject, predicate, object, None)?;
         }
         if let Some(diagnostic) = &snapshot.diagnostic {
-            let predicate = builder.intern_iri(&format!("{NS}syslogDiagnostic"));
-            let object = builder.intern_literal(RdfLiteral::simple(diagnostic));
-            builder.push_quad(subject, predicate, object, None);
+            let predicate = builder.intern_iri(&format!("{NS}syslogDiagnostic"))?;
+            let object = builder.intern_literal(RdfLiteral::simple(diagnostic))?;
+            builder.push_quad(subject, predicate, object, None)?;
         }
     }
     if let Some(position) = &record.producer {
-        let predicate = builder.intern_iri(&format!("{NS}stream"));
-        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.stream_id));
-        builder.push_quad(subject, predicate, object, None);
-        let predicate = builder.intern_iri(&format!("{NS}producerSequence"));
+        let predicate = builder.intern_iri(&format!("{NS}stream"))?;
+        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.stream_id))?;
+        builder.push_quad(subject, predicate, object, None)?;
+        let predicate = builder.intern_iri(&format!("{NS}producerSequence"))?;
         let object = builder.intern_literal(RdfLiteral::typed(
             position.sequence.to_string(),
             "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-        ));
-        builder.push_quad(subject, predicate, object, None);
+        ))?;
+        builder.push_quad(subject, predicate, object, None)?;
     }
     if let Some(position) = &record.receiver {
-        let predicate = builder.intern_iri(&format!("{NS}receiverWindow"));
-        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.window_id));
-        builder.push_quad(subject, predicate, object, None);
-        let predicate = builder.intern_iri(&format!("{NS}receiverSequence"));
+        let predicate = builder.intern_iri(&format!("{NS}receiverWindow"))?;
+        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.window_id))?;
+        builder.push_quad(subject, predicate, object, None)?;
+        let predicate = builder.intern_iri(&format!("{NS}receiverSequence"))?;
         let object = builder.intern_literal(RdfLiteral::typed(
             position.sequence.to_string(),
             "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-        ));
-        builder.push_quad(subject, predicate, object, None);
+        ))?;
+        builder.push_quad(subject, predicate, object, None)?;
     }
     if let crate::EventTime::Known {
         millis, profile_id, ..
     } = &record.event_time
     {
-        let predicate = builder.intern_iri(&format!("{NS}eventTime"));
+        let predicate = builder.intern_iri(&format!("{NS}eventTime"))?;
         let object = builder.intern_literal(RdfLiteral::typed(
             crate::format_instant(*millis)?,
             "http://www.w3.org/2001/XMLSchema#dateTime",
-        ));
-        builder.push_quad(subject, predicate, object, None);
-        let predicate = builder.intern_iri(&format!("{NS}sourceTimeProfile"));
-        let object = builder.intern_iri(&format!("urn:sparrow:{profile_id}"));
-        builder.push_quad(subject, predicate, object, None);
+        ))?;
+        builder.push_quad(subject, predicate, object, None)?;
+        let predicate = builder.intern_iri(&format!("{NS}sourceTimeProfile"))?;
+        let object = builder.intern_iri(&format!("urn:sparrow:{profile_id}"))?;
+        builder.push_quad(subject, predicate, object, None)?;
     }
     if state.and_then(|s| s.get("state")).and_then(Value::as_str) == Some("complete") {
-        let predicate = builder.intern_iri(&format!("{NS}projection"));
-        let object = builder.intern_iri(&graph_iri(&record.rdf_projection_id));
-        builder.push_quad(subject, predicate, object, None);
+        let predicate = builder.intern_iri(&format!("{NS}projection"))?;
+        let object = builder.intern_iri(&graph_iri(&record.rdf_projection_id))?;
+        builder.push_quad(subject, predicate, object, None)?;
     }
     builder
         .freeze()
@@ -718,19 +718,21 @@ mod tests {
         let db = DB::open_default(dir.path()).unwrap();
         empty_dictionary(&db);
         let mut builder = RdfDatasetBuilder::new();
-        let s = builder.intern_iri("urn:fixture:s");
-        let p = builder.intern_iri("urn:fixture:p");
-        let o = builder.intern_literal(RdfLiteral::typed(
-            "x".repeat(70000),
-            "http://www.w3.org/2001/XMLSchema#string",
-        ));
-        builder.push_quad(s, p, o, None);
+        let s = builder.intern_iri("urn:fixture:s").unwrap();
+        let p = builder.intern_iri("urn:fixture:p").unwrap();
+        let o = builder
+            .intern_literal(RdfLiteral::typed(
+                "x".repeat(70000),
+                "http://www.w3.org/2001/XMLSchema#string",
+            ))
+            .unwrap();
+        builder.push_quad(s, p, o, None).unwrap();
         let oversized = builder.freeze().unwrap();
         let mut builder = RdfDatasetBuilder::new();
-        let s = builder.intern_iri("urn:fixture:s");
-        let p = builder.intern_iri("urn:fixture:p");
-        let o = builder.intern_iri("urn:fixture:o");
-        builder.push_quad(s, p, o, None);
+        let s = builder.intern_iri("urn:fixture:s").unwrap();
+        let p = builder.intern_iri("urn:fixture:p").unwrap();
+        let o = builder.intern_iri("urn:fixture:o").unwrap();
+        builder.push_quad(s, p, o, None).unwrap();
         let valid = builder.freeze().unwrap();
         let mut write = RdfWrite::new(&db).unwrap();
         let mut batch = WriteBatch::default();
@@ -780,26 +782,32 @@ mod tests {
         let db = DB::open_default(dir.path()).unwrap();
         empty_dictionary(&db);
         let mut builder = RdfDatasetBuilder::new();
-        let s = builder.intern_iri("urn:fixture:subject");
-        let p = builder.intern_iri("urn:fixture:predicate");
-        let first_blank = builder.intern_blank("same", BlankScope(0));
-        let second_blank = builder.intern_blank("same", BlankScope(1));
-        let literal = builder.intern_literal(RdfLiteral {
-            lexical_form: "مرحبا".into(),
-            datatype: None,
-            language: Some("ar".into()),
-            direction: Some(RdfTextDirection::Rtl),
-        });
-        let inner = builder.intern_triple(s, p, first_blank);
-        let nested = builder.intern_triple(s, p, inner);
-        let reifier = builder.intern_iri("urn:fixture:reifier");
-        let graph = builder.intern_iri("urn:fixture:graph");
-        let empty = builder.intern_iri("urn:fixture:empty");
-        builder.declare_named_graph(empty);
-        builder.push_quad(s, p, first_blank, None);
-        builder.push_quad(s, p, second_blank, Some(graph));
-        builder.push_reifier_in_graph(reifier, nested, Some(graph));
-        builder.push_annotation_in_graph(reifier, p, literal, Some(graph));
+        let s = builder.intern_iri("urn:fixture:subject").unwrap();
+        let p = builder.intern_iri("urn:fixture:predicate").unwrap();
+        let first_blank = builder.intern_blank("same", BlankScope(0)).unwrap();
+        let second_blank = builder.intern_blank("same", BlankScope(1)).unwrap();
+        let literal = builder
+            .intern_literal(RdfLiteral {
+                lexical_form: "مرحبا".into(),
+                datatype: None,
+                language: Some("ar".into()),
+                direction: Some(RdfTextDirection::Rtl),
+            })
+            .unwrap();
+        let inner = builder.intern_triple(s, p, first_blank).unwrap();
+        let nested = builder.intern_triple(s, p, inner).unwrap();
+        let reifier = builder.intern_iri("urn:fixture:reifier").unwrap();
+        let graph = builder.intern_iri("urn:fixture:graph").unwrap();
+        let empty = builder.intern_iri("urn:fixture:empty").unwrap();
+        builder.declare_named_graph(empty).unwrap();
+        builder.push_quad(s, p, first_blank, None).unwrap();
+        builder.push_quad(s, p, second_blank, Some(graph)).unwrap();
+        builder
+            .push_reifier_in_graph(reifier, nested, Some(graph))
+            .unwrap();
+        builder
+            .push_annotation_in_graph(reifier, p, literal, Some(graph))
+            .unwrap();
         let native = builder.freeze().unwrap();
         let mut batch = WriteBatch::default();
         let mut write = RdfWrite::new(&db).unwrap();

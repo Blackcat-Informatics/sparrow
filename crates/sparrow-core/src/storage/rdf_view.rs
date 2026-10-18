@@ -9,7 +9,7 @@ use purrdf::{
     TermRef, TermValue, ViewOperationStatus, projections::ProjectionTerm,
 };
 use purrdf::{
-    dataset_view::{TermGuard, WorkspaceReservation},
+    dataset_view::{OwnedWorkspaceReservation, TermGuard, WorkspaceReservation},
     ir::GlobalTermId,
 };
 use rocksdb::{DB, DBIteratorWithThreadMode, Direction, IteratorMode, Snapshot};
@@ -91,7 +91,7 @@ pub struct StoredRdfView<'a> {
     snapshot: Snapshot<'a>,
     owners: BTreeSet<u64>,
     budget: Arc<Budget>,
-    _scope: Reservation,
+    _scope: Arc<Reservation>,
     terms: u64,
     max_encoded: u64,
 }
@@ -196,7 +196,7 @@ impl<'a> StoredRdfView<'a> {
         graph_ids: &[String],
     ) -> Result<Self, ReadError> {
         let budget = Budget::new(limits)?;
-        let scope = budget.reserve(4096 + (graph_ids.len() as u64).saturating_mul(256))?;
+        let scope = Arc::new(budget.reserve(4096 + (graph_ids.len() as u64).saturating_mul(256))?);
         let mut view = Self {
             snapshot: db.snapshot(),
             owners: BTreeSet::new(),
@@ -566,6 +566,12 @@ impl DatasetView for StoredRdfView<'_> {
     ) -> Result<impl WorkspaceReservation<Error = ReadError> + '_, ReadError> {
         self.budget.reserve(bytes)
     }
+    fn reserve_owned_workspace(
+        &self,
+        bytes: u64,
+    ) -> Option<Result<OwnedWorkspaceReservation<ReadError>, ReadError>> {
+        Some(self.budget.reserve_owned(bytes, &self._scope))
+    }
     fn max_owned_term_bytes(&self) -> Option<u64> {
         Some(self.max_encoded.saturating_mul(256).saturating_add(4096))
     }
@@ -778,7 +784,9 @@ impl Store {
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new(&db, limits, &[])?;
         let mut scope_bytes = 4096 + ids.len() as u64 * 2048;
-        view._scope.resize(scope_bytes)?;
+        Arc::get_mut(&mut view._scope)
+            .expect("scope capture precedes owned query admission")
+            .resize(scope_bytes)?;
         let catalog_bound = (writer.config.max_artifact_bytes / super::CHUNK + 1)
             .saturating_mul(128)
             .saturating_add(8192) as u64;
@@ -806,7 +814,9 @@ impl Store {
                 )));
             }
             drop(bytes);
-            view._scope.resize(scope_bytes)?;
+            Arc::get_mut(&mut view._scope)
+                .expect("scope capture precedes owned query admission")
+                .resize(scope_bytes)?;
             if record.expires_at <= now {
                 targets.insert(record.id.clone());
                 targets.insert(record.artifact_id.clone());

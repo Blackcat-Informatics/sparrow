@@ -46,6 +46,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use proc_macro2::TokenStream;
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
@@ -563,7 +564,7 @@ impl Workspace {
     fn walk_mod(&mut self, context: &Context<'_>, place: &Place<'_>, item: &syn::ItemMod) {
         self.define(context, place, &item.ident, &item.attrs, place.module);
         let module = format!("{}::{}", place.module, item.ident);
-        let child_directory = format!("{}/{}", place.directory, item.ident);
+        let child_directory = format!("{}/{}", place.directory, item.ident.unraw());
         if let Some((_, items)) = &item.content {
             let inner = Place {
                 file: place.file,

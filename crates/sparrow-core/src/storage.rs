@@ -177,6 +177,16 @@ impl From<rocksdb::Error> for Error {
     }
 }
 
+impl From<purrdf_lex::allocation::StorageError> for Error {
+    fn from(error: purrdf_lex::allocation::StorageError) -> Self {
+        let code = match error {
+            purrdf_lex::allocation::StorageError::FormattingFailed => "STORAGE_FAILURE",
+            _ => "RESOURCE_LIMIT",
+        };
+        Self::new(code, error.to_string())
+    }
+}
+
 /// Explicit, bounded storage admission configuration.
 #[derive(Clone, Debug)]
 pub struct Config {

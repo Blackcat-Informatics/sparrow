@@ -149,11 +149,10 @@ impl Store {
         };
         terms.sort();
         terms.dedup();
-        if query.text.is_some() && (terms.is_empty() || terms.len() > purrdf::text::QUERY_TERMS_MAX)
-        {
+        if query.text.is_some() && terms.is_empty() {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "text query requires 1..1024 distinct analyzed terms",
+                "text query requires at least one analyzed term",
             ));
         }
         let mut field_coverage = record_fields::FieldCoverage::default();
@@ -495,7 +494,7 @@ impl Store {
                 .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
             scored.push((score, id.clone()));
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.sort_by(|a, b| b.0.value.cmp(&a.0.value).then_with(|| a.1.cmp(&b.1)));
         if capture && scored.len() > row_limit {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -552,7 +551,7 @@ impl Store {
                     Error::new("STORAGE_FAILURE", "captured field witnesses missing")
                 })?,
             )?
-            .with("score", score.to_decimal_lexical())
+            .with("score", score.value.to_decimal_lexical())
             .with("evidence", Value::array(evidence))
             .with("evidence_limited", evidence_limited)
             .into();

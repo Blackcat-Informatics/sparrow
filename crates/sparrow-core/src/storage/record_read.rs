@@ -293,14 +293,7 @@ fn query_evidence(selector: &Selector, result: &Value) -> Result<Value, Error> {
                         Value::Null
                     },
                 )
-                .with(
-                    "query_terms",
-                    if postings {
-                        Value::from(purrdf::text::QUERY_TERMS_MAX as u64)
-                    } else {
-                        Value::Null
-                    },
-                )
+                .with("query_terms", Value::Null)
                 .with(
                     "field_constraints",
                     if fields {

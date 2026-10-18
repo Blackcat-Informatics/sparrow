@@ -404,17 +404,17 @@ pub(super) fn graph_owner(record: &Record) -> Option<String> {
 pub(super) fn rdf(record: &Record) -> Result<std::sync::Arc<purrdf::RdfDataset>, Error> {
     use purrdf::{RdfDatasetBuilder, RdfLiteral};
     let mut builder = RdfDatasetBuilder::new();
-    let subject = builder.intern_iri(&format!("urn:sparrow:{}", record.id));
+    let subject = builder.intern_iri(&format!("urn:sparrow:{}", record.id))?;
     for (dimension, value) in &record.diagnostics.fields {
         let evidence = builder.intern_iri(&format!(
             "urn:sparrow:diagnostic:{}:{}",
             record.id,
             dimension.name()
-        ));
-        let predicate = builder.intern_iri("urn:sparrow:vocab:diagnosticEvidence");
-        builder.push_quad(subject, predicate, evidence, None);
+        ))?;
+        let predicate = builder.intern_iri("urn:sparrow:vocab:diagnosticEvidence")?;
+        builder.push_quad(subject, predicate, evidence, None)?;
         if let DiagnosticValue::Known { value, .. } = value {
-            let literal = builder.intern_literal(RdfLiteral::simple(value));
+            let literal = builder.intern_literal(RdfLiteral::simple(value))?;
             let predicate = builder.intern_iri(&format!(
                 "urn:sparrow:vocab:{}",
                 match dimension {
@@ -422,17 +422,17 @@ pub(super) fn rdf(record: &Record) -> Result<std::sync::Arc<purrdf::RdfDataset>,
                     DiagnosticDimension::SpanId => "spanId",
                     _ => dimension.name(),
                 }
-            ));
-            builder.push_quad(subject, predicate, literal, None);
+            ))?;
+            builder.push_quad(subject, predicate, literal, None)?;
         }
         let mut facts = vec![(
             "dimension",
-            builder.intern_literal(RdfLiteral::simple(dimension.name())),
+            builder.intern_literal(RdfLiteral::simple(dimension.name()))?,
         )];
         if let Some(profile_id) = &record.diagnostics.profile_id {
             facts.push((
                 "sourceDiagnosticProfile",
-                builder.intern_iri(&format!("urn:sparrow:{profile_id}")),
+                builder.intern_iri(&format!("urn:sparrow:{profile_id}"))?,
             ));
         }
         match value {
@@ -442,7 +442,7 @@ pub(super) fn rdf(record: &Record) -> Result<std::sync::Arc<purrdf::RdfDataset>,
                 source_start,
                 source_end,
             } => {
-                facts.push(("value", builder.intern_literal(RdfLiteral::simple(value))));
+                facts.push(("value", builder.intern_literal(RdfLiteral::simple(value))?));
                 for (name, number) in [
                     ("occurrence", occurrence),
                     ("sourceByteStart", source_start),
@@ -453,18 +453,18 @@ pub(super) fn rdf(record: &Record) -> Result<std::sync::Arc<purrdf::RdfDataset>,
                         builder.intern_literal(RdfLiteral::typed(
                             number.to_string(),
                             "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-                        )),
+                        ))?,
                     ));
                 }
             }
             DiagnosticValue::Unknown(reason) => facts.push((
                 "diagnosticReason",
-                builder.intern_literal(RdfLiteral::simple(reason)),
+                builder.intern_literal(RdfLiteral::simple(reason))?,
             )),
         }
         for (name, object) in facts {
-            let predicate = builder.intern_iri(&format!("urn:sparrow:vocab:{name}"));
-            builder.push_quad(evidence, predicate, object, None);
+            let predicate = builder.intern_iri(&format!("urn:sparrow:vocab:{name}"))?;
+            builder.push_quad(evidence, predicate, object, None)?;
         }
     }
     builder

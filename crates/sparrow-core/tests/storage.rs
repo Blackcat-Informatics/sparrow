@@ -364,7 +364,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
         let result = purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
             purrdf::SparqlRequest { query: "SELECT ?record ?window ?sequence WHERE { ?record <urn:sparrow:vocab:receiverWindow> ?window . ?record <urn:sparrow:vocab:receiverSequence> ?sequence }", base_iri: None, substitutions: &[] },
             purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(100000).with_max_answers(10).with_max_intermediate_cells(1000).with_max_scratch_bytes(1024*1024).with_max_remote_requests(0)).unwrap().result;
-        let purrdf::SparqlResult::Solutions { rows, .. } = result else { panic!("receiver metadata did not produce solutions") };
+        let (_, rows) = result.solutions().expect("receiver metadata did not produce solutions");
         assert_eq!(rows.len(), 2);
     }).unwrap();
     assert!(record.producer.is_none());
@@ -2104,9 +2104,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
                 .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0))
             .map_err(Box::new)
     }).unwrap().unwrap();
-    let purrdf::SparqlResult::Solutions { rows, .. } = native.result else {
-        panic!("native SELECT result");
-    };
+    let (_, rows) = native.result.solutions().expect("native SELECT result");
     assert_eq!(rows.len(), 2);
     assert!(format!("{rows:?}").contains(&position.stream_id));
     let second = ProducerBatch {
@@ -8389,9 +8387,52 @@ fn pin_renewal_serializes_competing_revision_guards() {
 }
 
 #[test]
+fn text_query_uses_native_ranking_beyond_the_former_term_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config();
+    let text = std::iter::once("needle".to_owned())
+        .chain((0..1100).map(|i| format!("probe{i}tail")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let terms = config.text_analyzer.terms(&text).unwrap();
+    assert!(
+        terms
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1024
+    );
+    let store = Store::open(dir.path(), config).unwrap();
+    let artifact = store
+        .ingest("many-query-terms", "source", "log", b"needle\n", 0)
+        .unwrap();
+    let mut request = sparrow_core::RecordRead {
+        operation: sparrow_core::RecordOperation::Text,
+        scope: record_page_scope("source", 100),
+        query: sparrow_core::RecordQuery {
+            text: Some(text),
+            ..Default::default()
+        },
+        cursor: None,
+    };
+    let page = store.records_read(&request, 1).unwrap();
+    let result = page.body.result().unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["rows"][0]["record_id"].as_str(),
+        Some(artifact.record_ids[0].as_str())
+    );
+    assert!(result["query_evidence"]["limits"]["query_terms"].is_null());
+    request.query.text = Some("x".repeat(65537));
+    let refusal = store.records_read(&request, 1).unwrap_err();
+    assert_eq!(refusal.code, "RESOURCE_LIMIT");
+    assert!(refusal.message.contains("64 KiB"));
+}
+
+#[test]
 fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
     use purrdf::{
-        SparqlRequest, SparqlResult,
+        SparqlEngine, SparqlRequest, SparqlResult,
         sparql::{NativeSparqlEngine, QueryGovernors, QueryOptions},
     };
     let dir = tempfile::tempdir().unwrap();
@@ -8449,11 +8490,12 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
         })
         .unwrap()
         .unwrap();
-    let SparqlResult::Solutions { rows, .. } = result.result else {
-        panic!("SELECT result required")
-    };
+    let (_, rows) = result.result.solutions().expect("SELECT result required");
     assert_eq!(rows.len(), 4);
     assert!(!format!("{rows:?}").contains(&unrelated.record_ids[0]));
+    let retained = result.result.clone().into_solutions().unwrap();
+    drop(result);
+    assert_eq!(retained.as_parts().1.len(), 4);
     let stopped = store
         .with_rdf_records(&ids, 3, sparrow_core::RdfReadLimits::default(), |view| {
             engine
@@ -8474,11 +8516,20 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
         *stopped.unwrap_err(),
         purrdf::sparql::FallibleSparqlError::BudgetExhausted { .. }
     ));
+    let resident = store
+        .with_rdf_records(&ids, 3, Default::default(), |view| {
+            purrdf::ir::dataset_from_view(view).unwrap()
+        })
+        .unwrap();
     for query in [
-        "SELECT ?s WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } }",
+        "SELECT ?s WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } } ORDER BY ?s",
         "ASK { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> \"rdf-native\" } }",
         "CONSTRUCT { ?s <urn:sparrow:vocab:sourceName> ?name } WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } }",
         "DESCRIBE ?s WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> \"rdf-native\" } }",
+        "SELECT ?s ?tag WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name OPTIONAL { ?s <urn:sparrow:vocab:missing> ?unused } } BIND(CONCAT(STR(?name), \"!\") AS ?tag) FILTER(?name = \"rdf-native\") } ORDER BY ?s",
+        "SELECT (COUNT(?s) AS ?count) WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } }",
+        "SELECT DISTINCT ?name WHERE { { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } } UNION { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } } } ORDER BY ?name",
+        "SELECT ?s ?related WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name . ?s <urn:sparrow:vocab:payload>/^<urn:sparrow:vocab:payload> ?related } } ORDER BY ?s ?related",
     ] {
         let result = store
             .with_rdf_records(&ids, 3, sparrow_core::RdfReadLimits::default(), |view| {
@@ -8496,12 +8547,38 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
                     .map_err(Box::new)
             })
             .unwrap();
-        let purrdf::sparql::FallibleSparqlError::Query { diagnostic, .. } = *result.unwrap_err()
-        else {
-            panic!("native admission diagnostic required")
-        };
-        assert_eq!(diagnostic.code, "native-sparql-workspace-unpriced");
+        let result = result.unwrap_or_else(|error| panic!("stored query {query}: {error:?}"));
+        let oracle = engine
+            .query(
+                &resident,
+                SparqlRequest {
+                    query,
+                    base_iri: None,
+                    substitutions: &[],
+                },
+            )
+            .unwrap();
+        match oracle {
+            SparqlResult::Solutions {
+                variables, rows, ..
+            } => {
+                let (actual_variables, actual_rows) = result.result.solutions().unwrap();
+                assert_eq!(actual_variables, variables);
+                assert_eq!(actual_rows, rows);
+            }
+            SparqlResult::Boolean(answer) => assert_eq!(result.result.boolean(), Some(answer)),
+            SparqlResult::Graph(graph) => assert!(purrdf::ir::datasets_isomorphic(
+                result.result.graph().unwrap(),
+                graph.as_ref(),
+            )),
+        }
     }
+    let explanation = store.with_rdf_records(&ids, 3, Default::default(), |view| {
+        engine.explain_query_fallible_view(view,
+            "SELECT ?s WHERE { GRAPH ?g { ?s <urn:sparrow:vocab:sourceName> ?name } } ORDER BY ?s", None)
+            .map_err(Box::new)
+    }).unwrap().unwrap().0;
+    assert!(!explanation.ledger().is_empty());
     store
         .pin(
             "native-query-pin",
@@ -9119,7 +9196,7 @@ fn artifact_selection_seeks_members_without_reading_unrelated_corrupt_catalog_en
 
 #[test]
 fn stored_rdf_layers_select_native_graph_owners_and_keep_failure_and_retention_boundaries() {
-    use purrdf::{DatasetView, SparqlResult};
+    use purrdf::DatasetView;
     use sparrow_core::{DiagnosticDimension as D, RdfGraphLayers, RdfReadLimits};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -9158,9 +9235,7 @@ fn stored_rdf_layers_select_native_graph_owners_and_keep_failure_and_retention_b
             .into_iter()
             .zip([layers.diagnostic, layers.metadata && layers.diagnostic])
         {
-            let SparqlResult::Solutions { rows, .. } = result else {
-                panic!("native SELECT required")
-            };
+            let (_, rows) = result.solutions().expect("native SELECT required");
             assert_eq!(rows.len(), if present { 2 } else { 0 });
             if present {
                 assert!(format!("{rows:?}").contains("worker"));
@@ -11719,9 +11794,7 @@ fn source_time_profiles_are_durable_immutable_and_do_not_reinterpret_old_records
                     .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0))
                     .map_err(Box::new)
         }).unwrap().unwrap();
-    let purrdf::SparqlResult::Solutions { rows, .. } = native.result else {
-        panic!("native SELECT result");
-    };
+    let (_, rows) = native.result.solutions().expect("native SELECT result");
     assert_eq!(rows.len(), 1);
     assert!(format!("{rows:?}").contains("2026-10-07T03:00:00.123Z"));
     assert!(format!("{rows:?}").contains(&profile.id));
@@ -13706,10 +13779,7 @@ fn captured_query_evidence_freezes_native_profiles_and_applicable_admission_limi
     );
     assert_eq!(context["limits"]["field_constraints"].as_u64(), Some(32));
     assert_eq!(context["limits"]["query_text_bytes"].as_u64(), Some(65536));
-    assert_eq!(
-        context["limits"]["query_terms"].as_u64(),
-        Some(purrdf::text::QUERY_TERMS_MAX as u64)
-    );
+    assert!(context["limits"]["query_terms"].is_null());
     assert_eq!(
         context["limits"]["text_membership_bytes"].as_u64(),
         Some(64 * 1024 * 1024)

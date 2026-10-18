@@ -444,16 +444,22 @@ pub(super) fn capture(
         },
         representation => {
             let lexical = read_field::<String>(value, "lexical")?;
-            purrdf::xsd::numeric::parse_integer(&lexical)
-                .ok()
-                .and_then(|value| u64::try_from(value).ok())
-                .and_then(|value| {
-                    if representation == TimeRepresentation::UnixSeconds {
-                        value.checked_mul(1000)
-                    } else {
-                        Some(value)
-                    }
-                })
+            match purrdf::xsd::numeric::parse_integer(&lexical) {
+                Ok(value) => Some(value),
+                Err(purrdf::xsd::XsdError::Storage(error)) => {
+                    return Err(Error::new("RESOURCE_LIMIT", error.to_string()));
+                }
+                Err(_) => None,
+            }
+            .and_then(|value| value.to_i128().ok())
+            .and_then(|value| u64::try_from(value).ok())
+            .and_then(|value| {
+                if representation == TimeRepresentation::UnixSeconds {
+                    value.checked_mul(1000)
+                } else {
+                    Some(value)
+                }
+            })
         }
     };
     let Some(millis) = parsed.filter(|millis| crate::format_instant(*millis).is_ok()) else {

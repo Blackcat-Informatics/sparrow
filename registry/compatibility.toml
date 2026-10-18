@@ -4,12 +4,12 @@
 # The census reference tree, not a compiled Sparrow dependency lock.
 # Advance deliberately, record the reason, and run make check at the new revision.
 manifest_version = 1
-recorded = "2026-10-06"
+recorded = "2026-10-15"
 
 [[supplier]]
 name = "purrdf"
 version = "3.0.1"
-git_revision = "e58974e504b9681597faea1490002ce8ddaf7448"
+git_revision = "7734b013d19b68600ad24c4e8aa5a40955a8e89e"
 repository = "../purrdf"
 role = "Reference tree for structural helper discovery and PurRDF-owned ledger jobs."
 
@@ -18,3 +18,9 @@ date = "2026-10-06"
 supplier = "purrdf"
 revision = "e58974e504b9681597faea1490002ce8ddaf7448"
 reason = "Initial census reference: local PurRDF HEAD; workspace Cargo.toml declares version 3.0.1 and Rust 1.98. This does not replace the architecture document's earlier inspected baseline or select a runtime dependency."
+
+[[event]]
+date = "2026-10-15"
+supplier = "purrdf"
+revision = "7734b013d19b68600ad24c4e8aa5a40955a8e89e"
+reason = "Adopt committed main after bounded operational SPARQL issue 508: owned workspace admission, retained complete/partial results and measured EXPLAIN. Advance discovery reference with the separately selected runtime revision; qualify Sparrow adapters and rerun the pinned census gate."

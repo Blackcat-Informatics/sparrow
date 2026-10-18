@@ -466,7 +466,7 @@ fn timestamp(value: &str) -> Result<(i64, u32), String> {
         || value.as_bytes()[17..19]
             .iter()
             .any(|byte| !byte.is_ascii_digit())
-        || &value.as_bytes()[17..19] > b"59"
+        || &value.as_bytes()[17..19] > b"59".as_slice()
         || value.contains('z')
         || value.find('.').is_some_and(|offset| {
             !(1..=6).contains(

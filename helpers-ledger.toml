@@ -3803,3 +3803,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(render_retention_account_again|read_metrics_outside_sdk)$']
+
+[[job]]
+id = "stored-rdf-owned-workspace"
+summary = "Sparrow's native retained reservation keeps the original scope/account alive, admits its erased control box before allocation and retains that charge through payload resize and final output release."
+home = "sparrow_core::storage::rdf_view::budget::Budget::reserve_owned"
+entry_points = ["sparrow_core::storage::rdf_view::StoredRdfView::reserve_owned_workspace", "sparrow_core::storage::rdf_view::budget::RetainedReservation::resize"]
+spec = "docs/purrdf-integration-gaps.md: retained operational SPARQL integration."
+vectors = ["crates/sparrow-core/src/storage/rdf_view/budget.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(unbounded_rdf_workspace|detached_rdf_result_reservation)$']
+
+[[job]]
+id = "fallible-control-box-allocation"
+summary = "Admit storage-specific capacity locally and allocate the retained capability with PurRDF's public fallible box primitive; no local unsafe allocation or second boxing implementation."
+home = "purrdf:purrdf_lex::allocation::boxed::try_boxed"
+entry_points = []
+spec = "docs/purrdf-integration-gaps.md: retained operational SPARQL integration."
+vectors = []
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(try_boxed|try_boxed_one)$']

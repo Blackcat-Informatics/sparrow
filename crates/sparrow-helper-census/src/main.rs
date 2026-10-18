@@ -36,6 +36,8 @@
 //! top of the census — entry points, vectors, bench targets, variant staleness,
 //! `enforced`, stale fingerprints and the cross-package `#[path]` rule — are in
 //! `--check` itself.
+//! Sparrow's module walk also resolves raw identifiers to their ordinary
+//! filesystem names; this changes source discovery, not the duplicate rules.
 //!
 //! # Against purrdf
 //!
@@ -1379,6 +1381,27 @@ fn self_test_cases() -> Vec<(&'static str, bool)> {
     cases.extend(path_escape_cases());
     cases.extend(cross_cases());
     cases.extend(own_type_cases());
+    cases.push((
+        "raw module names use ordinary filesystem names and preserve Rust symbol paths",
+        {
+            let tree = Memory {
+                files: [
+                    ("crates/raw/Cargo.toml", "[package]\nname = \"fixture-raw\"\n"),
+                    ("crates/raw/src/lib.rs", "pub mod r#match; pub mod r#async; pub mod r#type { pub mod child; } #[path = \"explicit.rs\"] pub mod r#const; pub use r#match::go;"),
+                    ("crates/raw/src/match/mod.rs", "pub mod r#loop; pub fn go() -> u8 { 1 }"),
+                    ("crates/raw/src/match/loop.rs", "pub fn nested() -> u8 { 2 }"),
+                    ("crates/raw/src/async.rs", "pub fn flat() -> u8 { 3 }"),
+                    ("crates/raw/src/type/child.rs", "pub fn inline() -> u8 { 4 }"),
+                    ("crates/raw/src/explicit.rs", "pub fn explicit() -> u8 { 5 }"),
+                ].into_iter().map(|(path, text)| (path.to_owned(), text.to_owned())).collect(),
+            };
+            let walked = Workspace::walk(&tree);
+            walked.errors.is_empty()
+                && walked.resolve("fixture_raw::go").as_deref() == Some("fixture_raw::r#match::go")
+                && ["r#match::r#loop::nested", "r#async::flat", "r#type::child::inline", "r#const::explicit"]
+                    .iter().all(|path| walked.resolve(&format!("fixture_raw::{path}")).is_some())
+        },
+    ));
     cases
 }
 
