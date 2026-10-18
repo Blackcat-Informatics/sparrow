@@ -9,9 +9,10 @@ quad permutations; typed inspection exposes projection state and stream counts.
 The native stored view now supports bounded lazy reads and governed
 SELECT, ASK, CONSTRUCT and DESCRIBE through the Rust core API, with native typed
 substitutions, retained outcomes and scoped membership/coverage. The CLI/MCP and
-typed RPC graph surface is implemented and deployed as schema 51. Recordless
-artifact RDF is under qualification in schema 52; text relations, correlation
-and public explanations remain required; the integration state is recorded in
+typed RPC graph surface is implemented and deployed. Recordless
+artifact RDF and independent artifact coverage are deployed in schema 52;
+text relations, correlation and public explanations remain required. The
+integration state is recorded in
 [PurRDF integration gaps](purrdf-integration-gaps.md).
 Independent Artifact-class metadata for populated artifacts and persisted
 Source/Stream class declarations remain required. Record-backed provenance

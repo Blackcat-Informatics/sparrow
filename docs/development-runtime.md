@@ -3,19 +3,81 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-51 adoption below. It uses
-schema 51 and store format 37. The stable installed
+after the approved checkpoint recovery and schema-52 adoption below. It uses
+schema 52 and store format 48. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`373b715`; see [schema-51 live adoption](#schema-51-live-adoption) for
+`7e1b208`; see [schema-52 live adoption](#schema-52-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-52 live adoption
+
+Signed source `7e1b208b26038d13b7023da372355de602fdef3c` passed the normal
+pre-commit gate described below. A fresh private copy of the 107-file closed
+format-37 backup then replayed migration against that exact source, passed all
+four native read forms, retained a Record count of 217, and admitted one private
+empty artifact with zero records. The original backup hashes remained unchanged.
+Source and probe-image hashes are `schema52-final-restore-source.json`; the
+results are `schema52-final-restore.{json,log}` under
+`.stage/native-graph-integration/`. The temporary example was removed.
+
+Both runtime bins were explicitly rebuilt after verification with
+`cargo build --locked --release -p sparrow-server --bins`. Cargo's machine artifact
+paths selected these installed files:
+
+- `~/.local/libexec/sparrow/sparrowd-schema52-7e1b208`, SHA-256
+  `61f2810243131cfb9d0bae6b3478ddae94b6a4f1cb570d84630be12efba9bdc1`.
+- `~/.local/libexec/sparrow/sparrow-schema52-7e1b208`, SHA-256
+  `e27ef0a8a8199e9f6b1ee6e4302a2424d79d7d142cd5c77aabb4bb155f096707`.
+
+The daemon's sole `cap_net_bind_service=ep` capability was verified before
+draining its predecessor through SIGINT. With PID zero, an inactive unit and
+the Unix endpoint removed, an exclusive native store lock protected a fresh
+closed backup at
+`.stage/native-graph-integration/schema52-pre-adoption-closed-backup-20261018`.
+Every regular-file hash matched the closed source. Configuration, unit and intake
+roots were preserved. Stable executable aliases were switched to the qualified
+pair, and the unit started at 2026-10-18 06:27:44 UTC, observed PID 3123221.
+Installed aliases/hashes, enabled/active unit state, startup journal and typed
+behavior were checked. No running-process executable hash is claimed.
+
+The first acceptance call arrived before listener readiness and received
+connection refused. It was retained as
+`schema52-live-initial-readiness-failure.log`; the same process became ready
+without another restart. Native socket inspection then confirmed `0.0.0.0:518`.
+Typed TCP and Unix status reported schema 52, format 48 and the original store
+`store:46c88e949ccec658600b66c7becd5bb7`, with 217 records, 213 unique payload
+chunks and no watch failures. SELECT, ASK, CONSTRUCT and six-page DESCRIBE passed
+at default limits, including continuation across the two endpoints and release.
+
+Live acceptance then durably ingested one zero-byte synthetic log artifact from
+the private fixture file, source `development-schema52-empty`, request
+`development-schema52-empty-7e1b208`. Its native metadata preserved the occurrence
+IRI, zero typed byte length, format and exact typed receipt/retention timestamps.
+CLI and Unix MCP agreed on one selected artifact and zero selected records.
+Metadata-layer exclusion retained known membership while yielding no graph rows.
+A service diagnostic filter yielded no rows and one unknown artifact in
+permissive mode; strict mode returned MCP `isError=true`, `INDEX_NOT_READY`.
+Full native class counts after ingestion were 217 Records and one Artifact.
+Final status retained 213 chunks and zero graph result handles/bytes. The one
+pre-existing failed content projection remains independent coverage evidence.
+
+Fresh typed reads also preserved both recovered generations' `identity_changed`
+gaps, offsets 37/0 and record counts 1/0. This deployment did not repeat recovery
+or claim restored producer continuity. Runtime receipts include
+`schema52-runtime-build.{jsonl,log}`, `schema52-runtime-artifacts.json`,
+`schema52-adoption-prerequisites.json`,
+`schema52-pre-adoption-closed-backup.json`, `schema52-live-service.txt`,
+`schema52-live-acceptance.{py,log}`, `schema52-live-empty-*`,
+`schema52-live-*-count-after-empty.json` and `schema52-recovered-generation-*`.
+This is finite development acceptance; the remaining graph/reclamation and
+production qualification requirements below are still unmet.
+
 ## Recordless artifact RDF source qualification
 
 The implementation branch adds schema 52 and store formats 44 through 54 for
-recordless artifact RDF. Source qualification has not replaced
-the installed schema-51/format-37 daemon. The source shares the native RDF writer,
+recordless artifact RDF, now adopted above. The source shares the native RDF writer,
 occurrence metadata envelope, catalog migration pager and captured query scope.
 The full local gate passes release Clippy with warnings denied, 21 core unit
 tests, 179 storage tests, all 63 RPC tests, the other workspace/doc tests, census
@@ -46,15 +108,16 @@ Evidence under `.stage/native-graph-integration/` includes
 `artifact-rdf-admission-final-check.log`, the signed normal commit gate
 `artifact-rdf-commit.log`, `schema52-restore-probe.{json,log}`,
 `schema52-restore-empty-probe.{json,log}`, and their source/image receipts.
-The temporary probe example was removed. The installed daemon remains schema 51
-and format 37 until qualified image adoption is recorded separately.
+The temporary probe example was removed. Exact-source replay and live adoption
+of schema 52/format 48 are recorded above.
 
 ## Native graph transport source
 
 The implementation branch now includes schema 51 native graph RPC publication,
 CLI `sparql REQUEST.json`, MCP `sparql_query`, and generic graph `result_next`.
-These changes are now deployed on the development service. They do not alter
-the store format; the service remains the sole database writer.
+These changes are deployed on the development service. The original schema-51
+transport preserved the prior store format; schema 52 adds the recordless metadata
+fence above. The service remains the sole database writer.
 
 The typed transport preserves native complete/certain/at-most/unknown outcomes,
 all governor dimensions, source evidence, coverage, RDF 1.2 graph item roles,
@@ -80,7 +143,8 @@ owners. No detectors were relaxed. The final normal `make check` commit gate is
 logged in `.stage/native-graph-integration/graph-wire-commit.log`; the related
 focused, integration and census receipts use the `graph-wire-*` prefix.
 
-Recordless artifact RDF metadata, native text relations, correlation, public
+Populated artifact metadata and Source/Stream class declarations, native text
+relations, correlation, public
 explanation, forced bounded physical reclamation and production-volume/resource
 acceptance remain unfinished. The concrete native storage integration gap is
 documented in [native reclamation integration](native-reclamation.md).
@@ -171,7 +235,8 @@ Evidence under `.stage/native-graph-integration/` includes
 `schema51-live-query-*`, `schema51-live-mcp.json`,
 `schema51-live-acceptance.{py,log}`, `schema51-live-acceptance-summary.json`,
 and the before/after typed status receipts. This establishes development graph
-acceptance on the owned synthetic store. Recordless-artifact RDF metadata,
+acceptance on the owned synthetic store. At that schema-51 boundary,
+recordless-artifact RDF metadata,
 text/correlation/explanation integration, forced bounded physical reclamation,
 and production-volume/resource acceptance remain unfinished.
 

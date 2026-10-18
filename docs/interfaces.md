@@ -377,8 +377,8 @@ refused by native read preparation; federation is disabled. These are core
 integration surfaces. Schema 51 exposes the same native read through typed
 `Sparrow.sparqlQuery`, CLI `sparrow ENDPOINT sparql REQUEST.json`, and MCP
 `sparql_query`. Text relations, correlation and public explanation contracts
-remain unfinished. Recordless artifact metadata is implemented in schema 52
-and undergoing qualification below.
+remain unfinished. Recordless artifact metadata is implemented and deployed in
+schema 52, as qualified below.
 
 The core `sparql_read`/`sparql_read_next` pair publishes immutable native captures
 through the existing finite catalog lease owner. Pages share the native outcome
@@ -832,7 +832,9 @@ reserve and complete write-batch estimate before its durable migration commit.
 Capacity refusal preserves the prior checkpoint and can resume after space or
 budget recovery. Direct empty ingestion also admits its final RDF/catalog batch
 through the original live publication observer before any dependency is committed.
-These new formats have not yet been adopted by the development service.
+The development service adopted schema 52 and format 48 after closed-copy
+migration qualification and a fresh closed-store backup; live acceptance is
+recorded in [Development runtime](development-runtime.md#schema-52-live-adoption).
 
 ### Core graph vocabulary
 
