@@ -12,6 +12,27 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Current-source turnover and logical graph closure
+
+The existing offline larger-profile qualifier was explicitly rebuilt from signed
+`72804f3`, with PurRDF pinned to `7734b013`, and run through all three 60-day pin
+modes. [The qualification report](turnover-qualification.md#current-source-provenance-and-tracing-qualification)
+records 76,920 accepted records and 65,642,380 raw bytes per mode, independent
+daily/byte/RDF checks, sparse parent loss, pin release, four reopens and final
+zero logical ownership. Separate verified closed copies also yield zero native
+dictionary terms and false governed ASK results after retirement. Their original
+closed files remain unchanged. Native physical file bytes remain measurable;
+this is not forced-reclamation acceptance.
+
+The frozen image, source/gates, compiler/host observations, configurations,
+collector, reports, inputs and copy-check manifests are under
+`~/.local/state/sparrow/turnover-v2-qualified-4_3d113n`. The offline example uses
+core feature `test-support`, separately from default-image/live qualification.
+No public daemon/client alias, configuration or producer source changed. The
+service remains PID 4001300, schema 60/format 92, with the original 217 records
+and healthy watches. Production resource/turnover and upstream integration
+requirements remain open.
+
 ## Capability client adoption
 
 Signed source `819ab66d2f17a89337732135d03e27f408e6624e` adds the previously

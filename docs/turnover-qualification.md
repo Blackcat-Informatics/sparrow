@@ -193,3 +193,80 @@ selected-build identity, hardware/filesystem evidence, reports and generated
 inputs. The live daemon remained source `2f1f8ff`, PID 2129972, during both runs;
 a read-only status check reported the same store identity, 212 records and zero
 pins. No service lifecycle action or public ingestion was needed.
+
+## Current-source provenance and tracing qualification
+
+On 2026-10-18, the same larger profile and unchanged frozen collector were run
+against signed source `72804f3b251328ee103b368c0df2c727fdd0d23c`, selected PurRDF
+`7734b013d19b68600ad24c4e8aa5a40955a8e89e` and the current RDF/provenance/tracing
+owners. The source's required gate passes 28 core unit, 189 storage and 67 RPC
+tests, the other workspace tests, release Clippy, census self-tests and 291
+ownership jobs with zero distinct exceptions. This refresh is separate from
+the older source/image results above.
+
+The selected offline image is `~/.local/libexec/sparrow/turnover-72804f3`, SHA-256
+`cae41183913c55597155e1d27a6a145adaa1ee6f5588720e615b929d9e318ecf`.
+Its explicit example build reports core feature `test-support`; this is an
+offline core qualification, not a default-daemon image qualification. The
+compiler observation is Rust `1.101.0-nightly (21b707e3f 2026-09-30)`.
+
+Evidence is `~/.local/state/sparrow/turnover-v2-qualified-4_3d113n`, with the
+frozen collector, compiler/CPU/filesystem observations, source/gate and image
+identities, configurations, native reports, saved inputs and digest manifests.
+The host reports an AMD RYZEN AI MAX+ 395, 16 cores and 32 logical CPUs. The
+filesystem is Btrfs with `compress=zstd:1`. Each new store uses a 2 GiB
+application disk budget and 128 MiB maintenance reserve. The original collector's
+600-second per-mode deadline and 8 GiB host free-space-delta guard were preserved;
+neither was reached. The guard is not a filesystem quota. No hard quota or
+production resource ceiling was configured by this run.
+
+Each mode accepts 76,920 records and 65,642,380 raw bytes in 240 independent
+artifact occurrences. All sixty daily counts, exact artifact/record bytes,
+repeated/changing content identities, 30-day boundaries, sparse parent expiry,
+pin release, expired-target refusal and four reopen points pass. Sparse mode
+preserves 60 native inspections of its protected record; dense mode preserves
+76,920 inspections of its first cohort, including the deliberately failed JSONL
+projection. Their native inspection fields stay identical except for membership
+time. Final records, active pins, payload/JSON-projection references and all five
+read-handle/byte families are zero, with no resurrection after the final reopen.
+
+| Pin mode | Records at day 59 | Sampled peak RSS KiB | Maximum daily file bytes | Closed final file bytes | Wall seconds | Final expiry passes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | 38,460 | 168,896 | 393,164,375 | 52,571,341 | 464.108 | 1,212 |
+| Sparse record | 38,461 | 159,968 | 352,899,859 | 40,132,578 | 472.418 | 1,212 |
+| Dense all artifacts | 76,920 | 159,808 | 379,697,957 | 11,462,260 | 529.498 | 2,423 |
+
+All final stores identify format 86: the current tracing/manifest-retirement
+authority family for this workload without watches, receivers or log-clock
+definitions. This does not qualify every writer-authority family by itself.
+Final allocated bytes are 52,633,600 / 40,181,760 / 11,497,472. None and sparse
+each retain 37,811,892 blob-file bytes; dense has no blob files at its final
+sample. Every mode has 240 WAL bytes along with SST and control/log files.
+Zero logical ownership therefore still leaves measured physical storage.
+
+A separate temporary callsite was compiled against the same locked native core
+and archived outside the build tree before the repository gate. It opens only
+SHA-256 verified closed copies, using the production captured RDF view and
+governed SPARQL API at day 90. All three copies report zero native dictionary
+terms and zero selected records/artifacts, and complete `ASK { ?s ?p ?o }` with
+false. Source admission retains its defaults; native governors specify 100,000
+fuel, 100 answers, 10,000 intermediate cells, 1 MiB scratch and zero remote
+requests. The original closed stores were not opened by RocksDB for these
+follow-up reads; all 27 / 23 / 16 files remain hash-identical.
+`graph-closure-qualified.json` and the archived callsite/image identity bind
+these read checks; they certify logical graph closure, not physical reclamation.
+
+RSS/HWM is sampled every 100 ms, and physical sizes once per completed day.
+Neither is a true peak/allocation bound. Sequential modes, shared-host activity
+(including the graph-probe build), native compaction and different formats make
+the elapsed/file-size observations unsuitable for causal comparisons with older
+runs. Last sampled process write bytes are 5,311,143,936 / 5,295,796,224 /
+5,943,083,008, including inputs, reports, WAL, indexes and maintenance rather than
+isolated engine amplification. No production throughput/density, quota pressure,
+power-loss or forced bounded reclamation acceptance is claimed. Native text/SPARQL,
+governed explanation and materialization integration gaps remain open.
+
+The public service remains PID 4001300 with its original start and store identity,
+schema 60, format 92, 217 records and healthy watches over TCP and Unix. No service
+lifecycle, public ingestion or producer-file operation was performed. Live
+status and immutable source/image/collector checks are retained with the reports.
