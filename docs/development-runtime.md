@@ -3,13 +3,54 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-57 adoption below. It uses
-schema 57 and store format 70. The stable installed
+after the approved checkpoint recovery and schema-58 adoption below. It uses
+schema 58 and store format 70. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`974160f`; see [schema-57 live adoption](#schema-57-live-adoption) for
+`4aadf2c`; see [schema-58 live adoption](#schema-58-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Schema-58 live adoption
+
+Signed source `4aadf2c782e980a5ad3a617d7d488d2c8f9850d2` passed the full normal
+commit hook. The explicitly selected default daemon/client build reports
+`core_features=[]`; exclusive versioned copies were hash-verified before adoption:
+
+- `~/.local/libexec/sparrow/sparrowd-schema58-4aadf2c`, SHA-256
+  `170586e181b4041eb0929f6bafc8033bb39e95db45879b22815db81b7bf7e31a`.
+- `~/.local/libexec/sparrow/sparrow-schema58-4aadf2c`, SHA-256
+  `50b0ae6197ee8a71245f6eee8760020908ed4451d3c42503fc8aaf29345fbee1`.
+
+The private default-image fixture passed shared scope receipts across all query
+surfaces, pin revision/release and retained graph replay, plus CLI/MCP native
+correlation with six distinct directed pairs, continuation, unknown-interpretation
+coverage and strict refusal. Configuration, unit and old-image hashes matched
+their previous receipts. The new daemon received only `cap_net_bind_service=ep`.
+After clean shutdown, the native store lock was held while creating and verifying
+the 113-file `schema58-pre-adoption-closed-backup-20261018`. Each stable alias was
+replaced atomically before starting the enabled persistent service at
+2026-10-18 06:57:54 MDT (12:57:54 UTC), PID 3937614. No recovery was repeated.
+
+TCP and Unix report schema 58, format 70, the original store ID, 217 records and
+healthy watches. Both original `identity_changed` generation receipts match
+schema 57 exactly. Explicit receipt-interval correlation over two selected live
+records returns both directed pairs with exact native certainty; TCP/Unix pages
+and MCP share the same recipe fingerprint and logical scope. Continuations keep
+that scope and operation; all query handles return to zero.
+
+All 253 retained artifact/record targets were fetched over typed TCP in ranges
+of at most 1 MiB. Full BLAKE3 identities match the schema-57 baseline: 36,005,590
+verified bytes, including overlapping record/artifact ranges. The closed backup
+remains unopened. Production resource, physical reclamation and host-reboot
+acceptance remain unmet.
+
+Evidence is under `.stage/native-graph-integration/schema58-*`, including runtime
+build/artifact receipts, private fixture output, adoption prerequisites, closed
+backup manifest, live correlation and complete-byte verification. The first
+fixture command ran before its artifact receipt was published; the first live
+harness combined mutually exclusive `--page-size`/`--limit` flags. Both harness
+errors were corrected, failed logs retained and qualification rerun successfully.
 
 ## Schema-58 correlation source qualification
 
@@ -35,8 +76,8 @@ and 285 pinned ownership jobs with no distinct exceptions. The census identified
 the duplicated diagnostic-name/predicate mapping during development; both now
 read one vocabulary table. Earlier failed gate attempts remain in
 `.stage/native-graph-integration/correlation-*` alongside the final commit gate.
-The installed service remains schema 57; source qualification does not establish
-default-image adoption or production resource/reclamation acceptance.
+Default-image adoption is recorded separately above; source qualification alone
+does not establish adoption or production resource/reclamation acceptance.
 
 ## Schema-57 live adoption
 

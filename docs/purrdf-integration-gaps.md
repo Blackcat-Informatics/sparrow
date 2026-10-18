@@ -5,11 +5,11 @@ scope. Sparrow must retain native semantics and bounded reads while resolving th
 
 ## Current integration state
 
-Schema 57 is deployed on format 70 with native SELECT, ASK, CONSTRUCT and
+Schema 58 is deployed on format 70 with native SELECT, ASK, CONSTRUCT and
 DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
-[Development runtime](development-runtime.md#schema-57-live-adoption).
+[Development runtime](development-runtime.md#schema-58-live-adoption).
 Native text relations, public measured explanation, bounded physical
 reclamation and production resource/turnover acceptance remain required. The
 earlier qualification evidence below records how the deployed graph surface grew.
@@ -21,15 +21,15 @@ original owners. [Source qualification](development-runtime.md#schema-57-graphco
 and [default-image live adoption](development-runtime.md#schema-57-live-adoption)
 are separately recorded; the remaining requirements listed above are still open.
 
-Source schema 58 adds native correlation through fixed SELECT recipes and typed
+Deployed schema 58 adds native correlation through fixed SELECT recipes and typed
 substitutions, sharing the same immutable scope, governor, cancellation and
 retained-page owners. Selectors cover concrete evidence, diagnostic fields,
 source labels and explicit receipt/event intervals. Relationships cover shared
 trace ID, span ID, Source entity and co-occurrence within an explicit interval.
 Unknown interpretations reduce coverage and strict requests refuse them; native
 certainty remains independent. This source implementation does not resolve the
-borrowed text producer or operational EXPLAIN gaps below. The installed service
-remains schema 57 until a separately qualified runtime adoption is recorded.
+borrowed text producer or operational EXPLAIN gaps below. Default-image private
+qualification and live adoption are recorded separately in Development runtime.
 
 ## Query-scoped stored text producers
 
