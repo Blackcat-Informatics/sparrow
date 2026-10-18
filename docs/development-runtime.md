@@ -11,6 +11,31 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-56 scope receipt source qualification
+
+Schema 56 adds frozen logical scope receipts to the shared paged record/text/key/value
+capture, including artifact groups. Selection resolution records the actual pin
+revision/deadline once; anonymous staging retains that receipt through renewal,
+release and logical evidence retirement. Normalized source/diagnostic alternatives
+and evidence ID sets use native PurRDF streaming framing and BLAKE3. The compact
+receipt does not echo large selector values or replace snapshot/corpus identity.
+See [the contract](interfaces.md#frozen-scope-receipts-schema-56).
+
+Release qualification passed 27 core unit, 184 storage and 64 RPC tests, including
+CLI/MCP pin-page replay and key discovery parity, malformed scope rejection,
+normalized identities, and a 100,000-byte exact-source selector with all six
+128-alternative dimensions. That selector's scope receipt stays below 1 KiB.
+Formatting, release Clippy with warnings denied, all other workspace tests,
+seeded census self-tests and the pinned cross-workspace gate passed: 281 ledger
+jobs and no distinct exceptions. Evidence is
+`.stage/native-graph-integration/scope-full-check.log`; the ordinary signed-commit
+hook records its independent gate in `scope-commit.log`.
+
+This is source qualification. Schema 56 has not been packaged or adopted by the
+running service. A fresh TCP/Unix readback in `scope-pre-runtime-readback.json`
+confirmed schema 55, format 70, 217 records, healthy watches and exact equality
+of both original recovered generation receipts. No recovery was repeated.
+
 ## Schema-55 live adoption
 
 Signed source `f715df8e1a520ebd897650e21bad80352948e1f8` contains the

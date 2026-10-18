@@ -52,9 +52,12 @@ the shared lease contract, and any staging or page failure returns no successful
 prefix. No durable query receipt, evidence pin or renewed retention is created.
 
 Schema 45 introduced disk row staging. Host admission profile
-`sparrow-query-capture/6` identifies the current disk index/page-map path. Record,
+`sparrow-query-capture/7` identifies the current disk index/page-map path. Record,
 text, key and value receipts advertise a 64 MiB maximum disk capture;
 the configured store allowance can admit less or refuse with storage pressure.
+Schema 56 freezes the compact logical scope identity and resolved pin receipt in
+this same immutable metadata, before the writer boundary is released; see
+[frozen scope receipts](interfaces.md#frozen-scope-receipts-schema-56).
 Native ranked membership
 keeps its separate 64 MiB admission; output staging does not remove that bound.
 

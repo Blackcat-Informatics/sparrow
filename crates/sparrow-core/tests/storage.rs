@@ -13422,7 +13422,7 @@ fn record_pages_keep_pin_capture_after_release_and_retirement_and_expire_absolut
     let mut scope = record_page_scope("pages", 1);
     scope.selection = QuerySelection::Pin {
         id: pin.id.clone(),
-        expected_revision: Some(pin.revision),
+        expected_revision: None,
     };
     let mut query = RecordRead {
         operation: sparrow_core::RecordOperation::Records,
@@ -13431,8 +13431,28 @@ fn record_pages_keep_pin_capture_after_release_and_retirement_and_expire_absolut
         cursor: None,
     };
     let first = store.records_read(&query, 31 * DAY).unwrap();
+    let frozen = first.body.result().unwrap()["query_evidence"]["scope"].clone();
+    assert_eq!(frozen["pin"]["id"].as_str(), Some(pin.id.as_str()));
+    assert_eq!(frozen["pin"]["revision"].as_u64(), Some(pin.revision));
+    assert_eq!(
+        frozen["pin"]["expires_at_ms"].as_u64(),
+        Some(pin.expires_at)
+    );
+    assert_eq!(frozen["direct_members"].as_str(), Some("1"));
+    assert_eq!(frozen["expanded_records"].as_str(), Some("3"));
+    let renewed = store
+        .renew_pin("scope-renew", &pin.id, 40, Some(pin.revision), 31 * DAY)
+        .unwrap();
+    let fresh = store.records_read(&query, 31 * DAY).unwrap();
+    let changed = fresh.body.result().unwrap()["query_evidence"]["scope"].clone();
+    assert_eq!(changed["pin"]["revision"].as_u64(), Some(renewed.revision));
+    assert_ne!(changed["id"], frozen["id"]);
     query.cursor = first.next_cursor.clone();
     let before = store.records_read(&query, 31 * DAY).unwrap();
+    assert_eq!(
+        before.body.result().unwrap()["query_evidence"]["scope"],
+        frozen
+    );
     store
         .release_retry("record-pages-release", &pin.id, 31 * DAY + 1)
         .unwrap();
@@ -15371,4 +15391,99 @@ fn populated_artifact_upgrade_preserves_original_records_and_requires_its_checkp
         Store::open(dir.path(), config()).err().unwrap().code,
         "STORAGE_FAILURE"
     );
+}
+
+#[test]
+fn scope_receipts_normalize_sets_keep_limits_separate_and_bound_large_selectors() {
+    use sparrow_core::{
+        DiagnosticDimension, QueryAlternatives, QuerySelection, RecordOperation, RecordQuery,
+        RecordRead,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = store
+        .ingest("scope-identity", "pages", "jsonl", b"{}\n{}\n{}\n", 1)
+        .unwrap();
+    let capture = |scope| {
+        let page = store
+            .records_read(
+                &RecordRead {
+                    scope,
+                    operation: RecordOperation::Records,
+                    query: RecordQuery::default(),
+                    cursor: None,
+                },
+                2,
+            )
+            .unwrap();
+        let scope = page.body.result().unwrap()["query_evidence"]["scope"].clone();
+        assert_eq!(
+            store
+                .result_release(&page.store_id, &page.snapshot_id, 2)
+                .unwrap(),
+            page.next_cursor.is_some()
+        );
+        scope
+    };
+    let mut scope = record_page_scope("pages", 1);
+    let live = capture(scope.clone());
+    assert!(live["direct_members"].is_null() && live["expanded_records"].is_null());
+    assert_eq!(live["received_before_ms"].as_u64(), Some(u64::MAX));
+    scope.selection = QuerySelection::Evidence(vec![
+        input.id.clone(),
+        input.record_ids[0].clone(),
+        input.record_ids[0].clone(),
+    ]);
+    scope.sources =
+        Some(QueryAlternatives::new(vec!["pages".into(), "other".into(), "pages".into()]).unwrap());
+    let selected = capture(scope.clone());
+    assert_eq!(selected["direct_members"].as_str(), Some("2"));
+    assert_eq!(selected["expanded_records"].as_str(), Some("3"));
+    assert_eq!(selected["source_alternatives"].as_u64(), Some(2));
+    scope.selection = QuerySelection::Evidence(vec![input.record_ids[0].clone(), input.id.clone()]);
+    scope.sources = Some(QueryAlternatives::new(vec!["other".into(), "pages".into()]).unwrap());
+    scope.limit = 2;
+    scope.scan_budget = 100;
+    assert_eq!(capture(scope.clone()), selected);
+    scope.received_from = 1;
+    assert_ne!(capture(scope.clone())["id"], selected["id"]);
+    scope.received_from = 0;
+    scope.source = None;
+    assert_ne!(capture(scope.clone())["id"], selected["id"]);
+    scope.source = Some("pages".into());
+    scope.diagnostics.insert(
+        DiagnosticDimension::Service,
+        QueryAlternatives::new(vec!["a".into(), "b".into(), "a".into()]).unwrap(),
+    );
+    let diagnostic = capture(scope.clone());
+    assert_ne!(diagnostic["id"], selected["id"]);
+    scope.diagnostics.insert(
+        DiagnosticDimension::Service,
+        QueryAlternatives::new(vec!["b".into(), "a".into()]).unwrap(),
+    );
+    assert_eq!(capture(scope.clone()), diagnostic);
+    // All admitted selector dimensions can be large without inflating frozen metadata.
+    let alternatives = QueryAlternatives::new(
+        (0..128)
+            .map(|n| format!("{n:03}{}", "s".repeat(509)))
+            .collect(),
+    )
+    .unwrap();
+    scope.sources = Some(alternatives.clone());
+    for dimension in [
+        DiagnosticDimension::Service,
+        DiagnosticDimension::Host,
+        DiagnosticDimension::Severity,
+        DiagnosticDimension::TraceId,
+        DiagnosticDimension::SpanId,
+    ] {
+        scope.diagnostics.insert(dimension, alternatives.clone());
+    }
+    scope.selection = QuerySelection::Evidence(vec![input.id; 1000]);
+    scope.source = Some("s".repeat(100_000));
+    let large = capture(scope);
+    assert_eq!(large["has_exact_source"].as_bool(), Some(true));
+    assert_eq!(large["source_alternatives"].as_u64(), Some(128));
+    assert_eq!(large["diagnostic_dimensions"].as_u64(), Some(5));
+    assert!(purrdf_lex::json::write_compact(&large).len() < 1024);
 }

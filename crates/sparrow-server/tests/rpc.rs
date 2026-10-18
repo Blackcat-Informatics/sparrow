@@ -9159,6 +9159,27 @@ async fn record_pages_share_frozen_ranked_receipts_after_pin_release_in_cli_and_
             assert_eq!(first["receipt"]["execution"].as_str(), Some("complete"));
             assert_eq!(first["page"]["total_items"].as_str(), Some("5"));
             assert_eq!(first["qualified_records"].as_str(), Some("5"));
+            let frozen = &first["receipt"]["scope"];
+            assert_eq!(
+                frozen["profile"].as_str(),
+                Some(sparrow_core::QUERY_SCOPE_PROFILE)
+            );
+            assert_eq!(frozen["selection"].as_str(), Some("pin"));
+            assert_eq!(frozen["pin"]["id"].as_str(), Some(pin.id.as_str()));
+            assert_eq!(
+                frozen["pin"]["revision"].as_str(),
+                Some(pin.revision.to_string().as_str())
+            );
+            assert_eq!(
+                frozen["pin"]["expires_at_ms"].as_str(),
+                Some(pin.expires_at.to_string().as_str())
+            );
+            assert_eq!(frozen["direct_members"].as_str(), Some("1"));
+            assert_eq!(frozen["expanded_records"].as_str(), Some("5"));
+            assert_eq!(
+                frozen["received_before_ms"].as_str(),
+                Some(u64::MAX.to_string().as_str())
+            );
             assert_eq!(first["rows"].as_array().unwrap().len(), 2);
             let cursor = first["page"]["next_cursor"].as_str().unwrap();
             let mut mcp = Mcp::start(&socket);
@@ -10592,6 +10613,15 @@ async fn key_paths_share_native_counts_cursor_binding_and_typed_cli_mcp_admissio
                 .await;
             assert_eq!(same["isError"].as_bool(), Some(false));
             assert_eq!(same["structuredContent"]["rows"], first["rows"]);
+            assert_eq!(
+                same["structuredContent"]["receipt"]["scope"],
+                first["receipt"]["scope"]
+            );
+            assert_eq!(
+                first["receipt"]["scope"]["selection"].as_str(),
+                Some("live")
+            );
+            assert!(first["receipt"]["scope"]["expanded_records"].is_null());
             assert_eq!(first["page"]["total_items"].as_str(), Some("3"));
             assert_eq!(
                 first["receipt"]["limits"]["query_path_bytes"].as_str(),

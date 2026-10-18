@@ -18,7 +18,20 @@ pub(super) struct SelectionMembers {
     pub artifacts: BTreeSet<String>,
     pub parents: BTreeSet<String>,
     pub artifact_times: BTreeMap<String, u64>,
+    pub direct_members: usize,
+    pub pin: Option<CapturedPin>,
     visits: usize,
+}
+
+pub(super) struct CapturedPin {
+    pub id: String,
+    pub revision: u64,
+    pub expires_at: u64,
+}
+
+pub(super) struct CandidateCapture<'a> {
+    pub scope: super::Value,
+    pub records: Box<dyn Iterator<Item = Result<Record, Error>> + 'a>,
 }
 
 impl SelectionMembers {
@@ -111,6 +124,7 @@ impl Writer {
         protected: &BTreeSet<String>,
         mut admission: Option<&mut CaptureAdmission<'_>>,
     ) -> Result<Option<SelectionMembers>, Error> {
+        let mut captured_pin = None;
         let members = match selection {
             QuerySelection::Live => return Ok(None),
             QuerySelection::Evidence(ids) => ids.iter().cloned().collect::<BTreeSet<_>>(),
@@ -131,6 +145,11 @@ impl Writer {
                 if expected_revision.is_some_and(|revision| revision != pin.revision) {
                     return Err(Error::new("CONFLICT", "selected pin revision changed"));
                 }
+                captured_pin = Some(CapturedPin {
+                    id: pin.id,
+                    revision: pin.revision,
+                    expires_at: pin.expires_at,
+                });
                 pin.members
             }
         };
@@ -140,7 +159,11 @@ impl Writer {
                 "selection exceeds 100000 direct members",
             ));
         }
-        let mut resolved = SelectionMembers::default();
+        let mut resolved = SelectionMembers {
+            direct_members: members.len(),
+            pin: captured_pin,
+            ..SelectionMembers::default()
+        };
         for member in members {
             if member.len() > 128 {
                 return Err(Error::new(
@@ -201,12 +224,18 @@ impl Writer {
         scope: &QueryScope,
         now: u64,
         protected: &BTreeSet<String>,
-    ) -> Result<Box<dyn Iterator<Item = Result<Record, Error>> + 'a>, Error> {
-        self.query_candidates_from_members(
+    ) -> Result<CandidateCapture<'a>, Error> {
+        let members = self.query_selection_membership(&scope.selection, now, protected, None)?;
+        let receipt = super::scope_receipt::capture(&self.id, scope, members.as_ref())?;
+        let records = self.query_candidates_from_members(
             scope,
-            self.query_membership(scope, now, protected)?,
+            members.map(|members| members.records),
             |id| self.get(id),
-        )
+        )?;
+        Ok(CandidateCapture {
+            scope: receipt,
+            records,
+        })
     }
 
     /// Reuse candidate ordering with a caller-admitted catalog lookup. Membership

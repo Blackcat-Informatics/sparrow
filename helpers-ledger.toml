@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "frozen-query-scope"
+summary = "One membership resolution captures pin revision/deadline and compact logical scope identity using native PurRDF streaming framing and hashing; record/text/key/value staging freezes it for one typed transport and shared agent renderer."
+home = "sparrow_core::storage::scope_receipt::capture"
+entry_points = ["sparrow_core::storage::query_membership::Writer::query_candidates", "sparrow_server::rpc::query_scope_receipt", "sparrow_server::agent::query_receipt::scope_receipt"]
+spec = "docs/interfaces.md: schema 56 frozen scope receipts."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/agent/query_receipt.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(recapture_pin_for_receipt|serialize_full_scope_for_receipt)$']
+
+[[job]]
 id = "temporal-backend-candidates"
 summary = "Current and snapshot-bound readers use the same native half-open temporal iterator and catalog/index integrity checks; backends supply lookup only."
 home = "sparrow_core::storage::query_membership::temporal_candidates"

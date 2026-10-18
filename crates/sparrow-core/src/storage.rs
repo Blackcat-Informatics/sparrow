@@ -44,6 +44,8 @@ pub(crate) mod receiver_stream;
 mod record_fields;
 pub(crate) mod record_read;
 mod record_spool;
+mod scope_receipt;
+pub use scope_receipt::QUERY_SCOPE_PROFILE;
 mod recordless;
 pub(crate) mod result_read;
 pub(crate) mod retention_metrics;
@@ -1611,7 +1613,11 @@ impl Store {
         let mut value_visits = 0_usize;
         let mut response_bytes = 0_usize;
         let mut matched_values = 0_usize;
-        for record in writer.query_candidates(scope, now, &protected)? {
+        let captured = writer.query_candidates(scope, now, &protected)?;
+        if let Some(stage) = stage.as_deref_mut() {
+            stage.scope = Some(captured.scope);
+        }
+        for record in captured.records {
             if let Some(stage) = stage.as_deref() {
                 stage.checkpoint()?;
             }

@@ -194,7 +194,7 @@ impl RowStorage {
 }
 
 /// Host-owned query admission profile; native semantic profiles remain separate.
-pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/6";
+pub const QUERY_CAPTURE_PROFILE: &str = "sparrow-query-capture/7";
 
 pub(super) fn disk_capture_items(query: Option<&crate::RecordQuery>, scan_budget: usize) -> usize {
     if query.is_some_and(|query| query.text.is_some() || query.event_interval.is_some()) {
@@ -510,7 +510,11 @@ impl Store {
                 self.json_query_stage(&q.scope, &q.query, now, Some(&mut staged))?
             }
         };
-        let super::record_spool::Finished { rows, groups } = staged.finish()?;
+        let super::record_spool::Finished {
+            rows,
+            groups,
+            scope: captured_scope,
+        } = staged.finish()?;
         if let Some(counts) = groups {
             let mut groups = purrdf_lex::json::Object::new();
             for (artifact, count) in counts {
@@ -521,7 +525,11 @@ impl Store {
                 .ok_or_else(|| Error::new("STORAGE_FAILURE", "record capture is not an object"))?
                 .insert("artifact_group_counts", groups);
         }
-        let evidence = query_evidence(&selector, &value)?;
+        let mut evidence = query_evidence(&selector, &value)?;
+        evidence
+            .as_object_mut()
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "query evidence is not an object"))?
+            .insert("scope", captured_scope);
         value
             .as_object_mut()
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "query result is not an object"))?

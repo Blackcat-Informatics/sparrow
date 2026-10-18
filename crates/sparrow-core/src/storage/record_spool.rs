@@ -54,6 +54,7 @@ impl Drop for Charge {
 
 /// Incremental staging owner; an error drops every private row and its charge.
 pub(super) struct Builder {
+    pub(super) scope: Option<Value>,
     pub(super) cancellation: super::record_read::QueryCancellation,
     file: File,
     index: File,
@@ -68,6 +69,7 @@ pub(super) struct Builder {
 }
 
 pub(super) struct Finished {
+    pub scope: Value,
     pub rows: Arc<Rows>,
     pub groups: Option<BTreeMap<String, u64>>,
 }
@@ -96,6 +98,7 @@ impl Builder {
         let file = staging_file(writer.db.path())?;
         let index = staging_file(writer.db.path())?;
         Ok(Self {
+            scope: None,
             cancellation: Default::default(),
             file,
             index,
@@ -238,6 +241,9 @@ impl Builder {
             _charge: self.charge,
         });
         Ok(Finished {
+            scope: self
+                .scope
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "query scope was not captured"))?,
             rows,
             groups: self.groups,
         })
@@ -257,6 +263,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let counter = Arc::new(AtomicU64::new(DISK_BYTES));
         let mut builder = Builder {
+            scope: Some(Value::Null),
             cancellation: Default::default(),
             file: staging_file(dir.path()).unwrap(),
             index: staging_file(dir.path()).unwrap(),

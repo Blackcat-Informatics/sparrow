@@ -83,5 +83,5 @@ pub use storage::tail::{
     TailPosition, TailPublication, TailStart,
 };
 pub use storage::watch_registry::MAX_WATCH_REGISTRY_BYTES;
-pub use storage::{Artifact, Config, Error, Pin, Record, Store};
+pub use storage::{Artifact, Config, Error, Pin, QUERY_SCOPE_PROFILE, Record, Store};
 pub use text::resolve_text_analyzer;

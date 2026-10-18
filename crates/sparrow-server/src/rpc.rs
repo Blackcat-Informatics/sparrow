@@ -1290,6 +1290,52 @@ fn diagnostic_coverage(
     Ok(())
 }
 
+fn query_scope_receipt(
+    mut out: wire::query_scope_receipt::Builder<'_>,
+    scope: &Value,
+) -> capnp::Result<()> {
+    out.set_profile(field::<String>(scope, "profile")?);
+    out.set_id(field::<String>(scope, "id")?);
+    out.set_selection(match field::<String>(scope, "selection")?.as_str() {
+        "live" => wire::ScopeSelectionKind::Live,
+        "evidence" => wire::ScopeSelectionKind::Evidence,
+        "pin" => wire::ScopeSelectionKind::Pin,
+        _ => {
+            return Err(capnp::Error::failed(
+                "invalid captured selection kind".into(),
+            ));
+        }
+    });
+    let pin = scope
+        .get("pin")
+        .ok_or_else(|| capnp::Error::failed("missing captured pin".into()))?;
+    if pin.is_null() {
+        out.reborrow().init_pin().set_absent(());
+    } else {
+        let mut target = out.reborrow().init_pin().init_value();
+        target.set_id(field::<String>(pin, "id")?);
+        target.set_revision(field::<u64>(pin, "revision")?);
+        target.set_expires_at_ms(field::<u64>(pin, "expires_at_ms")?);
+    }
+    count(
+        out.reborrow().init_direct_members(),
+        scope,
+        "direct_members",
+    )?;
+    count(
+        out.reborrow().init_expanded_records(),
+        scope,
+        "expanded_records",
+    )?;
+    out.set_has_exact_source(field::<bool>(scope, "has_exact_source")?);
+    out.set_source_alternatives(field::<u32>(scope, "source_alternatives")?);
+    out.set_diagnostic_dimensions(field::<u32>(scope, "diagnostic_dimensions")?);
+    out.set_received_from_ms(field::<u64>(scope, "received_from_ms")?);
+    out.set_received_before_ms(field::<u64>(scope, "received_before_ms")?);
+    out.set_require_complete_index(field::<bool>(scope, "require_complete_index")?);
+    Ok(())
+}
+
 fn query_capture(
     mut out: wire::query_capture::Builder<'_>,
     page: &sparrow_core::RecordReadPage,
@@ -1299,6 +1345,12 @@ fn query_capture(
     let evidence = result
         .get("query_evidence")
         .ok_or_else(|| capnp::Error::failed("missing frozen query evidence".into()))?;
+    query_scope_receipt(
+        out.reborrow().init_scope(),
+        evidence
+            .get("scope")
+            .ok_or_else(|| capnp::Error::failed("missing frozen scope".into()))?,
+    )?;
     let profiles = evidence
         .get("profile_ids")
         .and_then(Value::as_array)

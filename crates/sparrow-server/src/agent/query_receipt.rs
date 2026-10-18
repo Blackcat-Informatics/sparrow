@@ -3,8 +3,82 @@
 
 //! Frozen capture provenance, preserving the original semantic certainty and coverage.
 
-use super::{Result, instant, optional_value, wire};
+use super::{Result, instant, optional_value, render_count, wire};
 use purrdf_lex::json::{Object, Value};
+
+fn scope_receipt(scope: wire::query_scope_receipt::Reader<'_>, as_of: u64) -> Result<Value> {
+    let profile = scope.get_profile()?.to_str()?;
+    let id = scope.get_id()?.to_str()?;
+    let selection = scope.get_selection()?;
+    let pin = scope.get_pin()?.which()?;
+    let direct = render_count(scope.get_direct_members()?)?;
+    let expanded = render_count(scope.get_expanded_records()?)?;
+    let live = selection == wire::ScopeSelectionKind::Live;
+    let pin_selected = selection == wire::ScopeSelectionKind::Pin;
+    if profile != sparrow_core::QUERY_SCOPE_PROFILE
+        || !id
+            .strip_prefix("scope:")
+            .is_some_and(|hash| purrdf_hash::hex::decode_32_canonical(hash).is_some())
+        || direct.is_null() != live
+        || expanded.is_null() != live
+        || matches!(&pin, wire::optional_captured_pin::Value(_)) != pin_selected
+        || scope.get_received_from_ms() >= scope.get_received_before_ms()
+        || scope.get_source_alternatives() > 128
+        || scope.get_diagnostic_dimensions() > 5
+    {
+        return Err(sparrow_client::Error::Protocol("invalid frozen scope receipt").into());
+    }
+    let pin = match pin {
+        wire::optional_captured_pin::Absent(()) => Value::Null,
+        wire::optional_captured_pin::Value(pin) => {
+            let pin = pin?;
+            let id = pin.get_id()?.to_str()?;
+            if !id.starts_with("pin:")
+                || id.len() <= 4
+                || id.len() > 128
+                || pin.get_revision() == 0
+                || pin.get_expires_at_ms() <= as_of
+            {
+                return Err(sparrow_client::Error::Protocol("invalid frozen pin receipt").into());
+            }
+            Object::new()
+                .with("id", id)
+                .with("revision", pin.get_revision().to_string())
+                .with("expires_at_ms", pin.get_expires_at_ms().to_string())
+                .into()
+        }
+    };
+    Ok(Object::new()
+        .with("profile", profile)
+        .with("id", id)
+        .with(
+            "selection",
+            match selection {
+                wire::ScopeSelectionKind::Live => "live",
+                wire::ScopeSelectionKind::Evidence => "evidence",
+                wire::ScopeSelectionKind::Pin => "pin",
+            },
+        )
+        .with("pin", pin)
+        .with("direct_members", direct)
+        .with("expanded_records", expanded)
+        .with("has_exact_source", scope.get_has_exact_source())
+        .with(
+            "source_alternatives",
+            scope.get_source_alternatives().to_string(),
+        )
+        .with(
+            "diagnostic_dimensions",
+            scope.get_diagnostic_dimensions().to_string(),
+        )
+        .with("received_from_ms", scope.get_received_from_ms().to_string())
+        .with(
+            "received_before_ms",
+            scope.get_received_before_ms().to_string(),
+        )
+        .with("require_complete_index", scope.get_require_complete_index())
+        .into())
+}
 
 fn limit(value: wire::optional_limit::Reader<'_>) -> Result<Value> {
     Ok(match value.which()? {
@@ -37,6 +111,10 @@ pub(super) fn apply(out: Object, capture: wire::query_capture::Reader<'_>) -> Re
         .collect::<Result<Vec<_>>>()?;
     let limits = capture.get_limits()?;
     Ok(out
+        .with(
+            "scope",
+            scope_receipt(capture.get_scope()?, page.get_as_of()?.get_unix_millis())?,
+        )
         .with("snapshot_id", page.get_snapshot_id()?.to_str()?)
         .with("as_of", instant(page.get_as_of()?)?)
         .with("lease_expires_at", instant(page.get_lease_expires_at()?)?)
@@ -91,4 +169,52 @@ pub(super) fn apply(out: Object, capture: wire::query_capture::Reader<'_>) -> Re
                 .with("result_bytes", limits.get_result_bytes().to_string())
                 .with("lease_ms", limits.get_lease_ms().to_string()),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_decoder_refuses_missing_or_incoherent_required_evidence() {
+        let mut message = capnp::message::Builder::new_default();
+        let mut scope = message.init_root::<wire::query_scope_receipt::Builder<'_>>();
+        assert_eq!(
+            scope_receipt(scope.reborrow_as_reader(), 0)
+                .unwrap_err()
+                .code,
+            "PROTOCOL_FAILURE"
+        );
+        scope.set_profile(sparrow_core::QUERY_SCOPE_PROFILE);
+        scope.set_id(format!("scope:{}", "0".repeat(64)));
+        scope.set_received_before_ms(u64::MAX);
+        let live = scope_receipt(scope.reborrow_as_reader(), 0).unwrap();
+        assert!(live["direct_members"].is_null());
+        assert_eq!(
+            live["received_before_ms"].as_str(),
+            Some(u64::MAX.to_string().as_str())
+        );
+        scope.set_selection(wire::ScopeSelectionKind::Evidence);
+        assert!(scope_receipt(scope.reborrow_as_reader(), 0).is_err());
+        scope.reborrow().init_direct_members().set_known(1);
+        scope.reborrow().init_expanded_records().set_known(0);
+        assert!(scope_receipt(scope.reborrow_as_reader(), 0).is_ok());
+        scope.set_selection(wire::ScopeSelectionKind::Pin);
+        assert!(scope_receipt(scope.reborrow_as_reader(), 0).is_err());
+        {
+            let mut pin = scope.reborrow().init_pin().init_value();
+            pin.set_id("pin:captured");
+            pin.set_revision(7);
+            pin.set_expires_at_ms(100);
+        }
+        let pin = scope_receipt(scope.reborrow_as_reader(), 0).unwrap();
+        assert_eq!(pin["pin"]["revision"].as_str(), Some("7"));
+        match scope.reborrow().get_pin().unwrap().which().unwrap() {
+            wire::optional_captured_pin::Value(pin) => pin.unwrap().set_revision(0),
+            _ => panic!("missing captured pin"),
+        }
+        assert!(scope_receipt(scope.reborrow_as_reader(), 0).is_err());
+        scope.set_profile("future-profile");
+        assert!(scope_receipt(scope.reborrow_as_reader(), 0).is_err());
+    }
 }

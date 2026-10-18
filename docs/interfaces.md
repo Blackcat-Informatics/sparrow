@@ -3,7 +3,7 @@
 Schema 45 uses anonymous, disk-admitted immutable staging for record, text, key
 and value pages, including field filters, source-time ordering and artifact grouping. Each page remains bounded
 and replayable with the original absolute deadline; release removes only the
-query allocation. Host admission profile `sparrow-query-capture/6` advertises a
+query allocation. Host admission profile `sparrow-query-capture/7` advertises a
 64 MiB maximum disk capture for this path, subject to the configured store budget.
 Row offsets are disk-backed; a bounded resident page map preserves replay.
 Chronological record and JSON captures report the requested scan budget as their
@@ -36,6 +36,47 @@ See [cooperative query cancellation](query-streaming.md#cooperative-query-cancel
 MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not
 implement separate filtering, retention, pin, or query semantics. The daemon
 owns the database; the local CLI and stdio MCP adapter connect to it.
+
+### Frozen scope receipts (schema 56)
+
+Record, text, artifact-group, key and value captures include a typed
+`QueryCapture.scope`, rendered as `receipt.scope` by the shared CLI/MCP adapter.
+Profile `sparrow-scope-receipt/1` supplies a compact `scope:<BLAKE3>` identity,
+selection kind (`live`, `evidence`, or `pin`), direct selected-reference count and
+expanded record count before source/time/diagnostic filters. Live membership
+counts are explicitly unknown. A pin receipt includes its stable ID, actual
+resolved revision and absolute deadline, even when no revision guard was sent.
+These are captured at the same serialized writer boundary as membership; later
+renewal, release or reuse of a pin name cannot change a continuation receipt.
+
+The identity frames the profile, store identity, selection (unique sorted evidence
+IDs or resolved pin ID/revision), optional exact source, unique sorted OR
+alternatives by source/diagnostic dimension, half-open receipt-time interval and
+scope-level `require_complete_index`. PurRDF's native streaming frame and BLAKE3
+helpers own encoding and hashing. The receipt reports `has_exact_source`, alternative
+and dimension counts, rather than potentially hundreds of KiB of selector values.
+An exact-source selector need not fit a stored source name; it can validly select
+no records. Its full value participates in the fingerprint without enlarging the receipt.
+The original selector remains bound to the continuation through the existing
+lease owner. Set normalization describes the logical identity; it does not relax
+continuation selector equality.
+
+`received_from_ms`, `received_before_ms` and pin `expires_at_ms` retain raw UInt64
+milliseconds, rendered as decimal strings; `received_before_ms=18446744073709551615`
+is the existing unbounded upper selector, never a formatted civil timestamp.
+Membership counts and revisions also render as decimal strings. Page size and
+scan budget remain in capture limits, outside the logical scope identity. Record
+predicates, event-time intervals and text are operation inputs outside this scope
+fingerprint. The identity is neither a content hash nor a snapshot or ranked corpus
+identity: those retain their separate capture/profile fields. Scope-level strict
+index input does not replace a record query's additional strictness setting.
+
+Host admission profile advances to `sparrow-query-capture/7`; row, metadata, page,
+lease and disk ceilings stay unchanged. Store format stays 70. Older endpoints
+fail the existing exact-schema discovery check. The adapter refuses a missing or
+incoherent required scope receipt. This change does not supply scope receipts for
+SPARQL/context or finish correlation queries and production-volume acceptance.
+The installed runtime version is recorded in [Development runtime](development-runtime.md).
 
 ### Local endpoint recovery
 
@@ -527,7 +568,9 @@ holds membership stable throughout each operation. Schema 28 adds immutable
 result captures and cursors for `recordsSearch`, including its same-record field,
 source-time and native ranked-text forms. Schema 29 routes standalone text search
 through that same capture. Schema 30 routes native key/value discovery through the same result lease and
-bounded native JSON page body. Complete scope receipt fields remain unfinished.
+bounded native JSON page body. Schema 56 adds frozen scope receipts for the
+paged record/text/key/value pipeline described below; other query families retain
+their separate receipt contracts.
 
 ### Exact JSON key path restriction
 
@@ -544,7 +587,7 @@ Keys and values share the existing occurrence predicate and one typed input
 admission owner. JSON query paths admit at most 65,536 UTF-8 bytes before the
 server allocates an owned spelling. The core enforces the same limit for direct
 JSON discovery calls. The updated host capture profile is
-sparrow-query-capture/6; QueryLimits.queryPathBytes reports that ceiling for
+sparrow-query-capture/7; QueryLimits.queryPathBytes reports that ceiling for
 JSON captures and explicit absence for other query phases. Stored evidence,
 native projection identities and storage formats are unchanged.
 

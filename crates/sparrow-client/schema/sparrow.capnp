@@ -392,9 +392,22 @@ struct QueryLimits {
   compiledFieldBytes @18 :OptionalLimit; queryPathBytes @19 :OptionalLimit;
   keyAggregationBytes @20 :OptionalLimit;
 }
+enum ScopeSelectionKind { live @0; evidence @1; pin @2; }
+struct CapturedPin {
+  id @0 :Text; revision @1 :UInt64; expiresAtMs @2 :UInt64;
+}
+struct OptionalCapturedPin { union { absent @0 :Void; value @1 :CapturedPin; } }
+struct QueryScopeReceipt {
+  profile @0 :Text; id @1 :Text; selection @2 :ScopeSelectionKind;
+  pin @3 :OptionalCapturedPin; directMembers @4 :Count; expandedRecords @5 :Count;
+  hasExactSource @6 :Bool; sourceAlternatives @7 :UInt32; diagnosticDimensions @8 :UInt32;
+  receivedFromMs @9 :UInt64; receivedBeforeMs @10 :UInt64;
+  requireCompleteIndex @11 :Bool;
+}
 struct QueryCapture {
   page @0 :CatalogReadReceipt; profileIds @1 :List(QueryProfile);
   nativeGovernor @2 :OptionalText; limits @3 :QueryLimits;
+  scope @4 :QueryScopeReceipt;
 }
 struct OptionalQueryCapture { union { absent @0 :Void; value @1 :QueryCapture; } }
 struct Receipt {

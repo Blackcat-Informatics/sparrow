@@ -297,7 +297,11 @@ impl Store {
         let mut not_applicable = 0_u64;
         let mut total = 0_u128;
         let mut limited = false;
-        for record in writer.query_candidates(scope, now, &protected)? {
+        let captured = writer.query_candidates(scope, now, &protected)?;
+        if let Some(stage) = stage.as_deref_mut() {
+            stage.scope = Some(captured.scope);
+        }
+        for record in captured.records {
             if let Some(stage) = stage.as_deref() {
                 stage.checkpoint()?;
             }
