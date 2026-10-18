@@ -3,19 +3,94 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-53 adoption below. It uses
-schema 53 and store format 48. The stable installed
+after the approved checkpoint recovery and schema-54 adoption below. It uses
+schema 54 and store format 59. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`4d44a2e`; see [schema-53 live adoption](#schema-53-live-adoption) for
+`be0994e`; see [schema-54 live adoption](#schema-54-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-54 live adoption
+
+Signed source `be0994e8a5ee30abf91513b327b460d210244507` passed the normal full
+pre-commit gate in `all-artifact-commit.log`. This includes the final write-boundary
+adjustment, 24 core unit tests, 182 storage tests, 64 RPC tests and the pinned
+census with 279 ownership jobs and zero exceptions.
+
+A hash-verified private copy of the 108-file schema-53 closed backup migrated
+from format 48 to 59 without activating listeners or intake workers. Its durable
+watch definitions were preserved. An offline probe passed SELECT, ASK, CONSTRUCT
+and DESCRIBE; native class counts of 217 Records and 36 complete Artifacts agreed
+with independent paged artifact-catalog discovery. Reopening produced identical
+query reports. Both old discontinuous generations retained offsets 37/0, records
+1/0, root device 56, original revision and terminal expiry, and `identity_changed`.
+
+The existing offline recovery example then verified all 217 retained records and
+36 complete artifacts: 253 targets and 36,005,590 logical bytes, including overlap
+between artifact and record reads. The original backup's complete hash map
+remained unchanged. The first target-list harness incorrectly assumed a single
+page; the corrected three-page query consumes and releases the native cursor.
+Final live handles/bytes are zero. Evidence under `.stage/native-graph-integration/`
+includes `schema54-copy-{source,images,first,reopen,qualified}.json`,
+`schema54-copy-build.{jsonl,log}`, `schema54_copy_probe.rs`,
+`schema54-copy-all-bytes.{json,log}` and `schema54-copy-targets-*`.
+
+The offline examples compile with the dev-only `test-support` feature. Their
+qualification did not invoke its fixture-retirement entrypoint. Ordinary runtime
+packaging was separately selected with
+`cargo build --locked --release -p sparrow-server --bins --message-format=json`;
+the emitted core feature list is empty. Its machine artifact paths selected:
+
+- `~/.local/libexec/sparrow/sparrowd-schema54-be0994e`, SHA-256
+  `42020c6249e33103b587d99b54b7a8067a1caf2f2228901ef926fc9205ce78c5`.
+- `~/.local/libexec/sparrow/sparrow-schema54-be0994e`, SHA-256
+  `000220d0e430b3984453a82c8a674fc6fdc960947c8e1c25706d88d25b7b564d`.
+
+A fresh private daemon using that exact ordinary pair passed CLI/MCP diagnostic
+matches and exclusions, complete original artifact byte length, metadata-layer
+exclusion, record-only selection without implicit whole-parent membership, strict
+unknown-artifact refusal without a successful prefix, and permissive incomplete
+coverage. It shut down cleanly with zero graph handles/bytes. These receipts use
+the `schema54-agent-*` prefix. The temporary probe example was removed from source.
+
+Both installed image hashes and the daemon's sole `cap_net_bind_service=ep`
+capability were checked before SIGINT drain. With the unit inactive, PID zero
+and Unix socket absent, an exclusive native lock protected a fresh synchronized
+110-file closed backup at `schema54-pre-adoption-closed-backup-20261018`.
+Every regular-file hash matched the closed source before and after copying.
+Configuration, unit and intake roots were preserved while both executable aliases
+were switched. The enabled unit started at 2026-10-18 08:31:20 UTC, observed PID
+4078213, and the first readiness probe succeeded. Installed aliases/hashes,
+capability, unit state and typed behavior were checked; no running-process
+executable hash is claimed.
+
+Live TCP still binds `0.0.0.0:518`; TCP and Unix agree on schema 54, format 59,
+original store identity, 217 records, 213 payload chunks and no watch failures.
+All four native read forms, six-page DESCRIBE, cross-endpoint continuation/release
+and CLI/MCP agreement passed. Native counts remain 217 Records and 36 Artifacts.
+Populated-artifact identity, 96-byte length, format and typed receipt/retention
+timestamps agree with the independent pre-upgrade catalog receipt. Metadata-layer
+exclusion preserves membership while yielding no graph rows. The count query
+admits 7,568,623 source bytes at unchanged ceilings; accounted peak live bytes
+remain 115,740,672. These are logical accounts, not physical I/O or RSS results.
+
+Both recovered generation receipts are exactly equal to their schema-53 receipts
+over TCP and Unix, including original declarations, clocks and gaps. No recovery
+was repeated and no input was ingested by live acceptance. Final graph handles
+and bytes are zero; the fresh closed backup hashes remain unchanged. Evidence
+includes `schema54-runtime-{build,artifacts}*`,
+`schema54-adoption-prerequisites.json`, `schema54-pre-adoption-closed-backup.json`,
+`schema54-readiness-*`, `schema54-live-acceptance.{py,log}`,
+`schema54-live-populated*`, `schema54-live-{tcp,unix}-generation-*`,
+`schema54-live-service.txt` and `schema54-final-readback.json`.
+This finite development qualification leaves the remaining graph, reclamation,
+agent-contract and production-volume requirements below unfinished.
+
 ## Populated-artifact RDF source qualification
 
 Source schema 54 adds independent populated-artifact metadata, source profile v3
-and store writer fences 55 through 65. It remains under qualification; the
-installed schema-53 pair below has not changed. Direct publication shares the
+and store writer fences 55 through 65, adopted above. Direct publication shares the
 record RDF writer; staged publication adds the parent only after complete-byte
 validation. The native streaming manifest header supplies scalar metadata and
 effective eviction state without materializing its arrays. Artifact timeline and
@@ -36,8 +111,8 @@ last write-boundary adjustment, is the normal hook in `all-artifact-commit.log`.
 
 Historical fixture cleanup uses a dev-only feature entry into the same native
 RDF retirement implementation. Ordinary runtime builds must omit that feature.
-Private-copy migration acceptance and explicit runtime packaging/adoption remain
-required before replacing the installed image.
+Private-copy migration acceptance and ordinary runtime packaging/adoption are
+recorded above.
 
 ## Source catalog admission qualification
 
@@ -240,7 +315,7 @@ owners. No detectors were relaxed. The final normal `make check` commit gate is
 logged in `.stage/native-graph-integration/graph-wire-commit.log`; the related
 focused, integration and census receipts use the `graph-wire-*` prefix.
 
-Populated artifact metadata and Source/Stream class declarations, native text
+Source/Stream class declarations, native text
 relations, correlation, public
 explanation, forced bounded physical reclamation and production-volume/resource
 acceptance remain unfinished. The concrete native storage integration gap is

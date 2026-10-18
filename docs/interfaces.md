@@ -443,9 +443,9 @@ native status errors and half-open receipt bounds. This removes the previous
 This source change passed the full local gate and is installed as schema 53;
 live adoption evidence is recorded in Development runtime.
 
-The implementation branch adds schema 54 and source profile
-`sparrow-rdf-source-v3` for independent populated-artifact metadata. This remains
-under qualification; the installed server is still schema 53. Live graph scopes
+Schema 54 and source profile `sparrow-rdf-source-v3` add independent
+populated-artifact metadata, now installed on the development server with the
+qualification evidence in Development runtime. Live graph scopes
 include complete eligible artifacts on their own receipt timeline. Explicit
 whole-artifact and pin selections include that metadata alongside their record
 expansion; selecting an individual record does not select its whole parent.
