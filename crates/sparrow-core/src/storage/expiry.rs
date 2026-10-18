@@ -180,21 +180,20 @@ impl Writer {
                             report.frontier = ExpiryFrontier::UnitLimit;
                             break 'phases;
                         }
-                        if retirement.artifact_graph(&artifact.id)? {
+                        let graph_retired = retirement.artifact_graph(&artifact.id)?;
+                        if graph_retired {
                             report.artifacts += 1;
                         }
                         if artifact.pending() != 0 {
-                            if report.records + report.artifacts == limits.max_records as u64 {
-                                report.frontier = ExpiryFrontier::UnitLimit;
-                                break 'phases;
-                            }
                             let remaining = limits.max_payload_refs - report.payload_refs;
                             if remaining == 0 {
                                 report.frontier = ExpiryFrontier::PayloadBudget;
                                 break 'phases;
                             }
                             report.payload_refs += retirement.artifact(&mut artifact, remaining)?;
-                            report.artifacts += 1;
+                            if !graph_retired {
+                                report.artifacts += 1;
+                            }
                             if artifact.pending() != 0 {
                                 position.next = Some((key.to_vec(), true));
                                 report.frontier = ExpiryFrontier::PayloadBudget;

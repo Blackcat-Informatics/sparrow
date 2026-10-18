@@ -127,6 +127,7 @@ impl Writer {
         &self,
         mut batch: WriteBatch,
         buffered_id: Option<&str>,
+        record_estimate: Option<u64>,
     ) -> Result<(), Error> {
         if buffered_id.is_none() && batch.is_empty() {
             return self.synchronize().map(|_| ());
@@ -191,8 +192,14 @@ impl Writer {
                 },
             )?;
         }
-        if publication.artifact_rdf {
-            self.admit_import_batch(&batch)?;
+        if publication.artifact_rdf || record_estimate.is_some() {
+            // Admit once after source context and authority metadata have joined
+            // the exact batch. A smaller preliminary refusal cannot certify a retry.
+            self.admit_data_write(
+                record_estimate
+                    .unwrap_or(0)
+                    .max(super::pressure::data_batch_estimate(&batch)),
+            )?;
         }
         let bytes = batch.size_in_bytes();
         {

@@ -1344,6 +1344,7 @@ dependencies = [
  "rocksdb",
  "rustix",
  "sparrow-client",
+ "sparrow-core",
  "tempfile",
 ]
 

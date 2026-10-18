@@ -443,6 +443,33 @@ native status errors and half-open receipt bounds. This removes the previous
 This source change passed the full local gate and is installed as schema 53;
 live adoption evidence is recorded in Development runtime.
 
+The implementation branch adds schema 54 and source profile
+`sparrow-rdf-source-v3` for independent populated-artifact metadata. This remains
+under qualification; the installed server is still schema 53. Live graph scopes
+include complete eligible artifacts on their own receipt timeline. Explicit
+whole-artifact and pin selections include that metadata alongside their record
+expansion; selecting an individual record does not select its whole parent.
+Diagnostic filters include a populated artifact only when its eligible records
+prove a match in the same capture. Empty artifacts retain explicit unknown
+diagnostic coverage and strict refusal. Metadata-layer exclusion suppresses all
+artifact quads without erasing known membership.
+
+The new timeline and receipt-bearing RDF ownership marker are published atomically
+with the catalog. Direct ingestion shares its existing record RDF dictionary
+writer; staged imports publish the parent after validating their complete byte
+cover. Expiry and eviction retire the parent graph and timeline through that same
+reference owner, while individual record pins retain their original evidence.
+Startup fences older writers with store formats 55 through 65, preserving each
+original authority family. One-owner migration pages retain durable progress and
+original clocks. Native streaming manifest headers supply scalar metadata without
+materializing large record/chunk arrays; their input and scalar allocations share
+the existing finite catalog account. Record catalog bodies retain their 64x DOM
+charge. The source/request/row and native governor ceilings remain unchanged.
+
+Historical test fixtures retire artifact-only graphs through a dev-only feature
+entry into that production owner before removing feature checkpoints. The shared
+test-support crate selects the feature; ordinary runtime builds do not.
+
 Optional `limits` counters use unsigned decimal strings: `fuel`, `answer_rows`,
 `intermediate_cells`, `scratch_bytes`, `live_bytes`, `requests`, `io_bytes`,
 `row_visits`, `source_lease_ms`. Defaults and actual effective limits are echoed

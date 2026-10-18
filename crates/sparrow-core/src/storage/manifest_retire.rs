@@ -51,14 +51,14 @@ pub(super) struct State {
 }
 
 impl State {
-    fn read(writer: &Writer, id: &str) -> Result<Option<Self>, Error> {
-        let Some(bytes) = writer.db.get_pinned(key(id))? else {
+    fn read(db: &rocksdb::DB, id: &str) -> Result<Option<Self>, Error> {
+        let Some(bytes) = db.get_pinned(key(id))? else {
             return Ok(None);
         };
         if bytes.len() != 17
             || bytes[16] > 1
             || !matches!(
-                super::writer_format::read(&writer.db)?.as_deref(),
+                super::writer_format::read(db)?.as_deref(),
                 Some(FORMAT | WATCH_FORMAT)
             )
         {
@@ -90,7 +90,7 @@ impl State {
 
 /// Apply effective ownership only to stored catalogs, never to original retry receipts.
 pub(super) fn resolve(writer: &Writer, artifact: &mut Artifact) -> Result<(), Error> {
-    if let Some(state) = State::read(writer, &artifact.id)? {
+    if let Some(state) = State::read(&writer.db, &artifact.id)? {
         if state.total != artifact.chunks.len() as u64 {
             return Err(failure(
                 "manifest retirement count disagrees with stored artifact",
@@ -172,17 +172,21 @@ fn strings(
     }
 }
 
-struct Header {
-    id: String,
-    received_at: u64,
-    expires_at: u64,
-    evicted: bool,
+pub(super) struct Header {
+    /// Scalars only. Native array traversal validates membership without owning it.
+    pub artifact: Artifact,
+    pub record_count: u64,
     records: Range<usize>,
     chunks: Array,
 }
 
 /// Validate the existing artifact codec's scalar fields without owning its large arrays.
-fn header(bytes: &[u8], remaining: &mut usize, skip: u64, take: usize) -> Result<Header, Error> {
+pub(super) fn header(
+    bytes: &[u8],
+    remaining: &mut usize,
+    skip: u64,
+    take: usize,
+) -> Result<Header, Error> {
     let mut reader = json::Reader::from_slice(bytes, CATALOG_LIMITS)?;
     if !matches!(reader.next_event()?, json::Event::BeginObject { .. }) {
         return Err(failure("artifact catalog must be an object"));
@@ -206,7 +210,7 @@ fn header(bytes: &[u8], remaining: &mut usize, skip: u64, take: usize) -> Result
         }
         let value = match name.as_str() {
             "record_ids" => {
-                records = Some(strings(&mut reader, remaining, 0, 0, None)?.range);
+                records = Some(strings(&mut reader, remaining, 0, 0, None)?);
                 json::Value::array(Vec::<String>::new())
             }
             "chunks" => {
@@ -237,14 +241,44 @@ fn header(bytes: &[u8], remaining: &mut usize, skip: u64, take: usize) -> Result
     // The arrays were individually type/grammar checked. The existing codec owns
     // every scalar shape, required field and integer conversion.
     let artifact = Artifact::decode(&fields.into())?;
+    let records = records.ok_or_else(|| failure("missing record manifest"))?;
+    let chunks = chunks.ok_or_else(|| failure("missing payload manifest"))?;
+    if records.count == 0 && (artifact.byte_length != 0 || chunks.count != 0) {
+        return Err(failure(
+            "recordless artifact has unaccounted original bytes",
+        ));
+    }
     Ok(Header {
-        id: artifact.id,
-        received_at: artifact.received_at,
-        expires_at: artifact.expires_at,
-        evicted: artifact.evicted,
-        records: records.ok_or_else(|| failure("missing record manifest"))?,
-        chunks: chunks.ok_or_else(|| failure("missing payload manifest"))?,
+        artifact,
+        record_count: records.count,
+        records: records.range,
+        chunks,
     })
+}
+
+impl Header {
+    /// Return scalar metadata only; the arrays are validated but intentionally absent.
+    pub(super) fn stored(mut self, db: &rocksdb::DB, id: &str) -> Result<Self, Error> {
+        if self.artifact.id != id {
+            return Err(failure("artifact catalog identity disagrees with its key"));
+        }
+        if !id.starts_with("artifact:") || id.len() <= 9 {
+            return Err(failure(
+                "artifact metadata requires a bounded artifact identity",
+            ));
+        }
+        super::validate_ingest_labels(id, &self.artifact.source, &self.artifact.format)
+            .map_err(|error| failure(&error.message))?;
+        if let Some(state) = State::read(db, id)? {
+            if state.total != self.chunks.count {
+                return Err(failure(
+                    "manifest retirement count disagrees with stored artifact",
+                ));
+            }
+            self.artifact.evicted |= state.evicted;
+        }
+        Ok(self)
+    }
 }
 
 pub(super) struct Envelope {
@@ -272,14 +306,14 @@ impl Envelope {
             &mut available,
             bytes.len().saturating_mul(2).saturating_add(8192),
         )?;
-        let saved = State::read(writer, id)?;
+        let saved = State::read(&writer.db, id)?;
         let header = header(
             bytes,
             &mut available,
             saved.map_or(0, |state| state.retired),
             take,
         )?;
-        if header.id != id {
+        if header.artifact.id != id {
             return Err(failure("artifact catalog identity disagrees with its key"));
         }
         let state = saved.unwrap_or(State {
@@ -293,10 +327,10 @@ impl Envelope {
         }
         let envelope = Self {
             raw: bytes.to_vec(),
-            id: header.id,
-            received_at: header.received_at,
-            expires_at: header.expires_at,
-            root_evicted: header.evicted,
+            id: header.artifact.id,
+            received_at: header.artifact.received_at,
+            expires_at: header.artifact.expires_at,
+            root_evicted: header.artifact.evicted,
             records: header.records,
             prefix: header.chunks.prefix,
             before: state,
@@ -420,7 +454,8 @@ mod tests {
         let input = r#"{"chunks":["first","sec\u006fnd"],"record_ids":["record:\u0078"],"evicted":false,"payload_id":"blake3:x","byte_length":"1","expires_at":"2","received_at":"0","format":"log","source":"source","id":"artifact:x"}"#;
         let mut remaining = usize::MAX;
         let parsed = header(input.as_bytes(), &mut remaining, 1, 1).unwrap();
-        assert_eq!(parsed.id, "artifact:x");
+        assert_eq!(parsed.artifact.id, "artifact:x");
+        assert_eq!(parsed.record_count, 1);
         assert_eq!(parsed.chunks.count, 2);
         assert_eq!(parsed.chunks.prefix, ["second"]);
         let mut reader =

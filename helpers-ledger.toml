@@ -1630,7 +1630,7 @@ names = ['^(prepare_import_layout|build_record_layout)$']
 id = "native-record-preparation"
 summary = "Prepare original record bytes and native JSON, RDF, text and source-time dependencies once for catalog publication."
 home = "sparrow_core::storage::ingest::RecordBatch::record"
-entry_points = []
+entry_points = ["sparrow_core::storage::ingest::RecordBatch::prepare", "sparrow_core::storage::ingest::RecordBatch::finish"]
 spec = "docs/development-runtime.md: shared record preparation and bounded staged byte reads."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -4016,9 +4016,9 @@ names = ['^(rebuild_scoped_rdf_in_memory|copy_foreign_quad_scan_for_describe)$']
 
 [[job]]
 id = "artifact-rdf-writer-authority"
-summary = "One explicit writer-format map adds recordless artifact RDF to each existing authority family and preserves that fence across watch, consumption, receiver, pressure and manifest transitions. Discovery retains the actual stored identity."
+summary = "One explicit writer-format map adds artifact RDF to each existing authority family and preserves that fence across watch, consumption, receiver, pressure and manifest transitions. Discovery retains the actual stored identity."
 home = "sparrow_core::storage::writer_format::stage"
-entry_points = ["sparrow_core::storage::writer_format::read", "sparrow_core::storage::writer_format::enable", "sparrow_core::storage::writer_format::has_artifact_rdf"]
+entry_points = ["sparrow_core::storage::writer_format::read", "sparrow_core::storage::writer_format::enable", "sparrow_core::storage::writer_format::has_artifact_rdf", "sparrow_core::storage::writer_format::has_all_artifact_rdf", "sparrow_core::storage::writer_format::enable_all"]
 spec = "docs/interfaces.md: recordless artifact RDF writer authority."
 vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -4030,9 +4030,9 @@ names = ['^(artifact_rdf_format_elsewhere|discard_artifact_writer_fence)$']
 
 [[job]]
 id = "recordless-rdf-ownership"
-summary = "Recordless artifact graph publication, retirement and one-owner native migration batches share the original RDF dictionary writer and catalog upgrade pager; missing state and unfenced ownership fail explicitly."
+summary = "Artifact graph publication, retirement and one-owner native migration batches share the original RDF dictionary writer and catalog upgrade pager; missing state and unfenced ownership fail explicitly."
 home = "sparrow_core::storage::artifact_rdf::publish"
-entry_points = ["sparrow_core::storage::artifact_rdf::upgrade", "sparrow_core::storage::artifact_rdf::admit", "sparrow_core::storage::artifact_rdf::backfill", "sparrow_core::storage::artifact_rdf::retire", "sparrow_core::storage::retire::Retirement::artifact_graph"]
+entry_points = ["sparrow_core::storage::artifact_rdf::upgrade", "sparrow_core::storage::artifact_rdf::admit", "sparrow_core::storage::artifact_rdf::backfill", "sparrow_core::storage::artifact_rdf::retire", "sparrow_core::storage::retire::Retirement::artifact_graph", "sparrow_core::storage::artifact_rdf::stage", "sparrow_core::storage::artifact_rdf::backfill_all", "sparrow_core::storage::artifact_rdf::time_key", "sparrow_core::storage::ingest::RecordBatch::finish_artifact"]
 spec = "docs/interfaces.md: recordless artifact RDF writer authority."
 vectors = ["crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -4058,9 +4058,9 @@ names = ['^(copy_occurrence_rdf_envelope|empty_artifact_rdf_projector)$']
 
 [[job]]
 id = "legacy-artifact-rdf-test-fixture"
-summary = "Dev-only legacy fixtures remove the migration checkpoint only after production maintenance has retired every artifact RDF owner; fixture setup never copies RDF dictionary retirement semantics."
+summary = "Dev-only legacy fixtures retire artifact-only owners through the same native writer before removing both migration checkpoints; record graphs and payloads remain intact, and no retirement semantics are copied."
 home = "sparrow_test_support::remove_artifact_rdf_upgrade"
-entry_points = []
+entry_points = ["sparrow_core::storage::artifact_rdf::retire_artifact_rdf_for_legacy_fixture"]
 spec = "docs/interfaces.md: recordless artifact RDF writer authority."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -4083,3 +4083,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(price_graph_catalog_body_elsewhere|copy_temporal_cursor_for_rdf)$']
+
+[[job]]
+id = "artifact-scalar-header-admission"
+summary = "Artifact graph membership and migration reuse the native streaming manifest header and effective retirement state; large arrays are validated without materializing them or duplicating their codec."
+home = "sparrow_core::storage::artifact_rdf::catalog"
+entry_points = ["sparrow_core::storage::artifact_rdf::catalog_charge", "sparrow_core::storage::manifest_retire::header", "sparrow_core::storage::manifest_retire::Header::stored"]
+spec = "docs/interfaces.md: populated artifact metadata."
+vectors = ["crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_artifact_metadata_elsewhere|copy_manifest_header_for_graph)$']

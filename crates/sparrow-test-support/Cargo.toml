@@ -9,6 +9,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+sparrow-core = { path = "../sparrow-core", features = ["test-support"] }
 rocksdb.workspace = true
 purrdf-lex.workspace = true
 sparrow-client = { path = "../sparrow-client" }

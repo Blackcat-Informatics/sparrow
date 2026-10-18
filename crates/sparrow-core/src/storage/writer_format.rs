@@ -33,18 +33,50 @@ const RDF: [&[u8]; 11] = [
     b"sparrow.store/53",
     b"sparrow.store/54",
 ];
+const ALL_RDF: [&[u8]; 11] = [
+    b"sparrow.store/55",
+    b"sparrow.store/56",
+    b"sparrow.store/57",
+    b"sparrow.store/58",
+    b"sparrow.store/59",
+    b"sparrow.store/60",
+    b"sparrow.store/61",
+    b"sparrow.store/62",
+    b"sparrow.store/63",
+    b"sparrow.store/64",
+    b"sparrow.store/65",
+];
+
+pub(super) fn has_all_artifact_rdf(format: &[u8]) -> bool {
+    ALL_RDF.contains(&format)
+}
 
 pub(super) fn has_artifact_rdf(format: &[u8]) -> bool {
-    RDF.contains(&format)
+    RDF.contains(&format) || has_all_artifact_rdf(format)
 }
 
 /// Authority checks use their original family. Public discovery uses the raw identity.
 pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
     Ok(db.get("store_format")?.map(|raw| {
         RDF.iter()
+            .chain(ALL_RDF.iter())
             .position(|identity| *identity == raw)
-            .map_or(raw.clone(), |index| BASE[index].to_vec())
+            .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
+}
+
+pub(super) fn enable_all(format: &[u8]) -> Result<&'static [u8], Error> {
+    BASE.iter()
+        .chain(RDF.iter())
+        .chain(ALL_RDF.iter())
+        .position(|identity| *identity == format)
+        .map(|index| ALL_RDF[index % BASE.len()])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "complete artifact RDF requires a current authority family",
+            )
+        })
 }
 
 pub(super) fn enable(format: &[u8]) -> Result<&'static [u8], Error> {
@@ -66,7 +98,9 @@ pub(super) fn stage(db: &DB, batch: &mut WriteBatch, base: &[u8]) -> Result<(), 
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
     batch.put(
         "store_format",
-        if has_artifact_rdf(&current) {
+        if has_all_artifact_rdf(&current) {
+            enable_all(base)?
+        } else if has_artifact_rdf(&current) {
             enable(base)?
         } else {
             base
@@ -82,18 +116,25 @@ mod tests {
     fn every_authority_transition_preserves_the_artifact_writer_fence() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
-        for base in BASE {
-            db.put("store_format", enable(base).unwrap()).unwrap();
-            assert_eq!(read(&db).unwrap().as_deref(), Some(base));
-            for next in BASE {
-                let mut batch = WriteBatch::default();
-                stage(&db, &mut batch, next).unwrap();
-                db.write(batch).unwrap();
-                assert_eq!(
-                    db.get("store_format").unwrap().as_deref(),
-                    Some(enable(next).unwrap())
-                );
-                assert_eq!(read(&db).unwrap().as_deref(), Some(next));
+        for family in [RDF, ALL_RDF] {
+            for (base, format) in BASE.into_iter().zip(family) {
+                db.put("store_format", format).unwrap();
+                assert_eq!(read(&db).unwrap().as_deref(), Some(base));
+                for (index, next) in BASE.into_iter().enumerate() {
+                    let mut batch = WriteBatch::default();
+                    stage(&db, &mut batch, next).unwrap();
+                    db.write(batch).unwrap();
+                    assert_eq!(
+                        db.get("store_format").unwrap().as_deref(),
+                        Some(family[index])
+                    );
+                    assert_eq!(read(&db).unwrap().as_deref(), Some(next));
+                }
+            }
+        }
+        for (index, base) in BASE.into_iter().enumerate() {
+            for previous in [base, RDF[index], ALL_RDF[index]] {
+                assert_eq!(enable_all(previous).unwrap(), ALL_RDF[index]);
             }
         }
         assert!(enable(b"sparrow.store/5").is_err());

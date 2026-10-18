@@ -30,12 +30,56 @@ fn artifact_catalog(
     admission: &mut CaptureAdmission<'_>,
     key: &[u8],
     value: &[u8],
-) -> Result<crate::storage::Artifact, Error> {
-    crate::storage::temporal_index::check_width("empty-time:", key, value)?;
+) -> Result<crate::storage::manifest_retire::Header, Error> {
+    use crate::storage::artifact_rdf;
+    crate::storage::temporal_index::check_width(artifact_rdf::TIME, key, value)?;
     admission.entry(key.len() + value.len())?;
-    crate::storage::recordless::read_recordless(key, value, |id| {
-        writer.get_admitted(id, |bytes| catalog_entry(budget, id, bytes, admission))
-    })
+    let id = std::str::from_utf8(value)
+        .map_err(|_| Error::new("STORAGE_FAILURE", "invalid artifact receipt identity"))?;
+    if !id.starts_with("artifact:") || id.len() <= 9 {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "artifact receipt requires an artifact identity",
+        ));
+    }
+    let bytes = writer.db.get_pinned(id)?.ok_or_else(|| {
+        Error::new(
+            "STORAGE_FAILURE",
+            "artifact receipt references a missing catalog",
+        )
+    })?;
+    budget
+        .admit_bytes((id.len() + bytes.len()) as u64)
+        .map_err(|error| Error::new(error.code, error.message.clone()))?;
+    let header = artifact_rdf::catalog(&writer.db, id, &bytes, admission.remaining)?;
+    if header.record_count == 0 {
+        budget
+            .request(row_bound("empty-time:"), false)
+            .map_err(|error| Error::new(error.code, error.message.clone()))?;
+        if writer
+            .db
+            .get_pinned(crate::storage::recordless::key_parts(
+                header.artifact.received_at,
+                id,
+            ))?
+            .as_deref()
+            != Some(id.as_bytes())
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "empty artifact receipt index is missing or inconsistent",
+            ));
+        }
+    }
+    if key != artifact_rdf::time_key(header.artifact.received_at, id).as_bytes()
+        || header.artifact.evicted
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "artifact receipt index disagrees with its catalog",
+        ));
+    }
+    Ok(header)
 }
 
 /// Coverage of a completed graph-owner capture, independently of query certainty.
@@ -46,9 +90,9 @@ pub struct RdfScopeCoverage {
     /// Known selected record occurrences, never a count of shared content graphs.
     /// The exact total is unknown when diagnostic membership is incomplete.
     pub selected_records: u64,
-    /// Empty-artifact candidates visited independently of record occurrences.
+    /// Artifact candidates visited independently of record occurrences.
     pub artifacts_visited: u64,
-    /// Proven recordless artifact membership; no content projection is implied.
+    /// Proven complete-artifact membership; no content projection is implied.
     pub selected_artifacts: u64,
     /// Otherwise eligible empty artifacts lacking requested diagnostic dimensions.
     pub artifact_diagnostic_unknown: u64,
@@ -94,20 +138,26 @@ impl StoredRdfView<'_> {
     fn include_artifact(
         &mut self,
         writer: &crate::storage::Writer,
-        artifact: &crate::storage::Artifact,
+        header: &crate::storage::manifest_retire::Header,
+        matched_artifacts: &BTreeSet<String>,
         scope: &QueryScope,
         layers: RdfGraphLayers,
         now: u64,
         protected: &BTreeSet<String>,
         coverage: &mut RdfScopeCoverage,
     ) -> Result<(), ReadError> {
+        let artifact = &header.artifact;
         coverage.artifacts_visited += 1;
         if !writer.live_artifact(artifact, now, protected)
             || !scope.matches_source(&artifact.source)
         {
             return Ok(());
         }
-        if !scope.diagnostics.is_empty() {
+        if !scope.diagnostics.is_empty() && header.record_count != 0 {
+            if !matched_artifacts.contains(&artifact.id) {
+                return Ok(());
+            }
+        } else if !scope.diagnostics.is_empty() {
             coverage.artifact_diagnostic_unknown += 1;
             if scope.require_complete_index {
                 return Err(self.budget.fail(Error::new("INDEX_NOT_READY","selected recordless artifact has no diagnostic record; omit diagnostic filters or select records")));
@@ -117,19 +167,23 @@ impl StoredRdfView<'_> {
         coverage.selected_artifacts += 1;
         if layers.metadata {
             let marker = format!("artifact-rdf:{}", artifact.id);
-            let value = self.point(marker.as_bytes(), 0)?.ok_or_else(|| {
+            let value = self.point(marker.as_bytes(), 8)?.ok_or_else(|| {
                 self.budget.fail(Error::new(
                     "STORAGE_FAILURE",
-                    "recordless artifact RDF ownership marker missing",
+                    "artifact RDF ownership marker missing",
                 ))
             })?;
+            if value.as_ref() != artifact.received_at.to_be_bytes() {
+                return Err(self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "artifact RDF receipt marker disagrees with its catalog",
+                )));
+            }
             drop(value);
             let graph = format!("rdf:graph:{}", artifact.id);
             let manifest = self.point(graph.as_bytes(), 65536)?.ok_or_else(|| {
-                self.budget.fail(Error::new(
-                    "STORAGE_FAILURE",
-                    "recordless artifact RDF graph missing",
-                ))
+                self.budget
+                    .fail(Error::new("STORAGE_FAILURE", "artifact RDF graph missing"))
             })?;
             drop(manifest);
             self.include_owner(&artifact.id)?;
@@ -272,8 +326,8 @@ impl Store {
         let selection = writer
             .query_selection_membership(&scope.selection, now, &protected, Some(&mut admission))
             .map_err(|e| budget.fail(e))?;
-        let (members, recordless) = match selection {
-            Some(members) => (Some(members.records), Some(members.recordless)),
+        let (members, artifacts) = match selection {
+            Some(members) => (Some(members.records), Some(members.artifact_times)),
             None => (None, None),
         };
         let mut candidates = writer
@@ -284,6 +338,7 @@ impl Store {
             })
             .map_err(|e| budget.fail(e))?;
         let mut coverage = RdfScopeCoverage::default();
+        let mut matched_artifacts = BTreeSet::new();
         loop {
             budget.request(row_bound("time:"), true)?;
             let Some(record) = candidates.next() else {
@@ -308,18 +363,20 @@ impl Store {
                 .validate_event_record(&record)
                 .map_err(|e| budget.fail(e))?;
             coverage.selected_records += 1;
+            if !scope.diagnostics.is_empty() {
+                matched_artifacts.insert(record.artifact_id.clone());
+            }
             view.include_record(&record, layers, scope.require_complete_index, &mut coverage)?;
         }
         drop(candidates);
-        // Only empty artifacts have independent graph owners. Populated artifact
-        // membership still expands through its original record occurrences.
-        if let Some(members) = recordless {
+        // Whole-artifact membership is independent of its record expansion.
+        if let Some(members) = artifacts {
             for (id, time) in members {
                 if time < scope.received_from || time >= scope.received_before {
                     continue;
                 }
-                let key = crate::storage::recordless::key_parts(time, &id);
-                budget.request(row_bound("empty-time:"), true)?;
+                let key = crate::storage::artifact_rdf::time_key(time, &id);
+                budget.request(row_bound(crate::storage::artifact_rdf::TIME), true)?;
                 let value = writer
                     .db
                     .get_pinned(&key)
@@ -327,7 +384,7 @@ impl Store {
                     .ok_or_else(|| {
                         budget.fail(Error::new(
                             "STORAGE_FAILURE",
-                            "selected empty artifact temporal index missing",
+                            "selected artifact temporal index missing",
                         ))
                     })?;
                 let artifact =
@@ -336,6 +393,7 @@ impl Store {
                 view.include_artifact(
                     &writer,
                     &artifact,
+                    &matched_artifacts,
                     scope,
                     layers,
                     now,
@@ -345,13 +403,13 @@ impl Store {
             }
         } else {
             let mut rows = TemporalRows::new(
-                "empty-time:",
+                crate::storage::artifact_rdf::TIME,
                 scope.received_from,
                 scope.received_before,
                 |options| writer.db.raw_iterator_opt(options),
             );
             loop {
-                budget.request(row_bound("empty-time:"), true)?;
+                budget.request(row_bound(crate::storage::artifact_rdf::TIME), true)?;
                 let Some(artifact) = rows.read_next(|key, value| {
                     artifact_catalog(&writer, &budget, &mut admission, key, value)
                 }) else {
@@ -361,6 +419,7 @@ impl Store {
                 view.include_artifact(
                     &writer,
                     &artifact,
+                    &matched_artifacts,
                     scope,
                     layers,
                     now,
@@ -370,6 +429,7 @@ impl Store {
             }
         }
         coverage.catalog_entries = scanned;
+        drop(matched_artifacts);
         drop(protected);
         drop(_catalog);
         drop(writer);

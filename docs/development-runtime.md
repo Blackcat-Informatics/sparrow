@@ -11,6 +11,34 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Populated-artifact RDF source qualification
+
+Source schema 54 adds independent populated-artifact metadata, source profile v3
+and store writer fences 55 through 65. It remains under qualification; the
+installed schema-53 pair below has not changed. Direct publication shares the
+record RDF writer; staged publication adds the parent only after complete-byte
+validation. The native streaming manifest header supplies scalar metadata and
+effective eviction state without materializing its arrays. Artifact timeline and
+graph retirement share the existing native reference owner.
+
+The first release sweep passed 175 storage tests and exposed five failures in
+`all-artifact-tests.log`. Record-only query fixtures and explicit-parent scope
+expectations were adjusted for independent artifact membership. The pressure
+failures exposed an earlier, smaller preliminary admission estimate: direct
+ingestion now admits at the final native write boundary after source-context and
+authority metadata join the batch, retaining the greater conservative estimate.
+The release sweep `all-artifact-full-check.log` passed 24 core unit tests,
+182 storage tests, 64 RPC tests, the other workspace suites and the seeded census
+self-tests. The new staged/private-publication, record-pin lifetime,
+upgrade-resume and missing-checkpoint regressions passed. The pinned census held
+279 ownership jobs with zero exceptions. Final-source verification, including the
+last write-boundary adjustment, is the normal hook in `all-artifact-commit.log`.
+
+Historical fixture cleanup uses a dev-only feature entry into the same native
+RDF retirement implementation. Ordinary runtime builds must omit that feature.
+Private-copy migration acceptance and explicit runtime packaging/adoption remain
+required before replacing the installed image.
+
 ## Source catalog admission qualification
 
 Schema 53 source identifies `sparrow-rdf-source-v2`: pinned catalog bodies are

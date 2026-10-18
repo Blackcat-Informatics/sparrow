@@ -35,9 +35,8 @@ pub(super) fn is_live_owner(artifact: &Artifact) -> Result<bool, Error> {
     Ok(false)
 }
 
-pub(super) fn publish(db: &DB, batch: &mut WriteBatch, artifact: &Artifact) -> Result<(), Error> {
+pub(super) fn publish(batch: &mut WriteBatch, artifact: &Artifact) -> Result<(), Error> {
     if is_live_owner(artifact)? {
-        super::artifact_rdf::publish(db, batch, artifact)?;
         batch.put(key(artifact), artifact.id.as_bytes());
     }
     Ok(())
@@ -451,6 +450,90 @@ mod tests {
                 .unwrap_err()
                 .code,
             "STORAGE_FAILURE"
+        );
+    }
+
+    #[test]
+    fn populated_rdf_upgrade_keeps_one_owner_atomic_and_resumes_after_refusal() {
+        use super::super::{artifact_rdf, catalog_upgrade, rdf_index, writer_format};
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        for key in ["rdf:next", "rdf:term-count", "rdf:max-encoded"] {
+            db.put(key, 0_u64.to_be_bytes()).unwrap();
+        }
+        db.put(
+            "store_format",
+            writer_format::enable_all(super::super::FORMAT).unwrap(),
+        )
+        .unwrap();
+        let mut b = artifact("artifact:b");
+        b.record_ids = vec!["record:b".into()];
+        let digest = super::super::hex::encode(super::super::blake3::hash(b"x").as_bytes());
+        b.chunks = vec![digest.clone()];
+        b.payload_id = format!("blake3:{digest}");
+        b.byte_length = 1;
+        let mut a = b.clone();
+        a.id = "artifact:a".into();
+        let mut batch = WriteBatch::default();
+        super::super::put(&mut batch, &a.id, &a);
+        super::super::put(&mut batch, &b.id, &b);
+        catalog_upgrade::seed(&db, &artifact_rdf::ALL_JOB, &mut batch).unwrap();
+        commit(&db, batch).unwrap();
+        let saved = db.get(artifact_rdf::ALL_JOB.checkpoint).unwrap().unwrap();
+        let deny = |_: &WriteBatch| Err(Error::new("STORAGE_PRESSURE", "admission denied"));
+        assert_eq!(
+            catalog_upgrade::step(
+                &db,
+                &artifact_rdf::ALL_JOB,
+                Progress::default(),
+                1,
+                Some(&deny)
+            )
+            .unwrap_err()
+            .code,
+            "STORAGE_PRESSURE"
+        );
+        assert_eq!(
+            db.get(artifact_rdf::ALL_JOB.checkpoint).unwrap().unwrap(),
+            saved
+        );
+        assert!(db.get("rdf:graph:artifact:a").unwrap().is_none());
+        catalog_upgrade::step(&db, &artifact_rdf::ALL_JOB, Progress::default(), 1, None).unwrap();
+        let saved = db.get(artifact_rdf::ALL_JOB.checkpoint).unwrap().unwrap();
+        let terms = rdf_index::required_counter(&db, "rdf:term-count").unwrap();
+        let mut corrupt = b.clone();
+        corrupt.id = "artifact:foreign".into();
+        db.put(&b.id, json::write_compact(&corrupt.encode()))
+            .unwrap();
+        drop(db);
+        let db = DB::open_default(dir.path()).unwrap();
+        assert_eq!(
+            catalog_upgrade::run(&db, &artifact_rdf::ALL_JOB, None)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        assert_eq!(
+            db.get(artifact_rdf::ALL_JOB.checkpoint).unwrap().unwrap(),
+            saved
+        );
+        assert_eq!(
+            rdf_index::required_counter(&db, "rdf:term-count").unwrap(),
+            terms
+        );
+        assert!(db.get("rdf:graph:artifact:b").unwrap().is_none());
+        db.put(&b.id, json::write_compact(&b.encode())).unwrap();
+        catalog_upgrade::run(&db, &artifact_rdf::ALL_JOB, None).unwrap();
+        let terms = rdf_index::required_counter(&db, "rdf:term-count").unwrap();
+        catalog_upgrade::run(&db, &artifact_rdf::ALL_JOB, None).unwrap();
+        assert_eq!(
+            rdf_index::required_counter(&db, "rdf:term-count").unwrap(),
+            terms
+        );
+        assert!(
+            db.get(artifact_rdf::time_key(b.received_at, &b.id))
+                .unwrap()
+                .is_some()
         );
     }
 

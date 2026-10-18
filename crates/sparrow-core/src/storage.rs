@@ -16,6 +16,8 @@ use rocksdb::{
 };
 
 mod artifact_rdf;
+#[cfg(feature = "test-support")]
+pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
 pub(crate) mod artifact_read;
 pub(crate) mod catalog_lease;
 mod catalog_upgrade;
@@ -759,7 +761,7 @@ impl Writer {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), Error> {
-        self.apply(batch, None)
+        self.apply(batch, None, None)
     }
 
     fn get<T: Catalog>(&self, key: &str) -> Result<T, Error> {
@@ -1486,7 +1488,6 @@ impl Store {
             records.push(record.id);
             start = end;
         }
-        let ingest::PreparedRecords { mut batch, chunks } = prepared.finish()?;
         let artifact = Artifact {
             buffered: None,
             id,
@@ -1497,11 +1498,12 @@ impl Store {
             byte_length: bytes.len() as u64,
             payload_id,
             record_ids: records,
-            chunks,
+            chunks: Vec::new(),
             evicted: false,
         };
+        let (mut batch, artifact, estimate) = prepared.finish_artifact(artifact)?;
         put(&mut batch, &artifact.id, &artifact);
-        recordless::publish(&writer.db, &mut batch, &artifact)?;
+        recordless::publish(&mut batch, &artifact)?;
         writer.ingest_receipt(&mut batch, request_id, &artifact, origin, now)?;
         if let Some(checkpoint) = tail_checkpoint {
             batch.put(tail::KEY, checkpoint.encoded);
@@ -1518,12 +1520,10 @@ impl Store {
                 "atomic ingestion batch exceeds 128 MiB; split the import into smaller complete artifacts",
             ));
         }
-        if origin.receiver().is_some() {
-            writer.admit_import_batch(&batch)?;
-        }
         writer.apply(
             batch,
             (mode == durability::Durability::Buffered).then_some(artifact.id.as_str()),
+            Some(estimate),
         )?;
         writer.receipt(artifact, mode)
     }

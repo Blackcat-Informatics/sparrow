@@ -67,6 +67,8 @@ pub use storage::record_read::{
 };
 pub use storage::result_read::ResultPage;
 pub use storage::retention_metrics::{RetentionMetrics, RetentionReadLimits};
+#[cfg(feature = "test-support")]
+pub use storage::retire_artifact_rdf_for_legacy_fixture;
 pub use storage::source_read::{
     SourcePageBody, SourceRead, SourceReadPage, SourceSelector, SourceSummary, SourceSyslogBinding,
     SourceWatchBinding, SourceWatchInfo,

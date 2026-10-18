@@ -346,6 +346,7 @@ impl Writer {
                 if let Some(parent) = parents.get_mut(&record.artifact_id)
                     && !parent.evicted()
                 {
+                    retirement.artifact_graph(&parent.id)?;
                     parent.evict();
                     report.artifacts.push(parent.id.clone());
                 }

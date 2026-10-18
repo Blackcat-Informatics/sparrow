@@ -408,7 +408,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(12).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/52")
+        Some("sparrow.store/63")
     );
     assert_eq!(
         store.watch_registry().unwrap().as_deref(),
@@ -589,7 +589,7 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     let intact = db.get("syslog-receiver-registry").unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/51".as_slice())
+        Some(b"sparrow.store/62".as_slice())
     );
     db.delete("syslog-receiver-registry").unwrap();
     drop(db);
@@ -599,14 +599,14 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     );
     let db = catalog_db(dir.path()).unwrap();
     db.put("syslog-receiver-registry", &intact).unwrap();
-    db.put("store_format", b"sparrow.store/47").unwrap();
+    db.put("store_format", b"sparrow.store/58").unwrap();
     drop(db);
     assert_eq!(
         Store::open(dir.path(), config()).err().unwrap().code,
         "STORAGE_FAILURE"
     );
     let db = catalog_db(dir.path()).unwrap();
-    db.put("store_format", b"sparrow.store/51").unwrap();
+    db.put("store_format", b"sparrow.store/62").unwrap();
     let value = purrdf_lex::json::read_slice(&intact, purrdf_lex::json::Limits::DEFAULT).unwrap();
     let mut rows = value.as_array().unwrap().clone();
     rows[1] = rows[0].clone();
@@ -875,7 +875,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
                     };
                     object.remove("tail_published").unwrap();
                 }
-                _ => db.put("store_format", b"sparrow.store/47").unwrap(),
+                _ => db.put("store_format", b"sparrow.store/58").unwrap(),
             }
             db.put(&key, json::write_compact(&value)).unwrap();
         }
@@ -887,12 +887,12 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         drop(store);
         let db = catalog_db(dir.path()).unwrap();
         db.put(&key, &saved).unwrap();
-        db.put("store_format", b"sparrow.store/48").unwrap();
+        db.put("store_format", b"sparrow.store/59").unwrap();
     }
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/48")
+        Some("sparrow.store/59")
     );
     assert_eq!(
         store
@@ -1019,7 +1019,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/48")
+        Some("sparrow.store/59")
     );
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -1558,7 +1558,7 @@ fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfe
         let store = Store::open(dir.path(), config()).unwrap();
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", legacy + 19).as_str())
+            Some(format!("sparrow.store/{}", legacy + 30).as_str())
         );
         assert_eq!(store.tail_generation(&generation.id).unwrap(), original);
         assert_eq!(store.bytes(&first.record_ids[0], 0, 2, 3).unwrap(), b"n\n");
@@ -2050,7 +2050,7 @@ fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() 
         }
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 11).as_str())
+            Some(format!("sparrow.store/{}", current + 22).as_str())
         );
         let state = store.producer_stream(&id, 2).unwrap();
         assert_eq!(state.accepted_events, 2);
@@ -2393,7 +2393,7 @@ fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_anno
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 11).as_str())
+            Some(format!("sparrow.store/{}", current + 22).as_str())
         );
         let record = store.record(&a.record_ids[0]).unwrap();
         assert!(record.producer.is_none());
@@ -3034,7 +3034,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 35).as_str())
+            Some(format!("sparrow.store/{}", version + 46).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -3553,7 +3553,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(3).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 11).as_str())
+            Some(format!("sparrow.store/{}", current + 22).as_str())
         );
         assert_eq!(
             store.bytes(&populated.id, 0, 10, 3).unwrap(),
@@ -3838,7 +3838,7 @@ fn manifest_retirement_survives_reopen_without_rewriting_original_catalog_or_rec
     let root = db.get(&original.id).unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/53".as_slice())
+        Some(b"sparrow.store/64".as_slice())
     );
     let position = db
         .get(format!("artifact-retirement:{}", original.id))
@@ -3916,7 +3916,7 @@ fn manifest_retirement_fences_later_writers_and_rejects_corrupt_state() {
         .unwrap();
     assert_eq!(
         store.status(3).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/54")
+        Some("sparrow.store/65")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -4379,7 +4379,7 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     // Force a strictly larger linked footprint: this is no native recovery observation.
     assert_eq!(
         store.status(4).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/53")
+        Some("sparrow.store/64")
     );
     file.set_len(15 * 1024 * 1024).unwrap();
     drop(file);
@@ -4417,21 +4417,21 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/53".as_slice())
+        Some(b"sparrow.store/64".as_slice())
     );
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/54")
+        Some("sparrow.store/65")
     );
     store
         .watch_registry_replace(Some(b"registered"), b"updated")
         .unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/54")
+        Some("sparrow.store/65")
     );
 }
 
@@ -4446,7 +4446,7 @@ fn invalid_pressure_recovery_markers_refuse_open() {
         drop(Store::open(dir.path(), config()).unwrap());
         let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
         db.put("pressure-reclamation-wait", bytes).unwrap();
-        db.put("store_format", b"sparrow.store/49").unwrap();
+        db.put("store_format", b"sparrow.store/60").unwrap();
         drop(db);
         match Store::open(dir.path(), config()) {
             Ok(_) => panic!("invalid pressure marker admitted"),
@@ -4982,7 +4982,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/46")
+        Some("sparrow.store/57")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -4997,7 +4997,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/46")
+        Some("sparrow.store/57")
     );
 }
 
@@ -5054,7 +5054,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/44")
+        Some("sparrow.store/55")
     );
     let digest = format!(
         "blake3:{}",
@@ -5079,7 +5079,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/45")
+        Some("sparrow.store/56")
     );
     assert_eq!(
         store
@@ -5114,7 +5114,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/47")
+        Some("sparrow.store/58")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     let selector = IngestSelector::Handoff(handoff.request_id.clone());
@@ -5131,7 +5131,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/47")
+        Some("sparrow.store/58")
     );
     assert_eq!(
         store
@@ -5409,7 +5409,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/46")
+        Some("sparrow.store/57")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -10224,7 +10224,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/44")
+        Some("sparrow.store/55")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]
@@ -12418,7 +12418,7 @@ fn native_sparql_pages_freeze_byte_boundaries_and_release_original_leases() {
         scope: &scope,
         layers: RdfGraphLayers::ALL,
         request: SparqlRequest {
-            query: "SELECT ?record ?value WHERE { ?record <urn:sparrow:vocab:payload> ?payload } ORDER BY ?record",
+            query: "SELECT ?record ?value WHERE { ?record a <urn:sparrow:vocab:Record> ; <urn:sparrow:vocab:payload> ?payload } ORDER BY ?record",
             base_iri: None,
             substitutions: &bindings,
         },
@@ -12577,7 +12577,7 @@ fn scoped_sparql_uses_native_read_forms_bindings_and_governor_outcomes() {
         scope: &scope,
         layers: RdfGraphLayers::ALL,
         request: SparqlRequest {
-            query: "SELECT ?record WHERE { ?record ?predicate ?payload }",
+            query: "SELECT ?record WHERE { ?record a <urn:sparrow:vocab:Record> ; ?predicate ?payload }",
             base_iri: None,
             substitutions: &bindings,
         },
@@ -12691,7 +12691,12 @@ fn rdf_scope_captures_shared_selection_and_freezes_after_pin_release() {
             },
         )
         .unwrap();
-    assert_eq!(live, explicit);
+    assert_eq!(
+        live.len(),
+        explicit.len() + 1,
+        "only live scope independently includes b's complete parent"
+    );
+    assert!(explicit.iter().all(|graph| live.contains(graph)));
     scope.selection = QuerySelection::Pin {
         id: pin.id.clone(),
         expected_revision: Some(pin.revision),
@@ -14649,8 +14654,8 @@ fn recordless_rdf_scope_preserves_occurrences_filters_and_unknown_diagnostics() 
     let mut scope = record_page_scope("empty", 1);
     let (coverage, rows) = run(&scope, RdfGraphLayers::ALL, 30);
     assert_eq!(coverage.selected_records, 1);
-    assert_eq!(coverage.selected_artifacts, 2);
-    assert_eq!(coverage.artifacts_visited, 3);
+    assert_eq!(coverage.selected_artifacts, 3);
+    assert_eq!(coverage.artifacts_visited, 4);
     assert!(coverage.complete());
     let actual = rows
         .into_iter()
@@ -14660,7 +14665,8 @@ fn recordless_rdf_scope_preserves_occurrences_filters_and_unknown_diagnostics() 
         actual,
         [
             TermValue::iri(format!("urn:sparrow:{}", a.id)),
-            TermValue::iri(format!("urn:sparrow:{}", b.id))
+            TermValue::iri(format!("urn:sparrow:{}", b.id)),
+            TermValue::iri(format!("urn:sparrow:{}", ordinary.id))
         ]
         .into_iter()
         .collect()
@@ -14975,7 +14981,7 @@ fn rdf_scope_charges_admitted_catalog_bodies_and_keeps_large_occurrence_counts()
         );
         assert_eq!(
             result.coverage.selected_artifacts,
-            if records { 0 } else { 300 }
+            if records { 1 } else { 300 }
         );
         let run = result.outcome.unwrap();
         let rows = run.result.solutions().unwrap().1;
@@ -14988,4 +14994,204 @@ fn rdf_scope_charges_admitted_catalog_bodies_and_keeps_large_occurrence_counts()
         );
         eprintln!("records={records} source={:?}", run.evidence.view);
     }
+}
+
+#[test]
+fn populated_artifact_rdf_follows_atomic_publication_and_independent_pin_lifetimes() {
+    use purrdf::{SparqlRequest, TermValue, sparql::QueryGovernors};
+    use sparrow_core::{QueryCancellation, QueryScope, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"one\ntwo\n";
+    let a = store
+        .ingest("artifact-direct", "oversized", "log", input, 10)
+        .unwrap();
+    let manifest = stage_fixture(&store, "artifact-staged", "log", input);
+    let run = |store: &Store, scope: &QueryScope, now| {
+        let governors = QueryGovernors::METERED.with_fuel(1_000_000);
+        let result = store.sparql_query(&SparqlRead {
+            scope, layers: RdfGraphLayers { metadata: true, diagnostic: false, content: false },
+            request: SparqlRequest { query: "SELECT ?artifact ?bytes WHERE { ?artifact a <urn:sparrow:vocab:Artifact> ; <urn:sparrow:vocab:byteLength> ?bytes } ORDER BY ?artifact", base_iri: None, substitutions: &[] },
+            governors: &governors, limits: RdfReadLimits::default(),
+        }, now, &QueryCancellation::default()).unwrap();
+        (
+            result.coverage,
+            result
+                .outcome
+                .unwrap()
+                .result
+                .solutions()
+                .unwrap()
+                .1
+                .to_vec(),
+        )
+    };
+    let scope = record_page_scope("oversized", 1);
+    assert_eq!(run(&store, &scope, 20).1.len(), 1);
+    for ordinal in 0..2 {
+        store
+            .import_prepare_record(&manifest.id, ordinal, 1)
+            .unwrap();
+    }
+    assert_eq!(
+        run(&store, &scope, 20).1.len(),
+        1,
+        "private preparation must not publish a parent"
+    );
+    let b = store.import_publish(&manifest.id, 1).unwrap();
+    assert_eq!(a.payload_id, b.payload_id);
+    let (coverage, rows) = run(&store, &scope, 20);
+    assert_eq!(
+        (coverage.selected_records, coverage.selected_artifacts),
+        (4, 2)
+    );
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert!(
+            matches!(&row[1], Some(TermValue::Literal { lexical_form, .. }) if lexical_form == "8")
+        );
+    }
+    let mut records_only = scope.clone();
+    records_only.selection = sparrow_core::QuerySelection::Evidence(vec![a.record_ids[0].clone()]);
+    assert!(run(&store, &records_only, 20).1.is_empty());
+    let whole = store
+        .pin(
+            "artifact-whole-pin",
+            "whole",
+            std::slice::from_ref(&a.id),
+            40,
+            20,
+        )
+        .unwrap();
+    store
+        .pin(
+            "artifact-record-pin",
+            "record",
+            std::slice::from_ref(&b.record_ids[0]),
+            40,
+            20,
+        )
+        .unwrap();
+    let original = store.record(&b.record_ids[0]).unwrap();
+    store.expire(31 * DAY).unwrap();
+    let (coverage, rows) = run(&store, &scope, 31 * DAY);
+    assert_eq!(
+        (coverage.selected_records, coverage.selected_artifacts),
+        (3, 1)
+    );
+    assert_eq!(
+        rows[0][0],
+        Some(TermValue::iri(format!("urn:sparrow:{}", a.id)))
+    );
+    store
+        .release_retry("artifact-whole-release", &whole.id, 31 * DAY)
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    assert!(run(&store, &scope, 31 * DAY).1.is_empty());
+    assert_eq!(
+        store.bytes(&b.record_ids[0], 0, 4, 31 * DAY).unwrap(),
+        b"one\n"
+    );
+    let retained = store.record(&b.record_ids[0]).unwrap();
+    assert_eq!(
+        (retained.received_at, retained.expires_at),
+        (original.received_at, original.expires_at)
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    for artifact in [&a, &b] {
+        assert!(
+            db.get(format!("artifact-rdf:{}", artifact.id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get(format!(
+                "artifact-time:{:020}:{}",
+                artifact.received_at, artifact.id
+            ))
+            .unwrap()
+            .is_none()
+        );
+    }
+    assert!(
+        db.get(format!("rdf:graph:{}", b.record_ids[0]))
+            .unwrap()
+            .is_some()
+    );
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(run(&store, &scope, 31 * DAY).1.is_empty());
+    assert_eq!(
+        store.bytes(&b.record_ids[0], 0, 4, 31 * DAY).unwrap(),
+        b"one\n"
+    );
+}
+
+#[test]
+fn populated_artifact_upgrade_preserves_original_records_and_requires_its_checkpoint() {
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("artifact-upgrade", "upgrade", "log", b"original\n", 10)
+        .unwrap();
+    let original = store.record(&artifact.record_ids[0]).unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    remove_artifact_rdf_upgrade(&db).unwrap();
+    db.put("store_format", b"sparrow.store/44").unwrap();
+    db.put(
+        "artifact-rdf-index-upgrade",
+        br#"{"after":null,"complete":true}"#,
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let after = store.record(&original.id).unwrap();
+    assert_eq!(
+        (
+            after.received_at,
+            after.expires_at,
+            after.byte_start,
+            after.byte_end
+        ),
+        (
+            original.received_at,
+            original.expires_at,
+            original.byte_start,
+            original.byte_end
+        )
+    );
+    assert_eq!(store.bytes(&artifact.id, 0, 9, 20).unwrap(), b"original\n");
+    store
+        .with_rdf_scope(
+            &record_page_scope("upgrade", 1),
+            RdfGraphLayers::ALL,
+            20,
+            RdfReadLimits::default(),
+            &QueryCancellation::default(),
+            |_, coverage| {
+                assert_eq!(
+                    (coverage.selected_records, coverage.selected_artifacts),
+                    (1, 1)
+                );
+            },
+        )
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    assert_eq!(
+        db.get(format!("artifact-rdf:{}", artifact.id))
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        10_u64.to_be_bytes()
+    );
+    db.delete("all-artifact-rdf-index-upgrade").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
 }

@@ -197,7 +197,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/48"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/59"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -3041,7 +3041,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/47");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/58");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -3258,7 +3258,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/46")
+                Some("sparrow.store/57")
             );
         })
         .await;
@@ -3622,7 +3622,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/46"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/57"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -8703,7 +8703,7 @@ async fn graph_catalog_io_profile_preserves_three_hundred_occurrences_through_cl
             let expected = cli(&socket, &["sparql", path.to_str().unwrap()]);
             let mut mcp = Mcp::start(&socket);
             mcp.initialize(1).await;
-            let response = mcp.tool(2, "sparql_query", args.into()).await;
+            let response = mcp.tool(2, "sparql_query", args.clone().into()).await;
             assert_eq!(response["isError"].as_bool(), Some(false), "{response:?}");
             let result = &response["structuredContent"];
             assert_eq!(result["rows"], expected["rows"]);
@@ -8715,6 +8715,10 @@ async fn graph_catalog_io_profile_preserves_three_hundred_occurrences_through_cl
             assert_eq!(
                 result["coverage"]["known_selected_records"].as_str(),
                 Some("300")
+            );
+            assert_eq!(
+                result["coverage"]["known_selected_artifacts"].as_str(),
+                Some("1")
             );
             assert_eq!(
                 result["limits"]["source_profile"].as_str(),
@@ -8735,6 +8739,23 @@ async fn graph_catalog_io_profile_preserves_three_hundred_occurrences_through_cl
                     .parse::<u64>()
                     .unwrap()
                     < 32 * 1024 * 1024
+            );
+            let artifact_args = args.with(
+                "query",
+                "SELECT (COUNT(*) AS ?count) WHERE { ?entity a <urn:sparrow:vocab:Artifact> }",
+            );
+            std::fs::write(&path, json::write_compact(&artifact_args.clone().into())).unwrap();
+            let artifact_cli = cli(&socket, &["sparql", path.to_str().unwrap()]);
+            let artifact_reply = mcp.tool(3, "sparql_query", artifact_args.into()).await;
+            assert_eq!(artifact_reply["isError"].as_bool(), Some(false));
+            assert_eq!(
+                artifact_reply["structuredContent"]["rows"],
+                artifact_cli["rows"]
+            );
+            assert_eq!(
+                artifact_cli["rows"]["native_result"]["results"]["bindings"][0]["count"]["value"]
+                    .as_str(),
+                Some("1")
             );
         })
         .await;
