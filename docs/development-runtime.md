@@ -67,6 +67,17 @@ The earlier all-content export refusal remains unresolved. Production resource
 bounds, physical reclamation, turnover and host-reboot acceptance remain open,
 alongside the upstream integration requirements.
 
+The subsequent private-copy investigation traced the full content-export refusal
+to native solution materialization: complete results settled near 1.46 MB of
+retained admission after peaking near 1.15 GB. The deployed workspace limit
+remains 128 MiB. [The diagnosis and controlled comparisons](purrdf-integration-gaps.md#governed-solution-materialization)
+are tracked in [PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605).
+They do not replace the missing public export/resource acceptance. The
+diagnostic probe opens only a verified private copy, with no intake/listener;
+its dev-only build and higher private admission are separate from default-image
+and live qualification. The temporary example is archived outside the build
+tree before the required workspace gate.
+
 ## Schema-60 plain-log time source qualification
 
 Source schema 60 adds explicit whole-record log capture profiles through the

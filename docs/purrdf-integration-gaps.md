@@ -11,7 +11,9 @@ certificates and source/coverage receipts. Metadata includes populated/recordles
 artifacts and retained Source/Stream declarations; the live qualification is in
 [Development runtime](development-runtime.md#schema-60-live-adoption).
 Native text relations, public measured explanation, bounded physical
-reclamation and production resource/turnover acceptance remain required. The
+reclamation and production resource/turnover acceptance remain required. Native
+solution materialization also has a confirmed admission limitation tracked in
+[PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605). The
 earlier qualification evidence below records how the deployed graph surface grew.
 
 Source schema 57 shares frozen logical scope receipts across native graph,
@@ -104,6 +106,50 @@ Compile-probe source/results, issue readback and local gate evidence are under
 `purrdf-scoped-relations-issue-readback.json` and
 `text-snapshot-full-check.log`. Temporary probe examples are removed before the
 normal workspace gate. Runtime adoption remains separate from source validation.
+
+## Governed solution materialization
+
+[PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605) records
+the concrete cause of the supplementary content-export admission limitation.
+The same nine synthetic producer records expose 2,990 content triples. Counting
+them and returning 100 rows succeed on the installed default image; complete
+SELECT refuses even without ORDER BY. The installed 128 MiB workspace ceiling
+was preserved.
+
+A separately verified 113-file closed backup supplied a private copy, opened
+without intake or listeners. Its view reports a 128,256-byte maximum owned-term
+certificate. Through the pinned native governed path, complete unsorted SELECT
+refuses at private live allowances of 128 MiB, 512 MiB and 1 GiB. The sorted form
+also refuses at 128/512 MiB; at 1 GiB it separately reaches the original 100,000
+source-request ceiling. These trials are diagnostic admission measurements,
+not process RSS or production qualification.
+
+A controlled direct-native comparison with a private 1,536 MiB live allowance
+and one million source requests completes both full queries, with 2,990 rows
+and no governor trip. Unsorted materialization peaks at 1,152,851,360 admitted
+bytes but settles to 1,464,897 retained bytes. Sorted execution peaks at
+1,152,852,711 and settles to 1,466,248. Its 111,769 source requests independently
+exceed the deployed 100,000 ceiling; this experiment does not certify public
+sorted export or authorize silently increasing limits. The same direct calls
+at 128 MiB return native Operational refusals without governor trips. Other
+finite governors, cumulative I/O and row/lease ceilings are preserved.
+
+The native `materialize_solutions` calls `try_value_of_admitted` for each cell.
+For Existing terms, that function retains the whole-view maximum before copying
+the term, then final publication settles the actual retained layout. The 8,970
+output cells therefore stage 1,150,456,320 bytes of term allowance alone. The
+existing native `try_owned_value_of`/`term_value_with_memory` path already admits
+actual copied payloads under the original allocation owner. The upstream task
+requests reuse of that owner in governed materialization, with unchanged source
+failure precedence, cancellation, governors and retained-result ownership.
+Sparrow must not write a second materializer or weaken its storage certificate.
+
+The relevant native materialization bodies are unchanged between pinned
+`7734b013` and inspected main `9a6055e8`. Main was not executed. Evidence and
+probe sources are retained under `.stage/native-graph-integration/graph-workspace-*`
+and `purrdf-materialization-issue*`. Failed live reads leave no query handles or
+retained byte charge; the live record count and original backup hashes remain
+unchanged. Complete content-export acceptance remains NOT MET.
 
 ## Retained operational SPARQL integration
 
