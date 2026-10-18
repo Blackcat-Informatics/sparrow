@@ -3,13 +3,69 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-59 adoption below. It uses
-schema 59 and store format 81. The stable installed
+after the approved checkpoint recovery and schema-60 adoption below. It uses
+schema 60 and store format 92. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`293b495`; see [schema-59 live adoption](#schema-59-live-adoption) for
+`f3c8a63`; see [schema-60 live adoption](#schema-60-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Schema-60 live adoption
+
+Signed source `f3c8a63af523e850da27c6466608912a80d686f4` passed the complete
+normal commit hook. Explicit default daemon/client builds report
+`core_features=[]`. Exclusive installed copies were hash-verified:
+
+- `~/.local/libexec/sparrow/sparrowd-schema60-f3c8a63`, SHA-256
+  `be841bf2682c27830a1e5a6fd869b55752cdc6017944ec433d535267d8da8051`.
+- `~/.local/libexec/sparrow/sparrow-schema60-f3c8a63`, SHA-256
+  `23f1d17d8f96703e79a85a7d9208a5eb44a77641a0c85a08b84f5ef9c7eaef12`.
+
+The private default-image fixture passed record/text/key/value/context/graph
+scope, pin renewal/release, native continuation and CLI/MCP checks. Three actual
+plain-log records produced two known clocks and one unknown, with exact timestamp
+byte spans, timezone conversion, chronological paging/replay and native RDF
+event-time results. An adversarial native pattern refused at its work limit
+without publishing records. The fixture ended with six records, format 90,
+zero pins or retained query handles and clean shutdown. The schema-59 daemon
+refused a private copy of the new format before intake.
+
+The first private fixture incorrectly selected an unknown clock by row position;
+receipt-time ties use occurrence identity. Selecting the actual record corrected
+the harness without changing the product. Live harness corrections likewise
+followed the existing nested profile reply and actual old-client error text.
+
+Configuration, unit and old-image identities matched their receipts. The new
+daemon received only `cap_net_bind_service=ep`. Following clean shutdown, the
+native store lock was held while creating and hashing the 113-file
+`schema60-pre-adoption-closed-backup-20261018`. Stable aliases were replaced
+atomically. The enabled persistent unit started at 2026-10-18 08:53:16 MDT
+(14:53:16 UTC), PID 4001300, on the unchanged TCP and Unix endpoints.
+No checkpoint recovery was repeated.
+
+The store initially retained format 81. Defining the synthetic control-only
+source `development-log-clock-f3c8a63` atomically installed the log interpretation
+fence and format 92. Its RFC3339 capture uses pattern `([^ ]+) .*`, group 1 and
+flag `s`. TCP, Unix and MCP definition/lookup return the same durable profile
+`time-profile:09cab41e72e8b1d9a2267695edb1f30d02101a1cd32d3b610f73bc2a03dc3950`.
+This source has no watch binding and added no records. The original JSON profile
+retains every prior field and its identity, adding only the extraction descriptor.
+
+Live correlation, continuation, adapter scope parity and both original recovered
+generation receipts passed. The original store retains 217 records, 36 complete
+artifacts and healthy watches. All 253 byte targets were fetched over typed TCP
+and matched the previous full hashes: 36,005,590 bytes. All five query-handle
+families return to zero. The schema-59 and schema-60 closed backups remain
+hash-identical and unopened; the old client refuses discovery before operations.
+
+Evidence is under `.stage/native-graph-integration/schema60-*`, including the
+separate runtime build, `schema60-v2-*` private fixture, old-writer refusal,
+closed backup manifest, live log profile/correlation/byte qualification and
+post-adoption integrity readback. Source gates remain under `log-time-*`.
+The earlier all-content export refusal remains unresolved. Production resource
+bounds, physical reclamation, turnover and host-reboot acceptance remain open,
+alongside the upstream integration requirements.
 
 ## Schema-60 plain-log time source qualification
 
@@ -46,9 +102,8 @@ retain their evidence upstream; the ledger declaration was corrected accordingly
 Logs remain under `.stage/native-graph-integration/log-time-*`, including the full
 release gate and final normal commit hook.
 
-The running service remains schema 59. Default-image build/qualification and live
-adoption are separate from this source milestone. Full architecture acceptance
-and the upstream-dependent requirements remain open.
+Default-image qualification and live adoption are recorded separately above.
+Full architecture acceptance and the upstream-dependent requirements remain open.
 
 ## Schema-59 live adoption
 

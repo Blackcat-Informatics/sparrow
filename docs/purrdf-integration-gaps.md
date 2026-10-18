@@ -5,11 +5,11 @@ scope. Sparrow must retain native semantics and bounded reads while resolving th
 
 ## Current integration state
 
-Schema 59 is deployed on format 81 with native SELECT, ASK, CONSTRUCT and
+Schema 60 is deployed on format 92 with native SELECT, ASK, CONSTRUCT and
 DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
-[Development runtime](development-runtime.md#schema-59-live-adoption).
+[Development runtime](development-runtime.md#schema-60-live-adoption).
 Native text relations, public measured explanation, bounded physical
 reclamation and production resource/turnover acceptance remain required. The
 earlier qualification evidence below records how the deployed graph surface grew.
@@ -44,12 +44,14 @@ export over the nine original producer records was refused by the existing
 schema-58 workspace ceiling; complete content-export/resource acceptance is not
 claimed from the successful byte or metadata migration checks.
 
-Source schema 60 adds explicit plain-log timestamp captures using the public
+Deployed schema 60 adds explicit plain-log timestamp captures using the public
 native XPath engine, sharing timestamp interpretation and byte evidence with
 JSON bindings. A direct reference to the already locked `purrdf-core` supplies
-that public API without a facade re-export or a second matcher. Source
-qualification is recorded in Development runtime; the installed version remains
-schema 59 until separate default-image and live qualification are recorded.
+that public API without a facade re-export or a second matcher. Source,
+default-image and live qualification are recorded separately in Development
+runtime. The synthetic control-only profile advances the live writer fence
+without new records; original JSON profile identities and recovered generation
+receipts remain unchanged. All 253 retained byte targets match their prior hashes.
 
 On 2026-10-18 upstream main advanced to `9a6055e8a60d34656d9d47c70ba5b85270142a54`
 with OWL causal-dependency work. Its change set does not alter the SPARQL evaluator
