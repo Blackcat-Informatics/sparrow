@@ -440,8 +440,8 @@ Record and empty-artifact timelines share one native borrowed iterator. It
 checks key/identity widths before copying or loading a catalog and preserves
 native status errors and half-open receipt bounds. This removes the previous
 512-KiB charge for every tiny catalog body without relaxing index integrity.
-This source change passed the full local gate; the installed image remains
-schema 52 until adoption evidence is recorded in Development runtime.
+This source change passed the full local gate and is installed as schema 53;
+live adoption evidence is recorded in Development runtime.
 
 Optional `limits` counters use unsigned decimal strings: `fuel`, `answer_rows`,
 `intermediate_cells`, `scratch_bytes`, `live_bytes`, `requests`, `io_bytes`,

@@ -3,10 +3,10 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-52 adoption below. It uses
-schema 52 and store format 48. The stable installed
+after the approved checkpoint recovery and schema-53 adoption below. It uses
+schema 53 and store format 48. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`7e1b208`; see [schema-52 live adoption](#schema-52-live-adoption) for
+`4d44a2e`; see [schema-53 live adoption](#schema-53-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
@@ -30,7 +30,55 @@ The final focused counter receipt `rdf-catalog-io-final-focused.log` reports
 2,108,461 admitted source bytes for 300 records and 21,480,711 for 300 empty
 artifacts; both report 34,639,872 peak accounted live bytes. These are logical
 admission counters, not physical I/O or RSS measurements.
-This source qualification has not changed the installed schema-52 image.
+The qualified source is now adopted below.
+
+## Schema-53 live adoption
+
+Signed source `4d44a2e2dbe4c8a15473eeae436e9afac447ecba` passed the normal full
+pre-commit gate, recorded as `rdf-catalog-io-commit.log` under
+`.stage/native-graph-integration/`. Both runtime bins were then explicitly built
+with `cargo build --locked --release -p sparrow-server --bins --message-format=json`.
+Cargo's machine artifact paths selected these exclusive installed files:
+
+- `~/.local/libexec/sparrow/sparrowd-schema53-4d44a2e`, SHA-256
+  `aebc1fefbcdd586f8a84ce62d6e4b1001d4c8767b39c81a1752cba257375e560`.
+- `~/.local/libexec/sparrow/sparrow-schema53-4d44a2e`, SHA-256
+  `3ab8f1819ab1dab3126f4987ee358e421577aaa011b22682f0a2c7b9eb285cf0`.
+
+The daemon's sole `cap_net_bind_service=ep` capability and both image hashes were
+verified before draining the predecessor through SIGINT. With the unit inactive,
+PID zero and the Unix socket absent, an exclusive native store lock protected
+the 108-file closed copy `schema53-pre-adoption-closed-backup-20261018` in that
+evidence directory. Every regular-file hash matched the closed source before
+and after copying. The backup and manifest were synchronized before switching
+both executable aliases. Configuration, unit and intake roots were preserved.
+
+The enabled persistent unit started at 2026-10-18 07:21:04 UTC, observed PID
+3543539. The first readiness probe succeeded. Installed aliases/hashes,
+capability, unit state, startup journal and typed behavior were checked; no
+running-process executable hash is claimed. TCP still binds `0.0.0.0:518`.
+TCP and Unix status agree on schema 53, format 48, original store identity,
+217 live records, 213 payload chunks and no watch failures.
+
+Read-only live acceptance passed SELECT, ASK, CONSTRUCT and six-page DESCRIBE,
+including continuation across TCP/Unix and release. CLI and MCP agree on the
+native count and source profile v2. Full class counts remain 217 Records and one
+Artifact. The same native count request returned identical rows while admitted
+source bytes fell from 119,681,897 to 5,127,039. Accounted peak live bytes remain
+115,740,672; these are neither physical I/O nor RSS measurements. No source or
+native governor ceilings were raised. Final graph handles/bytes are zero.
+
+Both original recovered generations still report `identity_changed`, offsets
+37/0, records 1/0 and unknown continuity over both endpoints. No recovery was
+repeated and no input was ingested by these acceptance calls. Evidence includes
+`schema53-runtime-build.{jsonl,log}`, `schema53-runtime-artifacts.json`,
+`schema53-adoption-prerequisites.json`, `schema53-pre-adoption-closed-backup.json`,
+`schema53-readiness-*`, `schema53-live-service.txt`,
+`schema53-live-acceptance.{py,log}`, `schema53-live-query-*`,
+`schema53-live-admission-comparison.json`, `schema53-live-mcp.json` and the
+`schema53-live-{tcp,unix}-generation-*` receipts. This finite development
+acceptance does not complete the remaining graph, reclamation, agent-contract
+or production qualification requirements below.
 
 ## Schema-52 live adoption
 
