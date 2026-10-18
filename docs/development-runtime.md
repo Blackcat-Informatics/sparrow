@@ -3,13 +3,82 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-54 adoption below. It uses
-schema 54 and store format 59. The stable installed
+after the approved checkpoint recovery and schema-55 adoption below. It uses
+schema 55 and store format 70. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`be0994e`; see [schema-54 live adoption](#schema-54-live-adoption) for
+`f715df8`; see [schema-55 live adoption](#schema-55-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Schema-55 live adoption
+
+Signed source `f715df8e1a520ebd897650e21bad80352948e1f8` contains the
+Source/Stream implementation from `01626f1` and its full-gate qualification below.
+Native query qualification on the migrated private store passed SELECT, ASK,
+CONSTRUCT and DESCRIBE plus independent Record/Artifact counts of 217/36.
+Two typed source-catalog pages agreed exactly with 22 retained RDF Sources,
+including their published IRIs and exact labels. Typed record positions agreed
+with 7 file-generation Streams, 4 producer Streams, and 22 positioned records
+across 5 source/kind groups. Native query reports were identical after reopening;
+all 112 original qualification-store file hashes remained unchanged.
+The first harness incorrectly required a single source page; the corrected
+probe consumes every page and releases its original snapshot. Its source is
+archived as `schema55_copy_probe.rs`; the temporary example was removed before
+ordinary runtime packaging.
+Evidence under `.stage/native-graph-integration/` includes
+`schema55-query-build-v2.{jsonl,log}`, `schema55-query-image-v2.json`,
+`schema55-query-v2-{first,reopen}.{json,log}` and `schema55-query-qualified.json`.
+
+Ordinary runtime packaging was explicitly selected with
+`cargo build --locked --release -p sparrow-server --bins --message-format=json`.
+Its emitted core feature list is empty. The selected installed images are:
+
+- `~/.local/libexec/sparrow/sparrowd-schema55-f715df8`, SHA-256
+  `4be1ae5eef417ffa85ca05c50d2e946b9e7dc54b95815799b1bebf46fec81530`.
+- `~/.local/libexec/sparrow/sparrow-schema55-f715df8`, SHA-256
+  `0c58775168ef445ce2d778545670b91a719c3751875c6c3b6cf1642c19966443`.
+
+A fresh private daemon using that exact pair passed the existing diagnostic,
+artifact-length, strict-refusal and permissive-coverage agent scenarios. Added
+checks verified Source IRI agreement with typed source discovery, default-union
+deduplication, named occurrence contexts, metadata-layer exclusion, record-only
+Source provenance without whole-parent membership, and no invented Stream for an
+ordinary import. CLI/MCP Source results agreed. The fixture shut down cleanly with
+zero graph handles/bytes and no watches. Its receipts use `schema55-agent-*`.
+
+Image hashes and the daemon's sole `cap_net_bind_service=ep` capability were
+verified before SIGINT drain. With the unit inactive, PID zero and Unix socket
+absent, an exclusive native lock protected a synchronized 109-file closed backup
+at `schema55-pre-adoption-closed-backup-20261018`. Every regular-file hash matched
+the closed source before and after copying. Both aliases were then switched and
+the enabled user unit started at 2026-10-18 09:42:47 UTC, observed PID 2584986.
+The first TCP readiness probe succeeded. Verification binds the installed image
+hashes and capability to the configured aliases, unit start and typed behavior.
+Configuration, unit and both watch declarations retained their
+recorded identities. No checkpoint recovery was repeated.
+
+Live TCP binds `0.0.0.0:518`; TCP and Unix agree on schema 55, format 70, the
+original store identity, 217 records, 213 payload chunks and no watch failures.
+All four native read forms, six-page DESCRIBE, cross-endpoint continuation/release
+and CLI/MCP agreement passed. Source discovery consumed both catalog pages and
+released its snapshot across endpoints. Native Source, Stream and position-join
+results agreed over TCP, Unix and MCP: 22 Sources, 11 Streams and 22 positioned
+records. Populated-artifact metadata and layer exclusion still match the original
+catalog. Every recovered generation receipt is exactly equal to its pre-adoption
+receipt over both endpoints, preserving declarations, clocks, gaps and offsets.
+Acceptance ingested no live input. All read handles/bytes are zero and the fresh
+closed backup's complete hash map remains unchanged.
+
+Source selection admits 12,194,428 bytes, the Stream-kind aggregate 5,572,146,
+and the record/Stream/Source join 19,430,348 at unchanged ceilings and source
+profile v3. Accounted peak live bytes remain 115,740,672. These finite logical
+accounts do not measure RSS or physical I/O. Adoption evidence includes
+`schema55-runtime-*`, `schema55-adoption-prerequisites.json`,
+`schema55-pre-adoption-closed-backup.json`, `schema55-live-acceptance.{py,log}`,
+`schema55-live-provenance-*`, `schema55-live-service.txt` and
+`schema55-final-readback.json`. Remaining graph/text, reclamation, agent-contract
+and production-volume acceptance work is still unfinished.
 
 ## Schema-55 Source and Stream implementation
 
@@ -54,9 +123,8 @@ has SHA-256 `56ec7d1a9c8df4fb2140a5b13db82db5f0773f55e90222860012ff7ed1af32b4`
 and the dev-only `test-support` feature; its fixture-retirement entrypoint was not
 invoked. These finite offline checks do not qualify an ordinary runtime image.
 
-The running development service remains schema 54. Schema-55 native query
-qualification on this restored copy, ordinary-runtime packaging and live adoption
-are not yet qualified.
+The later native query, ordinary-runtime and live-adoption qualification is
+recorded above. Those finite development checks leave broader acceptance open.
 This implementation does not complete text/SPARQL relations, governed public
 EXPLAIN, forced bounded physical reclamation or production-volume acceptance.
 
