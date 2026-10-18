@@ -11,7 +11,7 @@ SELECT, ASK, CONSTRUCT and DESCRIBE through the Rust core API, with native typed
 substitutions, retained outcomes and scoped membership/coverage. The CLI/MCP and
 typed RPC graph surface is implemented and deployed. Recordless
 artifact RDF and independent artifact coverage are deployed in schema 52;
-native correlation is implemented in source schema 58 through the same governed
+native correlation is deployed in schema 58 through the same governed
 query and retained-result owners. Text relations and public explanations remain
 required. The
 integration state is recorded in
@@ -50,8 +50,10 @@ typed RPC, CLI and MCP. Its schema-43 live and copied-corpus evidence is recorde
 in [Development runtime](development-runtime.md#frozen-artifact-match-groups).
 Existing paged query receipts now freeze
 capture identity, native profiles and effective host admission ceilings while
-preserving original coverage and certainty. Native certified governor receipts,
-full scope receipts and corpus-scale indexed selection remain required.
+preserving original coverage and certainty. Native graph captures retain the
+engine's certified governor outcomes. Frozen logical scope receipts are deployed
+for record/text/key/value queries in schema 56 and graph/context in schema 57.
+Production-scale indexed-selection and resource acceptance remain required.
 Key discovery now supports exact native RFC 6901 path restriction through the
 same occurrence matcher, typed client, CLI and MCP; paths and complete counts
 remain frozen across continuations.
@@ -74,6 +76,35 @@ This plan builds on [Architecture](architecture.md) and [Interfaces](interfaces.
 It records the initial query priorities and sample discovery supplied on
 2026-10-06. The existing milestone dependencies remain: qualify storage and
 lifetime first, then import, then query surfaces, then continuous producers.
+
+## Current acceptance boundary
+
+The following gaps preserve the original first-version scope. Installed image
+identities and source qualification are recorded separately in
+[Development runtime](development-runtime.md). Finite fixtures do not establish
+production capacity.
+
+| Required area | Evidence already present | Required work still NOT MET |
+| --- | --- | --- |
+| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. | Public measured EXPLAIN with request/governor parity ([PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600)); query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); complete synthetic content export within the existing admitted workspace ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
+| Reclamation | Logical retirement, pin protection, pressure backpressure, native automatic compaction and separately measured physical files. | Safe bounded metadata/file-compaction/output admission, an owned production reclamation worker, exact native failures, measured physical recovery and successful retry admission. [Binding requirements](native-reclamation.md). |
+| Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results and cancellation. | The missing graph operations above and complete resource/latency qualification over the deployment corpus. Existing tools must not advertise unsupported native relations or explanations. [Interfaces](interfaces.md). |
+| Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Production envelope and producer contracts, hard-quota/resource and sustained/burst acceptance, bounded physical reclamation, host-reboot/power-loss acceptance and remaining watcher scheduling/kernel-watch-exhaustion scenarios. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
+
+The qualified kernel-overflow fixture changes no host limits; configured
+directory-budget exhaustion is independent of exhausting the shared kernel
+watch quota. The SIGKILL matrix starts from durable reservation and does not
+prove power-loss persistence at arbitrary filesystem boundaries. The finite
+turnover corpus is 65,642,380 raw bytes per pin mode. None of these results closes
+the remaining production acceptance gates.
+
+Upstream readback on 2026-10-18 found #600, #601 and #605 open without comments.
+PurRDF main `1de2bbbccbffd2e0be571e8b6aa1dd047e7177b2` adds documentation/binding
+changes after `9a6055e8`; its changed-file list does not include the blocked
+SPARQL evaluator/property-function owners. This is a source comparison, not an
+execution qualification of main. The selected rust-rocksdb upstream remains
+`46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`; a missing safe integration seam
+cannot be replaced with a unit-returning compaction call or downstream unsafe FFI.
 
 ## First useful outcome
 
@@ -215,10 +246,12 @@ complete stream history. Multi-source temporal correlation uses the explicit
 ## PurRDF integration and ownership
 
 Inspect and compile against an exact selected native dependency revision before
-runtime implementation. The current census reference is
-`e58974e504b9681597faea1490002ce8ddaf7448`; Sparrow's runtime dependencies are now
-locked to that same revision and have compiled. These seams were inspected at
-that revision:
+runtime implementation. The current runtime dependencies and census reference
+both select `7734b013d19b68600ad24c4e8aa5a40955a8e89e`, as recorded separately in
+`Cargo.toml`, `Cargo.lock` and `registry/compatibility.toml`. The table below
+preserves the original seam audit at
+`e58974e504b9681597faea1490002ce8ddaf7448`; later native integration and its
+remaining gaps are recorded in [PurRDF integration gaps](purrdf-integration-gaps.md).
 
 | Concern | Native owner / inspected surface | Sparrow work |
 | --- | --- | --- |

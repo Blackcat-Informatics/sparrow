@@ -850,8 +850,11 @@ and null stop_reason; capacity/scan exhaustion refuses before a page is publishe
 
 These operations do not invoke a native query governor, and native_governor is
 explicitly absent. Existing incomplete index/scope certainty is preserved;
-it is not relabeled as a native certified partial answer. The wider receipt
-contract, native governor certification, remaining query surfaces remain first-version requirements.
+it is not relabeled as a native certified partial answer. Native graph queries
+separately preserve PurRDF governor certificates through the schema-51 graph
+surface. Frozen scope receipts extend these host captures in schema 56 and
+graph/context in schema 57. Public measured explanations and stored-text SPARQL
+relations remain unfinished, as recorded in [native integration gaps](purrdf-integration-gaps.md).
 
 
 ### Single context capture admission
