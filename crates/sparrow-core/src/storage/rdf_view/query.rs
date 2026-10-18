@@ -34,6 +34,10 @@ pub struct ScopedSparqlResult {
     pub sequence: u64,
     /// Captured eligibility clock in UTC Unix milliseconds.
     pub as_of: u64,
+    /// Requested physical graph layers, retained for continuation receipts.
+    pub layers: RdfGraphLayers,
+    /// Effective host source ceilings, retained without renewing their lease.
+    pub limits: RdfReadLimits,
     /// Independent scope and applicable projection coverage.
     pub coverage: RdfScopeCoverage,
     /// Complete native result or typed diagnostic/partial/failure outcome.
@@ -88,6 +92,8 @@ impl Store {
                     store_id,
                     sequence: view.snapshot_sequence_number(),
                     as_of: now,
+                    layers: read.layers,
+                    limits: read.limits,
                     coverage: coverage.clone(),
                     outcome,
                 };

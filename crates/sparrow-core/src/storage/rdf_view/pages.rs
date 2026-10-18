@@ -166,9 +166,7 @@ fn term_wire_bytes(root: TermInput<'_>) -> Result<usize, Error> {
                 ),
             },
         };
-        let charge = text
-            .and_then(|n| n.checked_mul(6))
-            .and_then(|n| n.checked_add(512));
+        let charge = text.and_then(sparql_term_node_bytes);
         let Some(next) = charge
             .and_then(|n| bytes.checked_add(n))
             .filter(|n| *n <= catalog_lease::PAGE_BYTES)
@@ -185,6 +183,17 @@ fn term_wire_bytes(root: TermInput<'_>) -> Result<usize, Error> {
         ControlFlow::Continue(()) => Ok(bytes),
         ControlFlow::Break(error) => Err(error),
     }
+}
+
+/// Transport charge for one native term node, including worst-case JSON escaping.
+/// This is wire capacity, not RDF identity, validation or a scoring law.
+pub fn sparql_term_node_bytes(text: usize) -> Option<usize> {
+    text.checked_mul(6)?.checked_add(512)
+}
+
+/// Price an owned native term with the same law as persisted-result publication.
+pub fn sparql_term_wire_bytes(value: &TermValue) -> Result<usize, Error> {
+    term_wire_bytes(TermInput::Value(value))
 }
 
 fn item_wire_bytes(item: SparqlItem<'_>) -> Result<usize, Error> {
@@ -207,6 +216,11 @@ fn item_wire_bytes(item: SparqlItem<'_>) -> Result<usize, Error> {
                     .checked_add(term_wire_bytes(TermInput::Indexed(dataset, id))?)
                     .ok_or_else(|| Error::new("RESOURCE_LIMIT", "SPARQL item capacity overflow"))?;
             }
+            // Native extended N-Quads is embedded in the JSON result envelope:
+            // quotes, backslashes and control escapes may be escaped twice.
+            bytes = bytes.checked_mul(2).ok_or_else(|| {
+                Error::new("RESOURCE_LIMIT", "graph serialization capacity overflow")
+            })?;
         }
     }
     Ok(bytes)
@@ -384,7 +398,10 @@ impl Store {
                     .saturating_add(size_of::<
                         catalog_lease::Snapshot<SparqlSelector, SparqlPageBody>,
                     >())
-                    .saturating_add(governor_bytes.saturating_add(error_bytes).saturating_mul(6))
+                    .saturating_add(governor_bytes.saturating_mul(6))
+                    // Both the typed diagnostic and the human failure summary
+                    // may carry the same authored text, each JSON-escaped.
+                    .saturating_add(error_bytes.saturating_mul(12))
                     .saturating_add(variables);
                 if metadata > 64 * 1024 {
                     return Err(view.budget.fail(Error::new(

@@ -20,7 +20,10 @@ pub(crate) mod pages;
 mod query;
 mod scope;
 use budget::{Budget, Reservation};
-pub use pages::{SparqlGraphKind, SparqlItem, SparqlPageBody, SparqlReadPage};
+pub use pages::{
+    SparqlGraphKind, SparqlItem, SparqlPageBody, SparqlReadPage, sparql_term_node_bytes,
+    sparql_term_wire_bytes,
+};
 pub use query::{ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;
 

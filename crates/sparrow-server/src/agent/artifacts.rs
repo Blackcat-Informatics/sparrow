@@ -42,7 +42,7 @@ impl Input {
             match flag.as_str() {
                 "--scope-file" => {
                     selection = Box::new(
-                        super::selection::decode(&super::records::read_control_file(value)?)
+                        super::selection::decode(&super::records::read_control_file(value, 8)?)
                             .map_err(|error| invalid(error.to_string()))?,
                     )
                 }

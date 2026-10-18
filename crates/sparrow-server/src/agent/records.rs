@@ -73,10 +73,10 @@ pub(super) fn decode_fields(
 }
 
 pub(super) fn read_fields(path: &str) -> Result<Vec<sparrow_core::FieldConstraint>> {
-    decode_fields(&read_control_file(path)?).map_err(|e| invalid(e.to_string()))
+    decode_fields(&read_control_file(path, 8)?).map_err(|e| invalid(e.to_string()))
 }
 
-pub(super) fn read_control_file(path: &str) -> Result<Value> {
+pub(super) fn read_control_file(path: &str, max_depth: usize) -> Result<Value> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| invalid(e.to_string()))?;
     let metadata = file.metadata().map_err(|e| invalid(e.to_string()))?;
@@ -97,7 +97,7 @@ pub(super) fn read_control_file(path: &str) -> Result<Value> {
         purrdf_lex::json::Limits {
             max_string_bytes: 256 * 1024,
             unique_members: true,
-            max_depth: 8,
+            max_depth,
             max_values: 4096,
         },
     )

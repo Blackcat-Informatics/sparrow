@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "sparql_query",
+        "Execute native read-only SELECT, ASK, CONSTRUCT or DESCRIBE over an admitted immutable retained record scope. Typed bindings use PurRDF canonical term JSON. Native complete/certain/at-most/unknown certificates and source coverage remain separate from paging. Remote requests are disabled. Resume using result_next; reading never renews the one-minute result lease.",
+    ),
+    (
         "retention_metrics",
         "Read a complete admitted logical raw-payload account: oldest retained receipt, effective window, unique live/pin-held/retirable/private-owner bytes. Counts share one catalog instant. No maintenance, pin renewal or physical reclamation is performed or certified. Admission and integrity failures return no partial account.",
     ),
@@ -165,6 +169,22 @@ fn integer(maximum: u64) -> Value {
 
 pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
+        if *name == "sparql_query" {
+            return Object::new()
+                .with("name", *name)
+                .with("description", *description)
+                .with("inputSchema", super::super::sparql::schema())
+                .with("outputSchema", Object::new().with("type", "object"))
+                .with(
+                    "annotations",
+                    Object::new()
+                        .with("readOnlyHint", true)
+                        .with("destructiveHint", false)
+                        .with("idempotentHint", true)
+                        .with("openWorldHint", false),
+                )
+                .into();
+        }
         let mut properties = Object::new();
         let mut required = Vec::new();
         if [

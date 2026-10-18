@@ -37,6 +37,11 @@ pub(crate) enum Operation {
 
 impl Operation {
     pub(crate) fn parse(name: &str, arguments: &Value) -> Result<Self> {
+        if name == "sparql_query" {
+            return Ok(Self::Query(Command::Sparql(Box::new(
+                super::sparql::Input::decode(arguments)?,
+            ))));
+        }
         let decode = || -> std::result::Result<Self, DecodeError> {
             let mut fields = Record::new(arguments, "Sparrow tool arguments")?;
             let result = match name {

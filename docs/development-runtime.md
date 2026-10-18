@@ -11,6 +11,42 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Native graph transport source
+
+The implementation branch now includes schema 51 native graph RPC publication,
+CLI `sparql REQUEST.json`, MCP `sparql_query`, and generic graph `result_next`.
+The installed service described above remains schema 50; these source changes
+have not been deployed. They do not alter the store format or start another
+writer on the development database.
+
+The typed transport preserves native complete/certain/at-most/unknown outcomes,
+all governor dimensions, source evidence, coverage, RDF 1.2 graph item roles,
+page-local term forests, native diagnostic locations/presentation arguments,
+and exact 128-bit storage-capacity values. CLI/MCP use PurRDF's result serializer
+and canonical term projection, with explicit empty graph declarations and SELECT
+auxiliary graphs beside the native JSON result envelope. Query failures preserve
+the receipt while setting MCP `isError` and an unsuccessful CLI exit status.
+
+Qualification covers scoped blanks/directional triple terms, compact-DAG
+amplification and unreachable-node refusal, native binding validation independent
+of JSON member order, and diagnostic fidelity including capacity near
+`u128::MAX`. Private-daemon acceptance covers all four read forms, typed bindings,
+TCP CLI and Unix MCP replay, certain/at-most/unknown certificates, native query
+failures, unsuccessful CLI exits, release and cyclic-wire refusal. Single-page
+results do not retain a continuation handle; releasing those returns false.
+
+The pinned census holds 272 ownership jobs with zero distinct exceptions.
+Event fields and capacity diagnostics share the SDK's original `WideInteger`
+carrier and codec; argument errors and count rendering also reuse their existing
+owners. No detectors were relaxed. The final normal `make check` commit gate is
+logged in `.stage/native-graph-integration/graph-wire-commit.log`; the related
+focused, integration and census receipts use the `graph-wire-*` prefix.
+
+Recordless artifact RDF metadata, native text relations, correlation, public
+explanation, forced bounded physical reclamation and production-volume/resource
+acceptance remain unfinished. The concrete native storage integration gap is
+documented in [native reclamation integration](native-reclamation.md).
+
 ## Device-identity discontinuity and approved recovery
 
 A startup attempt on 2026-10-17 exited with the native guard:

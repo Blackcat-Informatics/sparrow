@@ -259,6 +259,26 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
                 ),
         )
         .with(
+            "sparql_read_handles",
+            value.get_sparql_read_handles().to_string(),
+        )
+        .with(
+            "sparql_read_bytes",
+            value.get_sparql_read_bytes().to_string(),
+        )
+        .with(
+            "max_sparql_read_handles",
+            value.get_max_sparql_read_handles().to_string(),
+        )
+        .with(
+            "max_sparql_read_bytes",
+            value.get_max_sparql_read_bytes().to_string(),
+        )
+        .with(
+            "sparql_read_lease_ms",
+            value.get_sparql_read_lease_ms().to_string(),
+        )
+        .with(
             "record_read_handles",
             value.get_record_read_handles().to_string(),
         )

@@ -23,6 +23,8 @@ pub enum ResultPage {
     Sources(SourceReadPage),
     /// Active collection summaries or captured direct members.
     Pins(PinReadPage),
+    /// Governed native RDF solutions, boolean or graph items and certificates.
+    Sparql(crate::SparqlReadPage),
 }
 
 impl Store {
@@ -76,6 +78,15 @@ impl Store {
             ));
         }
         let cursor = catalog_lease::Cursor::parse(cursor)?;
+        {
+            let mut reads = self.sparql_reads.lock().map_err(|_| {
+                Error::new("STORAGE_FAILURE", "native query read registry poisoned")
+            })?;
+            reads.purge(now);
+            if let Some((_, page)) = reads.resume_captured(&cursor, now)? {
+                return Ok(ResultPage::Sparql(page));
+            }
+        }
         {
             let mut reads = self
                 .record_reads

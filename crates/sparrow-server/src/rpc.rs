@@ -5,6 +5,7 @@
 
 use crate::sparrow_capnp as wire;
 mod ingest_status;
+mod sparql;
 use purrdf_lex::json::{Value, record::Record as JsonRecord};
 use sparrow_core::{
     Artifact, Error, JsonQuery, Pin, PinPageBody, PinRead, PinSelector, PinSummary, QueryScope,
@@ -13,7 +14,7 @@ use sparrow_core::{
 use std::{rc::Rc, sync::Arc};
 use tokio::sync::Semaphore;
 
-fn invalid(error: impl std::fmt::Display) -> Error {
+pub(crate) fn invalid(error: impl std::fmt::Display) -> Error {
     Error::new("INVALID_ARGUMENT", error.to_string())
 }
 
@@ -2602,6 +2603,11 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_record_read_handles(number(&value, "max_record_read_handles")?);
                 out.set_max_record_read_bytes(number(&value, "max_record_read_bytes")?);
                 out.set_record_read_lease_ms(number(&value, "record_read_lease_ms")?);
+                out.set_sparql_read_handles(number(&value, "sparql_read_handles")?);
+                out.set_sparql_read_bytes(number(&value, "sparql_read_bytes")?);
+                out.set_max_sparql_read_handles(number(&value, "max_sparql_read_handles")?);
+                out.set_max_sparql_read_bytes(number(&value, "max_sparql_read_bytes")?);
+                out.set_sparql_read_lease_ms(number(&value, "sparql_read_lease_ms")?);
             }
         }
         Ok(())
@@ -3481,10 +3487,23 @@ impl wire::sparrow::Server for Rpc {
                         sources_page(out.init_sources(), &page)?
                     }
                     sparrow_core::ResultPage::Pins(page) => pins_page(out.init_pins(), &page)?,
+                    sparrow_core::ResultPage::Sparql(page) => {
+                        if let Err(error) = sparql::page(out.init_sparql(), &page) {
+                            failure(results.get().init_result(), error);
+                        }
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    async fn sparql_query(
+        self: Rc<Self>,
+        params: wire::sparrow::SparqlQueryParams,
+        mut results: wire::sparrow::SparqlQueryResults,
+    ) -> capnp::Result<()> {
+        sparql::query(&self, params, &mut results).await
     }
 
     async fn keys_list(

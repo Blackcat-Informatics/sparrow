@@ -21,6 +21,7 @@ pub mod watches;
 pub use transport::{admit_connection, serve_connection};
 pub use watch_admin::WatchController;
 
+mod rdf_wire;
 mod rpc;
 pub use rpc::{Rpc, now};
 mod agent;

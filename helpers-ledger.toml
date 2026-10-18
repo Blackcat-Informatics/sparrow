@@ -3892,7 +3892,7 @@ names = ['^(copy_native_result_into_second_rdf_store|renew_sparql_result_on_next
 id = "native-sparql-wire-admission"
 summary = "Price typed and worst-case JSON envelopes over borrowed native carriers; never reimplement term semantics, owned conversion or nested traversal."
 home = "sparrow_core::storage::rdf_view::pages::term_wire_bytes"
-entry_points = ["sparrow_core::storage::rdf_view::pages::item_wire_bytes", "sparrow_core::storage::rdf_view::pages::items", "sparrow_core::storage::rdf_view::pages::graph_items", "sparrow_core::storage::rdf_view::pages::answer"]
+entry_points = ["sparrow_core::storage::rdf_view::pages::item_wire_bytes", "sparrow_core::storage::rdf_view::pages::items", "sparrow_core::storage::rdf_view::pages::graph_items", "sparrow_core::storage::rdf_view::pages::answer", "sparrow_core::storage::rdf_view::pages::sparql_term_node_bytes", "sparrow_core::storage::rdf_view::pages::sparql_term_wire_bytes"]
 spec = "docs/interfaces.md: RDF 1.2 egress and bounded structured output."
 vectors = ["crates/sparrow-core/src/storage/rdf_view/pages.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -3929,3 +3929,73 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(pin_read_stats|artifact_read_stats|source_read_stats|record_read_stats|sparql_read_stats)$']
+
+[[job]]
+id = "typed-native-term-forest"
+summary = "One server/client adapter uses native term walks, node pricing and projection validation for bounded flat transport; local links never expose persistent dictionary IDs."
+home = "sparrow_server::rdf_wire::encode"
+entry_points = ["sparrow_server::rdf_wire::decode", "sparrow_server::rdf_wire::leaf", "sparrow_server::rdf_wire::children", "sparrow_server::rdf_wire::direction", "sparrow_server::rdf_wire::language"]
+spec = "docs/interfaces.md: flat native graph term transport and binding admission."
+vectors = ["crates/sparrow-server/src/rdf_wire/tests.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_rdf_binding_by_hand|encode_persistent_term_id)$']
+
+[[job]]
+id = "typed-native-diagnostic-transport"
+summary = "Transport adapters preserve native diagnostic fields, typed presentation arguments and exact u128 capacity counters without reclassifying native failures."
+home = "sparrow_server::rdf_wire::diagnostic::encode"
+entry_points = ["sparrow_server::rdf_wire::diagnostic::render"]
+spec = "docs/interfaces.md: native query diagnostics and machine fidelity."
+vectors = ["crates/sparrow-server/src/rdf_wire/tests.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(classify_native_diagnostic_again|truncate_capacity_to_u64)$']
+
+[[job]]
+id = "native-sparql-rpc-publication"
+summary = "One typed RPC adapter carries native outcomes, governor receipts, all four statement streams and page-local terms through initial and generic continuation replies."
+home = "sparrow_server::rpc::sparql::page"
+entry_points = ["sparrow_server::rpc::sparql::query", "sparrow_server::rpc::sparql::request", "sparrow_server::rpc::sparql::data", "sparrow_server::rpc::sparql::governors", "sparrow_server::rpc::sparql::dimension"]
+spec = "docs/interfaces.md: schema 51 native graph query."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(rpc_evaluate_sparql_again|recapture_graph_on_next)$']
+
+[[job]]
+id = "native-sparql-agent-contract"
+summary = "CLI and MCP share one native result renderer and input codec; PurRDF supplies term validation and SPARQL JSON serialization, while the adapter preserves page certificates and auxiliary graph declarations."
+home = "sparrow_server::agent::sparql::render"
+entry_points = ["sparrow_server::agent::sparql::Input::decode", "sparrow_server::agent::sparql::Input::execute", "sparrow_server::agent::sparql::schema", "sparrow_server::agent::sparql::data", "sparrow_server::agent::sparql::serialize", "sparrow_server::agent::sparql::declarations", "sparrow_server::agent::sparql::shape", "sparrow_server::agent::sparql::governor", "sparrow_server::agent::sparql::dimension", "sparrow_server::agent::sparql::optional"]
+spec = "docs/interfaces.md: sparql_query and CLI request files."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(serialize_sparql_json_locally|format_nquads_locally)$']
+
+[[job]]
+id = "typed-wide-integer-transport"
+summary = "SDK event fields and native query capacity diagnostics use the same exact two-word integer codec and WideInteger wire carrier."
+home = "sparrow_client::events::wide"
+entry_points = ["sparrow_client::events::read_wide"]
+spec = "docs/interfaces.md: exact typed event and native diagnostic capacity values."
+vectors = ["crates/sparrow-server/src/rdf_wire/tests.rs", "crates/sparrow-client/src/events.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_u128_elsewhere|decode_u128_elsewhere)$']

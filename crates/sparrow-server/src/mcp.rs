@@ -147,7 +147,7 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32700, error.to_string())).await?; return Err(error.into()); }
                 };
                 drop(incoming); incoming = Box::pin(frame(&mut reader));
-                let value = match json::read_slice(&bytes, json::Limits { max_depth: 32, max_values: 16384, max_string_bytes: FRAME_LIMIT, unique_members: true }) {
+                let value = match json::read_slice(&bytes, json::Limits { max_depth: 64, max_values: 16384, max_string_bytes: FRAME_LIMIT, unique_members: true }) {
                     Ok(value) => value,
                     Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32700, error.to_string())).await?; continue; }
                 };
@@ -233,7 +233,7 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                                 })?;
                                 operation.execute(client.capability()).await
                             }).await.unwrap_or_else(|_| Err(AgentError { code: "RPC_TIMEOUT".into(), message: "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID".into(), retryable: true }));
-                            let output = match result { Ok(value) => tool_result(value, false), Err(error) => tool_result(Object::new().with("error", error.json()).into(), true) };
+                            let output = match result { Ok(value) => { let failed = value.get("execution_status").and_then(Value::as_str) == Some("failed"); tool_result(value, failed) }, Err(error) => tool_result(Object::new().with("error", error.json()).into(), true) };
                             response(id, output)
                             }, registration).await;
                             (result_key, reply)

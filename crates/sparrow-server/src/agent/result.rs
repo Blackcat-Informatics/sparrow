@@ -51,5 +51,6 @@ pub(super) fn render(page: wire::result_page::Reader<'_>) -> Result<Value> {
         wire::result_page::Artifacts(page) => super::artifacts::render(page?),
         wire::result_page::Sources(page) => super::sources::render(page?),
         wire::result_page::Pins(page) => super::pin::read::render(page?),
+        wire::result_page::Sparql(page) => super::sparql::render(page?),
     }
 }

@@ -368,8 +368,10 @@ membership and graph values remain on the same captured native snapshot.
 SELECT, ASK, CONSTRUCT and DESCRIBE implementation. Complete, certified partial
 and diagnostic/failure outcomes retain native ownership and certainty. UPDATE is
 refused by native read preparation; federation is disabled. These are core
-integration surfaces. CLI/MCP/typed RPC graph queries, recordless artifact graphs,
-text relations, correlation and public explanation contracts remain unfinished.
+integration surfaces. Schema 51 exposes the same native read through typed
+`Sparrow.sparqlQuery`, CLI `sparrow ENDPOINT sparql REQUEST.json`, and MCP
+`sparql_query`. Recordless artifact graphs, text relations, correlation and
+public explanation contracts remain unfinished.
 
 The core `sparql_read`/`sparql_read_next` pair publishes immutable native captures
 through the existing finite catalog lease owner. Pages share the native outcome
@@ -383,8 +385,9 @@ Native outcome certainty remains authoritative: item counts describe transport
 units, never proven-answer cardinality. Unknown outcomes expose no items, and
 query failures retain their native diagnostics without answer items. Certain and
 at-most results retain their original certificate and positional-prefix evidence.
-The core page API does not yet provide the typed RPC or generic `result_next`
-graph arm; the existing daemon cannot create these native graph handles.
+The typed `ResultPage.sparql` arm and generic `result_next` resume that same
+native capture. The installed development image is identified separately in
+`development-runtime.md`; schema additions in source do not imply deployment.
 
 The native registry admits at most eight handles and 8 MiB of aggregate retained
 capacity, with a fixed 60-second lease from capture start. Page size is at most
@@ -395,6 +398,46 @@ An oversized indivisible item or receipt refuses publication, never clips RDF.
 `result_release` releases these captures; status and maintenance share expiry
 accounting. Core status reports `sparql_read_handles`, `sparql_read_bytes` and
 their effective maxima/lease. No page read renews a lease or pins evidence.
+
+The graph request JSON uses the shared scope object, source/receipt-time filters,
+`page_size`, `scan_budget`, `require_complete_index`, optional `base_iri`, and
+`layers` flags (all three enabled by default). `bindings` is an array of
+`{"name":"predicate","term":<PurRDF canonical term JSON>}`; native projection
+validation owns its term semantics. Names are at most 128 UTF-8 bytes, with at
+most 64 bindings. JSON member order does not change the native binding identity.
+The transport admits at
+most 512 expanded transport nodes, 256 KiB term admission, and
+native projection nesting limit 16. Example:
+
+```json
+{"store_id":"STORE_ID","query":"SELECT ?record WHERE { ?record <urn:sparrow:vocab:payload> ?payload }","page_size":100,"layers":{"content":false}}
+```
+
+Optional `limits` counters use unsigned decimal strings: `fuel`, `answer_rows`,
+`intermediate_cells`, `scratch_bytes`, `live_bytes`, `requests`, `io_bytes`,
+`row_visits`, `source_lease_ms`. Defaults and actual effective limits are echoed
+in each page. Remote requests are always zero. Fuel zero is a real native
+governor setting, not a request for an unbounded query.
+
+Typed RDF values use a flat child-before-parent term forest with page-local
+UInt32 links, preserving blank scope, datatype, language, direction and nested
+triple structure. Unreachable nodes, forward/cyclic references and expanded DAG
+amplification refuse admission. Persistent native dictionary IDs never cross
+the wire. Graph items distinguish primary/auxiliary streams, named declarations,
+quads, reifiers and annotations. Query diagnostics retain native severity,
+location, detail, presentation arguments and exact 128-bit capacity values.
+
+Agent `rows.native_result` uses PurRDF's own SPARQL JSON serializer; graph results
+carry its extended N-Quads envelope. Explicit `named_graphs` and
+`auxiliary_graph` preserve declarations and SELECT auxiliary graphs that the
+native JSON result envelope does not otherwise include. Each object describes
+one page fragment, not the entire leased answer. Native `Certain` remains
+`answer_certainty=certain`, while `AtMost` uses `candidates` instead of `rows`.
+Unknown results expose a barrier without answer/candidate data. Page counts
+count transport items, never proven answers. Query failures preserve the receipt
+and native evidence, set MCP `isError`, and make the CLI exit unsuccessfully after
+printing its failure JSON. Releasing or expiring the handle releases only replay
+memory. It never changes evidence retention.
 
 Storage formats 13/14/15/16 fence older writers for the basic, consumption,
 watch-registry and handoff states. Existing 9/10/11/12 stores durably advance to

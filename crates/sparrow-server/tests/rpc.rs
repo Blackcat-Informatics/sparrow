@@ -7114,7 +7114,7 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 35);
+    assert_eq!(definitions.len(), 36);
     for (name, read_only) in [
         ("retention_metrics", true),
         ("ingest_get", true),
@@ -7227,7 +7227,7 @@ async fn mcp_exercise(
         Some(true)
     );
     assert!(
-        !definitions
+        definitions
             .iter()
             .any(|tool| tool["name"].as_str() == Some("sparql_query"))
     );
@@ -7925,7 +7925,7 @@ async fn mcp_exercise(
         .call(
             14,
             "tools/call",
-            query("sparql_query", Object::new().into()),
+            query("unsupported_query", Object::new().into()),
         )
         .await;
     assert_eq!(unknown["error"]["code"].as_i64(), Some(-32602));
@@ -8603,6 +8603,93 @@ fn cli(socket: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> purrdf_lex::json::
         String::from_utf8_lossy(&output.stderr)
     );
     purrdf_lex::json::read_slice(&output.stdout, purrdf_lex::json::Limits::default()).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cli_and_mcp() {
+    use purrdf_lex::json::{self, Object, Value};
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store"); let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(),&data,&socket);
+        let (address,reservation) = configure_tcp_listener(&config); drop(reservation);
+        let _daemon = start(&config,&socket).await;
+        let endpoint = format!("tcp://{address}");
+        let client = sparrow_client::Client::connect_endpoint(&sparrow_client::Endpoint::parse(&endpoint).unwrap()).await.unwrap();
+        let store = client.discovery().store_id.clone();
+        client.ingest("graph-input","graph-source",wire::Format::Json,br#"{"message":"native graph"}"#).await.unwrap();
+        let mut mcp = Mcp::start(&socket); mcp.initialize(1).await;
+        let path = dir.path().join("graph.json");
+        for (index,query) in [
+            "SELECT ?record WHERE { ?record ?predicate ?payload }",
+            "ASK { ?record <urn:sparrow:vocab:payload> ?payload }",
+            "CONSTRUCT { ?record <urn:copy:payload> ?payload } WHERE { ?record <urn:sparrow:vocab:payload> ?payload }",
+            "DESCRIBE ?record WHERE { ?record <urn:sparrow:vocab:payload> ?payload }",
+        ].into_iter().enumerate() {
+            let mut args = Object::new().with("store_id",store.clone()).with("query",query).with("page_size",1_u32);
+            if index==0 {
+                let limits = purrdf::projections::ProjectionLimits::new(1,262144,262144,262144,16).unwrap();
+                let term = purrdf::projections::ProjectionTerm::from_term_value(&purrdf::TermValue::iri("urn:sparrow:vocab:payload"),limits).unwrap().to_canonical_json(limits).unwrap();
+                let term = json::read_slice(&term,json::Limits::default()).unwrap();
+                args = args.with("bindings",Value::array([Object::new().with("name","predicate").with("term",term)]));
+            }
+            let args: Value = args.into();
+            std::fs::write(&path,json::write_compact(&args)).unwrap();
+            let first = cli(&endpoint,&["sparql",path.to_str().unwrap()]);
+            assert_eq!(first["execution_status"].as_str(),Some("complete"),"{first:?}");
+            assert_eq!(first["answer_certainty"].as_str(),Some("exact"));
+            assert_eq!(first["coverage"]["selected_records"].as_str(),Some("1"));
+            assert!(first["source_evidence"]["row_visits"].as_str().unwrap().parse::<u64>().unwrap()>0);
+            assert!(first["native_governor"]["resources"].as_array().unwrap().len()==8);
+            if index==0 { assert_eq!(first["rows"]["native_result"]["results"]["bindings"].as_array().unwrap().len(),1); }
+            if index==1 { assert_eq!(first["rows"]["native_result"]["boolean"].as_bool(),Some(true)); }
+            if index>=2 { assert!(first["rows"]["native_result"]["graph"].as_str().is_some()); }
+            let mut page = first.clone(); let mut pages = 1;
+            while let Some(cursor) = page["next_cursor"].as_str() {
+                let next = mcp.tool(10+index as u64,"result_next",Object::new().with("store_id",store.clone()).with("cursor",cursor).into()).await;
+                assert_eq!(next["isError"].as_bool(),Some(false),"{next:?}");
+                let replay = cli(&endpoint,&["result-next",&store,cursor]);
+                page = next["structuredContent"].clone(); assert_eq!(page,replay);
+                assert_eq!(page["snapshot_id"],first["snapshot_id"]); assert_eq!(page["native_governor"],first["native_governor"]); pages+=1; assert!(pages<100);
+            }
+            let released = sparrow_client::release_result(client.capability(),&store,first["snapshot_id"].as_str().unwrap()).await.unwrap(); assert_eq!(released.released,first["has_more"].as_bool().unwrap());
+            if let Some(cursor) = first["next_cursor"].as_str() { assert!(sparrow_server::run_cli(client.capability(),&["result-next".into(),store.clone(),cursor.into()]).await.is_err()); }
+        }
+        for (id,query,fuel,certainty) in [(30,"SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }","0","certain"),(31,"ASK { ?s ?p ?o }","0","unknown")] {
+            let response = mcp.tool(id,"sparql_query",Object::new().with("store_id",store.clone()).with("query",query).with("limits",Object::new().with("fuel",fuel)).into()).await;
+            assert_eq!(response["isError"].as_bool(),Some(false),"{response:?}");
+            let result = &response["structuredContent"]; assert_eq!(result["answer_certainty"].as_str(),Some(certainty)); assert_eq!(result["execution_status"].as_str(),Some("partial"));
+            if certainty=="unknown" { assert!(result.get("rows").is_none()); assert!(result.get("candidates").is_none()); }
+            sparrow_client::release_result(client.capability(),&store,result["snapshot_id"].as_str().unwrap()).await.unwrap();
+        }
+        let minus = "SELECT ?r WHERE { ?r <urn:sparrow:vocab:payload> ?p MINUS { ?r <urn:sparrow:vocab:payload> ?q } }";
+        let baseline = mcp.tool(39,"sparql_query",Object::new().with("store_id",store.clone()).with("query",minus).into()).await;
+        assert_eq!(baseline["isError"].as_bool(),Some(false),"{baseline:?}");
+        let measured = baseline["structuredContent"]["native_governor"]["resources"][0]["consumed"].as_str().unwrap().parse::<u64>().unwrap();
+        assert!(measured<=1024,"tiny MINUS fixture exceeded finite fuel-cut qualification admission");
+        sparrow_client::release_result(client.capability(),&store,baseline["structuredContent"]["snapshot_id"].as_str().unwrap()).await.unwrap();
+        let mut saw_upper_bound = false;
+        for fuel in 0..measured {
+            let reply = mcp.tool(39,"sparql_query",Object::new().with("store_id",store.clone()).with("query",minus).with("limits",Object::new().with("fuel",fuel.to_string())).into()).await;
+            assert_eq!(reply["isError"].as_bool(),Some(false),"{reply:?}");let receipt=&reply["structuredContent"];
+            sparrow_client::release_result(client.capability(),&store,receipt["snapshot_id"].as_str().unwrap()).await.unwrap();
+            if receipt["answer_certainty"].as_str()==Some("at_most") { assert!(receipt.get("rows").is_none());assert!(receipt.get("candidates").is_some());saw_upper_bound=true;break; }
+        }
+        assert!(saw_upper_bound,"MINUS did not expose the native at-most candidate certificate");
+        let failed = mcp.tool(40,"sparql_query",Object::new().with("store_id",store.clone()).with("query","SELECT WHERE {").into()).await;
+        assert_eq!(failed["isError"].as_bool(),Some(true),"{failed:?}");
+        let receipt = &failed["structuredContent"]; assert_eq!(receipt["execution_status"].as_str(),Some("failed")); assert!(receipt["diagnostic"]["code"].as_str().is_some()); assert!(receipt.get("native_governor").is_some());
+        sparrow_client::release_result(client.capability(),&store,receipt["snapshot_id"].as_str().unwrap()).await.unwrap();
+        std::fs::write(&path,json::write_compact(&Object::new().with("store_id",store.clone()).with("query","SELECT WHERE {").into())).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&endpoint).args(["sparql",path.to_str().unwrap()]).admitted_output().unwrap();
+        assert!(!output.status.success());let output=json::read_slice(&output.stdout,json::Limits::default()).unwrap();assert_eq!(output["execution_status"].as_str(),Some("failed"));
+        sparrow_client::release_result(client.capability(),&store,output["snapshot_id"].as_str().unwrap()).await.unwrap();
+        let mut bad = client.capability().sparql_query_request(); let mut query=bad.get().init_query(); query.set_store_id(&store);query.set_schema_version(sparrow_client::SCHEMA_VERSION);query.set_query("SELECT ?x WHERE {}");let mut scope = query.reborrow().init_scope(); scope.set_schema_version(sparrow_client::SCHEMA_VERSION); scope.init_received_before().set_unix_millis(u64::MAX);
+        let mut nodes = query.reborrow().init_terms(1); let mut triple = nodes.reborrow().get(0).init_triple();triple.set_subject(0);triple.set_predicate(0);triple.set_object(0);
+        let mut binding = query.init_bindings(1).get(0);binding.set_name("x");binding.set_term(0);
+        let response = bad.send().promise.await.unwrap(); match response.get().unwrap().get_result().unwrap().which().unwrap() { wire::result::Error(error)=>{ let error = error.unwrap(); assert_eq!(error.get_code().unwrap().to_str().unwrap(),"INVALID_ARGUMENT"); assert!(error.get_message().unwrap().to_str().unwrap().contains("earlier nodes")); },_=>panic!("cyclic wire term was admitted") }
+        let status = client.capability().status_request().send().promise.await.unwrap(); assert_eq!(rpc_ok(status.get().unwrap().get_result().unwrap()).get_sparql_read_handles(),0);
+    }).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -9886,6 +9973,7 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                     wire::result_page::Artifacts(_) => "artifacts",
                     wire::result_page::Sources(_) => "sources",
                     wire::result_page::Pins(_) => args[0],
+                    wire::result_page::Sparql(_) => "sparql",
                 };
                 assert_eq!(kind, args[0]);
                 let snapshot = cursor.split_once('/').unwrap().0;

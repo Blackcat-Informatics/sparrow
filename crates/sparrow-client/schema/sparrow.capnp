@@ -224,6 +224,9 @@ struct Status {
   recordReadLeaseMs @41 :UInt64;
   producerLimits @42 :ProducerLimits;
   syslogListeners @43 :List(SyslogListenerStatus);
+  sparqlReadHandles @44 :UInt64; sparqlReadBytes @45 :UInt64;
+  maxSparqlReadHandles @46 :UInt64; maxSparqlReadBytes @47 :UInt64;
+  sparqlReadLeaseMs @48 :UInt64;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
@@ -611,6 +614,7 @@ struct ResultPage {
     artifacts @4 :ArtifactListPage;
     sources @5 :SourceListPage;
     pins @6 :PinReadPage;
+    sparql @7 :SparqlPage;
   }
 }
 interface Sparrow {
@@ -661,4 +665,85 @@ interface Sparrow {
   receiverWindowGet @44 (query :ReceiverWindowQuery) -> (result :Result(ReceiverWindow));
   ingestStatus @45 (query :IngestStatusQuery) -> (result :Result(IngestStatus));
   retentionMetrics @46 (query :RetentionMetricsQuery) -> (result :Result(RetentionMetrics));
+  sparqlQuery @47 (query :SparqlQuery) -> (result :Result(SparqlPage));
 }
+
+# Page-local, child-before-parent term nodes. IDs never identify persisted terms.
+enum RdfDirection { absent @0; ltr @1; rtl @2; }
+struct RdfBlank { label @0 :Text; scope @1 :UInt32; }
+struct RdfLiteral { lexical @0 :Text; datatype @1 :Text; language @2 :OptionalText; direction @3 :RdfDirection; }
+struct RdfTripleTerm { subject @0 :UInt32; predicate @1 :UInt32; object @2 :UInt32; }
+struct RdfTermNode { union { iri @0 :Text; blank @1 :RdfBlank; literal @2 :RdfLiteral; triple @3 :RdfTripleTerm; } }
+struct OptionalRdfTerm { union { unbound @0 :Void; value @1 :UInt32; } }
+struct SparqlBinding { name @0 :Text; term @1 :UInt32; }
+struct RdfLayers { metadata @0 :Bool = true; diagnostic @1 :Bool = true; content @2 :Bool = true; }
+struct SparqlLimits {
+  fuel @0 :UInt64 = 1000000; answerRows @1 :UInt64 = 10000;
+  intermediateCells @2 :UInt64 = 1000000; scratchBytes @3 :UInt64 = 33554432;
+  liveBytes @4 :UInt64 = 134217728; requests @5 :UInt64 = 100000;
+  ioBytes @6 :UInt64 = 134217728; rowVisits @7 :UInt64 = 100000;
+  sourceLeaseMs @8 :UInt64 = 30000;
+}
+struct SparqlQuery {
+  storeId @0 :Text; schemaVersion @1 :UInt32; scope @2 :Scope;
+  query @3 :Text; baseIri @4 :OptionalText; layers @5 :RdfLayers;
+  terms @6 :List(RdfTermNode); bindings @7 :List(SparqlBinding); limits @8 :SparqlLimits;
+}
+enum GovernorDimension { fuel @0; answerRows @1; intermediateCells @2; scratchBytes @3; remoteRequests @4; udfDepth @5; pages @6; bytes @7; }
+struct GovernorUse { dimension @0 :GovernorDimension; consumed @1 :UInt64; ceiling @2 :UInt64; }
+struct GovernorBudget { dimension @0 :GovernorDimension; limit @1 :UInt64; consumed @2 :UInt64; }
+struct GovernorRefusal { dimension @0 :GovernorDimension; limit @1 :UInt64; estimate @2 :UInt64; }
+enum StopCause { cancelled @0; deadline @1; }
+struct GovernorStop { union { absent @0 :Void; budget @1 :GovernorBudget; refused @2 :GovernorRefusal; stopped @3 :StopCause; } }
+enum SilencedTargetKind { service @0; load @1; }
+enum SilencedFailureKind { transport @0; decode @1; disabled @2; unconfigured @3; denied @4; hostDenied @5; notAnIri @6; fault @7; }
+struct SilencedFailure { targetKind @0 :SilencedTargetKind; target @1 :Text; kind @2 :SilencedFailureKind; message @3 :Text; }
+struct ExpressionErrorCount { code @0 :Text; count @1 :UInt64; }
+struct NativeGovernorReceipt { profile @0 :Text; resources @1 :List(GovernorUse); stop @2 :GovernorStop; silenced @3 :List(SilencedFailure); expressionErrors @4 :List(ExpressionErrorCount); }
+struct RdfReadEvidence { requests @0 :UInt64; admittedBytes @1 :UInt64; rowVisits @2 :UInt64; liveBytes @3 :UInt64; peakLiveBytes @4 :UInt64; }
+struct SparqlCoverage {
+  visited @0 :UInt64; selectedRecords @1 :Count; knownSelectedRecords @2 :UInt64;
+  contentReady @3 :UInt64; contentFailed @4 :UInt64; contentNotApplicable @5 :UInt64;
+  diagnostics @6 :DiagnosticCoverage; catalogEntries @7 :UInt64; complete @8 :Bool;
+}
+struct SparqlHostLimits {
+  source @0 :SparqlLimits; pageBytes @1 :UInt64; metadataBytes @2 :UInt64;
+  resultHandles @3 :UInt64; resultBytes @4 :UInt64; resultLeaseMs @5 :UInt64;
+  scopeCatalogBytes @6 :UInt64; catalogExpansionFactor @7 :UInt64;
+  queryTextBytes @8 :UInt64; bindingBytes @9 :UInt64; bindingNodes @10 :UInt32;
+}
+enum SparqlForm { select @0; ask @1; graph @2; }
+struct SparqlSolution { cells @0 :List(OptionalRdfTerm); }
+struct RdfQuad { subject @0 :UInt32; predicate @1 :UInt32; object @2 :UInt32; graph @3 :OptionalRdfTerm; }
+struct RdfReifier { reifier @0 :UInt32; triple @1 :UInt32; graph @2 :OptionalRdfTerm; }
+struct RdfAnnotation { reifier @0 :UInt32; predicate @1 :UInt32; object @2 :UInt32; graph @3 :OptionalRdfTerm; }
+struct SparqlGraphItem { auxiliary @0 :Bool; union { declaration @1 :UInt32; quad @2 :RdfQuad; reifier @3 :RdfReifier; annotation @4 :RdfAnnotation; } }
+struct SparqlItem { union { solution @0 :SparqlSolution; boolean @1 :Bool; graph @2 :SparqlGraphItem; } }
+struct SparqlData { form @0 :SparqlForm; variables @1 :List(Text); terms @2 :List(RdfTermNode); items @3 :List(SparqlItem); }
+struct SparqlPartial { data @0 :SparqlData; positionalPrefix @1 :Bool; }
+struct SparqlOutcome { union { complete @0 :SparqlData; certain @1 :SparqlPartial; atMost @2 :SparqlPartial; unknown @3 :Text; failure @4 :Failure; } }
+struct SparqlPage {
+  page @0 :CatalogReadReceipt; sequence @1 :UInt64; layers @2 :RdfLayers;
+  coverage @3 :SparqlCoverage; governors @4 :NativeGovernorReceipt;
+  evidence @5 :RdfReadEvidence; limits @6 :SparqlHostLimits; outcome @7 :SparqlOutcome;
+  diagnostic @8 :OptionalNativeDiagnostic;
+}
+enum NativeSeverity { error @0; warning @1; note @2; info @3; }
+enum NativeStorageFailure { absent @0; capacity @1; sizeOverflow @2; allocationFailed @3; admissionFailed @4; formattingFailed @5; }
+struct NativeCapacity { space @0 :Text; attempted @1 :WideInteger; limit @2 :WideInteger; }
+struct NativeLocation {
+  path @0 :OptionalText; logical @1 :OptionalText; subject @2 :OptionalText;
+  line @3 :OptionalLimit; column @4 :OptionalLimit; gtsTermId @5 :OptionalLimit;
+  gtsQuadIndex @6 :OptionalLimit; gtsReifierId @7 :OptionalLimit;
+  gtsFrameIndex @8 :OptionalLimit; gtsSegmentIndex @9 :OptionalLimit;
+}
+struct NativeParameter { name @0 :Text; union { text @1 :Text; unsigned @2 :UInt64; signed @3 :Int64; boolean @4 :Bool; character @5 :UInt32; } }
+# Outer presentation first, followed by each nested detail in order.
+struct NativePresentation { messageId @0 :Text; english @1 :Text; parameters @2 :List(NativeParameter); }
+struct NativeDiagnostic {
+  severity @0 :NativeSeverity; code @1 :Text; message @2 :Text; detail @3 :OptionalText;
+  location @4 :NativeLocation; hasLocation @5 :Bool;
+  presentation @6 :List(NativePresentation); storageFailure @7 :NativeStorageFailure;
+  capacity @8 :NativeCapacity;
+}
+struct OptionalNativeDiagnostic { union { absent @0 :Void; value @1 :NativeDiagnostic; } }

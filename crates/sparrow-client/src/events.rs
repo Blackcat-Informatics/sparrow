@@ -409,11 +409,13 @@ fn encode_fields(
         }
     }
 }
-fn wide(mut out: wire::wide_integer::Builder<'_>, value: u128) {
+/// Encode the exact bit pattern of an unsigned 128-bit integer.
+pub fn wide(mut out: wire::wide_integer::Builder<'_>, value: u128) {
     out.set_high((value >> 64) as u64);
     out.set_low(value as u64);
 }
-fn read_wide(value: wire::wide_integer::Reader<'_>) -> u128 {
+/// Decode both words without reducing the integer to a 64-bit value.
+pub fn read_wide(value: wire::wide_integer::Reader<'_>) -> u128 {
     (u128::from(value.get_high()) << 64) | u128::from(value.get_low())
 }
 fn decode_fields(

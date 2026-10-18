@@ -52,6 +52,7 @@ mod events;
 pub use events::{
     EventBatch, EventField, EventSpan, FieldValue, MAX_EVENT_BATCH_BYTES, MAX_EVENT_BATCH_EVENTS,
     MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
+    read_wide as decode_wide_integer, wide as encode_wide_integer,
 };
 mod delivery;
 mod logging;
@@ -63,7 +64,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 50;
+pub const SCHEMA_VERSION: u32 = 51;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 

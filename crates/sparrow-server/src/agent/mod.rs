@@ -29,6 +29,7 @@ mod search;
 mod selection;
 mod source_time;
 mod sources;
+mod sparql;
 mod status;
 mod syslog;
 mod tail;
@@ -41,6 +42,7 @@ type Result<T> = AgentResult<T>;
 pub(crate) mod tool;
 
 pub(super) const USAGE: &str = concat!(
+    "sparrow SOCKET_PATH sparql REQUEST.json; ",
     "usage: sparrow SOCKET_PATH status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
     " | retention-metrics STORE_ID [--max-visits N] [--catalog-bytes N] [--payload-bytes N]",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
@@ -66,6 +68,7 @@ pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<
 pub(super) enum Command {
     Flush(sparrow_client::DurabilityWatermark),
     Status,
+    Sparql(Box<sparql::Input>),
     Result(result::Input),
     ReleaseResult(result::ReleaseInput),
     Watch(watch::Input),
@@ -190,6 +193,14 @@ fn parse_kind(
 
 impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
+        if args.first().is_some_and(|arg| arg == "sparql") {
+            if args.len() != 2 {
+                return Err(invalid("sparql requires REQUEST.json"));
+            }
+            return Ok(Self::Sparql(Box::new(sparql::Input::decode(
+                &records::read_control_file(&args[1], 64)?,
+            )?)));
+        }
         if args.first().is_some_and(|arg| arg == "ingest-get") {
             return Ok(Self::IngestStatus(ingest_status::Input::parse(&args[1..])?));
         }
@@ -226,7 +237,7 @@ impl Command {
             }
             let mappings = if define {
                 Some(
-                    diagnostic::decode_mappings(&records::read_control_file(&args[2])?)
+                    diagnostic::decode_mappings(&records::read_control_file(&args[2], 8)?)
                         .map_err(|e| invalid(e.to_string()))?,
                 )
             } else {
@@ -434,7 +445,7 @@ impl Command {
                 "--source" => options.source = Some(value.clone()),
                 "--scope-file" => {
                     options.selection = Box::new(
-                        selection::decode(&records::read_control_file(value)?)
+                        selection::decode(&records::read_control_file(value, 8)?)
                             .map_err(|e| invalid(e.to_string()))?,
                     )
                 }
@@ -508,6 +519,9 @@ impl Command {
     }
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+        if let Self::Sparql(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
         if let Self::Diagnostic(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
