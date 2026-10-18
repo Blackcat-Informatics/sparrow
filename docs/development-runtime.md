@@ -11,6 +11,39 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-59 tracing source qualification
+
+Schema 59 normalizes typed producer observations through the original metadata
+graph, using persisted native ordered JSON facts and native scalar/RDF codecs.
+Span IRIs include the producer instance. Lifecycle, context, parent and
+follows-from claims retain their observing record or context entry and exact
+context source spans; they do not become inferred global causal relationships.
+Invalid/ambiguous claimed observations publish interpretation diagnostics without
+partial relationships. Missing/corrupt required projection or profile state is a
+hard failure.
+
+The new writer formats 77..87 preserve all eleven prior authority families.
+One durable catalog pager backfills one metadata owner per atomic batch using
+the same dictionary/refcount writer as ingestion and retirement. Its bounded
+JSON input charge is shared with provenance migration. Historical-format tests
+continue checking watching, handoff, diagnostic, receiver, pressure and manifest
+retirement authority. Explicit legacy fixtures remove the newer tracing profile
+and checkpoint alongside other deliberately removed upgrade state.
+
+Qualification includes 28 core unit, 187 storage and 65 RPC tests, formatting,
+release Clippy with warnings denied, the other workspace tests, seeded census
+self-tests and 287 pinned ownership jobs with no distinct exceptions. The new
+storage regression covers reused span numbers in different instances, ambiguous
+profiles without relationship prefixes, exact context-object byte ranges,
+missing projection refusal after the durable fence, successful restart/replay,
+record-pin survival after parent/window expiry and final relationship retirement.
+Typed producer RPC coverage compares TCP CLI and Unix MCP native graph results.
+Early gate attempts and the final normal commit hook are retained under
+`.stage/native-graph-integration/tracing-*`.
+
+The installed service remains schema 58. Default-image build, closed-copy
+migration and runtime adoption remain separate from this source qualification.
+
 ## Schema-58 live adoption
 
 Signed source `4aadf2c782e980a5ad3a617d7d488d2c8f9850d2` passed the full normal

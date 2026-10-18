@@ -133,9 +133,11 @@ pub fn remove_artifact_rdf_upgrade(db: &rocksdb::DB) -> Result<(), Box<dyn std::
     }
     db.delete("artifact-rdf-index-upgrade")?;
     db.delete("all-artifact-rdf-index-upgrade")?;
+    db.delete("tracing-rdf:profile")?;
     for checkpoint in [
         "record-provenance-rdf-upgrade",
         "artifact-provenance-rdf-upgrade",
+        "tracing-rdf-upgrade",
     ] {
         db.delete(checkpoint)?;
     }

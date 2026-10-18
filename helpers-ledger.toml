@@ -2,6 +2,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "tracing-observation-rdf"
+summary = "One occurrence-owned tracing projection uses native ordered JSON facts, unique mapped occurrences, native scalar/hex codecs and the native RDF builder. Context and lifecycle claims retain their observing record and source ranges; span identities remain producer-instance scoped."
+home = "sparrow_core::storage::tracing_rdf::append"
+entry_points = ["sparrow_core::storage::tracing_rdf::observation", "sparrow_core::storage::tracing_rdf::Facts::at", "sparrow_core::storage::tracing_rdf::Facts::number", "sparrow_core::storage::rdf_index::metadata"]
+spec = "docs/interfaces.md: schema 59 tracing relationship observations."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_tracing_json_elsewhere|infer_global_span_parent|normalize_tracing_rdf_elsewhere)$']
+
+[[job]]
+id = "tracing-rdf-backfill"
+summary = "The tracing writer fence preserves every original authority family; the shared durable catalog pager replaces one metadata owner per admitted atomic batch through its original RDF dictionary/refcount writer."
+home = "sparrow_core::storage::tracing_rdf::upgrade"
+entry_points = ["sparrow_core::storage::tracing_rdf::publish", "sparrow_core::storage::catalog_upgrade::json_charge", "sparrow_core::storage::writer_format::enable_tracing"]
+spec = "docs/interfaces.md: schema 59 tracing relationship observations."
+vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(copy_tracing_upgrade_pager|append_unowned_tracing_graph)$']
+
+[[job]]
 id = "native-correlation-recipes"
 summary = "One fixed recipe owner normalizes selector parameters, fingerprints the recipe and supplies typed substitutions to native governed SPARQL; the original snapshot, result leases and interpretation coverage remain shared. No local relationship evaluator or interpolated user query text."
 home = "sparrow_core::storage::correlation::prepare"
@@ -4144,7 +4172,7 @@ names = ['^(copy_rdf_retirement_into_test_fixture|remove_artifact_rdf_upgrade_el
 id = "owned-provenance-rdf-upgrade"
 summary = "One bounded startup migration augments actual metadata graph owners, including private preparation, using native term codecs and builders; replacement reuses the existing dictionary and reference writer."
 home = "sparrow_core::storage::provenance_rdf::upgrade"
-entry_points = ["sparrow_core::storage::provenance_rdf::publish", "sparrow_core::storage::provenance_rdf::charge", "sparrow_core::storage::provenance_rdf::failure", "sparrow_core::storage::rdf_index::RdfWrite::replace_metadata", "sparrow_core::storage::rdf_index::manifest_rows"]
+entry_points = ["sparrow_core::storage::provenance_rdf::publish", "sparrow_core::storage::catalog_upgrade::json_charge", "sparrow_core::storage::provenance_rdf::failure", "sparrow_core::storage::rdf_index::RdfWrite::replace_metadata", "sparrow_core::storage::rdf_index::manifest_rows"]
 spec = "docs/interfaces.md: Source and Stream provenance ownership."
 vectors = ["crates/sparrow-core/src/storage/rdf_index.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []

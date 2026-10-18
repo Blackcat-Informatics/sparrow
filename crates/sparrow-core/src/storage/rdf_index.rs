@@ -728,6 +728,7 @@ pub(super) fn metadata(
     record: &Record,
     payload: &str,
     state: Option<&Value>,
+    facts: Option<&Value>,
 ) -> Result<std::sync::Arc<RdfDataset>, Error> {
     use purrdf::RdfLiteral;
     const NS: &str = "urn:sparrow:vocab:";
@@ -888,6 +889,7 @@ pub(super) fn metadata(
         let object = builder.intern_iri(&graph_iri(&record.rdf_projection_id))?;
         builder.push_quad(subject, predicate, object, None)?;
     }
+    super::tracing_rdf::append(&mut builder, record, subject, facts)?;
     metadata_dataset(builder)
 }
 

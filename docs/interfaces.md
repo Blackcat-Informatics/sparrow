@@ -1987,8 +1987,60 @@ that remap cloned span IDs are refused visibly rather than silently rewriting
 identities. The normal Registry preserves IDs. Application formatters and the
 subscriber's own bookkeeping remain application-controlled; the layer bounds its
 own buffers and uses nonblocking access to its snapshot and delivery state.
-The canonical event source currently carries span relationships; a separately
-normalized diagnostic RDF relationship view remains unfinished.
+### Tracing relationship observations (schema 59)
+
+Source schema 59 adds occurrence-owned tracing RDF to typed producer records.
+It reads the existing native ordered JSON facts for the explicit
+`sparrow.events/1` source profile. It uses the original native scalar codecs and
+RDF builder; it does not parse event JSON again or replace the typed client's
+event validation. Ordinary byte uploads do not acquire producer authority by
+claiming this profile. Original fields, repeated names and lexical source spans
+remain available through the unchanged JSON projection and byte operations.
+
+Record metadata carries `tracingProfile="sparrow-tracing-rdf/1"` and
+`tracingState`: `complete`, `not_applicable`, `projection_unavailable`, or
+`invalid_observation`. Invalid/ambiguous claimed observations expose a
+`tracingDiagnostic` and no relationship prefix. Corrupt stored projection facts
+and missing required migration inputs remain operational failures.
+Graph coverage and native query certainty do not replace this interpretation
+state: relationship queries must account for records without a complete tracing
+interpretation before claiming absence or complete producer history.
+
+Complete observations expose `eventKind`, `eventName`, `eventTarget`,
+`eventLevel`, `clientInstance`, optional `observedSpan` and `followsFromSpan`.
+The observing Record is the evidence subject; its existing receipt/event clocks,
+producer sequence, parent artifact and byte range remain queryable.
+Span identities are `urn:sparrow:span:<32 lowercase instance hex>:<nonzero ID>`
+with class `Span`, `clientInstance` and typed `spanIdentity`. A process instance
+separates reused span IDs. These are declared producer identities, not proof of
+authentication or a global distributed trace identity.
+
+Each `spanContext` object is an occurrence-specific context entry, with
+`contextIndex`, `observedSpan`, optional `declaredParentSpan`, `eventName`,
+`eventTarget`, and exact original `sourceByteStart`/`sourceByteEnd` for that
+native context object. Context entries are identified by record ID and ordinal;
+the same span observed twice remains two evidence observations. Parent and
+follows-from claims stay on their observing entry/record. They do not establish
+an inferred global parent or causal ordering. Span lifecycle kinds preserve the
+original `span_new`, `span_record`, `span_enter`, `span_exit`, `span_close` and
+`span_follows_from` observations; no missing lifecycle event is invented.
+
+These facts share the existing record metadata graph and lifetime. A record pin
+retains its observation after parent/producer-window expiry; it does not pin
+other observations or span history. Removing metadata from the selected RDF
+layers hides the tracing view too. Existing native SPARQL RPC, CLI/MCP, frozen
+scopes and continuations query this view without a second execution path.
+
+Writer formats 77..87 add tracing to the corresponding provenance authority
+families 66..76. A bounded durable startup job replaces one producer record's
+metadata graph per atomic page through the original RDF dictionary/refcount
+owner. It reuses persisted native JSON facts, retains raw bytes and occurrence
+clocks, and refuses missing inputs or admission exhaustion. Its 128 MiB page
+accounts encoded/decoded input at the existing 65x input-plus-decoding law;
+native RDF staging and disk maintenance admission remain independently bounded.
+Older writers refuse the new format; every later authority transition preserves
+the tracing fence. The running version is recorded separately in Development
+runtime.
 
 Run `cargo run --release -p sparrow-client --example tracing -- SOCKET SOURCE`
 for application-owned scoped subscriber composition and an explicit durable

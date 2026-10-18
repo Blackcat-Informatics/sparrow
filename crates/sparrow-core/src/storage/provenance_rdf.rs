@@ -17,7 +17,7 @@ const RECORDS: catalog_upgrade::Job = catalog_upgrade::Job {
     target: b"provenance-rdf:record:",
     page_bytes: PAGE_BYTES,
     page_entries: 1,
-    charge,
+    charge: |bytes| catalog_upgrade::json_charge(bytes, PAGE_BYTES),
     publish,
 };
 const ARTIFACTS: catalog_upgrade::Job = catalog_upgrade::Job {
@@ -51,17 +51,6 @@ pub(super) fn upgrade(db: &DB, disk_budget: u64, reserve: u64) -> Result<(), Err
 
 fn failure(message: &str) -> Error {
     Error::new("STORAGE_FAILURE", format!("provenance RDF: {message}"))
-}
-
-fn charge(bytes: &[u8]) -> Result<usize, Error> {
-    let charge = bytes.len().saturating_mul(65);
-    if charge > PAGE_BYTES {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
-            "provenance manifest exceeds migration admission",
-        ));
-    }
-    Ok(charge)
 }
 
 fn publish(

@@ -301,7 +301,7 @@ impl<'a> RecordBatch<'a> {
         self.rdf.graph(
             &mut self.batch,
             &record.id,
-            rdf_index::metadata(&record, &digest, rdf_state)?.as_ref(),
+            rdf_index::metadata(&record, &digest, rdf_state, json)?.as_ref(),
         )?;
         if let Some(owner) = super::diagnostic::graph_owner(&record) {
             self.rdf.graph(

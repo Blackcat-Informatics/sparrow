@@ -31,6 +31,16 @@ certainty remains independent. This source implementation does not resolve the
 borrowed text producer or operational EXPLAIN gaps below. Default-image private
 qualification and live adoption are recorded separately in Development runtime.
 
+Source schema 59 adds the normalized tracing observation view through the
+existing metadata graph and query paths. It consumes native ordered JSON facts,
+preserves producer-instance span identity and occurrence-specific parent/context
+evidence, and uses the shared catalog pager/native dictionary owner for backfill.
+Invalid claimed observations expose interpretation diagnostics without partial
+relationships. Required projection/profile corruption remains a hard failure.
+This is independent of the borrowed text producer, governed explanation and
+physical reclamation gaps below; the installed service remains schema 58 until
+separate runtime qualification and adoption are recorded.
+
 ## Query-scoped stored text producers
 
 [PurRDF #601](https://github.com/Blackcat-Informatics/purrdf/issues/601) requests

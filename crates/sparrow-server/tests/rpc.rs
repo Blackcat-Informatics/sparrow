@@ -197,7 +197,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/70"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/81"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -3041,7 +3041,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/69");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/80");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -3258,7 +3258,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/68")
+                Some("sparrow.store/79")
             );
         })
         .await;
@@ -3622,7 +3622,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/68"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/79"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -6331,6 +6331,8 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         let store_path = dir.path().join("store");
         let socket = store_path.join("rpc.sock");
         let config = write_server_config(dir.path(), &store_path, &socket);
+        let (address, reservation) = configure_tcp_listener(&config);
+        drop(reservation);
         let daemon = start(&config, &socket).await;
         let producer = sparrow_client::Client::connect(&socket).await.unwrap();
         assert_eq!(producer.discovery().max_event_batch_events, 256);
@@ -6389,6 +6391,24 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         assert_eq!(read["structuredContent"], initial);
         let sources = cli(&socket, &["sources", &receipt.store_id, "--source", "structured-sdk"]);
         assert_eq!(sources["rows"][0]["producer_stream_ids"][0].as_str(), Some(stream_id.as_str()));
+        let tracing_query = purrdf_lex::json::Object::new()
+            .with("store_id", receipt.store_id.clone())
+            .with("source", "structured-sdk")
+            .with("layers", purrdf_lex::json::Object::new().with("metadata", true).with("diagnostic", false).with("content", false))
+            .with("query", "PREFIX s: <urn:sparrow:vocab:> SELECT ?kind ?span WHERE { ?record s:tracingState \"complete\" ; s:eventKind ?kind ; s:observedSpan ?span } ORDER BY ?kind");
+        let tracing_path = dir.path().join("tracing-query.json");
+        std::fs::write(&tracing_path, purrdf_lex::json::write_compact(&tracing_query.clone().into())).unwrap();
+        let tracing_cli = cli(format!("tcp://{address}"), &["sparql", tracing_path.to_str().unwrap()]);
+        let tracing_mcp = mcp.tool(91, "sparql_query", tracing_query.into()).await;
+        assert_eq!(tracing_mcp["isError"].as_bool(), Some(false));
+        assert_eq!(tracing_mcp["structuredContent"]["rows"], tracing_cli["rows"]);
+        assert_eq!(tracing_cli["answer_certainty"].as_str(), Some("exact"));
+        let tracing_rows = tracing_cli["rows"]["native_result"]["results"]["bindings"].as_array().unwrap();
+        assert_eq!(tracing_rows.len(), 3);
+        for (row, kind) in tracing_rows.iter().zip(["log", "span_close", "span_new"]) {
+            assert_eq!(row["kind"]["value"].as_str(), Some(kind));
+            assert_eq!(row["span"]["value"].as_str(), Some("urn:sparrow:span:09090909090909090909090909090909:42"));
+        }
         let mut next = batch.clone(); next.request_id = "typed-events-next".into();
         next.events = vec![batch.events[1].clone()]; next.events[0].sequence = 8; next.events[0].event_time += 1000;
         let next_receipt = producer.events(&next).await.unwrap();

@@ -9,6 +9,18 @@ use rocksdb::{DB, Direction, IteratorMode, WriteBatch, WriteOptions};
 type Publish = fn(&DB, &str, &[u8], usize, &mut WriteBatch) -> Result<(), Error>;
 type PageAdmission<'a> = Option<&'a dyn Fn(&WriteBatch) -> Result<(), Error>>;
 
+/// Encoded input plus the shared 64x catalog JSON decoding allowance.
+pub(super) fn json_charge(bytes: &[u8], maximum: usize) -> Result<usize, Error> {
+    let charge = bytes.len().saturating_mul(65);
+    if charge > maximum {
+        return Err(Error::new(
+            "RESOURCE_LIMIT",
+            "catalog JSON exceeds migration admission",
+        ));
+    }
+    Ok(charge)
+}
+
 pub(super) struct Job {
     pub checkpoint: &'static str,
     pub source: &'static str,
