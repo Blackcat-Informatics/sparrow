@@ -1630,7 +1630,7 @@ names = ['^(prepare_import_layout|build_record_layout)$']
 id = "native-record-preparation"
 summary = "Prepare original record bytes and native JSON, RDF, text and source-time dependencies once for catalog publication."
 home = "sparrow_core::storage::ingest::RecordBatch::record"
-entry_points = ["sparrow_core::storage::ingest::RecordBatch::prepare", "sparrow_core::storage::ingest::RecordBatch::finish"]
+entry_points = ["sparrow_core::storage::ingest::RecordBatch::prepare"]
 spec = "docs/development-runtime.md: shared record preparation and bounded staged byte reads."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -4018,7 +4018,7 @@ names = ['^(rebuild_scoped_rdf_in_memory|copy_foreign_quad_scan_for_describe)$']
 id = "artifact-rdf-writer-authority"
 summary = "One explicit writer-format map adds artifact RDF to each existing authority family and preserves that fence across watch, consumption, receiver, pressure and manifest transitions. Discovery retains the actual stored identity."
 home = "sparrow_core::storage::writer_format::stage"
-entry_points = ["sparrow_core::storage::writer_format::read", "sparrow_core::storage::writer_format::enable", "sparrow_core::storage::writer_format::has_artifact_rdf", "sparrow_core::storage::writer_format::has_all_artifact_rdf", "sparrow_core::storage::writer_format::enable_all"]
+entry_points = ["sparrow_core::storage::writer_format::read", "sparrow_core::storage::writer_format::enable", "sparrow_core::storage::writer_format::has_artifact_rdf", "sparrow_core::storage::writer_format::has_all_artifact_rdf", "sparrow_core::storage::writer_format::enable_all", "sparrow_core::storage::writer_format::has_provenance", "sparrow_core::storage::writer_format::enable_provenance"]
 spec = "docs/interfaces.md: recordless artifact RDF writer authority."
 vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -4046,7 +4046,7 @@ names = ['^(recordless_rdf_publish_elsewhere|rebuild_artifact_graph_in_query)$']
 id = "occurrence-rdf-envelope"
 summary = "One native PurRDF builder emits shared payload, class, source and retention metadata for record and recordless artifact occurrences; domain-specific predicates extend that same envelope."
 home = "sparrow_core::storage::rdf_index::occurrence_metadata"
-entry_points = ["sparrow_core::storage::rdf_index::metadata_dataset", "sparrow_core::storage::rdf_index::metadata", "sparrow_core::storage::rdf_index::artifact_metadata"]
+entry_points = ["sparrow_core::storage::rdf_index::metadata_dataset", "sparrow_core::storage::rdf_index::metadata", "sparrow_core::storage::rdf_index::artifact_metadata", "sparrow_core::storage::rdf_index::source_metadata", "sparrow_core::storage::rdf_index::stream_metadata"]
 spec = "docs/interfaces.md: core graph vocabulary and recordless artifact RDF."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -4058,7 +4058,7 @@ names = ['^(copy_occurrence_rdf_envelope|empty_artifact_rdf_projector)$']
 
 [[job]]
 id = "legacy-artifact-rdf-test-fixture"
-summary = "Dev-only legacy fixtures retire artifact-only owners through the same native writer before removing both migration checkpoints; record graphs and payloads remain intact, and no retirement semantics are copied."
+summary = "Dev-only legacy fixtures retire artifact-only owners through the same native writer before removing owned-metadata migration checkpoints and provenance markers; record graphs and payloads remain intact, and no retirement semantics are copied."
 home = "sparrow_test_support::remove_artifact_rdf_upgrade"
 entry_points = ["sparrow_core::storage::artifact_rdf::retire_artifact_rdf_for_legacy_fixture"]
 spec = "docs/interfaces.md: recordless artifact RDF writer authority."
@@ -4069,6 +4069,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(copy_rdf_retirement_into_test_fixture|remove_artifact_rdf_upgrade_elsewhere)$']
+
+[[job]]
+id = "owned-provenance-rdf-upgrade"
+summary = "One bounded startup migration augments actual metadata graph owners, including private preparation, using native term codecs and builders; replacement reuses the existing dictionary and reference writer."
+home = "sparrow_core::storage::provenance_rdf::upgrade"
+entry_points = ["sparrow_core::storage::provenance_rdf::publish", "sparrow_core::storage::provenance_rdf::charge", "sparrow_core::storage::provenance_rdf::failure", "sparrow_core::storage::rdf_index::RdfWrite::replace_metadata", "sparrow_core::storage::rdf_index::manifest_rows"]
+spec = "docs/interfaces.md: Source and Stream provenance ownership."
+vectors = ["crates/sparrow-core/src/storage/rdf_index.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(copy_provenance_term_codec|rebuild_source_stream_facts_in_query)$']
 
 [[job]]
 id = "rdf-catalog-body-admission"

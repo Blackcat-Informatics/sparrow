@@ -11,6 +11,27 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-55 Source and Stream implementation
+
+Source now adds minimal Source/Stream RDF through occurrence metadata ownership.
+Formats 66–76 fence older writers; the underlying development authority family
+maps format 59 to 70. Startup migrates actual record/artifact graph owners,
+including private prepared imports, in resumable single-owner atomic batches.
+Native term codecs, builders and the original dictionary reference writer remain
+the only RDF implementation. Migration validates graph slots, dictionary identity
+and exact native term closure before replacing ownership.
+
+Source and Stream facts deduplicate in the default union while retaining named
+occurrence contexts. A record pin preserves them after parent and registry expiry;
+ordinary imports invent no Stream. Metadata-layer exclusion preserves membership.
+Private record preparation now performs data admission at its final atomic write
+boundary, after progress and authority metadata have joined the batch.
+
+The running development service remains schema 54. Schema-55 restored-copy
+migration, ordinary-runtime packaging and live adoption are not yet qualified.
+This implementation does not complete text/SPARQL relations, governed public
+EXPLAIN, forced bounded physical reclamation or production-volume acceptance.
+
 ## Schema-54 live adoption
 
 Signed source `be0994e8a5ee30abf91513b327b460d210244507` passed the normal full

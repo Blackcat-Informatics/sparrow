@@ -79,7 +79,7 @@ pub(super) struct RecordBatch<'a> {
 pub(super) struct PreparedRecords {
     pub batch: WriteBatch,
     pub chunks: Vec<String>,
-    estimate: u64,
+    pub estimate: u64,
 }
 
 impl<'a> RecordBatch<'a> {
@@ -328,14 +328,7 @@ impl<'a> RecordBatch<'a> {
         Ok((prepared.batch, artifact, prepared.estimate))
     }
 
-    pub(super) fn finish(self) -> Result<PreparedRecords, Error> {
-        let writer = self.writer;
-        let prepared = self.prepare()?;
-        writer.admit_data_write(prepared.estimate)?;
-        Ok(prepared)
-    }
-
-    fn prepare(mut self) -> Result<PreparedRecords, Error> {
+    pub(super) fn prepare(mut self) -> Result<PreparedRecords, Error> {
         let mut new_bytes = 0_u64;
         for (id, (state, added)) in self.rdf_projections {
             let key = format!("rdf:projection-ref:{id}");

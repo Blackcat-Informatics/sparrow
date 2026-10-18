@@ -46,9 +46,41 @@ const ALL_RDF: [&[u8]; 11] = [
     b"sparrow.store/64",
     b"sparrow.store/65",
 ];
+const PROVENANCE: [&[u8]; 11] = [
+    b"sparrow.store/66",
+    b"sparrow.store/67",
+    b"sparrow.store/68",
+    b"sparrow.store/69",
+    b"sparrow.store/70",
+    b"sparrow.store/71",
+    b"sparrow.store/72",
+    b"sparrow.store/73",
+    b"sparrow.store/74",
+    b"sparrow.store/75",
+    b"sparrow.store/76",
+];
+
+pub(super) fn has_provenance(format: &[u8]) -> bool {
+    PROVENANCE.contains(&format)
+}
+
+pub(super) fn enable_provenance(format: &[u8]) -> Result<&'static [u8], Error> {
+    BASE.iter()
+        .chain(RDF.iter())
+        .chain(ALL_RDF.iter())
+        .chain(PROVENANCE.iter())
+        .position(|identity| *identity == format)
+        .map(|index| PROVENANCE[index % BASE.len()])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "provenance RDF requires a current authority family",
+            )
+        })
+}
 
 pub(super) fn has_all_artifact_rdf(format: &[u8]) -> bool {
-    ALL_RDF.contains(&format)
+    ALL_RDF.contains(&format) || has_provenance(format)
 }
 
 pub(super) fn has_artifact_rdf(format: &[u8]) -> bool {
@@ -60,6 +92,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
     Ok(db.get("store_format")?.map(|raw| {
         RDF.iter()
             .chain(ALL_RDF.iter())
+            .chain(PROVENANCE.iter())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -98,7 +131,9 @@ pub(super) fn stage(db: &DB, batch: &mut WriteBatch, base: &[u8]) -> Result<(), 
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
     batch.put(
         "store_format",
-        if has_all_artifact_rdf(&current) {
+        if has_provenance(&current) {
+            enable_provenance(base)?
+        } else if has_all_artifact_rdf(&current) {
             enable_all(base)?
         } else if has_artifact_rdf(&current) {
             enable(base)?
@@ -116,7 +151,7 @@ mod tests {
     fn every_authority_transition_preserves_the_artifact_writer_fence() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
-        for family in [RDF, ALL_RDF] {
+        for family in [RDF, ALL_RDF, PROVENANCE] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
                 assert_eq!(read(&db).unwrap().as_deref(), Some(base));
@@ -135,7 +170,12 @@ mod tests {
         for (index, base) in BASE.into_iter().enumerate() {
             for previous in [base, RDF[index], ALL_RDF[index]] {
                 assert_eq!(enable_all(previous).unwrap(), ALL_RDF[index]);
+                assert_eq!(enable_provenance(previous).unwrap(), PROVENANCE[index]);
             }
+            assert_eq!(
+                enable_provenance(PROVENANCE[index]).unwrap(),
+                PROVENANCE[index]
+            );
         }
         assert!(enable(b"sparrow.store/5").is_err());
     }

@@ -192,7 +192,7 @@ impl Writer {
                 },
             )?;
         }
-        if publication.artifact_rdf || record_estimate.is_some() {
+        if publication.owned_rdf_metadata || record_estimate.is_some() {
             // Admit once after source context and authority metadata have joined
             // the exact batch. A smaller preliminary refusal cannot certify a retry.
             self.admit_data_write(

@@ -119,6 +119,18 @@ impl RdfScopeCoverage {
 
 impl StoredRdfView<'_> {
     fn include_owner(&mut self, id: &str) -> Result<(), ReadError> {
+        if id.starts_with("record:") || id.starts_with("artifact:") {
+            let marker = self
+                .snapshot
+                .get_pinned(format!("provenance-rdf:{id}"))
+                .map_err(|e| self.budget.fail(e.into()))?;
+            if marker.as_deref() != Some([].as_slice()) {
+                return Err(self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "occurrence provenance RDF marker missing or invalid",
+                )));
+            }
+        }
         let owner = self
             .term_id_by_value(&TermValue::iri(rdf_index::graph_iri(id)))?
             .ok_or_else(|| {

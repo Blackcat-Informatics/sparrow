@@ -16,6 +16,7 @@ use rocksdb::{
 };
 
 mod artifact_rdf;
+mod provenance_rdf;
 #[cfg(feature = "test-support")]
 pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
 pub(crate) mod artifact_read;
@@ -1228,6 +1229,7 @@ impl Store {
         diagnostic::fence_format(&db)?;
         tail_ranges::upgrade(&db)?;
         artifact_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
+        provenance_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(
                 "STORAGE_FAILURE",

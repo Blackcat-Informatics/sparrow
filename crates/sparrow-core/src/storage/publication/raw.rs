@@ -238,15 +238,18 @@ pub(super) fn advance(
         diagnostic_profile: diagnostic_profile.as_ref(),
     })?;
     parse(super::super::json::write_compact(&record.encode()).as_bytes())?;
-    let ingest::PreparedRecords { mut batch, .. } = builder.finish()?;
+    let ingest::PreparedRecords {
+        mut batch,
+        estimate,
+        ..
+    } = builder.prepare()?;
     put(&mut batch, &record_key(&manifest.id, span.index), &record);
     for index in 0..total.div_ceil(PAGE_CHUNKS) {
         batch.delete(page_key(&manifest.id, span.index, index));
     }
     progress.prepared_records += 1;
     put(&mut batch, &preparation_key(&manifest.id), &progress);
-    writer.admit_import_batch(&batch)?;
-    writer.commit(batch)?;
+    writer.apply(batch, None, Some(estimate))?;
     Ok(progress)
 }
 

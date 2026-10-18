@@ -277,7 +277,11 @@ impl<'a> RdfWrite<'a> {
         Ok(self.next)
     }
 
-    fn closure(&mut self, value: &TermValue, terms: &mut BTreeSet<u64>) -> Result<u64, Error> {
+    pub(super) fn closure(
+        &mut self,
+        value: &TermValue,
+        terms: &mut BTreeSet<u64>,
+    ) -> Result<u64, Error> {
         let id = self.intern(value)?;
         terms.insert(id);
         match value {
@@ -304,7 +308,7 @@ impl<'a> RdfWrite<'a> {
         let checkpoint_next = self.next;
         let checkpoint_bytes = self.staged_bytes;
         let checkpoint_max = self.max_encoded;
-        let result = self.graph_inner(batch, id, dataset);
+        let result = self.graph_inner(batch, id, dataset, false);
         if result.is_err() {
             self.terms.retain(|_, ordinal| *ordinal <= checkpoint_next);
             self.next = checkpoint_next;
@@ -319,10 +323,18 @@ impl<'a> RdfWrite<'a> {
         batch: &mut WriteBatch,
         id: &str,
         dataset: &RdfDataset,
+        replacing: bool,
     ) -> Result<(), Error> {
-        if self.owners.contains(id) || self.db.get(format!("rdf:graph:{id}"))?.is_some() {
+        if self.owners.contains(id)
+            || (!replacing && self.db.get(format!("rdf:graph:{id}"))?.is_some())
+        {
             return Ok(());
         }
+        let provenance = (id.starts_with("record:") || id.starts_with("artifact:"))
+            && self
+                .db
+                .get_pinned("store_format")?
+                .is_some_and(|f| super::writer_format::has_provenance(&f));
         let mut terms = BTreeSet::new();
         let owner = self.closure(&TermValue::iri(graph_iri(id)), &mut terms)?;
         let mut graphs = BTreeSet::from([owner]);
@@ -416,11 +428,31 @@ impl<'a> RdfWrite<'a> {
             }
         }
         batch.put(format!("rdf:graph:{id}"), manifest);
+        if provenance {
+            batch.put(format!("provenance-rdf:{id}"), []);
+        }
         for graph in graphs {
             batch.put(graph_key(graph, owner), []);
         }
         self.owners.insert(id.to_owned());
         Ok(())
+    }
+
+    /// Replace one committed owner atomically through the same dictionary/ref law.
+    pub(super) fn replace_metadata(
+        &mut self,
+        batch: &mut WriteBatch,
+        id: &str,
+        dataset: &RdfDataset,
+    ) -> Result<(), Error> {
+        if self.owners.contains(id) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "cannot replace a staged RDF owner",
+            ));
+        }
+        self.remove(batch, id)?;
+        self.graph_inner(batch, id, dataset, true)
     }
 
     fn adjust(&mut self, id: u64, add: bool) -> Result<(), Error> {
@@ -453,28 +485,7 @@ impl<'a> RdfWrite<'a> {
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF graph manifest missing"))?;
         let manifest = parse(&value)?;
         let owner = integer(&manifest, "owner")?;
-        let rows = manifest
-            .get("rows")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF rows missing"))?;
-        for row in rows {
-            let values = row
-                .as_array()
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid RDF row"))?;
-            if values.len() != 5 {
-                return Err(Error::new("STORAGE_FAILURE", "invalid RDF row width"));
-            }
-            let numbers = values
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid RDF row ID"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let stream = u8::try_from(numbers[0])
-                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid RDF stream"))?;
-            let row = [numbers[1], numbers[2], numbers[3], numbers[4]];
+        for (stream, row) in manifest_rows(&manifest)? {
             for (name, order) in ORDERS {
                 batch.delete(index_key(owner, stream, name, order, &row));
             }
@@ -495,6 +506,7 @@ impl<'a> RdfWrite<'a> {
             batch.delete(graph_key(graph, owner));
         }
         batch.delete(key);
+        batch.delete(format!("provenance-rdf:{id}"));
         Ok(())
     }
 
@@ -539,7 +551,45 @@ impl<'a> RdfWrite<'a> {
     }
 }
 
-fn metadata_dataset(
+pub(super) fn manifest_rows(manifest: &Value) -> Result<Vec<(u8, [u64; 4])>, Error> {
+    let rows = manifest
+        .get("rows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF rows missing"))?;
+    if rows.len() > MAX_ROWS {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "RDF manifest exceeds row bound",
+        ));
+    }
+    rows.iter()
+        .map(|row| {
+            let values = row
+                .as_array()
+                .filter(|v| v.len() == 5)
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid RDF row width"))?;
+            let mut numbers = [0; 5];
+            for (number, value) in numbers.iter_mut().zip(values) {
+                *number = value
+                    .as_str()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid RDF row ID"))?;
+            }
+            if numbers[0] > 2 || numbers[1..].contains(&0) {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "invalid RDF stream or term ID",
+                ));
+            }
+            Ok((
+                numbers[0] as u8,
+                [numbers[1], numbers[2], numbers[3], numbers[4]],
+            ))
+        })
+        .collect()
+}
+
+pub(super) fn metadata_dataset(
     builder: purrdf::RdfDatasetBuilder,
 ) -> Result<std::sync::Arc<RdfDataset>, Error> {
     builder
@@ -554,11 +604,19 @@ fn occurrence_metadata(
     expires_at: u64,
     class: &str,
     payload: &str,
-) -> Result<(purrdf::RdfDatasetBuilder, purrdf::ir::TermId), Error> {
+) -> Result<
+    (
+        purrdf::RdfDatasetBuilder,
+        purrdf::ir::TermId,
+        purrdf::ir::TermId,
+    ),
+    Error,
+> {
     use purrdf::{RdfDatasetBuilder, RdfLiteral};
     const NS: &str = "urn:sparrow:vocab:";
     let mut builder = RdfDatasetBuilder::new();
     let subject = builder.intern_iri(&format!("urn:sparrow:{id}"))?;
+    let source_node = source_metadata(&mut builder, source)?;
     for (predicate, object) in [
         (
             format!("{NS}payload"),
@@ -568,10 +626,7 @@ fn occurrence_metadata(
             "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into(),
             builder.intern_iri(&format!("{NS}{class}"))?,
         ),
-        (
-            format!("{NS}source"),
-            builder.intern_iri(&super::source_read::source_iri(source))?,
-        ),
+        (format!("{NS}source"), source_node),
         (
             format!("{NS}sourceName"),
             builder.intern_literal(RdfLiteral::simple(source))?,
@@ -594,7 +649,42 @@ fn occurrence_metadata(
         let predicate = builder.intern_iri(&predicate)?;
         builder.push_quad(subject, predicate, object, None)?;
     }
-    Ok((builder, subject))
+    Ok((builder, subject, source_node))
+}
+
+pub(super) fn source_metadata(
+    builder: &mut purrdf::RdfDatasetBuilder,
+    source: &str,
+) -> Result<purrdf::ir::TermId, Error> {
+    let node = builder.intern_iri(&super::source_read::source_iri(source))?;
+    let predicate = builder.intern_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")?;
+    let class = builder.intern_iri("urn:sparrow:vocab:Source")?;
+    builder.push_quad(node, predicate, class, None)?;
+    let predicate = builder.intern_iri("urn:sparrow:vocab:sourceName")?;
+    let name = builder.intern_literal(purrdf::RdfLiteral::simple(source))?;
+    builder.push_quad(node, predicate, name, None)?;
+    Ok(node)
+}
+
+pub(super) fn stream_metadata(
+    builder: &mut purrdf::RdfDatasetBuilder,
+    subject: purrdf::ir::TermId,
+    source: purrdf::ir::TermId,
+    stream_iri: &str,
+    kind: &str,
+) -> Result<(), Error> {
+    let stream = builder.intern_iri(stream_iri)?;
+    let link = builder.intern_iri("urn:sparrow:vocab:stream")?;
+    builder.push_quad(subject, link, stream, None)?;
+    let predicate = builder.intern_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")?;
+    let class = builder.intern_iri("urn:sparrow:vocab:Stream")?;
+    builder.push_quad(stream, predicate, class, None)?;
+    let predicate = builder.intern_iri("urn:sparrow:vocab:source")?;
+    builder.push_quad(stream, predicate, source, None)?;
+    let predicate = builder.intern_iri("urn:sparrow:vocab:streamKind")?;
+    let kind = builder.intern_literal(purrdf::RdfLiteral::simple(kind))?;
+    builder.push_quad(stream, predicate, kind, None)?;
+    Ok(())
 }
 
 pub(super) fn artifact_metadata(
@@ -607,7 +697,7 @@ pub(super) fn artifact_metadata(
             "artifact payload identity has no hash profile",
         )
     })?;
-    let (mut builder, subject) = occurrence_metadata(
+    let (mut builder, subject, _) = occurrence_metadata(
         &artifact.id,
         &artifact.source,
         artifact.received_at,
@@ -641,7 +731,7 @@ pub(super) fn metadata(
 ) -> Result<std::sync::Arc<RdfDataset>, Error> {
     use purrdf::RdfLiteral;
     const NS: &str = "urn:sparrow:vocab:";
-    let (mut builder, subject) = occurrence_metadata(
+    let (mut builder, subject, source) = occurrence_metadata(
         &record.id,
         &record.source,
         record.received_at,
@@ -649,6 +739,40 @@ pub(super) fn metadata(
         "Record",
         payload,
     )?;
+    let mut origin = None;
+    for candidate in [
+        record
+            .tail
+            .as_ref()
+            .map(|p| (p.generation_id.as_str(), "file-generation")),
+        record
+            .producer
+            .as_ref()
+            .map(|p| (p.stream_id.as_str(), "producer")),
+        record
+            .receiver
+            .as_ref()
+            .map(|p| (p.window_id.as_str(), "receiver-window")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if origin.replace(candidate).is_some() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "record has contradictory stream origins",
+            ));
+        }
+    }
+    if let Some((id, kind)) = origin {
+        stream_metadata(
+            &mut builder,
+            subject,
+            source,
+            &format!("urn:sparrow:{id}"),
+            kind,
+        )?;
+    }
     for (predicate, object) in [
         (
             format!("{NS}projectionState"),
@@ -727,9 +851,6 @@ pub(super) fn metadata(
         }
     }
     if let Some(position) = &record.producer {
-        let predicate = builder.intern_iri(&format!("{NS}stream"))?;
-        let object = builder.intern_iri(&format!("urn:sparrow:{}", position.stream_id))?;
-        builder.push_quad(subject, predicate, object, None)?;
         let predicate = builder.intern_iri(&format!("{NS}producerSequence"))?;
         let object = builder.intern_literal(RdfLiteral::typed(
             position.sequence.to_string(),
@@ -778,6 +899,154 @@ mod tests {
         for key in ["rdf:term-count", "rdf:max-encoded", "rdf:next"] {
             db.put(key, 0_u64.to_be_bytes()).unwrap();
         }
+    }
+
+    #[test]
+    fn provenance_upgrade_covers_private_owners_and_preserves_native_rows_after_reopen() {
+        use purrdf::{RdfDatasetBuilder, RdfLiteral};
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        empty_dictionary(&db);
+        db.put("store_format", b"sparrow.store/59").unwrap();
+        let source = super::super::source_read::source_iri("original source");
+        for (id, field, stream) in [
+            ("record:private", "stream", "producer-stream:original"),
+            ("record:tail", "fileGeneration", "file-generation:original"),
+            (
+                "record:receiver",
+                "receiverWindow",
+                "receiver-window:original",
+            ),
+            ("artifact:ordinary", "", ""),
+        ] {
+            let mut builder = RdfDatasetBuilder::new();
+            let subject = builder.intern_iri(&format!("urn:sparrow:{id}")).unwrap();
+            for (predicate, object) in [
+                ("source", builder.intern_iri(&source).unwrap()),
+                (
+                    "sourceName",
+                    builder
+                        .intern_literal(RdfLiteral::simple("original source"))
+                        .unwrap(),
+                ),
+            ] {
+                let predicate = builder
+                    .intern_iri(&format!("urn:sparrow:vocab:{predicate}"))
+                    .unwrap();
+                builder.push_quad(subject, predicate, object, None).unwrap();
+            }
+            if !field.is_empty() {
+                let predicate = builder
+                    .intern_iri(&format!("urn:sparrow:vocab:{field}"))
+                    .unwrap();
+                let object = builder
+                    .intern_iri(&format!("urn:sparrow:{stream}"))
+                    .unwrap();
+                builder.push_quad(subject, predicate, object, None).unwrap();
+            }
+            let mut rdf = RdfWrite::new(&db).unwrap();
+            let mut batch = WriteBatch::default();
+            rdf.graph(&mut batch, id, &builder.freeze().unwrap())
+                .unwrap();
+            rdf.finish(&mut batch).unwrap();
+            db.write(batch).unwrap();
+            assert!(
+                db.get(id).unwrap().is_none(),
+                "private graph has no public catalog row"
+            );
+        }
+        let receiver_bytes = db.get("rdf:graph:record:receiver").unwrap().unwrap();
+        let mut receiver_manifest = parse(&receiver_bytes).unwrap();
+        let receiver_subject = manifest_rows(&receiver_manifest).unwrap()[0].1[0];
+        *receiver_manifest.get_mut("terms").unwrap() = Value::array(std::iter::empty::<String>());
+        db.put(
+            "rdf:graph:record:receiver",
+            purrdf_lex::json::write_compact(&receiver_manifest),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::provenance_rdf::upgrade(&db, 128 * 1024 * 1024, 16 * 1024 * 1024)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        let count_after_private = required_counter(&db, "rdf:term-count").unwrap();
+        db.put("rdf:graph:record:receiver", receiver_bytes).unwrap();
+        let missing_key = term_key(receiver_subject);
+        let saved = db.get(&missing_key).unwrap().unwrap();
+        db.delete(&missing_key).unwrap();
+        assert_eq!(
+            super::super::provenance_rdf::upgrade(&db, 128 * 1024 * 1024, 16 * 1024 * 1024)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        assert!(db.get("provenance-rdf:record:private").unwrap().is_some());
+        assert!(db.get("provenance-rdf:record:receiver").unwrap().is_none());
+        assert_eq!(
+            required_counter(&db, "rdf:term-count").unwrap(),
+            count_after_private
+        );
+        assert_eq!(
+            parse(&db.get("record-provenance-rdf-upgrade").unwrap().unwrap()).unwrap()["after"]
+                .as_str(),
+            Some("rdf:graph:record:private")
+        );
+        db.put(missing_key, saved).unwrap();
+        drop(db);
+        let db = DB::open_default(dir.path()).unwrap();
+        super::super::provenance_rdf::upgrade(&db, 128 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
+        assert_eq!(
+            db.get("store_format").unwrap().unwrap(),
+            b"sparrow.store/70"
+        );
+        let before = db
+            .iterator(rocksdb::IteratorMode::Start)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (id, expected_rows) in [
+            ("record:private", 8),
+            ("record:tail", 9),
+            ("record:receiver", 9),
+            ("artifact:ordinary", 4),
+        ] {
+            let manifest = parse(&db.get(format!("rdf:graph:{id}")).unwrap().unwrap()).unwrap();
+            let rows = manifest_rows(&manifest).unwrap();
+            assert_eq!(
+                rows.iter().filter(|(stream, _)| *stream == 0).count(),
+                expected_rows
+            );
+            assert!(
+                db.get(format!("provenance-rdf:{id}"))
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(db);
+        let db = DB::open_default(dir.path()).unwrap();
+        super::super::provenance_rdf::upgrade(&db, 128 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
+        assert_eq!(
+            db.iterator(rocksdb::IteratorMode::Start)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            before
+        );
+        // Native retirement removes the new markers and all shared dictionary references.
+        for id in [
+            "record:private",
+            "record:tail",
+            "record:receiver",
+            "artifact:ordinary",
+        ] {
+            let mut rdf = RdfWrite::new(&db).unwrap();
+            let mut batch = WriteBatch::default();
+            rdf.remove(&mut batch, id).unwrap();
+            rdf.finish(&mut batch).unwrap();
+            db.write(batch).unwrap();
+            assert!(db.get(format!("provenance-rdf:{id}")).unwrap().is_none());
+        }
+        assert_eq!(required_counter(&db, "rdf:term-count").unwrap(), 0);
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub(super) struct Publication {
     pub(super) watch_registry: bool,
     pub(super) receiver_registry: bool,
     pub(super) manifest_retirement: bool,
-    pub(super) artifact_rdf: bool,
+    pub(super) owned_rdf_metadata: bool,
     invalid: bool,
 }
 
@@ -68,7 +68,8 @@ impl Publication {
 impl WriteBatchIteratorCf for Publication {
     fn put_cf(&mut self, cf_id: u32, key: &[u8], _value: &[u8]) {
         if cf_id == 0 {
-            self.artifact_rdf |= key.starts_with(b"artifact-rdf:");
+            self.owned_rdf_metadata |=
+                key.starts_with(b"artifact-rdf:") || key.starts_with(b"provenance-rdf:");
             self.pressure_wait |= key == super::pressure::WAIT_KEY.as_bytes();
             self.watch_registry |= key == b"watch_registry";
             self.receiver_registry |= key == super::receiver_stream::KEY.as_bytes();

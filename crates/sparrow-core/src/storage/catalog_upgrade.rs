@@ -39,7 +39,15 @@ impl Catalog for Progress {
             complete: read_field(value, "complete")?,
         };
         if progress.after.as_ref().is_some_and(|key| {
-            (!key.starts_with("artifact:") && !key.starts_with("record:")) || key.len() > 128
+            (![
+                "artifact:",
+                "record:",
+                "rdf:graph:artifact:",
+                "rdf:graph:record:",
+            ]
+            .iter()
+            .any(|prefix| key.starts_with(prefix)))
+                || key.len() > 128
         }) || (progress.complete && progress.after.is_some())
         {
             return Err(Error::new(

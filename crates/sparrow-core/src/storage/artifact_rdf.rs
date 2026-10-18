@@ -143,17 +143,22 @@ fn backfill_all(
     }
 }
 
-fn admit(db: &DB, disk_budget: u64, reserve: u64, batch: &WriteBatch) -> Result<(), Error> {
+pub(super) fn admit(
+    db: &DB,
+    disk_budget: u64,
+    reserve: u64,
+    batch: &WriteBatch,
+) -> Result<(), Error> {
     let mut publication = super::eviction::Publication::default();
     batch.iterate_cf(&mut publication);
     publication.check()?;
-    if publication.artifact_rdf {
+    if publication.owned_rdf_metadata {
         let estimate = super::pressure::data_batch_estimate(batch);
         let ceiling = super::pressure::data_write_ceiling(disk_budget, reserve, estimate)?;
         if super::linked_physical_bytes(db)? > ceiling {
             return Err(Error::new(
                 "STORAGE_PRESSURE",
-                "artifact RDF backfill needs more data-write allowance; increase the disk budget or free space before resuming",
+                "owned RDF metadata backfill needs more data-write allowance; increase the disk budget or free space before resuming",
             ));
         }
     }

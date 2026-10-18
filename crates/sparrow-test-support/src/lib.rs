@@ -133,6 +133,21 @@ pub fn remove_artifact_rdf_upgrade(db: &rocksdb::DB) -> Result<(), Box<dyn std::
     }
     db.delete("artifact-rdf-index-upgrade")?;
     db.delete("all-artifact-rdf-index-upgrade")?;
+    for checkpoint in [
+        "record-provenance-rdf-upgrade",
+        "artifact-provenance-rdf-upgrade",
+    ] {
+        db.delete(checkpoint)?;
+    }
+    let mut batch = rocksdb::WriteBatch::default();
+    for row in db.prefix_iterator(b"provenance-rdf:") {
+        let (key, _) = row?;
+        if !key.starts_with(b"provenance-rdf:") {
+            break;
+        }
+        batch.delete(key);
+    }
+    db.write(batch)?;
     Ok(())
 }
 

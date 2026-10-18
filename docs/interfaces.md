@@ -894,6 +894,34 @@ Sparrow's vocabulary is `urn:sparrow:vocab:`. Metadata uses `Artifact`, `Record`
 | `projection` | Named graph IRI for a content projection under its recorded profile. |
 | `byteLength`, `sourceByteStart`, `sourceByteEnd` | Typed nonnegative integer lengths/half-open offsets. |
 | `service`, `host`, `severity`, `traceId`, `spanId` | Normalized diagnostic strings when available; source spelling remains in the original evidence. |
+| `sourceName` | Exact logical source label on each occurrence and its `Source` entity. |
+| `streamKind` | `producer`, `file-generation`, or `receiver-window`, identifying the native origin represented by a `Stream`. |
+
+Schema 55 makes minimal `Source` and `Stream` provenance queryable in the
+metadata layer. The Source IRI is the same identity exposed by `sources_list`.
+Records with a declared producer position, tail generation, or receiver window
+link through `stream` to that identity; existing `fileGeneration` and
+`receiverWindow` links remain available. Ordinary file imports do not invent a
+Stream. A receiver window denotes bounded observed intake, not certified sender
+continuity. Mutable registry counters, gap history and current stream state
+remain available through their typed endpoints rather than immutable RDF facts.
+
+These facts belong to the occurrence's metadata graph. Identical facts collapse
+in the default union; named graphs preserve their occurrence contexts. A pinned
+record retains its minimal Source and Stream facts after its parent artifact or
+stream registry entry expires. Retirement removes them with their last selected
+evidence owner. Registry-only sources or windows without retained occurrences
+remain discoverable through the typed registry operations. Excluding the metadata
+layer excludes these facts without changing scope membership.
+
+Store formats 66–76 preserve the underlying authority families while excluding
+older writers. Startup durably fences both provenance migration jobs before
+visiting record and artifact graph owners, including private prepared imports.
+Each bounded page replaces one owner through the existing native RDF dictionary,
+reference and index writer, then checkpoints atomically. Missing terms, conflicting
+origin identities, unsupported metadata stream shapes or insufficient admission
+fail explicitly. The store is served only after both jobs complete. New graph
+publication and retirement maintain an atomic per-owner provenance marker.
 
 The API returns occurrence/graph IRIs; clients do not construct them by guessing
 an opaque ID's layout. PurRDF JSON and Markdown graphs retain their own explicitly

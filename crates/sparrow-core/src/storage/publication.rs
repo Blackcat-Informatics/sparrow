@@ -387,7 +387,11 @@ impl Store {
             source_time_profile: &profile,
             diagnostic_profile: diagnostic_profile.as_ref(),
         })?;
-        let ingest::PreparedRecords { mut batch, .. } = builder.finish()?;
+        let ingest::PreparedRecords {
+            mut batch,
+            estimate,
+            ..
+        } = builder.prepare()?;
         put(&mut batch, &record_key(id, expected_index), &record);
         progress.prepared_records += 1;
         put(&mut batch, &preparation_key(id), &progress);
@@ -397,8 +401,7 @@ impl Store {
                 "prepared record dependencies exceed 128 MiB",
             ));
         }
-        writer.admit_import_batch(&batch)?;
-        writer.commit(batch)?;
+        writer.apply(batch, None, Some(estimate))?;
         Ok(progress)
     }
 
