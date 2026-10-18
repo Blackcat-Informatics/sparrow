@@ -686,6 +686,7 @@ interface Sparrow {
   retentionMetrics @46 (query :RetentionMetricsQuery) -> (result :Result(RetentionMetrics));
   sparqlQuery @47 (query :SparqlQuery) -> (result :Result(SparqlPage));
   correlate @48 (query :CorrelateQuery) -> (result :Result(SparqlPage));
+  sparqlExplain @49 (query :SparqlQuery) -> (result :Result(SparqlPage));
 }
 
 # Page-local, child-before-parent term nodes. IDs never identify persisted terms.
@@ -758,7 +759,37 @@ struct SparqlGraphItem { auxiliary @0 :Bool; union { declaration @1 :UInt32; qua
 struct SparqlItem { union { solution @0 :SparqlSolution; boolean @1 :Bool; graph @2 :SparqlGraphItem; } }
 struct SparqlData { form @0 :SparqlForm; variables @1 :List(Text); terms @2 :List(RdfTermNode); items @3 :List(SparqlItem); }
 struct SparqlPartial { data @0 :SparqlData; positionalPrefix @1 :Bool; }
-struct SparqlOutcome { union { complete @0 :SparqlData; certain @1 :SparqlPartial; atMost @2 :SparqlPartial; unknown @3 :Text; failure @4 :Failure; } }
+struct SparqlOutcome { union { complete @0 :SparqlData; certain @1 :SparqlPartial; atMost @2 :SparqlPartial; unknown @3 :Text; failure @4 :Failure; explanation @5 :SparqlExplanation; } }
+enum NativeReadOperation { query @0; explain @1; }
+struct NativeChargeRate { label @0 :Text; cost @1 :UInt64; }
+struct NativePlanEstimate { rows @0 :UInt64; peakRows @1 :UInt64; columns @2 :UInt64; peakCells @3 :UInt64; }
+struct OptionalNativePlanEstimate { union { absent @0 :Void; value @1 :NativePlanEstimate; } }
+struct NativeNodeCharges {
+  ordinal @0 :UInt64; depth @1 :UInt64; label @2 :Text;
+  fuel @3 :List(UInt64); fuelTotal @4 :UInt64; rows @5 :UInt64; cells @6 :UInt64;
+  estimate @7 :OptionalNativePlanEstimate;
+}
+enum NativeReadResidency { absent @0; resident @1; nonResident @2; mixed @3; }
+struct NativeAccessEstimate {
+  work @0 :UInt64; rows @1 :UInt64; pages @2 :OptionalLimit;
+  residency @3 :NativeReadResidency; cardinalityFallback @4 :OptionalLimit;
+}
+struct OptionalNativeAccessEstimate { union { absent @0 :Void; value @1 :NativeAccessEstimate; } }
+struct NativeShapeReport {
+  node @0 :OptionalLimit; operator @1 :OptionalText; provider @2 :OptionalText;
+  registry @3 :OptionalLimit; sourceVisits @4 :UInt64; transitions @5 :UInt64;
+  outputRows @6 :UInt64; estimate @7 :OptionalNativeAccessEstimate;
+}
+struct NativeExplanationItem { union { node @0 :NativeNodeCharges; joinOrder @1 :Text; statistic @2 :Text; shape @3 :NativeShapeReport; } }
+struct NativeStatementIndexes { reifierTargets @0 :Bool; reifierComponents @1 :Bool; annotationValues @2 :Bool; }
+struct SparqlExplanation {
+  profile @0 :Text; version @1 :UInt32; digest @2 :Text; stopPollFuel @3 :UInt64;
+  schedule @4 :List(NativeChargeRate); indexes @5 :NativeStatementIndexes;
+  items @6 :List(NativeExplanationItem);
+  # This endpoint injects no custom relation/aggregate registry. Nonempty
+  # native declarations are refused before publishing instead of being omitted.
+  relations @7 :List(Text); aggregates @8 :List(Text);
+}
 struct SparqlPage {
   page @0 :CatalogReadReceipt; sequence @1 :UInt64; layers @2 :RdfLayers;
   coverage @3 :SparqlCoverage; governors @4 :NativeGovernorReceipt;
@@ -766,6 +797,7 @@ struct SparqlPage {
   diagnostic @8 :OptionalNativeDiagnostic;
   scope @9 :QueryScopeReceipt;
   correlation @10 :OptionalCorrelationCapture;
+  operation @11 :NativeReadOperation;
 }
 enum NativeSeverity { error @0; warning @1; note @2; info @3; }
 enum NativeStorageFailure { absent @0; capacity @1; sizeOverflow @2; allocationFailed @3; admissionFailed @4; formattingFailed @5; }

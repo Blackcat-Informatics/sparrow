@@ -86,7 +86,7 @@ production capacity.
 
 | Required area | Evidence already present | Required work still NOT MET |
 | --- | --- | --- |
-| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. | Public adapter qualification for the landed governed-request EXPLAIN API ([PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600)); query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); adoption and consumer qualification of the landed materialization fix for complete synthetic content export within the existing admitted workspace ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
+| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. Source schema 61 adds measured EXPLAIN RPC/CLI/MCP with structured native ledger paging and shared query admission; public consumer regressions pass. | Default-image qualification and runtime adoption; query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); default-image qualification of the landed materialization fix for the original complete synthetic content export within existing limits ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
 | Reclamation | Shared native tombstone-compaction policy; real-pressure source regression with measured file decrease, successful retry, protected shared bytes and reopen; full release gate at signed 22ec801. | Runtime adoption and sustained physical/resource qualification of the existing native compaction/blob-GC path. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
 | Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results and cancellation. | The missing graph operations above and complete resource/latency qualification over the deployment corpus. Existing tools must not advertise unsupported native relations or explanations. [Interfaces](interfaces.md). |
 | Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Production envelope and producer contracts, hard-quota/resource and sustained/burst acceptance, bounded physical reclamation, host-reboot/power-loss acceptance and remaining watcher scheduling/kernel-watch-exhaustion scenarios. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
@@ -104,9 +104,12 @@ governed request EXPLAIN (PR #611, closing #600). Source now selects committed
 `9b2bf3b71325154137bc1aa817b46356daadfe3a` for both runtime dependencies and
 census discovery. Three focused release consumer regressions and release Clippy
 pass, covering retained complete materialization and request/governor EXPLAIN
-parity, including host refusals. The normal full gate is required before commit;
-public EXPLAIN
-transport/agent integration and #601 stored-text integration remain required.
+parity, including host refusals. Signed `126248c` passed the full gate for that
+adoption. Source schema 61 adds the public EXPLAIN adapters, with three additional
+release consumer regressions, release Clippy and pinned census passing. The
+normal full gate is required before committing. Runtime adoption and #601
+stored-text integration remain required; a read-only upstream refresh still
+finds #601 open without a new implementation.
 The selected rust-rocksdb upstream remains
 `46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. The earlier inference that Sparrow
 required a new file-compaction API was unproven and is withdrawn. Existing native

@@ -134,40 +134,52 @@ pub(super) fn query_limits(
     Ok((source, governors))
 }
 
+pub(super) enum Operation {
+    Query,
+    Explain,
+}
+
 pub(super) async fn query(
     rpc: &Rpc,
-    params: wire::sparrow::SparqlQueryParams,
-    results: &mut wire::sparrow::SparqlQueryResults,
+    input: wire::sparql_query::Reader<'_>,
+    mut out: wire::result::Builder<'_, wire::sparql_page::Owned>,
+    operation: Operation,
 ) -> capnp::Result<()> {
-    let input = match request(rpc, params.get()?.get_query()?) {
+    let input = match request(rpc, input) {
         Ok(input) => input,
         Err(error) => {
-            failure(results.get().init_result(), error);
+            failure(out, error);
             return Ok(());
         }
     };
-    let reply = rpc
-        .query_work(true, move |store, now, cancellation| {
-            store
-                .sparql_read(
-                    &SparqlRead {
-                        scope: &input.scope,
-                        layers: input.layers,
-                        request: SparqlRequest {
-                            query: &input.text,
-                            base_iri: input.base.as_deref(),
-                            substitutions: &input.bindings,
-                        },
-                        governors: &input.governors,
-                        limits: input.source,
-                    },
-                    now,
-                    &cancellation,
-                )
-                .map_err(|e| Error::new(e.code, e.message.clone()))
-        })
-        .await;
-    deliver(results.get().init_result(), reply);
+    match operation {
+        Operation::Query => {
+            let reply = rpc
+                .query_work(true, move |store, now, cancellation| {
+                    store
+                        .sparql_read(&input.read(), now, &cancellation)
+                        .map_err(|e| Error::new(e.code, e.message.clone()))
+                })
+                .await;
+            deliver(out, reply);
+        }
+        Operation::Explain => {
+            let reply = rpc
+                .query_work(true, move |store, now, cancellation| {
+                    store
+                        .sparql_explanation_read(&input.read(), now, &cancellation)
+                        .map_err(|e| Error::new(e.code, e.message.clone()))
+                })
+                .await;
+            match reply {
+                Err(error) => failure(out, error),
+                Ok(mut reply) => match explanation_page(out.reborrow().init_ok(), &reply.page) {
+                    Ok(()) => reply.delivered = true,
+                    Err(error) => failure(out, error),
+                },
+            }
+        }
+    }
     Ok(())
 }
 
@@ -428,6 +440,53 @@ pub(super) fn page(
     page: &SparqlReadPage,
 ) -> Result<(), Error> {
     let run = page.body.captured();
+    let evidence = match &run.outcome {
+        Ok(value) => &value.evidence,
+        Err(error) => error.evidence(),
+    };
+    receipt(
+        out.reborrow(),
+        page,
+        run,
+        evidence,
+        run.outcome.as_ref().err(),
+    )?;
+    out.set_operation(wire::NativeReadOperation::Query);
+    let mut outcome = out.init_outcome();
+    match &run.outcome {
+        Ok(value) => data(outcome.init_complete(), page, &value.result)?,
+        Err(FallibleSparqlError::BudgetExhausted { partial, .. }) => match partial {
+            PartialAnswers::Certain(value) => {
+                let mut out = outcome.init_certain();
+                out.set_positional_prefix(value.is_positional_prefix());
+                data(out.init_data(), page, value.result())?;
+            }
+            PartialAnswers::AtMost(value) => {
+                let mut out = outcome.init_at_most();
+                out.set_positional_prefix(value.is_positional_prefix());
+                data(out.init_data(), page, value.result())?;
+            }
+            PartialAnswers::Unknown(barrier) => outcome.set_unknown(barrier.operator()),
+        },
+        Err(error) => {
+            native_failure(outcome.reborrow().init_failure(), error)?;
+        }
+    }
+    Ok(())
+}
+
+fn receipt<Body, Outcome>(
+    mut out: wire::sparql_page::Builder<'_>,
+    page: &sparrow_core::CatalogReadPage<Body>,
+    run: &sparrow_core::ScopedSparqlResult<Outcome>,
+    evidence: &GovernedEvidence<sparrow_core::RdfReadEvidence>,
+    error: Option<
+        &FallibleSparqlError<
+            sparrow_core::RdfReadError,
+            GovernedEvidence<sparrow_core::RdfReadEvidence>,
+        >,
+    >,
+) -> Result<(), Error> {
     match &run.correlation {
         Some(capture) => crate::correlation_wire::encode(
             out.reborrow().init_correlation().init_value(),
@@ -439,17 +498,13 @@ pub(super) fn page(
     }
     query_scope_receipt(out.reborrow().init_scope(), &run.scope)
         .map_err(|error| Error::new("STORAGE_FAILURE", format!("frozen graph scope: {error}")))?;
-    match &run.outcome {
-        Err(FallibleSparqlError::Query { diagnostic, .. }) => crate::rdf_wire::diagnostic::encode(
+    match error {
+        Some(FallibleSparqlError::Query { diagnostic, .. }) => crate::rdf_wire::diagnostic::encode(
             out.reborrow().init_diagnostic().init_value(),
             diagnostic.diagnostic(),
         )?,
         _ => out.reborrow().init_diagnostic().set_absent(()),
     }
-    let evidence: &GovernedEvidence<_> = match &run.outcome {
-        Ok(value) => &value.evidence,
-        Err(error) => error.evidence(),
-    };
     catalog_receipt(out.reborrow().init_page(), page);
     out.set_sequence(run.sequence);
     let mut layers = out.reborrow().init_layers();
@@ -539,50 +594,222 @@ pub(super) fn page(
             .limits
             .get(ResourceDimension::ScratchBytes),
     );
-    let mut outcome = out.init_outcome();
+    Ok(())
+}
+
+fn native_failure(
+    mut target: wire::failure::Builder<'_>,
+    error: &FallibleSparqlError<
+        sparrow_core::RdfReadError,
+        GovernedEvidence<sparrow_core::RdfReadEvidence>,
+    >,
+) -> Result<(), Error> {
+    target.set_retryable(false);
+    match error {
+        FallibleSparqlError::BudgetExhausted { .. } => {
+            target.set_code("RESOURCE_LIMIT");
+            target.set_message(
+                "native execution exhausted a governor before a ledger could be published",
+            );
+        }
+        FallibleSparqlError::Query { diagnostic, .. } => {
+            target.set_code(&diagnostic.diagnostic().code);
+            target.set_message(diagnostic.diagnostic().to_string());
+        }
+        FallibleSparqlError::Operational { error, .. } => {
+            target.set_code(error.code);
+            target.set_message(&error.message);
+        }
+        FallibleSparqlError::AllocationFailed { construct, .. } => {
+            target.set_code("RESOURCE_LIMIT");
+            target.set_message(construct);
+        }
+        FallibleSparqlError::ControlFailure { failure, .. } => {
+            target.set_code(failure.diagnostic_code());
+            target.set_message(failure.to_string());
+        }
+        _ => {
+            return Err(Error::new(
+                "UNSUPPORTED",
+                "native query failure lacks a wire variant",
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl Request {
+    fn read(&self) -> SparqlRead<'_> {
+        SparqlRead {
+            scope: &self.scope,
+            layers: self.layers,
+            request: SparqlRequest {
+                query: &self.text,
+                base_iri: self.base.as_deref(),
+                substitutions: &self.bindings,
+            },
+            governors: &self.governors,
+            limits: self.source,
+        }
+    }
+}
+
+pub(super) fn explanation_page(
+    mut out: wire::sparql_page::Builder<'_>,
+    page: &sparrow_core::SparqlExplanationReadPage,
+) -> Result<(), Error> {
+    let run = page.body.captured();
+    let evidence = match &run.outcome {
+        Ok((_, evidence)) => evidence,
+        Err(error) => error.evidence(),
+    };
+    receipt(
+        out.reborrow(),
+        page,
+        run,
+        evidence,
+        run.outcome.as_ref().err(),
+    )?;
+    out.set_operation(wire::NativeReadOperation::Explain);
     match &run.outcome {
-        Ok(value) => data(outcome.init_complete(), page, &value.result)?,
-        Err(FallibleSparqlError::BudgetExhausted { partial, .. }) => match partial {
-            PartialAnswers::Certain(value) => {
-                let mut out = outcome.init_certain();
-                out.set_positional_prefix(value.is_positional_prefix());
-                data(out.init_data(), page, value.result())?;
+        Err(error) => native_failure(out.init_outcome().init_failure(), error)?,
+        Ok((value, _)) => {
+            let mut data = out.init_outcome().init_explanation();
+            let profile = value.profile();
+            data.set_profile(profile.id);
+            data.set_version(profile.version);
+            data.set_digest(&profile.digest);
+            data.set_stop_poll_fuel(profile.stop_poll_fuel);
+            let mut schedule = data
+                .reborrow()
+                .init_schedule(purrdf::sparql::CHARGE_SCHEDULE.len() as u32);
+            for (index, (label, cost)) in purrdf::sparql::CHARGE_SCHEDULE.into_iter().enumerate() {
+                let mut row = schedule.reborrow().get(index as u32);
+                row.set_label(label);
+                row.set_cost(cost);
             }
-            PartialAnswers::AtMost(value) => {
-                let mut out = outcome.init_at_most();
-                out.set_positional_prefix(value.is_positional_prefix());
-                data(out.init_data(), page, value.result())?;
-            }
-            PartialAnswers::Unknown(barrier) => outcome.set_unknown(barrier.operator()),
-        },
-        Err(error) => {
-            let mut target = outcome.reborrow().init_failure();
-            target.set_retryable(false);
-            match error {
-                FallibleSparqlError::Query { diagnostic, .. } => {
-                    target.set_code(&diagnostic.diagnostic().code);
-                    target.set_message(diagnostic.diagnostic().to_string());
-                }
-                FallibleSparqlError::Operational { error, .. } => {
-                    target.set_code(error.code);
-                    target.set_message(&error.message);
-                }
-                FallibleSparqlError::AllocationFailed { construct, .. } => {
-                    target.set_code("RESOURCE_LIMIT");
-                    target.set_message(construct);
-                }
-                FallibleSparqlError::ControlFailure { failure, .. } => {
-                    target.set_code(failure.diagnostic_code());
-                    target.set_message(failure.to_string());
-                }
-                _ => {
-                    return Err(Error::new(
-                        "UNSUPPORTED",
-                        "native query failure lacks a wire variant",
-                    ));
-                }
+            let indexes = value.statement_indexes();
+            let mut target = data.reborrow().init_indexes();
+            target.set_reifier_targets(indexes.reifier_targets);
+            target.set_reifier_components(indexes.reifier_components);
+            target.set_annotation_values(indexes.annotation_values);
+            // Core validates that QueryOptions::default injected no registry.
+            data.reborrow().init_relations(0);
+            data.reborrow().init_aggregates(0);
+            let mut items = data.init_items(page.body.items().count() as u32);
+            for (index, item) in page.body.items().enumerate() {
+                explanation_item(items.reborrow().get(index as u32), item);
             }
         }
     }
     Ok(())
+}
+
+fn explanation_item(
+    mut out: wire::native_explanation_item::Builder<'_>,
+    item: sparrow_core::SparqlExplanationItem<'_>,
+) {
+    use sparrow_core::SparqlExplanationItem as I;
+    use wire::{optional_limit::Builder as Limit, optional_text::Builder as Text};
+    match item {
+        I::JoinOrder(text) => out.set_join_order(text),
+        I::Statistic(text) => out.set_statistic(text),
+        I::Node(node) => {
+            let mut out = out.init_node();
+            out.set_ordinal(node.ordinal as u64);
+            out.set_depth(node.depth as u64);
+            out.set_label(node.label);
+            out.set_fuel_total(node.fuel_total());
+            out.set_rows(node.rows);
+            out.set_cells(node.cells);
+            let mut fuel = out.reborrow().init_fuel(node.fuel.len() as u32);
+            for (index, units) in node.fuel.into_iter().enumerate() {
+                fuel.set(index as u32, units);
+            }
+            match &node.estimate {
+                None => out.init_estimate().set_absent(()),
+                Some(value) => {
+                    let mut out = out.init_estimate().init_value();
+                    out.set_rows(value.rows);
+                    out.set_peak_rows(value.peak_rows);
+                    out.set_columns(value.columns);
+                    out.set_peak_cells(value.peak_cells());
+                }
+            }
+        }
+        I::Shape(shape) => {
+            let mut out = out.init_shape();
+            explanation_optional(
+                out.reborrow().init_node(),
+                shape.node.map(|n| n as u64),
+                Limit::set_value,
+                Limit::set_absent,
+            );
+            explanation_optional(
+                out.reborrow().init_operator(),
+                shape.operator,
+                Text::set_value,
+                Text::set_absent,
+            );
+            explanation_optional(
+                out.reborrow().init_provider(),
+                shape.provider,
+                Text::set_value,
+                Text::set_absent,
+            );
+            explanation_optional(
+                out.reborrow().init_registry(),
+                shape.registry.map(|id| id.as_u64()),
+                Limit::set_value,
+                Limit::set_absent,
+            );
+            out.set_source_visits(shape.work.source_visits);
+            out.set_transitions(shape.work.transitions);
+            out.set_output_rows(shape.work.output_rows);
+            match shape.estimate.access {
+                None => out.init_estimate().set_absent(()),
+                Some(cost) => {
+                    let mut out = out.init_estimate().init_value();
+                    out.set_work(cost.work());
+                    out.set_rows(cost.rows());
+                    explanation_optional(
+                        out.reborrow().init_pages(),
+                        cost.pages(),
+                        Limit::set_value,
+                        Limit::set_absent,
+                    );
+                    explanation_optional(
+                        out.reborrow().init_cardinality_fallback(),
+                        cost.cardinality_fallback(),
+                        Limit::set_value,
+                        Limit::set_absent,
+                    );
+                    out.set_residency(match cost.residency() {
+                        None => wire::NativeReadResidency::Absent,
+                        Some(purrdf::dataset_view::ReadResidency::Resident) => {
+                            wire::NativeReadResidency::Resident
+                        }
+                        Some(purrdf::dataset_view::ReadResidency::NonResident) => {
+                            wire::NativeReadResidency::NonResident
+                        }
+                        Some(purrdf::dataset_view::ReadResidency::Mixed) => {
+                            wire::NativeReadResidency::Mixed
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn explanation_optional<B, T>(
+    mut out: B,
+    value: Option<T>,
+    present: impl FnOnce(&mut B, T),
+    absent: impl FnOnce(&mut B, ()),
+) {
+    match value {
+        Some(value) => present(&mut out, value),
+        None => absent(&mut out, ()),
+    }
 }

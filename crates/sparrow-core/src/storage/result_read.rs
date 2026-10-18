@@ -25,6 +25,8 @@ pub enum ResultPage {
     Pins(PinReadPage),
     /// Governed native RDF solutions, boolean or graph items and certificates.
     Sparql(crate::SparqlReadPage),
+    /// Measured native plan/cost ledger; never a query-answer certificate.
+    SparqlExplanation(crate::SparqlExplanationReadPage),
 }
 
 impl Store {
@@ -84,7 +86,7 @@ impl Store {
             })?;
             reads.purge(now);
             if let Some((_, page)) = reads.resume_captured(&cursor, now)? {
-                return Ok(ResultPage::Sparql(page));
+                return super::rdf_view::pages::NativeBody::into_result(page);
             }
         }
         {

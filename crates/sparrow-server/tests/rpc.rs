@@ -106,12 +106,32 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
                 baseline["status"]["schema_version"].as_u64(),
                 Some(u64::from(sparrow_client::SCHEMA_VERSION))
             );
-            assert!(
-                !baseline["tools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|tool| tool["name"].as_str() == Some("sparql_explain"))
+            let tools = baseline["tools"].as_array().unwrap();
+            let explain = tools
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some("sparql_explain"))
+                .unwrap();
+            let query = tools
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some("sparql_query"))
+                .unwrap();
+            assert_eq!(explain["inputSchema"], query["inputSchema"]);
+            assert_eq!(
+                explain["inputSchema"]["additionalProperties"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(explain["annotations"]["readOnlyHint"].as_bool(), Some(true));
+            let measured = cli(&socket, &["sparql-explain", request_file.to_str().unwrap()]);
+            assert_eq!(measured["operation"].as_str(), Some("sparql_explain"));
+            assert_eq!(measured["execution_status"].as_str(), Some("measured"));
+            assert!(measured.get("answer_certainty").is_none());
+            cli(
+                &socket,
+                &[
+                    "result-release",
+                    baseline["status"]["store_id"].as_str().unwrap(),
+                    measured["snapshot_id"].as_str().unwrap(),
+                ],
             );
             for endpoint in [
                 socket.to_str().unwrap().to_owned(),
@@ -7497,8 +7517,9 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 37);
+    assert_eq!(definitions.len(), 38);
     for (name, read_only) in [
+        ("sparql_explain", true),
         ("correlate", true),
         ("retention_metrics", true),
         ("ingest_get", true),
@@ -9526,6 +9547,94 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
         let mut binding = query.init_bindings(1).get(0);binding.set_name("x");binding.set_term(0);
         let response = bad.send().promise.await.unwrap(); match response.get().unwrap().get_result().unwrap().which().unwrap() { wire::result::Error(error)=>{ let error = error.unwrap(); assert_eq!(error.get_code().unwrap().to_str().unwrap(),"INVALID_ARGUMENT"); assert!(error.get_message().unwrap().to_str().unwrap().contains("earlier nodes")); },_=>panic!("cyclic wire term was admitted") }
         let status = client.capability().status_request().send().promise.await.unwrap(); assert_eq!(rpc_ok(status.get().unwrap().get_result().unwrap()).get_sparql_read_handles(),0);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_explanation_preserves_measured_work_over_tcp_cli_mcp_and_continuation() {
+    use purrdf_lex::json::{self, Object, Value};
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        let (address, reservation) = configure_tcp_listener(&config);
+        drop(reservation);
+        let _daemon = start(&config, &socket).await;
+        let endpoint = format!("tcp://{address}");
+        let client = sparrow_client::Client::connect(&socket).await.unwrap();
+        let store = client.discovery().store_id.clone();
+        client.ingest("explain-input", "explain-source", wire::Format::Jsonl, b"{}\n{}\n").await.unwrap();
+        let mut mcp = Mcp::start(&socket);
+        mcp.initialize(1).await;
+        let request = Object::new().with("store_id", store.clone()).with("source", "explain-source")
+            .with("query", "SELECT ?record ?payload WHERE { ?record a <urn:sparrow:vocab:Record>; ?predicate ?payload FILTER(?record != <urn:absent>) }")
+            .with("bindings", Value::array([Object::new().with("name", "predicate")
+                .with("term", Object::new().with("kind", "iri").with("value", "urn:sparrow:vocab:payload"))]))
+            .with("layers", Object::new().with("metadata", true).with("diagnostic", false).with("content", false))
+            .with("page_size", 1_u32);
+        let path = dir.path().join("explain.json");
+        std::fs::write(&path, json::write_compact(&request.clone().into())).unwrap();
+        let tcp = cli(&endpoint, &["sparql-explain", path.to_str().unwrap()]);
+        let response = mcp.tool(2, "sparql_explain", request.clone().into()).await;
+        assert_eq!(response["isError"].as_bool(), Some(false), "{response:?}");
+        let first = &response["structuredContent"];
+        for key in ["explanation", "native_governor", "coverage", "scope", "layers", "limits", "execution_status"] {
+            assert_eq!(tcp[key], first[key], "CLI/MCP explanation field {key}");
+        }
+        assert_eq!(first["operation"].as_str(), Some("sparql_explain"));
+        assert_eq!(first["execution_status"].as_str(), Some("measured"));
+        assert!(first.get("answer_certainty").is_none());
+        assert_eq!(first["explanation"]["items"][0]["rows"].as_str(), Some("2"), "typed predicate substitution must restrict the measured relation");
+        let snapshot = first["snapshot_id"].as_str().unwrap().to_owned();
+        let mut page = first.clone();
+        let mut count = 0_u64;
+        let mut fuel = 0_u64;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(json::write_compact(&page).len() <= 256 * 1024);
+            assert_eq!(page["scope"], first["scope"]);
+            assert_eq!(page["lease_expires_at"], first["lease_expires_at"]);
+            assert_eq!(page["snapshot_id"].as_str(), Some(snapshot.as_str()));
+            let items = page["explanation"]["items"].as_array().unwrap();
+            count += items.len() as u64;
+            for item in items {
+                if item["kind"].as_str() == Some("node") {
+                    fuel += item["fuel_total"].as_str().unwrap().parse::<u64>().unwrap();
+                }
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else { break; };
+            let next = cli(&socket, &["result-next", &store, cursor]);
+            let replay = cli(&socket, &["result-next", &store, cursor]);
+            assert_eq!(next, replay);
+            page = next;
+            assert!(pages < 100);
+        }
+        assert!(pages > 1);
+        assert_eq!(count.to_string(), first["total_items"].as_str().unwrap());
+        let resources = first["native_governor"]["resources"].as_array().unwrap();
+        let native_fuel = resources.iter().find(|row| row["dimension"].as_str() == Some("fuel")).unwrap();
+        assert_eq!(fuel.to_string(), native_fuel["consumed"].as_str().unwrap());
+        assert!(sparrow_client::release_result(client.capability(), &store, &snapshot).await.unwrap().released);
+        assert!(sparrow_client::release_result(client.capability(), &store, tcp["snapshot_id"].as_str().unwrap()).await.unwrap().released);
+        let stopped = request.clone().with("limits", Object::new().with("fuel", "0"));
+        let response = mcp.tool(3, "sparql_explain", stopped.into()).await;
+        let stopped = &response["structuredContent"];
+        assert_eq!(stopped["execution_status"].as_str(), Some("stopped"));
+        assert!(stopped.get("answer_certainty").is_none());
+        assert_ne!(stopped["stop_reason"], Value::Null);
+        let stopped_id = stopped["snapshot_id"].as_str().unwrap();
+        // An empty/single-page report need not retain a continuation handle.
+        sparrow_client::release_result(client.capability(), &store, stopped_id).await.unwrap();
+        let invalid = request.with("query", "INSERT DATA { <urn:s> <urn:p> <urn:o> }");
+        let response = mcp.tool(4, "sparql_explain", invalid.into()).await;
+        let invalid = &response["structuredContent"];
+        assert_eq!(invalid["operation"].as_str(), Some("sparql_explain"));
+        assert_eq!(invalid["execution_status"].as_str(), Some("failed"));
+        assert!(invalid.get("answer_certainty").is_none());
+        assert!(invalid.get("diagnostic").is_some());
+        assert_eq!(cli(&socket, &["status"])["sparql_read_handles"].as_str(), Some("0"));
     }).await;
 }
 

@@ -7,6 +7,10 @@ use purrdf_lex::json::{Object, Value};
 
 const TOOLS: &[(&str, &str)] = &[
     (
+        "sparql_explain",
+        "Measure a native read-only SPARQL request with its typed bindings and finite governors over one immutable retained scope. Returns the original native charge profile, structured plan/node counters, estimates, physical strategies and independent source/coverage receipts. A stopped ledger is measured work, not certified query answers. Shares query result admission, result_next, result_release and the absolute one-minute lease. Remote requests are disabled.",
+    ),
+    (
         "correlate",
         "Run fixed native governed correlation recipes over one immutable scope: equal declared trace/span values, shared sources or co-occurrence in an explicit receipt/event-time interval. Returns both supporting record IDs, source byte spans and the original native certainty/coverage receipt. Equal identifiers and temporal co-occurrence do not establish causality or global span identity. Missing interpretations degrade coverage; strict mode refuses them. Resume with result_next without recapturing seeds.",
     ),
@@ -173,7 +177,7 @@ fn integer(maximum: u64) -> Value {
 
 pub(crate) fn definitions() -> Value {
     Value::array(TOOLS.iter().map(|(name, description)| -> Value {
-        if *name == "sparql_query" || *name == "correlate" {
+        if *name == "sparql_query" || *name == "sparql_explain" || *name == "correlate" {
             return Object::new()
                 .with("name", *name)
                 .with("description", *description)

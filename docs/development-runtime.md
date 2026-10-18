@@ -12,6 +12,34 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Public measured explanation source work (schema 61)
+
+Source schema 61 adds `Sparrow.sparqlExplain`, generated SDK access, CLI
+`sparql-explain` and MCP `sparql_explain`. The shared closed request codec
+preserves native typed bindings, selected scope/layers and caller governors.
+Structured native profile/schedule, node charges, join orders, statistics and
+physical strategies are paged without rendering/reparsing native text or
+recalculating native costs. Measured/stopped reports carry no answer certainty.
+
+Query answers and explanations share one generic page body, boundary planner,
+receipt/failure writer and the existing native result lease family. Handle/byte
+ceilings remain eight/8 MiB, with 256 KiB pages, 64 KiB metadata and one absolute
+minute of replay. Continuation and release retain their existing owners.
+No dependency, listener configuration or store-format change is introduced.
+
+Three focused release consumer regressions pass: captured ledger replay and
+shared eight-handle exhaustion/release/expiry; a real long stored literal whose
+oversized native plan entry is refused without a handle; and TCP/CLI/MCP parity,
+typed bindings, continuation, governor totals, zero-fuel stops and UPDATE
+diagnostics. Release Clippy passes with warnings denied. The pinned census
+passes 294 ownership jobs with zero distinct exceptions; its duplicate optional
+writers were replaced with one implementation. The normal full gate is required
+before committing. Evidence is under
+`.stage/native-graph-integration/public-explain-*`. The installed schema-60
+daemon and client named above have not adopted this source; schema-61 clients
+require schema-61 discovery. Native stored-text integration, original-corpus
+default-image export and runtime/resource qualification remain open work.
+
 ## Native materialization and request explanation source qualification
 
 Source now selects committed PurRDF

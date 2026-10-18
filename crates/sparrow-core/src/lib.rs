@@ -61,8 +61,9 @@ pub use storage::producer_stream::{
 };
 pub use storage::publication::{ImportPreparation, RawPreparation};
 pub use storage::rdf_view::{
-    RDF_SOURCE_ADMISSION_PROFILE, RdfGraphLayers, RdfReadEvidence, RdfReadLimits, RdfScopeCoverage,
-    ReadError as RdfReadError, ScopedSparqlExplanation, ScopedSparqlResult, SparqlGraphKind,
+    NativePageBody, RDF_SOURCE_ADMISSION_PROFILE, RdfGraphLayers, RdfReadEvidence, RdfReadLimits,
+    RdfScopeCoverage, ReadError as RdfReadError, ScopedSparqlExplanation, ScopedSparqlResult,
+    SparqlExplanationItem, SparqlExplanationPageBody, SparqlExplanationReadPage, SparqlGraphKind,
     SparqlItem, SparqlPageBody, SparqlRead, SparqlReadPage, StoredRdfView, sparql_term_node_bytes,
     sparql_term_wire_bytes,
 };

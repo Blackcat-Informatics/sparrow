@@ -83,7 +83,7 @@ pub(super) fn scope_receipt(
         .into())
 }
 
-fn limit(value: wire::optional_limit::Reader<'_>) -> Result<Value> {
+pub(super) fn limit(value: wire::optional_limit::Reader<'_>) -> Result<Value> {
     Ok(match value.which()? {
         wire::optional_limit::Absent(()) => Value::Null,
         wire::optional_limit::Value(value) => value.to_string().into(),

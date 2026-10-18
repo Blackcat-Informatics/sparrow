@@ -3611,6 +3611,11 @@ impl wire::sparrow::Server for Rpc {
                             failure(results.get().init_result(), error);
                         }
                     }
+                    sparrow_core::ResultPage::SparqlExplanation(page) => {
+                        if let Err(error) = sparql::explanation_page(out.init_sparql(), &page) {
+                            failure(results.get().init_result(), error);
+                        }
+                    }
                 }
             }
         }
@@ -3622,7 +3627,27 @@ impl wire::sparrow::Server for Rpc {
         params: wire::sparrow::SparqlQueryParams,
         mut results: wire::sparrow::SparqlQueryResults,
     ) -> capnp::Result<()> {
-        sparql::query(&self, params, &mut results).await
+        sparql::query(
+            &self,
+            params.get()?.get_query()?,
+            results.get().init_result(),
+            sparql::Operation::Query,
+        )
+        .await
+    }
+
+    async fn sparql_explain(
+        self: Rc<Self>,
+        params: wire::sparrow::SparqlExplainParams,
+        mut results: wire::sparrow::SparqlExplainResults,
+    ) -> capnp::Result<()> {
+        sparql::query(
+            &self,
+            params.get()?.get_query()?,
+            results.get().init_result(),
+            sparql::Operation::Explain,
+        )
+        .await
     }
 
     async fn correlate(

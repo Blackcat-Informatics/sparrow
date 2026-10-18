@@ -14,6 +14,7 @@ mod correlation;
 mod diagnostic;
 mod durability;
 mod error;
+mod explanation;
 mod ingest;
 mod ingest_status;
 mod json;
@@ -44,7 +45,7 @@ type Result<T> = AgentResult<T>;
 pub(crate) mod tool;
 
 pub(super) const USAGE: &str = concat!(
-    "sparrow SOCKET_PATH sparql REQUEST.json | correlate REQUEST.json; ",
+    "sparrow SOCKET_PATH sparql REQUEST.json | sparql-explain REQUEST.json | correlate REQUEST.json; ",
     "usage: sparrow SOCKET_PATH capabilities | status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
     " | retention-metrics STORE_ID [--max-visits N] [--catalog-bytes N] [--payload-bytes N]",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
@@ -208,13 +209,19 @@ impl Command {
                 &records::read_control_file(&args[1], 64)?,
             )?)));
         }
-        if args.first().is_some_and(|arg| arg == "sparql") {
+        if args
+            .first()
+            .is_some_and(|arg| arg == "sparql" || arg == "sparql-explain")
+        {
             if args.len() != 2 {
-                return Err(invalid("sparql requires REQUEST.json"));
+                return Err(invalid("sparql and sparql-explain require REQUEST.json"));
             }
-            return Ok(Self::Sparql(Box::new(sparql::Input::decode(
-                &records::read_control_file(&args[1], 64)?,
-            )?)));
+            let input = sparql::Input::decode(&records::read_control_file(&args[1], 64)?)?;
+            return Ok(Self::Sparql(Box::new(if args[0] == "sparql-explain" {
+                input.explanation()
+            } else {
+                input
+            })));
         }
         if args.first().is_some_and(|arg| arg == "ingest-get") {
             return Ok(Self::IngestStatus(ingest_status::Input::parse(&args[1..])?));

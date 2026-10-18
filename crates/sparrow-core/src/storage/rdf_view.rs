@@ -16,14 +16,16 @@ use rocksdb::{DB, DBIteratorWithThreadMode, Direction, IteratorMode, Snapshot};
 use std::{collections::BTreeSet, sync::Arc};
 
 mod budget;
+mod explanation;
 pub(crate) mod pages;
 mod query;
 mod scope;
 mod sparse;
 use budget::{Budget, Reservation};
+pub use explanation::SparqlExplanationItem;
 pub use pages::{
-    SparqlGraphKind, SparqlItem, SparqlPageBody, SparqlReadPage, sparql_term_node_bytes,
-    sparql_term_wire_bytes,
+    NativePageBody, SparqlExplanationPageBody, SparqlExplanationReadPage, SparqlGraphKind,
+    SparqlItem, SparqlPageBody, SparqlReadPage, sparql_term_node_bytes, sparql_term_wire_bytes,
 };
 pub use query::{ScopedSparqlExplanation, ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;

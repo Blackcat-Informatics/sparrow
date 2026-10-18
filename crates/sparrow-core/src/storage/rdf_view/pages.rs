@@ -232,20 +232,27 @@ fn item_wire_bytes(item: SparqlItem<'_>, variable_bytes: usize) -> Result<usize,
     Ok(bytes)
 }
 
-struct Published {
-    run: ScopedSparqlResult,
+struct Published<Outcome> {
+    run: ScopedSparqlResult<Outcome>,
     boundaries: Vec<usize>,
     bytes: usize,
     _admission: OwnedWorkspaceReservation<ReadError>,
 }
 
 /// A sealed immutable range sharing the original native result and its admission.
-#[derive(Clone)]
-pub struct SparqlPageBody {
-    published: Arc<Published>,
+pub struct NativePageBody<Outcome> {
+    published: Arc<Published<Outcome>>,
     range: Range<usize>,
 }
-impl std::fmt::Debug for SparqlPageBody {
+impl<Outcome> Clone for NativePageBody<Outcome> {
+    fn clone(&self) -> Self {
+        Self {
+            published: self.published.clone(),
+            range: self.range.clone(),
+        }
+    }
+}
+impl<Outcome> std::fmt::Debug for NativePageBody<Outcome> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SparqlPageBody")
             .field("sequence", &self.published.run.sequence)
@@ -254,17 +261,19 @@ impl std::fmt::Debug for SparqlPageBody {
     }
 }
 // Equality is sealed capture/range identity, never a claim of RDF isomorphism.
-impl PartialEq for SparqlPageBody {
+impl<Outcome> PartialEq for NativePageBody<Outcome> {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.published, &other.published) && self.range == other.range
     }
 }
-impl Eq for SparqlPageBody {}
-impl SparqlPageBody {
-    /// Original complete/partial/failure outcome and independent coverage.
-    pub fn captured(&self) -> &ScopedSparqlResult {
+impl<Outcome> Eq for NativePageBody<Outcome> {}
+impl<Outcome> NativePageBody<Outcome> {
+    /// Original retained native outcome and independent coverage.
+    pub fn captured(&self) -> &ScopedSparqlResult<Outcome> {
         &self.published.run
     }
+}
+impl SparqlPageBody {
     /// Borrow this page's native solution, boolean and RDF 1.2 items.
     pub fn items(&self) -> impl Iterator<Item = SparqlItem<'_>> {
         items(self.captured())
@@ -272,7 +281,7 @@ impl SparqlPageBody {
             .take(self.range.len())
     }
 }
-impl PageBody for SparqlPageBody {
+impl<Outcome> PageBody for NativePageBody<Outcome> {
     const PAGE_ITEMS: usize = 1000;
     fn len(&self) -> usize {
         self.published.boundaries.last().copied().unwrap_or(0)
@@ -316,7 +325,7 @@ impl Selector for SparqlSelector {
         0
     }
 }
-pub(in crate::storage) type Reads = catalog_lease::Reads<SparqlSelector, SparqlPageBody>;
+pub(in crate::storage) type Reads = catalog_lease::Reads<SparqlSelector, NativeBody>;
 /// A leased transport page from one immutable native query execution.
 pub type SparqlReadPage = catalog_lease::CatalogReadPage<SparqlPageBody>;
 
@@ -342,7 +351,8 @@ impl Store {
         let cursor = catalog_lease::Cursor::parse(cursor)?;
         reads
             .resume_captured(&cursor, now)?
-            .map(|(_, page)| page)
+            .map(|(_, page)| page.try_map_body(NativeBody::query))
+            .transpose()?
             .ok_or_else(|| {
                 Error::new(
                     "RESULT_EXPIRED",
@@ -375,155 +385,49 @@ impl Store {
             now,
             cancellation,
             |view, run| -> Result<_, ReadError> {
-                let result = answer(&run);
                 let count = items(&run).count();
-                let governor_bytes = match &run.outcome {
+                let governors = match &run.outcome {
                     Ok(value) => &value.evidence.governors,
                     Err(error) => &error.evidence().governors,
-                }
-                .retained_bytes()
-                .ok_or_else(|| {
-                    view.budget.fail(Error::new(
-                        "RESOURCE_LIMIT",
-                        "native governor receipt capacity overflow",
-                    ))
-                })?;
-                let variables = result.and_then(|r| r.solutions()).map_or(0, |(names, _)| {
-                    names.iter().fold(0usize, |sum, name| {
-                        sum.saturating_add(name.len().saturating_mul(6))
-                            .saturating_add(64)
-                    })
-                });
-                let error_bytes = match &run.outcome {
-                    Err(FallibleSparqlError::Query { diagnostic, .. }) => {
-                        diagnostic.diagnostic().retained_bytes().ok_or_else(|| {
-                            view.budget.fail(Error::new(
-                                "RESOURCE_LIMIT",
-                                "native diagnostic capacity overflow",
-                            ))
-                        })?
-                    }
-                    Err(FallibleSparqlError::Operational { error, .. }) => {
-                        error.message.len().saturating_add(error.code.len())
-                    }
-                    Err(FallibleSparqlError::AllocationFailed { construct, .. }) => construct.len(),
-                    _ => 0,
                 };
-                let scope_bytes = catalog_lease::response_row_bytes(
-                    crate::storage::json::write_compact(&run.scope).len(),
-                );
-                let correlation_bytes = run.correlation.as_ref().map_or(0, |capture| {
-                    catalog_lease::response_row_bytes(
-                        crate::storage::json::write_compact(&capture.descriptor()).len(),
-                    )
-                });
-                let metadata = 8192usize
-                    .saturating_add(correlation_bytes)
-                    .saturating_add(scope_bytes)
-                    .saturating_add(size_of::<Published>())
-                    .saturating_add(size_of::<
-                        catalog_lease::Snapshot<SparqlSelector, SparqlPageBody>,
-                    >())
-                    .saturating_add(governor_bytes.saturating_mul(6))
-                    // Both the typed diagnostic and the human failure summary
-                    // may carry the same authored text, each JSON-escaped.
-                    .saturating_add(error_bytes.saturating_mul(12))
-                    .saturating_add(variables);
-                if metadata > 64 * 1024 {
-                    return Err(view.budget.fail(Error::new(
-                        "RESOURCE_LIMIT",
-                        "native query metadata exceeds 64 KiB page admission",
-                    )));
-                }
-                let boundary_bytes = count
-                    .checked_add(2)
-                    .and_then(|n| n.checked_mul(size_of::<usize>()))
-                    .and_then(|n| n.checked_add(metadata))
-                    .ok_or_else(|| {
-                        view.budget.fail(Error::new(
-                            "RESOURCE_LIMIT",
-                            "native result boundary capacity overflow",
-                        ))
-                    })?;
-                let admission = view
-                    .reserve_owned_workspace(boundary_bytes as u64)
-                    .ok_or_else(|| {
-                        view.budget.fail(Error::new(
-                            "STORAGE_FAILURE",
-                            "stored view lacks required owned workspace admission",
-                        ))
-                    })??;
-                if view.budget.checkpoint().1.live_bytes > catalog_lease::HANDLE_BYTES as u64 {
-                    return Err(view.budget.fail(Error::new(
-                        "RESOURCE_LIMIT",
-                        "native result exceeds retained handle capacity",
-                    )));
-                }
-                // Native iterative term visitor may grow a work list. A per-node
-                // charge stops before its storage can exceed this fixed scratch.
-                let scratch = view.budget.reserve(catalog_lease::PAGE_BYTES as u64)?;
-                let mut boundaries = Vec::new();
-                boundaries.try_reserve_exact(count + 2).map_err(|_| {
-                    view.budget.fail(Error::new(
-                        "RESOURCE_LIMIT",
-                        "native page boundary allocation refused",
-                    ))
-                })?;
-                boundaries.push(0);
-                let (mut bytes, mut rows) = (metadata, 0usize);
-                for (index, item) in items(&run).enumerate() {
-                    let (error, _) = view.budget.checkpoint();
-                    if let Some(error) = error {
-                        return Err(error);
-                    }
-                    let charge =
-                        item_wire_bytes(item, variables).map_err(|e| view.budget.fail(e))?;
-                    if charge.saturating_add(metadata) > catalog_lease::PAGE_BYTES {
-                        return Err(view.budget.fail(Error::new(
-                            "RESOURCE_LIMIT",
-                            "native result item cannot fit a transport page",
-                        )));
-                    }
-                    if rows == read.scope.limit
-                        || bytes.saturating_add(charge) > catalog_lease::PAGE_BYTES
-                    {
-                        boundaries.push(index);
-                        bytes = metadata;
-                        rows = 0;
-                    }
-                    bytes += charge;
-                    rows += 1;
-                }
-                if count > 0 {
-                    boundaries.push(count);
-                }
-                drop(scratch);
-                let (error, evidence) = view.budget.checkpoint();
-                if let Some(error) = error {
-                    return Err(error);
-                }
-                let bytes = usize::try_from(evidence.live_bytes).map_err(|_| {
-                    view.budget.fail(Error::new(
-                        "RESOURCE_LIMIT",
-                        "native result retained capacity overflow",
-                    ))
-                })?;
-                Ok(SparqlPageBody {
-                    published: Arc::new(Published {
-                        run,
-                        boundaries,
-                        bytes,
-                        _admission: admission,
-                    }),
-                    range: 0..count,
-                })
+                let variables = answer(&run)
+                    .and_then(|r| r.solutions())
+                    .map_or(0, |(names, _)| {
+                        names.iter().fold(0usize, |sum, name| {
+                            sum.saturating_add(name.len().saturating_mul(6))
+                                .saturating_add(64)
+                        })
+                    });
+                let metadata =
+                    metadata_bytes(view, &run, governors, run.outcome.as_ref().err(), variables)?;
+                let staged = stage_native_page(
+                    view,
+                    count,
+                    read.scope.limit,
+                    metadata,
+                    items(&run).map(|item| item_wire_bytes(item, variables)),
+                )?;
+                Ok(NativePageBody::new(run, count, staged))
             },
         )??;
+        self.publish_native(read, now, cancellation, started, NativeBody::Query(body))?
+            .try_map_body(NativeBody::query)
+            .map_err(Arc::new)
+    }
+
+    fn publish_native(
+        &self,
+        read: &SparqlRead<'_>,
+        now: u64,
+        cancellation: &QueryCancellation,
+        started: Instant,
+        body: NativeBody,
+    ) -> Result<catalog_lease::CatalogReadPage<NativeBody>, ReadError> {
         let id = crate::storage::random_id("sparql-read").map_err(Arc::new)?;
         let snapshot = catalog_lease::Snapshot {
             bytes: 0,
             id,
-            store_id: body.captured().store_id.clone(),
+            store_id: body.store_id().to_owned(),
             selector: SparqlSelector,
             as_of: now,
             expires_at: now.checked_add(catalog_lease::LEASE_MS).ok_or_else(|| {
@@ -535,7 +439,7 @@ impl Store {
             started,
             page_size: read.scope.limit,
             scan_budget: read.scope.scan_budget,
-            scanned: body.captured().coverage.catalog_entries,
+            scanned: body.scanned(),
             body,
         };
         let mut reads = self.sparql_reads.lock().map_err(|_| {
@@ -611,4 +515,341 @@ mod tests {
                 > term_wire_bytes(TermInput::Indexed(&graph, s)).unwrap()
         );
     }
+}
+
+type QueryOutcome = purrdf::sparql::FallibleSparqlResult<
+    ReadError,
+    purrdf::sparql::GovernedEvidence<RdfReadEvidence>,
+>;
+type ExplanationOutcome = purrdf::sparql::FallibleScopedResult<
+    purrdf::sparql::RetainedQueryExplanation,
+    ReadError,
+    purrdf::sparql::GovernedEvidence<RdfReadEvidence>,
+>;
+
+/// Immutable native query answers under the original host admission.
+pub type SparqlPageBody = NativePageBody<QueryOutcome>;
+/// Immutable measured native explanation under the original host admission.
+pub type SparqlExplanationPageBody = NativePageBody<ExplanationOutcome>;
+/// A leased transport page from one immutable native explanation.
+pub type SparqlExplanationReadPage = catalog_lease::CatalogReadPage<SparqlExplanationPageBody>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::storage) enum NativeBody {
+    Query(SparqlPageBody),
+    Explanation(SparqlExplanationPageBody),
+}
+
+impl NativeBody {
+    fn query(self) -> Result<SparqlPageBody, Error> {
+        match self {
+            Self::Query(body) => Ok(body),
+            Self::Explanation(_) => Err(Error::new(
+                "INVALID_ARGUMENT",
+                "cursor contains an explanation, not query answers",
+            )),
+        }
+    }
+    fn explanation(self) -> Result<SparqlExplanationPageBody, Error> {
+        match self {
+            Self::Explanation(body) => Ok(body),
+            Self::Query(_) => Err(Error::new(
+                "INVALID_ARGUMENT",
+                "cursor contains query answers, not an explanation",
+            )),
+        }
+    }
+    fn store_id(&self) -> &str {
+        match self {
+            Self::Query(body) => &body.captured().store_id,
+            Self::Explanation(body) => &body.captured().store_id,
+        }
+    }
+    fn scanned(&self) -> usize {
+        match self {
+            Self::Query(body) => body.captured().coverage.catalog_entries,
+            Self::Explanation(body) => body.captured().coverage.catalog_entries,
+        }
+    }
+    pub(in crate::storage) fn into_result(
+        page: catalog_lease::CatalogReadPage<Self>,
+    ) -> Result<crate::ResultPage, Error> {
+        match &page.body {
+            Self::Query(_) => page
+                .try_map_body(Self::query)
+                .map(crate::ResultPage::Sparql),
+            Self::Explanation(_) => page
+                .try_map_body(Self::explanation)
+                .map(crate::ResultPage::SparqlExplanation),
+        }
+    }
+}
+
+impl PageBody for NativeBody {
+    const PAGE_ITEMS: usize = 1000;
+    fn len(&self) -> usize {
+        match self {
+            Self::Query(body) => body.len(),
+            Self::Explanation(body) => body.len(),
+        }
+    }
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Query(body) => body.capacity(),
+            Self::Explanation(body) => body.capacity(),
+        }
+    }
+    fn page(&self, start: usize, end: usize) -> Result<Self, Error> {
+        match self {
+            Self::Query(body) => body.page(start, end).map(Self::Query),
+            Self::Explanation(body) => body.page(start, end).map(Self::Explanation),
+        }
+    }
+    fn page_end(&self, start: usize, size: usize) -> Result<usize, Error> {
+        match self {
+            Self::Query(body) => body.page_end(start, size),
+            Self::Explanation(body) => body.page_end(start, size),
+        }
+    }
+    fn is_boundary(&self, start: usize, size: usize) -> Result<bool, Error> {
+        match self {
+            Self::Query(body) => body.is_boundary(start, size),
+            Self::Explanation(body) => body.is_boundary(start, size),
+        }
+    }
+}
+
+impl Store {
+    /// Capture measured work once; continuation retains the original ledger and lease.
+    /// Explanations and query answers share the native handle/byte admission family.
+    pub fn sparql_explanation_read(
+        &self,
+        read: &SparqlRead<'_>,
+        now: u64,
+        cancellation: &QueryCancellation,
+    ) -> Result<SparqlExplanationReadPage, ReadError> {
+        let started = Instant::now();
+        let body = self.with_sparql_explanation(
+            read,
+            now,
+            cancellation,
+            |view, run| -> Result<_, ReadError> {
+                let governors = match &run.outcome {
+                    Ok((_, evidence)) => &evidence.governors,
+                    Err(error) => &error.evidence().governors,
+                };
+                let explanation = run.outcome.as_ref().ok().map(|(value, _)| &**value);
+                let payload_metadata = explanation
+                    .map(super::explanation::metadata_bytes)
+                    .transpose()
+                    .map_err(|e| view.budget.fail(e))?
+                    .unwrap_or(0);
+                let metadata = metadata_bytes(
+                    view,
+                    &run,
+                    governors,
+                    run.outcome.as_ref().err(),
+                    payload_metadata,
+                )?;
+                let count = super::explanation::items(explanation).count();
+                let staged = stage_native_page(
+                    view,
+                    count,
+                    read.scope.limit,
+                    metadata,
+                    super::explanation::items(explanation).map(super::explanation::item_bytes),
+                )?;
+                Ok(NativePageBody::new(run, count, staged))
+            },
+        )??;
+        self.publish_native(
+            read,
+            now,
+            cancellation,
+            started,
+            NativeBody::Explanation(body),
+        )?
+        .try_map_body(NativeBody::explanation)
+        .map_err(Arc::new)
+    }
+}
+
+impl SparqlExplanationPageBody {
+    /// Borrow structured native explanation entries in stable section order.
+    pub fn items(&self) -> impl Iterator<Item = super::explanation::SparqlExplanationItem<'_>> {
+        super::explanation::items(
+            self.captured()
+                .outcome
+                .as_ref()
+                .ok()
+                .map(|(value, _)| &**value),
+        )
+        .skip(self.range.start)
+        .take(self.range.len())
+    }
+}
+
+struct Staged {
+    boundaries: Vec<usize>,
+    bytes: usize,
+    admission: OwnedWorkspaceReservation<ReadError>,
+}
+
+impl<Outcome> NativePageBody<Outcome> {
+    fn new(run: ScopedSparqlResult<Outcome>, count: usize, staged: Staged) -> Self {
+        Self {
+            published: Arc::new(Published {
+                run,
+                boundaries: staged.boundaries,
+                bytes: staged.bytes,
+                _admission: staged.admission,
+            }),
+            range: 0..count,
+        }
+    }
+}
+
+fn metadata_bytes<Outcome>(
+    view: &StoredRdfView<'_>,
+    run: &ScopedSparqlResult<Outcome>,
+    governors: &purrdf::sparql::GovernorEvidence,
+    error: Option<
+        &purrdf::sparql::FallibleSparqlError<
+            ReadError,
+            purrdf::sparql::GovernedEvidence<RdfReadEvidence>,
+        >,
+    >,
+    payload_metadata: usize,
+) -> Result<usize, ReadError> {
+    let governor_bytes = governors.retained_bytes().ok_or_else(|| {
+        view.budget.fail(Error::new(
+            "RESOURCE_LIMIT",
+            "native governor receipt capacity overflow",
+        ))
+    })?;
+    let error_bytes = match error {
+        Some(FallibleSparqlError::Query { diagnostic, .. }) => {
+            diagnostic.diagnostic().retained_bytes().ok_or_else(|| {
+                view.budget.fail(Error::new(
+                    "RESOURCE_LIMIT",
+                    "native diagnostic capacity overflow",
+                ))
+            })?
+        }
+        Some(FallibleSparqlError::Operational { error, .. }) => {
+            error.message.len().saturating_add(error.code.len())
+        }
+        Some(FallibleSparqlError::AllocationFailed { construct, .. }) => construct.len(),
+        _ => 0,
+    };
+    let scope_bytes =
+        catalog_lease::response_row_bytes(crate::storage::json::write_compact(&run.scope).len());
+    let correlation_bytes = run.correlation.as_ref().map_or(0, |capture| {
+        catalog_lease::response_row_bytes(
+            crate::storage::json::write_compact(&capture.descriptor()).len(),
+        )
+    });
+    let metadata = 8192usize
+        .saturating_add(correlation_bytes)
+        .saturating_add(scope_bytes)
+        .saturating_add(size_of::<Published<Outcome>>())
+        .saturating_add(size_of::<catalog_lease::Snapshot<SparqlSelector, NativeBody>>())
+        .saturating_add(governor_bytes.saturating_mul(6))
+        // Both the typed diagnostic and the human failure summary
+        // may carry the same authored text, each JSON-escaped.
+        .saturating_add(error_bytes.saturating_mul(12))
+        .saturating_add(payload_metadata);
+    if metadata > 64 * 1024 {
+        return Err(view.budget.fail(Error::new(
+            "RESOURCE_LIMIT",
+            "native query metadata exceeds 64 KiB page admission",
+        )));
+    }
+
+    Ok(metadata)
+}
+
+fn stage_native_page(
+    view: &StoredRdfView<'_>,
+    count: usize,
+    page_size: usize,
+    metadata: usize,
+    charges: impl Iterator<Item = Result<usize, Error>>,
+) -> Result<Staged, ReadError> {
+    let boundary_bytes = count
+        .checked_add(2)
+        .and_then(|n| n.checked_mul(size_of::<usize>()))
+        .and_then(|n| n.checked_add(metadata))
+        .ok_or_else(|| {
+            view.budget.fail(Error::new(
+                "RESOURCE_LIMIT",
+                "native result boundary capacity overflow",
+            ))
+        })?;
+    let admission = view
+        .reserve_owned_workspace(boundary_bytes as u64)
+        .ok_or_else(|| {
+            view.budget.fail(Error::new(
+                "STORAGE_FAILURE",
+                "stored view lacks required owned workspace admission",
+            ))
+        })??;
+    if view.budget.checkpoint().1.live_bytes > catalog_lease::HANDLE_BYTES as u64 {
+        return Err(view.budget.fail(Error::new(
+            "RESOURCE_LIMIT",
+            "native result exceeds retained handle capacity",
+        )));
+    }
+    // Native iterative term visitor may grow a work list. A per-node
+    // charge stops before its storage can exceed this fixed scratch.
+    let scratch = view.budget.reserve(catalog_lease::PAGE_BYTES as u64)?;
+    let mut boundaries = Vec::new();
+    boundaries.try_reserve_exact(count + 2).map_err(|_| {
+        view.budget.fail(Error::new(
+            "RESOURCE_LIMIT",
+            "native page boundary allocation refused",
+        ))
+    })?;
+    boundaries.push(0);
+    let (mut bytes, mut rows) = (metadata, 0usize);
+    for (index, charge) in charges.enumerate() {
+        let (error, _) = view.budget.checkpoint();
+        if let Some(error) = error {
+            return Err(error);
+        }
+        let charge = charge.map_err(|e| view.budget.fail(e))?;
+        if charge.saturating_add(metadata) > catalog_lease::PAGE_BYTES {
+            return Err(view.budget.fail(Error::new(
+                "RESOURCE_LIMIT",
+                "native result item cannot fit a transport page",
+            )));
+        }
+        if rows == page_size || bytes.saturating_add(charge) > catalog_lease::PAGE_BYTES {
+            boundaries.push(index);
+            bytes = metadata;
+            rows = 0;
+        }
+        bytes += charge;
+        rows += 1;
+    }
+    if count > 0 {
+        boundaries.push(count);
+    }
+    drop(scratch);
+    let (error, evidence) = view.budget.checkpoint();
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let bytes = usize::try_from(evidence.live_bytes).map_err(|_| {
+        view.budget.fail(Error::new(
+            "RESOURCE_LIMIT",
+            "native result retained capacity overflow",
+        ))
+    })?;
+
+    Ok(Staged {
+        boundaries,
+        bytes,
+        admission,
+    })
 }

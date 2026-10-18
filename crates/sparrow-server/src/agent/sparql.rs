@@ -8,6 +8,7 @@ use purrdf::{SparqlResult, TermFactory, ir::RdfDatasetBuilder};
 use purrdf_lex::json::{self, Object, Value};
 
 pub(crate) struct Input {
+    explain: bool,
     controls: Controls,
     query: String,
     base: Option<String>,
@@ -98,6 +99,7 @@ impl Input {
             }
             fields.deny_unknown()?;
             Ok(Self {
+                explain: false,
                 controls,
                 query,
                 base,
@@ -110,8 +112,8 @@ impl Input {
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
         self.controls.require(client).await?;
-        let mut call = client.sparql_query_request();
-        let mut query = call.get().init_query();
+        let mut message = capnp::message::Builder::new_default();
+        let mut query = message.init_root::<wire::sparql_query::Builder<'_>>();
         query.set_store_id(&self.controls.store);
         query.set_schema_version(sparrow_client::SCHEMA_VERSION);
         query.set_query(&self.query);
@@ -135,11 +137,30 @@ impl Input {
             binding.set_term(ids[index]);
         }
         self.controls.fill_limits(query.init_limits());
-        let response = call.send().promise.await?;
-        match response.get()?.get_result()?.which()? {
-            wire::result::Ok(value) => render(value?),
-            wire::result::Error(error) => Err(failure(error?)),
+        let query = message.get_root_as_reader::<wire::sparql_query::Reader<'_>>()?;
+        if self.explain {
+            let mut call = client.sparql_explain_request();
+            call.get().set_query(query)?;
+            let response = call.send().promise.await?;
+            render_reply(response.get()?.get_result()?)
+        } else {
+            let mut call = client.sparql_query_request();
+            call.get().set_query(query)?;
+            let response = call.send().promise.await?;
+            render_reply(response.get()?.get_result()?)
         }
+    }
+
+    pub(super) fn explanation(mut self) -> Self {
+        self.explain = true;
+        self
+    }
+}
+
+fn render_reply(value: wire::result::Reader<'_, wire::sparql_page::Owned>) -> Result<Value> {
+    match value.which()? {
+        wire::result::Ok(value) => render(value?),
+        wire::result::Error(error) => Err(failure(error?)),
     }
 }
 
@@ -761,7 +782,9 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
         )
         .with(
             "operation",
-            if correlation.is_some() {
+            if value.get_operation()? == wire::NativeReadOperation::Explain {
+                "sparql_explain"
+            } else if correlation.is_some() {
                 "correlate"
             } else {
                 "sparql_query"
@@ -841,7 +864,32 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
             crate::rdf_wire::diagnostic::render(diagnostic?)?,
         );
     }
-    match value.get_outcome()?.which()? {
+    let explain = value.get_operation()? == wire::NativeReadOperation::Explain;
+    let outcome = value.get_outcome()?.which()?;
+    let valid_operation = match outcome {
+        wire::sparql_outcome::Explanation(_) => explain,
+        wire::sparql_outcome::Failure(_) => true,
+        _ => !explain,
+    };
+    if !valid_operation {
+        return Err(protocol("native operation disagrees with its outcome"));
+    }
+    match outcome {
+        wire::sparql_outcome::Explanation(v) => {
+            result = result
+                .with(
+                    "execution_status",
+                    if matches!(
+                        value.get_governors()?.get_stop()?.which()?,
+                        wire::governor_stop::Absent(())
+                    ) {
+                        "measured"
+                    } else {
+                        "stopped"
+                    },
+                )
+                .with("explanation", super::explanation::render(v?)?);
+        }
         wire::sparql_outcome::Complete(v) => {
             result = result
                 .with("execution_status", "complete")
@@ -874,8 +922,10 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
             let error = failure(error?);
             result = result
                 .with("execution_status", "failed")
-                .with("answer_certainty", "unknown")
                 .with("error", error.json());
+            if !explain {
+                result = result.with("answer_certainty", "unknown");
+            }
         }
     }
     let result: Value = result.into();

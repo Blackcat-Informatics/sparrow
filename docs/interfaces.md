@@ -520,7 +520,8 @@ and diagnostic/failure outcomes retain native ownership and certainty. UPDATE is
 refused by native read preparation; federation is disabled. These are core
 integration surfaces. Schema 51 exposes the same native read through typed
 `Sparrow.sparqlQuery`, CLI `sparrow ENDPOINT sparql REQUEST.json`, and MCP
-`sparql_query`. Text relations and public explanation contracts remain unfinished.
+`sparql_query`. Source schema 61 also provides the measured explanation surface
+below. Native stored-text relations remain unfinished.
 Native correlation is implemented in source schema 58, as specified below.
 Recordless artifact metadata is implemented and deployed in
 schema 52, as qualified below.
@@ -1041,6 +1042,7 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 | `record_get` | Record ID | Record metadata, parsed fields, projection/profile references, and source spans. |
 | `bytes_read` | Artifact/record/completed-generation ID, offset, length, encoding | Exact bounded bytes with original offset/length. Refuse an unavailable complete representation rather than substitute surviving partial bytes. |
 | `sparql_query` | Query, scope, graph layers, bindings, limits, coverage requirement | Typed native query result, result handle/page, and receipt. |
+| `sparql_explain` | Same closed request contract as `sparql_query` | Structured native measured-work ledger, original governor/source/scope receipts and immutable continuation; no query-answer certificate. |
 | `correlate` | Scope and seed IDs or trace/span/source/time selector | Relationships and their supporting evidence; implemented through prepared queries/retrieval. |
 | `result_next` | Store ID, result cursor | Next page from the same leased result; an expired handle refuses continuation. |
 | `result_release` | Store ID, snapshot ID | Release the captured replay lease and memory; never releases evidence pins. |
@@ -1073,12 +1075,43 @@ Its nested `status` is a current operational read, with
 the same integrity checks and cost as explicit status; it is not the catalog-free
 typed `discover` operation used internally for compatibility admission.
 
-`sparql_explain` remains required but is not yet advertised or callable through
-the daemon/agents. The selected native revision now provides governed measured
-EXPLAIN, and source core `Store::sparql_explain` shares request/scope ownership
-with ordinary queries. Consumer qualification and the public adapter remain in
-progress; see [native integration](purrdf-integration-gaps.md#retained-operational-sparql-integration).
-Native text/SPARQL integration remains independently required.
+### Measured native explanation (source schema 61)
+
+`Sparrow.sparqlExplain`, CLI `sparrow ENDPOINT sparql-explain REQUEST.json` and
+MCP `sparql_explain` accept the same closed input schema as `sparql_query`:
+query/base IRI, typed substitutions, retained selection, temporal/diagnostic
+filters, graph layers and finite source/native governors. They call native
+`explain_governed_fallible_view` through the same captured scope and admission
+owner as query execution. Remote requests remain zero; UPDATE is refused.
+
+The typed `SparqlOutcome.explanation` carries the original native profile ID,
+version, digest, stop polling granularity and charge schedule, plus statement
+index support. Its paged entries preserve native node ordinals/depths/labels,
+per-charge counters, total fuel, rows, cells and optional planner estimates;
+join-order/statistical descriptions; and physical strategies with optional
+provider/registry identity, actual work and optional access estimates. Unknown
+estimates remain absent. Sparrow does not render/reparse native explanation
+text, reprice native counters or evaluate the query a second time for paging.
+
+Query answers and explanations share one eight-handle/8 MiB native capture
+family, the existing 256 KiB page/64 KiB metadata ceilings, `result_next`,
+`result_release`, cancellation and the original absolute one-minute replay
+lease. Repeated cursors replay the same captured range without renewing it.
+An entry that cannot fit a page fails before publication. Every page retains the
+original native governor, source evidence, independent coverage and frozen scope.
+
+The shared agent renderer reports `operation="sparql_explain"` and
+`execution_status="measured"` or `"stopped"`. It deliberately omits
+`answer_certainty`: a stopped measured ledger does not certify query answers.
+Native parse/operational failures report `"failed"` with original diagnostics
+and evidence. The endpoint uses native default options with no injected custom
+relation or aggregate registry; empty declaration lists are explicit. An
+unexpected nonempty native registry is a hard integration failure before a
+report is published, never silently omitted metadata.
+
+The schema-61 adapters and consumer tests are source work; the installed schema-60
+image has not adopted them. Native stored-text integration and runtime/resource
+qualification remain required; see [native integration](purrdf-integration-gaps.md#retained-operational-sparql-integration).
 
 The query interface supports read forms such as SELECT, ASK, CONSTRUCT, and
 DESCRIBE through PurRDF. Preserve RDF term kind, datatype, language, base

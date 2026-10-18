@@ -10,17 +10,18 @@ DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained nati
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
 [Development runtime](development-runtime.md#schema-60-live-adoption).
-Native text relations, public measured explanation, runtime adoption and
+Native text relations, runtime adoption of public measured explanation and
 production resource/turnover acceptance remain required. Source now selects
 `9b2bf3b71325154137bc1aa817b46356daadfe3a`: upstream PR #609 closed
 [PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605) with
 actual-payload materialization, and PR #611 closed
 [#600](https://github.com/Blackcat-Informatics/purrdf/issues/600) with governed
 request EXPLAIN. The source core adds `Store::sparql_explain` through the same
-capture/admission owner as query execution. Three focused release consumer
-regressions and release Clippy with warnings denied pass. The normal full gate
-is required before committing; no explanation RPC or agent capability is
-advertised yet.
+capture/admission owner as query execution. Signed `126248c` passed the full
+release gate. Source schema 61 now adds typed explanation RPC, generated SDK,
+shared CLI/MCP rendering and immutable continuation under the existing native
+lease family. Three focused release consumer regressions, release Clippy and
+the pinned census pass. The normal full gate is required before committing.
 The installed image still uses the earlier native revision. The qualification
 evidence below records how these surfaces grew.
 
@@ -165,8 +166,12 @@ unchanged. Complete content-export acceptance remains NOT MET.
 The selected source now supplies `explain_governed_fallible_view`, accepting the
 original native request, options and governors and returning retained explanation
 and governor/view receipts. Sparrow core shares the original scope, cancellation,
-admission and remote-request policy through one execution boundary. Consumer
-qualification and transport/CLI/MCP integration remain required.
+admission and remote-request policy through one execution boundary. Source
+schema 61 adds transport/CLI/MCP integration, preserving structured native
+entries under the same page/handle owner. Public consumer regressions pass for
+bindings, measured counters, stopped/failure outcomes, replay/release/expiry,
+shared admission and oversized-entry refusal. Runtime adoption and default-image
+qualification remain required.
 
 The selected-source consumer regressions pass: complete persisted materialization
 retains 2,605 rows after source closure under the unchanged 128 MiB workspace;

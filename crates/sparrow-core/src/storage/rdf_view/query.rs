@@ -92,16 +92,26 @@ impl Store {
     /// Measure the original native request, substitutions and finite governors
     /// over the same captured view used by ordinary queries. The returned ledger
     /// retains native admission after the view and snapshot have been released.
-    #[expect(
-        clippy::result_large_err,
-        reason = "native failures retain original receipts; boxing a refusal would allocate after admission failure"
-    )]
     pub fn sparql_explain(
         &self,
         read: &SparqlRead<'_>,
         now: u64,
         cancellation: &QueryCancellation,
     ) -> Result<ScopedSparqlExplanation, ReadError> {
+        self.with_sparql_explanation(read, now, cancellation, |_, result| result)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "native failures retain original receipts; boxing a refusal would allocate after admission failure"
+    )]
+    pub(super) fn with_sparql_explanation<T>(
+        &self,
+        read: &SparqlRead<'_>,
+        now: u64,
+        cancellation: &QueryCancellation,
+        publish: impl FnOnce(&StoredRdfView<'_>, ScopedSparqlExplanation) -> T,
+    ) -> Result<T, ReadError> {
         self.with_native_result(
             (read, None),
             now,
@@ -114,7 +124,7 @@ impl Store {
                     governors,
                 )
             },
-            |_, result| result,
+            publish,
         )
     }
 

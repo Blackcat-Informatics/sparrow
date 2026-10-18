@@ -95,6 +95,28 @@ pub struct CatalogReadPage<B> {
     pub body: B,
 }
 
+impl<B> CatalogReadPage<B> {
+    /// Transform only the body, preserving the original immutable lease receipt.
+    pub(crate) fn try_map_body<C>(
+        self,
+        map: impl FnOnce(B) -> Result<C, Error>,
+    ) -> Result<CatalogReadPage<C>, Error> {
+        Ok(CatalogReadPage {
+            store_id: self.store_id,
+            snapshot_id: self.snapshot_id,
+            as_of: self.as_of,
+            lease_expires_at: self.lease_expires_at,
+            total_items: self.total_items,
+            page_start: self.page_start,
+            next_cursor: self.next_cursor,
+            page_size: self.page_size,
+            scan_budget: self.scan_budget,
+            scanned: self.scanned,
+            body: map(self.body)?,
+        })
+    }
+}
+
 pub(super) struct Snapshot<S, B> {
     pub bytes: usize,
     pub id: String,

@@ -41,9 +41,14 @@ impl Operation {
                 super::correlation::Input::decode(arguments)?,
             ))));
         }
-        if name == "sparql_query" {
+        if name == "sparql_query" || name == "sparql_explain" {
+            let input = super::sparql::Input::decode(arguments)?;
             return Ok(Self::Query(Command::Sparql(Box::new(
-                super::sparql::Input::decode(arguments)?,
+                if name == "sparql_explain" {
+                    input.explanation()
+                } else {
+                    input
+                },
             ))));
         }
         let decode = || -> std::result::Result<Self, DecodeError> {
