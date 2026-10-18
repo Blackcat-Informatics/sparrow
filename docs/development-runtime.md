@@ -2,11 +2,11 @@
 
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
-socket. It is running and both typed endpoints were verified on 2026-10-17 after
-the approved checkpoint recovery below. It uses
-schema 50 and store format 37. The stable installed
+socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
+after the approved checkpoint recovery and schema-51 adoption below. It uses
+schema 51 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`28e3915`; see [logical retention accounting](#logical-retention-accounting) for
+`373b715`; see [schema-51 live adoption](#schema-51-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
@@ -15,9 +15,8 @@ transient-unit and schema sections below retain historical evidence.
 
 The implementation branch now includes schema 51 native graph RPC publication,
 CLI `sparql REQUEST.json`, MCP `sparql_query`, and generic graph `result_next`.
-The installed service described above remains schema 50; these source changes
-have not been deployed. They do not alter the store format or start another
-writer on the development database.
+These changes are now deployed on the development service. They do not alter
+the store format; the service remains the sole database writer.
 
 The typed transport preserves native complete/certain/at-most/unknown outcomes,
 all governor dimensions, source evidence, coverage, RDF 1.2 graph item roles,
@@ -83,6 +82,61 @@ iterator; its regression checks zero added requests, rows and bytes before a
 pull. The full hardening gate and signed commit receipts are
 `graph-hardening-full-check-v2.log` and `graph-hardening-commit.log`.
 
+## Schema-51 live adoption
+
+Signed source `373b715771ecd10adcfeedbafd845d1707195046` passed the normal
+pre-commit `make check` gate: release Clippy, all release tests (including 19 core
+unit tests, 175 storage tests and 62 RPC tests), census self-tests, and 273 pinned
+ownership jobs with zero distinct exceptions. Both runtime executables were then
+explicitly rebuilt with `cargo build --locked --release -p sparrow-server --bins`;
+Cargo's machine artifact paths selected the installed bytes.
+
+The daemon image is
+`~/.local/libexec/sparrow/sparrowd-schema51-373b715`, SHA-256
+`3224b16d89e5dddd1d29e35757c1b66b9770e84715925f10cd45cecb06cc54d4`.
+The CLI image is `~/.local/libexec/sparrow/sparrow-schema51-373b715`, SHA-256
+`cb1a631d80cf9dfd3479365c2b63f6aa0b1226ab59f66982c1a880f36e0eb580`.
+The daemon's sole file capability `cap_net_bind_service=ep` was verified before
+stopping its predecessor. Stable aliases resolve to these qualified hashes;
+configuration, unit and intake roots were preserved. The enabled persistent unit
+was drained through SIGINT. With PID zero and the Unix endpoint removed, an
+exclusive native store lock protected a fresh closed backup at
+`.stage/native-graph-integration/schema51-pre-adoption-closed-backup-20261018`.
+Every regular-file hash matched the closed source before switching aliases.
+The earlier pre-recovery backup's full hash manifest was independently rechecked.
+
+The service started at 2026-10-18 05:20:30 UTC, observed PID 273940. Service state,
+start journal, installed aliases and hashes, schema discovery and typed queries
+were verified. Direct executable readback through the process filesystem was
+denied by the automatic policy guard, so no running-process executable hash is
+claimed. Native socket inspection confirmed `0.0.0.0:518`; typed TCP and Unix
+status reported the original store `store:46c88e949ccec658600b66c7becd5bb7`,
+schema 51, format 37, 217 live records and 213 unique payload chunks, with no
+watch failures.
+
+Live SELECT, ASK, CONSTRUCT and DESCRIBE passed at default governors against an
+original retained record. DESCRIBE traversed six immutable pages through TCP
+initial execution and Unix continuation: 23 transport items preserve 22 native
+quads and one named-graph declaration. It admitted 5,797 requests, 4,069 row visits
+and 3,672,376 source bytes. A full retained metadata COUNT returned 217, matching
+occurrence coverage; its 119,088,342 admitted bytes are finite-corpus evidence,
+not a production capacity claim. The independent failed-content count remains
+one. Unix MCP SELECT matched the CLI's native result, and final status reported
+zero SPARQL handles and retained result bytes. The probe initially expected 22
+transport items, then corrected that assertion to include the declaration and
+reran successfully; no runtime change was needed.
+
+Evidence under `.stage/native-graph-integration/` includes
+`schema51-runtime-build.{jsonl,log}`, `schema51-runtime-artifacts.json`,
+`schema51-adoption-prerequisites.json`,
+`schema51-pre-adoption-closed-backup.json`, `schema51-live-service.txt`,
+`schema51-live-query-*`, `schema51-live-mcp.json`,
+`schema51-live-acceptance.{py,log}`, `schema51-live-acceptance-summary.json`,
+and the before/after typed status receipts. This establishes development graph
+acceptance on the owned synthetic store. Recordless-artifact RDF metadata,
+text/correlation/explanation integration, forced bounded physical reclamation,
+and production-volume/resource acceptance remain unfinished.
+
 ## Device-identity discontinuity and approved recovery
 
 A startup attempt on 2026-10-17 exited with the native guard:
@@ -140,9 +194,9 @@ Local evidence is under `.stage/native-graph-integration/`:
 `checkpoint-recovery-qualified.json`, `runtime-pre-recovery-backup.json`,
 `checkpoint-recovery-apply.log`, `runtime-recovered-status.json` and
 `runtime-recovered-unix-status.json`.
-The installed daemon remains `28e3915`; the qualified PurRDF integration commit
-`a664689` has not been deployed. Neither its full `make check` pass nor the
-copy-only recovery alone establishes live service availability; the separate
+At this recovery boundary the daemon remained `28e3915`; later schema-51
+adoption is recorded above. Neither a full `make check` pass nor copy-only
+recovery alone establishes live service availability; the separate
 post-recovery typed status calls do.
 
 ## Independent backup restoration
