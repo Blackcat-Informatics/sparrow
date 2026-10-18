@@ -76,3 +76,14 @@ inspection. A candidate binding still needs the missing bounded collection and
 resource contracts, followed by full source/copy-store/failure qualification
 before runtime adoption. The original forced-reclamation requirement remains
 unmet.
+
+On 2026-10-18 the first-party
+[release index](https://github.com/zaidoon1/rust-rocksdb/releases) still identified
+v0.53.0 as latest. A fresh inspection of the current
+[metadata options](https://raw.githubusercontent.com/zaidoon1/rust-rocksdb/master/src/metadata.rs)
+and [compaction options](https://raw.githubusercontent.com/zaidoon1/rust-rocksdb/master/src/compaction.rs)
+found the same relevant limits: metadata selection filters levels/key ranges,
+and file compaction exposes per-output-file sizing and cancellation. These
+inspected types still supply neither admitted metadata pagination nor a total
+job output-byte ceiling. This refresh does not establish the missing bounded
+reclamation contract or justify changing the selected dependency.

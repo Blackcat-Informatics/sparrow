@@ -19,6 +19,7 @@ mod budget;
 pub(crate) mod pages;
 mod query;
 mod scope;
+mod sparse;
 use budget::{Budget, Reservation};
 pub use pages::{
     SparqlGraphKind, SparqlItem, SparqlPageBody, SparqlReadPage, sparql_term_node_bytes,
@@ -26,6 +27,7 @@ pub use pages::{
 };
 pub use query::{ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;
+use sparse::RowCursor;
 
 /// Sticky operational root cause shared by native readers and their guards.
 pub type ReadError = Arc<Error>;
@@ -350,13 +352,14 @@ impl<'a> StoredRdfView<'a> {
         pattern: [Option<GlobalTermId>; 3],
         graph: GraphMatch<GlobalTermId>,
     ) -> impl Iterator<Item = QuadIds<GlobalTermId>> + '_ {
-        let first = self.physical_rows(
-            stream,
-            plan,
-            pattern,
-            graph,
-            matches!(graph, GraphMatch::Default),
-        );
+        let cursor = |plan, graph, union_default| {
+            if pattern.iter().all(Option::is_none) && !matches!(graph, GraphMatch::Named(_)) {
+                RowCursor::scoped(self, stream, union_default)
+            } else {
+                RowCursor::Indexed(self.physical_rows(stream, plan, pattern, graph, union_default))
+            }
+        };
+        let first = cursor(plan, graph, matches!(graph, GraphMatch::Default));
         let union = matches!(graph, GraphMatch::Any).then(|| {
             let plan = self.probe_plan(
                 pattern[0].is_some(),
@@ -364,7 +367,7 @@ impl<'a> StoredRdfView<'a> {
                 pattern[2].is_some(),
                 GraphMatch::Default,
             );
-            self.physical_rows(stream, plan.0, pattern, GraphMatch::Default, true)
+            cursor(plan.0, GraphMatch::Default, true)
         });
         first.chain(union.into_iter().flatten())
     }
@@ -495,7 +498,7 @@ impl Iterator for QuadIter<'_> {
             if self.pattern[0].is_some_and(|id| id != row.s)
                 || self.pattern[1].is_some_and(|id| id != row.p)
                 || self.pattern[2].is_some_and(|id| id != row.o)
-                || !self.graph.matches(row.g)
+                || (!self.union_default && !self.graph.matches(row.g))
             {
                 continue;
             }

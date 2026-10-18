@@ -35,7 +35,8 @@ TCP CLI and Unix MCP replay, certain/at-most/unknown certificates, native query
 failures, unsuccessful CLI exits, release and cyclic-wire refusal. Single-page
 results do not retain a continuation handle; releasing those returns false.
 
-The pinned census holds 272 ownership jobs with zero distinct exceptions.
+The graph transport's original pinned census held 272 ownership jobs with zero
+distinct exceptions; scoped cursor ownership adds one job in the hardening below.
 Event fields and capacity diagnostics share the SDK's original `WideInteger`
 carrier and codec; argument errors and count rendering also reuse their existing
 owners. No detectors were relaxed. The final normal `make check` commit gate is
@@ -46,6 +47,41 @@ Recordless artifact RDF metadata, native text relations, correlation, public
 explanation, forced bounded physical reclamation and production-volume/resource
 acceptance remain unfinished. The concrete native storage integration gap is
 documented in [native reclamation integration](native-reclamation.md).
+
+Graph egress hardening reproduced two adapter failures before their fixes. A
+241-node native triple term fitted the forest's 512-node/256-KiB admission but
+failed a separate generic JSON depth default. The renderer now derives JSON
+bounds from transport admission; native serialization and native readback retain
+the complete term and an unbound cell. A 100-row projection with a 5,000-character
+variable name exposed a separate per-page sizing omission: native SRJ repeats
+the name in each row. Core boundary pricing now includes that repeated charge.
+The MCP/CLI regression traverses bounded pages and uses the native result reader
+to verify all 100 original values. Before/after receipts are
+`deep-result-{before,after}.log` and `projection-name-{before,after}.log` under
+`.stage/native-graph-integration`.
+
+Source-read refusal diagnostics also identify attempted requests, admitted bytes
+and row visits beside their ceilings. Failed requests retain the original sticky
+error and leave admitted-consumption counters unchanged.
+
+A hash-verified private copy of the pre-recovery development backup exposed a
+storage access problem absent from the tiny synthetic queries. Its single-record
+DESCRIBE exhausted 100,000 requests after 98,510 row visits, despite admitting
+only about 15.9 MB. Unbound reads scanned foreign statement rows before owner
+filtering. They now merge the existing graph-prefixed cursors for selected graph
+declarations, preserving physical order, owner filtering, empty declarations and
+default-union deduplication. The focused storage regression includes 2,000
+foreign rows, shared graph names and duplicate selected owners under a 500-visit
+ceiling. No governor ceiling or stored format was raised for this repair.
+The private copy then completed all four read forms at default limits, including
+DESCRIBE with 5,747 requests, 4,019 row visits and 3,668,536 admitted bytes. The
+full retained metadata count was 212, matching selected occurrence coverage;
+its independent content coverage still reported one failed projection. Those
+receipts are `schema51-restore-probe-after.json`/`.log`. The subsequent lazy
+initialization change prevents graph reads merely from constructing an unused
+iterator; its regression checks zero added requests, rows and bytes before a
+pull. The full hardening gate and signed commit receipts are
+`graph-hardening-full-check-v2.log` and `graph-hardening-commit.log`.
 
 ## Device-identity discontinuity and approved recovery
 

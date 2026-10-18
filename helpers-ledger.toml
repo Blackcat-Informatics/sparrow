@@ -3999,3 +3999,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(encode_u128_elsewhere|decode_u128_elsewhere)$']
+
+[[job]]
+id = "scoped-rdf-physical-cursor-merge"
+summary = "Unbound statement reads merge the existing selected graph-prefixed storage cursors in physical SPOG order, retaining native quad identity and the existing default-union projection without scanning foreign statement rows or materializing a second RDF corpus."
+home = "sparrow_core::storage::rdf_view::sparse::ScopedRows::new"
+entry_points = ["sparrow_core::storage::rdf_view::sparse::ScopedRows::initialize", "sparrow_core::storage::rdf_view::sparse::ScopedRows::grow", "sparrow_core::storage::rdf_view::sparse::ScopedRows::push_head", "sparrow_core::storage::rdf_view::sparse::ScopedRows::next", "sparrow_core::storage::rdf_view::sparse::RowCursor::scoped", "sparrow_core::storage::rdf_view::sparse::RowCursor::next"]
+spec = "docs/interfaces.md: scoped native snapshot reads and bounded storage access."
+vectors = ["crates/sparrow-core/src/storage/rdf_index.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(rebuild_scoped_rdf_in_memory|copy_foreign_quad_scan_for_describe)$']

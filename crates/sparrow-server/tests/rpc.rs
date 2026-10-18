@@ -8606,6 +8606,90 @@ fn cli(socket: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> purrdf_lex::json::
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn native_graph_pages_admit_repeated_projection_names_before_agent_rendering() {
+    use purrdf_lex::json::{self, Object};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            client
+                .ingest("name-price-input", "name-price", wire::Format::Json, b"{}")
+                .await
+                .unwrap();
+            let variable = "v".repeat(5000);
+            let values = (0..100)
+                .map(|n| format!("<urn:row:{n}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let query = format!("SELECT ?{variable} WHERE {{ VALUES ?{variable} {{ {values} }} }}");
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let first = mcp
+                .tool(
+                    2,
+                    "sparql_query",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("query", query)
+                        .with("page_size", 1000_u32)
+                        .into(),
+                )
+                .await;
+            assert_eq!(first["isError"].as_bool(), Some(false), "{first:?}");
+            let mut page = first["structuredContent"].clone();
+            let snapshot = page["snapshot_id"].as_str().unwrap().to_owned();
+            let mut pages = 0;
+            let mut actual = std::collections::BTreeSet::new();
+            let mut count = 0;
+            loop {
+                pages += 1;
+                assert!(json::write_compact(&page).len() <= 256 * 1024);
+                assert_eq!(page["answer_certainty"].as_str(), Some("exact"));
+                let native = purrdf::sparql::from_json(
+                    json::write_compact(&page["rows"]["native_result"]).as_bytes(),
+                )
+                .unwrap();
+                assert_eq!(native.variables, vec![variable.clone()]);
+                for row in native.rows {
+                    count += 1;
+                    assert!(actual.insert(row.into_iter().next().unwrap().unwrap()));
+                }
+                let Some(cursor) = page["next_cursor"].as_str() else {
+                    break;
+                };
+                page = cli(&socket, ["result-next", &store, cursor].as_slice());
+                assert_eq!(page["snapshot_id"].as_str(), Some(snapshot.as_str()));
+                assert!(pages <= 100);
+            }
+            assert!(
+                pages > 1,
+                "long native SRJ field names must affect transport page boundaries"
+            );
+            assert_eq!(count, 100);
+            assert_eq!(
+                actual,
+                (0..100)
+                    .map(|n| purrdf::TermValue::iri(format!("urn:row:{n}")))
+                    .collect()
+            );
+            assert!(
+                sparrow_client::release_result(client.capability(), &store, &snapshot)
+                    .await
+                    .unwrap()
+                    .released
+            );
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["sparql_read_handles"].as_str(), Some("0"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cli_and_mcp() {
     use purrdf_lex::json::{self, Object, Value};
     tokio::task::LocalSet::new().run_until(async {

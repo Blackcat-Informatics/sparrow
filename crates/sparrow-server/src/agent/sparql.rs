@@ -359,7 +359,22 @@ fn serialize(result: &SparqlResult) -> Result<Value> {
     if output.provenance_dropped {
         return Err(protocol("native result serializer dropped provenance"));
     }
-    json::read_slice(&output.bytes, json::Limits::default()).map_err(protocol)
+    if output.bytes.len() > crate::rdf_wire::MAX_BYTES {
+        return Err(protocol("native result JSON exceeds admitted page bytes"));
+    }
+    // Native SRJ nests a term's type/value objects in addition to its triple
+    // children. Bound this by the already admitted forest, rather than a
+    // generic JSON default that rejects valid RDF transport items.
+    json::read_slice(
+        &output.bytes,
+        json::Limits {
+            max_depth: 2 * crate::rdf_wire::MAX_NODES + 16,
+            max_values: crate::rdf_wire::MAX_BYTES as u64,
+            max_string_bytes: crate::rdf_wire::MAX_BYTES,
+            unique_members: false,
+        },
+    )
+    .map_err(protocol)
 }
 
 fn declarations(graph: &purrdf::RdfDataset) -> Result<Value> {
@@ -869,14 +884,25 @@ mod tests {
     }
 
     #[test]
-    fn native_select_json_keeps_unbound_cells_without_losing_the_row() {
+    fn native_select_json_keeps_admitted_nested_terms_and_unbound_cells() {
         let mut message = capnp::message::Builder::new_default();
         let mut wire = message.init_root::<wire::sparql_data::Builder<'_>>();
         wire.set_form(wire::SparqlForm::Select);
         let mut variables = wire.reborrow().init_variables(2);
         variables.set(0, "x");
         variables.set(1, "missing");
-        let value = TermValue::iri("urn:x");
+        // 241 native nodes fit the 512-node/256-KiB transport admission.
+        // Native SRJ adds two JSON objects per nested triple, exceeding an
+        // unrelated 128-container JSON reader default without exceeding RDF
+        // transport admission. Egress is independent of binding-input depth.
+        let mut value = TermValue::iri("urn:x");
+        for _ in 0..80 {
+            value = TermValue::Triple {
+                s: TermBox::new(value),
+                p: TermBox::new(TermValue::iri("urn:p")),
+                o: TermBox::new(TermValue::iri("urn:o")),
+            };
+        }
         let ids = crate::rdf_wire::encode(&[&value], |n| wire.reborrow().init_terms(n)).unwrap();
         let mut cells = wire
             .reborrow()
@@ -891,7 +917,10 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["x"]["value"].as_str(), Some("urn:x"));
+        let parsed =
+            purrdf::sparql::from_json(json::write_compact(&result["native_result"]).as_bytes())
+                .unwrap();
+        assert_eq!(parsed.rows, vec![vec![Some(value), None]]);
         assert!(rows[0].get("missing").is_none());
     }
 }

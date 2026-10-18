@@ -712,6 +712,82 @@ mod tests {
     }
 
     #[test]
+    fn scoped_full_streams_seek_selected_graphs_and_preserve_default_union_deduplication() {
+        use purrdf::{DatasetView, FallibleDatasetView, GraphMatch};
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        empty_dictionary(&db);
+        let mut selected = purrdf::RdfDatasetBuilder::new();
+        let s = selected.intern_iri("urn:selected").unwrap();
+        let p = selected.intern_iri("urn:p").unwrap();
+        let o = selected.intern_iri("urn:o").unwrap();
+        let a = selected.intern_iri("urn:graph:a").unwrap();
+        let b = selected.intern_iri("urn:graph:b").unwrap();
+        let empty = selected.intern_iri("urn:empty").unwrap();
+        selected.declare_named_graph(empty).unwrap();
+        selected.push_quad(s, p, o, Some(a)).unwrap();
+        selected.push_quad(s, p, o, Some(b)).unwrap();
+        let selected = selected.freeze().unwrap();
+        let mut outside = purrdf::RdfDatasetBuilder::new();
+        let foreign = outside.intern_iri("urn:foreign").unwrap();
+        let p = outside.intern_iri("urn:p").unwrap();
+        let shared = outside.intern_iri("urn:graph:a").unwrap();
+        outside
+            .push_quad(foreign, p, foreign, Some(shared))
+            .unwrap();
+        for n in 0..2000 {
+            let o = outside.intern_iri(&format!("urn:outside:{n}")).unwrap();
+            outside.push_quad(foreign, p, o, None).unwrap();
+        }
+        let outside = outside.freeze().unwrap();
+        let mut batch = WriteBatch::default();
+        let mut write = RdfWrite::new(&db).unwrap();
+        write.graph(&mut batch, "selected-a", &selected).unwrap();
+        write.graph(&mut batch, "selected-b", &selected).unwrap();
+        write.graph(&mut batch, "outside", &outside).unwrap();
+        write.finish(&mut batch).unwrap();
+        db.write(batch).unwrap();
+        let view = super::super::rdf_view::StoredRdfView::new(
+            &db,
+            crate::RdfReadLimits {
+                requests: 2000,
+                row_visits: 500,
+                ..Default::default()
+            },
+            &["selected-a".into(), "selected-b".into()],
+        )
+        .unwrap();
+        let before = view.operation_status().evidence().clone();
+        let unpulled = view.quads();
+        let after = view.operation_status().evidence().clone();
+        assert_eq!(before.requests, after.requests);
+        assert_eq!(before.row_visits, after.row_visits);
+        assert_eq!(before.admitted_bytes, after.admitted_bytes);
+        drop(unpulled);
+        let rows = view.quads().collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            3,
+            "two named statements plus one deduplicated default-union statement"
+        );
+        assert_eq!(rows.iter().filter(|row| row.g.is_none()).count(), 1);
+        assert_eq!(
+            view.quads_for_pattern(None, None, None, GraphMatch::Default)
+                .count(),
+            1
+        );
+        assert_eq!(
+            view.named_graphs().count(),
+            5,
+            "retain both owners and the explicit empty declaration"
+        );
+        assert!(
+            view.read_error().is_none(),
+            "the 2000 foreign default-graph rows must not consume this scope's visit budget"
+        );
+    }
+
+    #[test]
     fn refused_graphs_leave_dictionary_references_and_batch_unchanged() {
         use purrdf::{RdfDatasetBuilder, RdfLiteral};
         let dir = tempfile::tempdir().unwrap();
@@ -938,25 +1014,51 @@ mod tests {
             ));
             drop(view);
             db.put(&key, saved).unwrap();
-            let broken = index_key(1, 0, "SPOG", [0, 1, 2, 3], &[0; 4]);
-            db.put(&broken, []).unwrap();
-            let view = super::super::rdf_view::StoredRdfView::new(
+            let owner = counter(
                 &db,
-                crate::RdfReadLimits::default(),
-                &["rdf12-fixture".into()],
+                &reverse_key(&encoded(&TermValue::iri(graph_iri("rdf12-fixture"))).unwrap()),
             )
             .unwrap();
-            let failure = purrdf::dataset_view::checkpointed_drain(&view, |view| {
-                view.quads().collect::<Vec<_>>()
-            })
-            .unwrap_err();
-            assert_eq!(
-                failure.checkpoint,
-                purrdf::dataset_view::DrainCheckpoint::After
-            );
-            assert_eq!(failure.error.code, "STORAGE_FAILURE");
-            drop(view);
-            db.delete(broken).unwrap();
+            let subject = counter(
+                &db,
+                &reverse_key(&encoded(&native.as_ref().term_value(s)).unwrap()),
+            )
+            .unwrap();
+            let subject_id = purrdf::ir::GlobalTermId::checked_from_index(subject - 1).unwrap();
+            for (name, row, subject_filter) in [
+                ("SPOG", [subject, 0, 0, owner], Some(subject_id)),
+                ("GSPO", [0, 0, 0, owner], None),
+            ] {
+                let order = ORDERS
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .unwrap()
+                    .1;
+                let broken = index_key(owner, 0, name, order, &row);
+                db.put(&broken, []).unwrap();
+                let view = super::super::rdf_view::StoredRdfView::new(
+                    &db,
+                    crate::RdfReadLimits::default(),
+                    &["rdf12-fixture".into()],
+                )
+                .unwrap();
+                let failure = purrdf::dataset_view::checkpointed_drain(&view, |view| {
+                    if let Some(subject) = subject_filter {
+                        view.quads_for_pattern(Some(subject), None, None, purrdf::GraphMatch::Any)
+                            .collect::<Vec<_>>()
+                    } else {
+                        view.quads().collect::<Vec<_>>()
+                    }
+                })
+                .unwrap_err();
+                assert_eq!(
+                    failure.checkpoint,
+                    purrdf::dataset_view::DrainCheckpoint::After
+                );
+                assert_eq!(failure.error.code, "STORAGE_FAILURE");
+                drop(view);
+                db.delete(broken).unwrap();
+            }
             let broken = graph_key(0, 1);
             db.put(&broken, []).unwrap();
             let view = super::super::rdf_view::StoredRdfView::new(

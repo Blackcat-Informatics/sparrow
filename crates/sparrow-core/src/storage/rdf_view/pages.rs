@@ -196,10 +196,16 @@ pub fn sparql_term_wire_bytes(value: &TermValue) -> Result<usize, Error> {
     term_wire_bytes(TermInput::Value(value))
 }
 
-fn item_wire_bytes(item: SparqlItem<'_>) -> Result<usize, Error> {
+fn item_wire_bytes(item: SparqlItem<'_>, variable_bytes: usize) -> Result<usize, Error> {
     let mut bytes = 512usize;
     match item {
         SparqlItem::Solution(row) => {
+            // Native SRJ repeats variable names as object keys in every bound
+            // solution. Pricing them only in head.vars under-admits long
+            // projections, even though the typed wire carries names once.
+            bytes = bytes
+                .checked_add(variable_bytes)
+                .ok_or_else(|| Error::new("RESOURCE_LIMIT", "solution name capacity overflow"))?;
             bytes = bytes
                 .checked_add(row.len().saturating_mul(32))
                 .ok_or_else(|| Error::new("RESOURCE_LIMIT", "solution cell capacity overflow"))?;
@@ -450,7 +456,8 @@ impl Store {
                     if let Some(error) = error {
                         return Err(error);
                     }
-                    let charge = item_wire_bytes(item).map_err(|e| view.budget.fail(e))?;
+                    let charge =
+                        item_wire_bytes(item, variables).map_err(|e| view.budget.fail(e))?;
                     if charge.saturating_add(metadata) > catalog_lease::PAGE_BYTES {
                         return Err(view.budget.fail(Error::new(
                             "RESOURCE_LIMIT",

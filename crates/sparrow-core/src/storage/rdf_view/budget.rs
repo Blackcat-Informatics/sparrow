@@ -123,7 +123,10 @@ impl Budget {
         {
             let error = Arc::new(Error::new(
                 "RESOURCE_LIMIT",
-                "RDF read request, byte or row budget exhausted",
+                format!(
+                    "RDF read request, byte or row budget exhausted: attempted requests={requests}/{}, io_bytes={admitted_bytes}/{}, row_visits={row_visits}/{}",
+                    self.limits.requests, self.limits.io_bytes, self.limits.row_visits,
+                ),
             ));
             state.error = Some(error.clone());
             return Err(error);
@@ -277,6 +280,24 @@ mod tests {
         let before = budget.checkpoint().1;
         let error = budget.request(1, true).unwrap_err();
         assert_eq!(error.code, "RESOURCE_LIMIT");
+        assert_eq!(budget.checkpoint().1, before);
+        assert!(Arc::ptr_eq(&error, &budget.request(0, false).unwrap_err()));
+    }
+
+    #[test]
+    fn source_refusal_identifies_attempted_limits_without_changing_consumed_evidence() {
+        let budget = Budget::new(RdfReadLimits {
+            io_bytes: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        budget.request(1, true).unwrap();
+        let before = budget.checkpoint().1;
+        let error = budget.request(1, true).unwrap_err();
+        assert_eq!(error.code, "RESOURCE_LIMIT");
+        assert!(error.message.contains("requests=2/100000"));
+        assert!(error.message.contains("io_bytes=2/1"));
+        assert!(error.message.contains("row_visits=2/100000"));
         assert_eq!(budget.checkpoint().1, before);
         assert!(Arc::ptr_eq(&error, &budget.request(0, false).unwrap_err()));
     }

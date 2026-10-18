@@ -363,6 +363,12 @@ unavailable applicable content or unknown diagnostic membership. Exhausted
 capture admission refuses the whole selection, and the page-size limit never
 clips graph membership. The writer lock is released before native execution;
 membership and graph values remain on the same captured native snapshot.
+Unbound statement reads seek the existing graph-leading indexes for selected
+graph declarations, then merge their heads in physical SPOG order. The same
+native-identity deduplication preserves named statements and the default union.
+This uses memory proportional to active graph cursors; it does not replay a
+resident RDF corpus. Source requests, row visits, cursor buffers and deadlines
+remain admitted and failures remain sticky across the native read fence.
 
 `Store::sparql_query` passes typed substitutions and governors to PurRDF's native
 SELECT, ASK, CONSTRUCT and DESCRIBE implementation. Complete, certified partial
@@ -394,6 +400,11 @@ capacity, with a fixed 60-second lease from capture start. Page size is at most
 1,000 items and 256 KiB of conservatively admitted structured output, including
 metadata and worst-case JSON escaping. Native traversal and term/diagnostic
 capacity helpers supply the sizing inputs; Sparrow owns only transport charges.
+Each solution includes the escaped projection-name charge because native SPARQL
+JSON repeats those names in every row. Result JSON decoding derives its nesting
+and input bounds from the admitted term forest and page bytes. Binding-input
+depth remains independent; a deeper native result that fits egress admission
+does not inherit the binding-input depth limit.
 An oversized indivisible item or receipt refuses publication, never clips RDF.
 `result_release` releases these captures; status and maintenance share expiry
 accounting. Core status reports `sparql_read_handles`, `sparql_read_bytes` and
