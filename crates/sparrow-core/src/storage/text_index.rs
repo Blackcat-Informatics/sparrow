@@ -8,6 +8,127 @@ use purrdf::text::{FieldInput, PreparedCorpus, RankingProfile};
 
 pub(super) const MATCH_MEMBERSHIP_BYTES: usize = 64 * 1024 * 1024;
 
+/// Counts over the complete declared corpus, independently of matching postings.
+pub(super) struct CorpusStatistics {
+    pub documents: u64,
+    pub tokens: u128,
+}
+
+/// Native scores and exact matched-term ordinals from one immutable posting view.
+pub(super) struct RankedPostings {
+    pub scored: Vec<(purrdf::text::BoundedScore, String)>,
+    pub candidates: BTreeMap<String, BTreeMap<usize, u64>>,
+    pub posting_visits: usize,
+}
+
+/// One stored-posting ranker for ordinary searches and graph-snapshot adapters.
+/// The caller supplies its captured membership and cancellation/admission fence;
+/// PurRDF owns all numerical scoring. No payload is read or analyzed here.
+pub(super) fn rank_postings(
+    snapshot: &rocksdb::Snapshot<'_>,
+    terms: &[String],
+    statistics: CorpusStatistics,
+    document_length: impl Fn(&str) -> Option<u64>,
+    scan_budget: usize,
+    mut checkpoint: impl FnMut() -> Result<(), Error>,
+) -> Result<RankedPostings, Error> {
+    // The owned posting codec is exactly {"frequency":"<u64>"}; 64 bytes
+    // cover its maximum compact representation. Read borrowed native rows so a
+    // corrupt value cannot allocate an unrestricted Vec before this check.
+    const POSTING_BYTES: usize = 64;
+    let mut candidates = BTreeMap::<String, BTreeMap<usize, u64>>::new();
+    let mut frequencies = vec![0_u64; terms.len()];
+    let mut posting_visits = 0_usize;
+    for (ordinal, term) in terms.iter().enumerate() {
+        checkpoint()?;
+        let prefix = term_key("post", term, "");
+        let mut cursor = snapshot.raw_iterator();
+        cursor.seek(prefix.as_bytes());
+        while cursor.valid() {
+            checkpoint()?;
+            let key = cursor
+                .key()
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "text posting key missing"))?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if posting_visits == scan_budget {
+                return Err(Error::new(
+                    "RESOURCE_LIMIT",
+                    "posting scan budget exhausted; narrow source/time scope or raise scan_budget; no ranked prefix returned",
+                ));
+            }
+            posting_visits += 1;
+            if key.len() > prefix.len().saturating_add(128) {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "text posting identity exceeds its encoding bound",
+                ));
+            }
+            let id = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid posting identity"))?;
+            if document_length(id).is_some() {
+                let bytes = cursor
+                    .value()
+                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "text posting value missing"))?;
+                if bytes.len() > POSTING_BYTES {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "text posting exceeds its 64-byte encoding bound",
+                    ));
+                }
+                let posting = parse(bytes)?;
+                let frequency = integer(&posting, "frequency")?;
+                if frequency == 0 {
+                    return Err(Error::new("STORAGE_FAILURE", "zero-frequency text posting"));
+                }
+                frequencies[ordinal] += 1;
+                candidates
+                    .entry(id.to_owned())
+                    .or_default()
+                    .insert(ordinal, frequency);
+            }
+            cursor.next();
+        }
+        cursor.status()?;
+    }
+    let profile = RankingProfile::single_field();
+    let corpus = PreparedCorpus::new(&profile, statistics.documents, &[statistics.tokens])
+        .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+    let frequencies = terms
+        .iter()
+        .zip(&frequencies)
+        .map(|(term, frequency)| (term.as_str(), *frequency))
+        .collect::<Vec<_>>();
+    let query = corpus
+        .prepare_query(&frequencies)
+        .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+    let mut scored = Vec::new();
+    for (id, matches) in &candidates {
+        checkpoint()?;
+        let length = document_length(id)
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "captured text document disappeared"))?;
+        let fields = (0..terms.len())
+            .map(|ordinal| {
+                vec![FieldInput {
+                    term_frequency: matches.get(&ordinal).copied().unwrap_or(0),
+                    length,
+                }]
+            })
+            .collect::<Vec<_>>();
+        let score = query
+            .score(&fields)
+            .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+        scored.push((score, id.clone()));
+    }
+    scored.sort_by(|a, b| b.0.value.cmp(&a.0.value).then_with(|| a.1.cmp(&b.1)));
+    Ok(RankedPostings {
+        scored,
+        candidates,
+        posting_visits,
+    })
+}
+
 fn term_key(kind: &str, term: &str, id: &str) -> String {
     format!("text-{kind}:{}:{id}", hex::encode(term.as_bytes()))
 }
@@ -427,74 +548,27 @@ impl Store {
             purrdf_hash::frame::frame_le(&mut corpus_identity, &length.to_be_bytes());
         }
         let corpus_id = hex::encode(blake3::hash(&corpus_identity).as_bytes());
-        let mut candidates = BTreeMap::<String, BTreeMap<usize, u64>>::new();
-        let mut frequencies = vec![0_u64; terms.len()];
-        let mut posting_visits = 0_usize;
-        for (ordinal, term) in terms.iter().enumerate() {
-            let prefix = term_key("post", term, "");
-            for entry in writer.db.prefix_iterator(&prefix) {
+        let snapshot = writer.db.snapshot();
+        let RankedPostings {
+            scored,
+            candidates,
+            posting_visits,
+        } = rank_postings(
+            &snapshot,
+            &terms,
+            CorpusStatistics {
+                documents: documents.len() as u64,
+                tokens: total,
+            },
+            |id| documents.get(id).map(|(_, length)| *length),
+            scope.scan_budget,
+            || {
                 if let Some(stage) = stage.as_deref() {
                     stage.checkpoint()?;
                 }
-                let (key, bytes) = entry?;
-                if !key.starts_with(prefix.as_bytes()) {
-                    break;
-                }
-                if posting_visits == scope.scan_budget {
-                    return Err(Error::new(
-                        "RESOURCE_LIMIT",
-                        "posting scan budget exhausted; narrow source/time scope or raise scan_budget; no ranked prefix returned",
-                    ));
-                }
-                posting_visits += 1;
-                let id = std::str::from_utf8(&key[prefix.len()..])
-                    .map_err(|_| Error::new("STORAGE_FAILURE", "invalid posting identity"))?;
-                if !documents.contains_key(id) {
-                    continue;
-                }
-                let posting = parse(&bytes)?;
-                // Validate frequency even if no row will eventually be emitted.
-                if integer(&posting, "frequency")? == 0 {
-                    return Err(Error::new("STORAGE_FAILURE", "zero-frequency text posting"));
-                }
-                frequencies[ordinal] += 1;
-                candidates
-                    .entry(id.to_owned())
-                    .or_default()
-                    .insert(ordinal, integer(&posting, "frequency")?);
-            }
-        }
-        let profile = RankingProfile::single_field();
-        let corpus = PreparedCorpus::new(&profile, documents.len() as u64, &[total])
-            .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-        let frequencies = terms
-            .iter()
-            .zip(&frequencies)
-            .map(|(term, frequency)| (term.as_str(), *frequency))
-            .collect::<Vec<_>>();
-        let query = corpus
-            .prepare_query(&frequencies)
-            .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-        let mut scored = Vec::new();
-        for (id, matches) in &candidates {
-            if let Some(stage) = stage.as_deref() {
-                stage.checkpoint()?;
-            }
-            let (_, length) = &documents[id];
-            let fields = (0..terms.len())
-                .map(|ordinal| {
-                    vec![FieldInput {
-                        term_frequency: matches.get(&ordinal).copied().unwrap_or(0),
-                        length: *length,
-                    }]
-                })
-                .collect::<Vec<_>>();
-            let score = query
-                .score(&fields)
-                .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-            scored.push((score, id.clone()));
-        }
-        scored.sort_by(|a, b| b.0.value.cmp(&a.0.value).then_with(|| a.1.cmp(&b.1)));
+                Ok(())
+            },
+        )?;
         if capture && scored.len() > row_limit {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -514,8 +588,7 @@ impl Store {
                     break;
                 }
                 let term = &terms[*ordinal];
-                let bytes = writer
-                    .db
+                let bytes = snapshot
                     .get(term_key("evidence", term, &id))?
                     .ok_or_else(|| {
                         Error::new("STORAGE_FAILURE", "text posting evidence missing")
@@ -639,5 +712,180 @@ impl Store {
             .with("event_coverage", event_coverage)
             .with("rows", Value::array(rows))
             .into())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn stored_ranker_keeps_its_snapshot_and_matches_native_scoring_after_live_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = DB::open_default(directory.path()).unwrap();
+        let a = term_key("post", "needle", "record:a");
+        let b = term_key("post", "needle", "record:b");
+        db.put(&a, br#"{"frequency":"1"}"#).unwrap();
+        db.put(&b, br#"{"frequency":"1"}"#).unwrap();
+        let snapshot = db.snapshot();
+        db.delete(&a).unwrap();
+        db.put(&b, br#"{"frequency":"2"}"#).unwrap();
+        let terms = vec!["needle".to_owned()];
+        let captured = rank_postings(
+            &snapshot,
+            &terms,
+            CorpusStatistics {
+                documents: 2,
+                tokens: 4,
+            },
+            |id| match id {
+                "record:a" => Some(1),
+                "record:b" => Some(3),
+                _ => None,
+            },
+            10,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(captured.posting_visits, 2);
+        assert_eq!(
+            captured
+                .scored
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["record:a", "record:b"]
+        );
+        let profile = RankingProfile::single_field();
+        let native_corpus = PreparedCorpus::new(&profile, 2, &[4]).unwrap();
+        let native_query = native_corpus.prepare_query(&[("needle", 2)]).unwrap();
+        for ((score, id), length) in captured.scored.iter().zip([1, 3]) {
+            let oracle = native_query
+                .score(&[vec![FieldInput {
+                    term_frequency: 1,
+                    length,
+                }]])
+                .unwrap();
+            assert_eq!(score.value, oracle.value, "native scoring for {id}");
+            assert_eq!(captured.candidates[id][&0], 1);
+        }
+        let current = db.snapshot();
+        let replacement = rank_postings(
+            &current,
+            &terms,
+            CorpusStatistics {
+                documents: 1,
+                tokens: 3,
+            },
+            |id| (id == "record:b").then_some(3),
+            10,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(replacement.scored.len(), 1);
+        assert_eq!(replacement.scored[0].1, "record:b");
+        assert_eq!(replacement.candidates["record:b"][&0], 2);
+        assert!(db.get(a).unwrap().is_none());
+    }
+
+    #[test]
+    fn stored_ranker_refuses_corruption_scan_exhaustion_and_cancellation_without_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = DB::open_default(directory.path()).unwrap();
+        let a = term_key("post", "needle", "record:a");
+        let terms = vec!["needle".to_owned()];
+        for bytes in [br#"{"frequency":"0"}"#.to_vec(), vec![b' '; 1024 * 1024]] {
+            db.put(&a, bytes).unwrap();
+            assert_eq!(
+                rank_postings(
+                    &db.snapshot(),
+                    &terms,
+                    CorpusStatistics {
+                        documents: 1,
+                        tokens: 1
+                    },
+                    |_| Some(1),
+                    10,
+                    || Ok(())
+                )
+                .err()
+                .unwrap()
+                .code,
+                "STORAGE_FAILURE"
+            );
+        }
+        db.put(&a, br#"{"frequency":"1"}"#).unwrap();
+        assert_eq!(
+            rank_postings(
+                &db.snapshot(),
+                &terms,
+                CorpusStatistics {
+                    documents: 1,
+                    tokens: 1
+                },
+                |_| Some(1),
+                0,
+                || Ok(())
+            )
+            .err()
+            .unwrap()
+            .code,
+            "RESOURCE_LIMIT"
+        );
+        db.put(
+            term_key("post", "needle", "record:b"),
+            br#"{"frequency":"1"}"#,
+        )
+        .unwrap();
+        let mut checkpoints = 0;
+        let failure = rank_postings(
+            &db.snapshot(),
+            &terms,
+            CorpusStatistics {
+                documents: 2,
+                tokens: 2,
+            },
+            |_| Some(1),
+            10,
+            || {
+                checkpoints += 1;
+                if checkpoints == 4 {
+                    Err(Error::new(
+                        "CANCELLED",
+                        "test cancellation after candidate collection",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.code, "CANCELLED");
+        assert_eq!(checkpoints, 4);
+        db.delete(&a).unwrap();
+        db.delete(term_key("post", "needle", "record:b")).unwrap();
+        db.put(
+            term_key("post", "needle", &"x".repeat(129)),
+            br#"{"frequency":"1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rank_postings(
+                &db.snapshot(),
+                &terms,
+                CorpusStatistics {
+                    documents: 0,
+                    tokens: 0
+                },
+                |_| None,
+                10,
+                || Ok(())
+            )
+            .err()
+            .unwrap()
+            .code,
+            "STORAGE_FAILURE"
+        );
     }
 }

@@ -5,16 +5,60 @@ scope. Sparrow must retain native semantics and bounded reads while resolving th
 
 ## Current integration state
 
-Schema 51 is deployed on the development service with native SELECT, ASK,
-CONSTRUCT and DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation,
-retained native certificates and source/coverage receipts. Its live acceptance
-is recorded in [Development runtime](development-runtime.md#schema-51-live-adoption).
-Schema 52 recordless-artifact RDF and independent artifact coverage are deployed
-on format 48; see [its acceptance](development-runtime.md#schema-52-live-adoption).
-Populated artifact metadata and Source/Stream declarations, native text relations,
-correlation, public measured explanation, bounded physical reclamation and
-production resource/turnover acceptance remain required. The sections below
-retain the source integration's earlier qualification boundaries and evidence.
+Schema 55 is deployed on format 70 with native SELECT, ASK, CONSTRUCT and
+DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
+certificates and source/coverage receipts. Metadata includes populated/recordless
+artifacts and retained Source/Stream declarations; the live qualification is in
+[Development runtime](development-runtime.md#schema-55-live-adoption).
+Native text relations, correlation, public measured explanation, bounded physical
+reclamation and production resource/turnover acceptance remain required. The
+earlier qualification evidence below records how the deployed graph surface grew.
+
+## Query-scoped stored text producers
+
+[PurRDF #601](https://github.com/Blackcat-Informatics/purrdf/issues/601) requests
+the remaining borrowed-producer integration seam. Sparrow's RDF operation borrows
+one native RocksDB snapshot and releases its catalog writer before evaluation.
+Its stored-text relation must use that same snapshot. On pinned `7734b013` and
+by source inspection on main `c75cbf94`, `PropertyFunctionRegistry::register`
+requires `Arc<dyn PropertyFunction>` with an implicit `'static` bound, and the
+producer's cursor is also returned as an implicitly `'static` trait object.
+`NativeFnContext` supplies work/physical/cancellation ownership but no query-local
+borrowed source binding. A compile-only probe fails with the exact lifetime
+coercion; the otherwise identical owned-registration neighbor compiles.
+
+The requested API supports the original borrowed source through all invocations
+and cursor pulls, then retains only owned/admitted result values after query
+completion. Native preparation, allocation, governor/cancellation and operational
+failure precedence must remain intact. A worker/message bridge is a possible
+lifetime workaround, but introduces another per-query ownership and metering
+protocol. Sparrow requests the direct scoped seam rather than duplicating that
+coordination or replaying the corpus into a resident index. The shipped native
+`TextSearchRelation` and `TermOccurrenceRelation` hold a resident `TextIndex`;
+Sparrow's record-corpus adapter instead reuses public analyzer and
+`PreparedCorpus`/`PreparedQuery` scoring operations over persisted facts.
+
+The source branch now routes ordinary record/text searches through one
+`text_index::rank_postings` implementation accepting an explicit immutable
+snapshot, captured corpus statistics and membership lookup. Ranking and emitted
+posting evidence read the same snapshot. Native PurRDF still owns numerical
+scoring; no payload is analyzed or resident text index rebuilt. Borrowed posting
+rows reject oversized identity/value encodings before application-owned decoding.
+Focused release regressions verify native score equality, frozen postings across
+live replacement, corruption, cancellation and scan exhaustion without rows.
+The full `make check` gate passes release Clippy with warnings denied, 27 core
+unit tests, 183 storage tests, 64 RPC tests, the remaining workspace tests,
+census self-tests and 280 pinned ownership jobs with zero exceptions.
+The core helper is preparation for the text/SPARQL adapter; no text property
+function or new public capability is advertised by this change.
+
+Compile-probe source/results, issue readback and local gate evidence are under
+`.stage/native-graph-integration/`: `borrowed_relation_probe.rs`,
+`owned_relation_probe.rs`, `{borrowed,owned}-relation-probe.{jsonl,log}`,
+`scoped-relation-probe-qualified.json`,
+`purrdf-scoped-relations-issue-readback.json` and
+`text-snapshot-full-check.log`. Temporary probe examples are removed before the
+normal workspace gate. Runtime adoption remains separate from source validation.
 
 ## Retained operational SPARQL integration
 
@@ -129,12 +173,12 @@ The shared registry accounting now gives status and maintenance the same expiry
 path. These core pages still require typed graph RPC, generic `result_next`
 dispatch and CLI/MCP integration; the installed daemon cannot create them.
 
-The complete production graph surface still requires prepared bindings, native text
-relations and correlation, typed Cap'n Proto result publication and retained-page
-dispatch, cancellation and CLI/MCP parity. Complete, certain, at-most, unknown and
-operational failure outcomes must retain the native distinction. A missing or
-failed source checkpoint must never publish a successful result prefix. Measured
-EXPLAIN must execute through the same bounded persisted view.
+The remaining text/correlation surfaces must reuse native prepared bindings,
+typed Cap'n Proto publication, retained-page dispatch, cancellation and CLI/MCP
+parity. Complete, certain, at-most, unknown and operational failure outcomes must
+retain the native distinction. A missing or failed source checkpoint must never
+publish a successful result prefix. Measured EXPLAIN must execute through the
+same bounded persisted view.
 
 Do not suppress the bounded-view declaration, substitute a no-op reservation,
 replay a selected corpus into a resident dataset in production, or copy the
