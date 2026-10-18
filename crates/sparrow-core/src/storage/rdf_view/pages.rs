@@ -399,7 +399,11 @@ impl Store {
                     Err(FallibleSparqlError::AllocationFailed { construct, .. }) => construct.len(),
                     _ => 0,
                 };
+                let scope_bytes = catalog_lease::response_row_bytes(
+                    crate::storage::json::write_compact(&run.scope).len(),
+                );
                 let metadata = 8192usize
+                    .saturating_add(scope_bytes)
                     .saturating_add(size_of::<Published>())
                     .saturating_add(size_of::<
                         catalog_lease::Snapshot<SparqlSelector, SparqlPageBody>,

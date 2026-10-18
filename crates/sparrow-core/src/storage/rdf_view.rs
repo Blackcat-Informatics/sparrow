@@ -30,7 +30,7 @@ pub use scope::RdfScopeCoverage;
 use sparse::RowCursor;
 
 /// Host source law: bounded borrowed index entries and admitted encoded catalog bodies.
-pub const RDF_SOURCE_ADMISSION_PROFILE: &str = "sparrow-rdf-source-v3";
+pub const RDF_SOURCE_ADMISSION_PROFILE: &str = "sparrow-rdf-source-v4";
 
 /// Sticky operational root cause shared by native readers and their guards.
 pub type ReadError = Arc<Error>;
@@ -108,6 +108,7 @@ pub struct StoredRdfView<'a> {
     _scope: Arc<Reservation>,
     terms: u64,
     max_encoded: u64,
+    scope_receipt: Option<super::Value>,
 }
 
 /// Owned native term carrier whose strings live through this admitted guard.
@@ -227,6 +228,7 @@ impl<'a> StoredRdfView<'a> {
             _scope: scope,
             terms: 0,
             max_encoded: 0,
+            scope_receipt: None,
         };
         for key in ["rdf:term-count", "rdf:max-encoded"] {
             let bytes = view.point(key.as_bytes(), 8)?.ok_or_else(|| {

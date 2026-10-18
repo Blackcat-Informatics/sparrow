@@ -74,9 +74,47 @@ index input does not replace a record query's additional strictness setting.
 Host admission profile advances to `sparrow-query-capture/7`; row, metadata, page,
 lease and disk ceilings stay unchanged. Store format stays 70. Older endpoints
 fail the existing exact-schema discovery check. The adapter refuses a missing or
-incoherent required scope receipt. This change does not supply scope receipts for
-SPARQL/context or finish correlation queries and production-volume acceptance.
+incoherent required scope receipt. Schema 57 extends this same logical scope law
+to SPARQL and context below. Correlation queries and production-volume acceptance
+remain required.
 The installed runtime version is recorded in [Development runtime](development-runtime.md).
+
+### Graph and context scope receipts (schema 57)
+
+Native graph pages carry the same `QueryScopeReceipt` in `SparqlPage.scope`,
+rendered as top-level `scope` beside the native certificate and independent
+coverage. Context carries it in `ContextCapture.scope`, rendered as `receipt.scope`.
+Both use the same selection resolver, logical fingerprint, typed encoder and
+CLI/MCP decoder as record/text/key/value captures. The redundant record-only
+membership wrapper is removed. Scope receipts are captured under the writer
+boundary; native graph execution still runs over its original immutable snapshot
+after releasing the writer. Native partial, unknown and query-failure pages retain
+their scope without changing certainty, diagnostics, row classification or coverage.
+Continuation reuses the captured pin revision/deadline after renewal or release.
+Graph text, bindings and layers, and the context anchor, implicit source-local
+restriction and neighbor counts are operation inputs outside this scope identity.
+The scope counts still describe resolved selection membership before those operations.
+
+Source admission profile `sparrow-rdf-source-v4` reserves 64 KiB for the bounded
+scope value and hashing work before capture, and another 64 KiB through the
+existing owned native workspace seam before cloning that value into a result.
+The result owns that second reservation, including for native query errors, after
+the snapshot/view ends. Page metadata independently charges the frozen scope's
+typed/agent envelope against the existing 64 KiB metadata and 256 KiB page limits.
+The common source workspace, retained-handle and governor ceilings are unchanged.
+`limits.scope_receipt_bytes` advertises the per-copy 64 KiB allowance, not measured
+RSS or physical I/O.
+
+Context admission profile `sparrow-context-capture/3` reserves the same 64 KiB
+within its existing 32 MiB catalog allowance, and charges the encoded scope's
+typed/agent envelope to the existing 256 KiB aggregate response allowance before
+admitting the anchor and neighbors. Its `scope_receipt_bytes` limit reports that
+partition. A direction-scan partial still identifies the complete requested scope;
+it does not imply every selected member was returned. Context remains one reply
+without a continuation lease. Record/text/key/value admission profile stays `/7`.
+Schema discovery advances to 57; persistent store format remains 70.
+Adapters refuse missing/incoherent scope receipts and a mismatched admission
+profile or scope-workspace allowance before rendering a successful result.
 
 ### Local endpoint recovery
 
@@ -754,7 +792,7 @@ contract, native governor certification, remaining query surfaces remain first-v
 
 Schema 33 adds a typed ContextCapture to records_context. Each successful
 operation has a fresh snapshot_id and captured as_of, the host admission
-profile sparrow-context-capture/2, explicit native governor absence, and
+profile sparrow-context-capture/3, explicit native governor absence, and
 ContextLimits. Context is one complete reply without a continuation or retained
 result handle. CLI/MCP receipts report has_more=false and next_cursor=null;
 there is no read lease deadline to renew. Original execution, certainty,

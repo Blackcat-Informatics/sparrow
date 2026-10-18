@@ -4460,6 +4460,19 @@ async fn query_selection_is_shared_by_typed_cli_and_mcp_surfaces() {
                 );
                 let result = &result["structuredContent"];
                 if name == "records_context" {
+                    assert_eq!(result["receipt"]["scope"], cli_result["receipt"]["scope"]);
+                    assert_eq!(
+                        result["receipt"]["scope"]["selection"].as_str(),
+                        Some("evidence")
+                    );
+                    assert_eq!(
+                        result["receipt"]["scope"]["direct_members"].as_str(),
+                        Some("2")
+                    );
+                    assert_eq!(
+                        result["receipt"]["scope"]["expanded_records"].as_str(),
+                        Some("1")
+                    );
                     assert!(result["before"]["rows"].as_array().unwrap().is_empty());
                     assert!(result["after"]["rows"].as_array().unwrap().is_empty());
                     assert_eq!(result["anchor"], cli_result["anchor"]);
@@ -8644,6 +8657,10 @@ async fn recordless_graph_metadata_and_independent_coverage_reach_cli_and_mcp() 
             let mcp = &response["structuredContent"];
             assert_eq!(cli["rows"], mcp["rows"]);
             assert_eq!(cli["coverage"], mcp["coverage"]);
+            assert_eq!(cli["scope"], mcp["scope"]);
+            assert_eq!(cli["scope"]["selection"].as_str(), Some("evidence"));
+            assert_eq!(cli["scope"]["direct_members"].as_str(), Some("1"));
+            assert_eq!(cli["scope"]["expanded_records"].as_str(), Some("0"));
             assert_eq!(
                 cli["coverage"]["known_selected_records"].as_str(),
                 Some("0")
@@ -8878,6 +8895,10 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
             let first = cli(&endpoint,&["sparql",path.to_str().unwrap()]);
             assert_eq!(first["execution_status"].as_str(),Some("complete"),"{first:?}");
             assert_eq!(first["answer_certainty"].as_str(),Some("exact"));
+            assert_eq!(first["scope"]["selection"].as_str(),Some("live"));
+            assert!(first["scope"]["direct_members"].is_null());
+            assert!(first["scope"]["expanded_records"].is_null());
+            assert_eq!(first["limits"]["scope_receipt_bytes"].as_str(),Some(sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES.to_string().as_str()));
             assert_eq!(first["coverage"]["selected_records"].as_str(),Some("1"));
             assert!(first["source_evidence"]["row_visits"].as_str().unwrap().parse::<u64>().unwrap()>0);
             assert!(first["native_governor"]["resources"].as_array().unwrap().len()==8);
@@ -8890,6 +8911,7 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
                 assert_eq!(next["isError"].as_bool(),Some(false),"{next:?}");
                 let replay = cli(&endpoint,&["result-next",&store,cursor]);
                 page = next["structuredContent"].clone(); assert_eq!(page,replay);
+                assert_eq!(page["scope"],first["scope"]);
                 assert_eq!(page["snapshot_id"],first["snapshot_id"]); assert_eq!(page["native_governor"],first["native_governor"]); pages+=1; assert!(pages<100);
             }
             let released = sparrow_client::release_result(client.capability(),&store,first["snapshot_id"].as_str().unwrap()).await.unwrap(); assert_eq!(released.released,first["has_more"].as_bool().unwrap());
@@ -10408,6 +10430,26 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
             assert_eq!(
                 partial["receipt"]["stop_reason"].as_str(),
                 Some("direction_scan_budget")
+            );
+            assert_eq!(
+                partial["receipt"]["scope"]["selection"].as_str(),
+                Some("evidence")
+            );
+            assert_eq!(
+                partial["receipt"]["scope"]["direct_members"].as_str(),
+                Some("1")
+            );
+            assert_eq!(
+                partial["receipt"]["scope"]["expanded_records"].as_str(),
+                Some("1")
+            );
+            assert_eq!(
+                partial["receipt"]["limits"]["scope_receipt_bytes"].as_str(),
+                Some(
+                    sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES
+                        .to_string()
+                        .as_str()
+                )
             );
             assert_eq!(partial["receipt"]["certainty"].as_str(), Some("incomplete"));
             assert!(partial["receipt"]["native_governor"].is_null());

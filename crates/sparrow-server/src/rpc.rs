@@ -1072,7 +1072,11 @@ fn pin_summary(mut out: wire::pin_summary::Builder<'_>, pin: &PinSummary) {
     out.init_expires_at().set_unix_millis(pin.expires_at);
 }
 
-fn context_capture(mut out: wire::context_capture::Builder<'_>, value: &sparrow_core::Context) {
+fn context_capture(
+    mut out: wire::context_capture::Builder<'_>,
+    value: &sparrow_core::Context,
+) -> capnp::Result<()> {
+    query_scope_receipt(out.reborrow().init_scope(), &value.scope)?;
     out.set_snapshot_id(&value.snapshot_id);
     out.reborrow()
         .init_as_of()
@@ -1089,6 +1093,8 @@ fn context_capture(mut out: wire::context_capture::Builder<'_>, value: &sparrow_
     target.set_requested_after(limits.requested_after);
     target.set_membership_member_visits(limits.membership_member_visits);
     target.set_membership_record_visits(limits.membership_record_visits);
+    target.set_scope_receipt_bytes(limits.scope_receipt_bytes);
+    Ok(())
 }
 
 fn context_side(
@@ -2228,7 +2234,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_ordering(wire::ContextOrder::ReceivedAtRecordId);
                 out.set_continuity_unknown(true);
-                context_capture(out.reborrow().init_capture(), &value);
+                context_capture(out.reborrow().init_capture(), &value)?;
                 let mut receipt = out.reborrow().init_receipt();
                 receipt.set_store_id(&value.store_id);
                 receipt

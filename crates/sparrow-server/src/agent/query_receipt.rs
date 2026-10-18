@@ -6,7 +6,10 @@
 use super::{Result, instant, optional_value, render_count, wire};
 use purrdf_lex::json::{Object, Value};
 
-fn scope_receipt(scope: wire::query_scope_receipt::Reader<'_>, as_of: u64) -> Result<Value> {
+pub(super) fn scope_receipt(
+    scope: wire::query_scope_receipt::Reader<'_>,
+    as_of: u64,
+) -> Result<Value> {
     let profile = scope.get_profile()?.to_str()?;
     let id = scope.get_id()?.to_str()?;
     let selection = scope.get_selection()?;

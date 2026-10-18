@@ -11,6 +11,9 @@ use std::collections::BTreeSet;
 /// Logical selector fingerprint and compact resolved membership receipt format.
 pub const QUERY_SCOPE_PROFILE: &str = "sparrow-scope-receipt/1";
 
+/// Conservative receipt/hash workspace charged by context and native graph capture.
+pub const QUERY_SCOPE_WORKSPACE_BYTES: usize = 64 * 1024;
+
 pub(super) fn capture(
     store: &str,
     scope: &QueryScope,

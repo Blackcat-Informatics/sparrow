@@ -132,6 +132,14 @@ fn render_side(value: wire::context_side::Reader<'_>) -> Result<Value> {
 
 fn capture_receipt(value: wire::context::Reader<'_>) -> Result<Value> {
     let capture = value.get_capture()?;
+    if capture.get_host_profile()?.to_str()? != sparrow_core::CONTEXT_CAPTURE_PROFILE
+        || capture.get_limits()?.get_scope_receipt_bytes()
+            != sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES as u64
+    {
+        return Err(
+            sparrow_client::Error::Protocol("unsupported context capture admission").into(),
+        );
+    }
     let mut result = receipt(value.get_receipt()?)?;
     let out = result
         .as_object_mut()
@@ -140,6 +148,13 @@ fn capture_receipt(value: wire::context::Reader<'_>) -> Result<Value> {
         || value.get_after()?.get_frontier()? == wire::ContextFrontier::ScanBudget;
     out.insert("snapshot_id", capture.get_snapshot_id()?.to_str()?);
     out.insert("as_of", instant(capture.get_as_of()?)?);
+    out.insert(
+        "scope",
+        super::query_receipt::scope_receipt(
+            capture.get_scope()?,
+            capture.get_as_of()?.get_unix_millis(),
+        )?,
+    );
     out.insert(
         "execution_status",
         if limited { "partial" } else { "complete" },
@@ -175,6 +190,10 @@ fn capture_receipt(value: wire::context::Reader<'_>) -> Result<Value> {
                 limits.get_direction_visits().to_string(),
             )
             .with("catalog_bytes", limits.get_catalog_bytes().to_string())
+            .with(
+                "scope_receipt_bytes",
+                limits.get_scope_receipt_bytes().to_string(),
+            )
             .with("response_bytes", limits.get_response_bytes().to_string())
             .with("output_records", u64::from(limits.get_output_records()))
             .with("requested_before", u64::from(limits.get_requested_before()))

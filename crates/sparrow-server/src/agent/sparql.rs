@@ -683,12 +683,21 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     let e = value.get_evidence()?;
     let host = value.get_limits()?;
     let source_profile = host.get_source_profile()?.to_str()?;
-    if source_profile != sparrow_core::RDF_SOURCE_ADMISSION_PROFILE {
+    if source_profile != sparrow_core::RDF_SOURCE_ADMISSION_PROFILE
+        || host.get_scope_receipt_bytes() != sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES as u64
+    {
         return Err(protocol("unsupported RDF source admission profile"));
     }
     let limits = host.get_source()?;
     let layers = value.get_layers()?;
     let mut result = super::catalog::page(value.get_page()?)?
+        .with(
+            "scope",
+            super::query_receipt::scope_receipt(
+                value.get_scope()?,
+                value.get_page()?.get_as_of()?.get_unix_millis(),
+            )?,
+        )
         .with("operation", "sparql_query")
         .with("sequence", value.get_sequence().to_string())
         .with("coverage", coverage)
@@ -728,6 +737,10 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
                 .with(
                     "scope_catalog_bytes",
                     host.get_scope_catalog_bytes().to_string(),
+                )
+                .with(
+                    "scope_receipt_bytes",
+                    host.get_scope_receipt_bytes().to_string(),
                 )
                 .with(
                     "catalog_expansion_factor",

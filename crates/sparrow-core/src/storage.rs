@@ -45,7 +45,7 @@ mod record_fields;
 pub(crate) mod record_read;
 mod record_spool;
 mod scope_receipt;
-pub use scope_receipt::QUERY_SCOPE_PROFILE;
+pub use scope_receipt::{QUERY_SCOPE_PROFILE, QUERY_SCOPE_WORKSPACE_BYTES};
 mod recordless;
 pub(crate) mod result_read;
 pub(crate) mod retention_metrics;

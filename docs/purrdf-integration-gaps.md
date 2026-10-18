@@ -14,6 +14,12 @@ Native text relations, correlation, public measured explanation, bounded physica
 reclamation and production resource/turnover acceptance remain required. The
 earlier qualification evidence below records how the deployed graph surface grew.
 
+Source schema 57 shares frozen logical scope receipts across native graph,
+context and record/text/key/value captures. Graph receipt ownership uses the
+existing native owned-workspace seam; query certainty and coverage retain their
+original owners. [Source qualification](development-runtime.md#schema-57-graphcontext-scope-source-qualification)
+is separate from runtime adoption and the remaining requirements listed above.
+
 ## Query-scoped stored text producers
 
 [PurRDF #601](https://github.com/Blackcat-Informatics/purrdf/issues/601) requests

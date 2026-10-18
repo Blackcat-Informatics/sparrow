@@ -11,6 +11,34 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-57 graph/context scope source qualification
+
+Schema 57 extends the existing scope receipt owner to native graph and context
+queries. Pin resolution, normalized identity and typed encoding/decoding stay
+shared with record/text/key/value captures. Graph results retain scope workspace
+through the existing owned native reservation, including native query failures;
+continuations preserve the original scope after pin renewal and release. Context
+reserves receipt workspace and response bytes within its existing aggregate caps.
+Admission profiles advance to `sparrow-rdf-source-v4` and
+`sparrow-context-capture/3`, with an explicit per-copy 64 KiB scope allowance.
+Persistent store format remains 70.
+
+The full release gate passed 27 core unit, 185 storage and 64 RPC tests plus all
+other workspace checks, seeded census self-tests and the pinned cross-workspace
+gate: 281 ownership jobs, no distinct exceptions. The new injected-time regression
+compares record, graph and context scope receipts, renews/releases the pin, expires
+the original evidence and replays a native graph continuation unchanged. It also
+checks a native query failure and selected recordless artifact. TCP CLI/Unix MCP
+tests retain identical scope receipts across all native read forms and pages;
+selected and direction-limited context replies preserve their requested scope.
+Evidence is `.stage/native-graph-integration/graph-context-scope-full-check.log`;
+the ordinary signed-commit hook records its gate in `graph-context-scope-commit.log`.
+
+This is source qualification; schema 57 runtime packaging/adoption remains pending.
+The installed service is still schema 55 as described above. No recovery has been
+repeated. Scope receipts do not finish native text relations, governed EXPLAIN,
+correlation, bounded physical reclamation or production acceptance.
+
 ## Schema-56 scope receipt source qualification
 
 Schema 56 adds frozen logical scope receipts to the shared paged record/text/key/value

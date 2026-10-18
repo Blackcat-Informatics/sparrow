@@ -105,17 +105,6 @@ impl Writer {
         self.get_admitted(key, |bytes| admission.entry(bytes.len()))
     }
 
-    /// The record-query facade uses the same reference owner as artifact discovery.
-    pub(super) fn query_membership(
-        &self,
-        scope: &QueryScope,
-        now: u64,
-        protected: &BTreeSet<String>,
-    ) -> Result<Option<BTreeMap<String, u64>>, Error> {
-        self.query_selection_membership(&scope.selection, now, protected, None)
-            .map(|members| members.map(|members| members.records))
-    }
-
     /// Validate every selected reference before filters; preserve complete artifact identity.
     pub(super) fn query_selection_membership(
         &self,

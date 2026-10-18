@@ -3,10 +3,10 @@
 
 [[job]]
 id = "frozen-query-scope"
-summary = "One membership resolution captures pin revision/deadline and compact logical scope identity using native PurRDF streaming framing and hashing; record/text/key/value staging freezes it for one typed transport and shared agent renderer."
+summary = "One membership resolution captures pin revision/deadline and compact logical scope identity using native PurRDF streaming framing and hashing; record/text/key/value staging, native graph results and context captures share one typed transport and agent decoder, with retained native workspace ownership for graph receipts."
 home = "sparrow_core::storage::scope_receipt::capture"
-entry_points = ["sparrow_core::storage::query_membership::Writer::query_candidates", "sparrow_server::rpc::query_scope_receipt", "sparrow_server::agent::query_receipt::scope_receipt"]
-spec = "docs/interfaces.md: schema 56 frozen scope receipts."
+entry_points = ["sparrow_core::storage::query_membership::Writer::query_candidates", "sparrow_core::storage::context::Store::records_context", "sparrow_core::storage::rdf_view::scope::Store::with_rdf_scope", "sparrow_core::storage::rdf_view::query::Store::with_sparql_result", "sparrow_server::rpc::query_scope_receipt", "sparrow_server::agent::query_receipt::scope_receipt"]
+spec = "docs/interfaces.md: schema 56/57 frozen scope receipts."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/agent/query_receipt.rs"]
 bench = []
 enforced = true
@@ -873,7 +873,7 @@ names = ['^(check_claim_upload_stability|check_client_file_stability)$']
 id = "query-membership"
 summary = "Resolve retained artifact/record/pin membership once, before filters, with revision guards and bounded expansion."
 home = "sparrow_core::storage::query_membership::Writer::query_selection_membership"
-entry_points = ["sparrow_core::storage::query_membership::Writer::query_membership", "sparrow_core::storage::query_membership::SelectionMembers::admit_record"]
+entry_points = ["sparrow_core::storage::context::Store::records_context", "sparrow_core::storage::rdf_view::scope::Store::with_rdf_scope", "sparrow_core::storage::query_membership::SelectionMembers::admit_record"]
 spec = "docs/interfaces.md: schema 13 membership scopes."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []

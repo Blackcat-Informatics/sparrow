@@ -402,6 +402,8 @@ pub(super) fn page(
     page: &SparqlReadPage,
 ) -> Result<(), Error> {
     let run = page.body.captured();
+    query_scope_receipt(out.reborrow().init_scope(), &run.scope)
+        .map_err(|error| Error::new("STORAGE_FAILURE", format!("frozen graph scope: {error}")))?;
     match &run.outcome {
         Err(FallibleSparqlError::Query { diagnostic, .. }) => crate::rdf_wire::diagnostic::encode(
             out.reborrow().init_diagnostic().init_value(),
@@ -461,6 +463,7 @@ pub(super) fn page(
     limits.set_result_bytes(8 * 1024 * 1024);
     limits.set_result_lease_ms(60000);
     limits.set_scope_catalog_bytes(32 * 1024 * 1024);
+    limits.set_scope_receipt_bytes(sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES as u64);
     limits.set_catalog_expansion_factor(64);
     limits.set_query_text_bytes(65536);
     limits.set_binding_bytes(crate::rdf_wire::MAX_BYTES as u64);

@@ -26,10 +26,12 @@ pub struct SparqlRead<'a> {
 /// Native certainty and ownership, beside independent host coverage evidence.
 /// A governor stop remains a typed certified partial outcome. An operational
 /// refusal never becomes a successful prefix; the native error retains its cause.
-#[derive(Debug)]
 pub struct ScopedSparqlResult {
     /// Persistent store identity.
     pub store_id: String,
+    /// Frozen logical scope and resolved pin revision, independent of native certainty.
+    pub scope: crate::storage::Value,
+    _scope_admission: OwnedWorkspaceReservation<ReadError>,
     /// Native storage sequence of the captured membership and graph indexes.
     pub sequence: u64,
     /// Captured eligibility clock in UTC Unix milliseconds.
@@ -43,6 +45,21 @@ pub struct ScopedSparqlResult {
     /// Complete native result or typed diagnostic/partial/failure outcome.
     /// Retained carriers keep their original admitted owner after capture ends.
     pub outcome: FallibleSparqlResult<ReadError, GovernedEvidence<RdfReadEvidence>>,
+}
+
+impl std::fmt::Debug for ScopedSparqlResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedSparqlResult")
+            .field("store_id", &self.store_id)
+            .field("scope", &self.scope)
+            .field("sequence", &self.sequence)
+            .field("as_of", &self.as_of)
+            .field("layers", &self.layers)
+            .field("limits", &self.limits)
+            .field("coverage", &self.coverage)
+            .field("outcome", &self.outcome)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -79,6 +96,19 @@ impl Store {
             read.limits,
             cancellation,
             |view, coverage| {
+                let scope_admission = view
+                    .budget
+                    .reserve_owned(crate::QUERY_SCOPE_WORKSPACE_BYTES as u64, &view._scope)?;
+                let scope = view
+                    .scope_receipt
+                    .as_ref()
+                    .ok_or_else(|| {
+                        view.budget.fail(Error::new(
+                            "STORAGE_FAILURE",
+                            "native query scope was not captured",
+                        ))
+                    })?
+                    .clone();
                 let engine = NativeSparqlEngine::new();
                 let governors = read.governors.clone().with_max_remote_requests(0);
                 let outcome = engine.query_governed_fallible_view(
@@ -90,6 +120,8 @@ impl Store {
                 drop(engine);
                 let result = ScopedSparqlResult {
                     store_id,
+                    scope,
+                    _scope_admission: scope_admission,
                     sequence: view.snapshot_sequence_number(),
                     as_of: now,
                     layers: read.layers,
@@ -97,8 +129,8 @@ impl Store {
                     coverage: coverage.clone(),
                     outcome,
                 };
-                publish(view, result)
+                Ok(publish(view, result))
             },
-        )
+        )?
     }
 }

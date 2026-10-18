@@ -456,10 +456,12 @@ struct ContextLimits {
   directionVisits @0 :UInt64; catalogBytes @1 :UInt64; responseBytes @2 :UInt64;
   outputRecords @3 :UInt32; requestedBefore @4 :UInt32; requestedAfter @5 :UInt32;
   membershipMemberVisits @6 :UInt64; membershipRecordVisits @7 :UInt64;
+  scopeReceiptBytes @8 :UInt64;
 }
 struct ContextCapture {
   snapshotId @0 :Text; asOf @1 :Instant; hostProfile @2 :Text;
   limits @3 :ContextLimits; nativeGovernor @4 :OptionalText;
+  scope @5 :QueryScopeReceipt;
 }
 struct Context {
   receipt @0 :Receipt; anchor @1 :Record; before @2 :ContextSide; after @3 :ContextSide;
@@ -727,6 +729,7 @@ struct SparqlHostLimits {
   scopeCatalogBytes @6 :UInt64; catalogExpansionFactor @7 :UInt64;
   queryTextBytes @8 :UInt64; bindingBytes @9 :UInt64; bindingNodes @10 :UInt32;
   sourceProfile @11 :Text;
+  scopeReceiptBytes @12 :UInt64;
 }
 enum SparqlForm { select @0; ask @1; graph @2; }
 struct SparqlSolution { cells @0 :List(OptionalRdfTerm); }
@@ -743,6 +746,7 @@ struct SparqlPage {
   coverage @3 :SparqlCoverage; governors @4 :NativeGovernorReceipt;
   evidence @5 :RdfReadEvidence; limits @6 :SparqlHostLimits; outcome @7 :SparqlOutcome;
   diagnostic @8 :OptionalNativeDiagnostic;
+  scope @9 :QueryScopeReceipt;
 }
 enum NativeSeverity { error @0; warning @1; note @2; info @3; }
 enum NativeStorageFailure { absent @0; capacity @1; sizeOverflow @2; allocationFailed @3; admissionFailed @4; formattingFailed @5; }

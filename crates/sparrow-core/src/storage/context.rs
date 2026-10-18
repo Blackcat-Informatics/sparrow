@@ -9,7 +9,7 @@ use rocksdb::{Direction, IteratorMode};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Host-owned context admission; record interpretation profiles remain in each row.
-pub const CONTEXT_CAPTURE_PROFILE: &str = "sparrow-context-capture/2";
+pub const CONTEXT_CAPTURE_PROFILE: &str = "sparrow-context-capture/3";
 
 /// Effective ceilings bound into one context capture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub struct ContextLimits {
     pub membership_member_visits: u64,
     /// Independent membership record traversal ceiling.
     pub membership_record_visits: u64,
+    /// Conservative workspace reserved for the frozen scope receipt and its hashing.
+    pub scope_receipt_bytes: u64,
 }
 
 struct Admission {
@@ -77,6 +79,8 @@ pub struct ContextSide {
 pub struct Context {
     /// Opaque identity of this single, non-paginated capture.
     pub snapshot_id: String,
+    /// Frozen logical scope, resolved at the same boundary as anchor membership.
+    pub scope: super::Value,
     /// Actual host admission ceilings used for this capture.
     pub limits: ContextLimits,
     /// Store identity of all returned references.
@@ -117,11 +121,25 @@ impl Store {
         let writer = self.lock()?;
         super::source_context::ready(&writer)?;
         let mut admission = Admission {
-            catalog: catalog_lease::SCAN_BYTES,
+            catalog: catalog_lease::SCAN_BYTES - super::QUERY_SCOPE_WORKSPACE_BYTES,
             response: catalog_lease::PAGE_BYTES - 4096,
         };
         let protected = writer.protected(now)?;
-        let membership = writer.query_membership(scope, now, &protected)?;
+        let selection =
+            writer.query_selection_membership(&scope.selection, now, &protected, None)?;
+        let scope_receipt = super::scope_receipt::capture(&writer.id, scope, selection.as_ref())?;
+        admission.response = admission
+            .response
+            .checked_sub(catalog_lease::response_row_bytes(
+                json::write_compact(&scope_receipt).len(),
+            ))
+            .ok_or_else(|| {
+                Error::new(
+                    "RESOURCE_LIMIT",
+                    "context scope receipt exceeds reply admission",
+                )
+            })?;
+        let membership = selection.map(|selection| selection.records);
         let anchor: Record = writer.get_limited(id, &mut admission.catalog)?;
         writer.validate_event_record(&anchor)?;
         if !writer.live_record(&anchor, now, &protected) {
@@ -184,8 +202,10 @@ impl Store {
         diagnostics.merge(earlier.diagnostics);
         diagnostics.merge(later.diagnostics);
         Ok(Context {
+            scope: scope_receipt,
             snapshot_id: random_id("context-read")?,
             limits: ContextLimits {
+                scope_receipt_bytes: super::QUERY_SCOPE_WORKSPACE_BYTES as u64,
                 direction_visits: scope.scan_budget as u64,
                 catalog_bytes: catalog_lease::SCAN_BYTES as u64,
                 response_bytes: catalog_lease::PAGE_BYTES as u64,

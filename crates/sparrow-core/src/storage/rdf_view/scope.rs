@@ -338,6 +338,13 @@ impl Store {
         let selection = writer
             .query_selection_membership(&scope.selection, now, &protected, Some(&mut admission))
             .map_err(|e| budget.fail(e))?;
+        Arc::get_mut(&mut view._scope)
+            .expect("scope capture precedes owned query admission")
+            .grow(crate::QUERY_SCOPE_WORKSPACE_BYTES as u64)?;
+        view.scope_receipt = Some(
+            crate::storage::scope_receipt::capture(&writer.id, scope, selection.as_ref())
+                .map_err(|error| budget.fail(error))?,
+        );
         let (members, artifacts) = match selection {
             Some(members) => (Some(members.records), Some(members.artifact_times)),
             None => (None, None),

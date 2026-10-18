@@ -15487,3 +15487,133 @@ fn scope_receipts_normalize_sets_keep_limits_separate_and_bound_large_selectors(
     assert_eq!(large["diagnostic_dimensions"].as_u64(), Some(5));
     assert!(purrdf_lex::json::write_compact(&large).len() < 1024);
 }
+
+#[test]
+fn graph_context_and_record_scopes_share_frozen_pin_evidence_through_renewal_and_release() {
+    use purrdf::{SparqlRequest, sparql::QueryGovernors};
+    use sparrow_core::{
+        QueryCancellation, QuerySelection, RdfGraphLayers, RdfReadLimits, RecordOperation,
+        RecordQuery, RecordRead, SparqlRead,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = store
+        .ingest("shared-scope-input", "pages", "log", b"a\nb\nc\n", 0)
+        .unwrap();
+    let mut ids = input.record_ids.clone();
+    ids.sort();
+    let pin = store
+        .pin("shared-scope-pin", "shared-scope", &[input.id], 40, 0)
+        .unwrap();
+    let now = 31 * DAY;
+    let mut scope = record_page_scope("pages", 1);
+    scope.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: None,
+    };
+    let records = store
+        .records_read(
+            &RecordRead {
+                scope: scope.clone(),
+                operation: RecordOperation::Records,
+                query: RecordQuery::default(),
+                cursor: None,
+            },
+            now,
+        )
+        .unwrap();
+    let frozen = records.body.result().unwrap()["query_evidence"]["scope"].clone();
+    let governors = QueryGovernors::METERED.with_fuel(1_000_000);
+    let graph = |scope: &sparrow_core::QueryScope, query: &str, at: u64| {
+        store
+            .sparql_read(
+                &SparqlRead {
+                    scope,
+                    layers: RdfGraphLayers {
+                        metadata: true,
+                        diagnostic: false,
+                        content: false,
+                    },
+                    request: SparqlRequest {
+                        query,
+                        base_iri: None,
+                        substitutions: &[],
+                    },
+                    governors: &governors,
+                    limits: RdfReadLimits::default(),
+                },
+                at,
+                &QueryCancellation::default(),
+            )
+            .unwrap()
+    };
+    let first = graph(
+        &scope,
+        "SELECT ?record WHERE { ?record a <urn:sparrow:vocab:Record> } ORDER BY ?record",
+        now,
+    );
+    assert_eq!(first.total_items, 3);
+    assert_eq!(first.body.captured().scope, frozen);
+    let cursor = first.next_cursor.as_ref().unwrap();
+    scope.limit = 3;
+    let context = store.records_context(&ids[1], &scope, 1, 1, now).unwrap();
+    assert_eq!(context.scope, frozen);
+    assert_eq!(context.before.records.len(), 1);
+    assert_eq!(context.after.records.len(), 1);
+    assert_eq!(
+        context.limits.scope_receipt_bytes,
+        sparrow_core::QUERY_SCOPE_WORKSPACE_BYTES as u64
+    );
+    let renewed = store
+        .renew_pin("shared-scope-renew", &pin.id, 40, Some(pin.revision), now)
+        .unwrap();
+    let fresh = store.records_context(&ids[1], &scope, 1, 1, now).unwrap();
+    assert_eq!(
+        fresh.scope["pin"]["revision"].as_u64(),
+        Some(renewed.revision)
+    );
+    assert_ne!(fresh.scope["id"], frozen["id"]);
+    // A native parser failure still carries the captured scope, never invented rows.
+    let failure = graph(&scope, "SELECT {", now);
+    assert!(failure.body.captured().outcome.is_err());
+    assert_eq!(failure.body.captured().scope, fresh.scope);
+    assert_eq!(failure.total_items, 0);
+    store
+        .release_retry("shared-scope-release", &pin.id, now + 1)
+        .unwrap();
+    store.expire(now + 2).unwrap();
+    let second = store
+        .sparql_read_next(&first.store_id, cursor, now + 3)
+        .unwrap();
+    assert_eq!(second.body.captured().scope, frozen);
+    assert_eq!(context.scope, frozen);
+    assert_eq!(second.as_of, first.as_of);
+    assert!(
+        store
+            .result_release(&first.store_id, &first.snapshot_id, now + 4)
+            .unwrap()
+    );
+    assert!(
+        store
+            .result_release(&records.store_id, &records.snapshot_id, now + 4)
+            .unwrap()
+    );
+    let empty = store
+        .ingest("shared-scope-empty", "pages", "log", b"", now + 5)
+        .unwrap();
+    assert!(empty.record_ids.is_empty());
+    scope.selection = QuerySelection::Evidence(vec![empty.id]);
+    let empty = graph(
+        &scope,
+        "ASK { ?artifact a <urn:sparrow:vocab:Artifact> }",
+        now + 5,
+    );
+    assert_eq!(
+        empty.body.captured().scope["direct_members"].as_str(),
+        Some("1")
+    );
+    assert_eq!(
+        empty.body.captured().scope["expanded_records"].as_str(),
+        Some("0")
+    );
+}
