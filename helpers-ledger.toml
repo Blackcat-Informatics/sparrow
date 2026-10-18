@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "native-retirement-compaction-policy"
+summary = "Catalog and payload families share one native tombstone collector configuration. RocksDB owns table marking, compaction and blob GC; pressure retains its existing measured-recovery and pin-safe retirement owner."
+home = "sparrow_core::storage::pressure::native_compaction_options"
+entry_points = ["sparrow_core::storage::Store::open"]
+spec = "docs/native-reclamation.md: existing native controls and real-pressure qualification."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(catalog_compaction_policy|payload_compaction_policy|another_blob_garbage_collector)$']
+
+[[job]]
 id = "bounded-watch-coverage-epoch"
 summary = "One production detector resets readiness and rename evidence after event coverage loss, then requires a bounded recursive scan and fresh stability. Kernel-queue and directory-budget qualification invokes that owner directly."
 home = "sparrow_server::watches::Detector::reconcile"
@@ -1953,7 +1967,7 @@ names = ['^(admit_direct_disk_write|admit_staged_disk_write)$']
 
 [[job]]
 id = "physical-pressure-maintenance"
-summary = "Drive shared oldest-unpinned retirement, atomically durable recovery waits and finite native flush scheduling without repeated deletion during lag or mistaking anonymous staging release for stored-file recovery."
+summary = "Drive shared oldest-unpinned retirement, atomically durable recovery waits and finite native flush scheduling without repeated deletion during lag or mistaking anonymous staging release for stored-file recovery. Real native-file pressure qualifies measured recovery and exact retry/pin bytes through reopen."
 home = "sparrow_core::storage::pressure::Writer::maintain_pressure"
 entry_points = ["sparrow_core::storage::pressure::Store::pressure_maintain", "sparrow_core::storage::pressure::Writer::native_property", "sparrow_core::storage::pressure::State::load", "sparrow_core::storage::pressure::stage_wait"]
 spec = "docs/development-runtime.md: schema 17 pressure maintenance."

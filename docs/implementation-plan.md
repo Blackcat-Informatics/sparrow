@@ -86,8 +86,8 @@ production capacity.
 
 | Required area | Evidence already present | Required work still NOT MET |
 | --- | --- | --- |
-| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. | Public measured EXPLAIN with request/governor parity ([PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600)); query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); complete synthetic content export within the existing admitted workspace ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
-| Reclamation | Logical retirement, pin protection, pressure backpressure, native automatic compaction and separately measured physical files. | Safe bounded metadata/file-compaction/output admission, an owned production reclamation worker, exact native failures, measured physical recovery and successful retry admission. [Binding requirements](native-reclamation.md). |
+| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. | Public measured EXPLAIN with request/governor parity ([PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600)); query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); adoption and consumer qualification of the landed materialization fix for complete synthetic content export within the existing admitted workspace ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
+| Reclamation | Logical retirement, pin protection, pressure backpressure, native automatic compaction and separately measured physical files. | Qualify and, where necessary, configure existing native compaction/blob-GC policy so real physical recovery permits the refused write again, preserving pins and visible failures. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
 | Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results and cancellation. | The missing graph operations above and complete resource/latency qualification over the deployment corpus. Existing tools must not advertise unsupported native relations or explanations. [Interfaces](interfaces.md). |
 | Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Production envelope and producer contracts, hard-quota/resource and sustained/burst acceptance, bounded physical reclamation, host-reboot/power-loss acceptance and remaining watcher scheduling/kernel-watch-exhaustion scenarios. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
 
@@ -98,13 +98,19 @@ prove power-loss persistence at arbitrary filesystem boundaries. The finite
 turnover corpus is 65,642,380 raw bytes per pin mode. None of these results closes
 the remaining production acceptance gates.
 
-Upstream readback on 2026-10-18 found #600, #601 and #605 open without comments.
+The initial upstream readback on 2026-10-18 found #600, #601 and #605 open.
+A later readback found #605 closed by PR #609; main
+`aa8586fabe8c8af69ed429a80bddc6714eed8184` includes actual-payload materialization.
+Sparrow adoption and consumer qualification of that fix remain required.
+Issues #600 and #601 remain open.
 PurRDF main `1de2bbbccbffd2e0be571e8b6aa1dd047e7177b2` adds documentation/binding
 changes after `9a6055e8`; its changed-file list does not include the blocked
 SPARQL evaluator/property-function owners. This is a source comparison, not an
 execution qualification of main. The selected rust-rocksdb upstream remains
-`46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`; a missing safe integration seam
-cannot be replaced with a unit-returning compaction call or downstream unsafe FFI.
+`46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. The earlier inference that Sparrow
+required a new file-compaction API was unproven and is withdrawn. Existing native
+policy and measured pressure recovery must be evaluated before declaring an
+external dependency blocker.
 
 ## First useful outcome
 

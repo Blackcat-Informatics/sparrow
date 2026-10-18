@@ -12,8 +12,11 @@ artifacts and retained Source/Stream declarations; the live qualification is in
 [Development runtime](development-runtime.md#schema-60-live-adoption).
 Native text relations, public measured explanation, bounded physical
 reclamation and production resource/turnover acceptance remain required. Native
-solution materialization also has a confirmed admission limitation tracked in
-[PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605). The
+solution materialization has a confirmed admission limitation on the installed
+revision. [PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605)
+is now closed: PR #609 landed actual-payload materialization, included in main
+`aa8586fabe8c8af69ed429a80bddc6714eed8184`. Sparrow has not yet adopted or
+qualified that fix. The
 earlier qualification evidence below records how the deployed graph surface grew.
 
 Source schema 57 shares frozen logical scope receipts across native graph,
@@ -292,5 +295,7 @@ because there is no independent distinct-term ceiling; `query_text_bytes`
 continues to report the effective input ceiling. A regression covers more than
 1,024 distinct analyzed terms and independently refuses oversized input.
 
-Forced physical reclamation has its separate unresolved binding requirements in
-[native reclamation integration](native-reclamation.md).
+Physical pressure recovery has its separate existing-API qualification in
+[native reclamation](native-reclamation.md). The former proposed binding API is
+not a prerequisite; the implementation must be evaluated against available
+native compaction/blob-GC policy and measured retry admission.

@@ -1,89 +1,78 @@
-# Native reclamation integration
+# Native reclamation
 
-Forced bounded physical reclamation remains NOT MET. Logical retirement, native
-flush scheduling and automatic compaction/blob GC are implemented, but they do
-not establish sustained measured disk recovery.
+Sparrow must demonstrate physical recovery after logical retirement, preserve
+pinned/shared bytes, expose native failures and admit the refused write again.
+The earlier proposal for a new bounded file-compaction API is withdrawn as an
+unproven prerequisite. No new upstream RocksDB work is required by this contract.
 
-The current lockfile selects `rocksdb 0.25.0` and
-`librocksdb-sys 0.19.0+11.8.1`. Inspection of their implementations identified
-the following required seams:
+## Existing implementation and native controls
 
-- `rocksdb::DB::compact_range_cf_opt` returns `()`. Its C entry point
-  `rocksdb_compact_range_cf_opt` in `rocksdb/db/c.cc` discards the native
-  `CompactRange` status. A wrapper cannot recover that discarded failure reason
-  by pretending the return is a successful `Result`.
-- The C API provides `rocksdb_compact_files_cf`, which captures the native
-  `CompactFiles` status through `SaveError(errptr, s)`. The safe Rust facade
-  currently exposes no corresponding file-selection operation.
-- `DB::live_files` materializes metadata for every table file. A bounded worker
-  needs admitted/paged metadata rather than an unrestricted catalog allocation.
-- The safe `CompactOptions` facade exposes bottommost-level policy, exclusivity,
-  level changes and timestamp history. It does not expose the native bounded-file
-  compaction output options or `CompactRangeOptions`' explicit blob-GC policy.
+The selected `rocksdb 0.25.0` / `librocksdb-sys 0.19.0+11.8.1` already supplies:
 
-A key-range estimate is not an input/output byte bound: selected key ranges can
-intersect entire table files and referenced blob files. Merely splitting the
-hash key space or using `get_approximate_sizes_cf` would not prove admission
-against the maintenance reserve. Automatic native activity, background-error
-properties and a returned range-compaction call cannot certify the native
-request's successful completion.
+- Error-returning asynchronous column-family flush scheduling. The pressure
+  worker uses it after a durable, bounded retirement pass.
+- Native automatic compaction and blob garbage collection. The store already
+  enables blob GC and limits background jobs to two, with 8 MiB write buffers.
+- `Options::add_compact_on_deletion_collector_factory`, configured through one
+  helper for both column families: a 1,024-entry window, 128-deletion trigger and
+  0.25 whole-table deletion ratio. This marks tombstone-heavy tables for native
+  compaction even when level-size triggers are quiet.
+- `Options::set_blob_gc_force_threshold`, which can schedule targeted
+  compactions when eligible old blob files contain enough garbage. Its native
+  default is 1.0; merely enabling blob GC does not enable that trigger.
+- `DB::wait_for_compact` with a finite timeout and native error return. This is
+  an available observation primitive, not evidence that disk capacity recovered.
+- Background-error, pending/running compaction and snapshot observations used by
+  the existing pressure owner, plus independent filesystem-size measurement.
 
-The dependency integration task is to expose safe, error-returning bounded file
-compaction and bounded metadata capture, including the required blob-GC and
-output controls. It must preserve the workspace's `unsafe_code = "forbid"`
-policy; Sparrow must not copy private dependency code or introduce an unchecked
-FFI path. No dependency or sibling repository was modified for this inspection.
+The production path must use these owners rather than invent a second deletion
+engine. Scheduling or finishing a native job is insufficient: pressure remains
+until the measured footprint allows the outstanding write estimate. Failed or
+stalled native recovery must not authorize endlessly deleting more evidence.
+Status and pin-release controls remain usable during backpressure.
 
-After that seam exists, the production worker must admit selected input, expected
-output and control space; keep at most one owned reclamation job; release the
-catalog writer before native disk I/O; report exact native failures; and join
-its job during shutdown. Logical retirement must remain gated while reclamation
-is pending. Native completion still requires independent physical measurement
-and successful retry admission before pressure can be declared recovered.
-Qualification must include shared/pinned bytes, snapshots, worker shutdown,
-native failure, restart, and sustained pressure over the intended corpus.
+`compact_range_cf_opt` has a unit return and its C wrapper discards native
+status. A caller must not relabel that return as success. This limitation alone
+does not establish that Sparrow needs selected-file compaction, paginated file
+metadata or a new binding. No alternative binding has been selected.
 
-This gap does not authorize synthetic progress writes, silent retries, premature
-reclamation receipts or more evidence deletion while physical recovery stalls.
+## Resource and failure boundary
 
-## Alternative binding inspection
+Application admission accounts for expected write space and a maintenance
+reserve. Native worker count, buffer settings and compaction policy constrain
+work; target-file sizing or a preferred compaction byte count is not a hard
+total output guarantee. A filesystem/volume quota provides the hard outer disk
+ceiling. Quota/native errors remain visible storage failures. This follows the
+existing architecture boundary rather than requiring a new total-output API.
 
-On 2026-10-08, the maintained
-[zaidoon1 binding fork](https://docs.rs/crate/rust-rocksdb/0.53.0) was inspected as
-an alternative to the selected binding. Release `v0.53.0` names tag object
-`c8b2e2c3a6939ea2cd35ff073c10b1e431615d88`; its native package declares
-`rust-librocksdb-sys 0.48.1+11.8.1`. This is discovery, not a selected dependency
-or qualified store migration.
+## Qualification
 
-Its safe `compact_files`/`compact_files_cf` APIs return a typed native result or
-error and expose compaction output names/job information. `CompactionOptions`
-supplies per-output-file size, subcompaction, trivial-move and cancellation
-controls. Those are useful seams, but a per-file output size is not a total job
-input/output or blob-space bound. They do not establish pressure recovery.
+The real-pressure regression
+`pressure_recovers_real_native_bytes_and_retries_without_ballast_removal`
+fills an owned temporary store with incompressible bytes until native files
+cause `STORAGE_PRESSURE`. It keeps a pinned payload with an independently
+retirable shared occurrence, drives the production pressure worker, measures
+file-size recovery, retries the original refused write and checks exact bytes
+through reopen. It does not remove external ballast to simulate reclamation.
+Evidence is retained under
+`.stage/native-graph-integration/reclamation-existing-apis-*`.
 
-The release's `ColumnFamilyMetaDataOptions` filters by level and overlapping
-start/end keys. It does not supply a maximum admitted file count or metadata byte
-budget before collection. `get_column_family_metadata_with_options` returns all
-selected levels/files in its owned metadata result. The level and key filters
-do not prove bounded metadata capture or bounded compaction closure; overlapping
-file/blob input and total output still require admission. Range compaction also
-retains the unit-returning API. These observations are from
-[release metadata source](https://github.com/zaidoon1/rust-rocksdb/blob/v0.53.0/src/metadata.rs)
-and [release compaction source](https://github.com/zaidoon1/rust-rocksdb/blob/v0.53.0/src/compaction.rs).
+The unchanged production-default baseline retired 32 records and 1,024 payload
+references, but remained backpressured at its 45-second fixture deadline. Its
+file footprint grew from 63,136,303 to 63,324,660 bytes, with no pending flush,
+compaction or snapshot. This demonstrated missing scheduling after retirement,
+not a missing safe binding API.
 
-No dependency, sibling checkout, daemon or live store was changed for this
-inspection. A candidate binding still needs the missing bounded collection and
-resource contracts, followed by full source/copy-store/failure qualification
-before runtime adoption. The original forced-reclamation requirement remains
-unmet.
+With the shared native deletion collector, the same production-default fixture
+passed in 1.71 seconds: file bytes fell from 63,141,099 to 53,583,692 after 32
+record retirements, the original refused request was accepted, and exact pinned
+and newly accepted bytes survived reopen. No external ballast was removed, no
+binding/dependency changed, and the 96 MiB budget, 32 MiB maintenance reserve and
+45-second fixture deadline were preserved. This measures the linked native-file
+footprint and actual retry admission; it is not a hard-quota or allocated-block
+measurement.
 
-On 2026-10-18 the first-party
-[release index](https://github.com/zaidoon1/rust-rocksdb/releases) still identified
-v0.53.0 as latest. A fresh inspection of the current
-[metadata options](https://raw.githubusercontent.com/zaidoon1/rust-rocksdb/master/src/metadata.rs)
-and [compaction options](https://raw.githubusercontent.com/zaidoon1/rust-rocksdb/master/src/compaction.rs)
-found the same relevant limits: metadata selection filters levels/key ranges,
-and file compaction exposes per-output-file sizing and cancellation. These
-inspected types still supply neither admitted metadata pagination nor a total
-job output-byte ceiling. This refresh does not establish the missing bounded
-reclamation contract or justify changing the selected dependency.
+This finite test does not establish sustained production turnover, a hard-quota
+run, recovery of an already-stalled store created before this policy,
+snapshot-held recovery or every native storage-failure scenario. Those need
+separate evidence; none implies that a hypothetical upstream API is mandatory.

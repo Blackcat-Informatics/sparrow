@@ -4968,6 +4968,122 @@ fn catalog_frontiers_resume_a_complete_prefix_without_skipping_admission_failure
 }
 
 #[test]
+fn pressure_recovers_real_native_bytes_and_retries_without_ballast_removal() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 96 * 1024 * 1024;
+    settings.maintenance_reserve = 32 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let mut random = std::fs::File::open("/dev/urandom").unwrap();
+    let mut input = vec![0; 1024 * 1024];
+    random.read_exact(&mut input).unwrap();
+    let protected = store
+        .ingest("native-pin", "source", "opaque", &input, 1)
+        .unwrap();
+    let protected_bytes = input.clone();
+    let pin = store
+        .pin(
+            "native-pin-request",
+            "native-case",
+            std::slice::from_ref(&protected.id),
+            40,
+            1,
+        )
+        .unwrap();
+    // A second occurrence shares the protected payload but is independently evictable.
+    store
+        .ingest("native-shared", "source", "opaque", &input, 2)
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut qualified = None;
+    for index in 0..128 {
+        random.read_exact(&mut input).unwrap();
+        let request = format!("native-fill-{index}");
+        match store.ingest(&request, "source", "opaque", &input, 3 + index) {
+            Ok(_) => store.flush().unwrap(),
+            Err(error) => {
+                assert_eq!(error.code, "STORAGE_PRESSURE", "{error}");
+                let before = store.status(3 + index).unwrap()["physical_bytes"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                let recovered = loop {
+                    let state = store
+                        .pressure_maintain(3 + index, EvictionLimits::default())
+                        .unwrap();
+                    if state.phase == PressurePhase::Ready {
+                        break state;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "native recovery stalled: {state:?}; before={before}; status={:?}",
+                        store.status(3 + index).unwrap()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                };
+                let after = store.status(3 + index).unwrap()["physical_bytes"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                if recovered.evicted_records > 0 {
+                    qualified = Some((request, before, after, recovered));
+                    break;
+                }
+                // An in-flight flush/compaction can resolve transient pressure
+                // without deleting anything. Retry this exact body, then keep
+                // filling until the real retirement/reclamation path is needed.
+                store
+                    .ingest(&request, "source", "opaque", &input, 3 + index)
+                    .unwrap();
+                store.flush().unwrap();
+            }
+        }
+    }
+    let (request, before, after, recovered) =
+        qualified.expect("fixture did not reach physical recovery after real retirement");
+    assert!(
+        after < before,
+        "no measured native disk recovery: {before} -> {after}"
+    );
+    assert!(recovered.evicted_records > 0);
+    let accepted = store
+        .ingest(&request, "source", "opaque", &input, 201)
+        .unwrap();
+    assert_eq!(
+        store
+            .bytes(&protected.id, 0, protected_bytes.len(), 201)
+            .unwrap(),
+        protected_bytes
+    );
+    assert_eq!(
+        store.bytes(&accepted.id, 0, input.len(), 201).unwrap(),
+        input
+    );
+    eprintln!(
+        "PASS native physical recovery: before={before}, after={after}, evicted_records={}, retry={}",
+        recovered.evicted_records, accepted.id
+    );
+    drop(store);
+    let store = Store::open(dir.path(), settings).unwrap();
+    assert_eq!(store.pressure_status().unwrap().phase, PressurePhase::Ready);
+    assert_eq!(
+        store
+            .bytes(&protected.id, 0, protected_bytes.len(), 202)
+            .unwrap(),
+        protected_bytes
+    );
+    assert_eq!(
+        store.bytes(&accepted.id, 0, input.len(), 202).unwrap(),
+        input
+    );
+    store.release(&pin.id).unwrap();
+}
+
+#[test]
 fn pressure_admission_drives_bounded_retirement_and_waits_for_physical_capacity() {
     use sparrow_core::{EvictionLimits, PressurePhase};
     let dir = tempfile::tempdir().unwrap();

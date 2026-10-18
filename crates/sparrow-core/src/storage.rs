@@ -1120,6 +1120,7 @@ impl Store {
         options.set_write_buffer_size(8 * 1024 * 1024);
         options.set_compression_type(DBCompressionType::Lz4);
         options.set_bottommost_compression_type(DBCompressionType::Zstd);
+        pressure::native_compaction_options(&mut options);
         let mut payload = Options::default();
         payload.set_compression_type(DBCompressionType::Lz4);
         payload.set_bottommost_compression_type(DBCompressionType::Zstd);
@@ -1128,6 +1129,7 @@ impl Store {
         payload.set_blob_compression_type(DBCompressionType::Zstd);
         payload.set_enable_blob_gc(true);
         payload.set_write_buffer_size(8 * 1024 * 1024);
+        pressure::native_compaction_options(&mut payload);
         let db = DB::open_cf_descriptors(
             &options,
             path,

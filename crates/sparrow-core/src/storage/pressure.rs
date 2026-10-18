@@ -9,6 +9,13 @@ use super::{
 };
 use rocksdb::FlushOptions;
 
+/// Ask the native picker to revisit tombstone-heavy tables even when level-size
+/// triggers are quiet. In particular, a flushed retirement batch must not wait
+/// for more ingestion before its obsolete payload references can be collected.
+pub(super) fn native_compaction_options(options: &mut rocksdb::Options) {
+    options.add_compact_on_deletion_collector_factory(1024, 128, 0.25);
+}
+
 pub(super) const WAIT_KEY: &str = "pressure-reclamation-wait";
 pub(super) const FORMAT: &[u8] = b"sparrow.store/38";
 pub(super) const WATCH_FORMAT: &[u8] = b"sparrow.store/39";

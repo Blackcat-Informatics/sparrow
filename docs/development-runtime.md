@@ -12,6 +12,28 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Native reclamation source qualification
+
+The earlier conclusion that Sparrow required a new RocksDB compaction API was
+unproven and is withdrawn. The real-pressure regression exposed a native
+scheduling gap: after retiring 32 records and 1,024 payload references, the
+unchanged production policy remained backpressured with no native job pending.
+A shared `add_compact_on_deletion_collector_factory` configuration now marks
+tombstone-heavy tables in both existing column families for native compaction.
+RocksDB retains its original compaction and blob-GC implementation; the pressure
+worker retains its existing pin protection, native error checks and measured
+admission boundary. No binding, dependency, schema or store format changes.
+
+The focused release fixture passed in 1.71 seconds. Linked native-file bytes
+fell from 63,141,099 to 53,583,692, the original refused write succeeded, and exact
+pinned/new bytes survived reopen. Its configured budget/reserve remained
+96/32 MiB and its deadline 45 seconds. This is source qualification over a finite
+incompressible corpus, without external ballast removal or a hard quota.
+[Native reclamation](native-reclamation.md) records the method and remaining
+operational acceptance. Evidence is under
+`.stage/native-graph-integration/reclamation-existing-apis-*`.
+The installed daemon has not yet adopted this source change.
+
 ## Completed-file process-crash qualification
 
 The [completed-file crash matrix](interfaces.md#completed-file-process-crash-qualification)
