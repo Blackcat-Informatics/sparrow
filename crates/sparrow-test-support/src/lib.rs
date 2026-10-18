@@ -3,6 +3,9 @@
 
 //! Dev-only shared native storage fixtures. Runtime crates must not depend on this crate.
 
+/// Process-crash coordination for test-only production checkpoints.
+pub mod crash;
+
 /// One discovered store for SDK acceptance and ingestion status certificates.
 pub fn client_discovery() -> capnp::message::Builder<capnp::message::HeapAllocator> {
     let mut message = capnp::message::Builder::new_default();

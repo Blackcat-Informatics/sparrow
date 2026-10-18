@@ -1871,6 +1871,8 @@ impl wire::sparrow::Server for Rpc {
             .await
         {
             Ok((value, store)) => {
+                #[cfg(test)]
+                sparrow_test_support::crash::checkpoint("upload_chunk_committed");
                 import_progress(results.get().init_result().init_ok(), value, &store)?
             }
             Err(e) => failure(results.get().init_result(), e),

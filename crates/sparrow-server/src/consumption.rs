@@ -62,6 +62,9 @@ impl From<rustix::io::Errno> for Error {
 
 const INFLIGHT: &str = ".sparrow-inflight";
 
+#[cfg(test)]
+mod crash_tests;
+
 fn observation(file: &File) -> Result<ConsumptionGeneration, Error> {
     generation(CompletedFileIdentity::capture(&file.metadata()?))
 }
@@ -460,6 +463,8 @@ impl ClaimRoot {
                     ));
                 }
                 require(&file, &journal.observed)?;
+                #[cfg(test)]
+                sparrow_test_support::crash::checkpoint("claim_before_rename");
                 fs::renameat_with(
                     parent,
                     name,
@@ -467,6 +472,8 @@ impl ClaimRoot {
                     private_name,
                     RenameFlags::NOREPLACE,
                 )?;
+                #[cfg(test)]
+                sparrow_test_support::crash::checkpoint("claim_after_rename");
                 file
             }
             Err(error) => return Err(error),
@@ -485,15 +492,23 @@ impl ClaimRoot {
             // Never synchronize the source-parent removal before the destination
             // and source contents are durable: every interrupted move has a copy.
             file.sync_all()?;
+            #[cfg(test)]
+            sparrow_test_support::crash::checkpoint("claim_contents_synced");
             self.inflight.sync_all()?;
+            #[cfg(test)]
+            sparrow_test_support::crash::checkpoint("claim_destination_synced");
             parent
                 .as_ref()
                 .ok_or(Error::State(
                     "unconfirmed claim has no original parent descriptor",
                 ))?
                 .sync_all()?;
+            #[cfg(test)]
+            sparrow_test_support::crash::checkpoint("claim_parent_synced");
             require(&file, &observed)?;
             journal = self.store.consumption_claimed(id, observed)?;
+            #[cfg(test)]
+            sparrow_test_support::crash::checkpoint("claim_checkpointed");
         }
         // Refuse a renamed path that no longer names this exact opened generation.
         let named = open(&self.inflight, private_name, OFlags::RDONLY, BENEATH)?;
@@ -540,6 +555,8 @@ impl ClaimRoot {
             ));
         }
         claim.journal = saved;
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("claim_published");
         Ok(receipt)
     }
 
@@ -609,10 +626,19 @@ impl ClaimRoot {
             BENEATH,
         )?;
         require(&named, generation)?;
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("remove_before_unlink");
         fs::unlinkat(&self.inflight, journal.import_id.as_str(), AtFlags::empty())?;
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("remove_after_unlink");
         self.inflight.sync_all()?;
-        Ok(self
-            .store
-            .consumption_removed(&journal.import_id, &artifact, generation, now)?)
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("remove_directory_synced");
+        let removed =
+            self.store
+                .consumption_removed(&journal.import_id, &artifact, generation, now)?;
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("remove_checkpointed");
+        Ok(removed)
     }
 }

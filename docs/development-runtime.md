@@ -12,6 +12,17 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Completed-file process-crash qualification
+
+The [completed-file crash matrix](interfaces.md#completed-file-process-crash-qualification)
+now exercises twelve real SIGKILL windows around claim rename/synchronization,
+partial upload, publication and private-source removal. Each case reopens the
+production store, recovers through the SDK/RPC path, verifies exact bytes and
+stable accepted identities, preserves a replacement producer path and reopens
+again to verify idempotence. The checkpoints exist only in the test library.
+No installed image, service configuration or producer source changed for this
+qualification. Power-loss and watcher/overflow acceptance remain separate.
+
 ## Current-source turnover and logical graph closure
 
 The existing offline larger-profile qualifier was explicitly rebuilt from signed

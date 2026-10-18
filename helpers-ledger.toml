@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "owned-process-crash-checkpoints"
+summary = "Test-only production checkpoints share one dev-only marker/wait/kill owner. The parent reaps only its owned child and production claim/SDK/storage owners perform recovery; no simulated publication or deletion path."
+home = "sparrow_test_support::crash::checkpoint"
+entry_points = ["sparrow_test_support::crash::kill_at_checkpoint", "sparrow_test_support::crash::kill_and_reap", "sparrow_server::consumption::ClaimRoot::recover", "sparrow_server::consumption::ClaimRoot::publish", "sparrow_server::consumption::ClaimRoot::remove", "sparrow_server::rpc::Rpc::import_append"]
+spec = "docs/architecture.md: consumption crash acceptance; docs/interfaces.md: process-crash consumption checks."
+vectors = ["crates/sparrow-server/src/consumption/crash_tests.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(crash_release_daemon|fake_consumption_recovery|publish_replacement_on_retry)$']
+
+[[job]]
 id = "agent-capability-document"
 summary = "CLI and MCP share one capability document and certified status owner. Native Cap'n Proto enum introspection and the existing format label owner supply formats; metadata and capability vocabulary share one namespace constant. Transport labels describe supported protocol kinds."
 home = "sparrow_server::agent::capabilities::execute"

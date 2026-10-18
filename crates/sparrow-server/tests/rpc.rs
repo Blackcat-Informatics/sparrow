@@ -12,7 +12,7 @@ use std::{
 };
 
 // A child can briefly inherit CLOEXEC sockets before exec closes them.
-static PROCESS_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
+use sparrow_test_support::crash::PROCESS_START;
 type TcpReservation = (std::net::TcpListener, std::sync::MutexGuard<'static, ()>);
 
 #[tokio::test(flavor = "current_thread")]
@@ -4949,8 +4949,8 @@ async fn query_selection_is_shared_by_typed_cli_and_mcp_surfaces() {
 }
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.0.kill().expect("stop this test's daemon");
-        self.0.wait().expect("reap this test's daemon");
+        sparrow_test_support::crash::kill_and_reap(&mut self.0)
+            .expect("stop and reap this test's daemon");
     }
 }
 

@@ -1854,8 +1854,39 @@ the exact private source. Schema 15 `status.consumeWatches` reports coverage,
 bounded candidates/deferral, pending claims, completion counts and failures;
 the CLI and stdio MCP share its rendering. No live producer roots are configured
 in the development daemon. Completed-tail handoff is implemented through schema
-41. Forced-overflow qualification and whole-process crash injection at every filesystem boundary
-remain unfinished. Ordinary upload continues to preserve every caller source.
+41. Ordinary upload continues to preserve every caller source.
+
+### Completed-file process-crash qualification
+
+The server unit test
+`consumption::crash_tests::whole_process_crashes_preserve_claims_publication_and_replacements`
+starts with a durable reservation for an owned, finished 80 KiB opaque file.
+Each child uses the production claim implementation, SDK descriptor uploader,
+generated Cap'n Proto RPC server and RocksDB store over a private Unix socket.
+The parent waits for a complete checkpoint marker and sends SIGKILL to that child.
+The twelve independently recovered windows are:
+
+- Before and after the atomic rename into private ownership.
+- After file-content, destination-directory and original-parent synchronization.
+- After the durable claimed-generation checkpoint.
+- After the first committed 64 KiB upload chunk, before sealing or publication.
+- After durable publication, before returning its receipt.
+- Before unlink, after unlink, after directory synchronization and after the
+  durable removal checkpoint.
+
+Before recovery, assertions check journal ownership, publication visibility,
+private-path presence, removal confirmation and the partial-upload offset.
+Recovery and a second reopen must preserve exact bytes, one record and artifact,
+accepted identities and clocks, and any independently replaced original path.
+Already accepted artifacts retain their original retention deadline. The marker
+adds no filesystem synchronization barrier. The checkpoints compile only in the
+unit-test library and share the dev-only process helper; release builds expose
+no crash setting or additional RPC.
+
+This qualifies process death at these ownership transitions. It does not qualify
+power loss, startup directory/lock creation, automatic inotify discovery or
+forced overflow, or arbitrary filesystem errors. Those remaining acceptance
+requirements must not be inferred from this finite matrix.
 
 ## 6. CLI
 
