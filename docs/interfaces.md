@@ -425,6 +425,24 @@ native projection nesting limit 16. Example:
 {"store_id":"STORE_ID","query":"SELECT ?record WHERE { ?record <urn:sparrow:vocab:payload> ?payload }","page_size":100,"layers":{"content":false}}
 ```
 
+Schema 53 identifies host read admission as `sparrow-rdf-source-v2` in
+`limits.source_profile` and `profile_ids`, independently of the native governor
+profile. Capture admits prospective bounded index rows and the actual pinned
+catalog body/key bytes before native catalog decoding. Catalog entries retain
+their original width, 64x memory charge, scan and time checks. Body admission uses
+the same sticky source account without counting a second logical request or row.
+All source and native governor ceilings remain unchanged. Terminal iterator
+advances are admitted too; these counters describe admitted work, not physical
+RocksDB block reads or process RSS. Unknown/missing source profiles refuse at the
+agent boundary instead of claiming the current law.
+
+Record and empty-artifact timelines share one native borrowed iterator. It
+checks key/identity widths before copying or loading a catalog and preserves
+native status errors and half-open receipt bounds. This removes the previous
+512-KiB charge for every tiny catalog body without relaxing index integrity.
+This source change passed the full local gate; the installed image remains
+schema 52 until adoption evidence is recorded in Development runtime.
+
 Optional `limits` counters use unsigned decimal strings: `fuel`, `answer_rows`,
 `intermediate_cells`, `scratch_bytes`, `live_bytes`, `requests`, `io_bytes`,
 `row_visits`, `source_lease_ms`. Defaults and actual effective limits are echoed

@@ -4,12 +4,39 @@
 //! Store-owned graph membership; RDF meaning and query execution stay in PurRDF.
 
 use super::*;
+use crate::storage::temporal_index::{TemporalRows, row_bound};
 use crate::storage::{
     catalog_lease::{CaptureAdmission, SCAN_BYTES},
     diagnostic,
 };
 use crate::{DiagnosticCoverage, QueryCancellation, QueryScope};
 use std::time::Instant;
+
+fn catalog_entry(
+    budget: &Budget,
+    id: &str,
+    bytes: &[u8],
+    admission: &mut CaptureAdmission<'_>,
+) -> Result<(), Error> {
+    admission.entry(bytes.len())?;
+    budget
+        .admit_bytes((id.len() + bytes.len()) as u64)
+        .map_err(|error| Error::new(error.code, error.message.clone()))
+}
+
+fn artifact_catalog(
+    writer: &crate::storage::Writer,
+    budget: &Budget,
+    admission: &mut CaptureAdmission<'_>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<crate::storage::Artifact, Error> {
+    crate::storage::temporal_index::check_width("empty-time:", key, value)?;
+    admission.entry(key.len() + value.len())?;
+    crate::storage::recordless::read_recordless(key, value, |id| {
+        writer.get_admitted(id, |bytes| catalog_entry(budget, id, bytes, admission))
+    })
+}
 
 /// Coverage of a completed graph-owner capture, independently of query certainty.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -251,12 +278,14 @@ impl Store {
         };
         let mut candidates = writer
             .query_candidates_from_members(scope, members, |id| {
-                writer.get_admitted(id, |bytes| admission.entry(bytes.len()))
+                writer.get_admitted(id, |bytes| {
+                    catalog_entry(&budget, id, bytes, &mut admission)
+                })
             })
             .map_err(|e| budget.fail(e))?;
         let mut coverage = RdfScopeCoverage::default();
         loop {
-            budget.request(super::super::catalog_lease::ENTRY_BYTES as u64, true)?;
+            budget.request(row_bound("time:"), true)?;
             let Some(record) = candidates.next() else {
                 break;
             };
@@ -290,10 +319,7 @@ impl Store {
                     continue;
                 }
                 let key = crate::storage::recordless::key_parts(time, &id);
-                budget.request(super::super::catalog_lease::ENTRY_BYTES as u64, true)?;
-                admission
-                    .entry(key.len() + id.len())
-                    .map_err(|e| budget.fail(e))?;
+                budget.request(row_bound("empty-time:"), true)?;
                 let value = writer
                     .db
                     .get_pinned(&key)
@@ -304,9 +330,9 @@ impl Store {
                             "selected empty artifact temporal index missing",
                         ))
                     })?;
-                let artifact = writer
-                    .indexed_recordless(key.as_bytes(), &value, admission.remaining)
-                    .map_err(|e| budget.fail(e))?;
+                let artifact =
+                    artifact_catalog(&writer, &budget, &mut admission, key.as_bytes(), &value)
+                        .map_err(|e| budget.fail(e))?;
                 view.include_artifact(
                     &writer,
                     &artifact,
@@ -318,26 +344,20 @@ impl Store {
                 )?;
             }
         } else {
-            let start = crate::storage::recordless::key_parts(scope.received_from, "");
-            let mut options = rocksdb::ReadOptions::default();
-            options.set_iterate_upper_bound(
-                crate::storage::recordless::key_parts(scope.received_before, "").into_bytes(),
+            let mut rows = TemporalRows::new(
+                "empty-time:",
+                scope.received_from,
+                scope.received_before,
+                |options| writer.db.raw_iterator_opt(options),
             );
-            for row in writer.db.iterator_opt(
-                IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward),
-                options,
-            ) {
-                budget.request(super::super::catalog_lease::ENTRY_BYTES as u64, true)?;
-                let (key, value) = row.map_err(|e| budget.fail(e.into()))?;
-                if !key.starts_with(crate::storage::recordless::PREFIX) {
+            loop {
+                budget.request(row_bound("empty-time:"), true)?;
+                let Some(artifact) = rows.read_next(|key, value| {
+                    artifact_catalog(&writer, &budget, &mut admission, key, value)
+                }) else {
                     break;
-                }
-                admission
-                    .entry(key.len() + value.len())
-                    .map_err(|e| budget.fail(e))?;
-                let artifact = writer
-                    .indexed_recordless(&key, &value, admission.remaining)
-                    .map_err(|e| budget.fail(e))?;
+                };
+                let artifact = artifact.map_err(|e| budget.fail(e))?;
                 view.include_artifact(
                     &writer,
                     &artifact,

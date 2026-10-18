@@ -300,38 +300,47 @@ impl Writer {
         value: &[u8],
         remaining: &mut usize,
     ) -> Result<Artifact, Error> {
-        let id = std::str::from_utf8(value)
-            .map_err(|_| Error::new("STORAGE_FAILURE", "invalid recordless time index identity"))?;
-        if !id.starts_with("artifact:") || id.len() <= "artifact:".len() || id.len() > 128 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "recordless time index requires a bounded artifact identity",
-            ));
-        }
-        let artifact: Artifact = self.get_limited(id, remaining).map_err(|error| {
-            if error.code == "NOT_FOUND" {
-                Error::new(
-                    "STORAGE_FAILURE",
-                    "recordless time index references missing artifact",
-                )
-            } else {
-                error
-            }
-        })?;
-        if artifact.id != id
-            || artifact.evicted
-            || !artifact.record_ids.is_empty()
-            || artifact.byte_length != 0
-            || !artifact.chunks.is_empty()
-            || key != self::key(&artifact).as_bytes()
-        {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "recordless time index disagrees with its artifact",
-            ));
-        }
-        Ok(artifact)
+        read_recordless(key, value, |id| self.get_limited(id, remaining))
     }
+}
+
+pub(super) fn read_recordless(
+    key: &[u8],
+    value: &[u8],
+    lookup: impl FnOnce(&str) -> Result<Artifact, Error>,
+) -> Result<Artifact, Error> {
+    super::temporal_index::check_width("empty-time:", key, value)?;
+    let id = std::str::from_utf8(value)
+        .map_err(|_| Error::new("STORAGE_FAILURE", "invalid recordless time index identity"))?;
+    if !id.starts_with("artifact:") || id.len() <= "artifact:".len() || id.len() > 128 {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "recordless time index requires a bounded artifact identity",
+        ));
+    }
+    let artifact: Artifact = lookup(id).map_err(|error| {
+        if error.code == "NOT_FOUND" {
+            Error::new(
+                "STORAGE_FAILURE",
+                "recordless time index references missing artifact",
+            )
+        } else {
+            error
+        }
+    })?;
+    if artifact.id != id
+        || artifact.evicted
+        || !artifact.record_ids.is_empty()
+        || artifact.byte_length != 0
+        || !artifact.chunks.is_empty()
+        || key != self::key(&artifact).as_bytes()
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "recordless time index disagrees with its artifact",
+        ));
+    }
+    Ok(artifact)
 }
 
 #[cfg(test)]

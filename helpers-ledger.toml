@@ -5,7 +5,7 @@
 id = "temporal-backend-candidates"
 summary = "Current and snapshot-bound readers use the same native half-open temporal iterator and catalog/index integrity checks; backends supply lookup only."
 home = "sparrow_core::storage::query_membership::temporal_candidates"
-entry_points = ["sparrow_core::storage::Writer::query_candidates"]
+entry_points = ["sparrow_core::storage::Writer::query_candidates", "sparrow_core::storage::temporal_index::TemporalRows::new", "sparrow_core::storage::temporal_index::TemporalRows::read_next", "sparrow_core::storage::temporal_index::row_bound", "sparrow_core::storage::temporal_index::check_width"]
 spec = "docs/query-streaming.md: native read foundation."
 vectors = ["crates/sparrow-core/src/storage/query_membership.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2272,7 +2272,7 @@ names = ['^(retry_claim_lock|wait_for_claim_lock)$']
 id = 'recordless-time-publication'
 summary = 'Publish one native receipt-time entry for recordless artifacts from direct ingestion, staged publication or upgrade; expiry uses the same key owner.'
 home = 'sparrow_core::storage::recordless::publish'
-entry_points = ['sparrow_core::storage::recordless::is_live_owner', 'sparrow_core::storage::recordless::key', 'sparrow_core::storage::recordless::key_parts', 'sparrow_core::storage::recordless::Writer::indexed_recordless']
+entry_points = ['sparrow_core::storage::recordless::is_live_owner', 'sparrow_core::storage::recordless::key', 'sparrow_core::storage::recordless::key_parts', 'sparrow_core::storage::recordless::Writer::indexed_recordless', 'sparrow_core::storage::recordless::read_recordless']
 spec = "docs/development-runtime.md: schema 19 recordless artifact eviction."
 vectors = ["crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -4069,3 +4069,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(copy_rdf_retirement_into_test_fixture|remove_artifact_rdf_upgrade_elsewhere)$']
+
+[[job]]
+id = "rdf-catalog-body-admission"
+summary = "Graph capture admits each pinned catalog body before native decoding under its original cumulative source account, independently of bounded borrowed temporal index entries. Source profile v2 preserves request/row ceilings and sticky failure without a 512-KiB-per-record precharge."
+home = "sparrow_core::storage::rdf_view::scope::catalog_entry"
+entry_points = ["sparrow_core::storage::rdf_view::scope::artifact_catalog", "sparrow_core::storage::rdf_view::budget::Budget::admit_bytes", "sparrow_core::storage::rdf_view::budget::Budget::admit", "sparrow_core::storage::rdf_view::budget::Budget::request"]
+spec = "docs/interfaces.md: native graph source admission profile."
+vectors = ["crates/sparrow-core/src/storage/temporal_index.rs", "crates/sparrow-core/src/storage/rdf_view/budget.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(price_graph_catalog_body_elsewhere|copy_temporal_cursor_for_rdf)$']

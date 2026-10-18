@@ -29,6 +29,9 @@ pub use query::{ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;
 use sparse::RowCursor;
 
+/// Host source law: bounded borrowed index entries and admitted encoded catalog bodies.
+pub const RDF_SOURCE_ADMISSION_PROFILE: &str = "sparrow-rdf-source-v2";
+
 /// Sticky operational root cause shared by native readers and their guards.
 pub type ReadError = Arc<Error>;
 

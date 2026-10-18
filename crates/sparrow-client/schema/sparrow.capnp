@@ -713,6 +713,7 @@ struct SparqlHostLimits {
   resultHandles @3 :UInt64; resultBytes @4 :UInt64; resultLeaseMs @5 :UInt64;
   scopeCatalogBytes @6 :UInt64; catalogExpansionFactor @7 :UInt64;
   queryTextBytes @8 :UInt64; bindingBytes @9 :UInt64; bindingNodes @10 :UInt32;
+  sourceProfile @11 :Text;
 }
 enum SparqlForm { select @0; ask @1; graph @2; }
 struct SparqlSolution { cells @0 :List(OptionalRdfTerm); }

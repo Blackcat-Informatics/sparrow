@@ -3,9 +3,10 @@
 
 //! Store-owned query membership, shared by field, text and context reads.
 
+use super::temporal_index::{ID_BYTES, TemporalRows};
 use super::{Artifact, Catalog, Error, Pin, Record, Writer, catalog_lease::CaptureAdmission};
 use crate::{QueryScope, QuerySelection};
-use rocksdb::{IteratorMode, ReadOptions};
+use rocksdb::{DB, DBRawIteratorWithThreadMode, ReadOptions};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const MAX_SELECTION_VISITS: usize = 100_000;
@@ -232,7 +233,7 @@ impl Writer {
         Ok(Box::new(temporal_candidates(
             scope.received_from,
             scope.received_before,
-            |mode, options| self.db.iterator_opt(mode, options),
+            |options| self.db.raw_iterator_opt(options),
             lookup,
         )))
     }
@@ -240,35 +241,23 @@ impl Writer {
 
 /// One temporal iterator for current and native-snapshot reads. Storage lookup
 /// remains with its backend; interval and index integrity do not diverge.
-pub(super) fn temporal_candidates<'a, I>(
+pub(super) fn temporal_candidates<'a>(
     from: u64,
     before: u64,
-    scan: impl FnOnce(IteratorMode<'_>, ReadOptions) -> I,
+    scan: impl FnOnce(ReadOptions) -> DBRawIteratorWithThreadMode<'a, DB>,
     mut lookup: impl FnMut(&str) -> Result<Record, Error> + 'a,
-) -> impl Iterator<Item = Result<Record, Error>> + 'a
-where
-    I: Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> + 'a,
-{
-    let start = format!("time:{from:020}:");
-    let mut options = ReadOptions::default();
-    // The native upper bound stops before decoding a later record, even when
-    // its index entry or catalog body is corrupt.
-    options.set_iterate_upper_bound(format!("time:{before:020}:").into_bytes());
-    let mut iterator = scan(
-        IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward),
-        options,
-    );
+) -> impl Iterator<Item = Result<Record, Error>> + 'a {
+    let mut iterator = TemporalRows::new("time:", from, before, scan);
     std::iter::from_fn(move || {
-        let (key, id) = match iterator.next()? {
-            Ok(entry) => entry,
-            Err(error) => return Some(Err(error.into())),
-        };
-        if !key.starts_with(b"time:") {
-            return None;
-        }
-        Some((|| {
-            let id = std::str::from_utf8(&id)
+        iterator.read_next(|key, id| {
+            let id = std::str::from_utf8(id)
                 .map_err(|_| Error::new("STORAGE_FAILURE", "invalid temporal index identity"))?;
+            if !id.starts_with("record:") || id.len() <= 7 || id.len() > ID_BYTES {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "temporal index requires a bounded record identity",
+                ));
+            }
             let record: Record = lookup(id).map_err(|error| {
                 if error.code == "NOT_FOUND" {
                     Error::new(
@@ -279,8 +268,7 @@ where
                     error
                 }
             })?;
-            if record.id != id
-                || key.as_ref() != format!("time:{:020}:{id}", record.received_at).as_bytes()
+            if record.id != id || key != format!("time:{:020}:{id}", record.received_at).as_bytes()
             {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
@@ -288,7 +276,7 @@ where
                 ));
             }
             Ok(record)
-        })())
+        })
     })
 }
 
@@ -368,7 +356,7 @@ mod tests {
             let records = temporal_candidates(
                 20,
                 30,
-                |mode, options| snapshot.iterator_opt(mode, options),
+                |options| snapshot.raw_iterator_opt(options),
                 |id| decode(snapshot.get(id)?),
             )
             .collect::<Result<Vec<_>, _>>()
@@ -420,7 +408,7 @@ mod tests {
         let current = temporal_candidates(
             20,
             30,
-            |mode, options| db.iterator_opt(mode, options),
+            |options| db.raw_iterator_opt(options),
             |id| decode(db.get(id)?),
         )
         .collect::<Result<Vec<_>, _>>()
@@ -431,7 +419,7 @@ mod tests {
         let missing = temporal_candidates(
             20,
             30,
-            |mode, options| db.iterator_opt(mode, options),
+            |options| db.raw_iterator_opt(options),
             |_| Err(Error::new("NOT_FOUND", "missing")),
         )
         .next()
@@ -441,7 +429,7 @@ mod tests {
         let injected = temporal_candidates(
             20,
             30,
-            |mode, options| db.iterator_opt(mode, options),
+            |options| db.raw_iterator_opt(options),
             |_| Err(Error::new("INJECTED_IO", "failed")),
         )
         .next()
@@ -451,7 +439,7 @@ mod tests {
         let mismatch = temporal_candidates(
             20,
             30,
-            |mode, options| db.iterator_opt(mode, options),
+            |options| db.raw_iterator_opt(options),
             |_| Ok(template.clone()),
         )
         .next()

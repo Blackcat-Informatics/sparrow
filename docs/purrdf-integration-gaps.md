@@ -18,6 +18,18 @@ retain the source integration's earlier qualification boundaries and evidence.
 
 ## Retained operational SPARQL integration
 
+Public governed EXPLAIN remains blocked on
+[PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600).
+On 2026-10-18, pinned `7734b013` and current main `c75cbf94` expose retained
+fallible measured EXPLAIN, but its public inputs are text/base/options and an
+optional stop signal. Typed request substitutions are not accepted; options
+document prebinding as inert. The measuring body chooses METERED governors
+internally, so callers cannot supply the query's finite governor settings.
+Sparrow will not ignore bindings, rewrite query text, copy the private evaluator,
+or claim that different measuring limits explain the original governed request.
+The issue requests native request/governor parity through the existing measured
+execution and publication owners. Its acceptance remains required here.
+
 The runtime selection and helper census reference now name committed PurRDF
 `7734b013d19b68600ad24c4e8aa5a40955a8e89e`. That revision includes
 `a77b743bcc6fad89d88581ef9cb5a626a326834f` (PR #526), which delivered the

@@ -52,6 +52,7 @@ pub(crate) mod source_time;
 pub(crate) mod syslog;
 pub(crate) mod tail;
 mod tail_ranges;
+mod temporal_index;
 mod text_index;
 pub(crate) mod watch_registry;
 mod writer_format;

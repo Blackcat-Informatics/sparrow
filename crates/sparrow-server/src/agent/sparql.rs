@@ -682,6 +682,10 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     let stop = g["stop"].clone();
     let e = value.get_evidence()?;
     let host = value.get_limits()?;
+    let source_profile = host.get_source_profile()?.to_str()?;
+    if source_profile != sparrow_core::RDF_SOURCE_ADMISSION_PROFILE {
+        return Err(protocol("unsupported RDF source admission profile"));
+    }
     let limits = host.get_source()?;
     let layers = value.get_layers()?;
     let mut result = super::catalog::page(value.get_page()?)?
@@ -690,7 +694,10 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
         .with("coverage", coverage)
         .with("native_governor", g)
         .with("stop_reason", stop)
-        .with("profile_ids", vec![purrdf::sparql::GOVERNOR_PROFILE_ID])
+        .with(
+            "profile_ids",
+            vec![purrdf::sparql::GOVERNOR_PROFILE_ID, source_profile],
+        )
         .with(
             "layers",
             Object::new()
@@ -710,6 +717,7 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
         .with(
             "limits",
             Object::new()
+                .with("source_profile", source_profile)
                 .with("page_size", value.get_page()?.get_page_size())
                 .with("scan_budget", value.get_page()?.get_scan_budget())
                 .with("page_bytes", host.get_page_bytes().to_string())
@@ -797,6 +805,22 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
 mod tests {
     use super::*;
     use purrdf::{BlankScope, TermValue, ir::TermBox};
+
+    #[test]
+    fn missing_or_unknown_source_profiles_refuse_instead_of_claiming_current_admission() {
+        for profile in ["", "unknown-source-law"] {
+            let mut message = capnp::message::Builder::new_default();
+            let mut page = message.init_root::<wire::sparql_page::Builder<'_>>();
+            page.reborrow().init_limits().set_source_profile(profile);
+            let error = render(page.into_reader()).unwrap_err();
+            assert_eq!(error.code, "PROTOCOL_FAILURE");
+            assert!(
+                error
+                    .message
+                    .contains("unsupported RDF source admission profile")
+            );
+        }
+    }
 
     #[test]
     fn typed_binding_objects_use_native_decoding_independent_of_member_order() {

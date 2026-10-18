@@ -101,12 +101,21 @@ impl Budget {
     }
 
     pub(super) fn request(&self, bytes: u64, row: bool) -> Result<(), ReadError> {
+        self.admit(bytes, row, 1)
+    }
+
+    /// Admit the pinned catalog body before decoding, without inventing another read.
+    pub(super) fn admit_bytes(&self, bytes: u64) -> Result<(), ReadError> {
+        self.admit(bytes, false, 0)
+    }
+
+    fn admit(&self, bytes: u64, row: bool, request_count: u64) -> Result<(), ReadError> {
         let mut state = self.state();
         self.ready(&mut state)?;
         let requested = state
             .evidence
             .requests
-            .checked_add(1)
+            .checked_add(request_count)
             .zip(state.evidence.admitted_bytes.checked_add(bytes))
             .zip(state.evidence.row_visits.checked_add(u64::from(row)));
         let Some(((requests, admitted_bytes), row_visits)) = requested else {
@@ -258,6 +267,32 @@ mod tests {
         assert_eq!(budget.checkpoint().1.live_bytes, 0);
         assert_eq!(budget.checkpoint().1.peak_live_bytes, 128);
         assert!(Arc::ptr_eq(&error, &budget.reserve(0).err().unwrap()));
+    }
+
+    #[test]
+    fn catalog_body_admission_shares_the_original_counters_and_sticky_refusal() {
+        let budget = Budget::new(RdfReadLimits {
+            requests: 1,
+            row_visits: 1,
+            io_bytes: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        budget.request(2, true).unwrap();
+        budget.admit_bytes(8).unwrap();
+        let evidence = budget.checkpoint().1;
+        assert_eq!(
+            (
+                evidence.requests,
+                evidence.row_visits,
+                evidence.admitted_bytes
+            ),
+            (1, 1, 10)
+        );
+        let error = budget.admit_bytes(1).unwrap_err();
+        assert_eq!(error.code, "RESOURCE_LIMIT");
+        assert_eq!(budget.checkpoint().1, evidence);
+        assert!(Arc::ptr_eq(&error, &budget.request(0, false).unwrap_err()));
     }
 
     #[test]

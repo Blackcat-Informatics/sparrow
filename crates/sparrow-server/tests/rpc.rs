@@ -8666,6 +8666,81 @@ async fn recordless_graph_metadata_and_independent_coverage_reach_cli_and_mcp() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn graph_catalog_io_profile_preserves_three_hundred_occurrences_through_cli_and_mcp() {
+    use purrdf_lex::json::{self, Object};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            client
+                .ingest(
+                    "catalog-io-300",
+                    "catalog-io",
+                    wire::Format::Jsonl,
+                    &b"{}\n".repeat(300),
+                )
+                .await
+                .unwrap();
+            let args = Object::new()
+                .with("store_id", store)
+                .with(
+                    "query",
+                    "SELECT (COUNT(*) AS ?count) WHERE { ?entity a <urn:sparrow:vocab:Record> }",
+                )
+                .with(
+                    "layers",
+                    Object::new()
+                        .with("content", false)
+                        .with("diagnostic", false),
+                );
+            let path = dir.path().join("catalog-io.json");
+            std::fs::write(&path, json::write_compact(&args.clone().into())).unwrap();
+            let expected = cli(&socket, &["sparql", path.to_str().unwrap()]);
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let response = mcp.tool(2, "sparql_query", args.into()).await;
+            assert_eq!(response["isError"].as_bool(), Some(false), "{response:?}");
+            let result = &response["structuredContent"];
+            assert_eq!(result["rows"], expected["rows"]);
+            assert_eq!(
+                result["rows"]["native_result"]["results"]["bindings"][0]["count"]["value"]
+                    .as_str(),
+                Some("300")
+            );
+            assert_eq!(
+                result["coverage"]["known_selected_records"].as_str(),
+                Some("300")
+            );
+            assert_eq!(
+                result["limits"]["source_profile"].as_str(),
+                Some(sparrow_core::RDF_SOURCE_ADMISSION_PROFILE)
+            );
+            assert_eq!(result["profile_ids"], expected["profile_ids"]);
+            assert!(
+                result["profile_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v.as_str() == Some(sparrow_core::RDF_SOURCE_ADMISSION_PROFILE))
+            );
+            assert!(
+                result["source_evidence"]["admitted_bytes"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    < 32 * 1024 * 1024
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn native_graph_pages_admit_repeated_projection_names_before_agent_rendering() {
     use purrdf_lex::json::{self, Object};
     tokio::task::LocalSet::new()

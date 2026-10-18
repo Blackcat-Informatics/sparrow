@@ -11,6 +11,27 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Source catalog admission qualification
+
+Schema 53 source identifies `sparrow-rdf-source-v2`: pinned catalog bodies are
+admitted before decoding, separately from bounded borrowed temporal-index rows.
+The old 512-KiB per-candidate allowance exhausted 128 MiB after 256 visits in a
+300-record, 900-byte JSONL input. The failing focused receipt is
+`.stage/native-graph-integration/rdf-catalog-io-before.log`. Source/request/row,
+catalog-memory and scan ceilings have not been raised. The replacement passed
+`make check`: release Clippy with warnings denied, 23 core unit tests, 180 storage
+tests, 15 server unit tests, 64 RPC tests, the other workspace suites and seeded
+census self-tests. The pinned cross gate reports 278 ownership jobs and zero
+distinct exceptions. The full receipt is `rdf-catalog-io-full-check.log` in the
+same evidence directory. Both the 300-record and 300-empty-artifact native count
+regressions pass at unchanged defaults; CLI and MCP preserve the 300-record
+count and advertise source profile v2. Missing or unknown profiles refuse.
+The final focused counter receipt `rdf-catalog-io-final-focused.log` reports
+2,108,461 admitted source bytes for 300 records and 21,480,711 for 300 empty
+artifacts; both report 34,639,872 peak accounted live bytes. These are logical
+admission counters, not physical I/O or RSS measurements.
+This source qualification has not changed the installed schema-52 image.
+
 ## Schema-52 live adoption
 
 Signed source `7e1b208b26038d13b7023da372355de602fdef3c` passed the normal

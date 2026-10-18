@@ -454,6 +454,7 @@ pub(super) fn page(
     target.set_live_bytes(e.live_bytes);
     target.set_peak_live_bytes(e.peak_live_bytes);
     let mut limits = out.reborrow().init_limits();
+    limits.set_source_profile(sparrow_core::RDF_SOURCE_ADMISSION_PROFILE);
     limits.set_page_bytes(256 * 1024);
     limits.set_metadata_bytes(64 * 1024);
     limits.set_result_handles(8);

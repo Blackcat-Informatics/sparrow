@@ -14916,3 +14916,76 @@ fn recordless_rdf_admits_the_complete_batch_before_publishing_and_retries_cleanl
             .is_some()
     );
 }
+
+#[test]
+fn rdf_scope_charges_admitted_catalog_bodies_and_keeps_large_occurrence_counts() {
+    use purrdf::{SparqlRequest, TermValue, sparql::QueryGovernors};
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    for records in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        if records {
+            store
+                .ingest(
+                    "rdf-catalog-io",
+                    "catalog-io",
+                    "jsonl",
+                    &b"{}\n".repeat(300),
+                    1,
+                )
+                .unwrap();
+        } else {
+            for n in 0..300 {
+                store
+                    .ingest(&format!("rdf-empty-io-{n}"), "catalog-io", "log", b"", 1)
+                    .unwrap();
+            }
+        }
+        let scope = record_page_scope("catalog-io", 1);
+        let governors = QueryGovernors::METERED.with_fuel(1_000_000);
+        let query = if records {
+            "SELECT (COUNT(*) AS ?count) WHERE { ?entity a <urn:sparrow:vocab:Record> }"
+        } else {
+            "SELECT (COUNT(*) AS ?count) WHERE { ?entity a <urn:sparrow:vocab:Artifact> }"
+        };
+        let result = store
+            .sparql_query(
+                &SparqlRead {
+                    scope: &scope,
+                    layers: RdfGraphLayers {
+                        metadata: true,
+                        diagnostic: false,
+                        content: false,
+                    },
+                    request: SparqlRequest {
+                        query,
+                        base_iri: None,
+                        substitutions: &[],
+                    },
+                    governors: &governors,
+                    limits: RdfReadLimits::default(),
+                },
+                2,
+                &QueryCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.coverage.selected_records,
+            if records { 300 } else { 0 }
+        );
+        assert_eq!(
+            result.coverage.selected_artifacts,
+            if records { 0 } else { 300 }
+        );
+        let run = result.outcome.unwrap();
+        let rows = run.result.solutions().unwrap().1;
+        assert!(
+            matches!(&rows[0][0],Some(TermValue::Literal{lexical_form,..}) if lexical_form=="300")
+        );
+        assert!(
+            run.evidence.view.admitted_bytes < 32 * 1024 * 1024,
+            "tiny catalog bodies must not consume 512 KiB per occurrence"
+        );
+        eprintln!("records={records} source={:?}", run.evidence.view);
+    }
+}
