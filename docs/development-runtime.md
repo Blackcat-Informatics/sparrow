@@ -51,6 +51,17 @@ and format 37. Native socket inspection confirmed the listener at `0.0.0.0:518`.
 This closes the old generations; it does not certify uninterrupted producer
 continuity or exclude future re-ingestion of files still present in the watch.
 
+The watcher subsequently created four new generations, accepting 1, 1, 3 and 0
+records from the present files. Typed status then reported 217 live records and
+the same 213 payload chunks. These five new occurrences are the approved
+re-ingestion possibility becoming observable; they do not renew or rewrite the
+old generations. Both old checkpoints were independently fetched over typed TCP
+RPC and still report offsets 37/0, records 1/0 and `identity_changed`.
+The source inventory preserves `continuity_unknown=true`. Further evidence is
+`runtime-recovered-status-after-watch.json`,
+`runtime-recovered-tail-source.json` and the `runtime-recovered-generation-*`
+receipts in the same evidence directory.
+
 Local evidence is under `.stage/native-graph-integration/`:
 `runtime-start-failure.log`, `catalog-probe-run.json`,
 `checkpoint-trial.log`, `checkpoint-trial-result.json`,

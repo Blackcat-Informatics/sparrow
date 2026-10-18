@@ -350,6 +350,15 @@ pub struct Store {
     artifact_reads: Arc<Mutex<artifact_read::Reads>>,
     source_reads: Arc<Mutex<source_read::Reads>>,
     record_reads: Arc<Mutex<record_read::Reads>>,
+    sparql_reads: Arc<Mutex<rdf_view::pages::Reads>>,
+}
+
+struct ReadLeaseStats {
+    pin: (usize, usize),
+    artifact: (usize, usize),
+    source: (usize, usize),
+    record: (usize, usize),
+    sparql: (usize, usize),
 }
 
 struct Writer {
@@ -1241,6 +1250,7 @@ impl Store {
             artifact_reads: Arc::new(Mutex::new(artifact_read::Reads::default())),
             source_reads: Arc::new(Mutex::new(source_read::Reads::default())),
             record_reads: Arc::new(Mutex::new(record_read::Reads::default())),
+            sparql_reads: Arc::new(Mutex::new(rdf_view::pages::Reads::default())),
         };
         let writer = store.lock()?;
         producer_stream::registry(&writer)?;
@@ -2097,12 +2107,41 @@ impl Store {
         Ok(self.lock()?.properties()?.into())
     }
 
+    fn read_lease_stats(&self, now: u64) -> Result<ReadLeaseStats, Error> {
+        Ok(ReadLeaseStats {
+            pin: catalog_lease::read_stats(&self.pin_reads, now, "pin read registry poisoned")?,
+            artifact: catalog_lease::read_stats(
+                &self.artifact_reads,
+                now,
+                "artifact read registry poisoned",
+            )?,
+            source: catalog_lease::read_stats(
+                &self.source_reads,
+                now,
+                "source read registry poisoned",
+            )?,
+            record: catalog_lease::read_stats(
+                &self.record_reads,
+                now,
+                "query read registry poisoned",
+            )?,
+            sparql: catalog_lease::read_stats(
+                &self.sparql_reads,
+                now,
+                "native query read registry poisoned",
+            )?,
+        })
+    }
+
     /// Report measured database bytes and deduplicated live payload references.
     pub fn status(&self, now: u64) -> Result<Value, Error> {
-        let (pin_handles, pin_bytes) = self.pin_read_stats(now)?;
-        let (artifact_handles, artifact_bytes) = self.artifact_read_stats(now)?;
-        let (source_handles, source_bytes) = self.source_read_stats(now)?;
-        let (record_handles, record_bytes) = self.record_read_stats(now)?;
+        let ReadLeaseStats {
+            pin: (pin_handles, pin_bytes),
+            artifact: (artifact_handles, artifact_bytes),
+            source: (source_handles, source_bytes),
+            record: (record_handles, record_bytes),
+            sparql: (sparql_handles, sparql_bytes),
+        } = self.read_lease_stats(now)?;
         let writer = self.lock()?;
         let protected = writer.protected(now)?;
         let live = writer.count_catalog::<Record>("record:", |record| {
@@ -2122,6 +2161,17 @@ impl Store {
                 catalog_lease::HANDLE_BYTES.to_string(),
             )
             .with("source_read_lease_ms", catalog_lease::LEASE_MS.to_string())
+            .with("sparql_read_handles", sparql_handles.to_string())
+            .with("sparql_read_bytes", sparql_bytes.to_string())
+            .with(
+                "max_sparql_read_handles",
+                catalog_lease::MAX_HANDLES.to_string(),
+            )
+            .with(
+                "max_sparql_read_bytes",
+                catalog_lease::HANDLE_BYTES.to_string(),
+            )
+            .with("sparql_read_lease_ms", catalog_lease::LEASE_MS.to_string())
             .with("record_read_handles", record_handles.to_string())
             .with("record_read_bytes", record_bytes.to_string())
             .with(

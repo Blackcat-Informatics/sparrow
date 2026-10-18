@@ -413,15 +413,6 @@ impl Store {
             cancellation,
         )
     }
-
-    pub(super) fn pin_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {
-        let mut reads = self
-            .pin_reads
-            .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "pin read registry poisoned"))?;
-        reads.purge(now);
-        Ok((reads.snapshots.len(), reads.capacity()))
-    }
 }
 
 #[cfg(test)]

@@ -163,6 +163,19 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
     }
 }
 
+/// One lock/expiry/accounting path for every captured read registry.
+pub(super) fn read_stats<S: Selector, B: PageBody>(
+    registry: &std::sync::Mutex<Reads<S, B>>,
+    now: u64,
+    poisoned: &'static str,
+) -> Result<(usize, usize), Error> {
+    let mut reads = registry
+        .lock()
+        .map_err(|_| Error::new("STORAGE_FAILURE", poisoned))?;
+    reads.purge(now);
+    Ok((reads.snapshots.len(), reads.capacity()))
+}
+
 pub(super) struct Cursor<'a> {
     id: &'a str,
     start: usize,

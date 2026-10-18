@@ -12300,6 +12300,235 @@ fn artifact_filter_pages_freeze_coverage_and_bind_all_filters() {
 }
 
 #[test]
+fn native_sparql_pages_bound_handle_capacity_and_expire_without_renewal() {
+    use purrdf::{SparqlRequest, sparql::QueryGovernors};
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("native-page-handles", "scoped", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    let scope = record_page_scope("scoped", 1);
+    let governors = QueryGovernors::METERED
+        .with_fuel(1_000_000)
+        .with_max_answers(100)
+        .with_max_scratch_bytes(1024 * 1024);
+    let read = SparqlRead {
+        scope: &scope,
+        layers: RdfGraphLayers::ALL,
+        request: SparqlRequest {
+            query: "SELECT ?r WHERE { ?r <urn:sparrow:vocab:payload> ?p }",
+            base_iri: None,
+            substitutions: &[],
+        },
+        governors: &governors,
+        limits: RdfReadLimits::default(),
+    };
+    let cancellation = QueryCancellation::default();
+    let pages = (0..8)
+        .map(|_| store.sparql_read(&read, 2, &cancellation).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        store.status(2).unwrap()["sparql_read_handles"].as_str(),
+        Some("8")
+    );
+    assert_eq!(
+        store.sparql_read(&read, 2, &cancellation).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    assert!(
+        store
+            .result_release(&pages[0].store_id, &pages[0].snapshot_id, 3)
+            .unwrap()
+    );
+    let replacement = store.sparql_read(&read, 3, &cancellation).unwrap();
+    let cursor = replacement.next_cursor.as_ref().unwrap();
+    let resumed = store
+        .sparql_read_next(&replacement.store_id, cursor, 4)
+        .unwrap();
+    assert_eq!(resumed.lease_expires_at, replacement.lease_expires_at);
+    assert_eq!(
+        store
+            .sparql_read_next(&replacement.store_id, cursor, replacement.lease_expires_at)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+    assert_eq!(
+        store.status(replacement.lease_expires_at).unwrap()["sparql_read_handles"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store.status(replacement.lease_expires_at).unwrap()["sparql_read_bytes"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        store.record(&artifact.record_ids[0]).unwrap().id,
+        artifact.record_ids[0]
+    );
+}
+
+#[test]
+fn native_sparql_pages_freeze_byte_boundaries_and_release_original_leases() {
+    use purrdf::{SparqlRequest, TermValue, sparql::QueryGovernors};
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlItem, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("native-page-three", "scoped", "jsonl", b"{}\n{}\n{}\n", 1)
+        .unwrap();
+    let pin = store
+        .pin("native-page-pin", "native-pages", &[artifact.id], 40, 1)
+        .unwrap();
+    let now = 31 * DAY;
+    let scope = record_page_scope("scoped", 1000);
+    let governors = QueryGovernors::METERED
+        .with_fuel(1_000_000)
+        .with_max_answers(100)
+        .with_max_intermediate_cells(10_000)
+        .with_max_scratch_bytes(1024 * 1024);
+    let bindings = [(
+        "value".into(),
+        TermValue::iri(format!("urn:large:{}", "x".repeat(17000))),
+    )];
+    let read = SparqlRead {
+        scope: &scope,
+        layers: RdfGraphLayers::ALL,
+        request: SparqlRequest {
+            query: "SELECT ?record ?value WHERE { ?record <urn:sparrow:vocab:payload> ?payload } ORDER BY ?record",
+            base_iri: None,
+            substitutions: &bindings,
+        },
+        governors: &governors,
+        limits: RdfReadLimits::default(),
+    };
+    let first = store
+        .sparql_read(&read, now, &QueryCancellation::default())
+        .unwrap();
+    assert_eq!(first.total_items, 3);
+    assert_eq!(first.body.items().count(), 2); // byte ceiling, despite page-size=1000
+    let cursor = first.next_cursor.as_ref().unwrap();
+    let expected = store
+        .sparql_read_next(&first.store_id, cursor, now + 1)
+        .unwrap();
+    assert_eq!(expected.body.items().count(), 1);
+    assert!(expected.next_cursor.is_none());
+    for item in expected.body.items() {
+        let SparqlItem::Solution(row) = item else {
+            panic!("SELECT row expected");
+        };
+        assert_eq!(row[1].as_ref(), Some(&bindings[0].1));
+    }
+    store
+        .release_retry("native-page-unpin", &pin.id, now + 2)
+        .unwrap();
+    store.expire(now + 3).unwrap();
+    store
+        .ingest("native-page-later", "scoped", "json", b"{}", now + 3)
+        .unwrap();
+    assert_eq!(
+        store
+            .sparql_read_next(&first.store_id, cursor, now + 4)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        store
+            .sparql_read_next(
+                &first.store_id,
+                &format!("{}/1", first.snapshot_id),
+                now + 4
+            )
+            .unwrap_err()
+            .code,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        store
+            .sparql_read_next("store:foreign", cursor, now + 4)
+            .unwrap_err()
+            .code,
+        "STORE_MISMATCH"
+    );
+    assert!(
+        store
+            .result_release(&first.store_id, &first.snapshot_id, now + 5)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .sparql_read_next(&first.store_id, cursor, now + 6)
+            .unwrap_err()
+            .code,
+        "RESULT_EXPIRED"
+    );
+}
+
+#[test]
+fn native_sparql_pages_preserve_unknown_and_query_failures_without_rows() {
+    use purrdf::{
+        SparqlRequest,
+        sparql::{FallibleSparqlError, PartialAnswers, QueryGovernors},
+    };
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("native-page-unknown", "scoped", "json", b"{}", 1)
+        .unwrap();
+    let scope = record_page_scope("scoped", 1);
+    let governors = QueryGovernors::METERED
+        .with_fuel(0)
+        .with_max_scratch_bytes(1024 * 1024);
+    let mut read = SparqlRead {
+        scope: &scope,
+        layers: RdfGraphLayers::ALL,
+        request: SparqlRequest {
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?r <urn:sparrow:vocab:payload> ?p }",
+            base_iri: None,
+            substitutions: &[],
+        },
+        governors: &governors,
+        limits: RdfReadLimits::default(),
+    };
+    let lower = store
+        .sparql_read(&read, 2, &QueryCancellation::default())
+        .unwrap();
+    let Err(FallibleSparqlError::BudgetExhausted {
+        partial: PartialAnswers::Certain(partial),
+        ..
+    }) = &lower.body.captured().outcome
+    else {
+        panic!("native aggregate must preserve its certified empty lower bound");
+    };
+    assert!(partial.result().solutions().unwrap().1.is_empty());
+    assert_eq!(lower.body.items().count(), 0); // no fabricated COUNT binding
+    read.request.query = "ASK WHERE { ?r <urn:sparrow:vocab:payload> ?p }";
+    let unknown = store
+        .sparql_read(&read, 2, &QueryCancellation::default())
+        .unwrap();
+    assert!(matches!(
+        &unknown.body.captured().outcome,
+        Err(FallibleSparqlError::BudgetExhausted {
+            partial: PartialAnswers::Unknown(_),
+            ..
+        })
+    ));
+    assert_eq!(unknown.body.items().count(), 0);
+    assert!(unknown.next_cursor.is_none());
+    read.request.query = "SELECT WHERE {";
+    let failed = store
+        .sparql_read(&read, 2, &QueryCancellation::default())
+        .unwrap();
+    assert!(matches!(
+        &failed.body.captured().outcome,
+        Err(FallibleSparqlError::Query { .. })
+    ));
+    assert_eq!(failed.body.items().count(), 0);
+    assert!(failed.next_cursor.is_none());
+}
+
+#[test]
 fn scoped_sparql_uses_native_read_forms_bindings_and_governor_outcomes() {
     use purrdf::{
         SparqlRequest, TermValue,

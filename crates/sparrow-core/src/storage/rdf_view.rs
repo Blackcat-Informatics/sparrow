@@ -16,9 +16,11 @@ use rocksdb::{DB, DBIteratorWithThreadMode, Direction, IteratorMode, Snapshot};
 use std::{collections::BTreeSet, sync::Arc};
 
 mod budget;
+pub(crate) mod pages;
 mod query;
 mod scope;
 use budget::{Budget, Reservation};
+pub use pages::{SparqlGraphKind, SparqlItem, SparqlPageBody, SparqlReadPage};
 pub use query::{ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;
 

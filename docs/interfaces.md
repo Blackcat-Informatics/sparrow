@@ -371,6 +371,31 @@ refused by native read preparation; federation is disabled. These are core
 integration surfaces. CLI/MCP/typed RPC graph queries, recordless artifact graphs,
 text relations, correlation and public explanation contracts remain unfinished.
 
+The core `sparql_read`/`sparql_read_next` pair publishes immutable native captures
+through the existing finite catalog lease owner. Pages share the native outcome
+and its original admission; they do not build a second RDF store. Native SELECT
+solutions and auxiliary graphs, ASK values, graph declarations (including empty
+graphs), ordinary quads, reifier bindings and annotations remain available through
+borrowed typed items. Internal term IDs belong only to their accompanying native
+dataset and must be resolved there before transport.
+
+Native outcome certainty remains authoritative: item counts describe transport
+units, never proven-answer cardinality. Unknown outcomes expose no items, and
+query failures retain their native diagnostics without answer items. Certain and
+at-most results retain their original certificate and positional-prefix evidence.
+The core page API does not yet provide the typed RPC or generic `result_next`
+graph arm; the existing daemon cannot create these native graph handles.
+
+The native registry admits at most eight handles and 8 MiB of aggregate retained
+capacity, with a fixed 60-second lease from capture start. Page size is at most
+1,000 items and 256 KiB of conservatively admitted structured output, including
+metadata and worst-case JSON escaping. Native traversal and term/diagnostic
+capacity helpers supply the sizing inputs; Sparrow owns only transport charges.
+An oversized indivisible item or receipt refuses publication, never clips RDF.
+`result_release` releases these captures; status and maintenance share expiry
+accounting. Core status reports `sparql_read_handles`, `sparql_read_bytes` and
+their effective maxima/lease. No page read renews a lease or pins evidence.
+
 Storage formats 13/14/15/16 fence older writers for the basic, consumption,
 watch-registry and handoff states. Existing 9/10/11/12 stores durably advance to
 the corresponding state before serving, retaining their completed recordless

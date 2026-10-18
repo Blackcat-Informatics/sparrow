@@ -60,6 +60,7 @@ impl Store {
             };
         }
         release!(record_reads, "query read registry poisoned");
+        release!(sparql_reads, "native query read registry poisoned");
         release!(artifact_reads, "artifact read registry poisoned");
         release!(source_reads, "source read registry poisoned");
         release!(pin_reads, "pin read registry poisoned");

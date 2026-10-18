@@ -262,15 +262,6 @@ impl Store {
             cancellation,
         )
     }
-
-    pub(super) fn artifact_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {
-        let mut reads = self
-            .artifact_reads
-            .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
-        reads.purge(now);
-        Ok((reads.snapshots.len(), reads.capacity()))
-    }
 }
 
 /// One collector owns live and selected artifact/record metadata folding.

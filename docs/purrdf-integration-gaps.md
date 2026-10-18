@@ -83,9 +83,30 @@ the other workspace tests, seeded census tests and the pinned cross gate
 `.stage/native-graph-integration/scoped-graph-full-check.log`. Existing RPC tests
 do not establish a graph RPC surface; that remains unimplemented.
 
+The core `sparql_read`/`sparql_read_next` path now retains that same native
+outcome behind the shared catalog lease owner and precomputes item/byte page
+boundaries. It borrows native solutions, ASK values, all three RDF statement
+streams, explicit graph declarations and SELECT auxiliary graphs. It preserves
+native partial certificates rather than inferring certainty from an empty item
+list: zero-fuel COUNT can yield a certified empty lower bound without any count
+binding, while an unsettled ASK yields unknown with no items. Captured item
+counts are transport counts, not proven-answer cardinalities.
+
+Qualification passes three new storage regressions for byte boundaries and
+frozen replay after pin release/retirement within a live lease; certificate and
+failure preservation; and handle exhaustion, release and exact expiry. A native
+graph fixture separately covers empty declarations, ordinary quads, reifiers and
+annotations without an owned graph replay. Full `make check` passes 175 storage
+tests, 17 core unit tests, 60 existing RPC tests, the remaining workspace tests,
+release Clippy and both census gates (267 jobs, zero distinct exceptions).
+Evidence is `.stage/native-graph-integration/native-pages-full-check.log`.
+The shared registry accounting now gives status and maintenance the same expiry
+path. These core pages still require typed graph RPC, generic `result_next`
+dispatch and CLI/MCP integration; the installed daemon cannot create them.
+
 The complete production graph surface still requires prepared bindings, native text
-relations and correlation, typed Cap'n Proto result publication, retained page
-handles, cancellation and CLI/MCP parity. Complete, certain, at-most, unknown and
+relations and correlation, typed Cap'n Proto result publication and retained-page
+dispatch, cancellation and CLI/MCP parity. Complete, certain, at-most, unknown and
 operational failure outcomes must retain the native distinction. A missing or
 failed source checkpoint must never publish a successful result prefix. Measured
 EXPLAIN must execute through the same bounded persisted view.

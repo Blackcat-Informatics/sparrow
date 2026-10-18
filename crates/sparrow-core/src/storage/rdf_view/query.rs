@@ -26,6 +26,7 @@ pub struct SparqlRead<'a> {
 /// Native certainty and ownership, beside independent host coverage evidence.
 /// A governor stop remains a typed certified partial outcome. An operational
 /// refusal never becomes a successful prefix; the native error retains its cause.
+#[derive(Debug)]
 pub struct ScopedSparqlResult {
     /// Persistent store identity.
     pub store_id: String,
@@ -50,6 +51,16 @@ impl Store {
         now: u64,
         cancellation: &QueryCancellation,
     ) -> Result<ScopedSparqlResult, ReadError> {
+        self.with_sparql_result(read, now, cancellation, |_, result| result)
+    }
+
+    pub(super) fn with_sparql_result<T>(
+        &self,
+        read: &SparqlRead<'_>,
+        now: u64,
+        cancellation: &QueryCancellation,
+        publish: impl FnOnce(&StoredRdfView<'_>, ScopedSparqlResult) -> T,
+    ) -> Result<T, ReadError> {
         if read.request.query.len() > crate::query::RECORD_QUERY_TEXT_BYTES {
             return Err(Arc::new(Error::new(
                 "RESOURCE_LIMIT",
@@ -72,13 +83,15 @@ impl Store {
                     QueryOptions::default(),
                     &governors,
                 );
-                ScopedSparqlResult {
+                drop(engine);
+                let result = ScopedSparqlResult {
                     store_id,
                     sequence: view.snapshot_sequence_number(),
                     as_of: now,
                     coverage: coverage.clone(),
                     outcome,
-                }
+                };
+                publish(view, result)
             },
         )
     }

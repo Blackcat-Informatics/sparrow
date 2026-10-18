@@ -3864,7 +3864,7 @@ names = ['^(rdf_query_candidate_order|rdf_scope_temporal_candidates)$']
 id = "scoped-native-sparql-read"
 summary = "Execute every native read form and typed substitutions through one governed stored-scope boundary, preserving retained complete/partial/error outcomes and independent coverage."
 home = "sparrow_core::storage::rdf_view::query::Store::sparql_query"
-entry_points = []
+entry_points = ["sparrow_core::storage::rdf_view::query::Store::with_sparql_result"]
 spec = "docs/interfaces.md: native read forms and read receipts."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -3873,3 +3873,59 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(evaluate_sparql_locally|parse_sparql_again)$']
+
+[[job]]
+id = "leased-native-sparql-pages"
+summary = "Keep the immutable native complete/partial/failure outcome under its original account; share capture identity and precomputed byte boundaries through the existing finite catalog lease owner."
+home = "sparrow_core::storage::rdf_view::pages::Store::sparql_read"
+entry_points = ["sparrow_core::storage::rdf_view::pages::Store::sparql_read_next", "sparrow_core::storage::rdf_view::pages::SparqlPageBody::page", "sparrow_core::storage::rdf_view::pages::SparqlPageBody::page_end", "sparrow_core::storage::rdf_view::pages::SparqlPageBody::is_boundary", "sparrow_core::storage::rdf_view::pages::SparqlPageBody::captured", "sparrow_core::storage::rdf_view::pages::SparqlPageBody::items"]
+spec = "docs/interfaces.md: native graph pages, finite leases and independent certainty/coverage."
+vectors = ["crates/sparrow-core/src/storage/rdf_view/pages.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(copy_native_result_into_second_rdf_store|renew_sparql_result_on_next)$']
+
+[[job]]
+id = "native-sparql-wire-admission"
+summary = "Price typed and worst-case JSON envelopes over borrowed native carriers; never reimplement term semantics, owned conversion or nested traversal."
+home = "sparrow_core::storage::rdf_view::pages::term_wire_bytes"
+entry_points = ["sparrow_core::storage::rdf_view::pages::item_wire_bytes", "sparrow_core::storage::rdf_view::pages::items", "sparrow_core::storage::rdf_view::pages::graph_items", "sparrow_core::storage::rdf_view::pages::answer"]
+spec = "docs/interfaces.md: RDF 1.2 egress and bounded structured output."
+vectors = ["crates/sparrow-core/src/storage/rdf_view/pages.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(walk_sparql_term_tree_again|format_rdf_term_by_hand)$']
+
+[[job]]
+id = "native-nested-term-visitor"
+summary = "Native iterative traversal supplies all nested term work; Sparrow callbacks only price transport nodes and bytes."
+home = "purrdf:purrdf_core::ir::term_walk::visit_nested"
+entry_points = []
+spec = "AGENTS.md: PurRDF owns RDF carriers and semantic helpers."
+vectors = []
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(visit_nested|visit_nested_terms_again)$']
+
+[[job]]
+id = "captured-read-registry-accounting"
+summary = "Status and retention maintenance enumerate the same captured-read families, using one locked expiry/capacity implementation rather than separate copied stats helpers."
+home = "sparrow_core::storage::Store::read_lease_stats"
+entry_points = ["sparrow_core::storage::catalog_lease::read_stats"]
+spec = "docs/interfaces.md: finite result leases and observable resource admission."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(pin_read_stats|artifact_read_stats|source_read_stats|record_read_stats|sparql_read_stats)$']

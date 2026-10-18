@@ -592,12 +592,4 @@ impl Store {
             cancellation,
         )
     }
-    pub(super) fn source_read_stats(&self, now: u64) -> Result<(usize, usize), Error> {
-        let mut reads = self
-            .source_reads
-            .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "source read registry poisoned"))?;
-        reads.purge(now);
-        Ok((reads.snapshots.len(), reads.capacity()))
-    }
 }
