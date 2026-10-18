@@ -4058,9 +4058,9 @@ names = ['^(rdf_query_candidate_order|rdf_scope_temporal_candidates)$']
 
 [[job]]
 id = "scoped-native-sparql-read"
-summary = "Execute every native read form and typed substitutions through one governed stored-scope boundary, preserving retained complete/partial/error outcomes and independent coverage."
+summary = "Execute every native read form, typed substitutions and governed measured EXPLAIN through one stored-scope boundary, preserving retained payloads, original governors, failures and independent coverage. An explanation is measured work, not certified query answers."
 home = "sparrow_core::storage::rdf_view::query::Store::sparql_query"
-entry_points = ["sparrow_core::storage::rdf_view::query::Store::with_sparql_result"]
+entry_points = ["sparrow_core::storage::rdf_view::query::Store::with_sparql_result", "sparrow_core::storage::rdf_view::query::Store::with_native_result", "sparrow_core::storage::rdf_view::query::Store::sparql_explain"]
 spec = "docs/interfaces.md: native read forms and read receipts."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []

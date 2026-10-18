@@ -6,7 +6,8 @@
 use super::*;
 use crate::{QueryCancellation, QueryScope};
 use purrdf::sparql::{
-    FallibleSparqlResult, GovernedEvidence, NativeSparqlEngine, QueryGovernors, QueryOptions,
+    FallibleScopedResult, FallibleSparqlResult, GovernedEvidence, NativeSparqlEngine,
+    QueryGovernors, QueryOptions, RetainedQueryExplanation,
 };
 
 /// Borrowed query inputs; native PurRDF owns parsing, substitutions and governors.
@@ -23,10 +24,13 @@ pub struct SparqlRead<'a> {
     pub limits: RdfReadLimits,
 }
 
-/// Native certainty and ownership, beside independent host coverage evidence.
-/// A governor stop remains a typed certified partial outcome. An operational
-/// refusal never becomes a successful prefix; the native error retains its cause.
-pub struct ScopedSparqlResult {
+/// Native payload ownership beside independent host coverage evidence.
+/// The default query payload retains certified answer/partial outcomes. The
+/// explanation specialization describes measured work, not query answers.
+/// Operational refusal retains its original cause without a successful prefix.
+pub struct ScopedSparqlResult<
+    Outcome = FallibleSparqlResult<ReadError, GovernedEvidence<RdfReadEvidence>>,
+> {
     /// Persistent store identity.
     pub store_id: String,
     /// Frozen logical scope and resolved pin revision, independent of native certainty.
@@ -44,12 +48,19 @@ pub struct ScopedSparqlResult {
     pub limits: RdfReadLimits,
     /// Independent scope and applicable projection coverage.
     pub coverage: RdfScopeCoverage,
-    /// Complete native result or typed diagnostic/partial/failure outcome.
+    /// Native retained payload and evidence, or its typed diagnostic/failure.
+    /// Query payloads carry answer certificates; explanations carry measured work.
     /// Retained carriers keep their original admitted owner after capture ends.
-    pub outcome: FallibleSparqlResult<ReadError, GovernedEvidence<RdfReadEvidence>>,
+    pub outcome: Outcome,
 }
 
-impl std::fmt::Debug for ScopedSparqlResult {
+/// A measured native ledger under the same source/scope ownership as queries.
+/// A stopped explanation describes measured work; it does not certify answers.
+pub type ScopedSparqlExplanation = ScopedSparqlResult<
+    FallibleScopedResult<RetainedQueryExplanation, ReadError, GovernedEvidence<RdfReadEvidence>>,
+>;
+
+impl<Outcome: std::fmt::Debug> std::fmt::Debug for ScopedSparqlResult<Outcome> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScopedSparqlResult")
             .field("store_id", &self.store_id)
@@ -78,12 +89,69 @@ impl Store {
         self.with_sparql_result((read, None), now, cancellation, |_, result| result)
     }
 
+    /// Measure the original native request, substitutions and finite governors
+    /// over the same captured view used by ordinary queries. The returned ledger
+    /// retains native admission after the view and snapshot have been released.
+    #[expect(
+        clippy::result_large_err,
+        reason = "native failures retain original receipts; boxing a refusal would allocate after admission failure"
+    )]
+    pub fn sparql_explain(
+        &self,
+        read: &SparqlRead<'_>,
+        now: u64,
+        cancellation: &QueryCancellation,
+    ) -> Result<ScopedSparqlExplanation, ReadError> {
+        self.with_native_result(
+            (read, None),
+            now,
+            cancellation,
+            |engine, view, governors| {
+                engine.explain_governed_fallible_view(
+                    view,
+                    read.request,
+                    QueryOptions::default(),
+                    governors,
+                )
+            },
+            |_, result| result,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "native failures retain original receipts; boxing a refusal would allocate after admission failure"
+    )]
     pub(super) fn with_sparql_result<T>(
         &self,
         query: (&SparqlRead<'_>, Option<&crate::CorrelationCapture>),
         now: u64,
         cancellation: &QueryCancellation,
         publish: impl FnOnce(&StoredRdfView<'_>, ScopedSparqlResult) -> T,
+    ) -> Result<T, ReadError> {
+        self.with_native_result(
+            query,
+            now,
+            cancellation,
+            |engine, view, governors| {
+                engine.query_governed_fallible_view(
+                    view,
+                    query.0.request,
+                    QueryOptions::default(),
+                    governors,
+                )
+            },
+            publish,
+        )
+    }
+
+    fn with_native_result<Outcome, T>(
+        &self,
+        query: (&SparqlRead<'_>, Option<&crate::CorrelationCapture>),
+        now: u64,
+        cancellation: &QueryCancellation,
+        execute: impl FnOnce(&NativeSparqlEngine, &StoredRdfView<'_>, &QueryGovernors) -> Outcome,
+        publish: impl FnOnce(&StoredRdfView<'_>, ScopedSparqlResult<Outcome>) -> T,
     ) -> Result<T, ReadError> {
         let (read, correlation) = query;
         if read.request.query.len() > crate::query::RECORD_QUERY_TEXT_BYTES {
@@ -118,12 +186,7 @@ impl Store {
                     .clone();
                 let engine = NativeSparqlEngine::new();
                 let governors = read.governors.clone().with_max_remote_requests(0);
-                let outcome = engine.query_governed_fallible_view(
-                    view,
-                    read.request,
-                    QueryOptions::default(),
-                    &governors,
-                );
+                let outcome = execute(&engine, view, &governors);
                 drop(engine);
                 let result = ScopedSparqlResult {
                     store_id,

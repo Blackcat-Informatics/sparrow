@@ -1073,9 +1073,12 @@ Its nested `status` is a current operational read, with
 the same integrity checks and cost as explicit status; it is not the catalog-free
 typed `discover` operation used internally for compatibility admission.
 
-`sparql_explain` remains required but is not advertised or callable until the
-[governed native integration gap](purrdf-integration-gaps.md#retained-operational-sparql-integration)
-is resolved. Native text/SPARQL integration remains independently required.
+`sparql_explain` remains required but is not yet advertised or callable through
+the daemon/agents. The selected native revision now provides governed measured
+EXPLAIN, and source core `Store::sparql_explain` shares request/scope ownership
+with ordinary queries. Consumer qualification and the public adapter remain in
+progress; see [native integration](purrdf-integration-gaps.md#retained-operational-sparql-integration).
+Native text/SPARQL integration remains independently required.
 
 The query interface supports read forms such as SELECT, ASK, CONSTRUCT, and
 DESCRIBE through PurRDF. Preserve RDF term kind, datatype, language, base

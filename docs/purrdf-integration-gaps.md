@@ -10,14 +10,19 @@ DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained nati
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
 [Development runtime](development-runtime.md#schema-60-live-adoption).
-Native text relations, public measured explanation, bounded physical
-reclamation and production resource/turnover acceptance remain required. Native
-solution materialization has a confirmed admission limitation on the installed
-revision. [PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605)
-is now closed: PR #609 landed actual-payload materialization, included in main
-`aa8586fabe8c8af69ed429a80bddc6714eed8184`. Sparrow has not yet adopted or
-qualified that fix. The
-earlier qualification evidence below records how the deployed graph surface grew.
+Native text relations, public measured explanation, runtime adoption and
+production resource/turnover acceptance remain required. Source now selects
+`9b2bf3b71325154137bc1aa817b46356daadfe3a`: upstream PR #609 closed
+[PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605) with
+actual-payload materialization, and PR #611 closed
+[#600](https://github.com/Blackcat-Informatics/purrdf/issues/600) with governed
+request EXPLAIN. The source core adds `Store::sparql_explain` through the same
+capture/admission owner as query execution. Three focused release consumer
+regressions and release Clippy with warnings denied pass. The normal full gate
+is required before committing; no explanation RPC or agent capability is
+advertised yet.
+The installed image still uses the earlier native revision. The qualification
+evidence below records how these surfaces grew.
 
 Source schema 57 shares frozen logical scope receipts across native graph,
 context and record/text/key/value captures. Graph receipt ownership uses the
@@ -58,11 +63,11 @@ runtime. The synthetic control-only profile advances the live writer fence
 without new records; original JSON profile identities and recovered generation
 receipts remain unchanged. All 253 retained byte targets match their prior hashes.
 
-On 2026-10-18 upstream main advanced to `9a6055e8a60d34656d9d47c70ba5b85270142a54`
-with OWL causal-dependency work. Its change set does not alter the SPARQL evaluator
-or property-function APIs below; #600 and #601 remain open. The existing probes
-against then-main `c75cbf94` remain historical evidence. Sparrow's runtime/census
-selection remains `7734b013`.
+An earlier 2026-10-18 readback found upstream main at
+`9a6055e8a60d34656d9d47c70ba5b85270142a54`, whose OWL causal-dependency changes
+left #600 and #601 open at that time. Subsequent PR #611 closed #600. The probes
+against `c75cbf94` and preceding source/census selection `7734b013` below remain
+historical evidence; current source selection is recorded above.
 
 ## Query-scoped stored text producers
 
@@ -156,19 +161,35 @@ unchanged. Complete content-export acceptance remains NOT MET.
 
 ## Retained operational SPARQL integration
 
-Public governed EXPLAIN remains blocked on
-[PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600).
-On 2026-10-18, pinned `7734b013` and then-main `c75cbf94` expose retained
+[PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600) is closed.
+The selected source now supplies `explain_governed_fallible_view`, accepting the
+original native request, options and governors and returning retained explanation
+and governor/view receipts. Sparrow core shares the original scope, cancellation,
+admission and remote-request policy through one execution boundary. Consumer
+qualification and transport/CLI/MCP integration remain required.
+
+The selected-source consumer regressions pass: complete persisted materialization
+retains 2,605 rows after source closure under the unchanged 128 MiB workspace;
+EXPLAIN preserves substitutions, all native governor limits, frozen scope and
+retained node charges, including zero-fuel stops; UPDATE, zero host source-read
+admission and cancellation retain their refusals. Release Clippy passes with
+warnings denied. Evidence is under
+`.stage/native-graph-integration/native-request-adoption-core-explain-final-*`.
+These checks do not qualify the installed image or a public explanation adapter.
+
+The prior limitation was observed on 2026-10-18: `7734b013` and then-main
+`c75cbf94` exposed retained
 fallible measured EXPLAIN, but its public inputs are text/base/options and an
 optional stop signal. Typed request substitutions are not accepted; options
 document prebinding as inert. The measuring body chooses METERED governors
 internally, so callers cannot supply the query's finite governor settings.
 Sparrow will not ignore bindings, rewrite query text, copy the private evaluator,
 or claim that different measuring limits explain the original governed request.
-The issue requests native request/governor parity through the existing measured
-execution and publication owners. Its acceptance remains required here.
+PR #611 supplies that native request/governor parity through the existing
+measuring and publication owners. The historical observations below preserve
+source-bound evidence rather than describing the new API.
 
-The runtime selection and helper census reference now name committed PurRDF
+The preceding runtime selection and helper census reference named committed PurRDF
 `7734b013d19b68600ad24c4e8aa5a40955a8e89e`. That revision includes
 `a77b743bcc6fad89d88581ef9cb5a626a326834f` (PR #526), which delivered the
 bounded operational SPARQL ownership requested in

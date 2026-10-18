@@ -13367,6 +13367,267 @@ fn native_sparql_pages_preserve_unknown_and_query_failures_without_rows() {
 }
 
 #[test]
+fn adopted_native_materialization_retains_complete_cells_after_source_close() {
+    use purrdf::{DatasetView, GraphMatch, SparqlRequest};
+    use purrdf_lex::json::{self, Object, Value};
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = Object::new().with("unrelated", "x".repeat(512)).with(
+        "rows",
+        Value::array((0..64_u64).map(|i| {
+            Value::from(
+                Object::new()
+                    .with("value", format!("item-{i}"))
+                    .with("ordinal", i),
+            )
+        })),
+    );
+    let artifact = store
+        .ingest(
+            "many-native-cells",
+            "native-cells",
+            "json",
+            json::write_compact(&input.into()).as_bytes(),
+            1,
+        )
+        .unwrap();
+    let layers = RdfGraphLayers {
+        metadata: false,
+        diagnostic: false,
+        content: true,
+    };
+    let expected = store
+        .with_rdf_record_layers(
+            &artifact.record_ids,
+            layers,
+            2,
+            RdfReadLimits::default(),
+            |view| {
+                view.quads_for_pattern(None, None, None, GraphMatch::Default)
+                    .count()
+            },
+        )
+        .unwrap();
+    assert!(
+        expected > 500,
+        "fixture must require complete materialization of many short cells"
+    );
+    let scope = record_page_scope("native-cells", 1);
+    let governors = purrdf::sparql::QueryGovernors::METERED
+        .with_fuel(2_000_000)
+        .with_max_answers(10_000)
+        .with_max_intermediate_cells(100_000)
+        .with_max_scratch_bytes(16 * 1024 * 1024)
+        .with_max_remote_requests(0);
+    let result = store
+        .sparql_query(
+            &SparqlRead {
+                scope: &scope,
+                layers,
+                request: SparqlRequest {
+                    query: "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+                    base_iri: None,
+                    substitutions: &[],
+                },
+                governors: &governors,
+                limits: RdfReadLimits::default(),
+            },
+            2,
+            &QueryCancellation::default(),
+        )
+        .unwrap();
+    let outcome = result.outcome.as_ref().unwrap();
+    assert!(outcome.evidence.governors.is_complete());
+    assert!(outcome.evidence.view.peak_live_bytes <= RdfReadLimits::default().live_bytes);
+    drop(store);
+    let (variables, rows) = result.outcome.as_ref().unwrap().result.solutions().unwrap();
+    assert_eq!(variables, &["s", "p", "o"]);
+    assert_eq!(rows.len(), expected);
+    assert!(
+        rows.iter()
+            .all(|row| row.len() == 3 && row.iter().all(Option::is_some))
+    );
+    eprintln!(
+        "PASS native persisted materialization: rows={expected}, default 128 MiB workspace, retained after source close"
+    );
+}
+
+#[test]
+fn adopted_native_explain_keeps_bindings_governors_and_retained_ledger() {
+    use purrdf::{SparqlRequest, TermValue, sparql::QueryGovernors};
+    use purrdf_core::ResourceDimension;
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("explain-native", "native-explain", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    let scope = record_page_scope("native-explain", 2);
+    let cancellation = QueryCancellation::default();
+    let layers = RdfGraphLayers {
+        metadata: true,
+        diagnostic: false,
+        content: false,
+    };
+    let governors = QueryGovernors::METERED
+        .with_fuel(123_456)
+        .with_max_answers(33)
+        .with_max_intermediate_cells(4444)
+        .with_max_scratch_bytes(8 * 1024 * 1024)
+        .with_max_remote_requests(0);
+    let query =
+        "SELECT ?record WHERE { ?record a <urn:sparrow:vocab:Record>; ?predicate ?payload }";
+    for (predicate, expected) in [
+        ("urn:sparrow:vocab:payload", 2),
+        ("urn:absent:predicate", 0),
+    ] {
+        let substitutions = [("predicate".into(), TermValue::iri(predicate))];
+        let read = SparqlRead {
+            scope: &scope,
+            layers,
+            request: SparqlRequest {
+                query,
+                base_iri: None,
+                substitutions: &substitutions,
+            },
+            governors: &governors,
+            limits: RdfReadLimits::default(),
+        };
+        let captured = store.sparql_explain(&read, 2, &cancellation).unwrap();
+        let executed = store.sparql_query(&read, 2, &cancellation).unwrap();
+        assert_eq!(captured.scope, executed.scope);
+        assert_eq!(captured.sequence, executed.sequence);
+        assert_eq!(captured.coverage.selected_records, 2);
+        assert_eq!(
+            executed
+                .outcome
+                .as_ref()
+                .unwrap()
+                .result
+                .solutions()
+                .unwrap()
+                .1
+                .len(),
+            expected as usize
+        );
+        let (explanation, receipt) = captured.outcome.as_ref().unwrap();
+        assert_eq!(
+            receipt.governors.limits(),
+            executed
+                .outcome
+                .as_ref()
+                .unwrap()
+                .evidence
+                .governors
+                .limits()
+        );
+        assert_eq!(explanation.ledger()[0].rows, expected);
+        assert_eq!(explanation.evidence().limits(), governors.limits());
+        assert_eq!(
+            explanation
+                .ledger()
+                .iter()
+                .map(|node| node.fuel_total())
+                .sum::<u64>(),
+            receipt.governors.consumed_in(ResourceDimension::Fuel)
+        );
+        assert_eq!(
+            explanation.evidence().consumed(),
+            receipt.governors.consumed()
+        );
+    }
+    let stopped = governors.with_fuel(0);
+    let captured = store
+        .sparql_explain(
+            &SparqlRead {
+                scope: &scope,
+                layers,
+                request: SparqlRequest {
+                    query,
+                    base_iri: None,
+                    substitutions: &[],
+                },
+                governors: &stopped,
+                limits: RdfReadLimits::default(),
+            },
+            2,
+            &cancellation,
+        )
+        .unwrap();
+    let (explanation, receipt) = captured.outcome.as_ref().unwrap();
+    drop(store);
+    assert_eq!(explanation.evidence().limits(), stopped.limits());
+    assert_eq!(explanation.evidence().limit_for(ResourceDimension::Fuel), 0);
+    assert!(explanation.evidence().tripped().is_some());
+    assert_eq!(
+        explanation.evidence().tripped(),
+        receipt.governors.tripped()
+    );
+    assert_eq!(
+        explanation
+            .ledger()
+            .iter()
+            .map(|node| node.fuel_total())
+            .sum::<u64>(),
+        receipt.governors.consumed_in(ResourceDimension::Fuel)
+    );
+}
+
+#[test]
+fn adopted_native_explain_preserves_read_only_and_host_refusals() {
+    use purrdf::{
+        SparqlRequest,
+        sparql::{FallibleSparqlError, QueryGovernors},
+    };
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("explain-refusal", "explain-refusal", "jsonl", b"{}\n", 1)
+        .unwrap();
+    let scope = record_page_scope("explain-refusal", 1);
+    let governors = QueryGovernors::METERED.with_fuel(1_000_000);
+    let mut read = SparqlRead {
+        scope: &scope,
+        layers: RdfGraphLayers::ALL,
+        request: SparqlRequest {
+            query: "INSERT DATA { <urn:s> <urn:p> <urn:o> }",
+            base_iri: None,
+            substitutions: &[],
+        },
+        governors: &governors,
+        limits: RdfReadLimits::default(),
+    };
+    let cancellation = QueryCancellation::default();
+    assert!(matches!(
+        store
+            .sparql_explain(&read, 2, &cancellation)
+            .unwrap()
+            .outcome,
+        Err(FallibleSparqlError::Query { .. })
+    ));
+    read.request.query = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }";
+    read.limits.requests = 0;
+    assert_eq!(
+        store
+            .sparql_explain(&read, 2, &cancellation)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    read.limits = RdfReadLimits::default();
+    cancellation.cancel();
+    assert_eq!(
+        store
+            .sparql_explain(&read, 2, &cancellation)
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+}
+
+#[test]
 fn scoped_sparql_uses_native_read_forms_bindings_and_governor_outcomes() {
     use purrdf::{
         SparqlRequest, TermValue,

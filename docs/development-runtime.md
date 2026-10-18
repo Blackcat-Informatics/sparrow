@@ -12,6 +12,29 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Native materialization and request explanation source qualification
+
+Source now selects committed PurRDF
+`9b2bf3b71325154137bc1aa817b46356daadfe3a` for dependencies and census. The
+lockfile changes only the selected first-party source references; no registry
+package was added or removed. Native actual-payload materialization and governed
+request EXPLAIN are available through the public facade.
+
+Three focused release consumer regressions pass. A persisted content query
+returns all 2,605 rows under the unchanged default 128 MiB source workspace and
+retains its complete cells after the store closes. `Store::sparql_explain`
+shares scope/admission ownership with ordinary queries, preserving typed
+substitutions, all native governor limits, frozen receipts and retained measured
+node charges, including a zero-fuel stop. UPDATE, zero host source-read admission
+and cancellation remain refusals. Release Clippy passes with warnings denied.
+Evidence is under
+`.stage/native-graph-integration/native-request-adoption-core-explain-final-*`.
+
+The normal full gate is required before committing. These are source checks;
+the installed daemon/client remain on the images named above. No EXPLAIN RPC,
+CLI/MCP capability or complete original nine-record content export is claimed
+from these regressions. Public adapter and runtime qualification remain work.
+
 ## Native reclamation source qualification
 
 The earlier conclusion that Sparrow required a new RocksDB compaction API was

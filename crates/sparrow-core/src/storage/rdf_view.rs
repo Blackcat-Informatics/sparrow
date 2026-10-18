@@ -25,7 +25,7 @@ pub use pages::{
     SparqlGraphKind, SparqlItem, SparqlPageBody, SparqlReadPage, sparql_term_node_bytes,
     sparql_term_wire_bytes,
 };
-pub use query::{ScopedSparqlResult, SparqlRead};
+pub use query::{ScopedSparqlExplanation, ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;
 use sparse::RowCursor;
 

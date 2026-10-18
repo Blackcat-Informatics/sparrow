@@ -86,8 +86,8 @@ production capacity.
 
 | Required area | Evidence already present | Required work still NOT MET |
 | --- | --- | --- |
-| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. | Public measured EXPLAIN with request/governor parity ([PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600)); query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); adoption and consumer qualification of the landed materialization fix for complete synthetic content export within the existing admitted workspace ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
-| Reclamation | Logical retirement, pin protection, pressure backpressure, native automatic compaction and separately measured physical files. | Qualify and, where necessary, configure existing native compaction/blob-GC policy so real physical recovery permits the refused write again, preserving pins and visible failures. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
+| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. | Public adapter qualification for the landed governed-request EXPLAIN API ([PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600)); query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); adoption and consumer qualification of the landed materialization fix for complete synthetic content export within the existing admitted workspace ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
+| Reclamation | Shared native tombstone-compaction policy; real-pressure source regression with measured file decrease, successful retry, protected shared bytes and reopen; full release gate at signed 22ec801. | Runtime adoption and sustained physical/resource qualification of the existing native compaction/blob-GC path. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
 | Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results and cancellation. | The missing graph operations above and complete resource/latency qualification over the deployment corpus. Existing tools must not advertise unsupported native relations or explanations. [Interfaces](interfaces.md). |
 | Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Production envelope and producer contracts, hard-quota/resource and sustained/burst acceptance, bounded physical reclamation, host-reboot/power-loss acceptance and remaining watcher scheduling/kernel-watch-exhaustion scenarios. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
 
@@ -99,14 +99,15 @@ turnover corpus is 65,642,380 raw bytes per pin mode. None of these results clos
 the remaining production acceptance gates.
 
 The initial upstream readback on 2026-10-18 found #600, #601 and #605 open.
-A later readback found #605 closed by PR #609; main
-`aa8586fabe8c8af69ed429a80bddc6714eed8184` includes actual-payload materialization.
-Sparrow adoption and consumer qualification of that fix remain required.
-Issues #600 and #601 remain open.
-PurRDF main `1de2bbbccbffd2e0be571e8b6aa1dd047e7177b2` adds documentation/binding
-changes after `9a6055e8`; its changed-file list does not include the blocked
-SPARQL evaluator/property-function owners. This is a source comparison, not an
-execution qualification of main. The selected rust-rocksdb upstream remains
+Later main landed actual-payload materialization (PR #609, closing #605) and
+governed request EXPLAIN (PR #611, closing #600). Source now selects committed
+`9b2bf3b71325154137bc1aa817b46356daadfe3a` for both runtime dependencies and
+census discovery. Three focused release consumer regressions and release Clippy
+pass, covering retained complete materialization and request/governor EXPLAIN
+parity, including host refusals. The normal full gate is required before commit;
+public EXPLAIN
+transport/agent integration and #601 stored-text integration remain required.
+The selected rust-rocksdb upstream remains
 `46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. The earlier inference that Sparrow
 required a new file-compaction API was unproven and is withdrawn. Existing native
 policy and measured pressure recovery must be evaluated before declaring an
@@ -253,7 +254,7 @@ complete stream history. Multi-source temporal correlation uses the explicit
 
 Inspect and compile against an exact selected native dependency revision before
 runtime implementation. The current runtime dependencies and census reference
-both select `7734b013d19b68600ad24c4e8aa5a40955a8e89e`, as recorded separately in
+both select `9b2bf3b71325154137bc1aa817b46356daadfe3a`, as recorded separately in
 `Cargo.toml`, `Cargo.lock` and `registry/compatibility.toml`. The table below
 preserves the original seam audit at
 `e58974e504b9681597faea1490002ce8ddaf7448`; later native integration and its
