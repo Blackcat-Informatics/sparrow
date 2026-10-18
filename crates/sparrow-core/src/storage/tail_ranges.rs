@@ -11,6 +11,7 @@ const JOB: catalog_upgrade::Job = catalog_upgrade::Job {
     checkpoint: "tail-range-index-upgrade",
     source: "record:",
     target: PREFIX,
+    page_entries: 512,
     page_bytes: 32 * 1024 * 1024,
     charge: upgrade_charge,
     publish: upgrade_publish,
@@ -45,7 +46,7 @@ pub(super) fn seed(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
 }
 
 pub(super) fn upgrade(db: &DB) -> Result<(), Error> {
-    catalog_upgrade::run(db, &JOB)
+    catalog_upgrade::run(db, &JOB, None)
 }
 
 fn upgrade_charge(bytes: &[u8]) -> Result<usize, Error> {

@@ -644,6 +644,15 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     let d = c.get_diagnostics()?;
     let coverage = Object::new()
         .with("visited", c.get_visited().to_string())
+        .with("artifacts_visited", c.get_artifacts_visited().to_string())
+        .with(
+            "known_selected_artifacts",
+            c.get_known_selected_artifacts().to_string(),
+        )
+        .with(
+            "artifact_diagnostic_unknown",
+            c.get_artifact_diagnostic_unknown().to_string(),
+        )
         .with("catalog_entries", c.get_catalog_entries().to_string())
         .with(
             "selected_records",

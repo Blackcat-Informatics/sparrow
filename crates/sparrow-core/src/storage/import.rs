@@ -308,10 +308,7 @@ impl Writer {
     }
 
     pub(super) fn admit_import_batch(&self, batch: &WriteBatch) -> Result<(), Error> {
-        let estimate = (batch.size_in_bytes() as u64)
-            .saturating_mul(4)
-            .saturating_add(65536);
-        self.admit_data_write(estimate)
+        self.admit_data_write(super::pressure::data_batch_estimate(batch))
     }
 
     fn commit_layout_page(

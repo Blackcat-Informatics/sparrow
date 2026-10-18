@@ -420,7 +420,7 @@ impl Writer {
         let journal = ConsumptionJournal::decode(value.get("journal").unwrap_or(&value))?;
         if journal.tail.is_some()
             && !matches!(
-                self.db.get("store_format")?.as_deref(),
+                super::writer_format::read(&self.db)?.as_deref(),
                 Some(
                     TAIL_FORMAT
                         | super::pressure::WATCH_FORMAT
@@ -602,14 +602,14 @@ impl Store {
             put(&mut batch, &key(&journal.import_id), &journal);
         }
         // Older writers must refuse before they can reclaim source-owned staging.
-        if writer.db.get("store_format")?.as_deref() == Some(super::FORMAT) {
-            batch.put("store_format", FORMAT);
+        if super::writer_format::read(&writer.db)?.as_deref() == Some(super::FORMAT) {
+            super::writer_format::stage(&writer.db, &mut batch, FORMAT)?;
         }
         if let Some((intent, now)) = handoff {
             writer.bind_handoff(&mut batch, intent, &journal, now)?;
         }
         if journal.tail.is_some() {
-            batch.put("store_format", TAIL_FORMAT);
+            super::writer_format::stage(&writer.db, &mut batch, TAIL_FORMAT)?;
         }
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;

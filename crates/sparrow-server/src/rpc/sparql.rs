@@ -423,6 +423,9 @@ pub(super) fn page(
     let mut coverage = out.reborrow().init_coverage();
     coverage.set_visited(c.visited);
     coverage.set_known_selected_records(c.selected_records);
+    coverage.set_artifacts_visited(c.artifacts_visited);
+    coverage.set_known_selected_artifacts(c.selected_artifacts);
+    coverage.set_artifact_diagnostic_unknown(c.artifact_diagnostic_unknown);
     coverage.set_content_ready(c.content_ready);
     coverage.set_content_failed(c.content_failed);
     coverage.set_content_not_applicable(c.content_not_applicable);

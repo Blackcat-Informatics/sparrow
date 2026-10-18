@@ -705,6 +705,8 @@ struct SparqlCoverage {
   visited @0 :UInt64; selectedRecords @1 :Count; knownSelectedRecords @2 :UInt64;
   contentReady @3 :UInt64; contentFailed @4 :UInt64; contentNotApplicable @5 :UInt64;
   diagnostics @6 :DiagnosticCoverage; catalogEntries @7 :UInt64; complete @8 :Bool;
+  artifactsVisited @9 :UInt64; knownSelectedArtifacts @10 :UInt64;
+  artifactDiagnosticUnknown @11 :UInt64;
 }
 struct SparqlHostLimits {
   source @0 :SparqlLimits; pageBytes @1 :UInt64; metadataBytes @2 :UInt64;

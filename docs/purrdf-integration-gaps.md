@@ -3,6 +3,18 @@
 These are unfinished first-version requirements, not exclusions from Sparrow's
 scope. Sparrow must retain native semantics and bounded reads while resolving them.
 
+## Current integration state
+
+Schema 51 is deployed on the development service with native SELECT, ASK,
+CONSTRUCT and DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation,
+retained native certificates and source/coverage receipts. Its live acceptance
+is recorded in [Development runtime](development-runtime.md#schema-51-live-adoption).
+Schema 52 recordless-artifact RDF and independent artifact coverage are under
+qualification; the installed store remains format 37. Native text relations,
+correlation, public measured explanation, bounded physical reclamation and
+production resource/turnover acceptance remain required. The sections below
+retain the source integration's earlier qualification boundaries and evidence.
+
 ## Retained operational SPARQL integration
 
 The runtime selection and helper census reference now name committed PurRDF

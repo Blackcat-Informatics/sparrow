@@ -246,9 +246,7 @@ impl Catalog for ReceiverWindow {
 }
 
 pub(super) fn registry(writer: &Writer) -> Result<Vec<ReceiverWindow>, Error> {
-    let format = writer
-        .db
-        .get("store_format")?
+    let format = super::writer_format::read(&writer.db)?
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "receiver store format missing"))?;
     let fenced = super::manifest_retire::features(&writer.db)?
         .unwrap_or(format.as_slice() == FORMAT || format.as_slice() == WATCH_FORMAT);

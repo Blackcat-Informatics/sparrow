@@ -15,6 +15,7 @@ use rocksdb::{
     ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions,
 };
 
+mod artifact_rdf;
 pub(crate) mod artifact_read;
 pub(crate) mod catalog_lease;
 mod catalog_upgrade;
@@ -53,6 +54,7 @@ pub(crate) mod tail;
 mod tail_ranges;
 mod text_index;
 pub(crate) mod watch_registry;
+mod writer_format;
 
 const FORMAT: &[u8] = b"sparrow.store/33";
 const DAY: u64 = 86_400_000;
@@ -1040,49 +1042,53 @@ impl Writer {
     }
 
     fn linked_physical_bytes(&self) -> Result<u64, Error> {
-        fn failure(error: std::io::Error, path: &Path, root: &Path) -> Error {
-            Error::new(
-                if error.kind() == std::io::ErrorKind::NotFound && path != root {
-                    "ACCOUNTING_CHANGED"
-                } else {
-                    "STORAGE_FAILURE"
-                },
-                format!("{}: {error}", path.display()),
-            )
-        }
-        fn directory(path: &Path, root: &Path) -> Result<u64, Error> {
-            let mut size = 0_u64;
-            for entry in std::fs::read_dir(path).map_err(|e| failure(e, path, root))? {
-                let entry = entry.map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-                let metadata = entry
-                    .metadata()
-                    .map_err(|e| failure(e, &entry.path(), root))?;
-                let bytes = if metadata.is_dir() {
-                    directory(&entry.path(), root)?
-                } else {
-                    metadata.len()
-                };
-                size = size
-                    .checked_add(bytes)
-                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "disk accounting overflow"))?;
-            }
-            Ok(size)
-        }
-        let mut last = String::new();
-        for _ in 0..3 {
-            match directory(self.db.path(), self.db.path()) {
-                Ok(bytes) => return Ok(bytes),
-                Err(error) if error.code == "ACCOUNTING_CHANGED" => last = error.message,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(Error::new(
-            "STORAGE_PRESSURE",
-            format!(
-                "database footprint stayed unstable across 3 complete measurements; retry accounting before admission: {last}"
-            ),
-        ))
+        linked_physical_bytes(&self.db)
     }
+}
+
+pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
+    fn failure(error: std::io::Error, path: &Path, root: &Path) -> Error {
+        Error::new(
+            if error.kind() == std::io::ErrorKind::NotFound && path != root {
+                "ACCOUNTING_CHANGED"
+            } else {
+                "STORAGE_FAILURE"
+            },
+            format!("{}: {error}", path.display()),
+        )
+    }
+    fn directory(path: &Path, root: &Path) -> Result<u64, Error> {
+        let mut size = 0_u64;
+        for entry in std::fs::read_dir(path).map_err(|e| failure(e, path, root))? {
+            let entry = entry.map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|e| failure(e, &entry.path(), root))?;
+            let bytes = if metadata.is_dir() {
+                directory(&entry.path(), root)?
+            } else {
+                metadata.len()
+            };
+            size = size
+                .checked_add(bytes)
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "disk accounting overflow"))?;
+        }
+        Ok(size)
+    }
+    let mut last = String::new();
+    for _ in 0..3 {
+        match directory(db.path(), db.path()) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if error.code == "ACCOUNTING_CHANGED" => last = error.message,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::new(
+        "STORAGE_PRESSURE",
+        format!(
+            "database footprint stayed unstable across 3 complete measurements; retry accounting before admission: {last}"
+        ),
+    ))
 }
 
 fn put<T: Catalog>(batch: &mut WriteBatch, key: &str, value: &T) {
@@ -1123,7 +1129,7 @@ impl Store {
         )?;
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
         let rdf_fingerprint = rdf_index::profile_identity()?;
-        let id = match db.get("store_format")? {
+        let id = match writer_format::read(&db)? {
             Some(format)
                 if format == FORMAT
                     || format == consumption::FORMAT
@@ -1218,6 +1224,7 @@ impl Store {
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
         tail_ranges::upgrade(&db)?;
+        artifact_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -1493,7 +1500,7 @@ impl Store {
             evicted: false,
         };
         put(&mut batch, &artifact.id, &artifact);
-        recordless::publish(&mut batch, &artifact)?;
+        recordless::publish(&writer.db, &mut batch, &artifact)?;
         writer.ingest_receipt(&mut batch, request_id, &artifact, origin, now)?;
         if let Some(checkpoint) = tail_checkpoint {
             batch.put(tail::KEY, checkpoint.encoded);

@@ -73,7 +73,7 @@ impl State {
             return Ok(Self::default());
         };
         if !matches!(
-            db.get("store_format")?.as_deref(),
+            super::writer_format::read(db)?.as_deref(),
             Some(
                 FORMAT
                     | WATCH_FORMAT
@@ -114,23 +114,43 @@ impl State {
     }
 }
 
+/// The existing conservative batch output/WAL estimate, shared by boot and live writes.
+pub(super) fn data_batch_estimate(batch: &rocksdb::WriteBatch) -> u64 {
+    (batch.size_in_bytes() as u64)
+        .saturating_mul(4)
+        .saturating_add(65536)
+}
+
+/// Largest measured footprint that still leaves the admitted data-write allowance.
+pub(super) fn data_write_ceiling(
+    disk_budget: u64,
+    reserve: u64,
+    estimate: u64,
+) -> Result<u64, Error> {
+    if estimate == 0 {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "data write requires a positive capacity estimate",
+        ));
+    }
+    let limit = disk_budget.checked_sub(reserve).ok_or_else(|| {
+        Error::new(
+            "INVALID_ARGUMENT",
+            "disk budget must exceed maintenance reserve",
+        )
+    })?;
+    limit.checked_sub(estimate).ok_or_else(||Error::new("RESOURCE_LIMIT","estimated atomic write cannot fit the configured data budget; increase the disk budget or reduce the operation"))
+}
+
 impl Writer {
     /// Called before publishing a prepared data batch; never mutates its dependencies.
     pub(super) fn admit_data_write(&self, estimate: u64) -> Result<(), Error> {
-        if estimate == 0 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "data write requires a positive capacity estimate",
-            ));
-        }
-        let limit = self.config.disk_budget - self.config.maintenance_reserve;
-        if estimate > limit {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "estimated atomic write cannot fit the configured data budget; increase the disk budget or reduce the operation",
-            ));
-        }
-        if self.physical_bytes()?.saturating_add(estimate) <= limit {
+        let ceiling = data_write_ceiling(
+            self.config.disk_budget,
+            self.config.maintenance_reserve,
+            estimate,
+        )?;
+        if self.physical_bytes()? <= ceiling {
             return Ok(());
         }
         let mut pressure = self.pressure.borrow_mut();

@@ -543,7 +543,7 @@ impl Store {
         };
         parse(json::write_compact(&artifact.encode()).as_bytes())?;
         put(&mut batch, &artifact.id, &artifact);
-        super::recordless::publish(&mut batch, &artifact)?;
+        super::recordless::publish(&writer.db, &mut batch, &artifact)?;
         manifest.published_artifact = Some(artifact.id.clone());
         writer.publish_consumption(&mut batch, &manifest, &artifact)?;
         put(&mut batch, id, &manifest);

@@ -621,7 +621,7 @@ names = ['^(read_cli_watch_status|read_mcp_watch_status)$']
 id = "storage-physical-footprint"
 summary = "Measure all database filesystem bytes through one owner, retry complete observations when compaction removes an entry, and refuse an unstable or broken measurement without a partial sum."
 home = "sparrow_core::storage::Writer::physical_bytes"
-entry_points = ["sparrow_core::storage::Writer::linked_physical_bytes"]
+entry_points = ["sparrow_core::storage::Writer::linked_physical_bytes", "sparrow_core::storage::linked_physical_bytes"]
 spec = "docs/development-runtime.md: bounded physical accounting under directory churn."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -1759,7 +1759,7 @@ names = ['^(price_retirement_catalog_elsewhere|parse_retirement_json_elsewhere)$
 id = "data-write-capacity-admission"
 summary = "One measured physical-space law signals pressure for direct and staged data writes before publication."
 home = "sparrow_core::storage::pressure::Writer::admit_data_write"
-entry_points = []
+entry_points = ["sparrow_core::storage::pressure::data_batch_estimate", "sparrow_core::storage::pressure::data_write_ceiling"]
 spec = "docs/development-runtime.md: schema 17 pressure maintenance."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2272,7 +2272,7 @@ names = ['^(retry_claim_lock|wait_for_claim_lock)$']
 id = 'recordless-time-publication'
 summary = 'Publish one native receipt-time entry for recordless artifacts from direct ingestion, staged publication or upgrade; expiry uses the same key owner.'
 home = 'sparrow_core::storage::recordless::publish'
-entry_points = ['sparrow_core::storage::recordless::key', 'sparrow_core::storage::recordless::key_parts', 'sparrow_core::storage::recordless::Writer::indexed_recordless']
+entry_points = ['sparrow_core::storage::recordless::is_live_owner', 'sparrow_core::storage::recordless::key', 'sparrow_core::storage::recordless::key_parts', 'sparrow_core::storage::recordless::Writer::indexed_recordless']
 spec = "docs/development-runtime.md: schema 19 recordless artifact eviction."
 vectors = ["crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -3836,7 +3836,7 @@ names = ['^(try_boxed|try_boxed_one)$']
 id = "stored-rdf-filtered-scope"
 summary = "Capture graph owners through shared retained evidence selection, temporal candidate ordering and diagnostic qualification; admission refusal and cancellation never publish a partial membership."
 home = "sparrow_core::storage::rdf_view::scope::Store::with_rdf_scope"
-entry_points = ["sparrow_core::storage::rdf_view::scope::Store::rdf_read_lease", "sparrow_core::storage::rdf_view::scope::StoredRdfView::include_record", "sparrow_core::storage::rdf_view::scope::StoredRdfView::include_owner", "sparrow_core::storage::rdf_view::scope::RdfScopeCoverage::complete"]
+entry_points = ["sparrow_core::storage::rdf_view::scope::Store::rdf_read_lease", "sparrow_core::storage::rdf_view::scope::StoredRdfView::include_record", "sparrow_core::storage::rdf_view::scope::StoredRdfView::include_artifact", "sparrow_core::storage::rdf_view::scope::StoredRdfView::include_owner", "sparrow_core::storage::rdf_view::scope::RdfScopeCoverage::complete"]
 spec = "docs/interfaces.md: SPARQL graph layers and independent read coverage."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -4013,3 +4013,59 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(rebuild_scoped_rdf_in_memory|copy_foreign_quad_scan_for_describe)$']
+
+[[job]]
+id = "artifact-rdf-writer-authority"
+summary = "One explicit writer-format map adds recordless artifact RDF to each existing authority family and preserves that fence across watch, consumption, receiver, pressure and manifest transitions. Discovery retains the actual stored identity."
+home = "sparrow_core::storage::writer_format::stage"
+entry_points = ["sparrow_core::storage::writer_format::read", "sparrow_core::storage::writer_format::enable", "sparrow_core::storage::writer_format::has_artifact_rdf"]
+spec = "docs/interfaces.md: recordless artifact RDF writer authority."
+vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(artifact_rdf_format_elsewhere|discard_artifact_writer_fence)$']
+
+[[job]]
+id = "recordless-rdf-ownership"
+summary = "Recordless artifact graph publication, retirement and one-owner native migration batches share the original RDF dictionary writer and catalog upgrade pager; missing state and unfenced ownership fail explicitly."
+home = "sparrow_core::storage::artifact_rdf::publish"
+entry_points = ["sparrow_core::storage::artifact_rdf::upgrade", "sparrow_core::storage::artifact_rdf::admit", "sparrow_core::storage::artifact_rdf::backfill", "sparrow_core::storage::artifact_rdf::retire", "sparrow_core::storage::retire::Retirement::artifact_graph"]
+spec = "docs/interfaces.md: recordless artifact RDF writer authority."
+vectors = ["crates/sparrow-core/src/storage/recordless.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(recordless_rdf_publish_elsewhere|rebuild_artifact_graph_in_query)$']
+
+[[job]]
+id = "occurrence-rdf-envelope"
+summary = "One native PurRDF builder emits shared payload, class, source and retention metadata for record and recordless artifact occurrences; domain-specific predicates extend that same envelope."
+home = "sparrow_core::storage::rdf_index::occurrence_metadata"
+entry_points = ["sparrow_core::storage::rdf_index::metadata_dataset", "sparrow_core::storage::rdf_index::metadata", "sparrow_core::storage::rdf_index::artifact_metadata"]
+spec = "docs/interfaces.md: core graph vocabulary and recordless artifact RDF."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(copy_occurrence_rdf_envelope|empty_artifact_rdf_projector)$']
+
+[[job]]
+id = "legacy-artifact-rdf-test-fixture"
+summary = "Dev-only legacy fixtures remove the migration checkpoint only after production maintenance has retired every artifact RDF owner; fixture setup never copies RDF dictionary retirement semantics."
+home = "sparrow_test_support::remove_artifact_rdf_upgrade"
+entry_points = []
+spec = "docs/interfaces.md: recordless artifact RDF writer authority."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(copy_rdf_retirement_into_test_fixture|remove_artifact_rdf_upgrade_elsewhere)$']

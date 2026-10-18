@@ -376,8 +376,9 @@ and diagnostic/failure outcomes retain native ownership and certainty. UPDATE is
 refused by native read preparation; federation is disabled. These are core
 integration surfaces. Schema 51 exposes the same native read through typed
 `Sparrow.sparqlQuery`, CLI `sparrow ENDPOINT sparql REQUEST.json`, and MCP
-`sparql_query`. Recordless artifact graphs, text relations, correlation and
-public explanation contracts remain unfinished.
+`sparql_query`. Text relations, correlation and public explanation contracts
+remain unfinished. Recordless artifact metadata is implemented in schema 52
+and undergoing qualification below.
 
 The core `sparql_read`/`sparql_read_next` pair publishes immutable native captures
 through the existing finite catalog lease owner. Pages share the native outcome
@@ -789,6 +790,49 @@ DESCRIBE through PurRDF. Preserve RDF term kind, datatype, language, base
 direction, and triple-term structure using its result serializers. SPARQL UPDATE
 does not provide arbitrary mutation of Sparrow's derived storage; it is refused
 by the read surface.
+
+### Recordless artifact RDF writer authority
+
+Schema 52 adds independently captured metadata for complete zero-byte artifacts,
+including empty JSONL/log inputs. These have no record occurrence and no content
+projection. Their native PurRDF metadata uses `Artifact`, `payload`, `source`,
+`sourceName`, `receivedAt`, `expiresAt`, `byteLength` and `format`. Record and
+artifact envelopes share one builder implementation; the persisted dictionary,
+statement indexes and native query evaluator remain the original owners.
+
+Publication commits the empty-artifact temporal index, RDF owner and catalog in
+one batch. Expiry/eviction retire its graph and ownership marker with its evidence;
+graph retirement consumes a bounded maintenance unit. Live graph scope streams
+the existing `empty-time:` index in the same half-open receipt interval. Concrete
+artifact and pin selections use the shared membership owner and do not expand an
+empty artifact into a fabricated record. Source filters precede diagnostic
+coverage. An otherwise eligible empty artifact cannot satisfy record diagnostic
+filters: permissive reads exclude it and count `artifact_diagnostic_unknown`;
+strict reads refuse `INDEX_NOT_READY`. Metadata layer exclusion removes its graph.
+
+Graph coverage keeps `known_selected_records` unchanged and separately reports
+`artifacts_visited`, `known_selected_artifacts` and
+`artifact_diagnostic_unknown`. Completeness requires known artifact membership as
+well as the existing record/content conditions. Captures use the original native
+snapshot and read/scan/catalog governors; they do not pin evidence. Missing
+required temporal/RDF ownership fails without successful rows.
+
+Store formats 44 through 54 add this feature respectively to existing authority
+families 33 through 43: basic, consumption, watches, handoff, completed tail,
+pressure without/with watches, receivers without/with watches, and manifest
+retirement without/with watches. The stored identity fences older writers; one
+internal map preserves the underlying authority checks across later transitions.
+Public discovery returns the actual fenced identity. No authority is discarded.
+Startup fences before backfill, then resumes durable one-owner batches through
+the shared catalog pager and RDF writer. This prevents separately resolved term
+counters from colliding in one batch. The service stays unavailable until backfill
+finishes. A missing checkpoint or unfenced pre-existing owner is a storage failure.
+Each new graph batch uses the original linked-file measurement, maintenance
+reserve and complete write-batch estimate before its durable migration commit.
+Capacity refusal preserves the prior checkpoint and can resume after space or
+budget recovery. Direct empty ingestion also admits its final RDF/catalog batch
+through the original live publication observer before any dependency is committed.
+These new formats have not yet been adopted by the development service.
 
 ### Core graph vocabulary
 

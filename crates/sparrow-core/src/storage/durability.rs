@@ -152,41 +152,47 @@ impl Writer {
                 || manifest_features == Some(true);
             let watch = publication.watch_registry || self.db.get("watch_registry")?.is_some();
             batch.put(super::manifest_retire::FEATURES, [u8::from(receiver)]);
-            batch.put(
-                "store_format",
+            super::writer_format::stage(
+                &self.db,
+                &mut batch,
                 if watch {
                     super::manifest_retire::WATCH_FORMAT
                 } else {
                     super::manifest_retire::FORMAT
                 },
-            );
+            )?;
         } else if publication.receiver_registry
             || self.db.get(super::receiver_stream::KEY)?.is_some()
         {
             let watch = publication.watch_registry || self.db.get("watch_registry")?.is_some();
-            batch.put(
-                "store_format",
+            super::writer_format::stage(
+                &self.db,
+                &mut batch,
                 if watch {
                     super::receiver_stream::WATCH_FORMAT
                 } else {
                     super::receiver_stream::FORMAT
                 },
-            );
+            )?;
         } else if publication.pressure_wait
             || matches!(
-                self.db.get("store_format")?.as_deref(),
+                super::writer_format::read(&self.db)?.as_deref(),
                 Some(super::pressure::FORMAT | super::pressure::WATCH_FORMAT)
             )
         {
             let watch = publication.watch_registry || self.db.get("watch_registry")?.is_some();
-            batch.put(
-                "store_format",
+            super::writer_format::stage(
+                &self.db,
+                &mut batch,
                 if watch {
                     super::pressure::WATCH_FORMAT
                 } else {
                     super::pressure::FORMAT
                 },
-            );
+            )?;
+        }
+        if publication.artifact_rdf {
+            self.admit_import_batch(&batch)?;
         }
         let bytes = batch.size_in_bytes();
         {

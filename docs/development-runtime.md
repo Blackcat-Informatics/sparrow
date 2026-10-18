@@ -11,6 +11,44 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Recordless artifact RDF source qualification
+
+The implementation branch adds schema 52 and store formats 44 through 54 for
+recordless artifact RDF. Source qualification has not replaced
+the installed schema-51/format-37 daemon. The source shares the native RDF writer,
+occurrence metadata envelope, catalog migration pager and captured query scope.
+The full local gate passes release Clippy with warnings denied, 21 core unit
+tests, 179 storage tests, all 63 RPC tests, the other workspace/doc tests, census
+self-tests and 277 pinned ownership jobs with zero distinct exceptions.
+Qualification includes interrupted owner backfill, reopen/idempotence, required
+checkpoint failure, all writer-family transitions, native class identity,
+source/time filters, diagnostic unknowns, pin/snapshot retention, corruption
+refusal, bounded expiry and independent CLI/MCP artifact coverage.
+
+Migration and direct empty publication share the original write-batch estimate
+and linked-file admission law. Tests refuse impossible/pressured migration
+without advancing its checkpoint, refuse an already present owner outside its
+atomic checkpoint, and resume after recovery. The direct-ingestion regression
+leaves room for the earlier empty-record estimate but refuses the complete RDF
+batch before publication; removing its private sparse ballast permits the same
+request to succeed once. Sparse ballast qualifies admission accounting, not a
+filesystem quota or forced physical reclamation.
+
+A prior hash-verified restored-copy trial migrated the original 217-record store
+from format 37 to 48 and passed all four read forms at default limits. Separate
+Record and Artifact counts preserved occurrence distinctions. That copy initially
+had no empty artifacts; a private synthetic empty input then returned one artifact
+and zero records while keeping 217 live records and 213 payload chunks. The 107
+closed-backup hashes remained unchanged. This finite trial predates the final
+admission hardening; exact-source migration replay is a separate adoption gate.
+
+Evidence under `.stage/native-graph-integration/` includes
+`artifact-rdf-admission-final-check.log`, the signed normal commit gate
+`artifact-rdf-commit.log`, `schema52-restore-probe.{json,log}`,
+`schema52-restore-empty-probe.{json,log}`, and their source/image receipts.
+The temporary probe example was removed. The installed daemon remains schema 51
+and format 37 until qualified image adoption is recorded separately.
+
 ## Native graph transport source
 
 The implementation branch now includes schema 51 native graph RPC publication,

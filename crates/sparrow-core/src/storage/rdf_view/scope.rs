@@ -19,6 +19,12 @@ pub struct RdfScopeCoverage {
     /// Known selected record occurrences, never a count of shared content graphs.
     /// The exact total is unknown when diagnostic membership is incomplete.
     pub selected_records: u64,
+    /// Empty-artifact candidates visited independently of record occurrences.
+    pub artifacts_visited: u64,
+    /// Proven recordless artifact membership; no content projection is implied.
+    pub selected_artifacts: u64,
+    /// Otherwise eligible empty artifacts lacking requested diagnostic dimensions.
+    pub artifact_diagnostic_unknown: u64,
     /// Selected occurrences with a ready content projection.
     pub content_ready: u64,
     /// Selected occurrences with a failed content projection.
@@ -34,7 +40,9 @@ pub struct RdfScopeCoverage {
 impl RdfScopeCoverage {
     /// All requested applicable content is ready and membership is known.
     pub fn complete(&self) -> bool {
-        self.diagnostics.complete(false) && self.content_failed == 0
+        self.diagnostics.complete(false)
+            && self.content_failed == 0
+            && self.artifact_diagnostic_unknown == 0
     }
 }
 
@@ -51,6 +59,53 @@ impl StoredRdfView<'_> {
                 .expect("scope capture precedes owned query admission")
                 .grow(512)?;
             self.owners.insert(ordinal(owner));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn include_artifact(
+        &mut self,
+        writer: &crate::storage::Writer,
+        artifact: &crate::storage::Artifact,
+        scope: &QueryScope,
+        layers: RdfGraphLayers,
+        now: u64,
+        protected: &BTreeSet<String>,
+        coverage: &mut RdfScopeCoverage,
+    ) -> Result<(), ReadError> {
+        coverage.artifacts_visited += 1;
+        if !writer.live_artifact(artifact, now, protected)
+            || !scope.matches_source(&artifact.source)
+        {
+            return Ok(());
+        }
+        if !scope.diagnostics.is_empty() {
+            coverage.artifact_diagnostic_unknown += 1;
+            if scope.require_complete_index {
+                return Err(self.budget.fail(Error::new("INDEX_NOT_READY","selected recordless artifact has no diagnostic record; omit diagnostic filters or select records")));
+            }
+            return Ok(());
+        }
+        coverage.selected_artifacts += 1;
+        if layers.metadata {
+            let marker = format!("artifact-rdf:{}", artifact.id);
+            let value = self.point(marker.as_bytes(), 0)?.ok_or_else(|| {
+                self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "recordless artifact RDF ownership marker missing",
+                ))
+            })?;
+            drop(value);
+            let graph = format!("rdf:graph:{}", artifact.id);
+            let manifest = self.point(graph.as_bytes(), 65536)?.ok_or_else(|| {
+                self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "recordless artifact RDF graph missing",
+                ))
+            })?;
+            drop(manifest);
+            self.include_owner(&artifact.id)?;
         }
         Ok(())
     }
@@ -187,10 +242,13 @@ impl Store {
             scanned: &mut scanned,
             remaining: &mut remaining,
         };
-        let members = writer
+        let selection = writer
             .query_selection_membership(&scope.selection, now, &protected, Some(&mut admission))
-            .map_err(|e| budget.fail(e))?
-            .map(|members| members.records);
+            .map_err(|e| budget.fail(e))?;
+        let (members, recordless) = match selection {
+            Some(members) => (Some(members.records), Some(members.recordless)),
+            None => (None, None),
+        };
         let mut candidates = writer
             .query_candidates_from_members(scope, members, |id| {
                 writer.get_admitted(id, |bytes| admission.entry(bytes.len()))
@@ -224,6 +282,73 @@ impl Store {
             view.include_record(&record, layers, scope.require_complete_index, &mut coverage)?;
         }
         drop(candidates);
+        // Only empty artifacts have independent graph owners. Populated artifact
+        // membership still expands through its original record occurrences.
+        if let Some(members) = recordless {
+            for (id, time) in members {
+                if time < scope.received_from || time >= scope.received_before {
+                    continue;
+                }
+                let key = crate::storage::recordless::key_parts(time, &id);
+                budget.request(super::super::catalog_lease::ENTRY_BYTES as u64, true)?;
+                admission
+                    .entry(key.len() + id.len())
+                    .map_err(|e| budget.fail(e))?;
+                let value = writer
+                    .db
+                    .get_pinned(&key)
+                    .map_err(|e| budget.fail(e.into()))?
+                    .ok_or_else(|| {
+                        budget.fail(Error::new(
+                            "STORAGE_FAILURE",
+                            "selected empty artifact temporal index missing",
+                        ))
+                    })?;
+                let artifact = writer
+                    .indexed_recordless(key.as_bytes(), &value, admission.remaining)
+                    .map_err(|e| budget.fail(e))?;
+                view.include_artifact(
+                    &writer,
+                    &artifact,
+                    scope,
+                    layers,
+                    now,
+                    &protected,
+                    &mut coverage,
+                )?;
+            }
+        } else {
+            let start = crate::storage::recordless::key_parts(scope.received_from, "");
+            let mut options = rocksdb::ReadOptions::default();
+            options.set_iterate_upper_bound(
+                crate::storage::recordless::key_parts(scope.received_before, "").into_bytes(),
+            );
+            for row in writer.db.iterator_opt(
+                IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward),
+                options,
+            ) {
+                budget.request(super::super::catalog_lease::ENTRY_BYTES as u64, true)?;
+                let (key, value) = row.map_err(|e| budget.fail(e.into()))?;
+                if !key.starts_with(crate::storage::recordless::PREFIX) {
+                    break;
+                }
+                admission
+                    .entry(key.len() + value.len())
+                    .map_err(|e| budget.fail(e))?;
+                let artifact = writer
+                    .indexed_recordless(&key, &value, admission.remaining)
+                    .map_err(|e| budget.fail(e))?;
+                view.include_artifact(
+                    &writer,
+                    &artifact,
+                    scope,
+                    layers,
+                    now,
+                    &protected,
+                    &mut coverage,
+                )?;
+            }
+        }
         coverage.catalog_entries = scanned;
         drop(protected);
         drop(_catalog);

@@ -657,8 +657,7 @@ impl Store {
 }
 
 pub(super) fn fence_format(db: &DB) -> Result<(), Error> {
-    if let Some(legacy) = db
-        .get("store_format")?
+    if let Some(legacy) = super::writer_format::read(db)?
         .as_deref()
         .and_then(super::recordless::legacy_format)
         .filter(|legacy| !legacy.needs_recordless_index)

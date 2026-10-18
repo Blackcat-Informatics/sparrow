@@ -539,20 +539,117 @@ impl<'a> RdfWrite<'a> {
     }
 }
 
-pub(super) fn metadata(
-    record: &Record,
-    payload: &str,
-    state: Option<&Value>,
+fn metadata_dataset(
+    builder: purrdf::RdfDatasetBuilder,
 ) -> Result<std::sync::Arc<RdfDataset>, Error> {
+    builder
+        .freeze()
+        .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))
+}
+
+fn occurrence_metadata(
+    id: &str,
+    source: &str,
+    received_at: u64,
+    expires_at: u64,
+    class: &str,
+    payload: &str,
+) -> Result<(purrdf::RdfDatasetBuilder, purrdf::ir::TermId), Error> {
     use purrdf::{RdfDatasetBuilder, RdfLiteral};
     const NS: &str = "urn:sparrow:vocab:";
     let mut builder = RdfDatasetBuilder::new();
-    let subject = builder.intern_iri(&format!("urn:sparrow:{}", record.id))?;
+    let subject = builder.intern_iri(&format!("urn:sparrow:{id}"))?;
     for (predicate, object) in [
         (
             format!("{NS}payload"),
             builder.intern_iri(&format!("urn:sparrow:payload:{payload}"))?,
         ),
+        (
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into(),
+            builder.intern_iri(&format!("{NS}{class}"))?,
+        ),
+        (
+            format!("{NS}source"),
+            builder.intern_iri(&super::source_read::source_iri(source))?,
+        ),
+        (
+            format!("{NS}sourceName"),
+            builder.intern_literal(RdfLiteral::simple(source))?,
+        ),
+        (
+            format!("{NS}receivedAt"),
+            builder.intern_literal(RdfLiteral::typed(
+                crate::format_instant(received_at)?,
+                "http://www.w3.org/2001/XMLSchema#dateTime",
+            ))?,
+        ),
+        (
+            format!("{NS}expiresAt"),
+            builder.intern_literal(RdfLiteral::typed(
+                crate::format_instant(expires_at)?,
+                "http://www.w3.org/2001/XMLSchema#dateTime",
+            ))?,
+        ),
+    ] {
+        let predicate = builder.intern_iri(&predicate)?;
+        builder.push_quad(subject, predicate, object, None)?;
+    }
+    Ok((builder, subject))
+}
+
+pub(super) fn artifact_metadata(
+    artifact: &super::Artifact,
+) -> Result<std::sync::Arc<RdfDataset>, Error> {
+    use purrdf::RdfLiteral;
+    let payload = artifact.payload_id.strip_prefix("blake3:").ok_or_else(|| {
+        Error::new(
+            "STORAGE_FAILURE",
+            "artifact payload identity has no hash profile",
+        )
+    })?;
+    let (mut builder, subject) = occurrence_metadata(
+        &artifact.id,
+        &artifact.source,
+        artifact.received_at,
+        artifact.expires_at,
+        "Artifact",
+        payload,
+    )?;
+    for (name, object) in [
+        (
+            "byteLength",
+            builder.intern_literal(RdfLiteral::typed(
+                artifact.byte_length.to_string(),
+                "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+            ))?,
+        ),
+        (
+            "format",
+            builder.intern_literal(RdfLiteral::simple(&artifact.format))?,
+        ),
+    ] {
+        let predicate = builder.intern_iri(&format!("urn:sparrow:vocab:{name}"))?;
+        builder.push_quad(subject, predicate, object, None)?;
+    }
+    metadata_dataset(builder)
+}
+
+pub(super) fn metadata(
+    record: &Record,
+    payload: &str,
+    state: Option<&Value>,
+) -> Result<std::sync::Arc<RdfDataset>, Error> {
+    use purrdf::RdfLiteral;
+    const NS: &str = "urn:sparrow:vocab:";
+    let (mut builder, subject) = occurrence_metadata(
+        &record.id,
+        &record.source,
+        record.received_at,
+        record.expires_at,
+        "Record",
+        payload,
+    )?;
+    for (predicate, object) in [
         (
             format!("{NS}projectionState"),
             builder.intern_literal(RdfLiteral::simple(
@@ -563,34 +660,8 @@ pub(super) fn metadata(
             ))?,
         ),
         (
-            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_owned(),
-            builder.intern_iri(&format!("{NS}Record"))?,
-        ),
-        (
             format!("{NS}artifact"),
             builder.intern_iri(&format!("urn:sparrow:{}", record.artifact_id))?,
-        ),
-        (
-            format!("{NS}source"),
-            builder.intern_iri(&super::source_read::source_iri(&record.source))?,
-        ),
-        (
-            format!("{NS}sourceName"),
-            builder.intern_literal(RdfLiteral::simple(&record.source))?,
-        ),
-        (
-            format!("{NS}receivedAt"),
-            builder.intern_literal(RdfLiteral::typed(
-                crate::format_instant(record.received_at)?,
-                "http://www.w3.org/2001/XMLSchema#dateTime",
-            ))?,
-        ),
-        (
-            format!("{NS}expiresAt"),
-            builder.intern_literal(RdfLiteral::typed(
-                crate::format_instant(record.expires_at)?,
-                "http://www.w3.org/2001/XMLSchema#dateTime",
-            ))?,
         ),
         (
             format!("{NS}sourceByteStart"),
@@ -696,9 +767,7 @@ pub(super) fn metadata(
         let object = builder.intern_iri(&graph_iri(&record.rdf_projection_id))?;
         builder.push_quad(subject, predicate, object, None)?;
     }
-    builder
-        .freeze()
-        .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))
+    metadata_dataset(builder)
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ const JOB: catalog_upgrade::Job = catalog_upgrade::Job {
     checkpoint: "source-context-cache-upgrade",
     source: "record:",
     target: PREFIX,
+    page_entries: 512,
     page_bytes: SCRATCH_BYTES,
     charge: reconstruction_charge,
     publish,
@@ -115,7 +116,7 @@ pub(super) fn rebuild(db: &DB) -> Result<(), Error> {
     let mut batch = WriteBatch::default();
     catalog_upgrade::seed(db, &JOB, &mut batch)?;
     catalog_upgrade::commit(db, batch)?;
-    match catalog_upgrade::run(db, &JOB) {
+    match catalog_upgrade::run(db, &JOB, None) {
         Err(error) if error.code == "CONTEXT_CATALOG_INVALID" => {
             let mut batch = WriteBatch::default();
             batch.put(FAILURE, error.message.as_bytes());

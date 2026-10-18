@@ -64,6 +64,10 @@ impl<'a> Retirement<'a> {
         Ok(true)
     }
 
+    pub(super) fn artifact_graph(&mut self, id: &str) -> Result<bool, Error> {
+        super::artifact_rdf::retire(&self.writer.db, &mut self.rdf, &mut self.batch, id)
+    }
+
     pub(super) fn artifact(
         &mut self,
         artifact: &mut super::manifest_retire::Envelope,

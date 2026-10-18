@@ -13,7 +13,7 @@ pub(super) const FEATURES: &str = "manifest-retirement-features";
 
 pub(super) fn features(db: &rocksdb::DB) -> Result<Option<bool>, Error> {
     let fenced = matches!(
-        db.get("store_format")?.as_deref(),
+        super::writer_format::read(db)?.as_deref(),
         Some(FORMAT | WATCH_FORMAT)
     );
     match (fenced, db.get_pinned(FEATURES)?) {
@@ -58,7 +58,7 @@ impl State {
         if bytes.len() != 17
             || bytes[16] > 1
             || !matches!(
-                writer.db.get("store_format")?.as_deref(),
+                super::writer_format::read(&writer.db)?.as_deref(),
                 Some(FORMAT | WATCH_FORMAT)
             )
         {

@@ -176,6 +176,13 @@ impl Writer {
                         now,
                         &protected,
                     ) {
+                        if report.records + report.artifacts == limits.max_records as u64 {
+                            report.frontier = ExpiryFrontier::UnitLimit;
+                            break 'phases;
+                        }
+                        if retirement.artifact_graph(&artifact.id)? {
+                            report.artifacts += 1;
+                        }
                         if artifact.pending() != 0 {
                             if report.records + report.artifacts == limits.max_records as u64 {
                                 report.frontier = ExpiryFrontier::UnitLimit;

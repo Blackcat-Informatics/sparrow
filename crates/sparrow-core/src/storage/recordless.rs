@@ -22,7 +22,7 @@ pub(super) fn key_parts(received_at: u64, id: &str) -> String {
     format!("empty-time:{received_at:020}:{id}")
 }
 
-pub(super) fn publish(batch: &mut WriteBatch, artifact: &Artifact) -> Result<(), Error> {
+pub(super) fn is_live_owner(artifact: &Artifact) -> Result<bool, Error> {
     if artifact.record_ids.is_empty() {
         if artifact.byte_length != 0 || !artifact.chunks.is_empty() {
             return Err(Error::new(
@@ -30,9 +30,15 @@ pub(super) fn publish(batch: &mut WriteBatch, artifact: &Artifact) -> Result<(),
                 "recordless artifact has unaccounted original bytes",
             ));
         }
-        if !artifact.evicted {
-            batch.put(key(artifact), artifact.id.as_bytes());
-        }
+        return Ok(!artifact.evicted);
+    }
+    Ok(false)
+}
+
+pub(super) fn publish(db: &DB, batch: &mut WriteBatch, artifact: &Artifact) -> Result<(), Error> {
+    if is_live_owner(artifact)? {
+        super::artifact_rdf::publish(db, batch, artifact)?;
+        batch.put(key(artifact), artifact.id.as_bytes());
     }
     Ok(())
 }
@@ -158,7 +164,7 @@ pub(super) fn requires_watch_registry(format: &[u8]) -> bool {
 /// Startup is unavailable until this persistent index is complete. Each page is durable.
 pub(super) fn upgrade(db: &DB) -> Result<(), Error> {
     fence(db)?;
-    super::catalog_upgrade::run(db, &JOB)
+    super::catalog_upgrade::run(db, &JOB, None)
 }
 
 fn fence(db: &DB) -> Result<(), Error> {
@@ -196,12 +202,13 @@ const JOB: super::catalog_upgrade::Job = super::catalog_upgrade::Job {
     checkpoint: UPGRADE,
     source: "artifact:",
     target: PREFIX,
+    page_entries: 512,
     page_bytes: PAGE_BYTES,
     charge: upgrade_charge,
     publish: upgrade_publish,
 };
 
-fn upgrade_charge(bytes: &[u8]) -> Result<usize, Error> {
+pub(super) fn upgrade_charge(bytes: &[u8]) -> Result<usize, Error> {
     Ok(if has_records(bytes)? {
         bytes.len()
     } else {
@@ -225,14 +232,16 @@ fn upgrade_publish(
                 "recordless upgrade artifact identity mismatch",
             ));
         }
-        publish(batch, &artifact)?;
+        if is_live_owner(&artifact)? {
+            batch.put(key(&artifact), artifact.id.as_bytes());
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 fn step(db: &DB, progress: Progress, maximum: usize) -> Result<(), Error> {
-    super::catalog_upgrade::step(db, &JOB, progress, maximum)
+    super::catalog_upgrade::step(db, &JOB, progress, maximum, None)
 }
 
 /// Native JSON event traversal inspects only the storage manifest's record membership.
@@ -349,6 +358,94 @@ mod tests {
     }
 
     #[test]
+    fn artifact_rdf_backfill_resumes_one_owner_batches_and_requires_its_writer_fence() {
+        use super::super::{artifact_rdf, catalog_upgrade, rdf_index, writer_format};
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        for key in ["rdf:next", "rdf:term-count", "rdf:max-encoded"] {
+            db.put(key, 0_u64.to_be_bytes()).unwrap();
+        }
+        db.put("store_format", super::super::FORMAT).unwrap();
+        let mut batch = WriteBatch::default();
+        for id in ["artifact:a", "artifact:b"] {
+            super::super::put(&mut batch, id, &artifact(id));
+        }
+        catalog_upgrade::seed(&db, &artifact_rdf::JOB, &mut batch).unwrap();
+        batch.put(
+            "store_format",
+            writer_format::enable(super::super::FORMAT).unwrap(),
+        );
+        commit(&db, batch).unwrap();
+        catalog_upgrade::step(&db, &artifact_rdf::JOB, Progress::default(), 1, None).unwrap();
+        assert!(db.get("rdf:graph:artifact:a").unwrap().is_some());
+        assert!(db.get("rdf:graph:artifact:b").unwrap().is_none());
+        let saved = db.get(artifact_rdf::JOB.checkpoint).unwrap().unwrap();
+        assert_eq!(
+            artifact_rdf::upgrade(&db, 8 * 1024 * 1024 + 1, 8 * 1024 * 1024)
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT"
+        );
+        let ballast = dir.path().join("migration-admission-ballast");
+        std::fs::File::create(&ballast)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            artifact_rdf::upgrade(&db, 9 * 1024 * 1024, 8 * 1024 * 1024)
+                .unwrap_err()
+                .code,
+            "STORAGE_PRESSURE"
+        );
+        assert_eq!(
+            db.get(artifact_rdf::JOB.checkpoint).unwrap().unwrap(),
+            saved
+        );
+        assert!(db.get("rdf:graph:artifact:b").unwrap().is_none());
+        std::fs::remove_file(ballast).unwrap();
+        let mut inconsistent = WriteBatch::default();
+        artifact_rdf::publish(&db, &mut inconsistent, &artifact("artifact:b")).unwrap();
+        commit(&db, inconsistent).unwrap();
+        assert_eq!(
+            artifact_rdf::upgrade(&db, 512 * 1024 * 1024, 8 * 1024 * 1024)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        let mut repair = WriteBatch::default();
+        let mut rdf = rdf_index::RdfWrite::new(&db).unwrap();
+        artifact_rdf::retire(&db, &mut rdf, &mut repair, "artifact:b").unwrap();
+        rdf.finish(&mut repair).unwrap();
+        commit(&db, repair).unwrap();
+        let next = rdf_index::required_counter(&db, "rdf:next").unwrap();
+        drop(db);
+        let db = DB::open_default(dir.path()).unwrap();
+        artifact_rdf::upgrade(&db, 512 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        assert!(db.get("rdf:graph:artifact:b").unwrap().is_some());
+        assert!(rdf_index::required_counter(&db, "rdf:next").unwrap() > next);
+        let count = rdf_index::required_counter(&db, "rdf:term-count").unwrap();
+        artifact_rdf::upgrade(&db, 512 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        assert_eq!(
+            rdf_index::required_counter(&db, "rdf:term-count").unwrap(),
+            count
+        );
+        db.delete(artifact_rdf::JOB.checkpoint).unwrap();
+        assert_eq!(
+            artifact_rdf::upgrade(&db, 512 * 1024 * 1024, 8 * 1024 * 1024)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        db.put("store_format", super::super::FORMAT).unwrap();
+        assert_eq!(
+            artifact_rdf::upgrade(&db, 512 * 1024 * 1024, 8 * 1024 * 1024)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+    }
+
+    #[test]
     fn upgrade_resumes_durable_native_pages_after_reopen_and_rejects_missing_state() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
@@ -395,6 +492,18 @@ mod tests {
         batch.put("artifact:b", br#"{"record_ids":false}"#);
         commit(&db, batch).unwrap();
         fence(&db).unwrap();
+        assert_eq!(
+            step(&db, Progress::default(), PAGE_ENTRIES)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+        assert!(db.get(key(&artifact("artifact:a"))).unwrap().is_none());
+        let mut invalid = artifact("artifact:b");
+        invalid.byte_length = 1;
+        let mut batch = WriteBatch::default();
+        super::super::put(&mut batch, &invalid.id, &invalid);
+        commit(&db, batch).unwrap();
         assert_eq!(
             step(&db, Progress::default(), PAGE_ENTRIES)
                 .unwrap_err()

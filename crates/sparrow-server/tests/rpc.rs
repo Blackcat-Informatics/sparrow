@@ -197,7 +197,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/37"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/48"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -3041,7 +3041,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/36");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/47");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -3258,7 +3258,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/35")
+                Some("sparrow.store/46")
             );
         })
         .await;
@@ -3622,7 +3622,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/35"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/46"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -8603,6 +8603,66 @@ fn cli(socket: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> purrdf_lex::json::
         String::from_utf8_lossy(&output.stderr)
     );
     purrdf_lex::json::read_slice(&output.stdout, purrdf_lex::json::Limits::default()).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recordless_graph_metadata_and_independent_coverage_reach_cli_and_mcp() {
+    use purrdf_lex::json::{self, Object};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+            let empty = client
+                .ingest("empty-graph-input", "empty-graph", wire::Format::Log, b"")
+                .await
+                .unwrap();
+            let args = Object::new()
+                .with("store_id", store.clone())
+                .with(
+                    "query",
+                    "SELECT ?artifact WHERE { ?artifact a <urn:sparrow:vocab:Artifact> }",
+                )
+                .with(
+                    "scope",
+                    Object::new()
+                        .with("kind", "selection")
+                        .with("store_id", store.clone())
+                        .with("artifact_ids", vec![empty.id.clone()]),
+                );
+            let path = dir.path().join("empty-graph.json");
+            std::fs::write(&path, json::write_compact(&args.clone().into())).unwrap();
+            let cli = cli(&socket, &["sparql", path.to_str().unwrap()]);
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let response = mcp.tool(2, "sparql_query", args.into()).await;
+            assert_eq!(response["isError"].as_bool(), Some(false), "{response:?}");
+            let mcp = &response["structuredContent"];
+            assert_eq!(cli["rows"], mcp["rows"]);
+            assert_eq!(cli["coverage"], mcp["coverage"]);
+            assert_eq!(
+                cli["coverage"]["known_selected_records"].as_str(),
+                Some("0")
+            );
+            assert_eq!(
+                cli["coverage"]["known_selected_artifacts"].as_str(),
+                Some("1")
+            );
+            assert_eq!(
+                cli["coverage"]["artifact_diagnostic_unknown"].as_str(),
+                Some("0")
+            );
+            assert_eq!(
+                cli["rows"]["native_result"]["results"]["bindings"][0]["artifact"]["value"]
+                    .as_str(),
+                Some(format!("urn:sparrow:{}", empty.id).as_str())
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

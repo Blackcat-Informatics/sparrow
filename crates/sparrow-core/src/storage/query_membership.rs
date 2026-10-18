@@ -16,6 +16,7 @@ pub(super) struct SelectionMembers {
     pub records: BTreeMap<String, u64>,
     pub artifacts: BTreeSet<String>,
     pub parents: BTreeSet<String>,
+    pub recordless: BTreeMap<String, u64>,
     visits: usize,
 }
 
@@ -167,6 +168,11 @@ impl Writer {
                         "RESOURCE_LIMIT",
                         "selected artifact exceeds 100000 record references",
                     ));
+                }
+                if artifact.record_ids.is_empty() {
+                    resolved
+                        .recordless
+                        .insert(member.clone(), artifact.received_at);
                 }
                 resolved.artifacts.insert(member.clone());
                 resolved.parents.insert(member.clone());

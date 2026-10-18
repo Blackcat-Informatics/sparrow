@@ -247,8 +247,9 @@ impl Writer {
                 completed: journal.removed_at.is_some(),
             },
         );
-        if self.db.get("store_format")?.as_deref() != Some(super::consumption::TAIL_FORMAT) {
-            batch.put("store_format", FORMAT);
+        if super::writer_format::read(&self.db)?.as_deref() != Some(super::consumption::TAIL_FORMAT)
+        {
+            super::writer_format::stage(&self.db, batch, FORMAT)?;
         }
         Ok(())
     }

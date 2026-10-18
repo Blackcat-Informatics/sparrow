@@ -7,12 +7,14 @@ use super::{Catalog, Error, json, parse, read_field};
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch, WriteOptions};
 
 type Publish = fn(&DB, &str, &[u8], usize, &mut WriteBatch) -> Result<(), Error>;
+type PageAdmission<'a> = Option<&'a dyn Fn(&WriteBatch) -> Result<(), Error>>;
 
 pub(super) struct Job {
     pub checkpoint: &'static str,
     pub source: &'static str,
     pub target: &'static [u8],
     pub page_bytes: usize,
+    pub page_entries: usize,
     pub charge: fn(&[u8]) -> Result<usize, Error>,
     pub publish: Publish,
 }
@@ -49,7 +51,7 @@ impl Catalog for Progress {
     }
 }
 
-pub(super) fn run(db: &DB, job: &Job) -> Result<(), Error> {
+pub(super) fn run(db: &DB, job: &Job, admit: PageAdmission<'_>) -> Result<(), Error> {
     loop {
         let bytes = db.get(job.checkpoint)?.ok_or_else(|| {
             Error::new(
@@ -70,7 +72,7 @@ pub(super) fn run(db: &DB, job: &Job) -> Result<(), Error> {
         if progress.complete {
             return Ok(());
         }
-        step(db, job, progress, 512)?;
+        step(db, job, progress, job.page_entries, admit)?;
     }
 }
 
@@ -102,6 +104,7 @@ pub(super) fn step(
     job: &Job,
     mut progress: Progress,
     maximum: usize,
+    admit: PageAdmission<'_>,
 ) -> Result<(), Error> {
     if progress
         .after
@@ -172,6 +175,9 @@ pub(super) fn step(
         progress.after = None;
     }
     super::put(&mut batch, job.checkpoint, &progress);
+    if let Some(admit) = admit {
+        admit(&batch)?;
+    }
     commit(db, batch)
 }
 
@@ -184,6 +190,7 @@ mod tests {
         source: "record:",
         target: b"test-range:",
         page_bytes: 4,
+        page_entries: 512,
         charge: |bytes| Ok(bytes.len()),
         publish: |_, identity, bytes, _, batch| {
             if bytes == b"bad" {
@@ -203,7 +210,7 @@ mod tests {
         let mut batch = WriteBatch::default();
         seed(&db, &JOB, &mut batch).unwrap();
         commit(&db, batch).unwrap();
-        step(&db, &JOB, Progress::default(), 512).unwrap();
+        step(&db, &JOB, Progress::default(), 512, None).unwrap();
         assert_eq!(db.get("test-range:record:a").unwrap().unwrap(), b"aa");
         assert!(db.get("test-range:record:b").unwrap().is_none());
         let progress =
@@ -212,14 +219,14 @@ mod tests {
         assert!(!progress.complete);
         drop(db);
         let db = DB::open_default(dir.path()).unwrap();
-        run(&db, &JOB).unwrap();
+        run(&db, &JOB, None).unwrap();
         assert_eq!(db.get("test-range:record:b").unwrap().unwrap(), b"bbb");
         assert!(seed(&db, &JOB, &mut WriteBatch::default()).is_err());
         let wrong = Progress {
             after: Some("artifact:a".into()),
             complete: false,
         };
-        assert!(step(&db, &JOB, wrong, 512).is_err());
+        assert!(step(&db, &JOB, wrong, 512, None).is_err());
         db.delete("test-range:record:a").unwrap();
         db.put("record:b", b"bad").unwrap();
         let mut batch = WriteBatch::default();
@@ -227,7 +234,7 @@ mod tests {
         commit(&db, batch).unwrap();
         let mut wide = JOB;
         wide.page_bytes = 8;
-        assert!(step(&db, &wide, Progress::default(), 512).is_err());
+        assert!(step(&db, &wide, Progress::default(), 512, None).is_err());
         assert!(db.get("test-range:record:a").unwrap().is_none());
         assert!(
             Progress::decode(&parse(&db.get(JOB.checkpoint).unwrap().unwrap()).unwrap())
@@ -237,7 +244,9 @@ mod tests {
         );
         db.put("record:a", b"oversized").unwrap();
         assert_eq!(
-            step(&db, &JOB, Progress::default(), 512).unwrap_err().code,
+            step(&db, &JOB, Progress::default(), 512, None)
+                .unwrap_err()
+                .code,
             "RESOURCE_LIMIT"
         );
     }

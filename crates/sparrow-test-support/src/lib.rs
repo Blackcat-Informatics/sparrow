@@ -116,6 +116,24 @@ pub fn remove_tail_range_index(db: &rocksdb::DB) -> Result<(), rocksdb::Error> {
     db.write(batch)
 }
 
+/// Remove only the completed artifact-RDF checkpoint from a fixture with no
+/// artifact graph owners. Legacy fixtures must retire owners through production
+/// maintenance before restoring any original pre-feature catalog bytes.
+pub fn remove_artifact_rdf_upgrade(db: &rocksdb::DB) -> Result<(), Box<dyn std::error::Error>> {
+    for prefix in [
+        b"artifact-rdf:".as_slice(),
+        b"rdf:graph:artifact:".as_slice(),
+    ] {
+        if let Some(row) = db.prefix_iterator(prefix).next()
+            && row?.0.starts_with(prefix)
+        {
+            return Err("legacy fixture still owns artifact RDF; retire it through Store before removing the checkpoint".into());
+        }
+    }
+    db.delete("artifact-rdf-index-upgrade")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod observer_tests {
     #[test]
