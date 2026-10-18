@@ -27,8 +27,36 @@ ordinary imports invent no Stream. Metadata-layer exclusion preserves membership
 Private record preparation now performs data admission at its final atomic write
 boundary, after progress and authority metadata have joined the batch.
 
-The running development service remains schema 54. Schema-55 restored-copy
-migration, ordinary-runtime packaging and live adoption are not yet qualified.
+Signed source `01626f1a7b39efb14d7e215b3b9bb9ac935f89ab` passed its normal
+full commit hook: release Clippy with warnings denied, all workspace tests
+(including 25 core unit, 183 storage and 64 RPC tests), census self-tests and
+280 pinned ownership jobs with zero exceptions. Tests cover default-union
+deduplication, named occurrence contexts, all three stream origin kinds,
+metadata-layer exclusion, private graph migration, corrupt ownership and missing
+terms, resumable reopening, and provenance lifetime under pins and retirement.
+
+A synchronized, hash-verified 112-file copy of the closed schema-54 qualification
+store migrated from format 59 to 70 through the existing offline recovery example.
+No listeners or intake workers were started. All 217 records and 36 complete
+artifacts retained identical byte lengths and native content digests across 253
+targets and 36,005,590 logical read bytes, including artifact/record overlap.
+Native RDF inspection retained all other projection/diagnostic fields and counts;
+metadata primary rows increased by 2 for 195 records, 5 for 9 producer records,
+and 6 for 13 tail/receiver records. Reopening returned identical target receipts.
+Every original qualification-store file hash remained unchanged after both runs.
+
+Evidence under `.stage/native-graph-integration/` is
+`source-provenance-commit.log`, `schema55-private-copy.{py,json}`,
+`schema55-recovery-build.{jsonl,log}`, `schema55-copy-verify.py`,
+`schema55-copy-all-bytes{,-first}.json`, and
+`schema55-copy-qualified{,-first}.json`. The explicitly selected recovery image
+has SHA-256 `56ec7d1a9c8df4fb2140a5b13db82db5f0773f55e90222860012ff7ed1af32b4`
+and the dev-only `test-support` feature; its fixture-retirement entrypoint was not
+invoked. These finite offline checks do not qualify an ordinary runtime image.
+
+The running development service remains schema 54. Schema-55 native query
+qualification on this restored copy, ordinary-runtime packaging and live adoption
+are not yet qualified.
 This implementation does not complete text/SPARQL relations, governed public
 EXPLAIN, forced bounded physical reclamation or production-volume acceptance.
 
