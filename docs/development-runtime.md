@@ -3,13 +3,66 @@
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-55 adoption below. It uses
-schema 55 and store format 70. The stable installed
+after the approved checkpoint recovery and schema-57 adoption below. It uses
+schema 57 and store format 70. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
-`f715df8`; see [schema-55 live adoption](#schema-55-live-adoption) for
+`974160f`; see [schema-57 live adoption](#schema-57-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Schema-57 live adoption
+
+Signed source `974160f2d397977f10b6e06e1898a153793203c4` includes the shared
+scope receipts from `5c40cc8` and graph/context source qualification below. The
+explicit default daemon/client build emitted `core_features=[]`; both selected
+artifacts were copied to exclusive versioned paths and hash-verified before any
+alias change:
+
+- `~/.local/libexec/sparrow/sparrowd-schema57-974160f`, SHA-256
+  `33e499370c14866b63bb4b919572d5370e3290320e528480c5bd97a50415de73`.
+- `~/.local/libexec/sparrow/sparrow-schema57-974160f`, SHA-256
+  `c1b4e2ae911884b2a35c8ad56501b40e4b9e884318e3168c93c182d366dc442f`.
+
+The private default-image fixture passed CLI/MCP record, text, key, value,
+context and native graph scope parity, actual pin revision/deadline capture,
+renewal/release and retained graph replay. It ended with three records, no pins
+and no retained query handles, then shut down cleanly. A fresh watch-free store
+correctly uses authority-family format 68; the first harness wrongly expected
+the live store's format 70. A startup probe established the difference, and the
+corrected fixture passed without a product change. Failed trial/probe artifacts
+remain under `schema57-scope-*` for review.
+
+Configuration and unit hashes matched their previous adoption receipts. The
+qualified daemon received only `cap_net_bind_service=ep`. The old service stopped
+cleanly before an exclusively locked, hash-verified 111-file closed backup was
+made at `schema57-pre-adoption-closed-backup-20261018`. Each stable alias then
+switched atomically to its qualified image. The enabled persistent unit started
+at 2026-10-18 05:31:21 MDT (11:31:21 UTC), PID 858590, on the unchanged TCP and
+Unix endpoints. No checkpoint recovery was repeated.
+
+Live TCP and Unix agree on schema 57, format 70, the original
+`store:46c88e949ccec658600b66c7becd5bb7`, 217 retained records and healthy watches.
+Both original recovered generation receipts are exactly equal to their schema-55
+receipts, including declarations, clocks, gaps and offsets 37/0. All primary query
+surfaces share the same frozen scope for a retained selected record. SELECT,
+ASK and CONSTRUCT each passed in one page; DESCRIBE passed through 16 pages over
+each endpoint, with exact native certainty and unchanged scope on continuation.
+The schema-55 client refuses discovery against schema 57. Live MCP native ASK,
+context and record results carry the same scope as both CLI endpoints.
+
+All 253 current artifact/record targets were fetched over typed TCP in ranges of
+at most 1 MiB. Their full BLAKE3 identities match the schema-55 complete-copy
+baseline: 36,005,590 verified bytes, including overlapping artifact and record
+ranges. All retained query handles returned to zero. The closed backup remains
+unopened; this adoption does not establish production-volume, physical-reclamation,
+quota or host-reboot acceptance.
+
+Evidence under `.stage/native-graph-integration/` includes `schema57-runtime-*`,
+`schema57-scope-fixture-qualified.json`, `schema57-adoption-prerequisites.json`,
+`schema57-pre-adoption-closed-backup.json`, `schema57-readiness-attempts.json`,
+`schema57-live-scope-qualified.json`, `schema57-live-mcp-qualified.json`,
+`schema57-live-bytes-qualified.json` and `schema57-final-readback.json`.
 
 ## Schema-57 graph/context scope source qualification
 
@@ -34,9 +87,8 @@ selected and direction-limited context replies preserve their requested scope.
 Evidence is `.stage/native-graph-integration/graph-context-scope-full-check.log`;
 the ordinary signed-commit hook records its gate in `graph-context-scope-commit.log`.
 
-This is source qualification; schema 57 runtime packaging/adoption remains pending.
-The installed service is still schema 55 as described above. No recovery has been
-repeated. Scope receipts do not finish native text relations, governed EXPLAIN,
+The default-image qualification and adoption above are separate from these source
+gates. Scope receipts do not finish native text relations, governed EXPLAIN,
 correlation, bounded physical reclamation or production acceptance.
 
 ## Schema-56 scope receipt source qualification
@@ -59,8 +111,8 @@ jobs and no distinct exceptions. Evidence is
 `.stage/native-graph-integration/scope-full-check.log`; the ordinary signed-commit
 hook records its independent gate in `scope-commit.log`.
 
-This is source qualification. Schema 56 has not been packaged or adopted by the
-running service. A fresh TCP/Unix readback in `scope-pre-runtime-readback.json`
+Schema 56 was not installed as a separate version; schema 57 includes this work.
+The earlier TCP/Unix readback in `scope-pre-runtime-readback.json`
 confirmed schema 55, format 70, 217 records, healthy watches and exact equality
 of both original recovered generation receipts. No recovery was repeated.
 

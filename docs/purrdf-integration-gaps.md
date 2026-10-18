@@ -5,11 +5,11 @@ scope. Sparrow must retain native semantics and bounded reads while resolving th
 
 ## Current integration state
 
-Schema 55 is deployed on format 70 with native SELECT, ASK, CONSTRUCT and
+Schema 57 is deployed on format 70 with native SELECT, ASK, CONSTRUCT and
 DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
-[Development runtime](development-runtime.md#schema-55-live-adoption).
+[Development runtime](development-runtime.md#schema-57-live-adoption).
 Native text relations, correlation, public measured explanation, bounded physical
 reclamation and production resource/turnover acceptance remain required. The
 earlier qualification evidence below records how the deployed graph surface grew.
@@ -18,7 +18,8 @@ Source schema 57 shares frozen logical scope receipts across native graph,
 context and record/text/key/value captures. Graph receipt ownership uses the
 existing native owned-workspace seam; query certainty and coverage retain their
 original owners. [Source qualification](development-runtime.md#schema-57-graphcontext-scope-source-qualification)
-is separate from runtime adoption and the remaining requirements listed above.
+and [default-image live adoption](development-runtime.md#schema-57-live-adoption)
+are separately recorded; the remaining requirements listed above are still open.
 
 ## Query-scoped stored text producers
 
