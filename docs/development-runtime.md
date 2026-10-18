@@ -5,11 +5,56 @@ configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
 socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
 after the approved checkpoint recovery and schema-60 adoption below. It uses
 schema 60 and store format 92. The stable installed
-client is `~/.local/bin/sparrow`. The latest installed daemon source is
+client is `~/.local/bin/sparrow`, now built from `819ab66`; see
+[capability client adoption](#capability-client-adoption). The latest installed daemon source is
 `f3c8a63`; see [schema-60 live adoption](#schema-60-live-adoption) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Capability client adoption
+
+Signed source `819ab66d2f17a89337732135d03e27f408e6624e` adds the previously
+documented but missing CLI `capabilities` command through the same owner as MCP.
+The capability document now identifies the Cap'n Proto protocol and both
+supported endpoint kinds, correcting the old Unix-only label for TCP callers.
+It supplies accepted formats through generated enum introspection and the
+existing SDK label owner, and shares its occurrence namespace with RDF metadata
+generation. Source-time tool descriptions include native whole-log captures.
+The tool catalog advertises the 37 implemented operations; governed EXPLAIN
+and stored-text SPARQL relations remain required upstream integrations.
+
+The source's normal commit hook passed formatting, release Clippy with warnings
+denied, 28 core unit tests, 189 storage tests, 67 RPC tests, other workspace tests,
+seeded census self-tests and all 291 ownership jobs with no distinct exceptions.
+The new RPC regression compares CLI/MCP documents over Unix/TCP, checks closed
+input refusal and format-label round trips, and uses the advertised vocabulary
+to query an ingested record through native SPARQL. A separate source audit finds
+exact agreement between the documented MCP table and all 37 registered tools.
+CLI examples now use actual endpoint, mutation identity, byte-file and pin syntax;
+obsolete unfinished-tail claims are replaced by the implemented contracts.
+
+An explicit default client-only release build reports `core_features=[]`.
+The exclusive immutable copy is
+`~/.local/libexec/sparrow/sparrow-schema60-819ab66`, SHA-256
+`4c115c91826421fc069f085d8053bf6416daeccc190267d8827406f1de218050`.
+Its stable client alias was replaced atomically on 2026-10-18 after checking
+the previous installed identity. The earlier client remains available unchanged.
+No runtime dependency, RPC schema or store format changed.
+
+The daemon alias/image remain the schema-60 `f3c8a63` artifact below; the enabled
+service remains PID 4001300 with its original 08:53:16 MDT start. No daemon
+lifecycle action was performed. Live CLI and MCP over both endpoint kinds return
+the same static capability fields and certified store/profile identities, and
+their tool catalog equals `tools/list`. Status remains schema 60, format 92,
+the original store, 217 records and healthy watches. All five read-handle and
+retained-byte families return to zero. These reads do not establish the remaining
+physical reclamation, production resource/turnover or host-reboot requirements.
+
+Evidence is under `.stage/native-graph-integration/capability-*`: focused tests,
+documentation audit, census and complete normal commit hook; signed build-source
+identity and separate default-image build; installed client hash/previous image;
+and four-adapter live qualification with unchanged daemon identity.
 
 ## Schema-60 live adoption
 
