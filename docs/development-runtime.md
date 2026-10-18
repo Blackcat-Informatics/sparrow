@@ -1,13 +1,66 @@
 # Development runtime
 
-The current installed server is the enabled persistent user unit
-`sparrow.service`, serving typed Cap'n Proto at `0.0.0.0:518` and the existing
-private Unix socket. It uses schema 50 and store format 37. The stable installed
+The installed server is the enabled persistent user unit `sparrow.service`,
+configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
+socket. It is running and both typed endpoints were verified on 2026-10-17 after
+the approved checkpoint recovery below. It uses
+schema 50 and store format 37. The stable installed
 client is `~/.local/bin/sparrow`. The latest installed daemon source is
 `28e3915`; see [logical retention accounting](#logical-retention-accounting) for
 its adoption evidence and [persistent service adoption](#persistent-service-adoption)
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
+
+## Device-identity discontinuity and approved recovery
+
+A startup attempt on 2026-10-17 exited with the native guard:
+`active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery`.
+The two active generations of the owned synthetic watch
+`development-tail-8a45378` captured root device 56, inode 55520248; the current
+root reports device 37 and the same inode. Revision 7, source and JSONL
+interpretation agree. Matching inodes do not establish producer continuity
+across a changed device identity.
+
+Generation `file-generation:91d7d7c4e3e638f9e0de28992a37fae9` has offset 37
+and one accepted record; `file-generation:b0236e4886ec59daabdadc86a0267088`
+has offset zero and no records. The original declarations and checkpoints
+were initially left unchanged. A read-only native RocksDB inspection verified that every
+regular file in the source store had the same SHA-256 before and after inspection.
+
+A private-copy trial used the existing `tail_discontinue` API with
+`identity_changed`. It preserved both declarations, offsets, record counts and
+original start clocks, and left live-record/chunk/projection/pin counts unchanged.
+This would permanently end the old generations. A subsequent watcher run may
+read the current files as new occurrences; it cannot claim uninterrupted capture.
+The trial did not change the source store or start watchers/listeners.
+
+After explicit approval, a second private-copy trial verified the guarded helper
+twice, including an idempotent retry without renewing terminal expiry. The source
+store's regular-file fingerprints remained unchanged. Before applying recovery,
+an exclusive native store lock protected a complete closed copy at
+`.stage/native-graph-integration/runtime-pre-recovery-backup-20261017`; its
+regular-file SHA-256 map matched the source exactly.
+
+Recovery was applied at UTC milliseconds `1792290770987`. Both old generations
+now declare `identity_changed`; declarations, offsets, accepted record counts
+and start clocks were preserved. Live records remained 212, payload chunks 213,
+JSON projections 208 and active pins zero across that operation. The persistent
+unit then started successfully. Typed status over TCP and the private Unix socket
+reported the original store `store:46c88e949ccec658600b66c7becd5bb7`, schema 50
+and format 37. Native socket inspection confirmed the listener at `0.0.0.0:518`.
+This closes the old generations; it does not certify uninterrupted producer
+continuity or exclude future re-ingestion of files still present in the watch.
+
+Local evidence is under `.stage/native-graph-integration/`:
+`runtime-start-failure.log`, `catalog-probe-run.json`,
+`checkpoint-trial.log`, `checkpoint-trial-result.json`,
+`checkpoint-recovery-qualified.json`, `runtime-pre-recovery-backup.json`,
+`checkpoint-recovery-apply.log`, `runtime-recovered-status.json` and
+`runtime-recovered-unix-status.json`.
+The installed daemon remains `28e3915`; the qualified PurRDF integration commit
+`a664689` has not been deployed. Neither its full `make check` pass nor the
+copy-only recovery alone establishes live service availability; the separate
+post-recovery typed status calls do.
 
 ## Independent backup restoration
 

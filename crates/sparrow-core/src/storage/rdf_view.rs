@@ -16,7 +16,11 @@ use rocksdb::{DB, DBIteratorWithThreadMode, Direction, IteratorMode, Snapshot};
 use std::{collections::BTreeSet, sync::Arc};
 
 mod budget;
+mod query;
+mod scope;
 use budget::{Budget, Reservation};
+pub use query::{ScopedSparqlResult, SparqlRead};
+pub use scope::RdfScopeCoverage;
 
 /// Sticky operational root cause shared by native readers and their guards.
 pub type ReadError = Arc<Error>;
@@ -195,7 +199,16 @@ impl<'a> StoredRdfView<'a> {
         limits: RdfReadLimits,
         graph_ids: &[String],
     ) -> Result<Self, ReadError> {
-        let budget = Budget::new(limits)?;
+        Self::new_cancellable(db, limits, graph_ids, crate::QueryCancellation::default())
+    }
+
+    fn new_cancellable(
+        db: &'a DB,
+        limits: RdfReadLimits,
+        graph_ids: &[String],
+        cancellation: crate::QueryCancellation,
+    ) -> Result<Self, ReadError> {
+        let budget = Budget::new_cancellable(limits, cancellation)?;
         let scope = Arc::new(budget.reserve(4096 + (graph_ids.len() as u64).saturating_mul(256))?);
         let mut view = Self {
             snapshot: db.snapshot(),
@@ -769,17 +782,7 @@ impl Store {
                 "RDF selection requires 1..1000 record IDs",
             )));
         }
-        let _lease = self.rdf_read.try_lock().map_err(|error| {
-            Arc::new(match error {
-                std::sync::TryLockError::WouldBlock => Error::new(
-                    "RESOURCE_LIMIT",
-                    "store already has an active RDF snapshot; retry after its lease ends",
-                ),
-                std::sync::TryLockError::Poisoned(_) => {
-                    Error::new("STORAGE_FAILURE", "RDF snapshot admission owner poisoned")
-                }
-            })
-        })?;
+        let _lease = self.rdf_read_lease()?;
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new(&db, limits, &[])?;
@@ -846,7 +849,6 @@ impl Store {
                 )
                 .map_err(|e| view.budget.fail(e))?
         };
-        let mut graphs = BTreeSet::new();
         for record in records {
             writer
                 .validate_event_record(&record)
@@ -857,53 +859,7 @@ impl Store {
                     "RDF selection contains expired evidence",
                 )));
             }
-            if layers.diagnostic
-                && let Some(owner) = super::diagnostic::graph_owner(&record)
-            {
-                graphs.insert(owner);
-            }
-            if layers.metadata {
-                graphs.insert(record.id);
-            }
-            if layers.content && !record.rdf_projection_id.is_empty() {
-                let _decode = view.budget.reserve(4096 * 64)?;
-                let key = format!("rdf:state:{}", record.rdf_projection_id);
-                let bytes = view.point(key.as_bytes(), 4096)?.ok_or_else(|| {
-                    view.budget.fail(Error::new(
-                        "STORAGE_FAILURE",
-                        "RDF projection state missing",
-                    ))
-                })?;
-                let state = super::parse(&bytes).map_err(|e| view.budget.fail(e))?;
-                let status: String =
-                    super::read_field(&state, "state").map_err(|e| view.budget.fail(e))?;
-                match status.as_str() {
-                    "complete" => {
-                        graphs.insert(record.rdf_projection_id);
-                    }
-                    "failed" => {
-                        return Err(view.budget.fail(Error::new(
-                            "INDEX_NOT_READY",
-                            "selected record RDF projection failed; inspect its diagnostic",
-                        )));
-                    }
-                    _ => {
-                        return Err(view.budget.fail(Error::new(
-                            "STORAGE_FAILURE",
-                            "invalid RDF projection state",
-                        )));
-                    }
-                }
-            }
-        }
-        for id in graphs {
-            let owner = view
-                .term_id_by_value(&TermValue::iri(rdf_index::graph_iri(&id)))?
-                .ok_or_else(|| {
-                    view.budget
-                        .fail(Error::new("STORAGE_FAILURE", "RDF graph owner missing"))
-                })?;
-            view.owners.insert(ordinal(owner));
+            view.include_record(&record, layers, true, &mut RdfScopeCoverage::default())?;
         }
         drop(writer);
         purrdf::dataset_view::checkpointed_drain(&view, operation).map_err(|failure| failure.error)

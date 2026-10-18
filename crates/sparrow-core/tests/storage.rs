@@ -12299,6 +12299,353 @@ fn artifact_filter_pages_freeze_coverage_and_bind_all_filters() {
     );
 }
 
+#[test]
+fn scoped_sparql_uses_native_read_forms_bindings_and_governor_outcomes() {
+    use purrdf::{
+        SparqlRequest, TermValue,
+        sparql::{FallibleSparqlError, QueryGovernors},
+    };
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits, SparqlRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("scoped-sparql", "scoped", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    let scope = record_page_scope("scoped", 1);
+    let governors = QueryGovernors::METERED
+        .with_fuel(1_000_000)
+        .with_max_answers(100)
+        .with_max_intermediate_cells(10_000)
+        .with_max_scratch_bytes(1024 * 1024);
+    let bindings = [(
+        "predicate".into(),
+        TermValue::iri("urn:sparrow:vocab:payload"),
+    )];
+    let mut read = SparqlRead {
+        scope: &scope,
+        layers: RdfGraphLayers::ALL,
+        request: SparqlRequest {
+            query: "SELECT ?record WHERE { ?record ?predicate ?payload }",
+            base_iri: None,
+            substitutions: &bindings,
+        },
+        governors: &governors,
+        limits: RdfReadLimits::default(),
+    };
+    let cancellation = QueryCancellation::default();
+    let result = store.sparql_query(&read, 2, &cancellation).unwrap();
+    assert_eq!(result.store_id, store.store_id().unwrap());
+    assert_eq!(result.as_of, 2);
+    assert_eq!(result.coverage.selected_records, 2);
+    assert_eq!(
+        result.outcome.unwrap().result.solutions().unwrap().1.len(),
+        2
+    );
+    for query in [
+        "ASK { ?record <urn:sparrow:vocab:payload> ?payload }",
+        "CONSTRUCT { ?record <urn:copy:payload> ?payload } WHERE { ?record <urn:sparrow:vocab:payload> ?payload }",
+        "DESCRIBE ?record WHERE { ?record <urn:sparrow:vocab:payload> ?payload }",
+    ] {
+        read.request = SparqlRequest {
+            query,
+            base_iri: None,
+            substitutions: &[],
+        };
+        let result = store
+            .sparql_query(&read, 2, &cancellation)
+            .unwrap()
+            .outcome
+            .unwrap()
+            .result;
+        if query.starts_with("ASK") {
+            assert_eq!(result.boolean(), Some(true));
+        } else {
+            assert!(result.graph().is_some_and(|graph| graph.quad_count() > 0));
+        }
+    }
+    read.request.query = "SELECT ?record WHERE { ?record <urn:sparrow:vocab:payload> ?payload }";
+    let exhausted = governors.clone().with_fuel(0);
+    read.governors = &exhausted;
+    assert!(matches!(
+        store.sparql_query(&read, 2, &cancellation).unwrap().outcome,
+        Err(FallibleSparqlError::BudgetExhausted { .. })
+    ));
+    read.governors = &governors;
+    read.request.query = "INSERT DATA { <urn:s> <urn:p> <urn:o> }";
+    assert!(matches!(
+        store.sparql_query(&read, 2, &cancellation).unwrap().outcome,
+        Err(FallibleSparqlError::Query { .. })
+    ));
+}
+
+#[test]
+fn rdf_scope_captures_shared_selection_and_freezes_after_pin_release() {
+    use purrdf::{DatasetView, FallibleDatasetView};
+    use sparrow_core::{QueryCancellation, QuerySelection, RdfGraphLayers, RdfReadLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("rdf-scope-a", "scoped", "json", b"{}", 10)
+        .unwrap();
+    let b = store
+        .ingest("rdf-scope-b", "scoped", "json", b"{}", 20)
+        .unwrap();
+    store
+        .ingest("rdf-scope-other", "other", "json", b"{}", 20)
+        .unwrap();
+    let pin = store
+        .pin(
+            "rdf-scope-pin",
+            "scoped",
+            &[a.id.clone(), b.record_ids[0].clone()],
+            40,
+            20,
+        )
+        .unwrap();
+    let mut scope = record_page_scope("scoped", 1);
+    scope.received_from = 10;
+    scope.received_before = 21;
+    let cancellation = QueryCancellation::default();
+    let live = store
+        .with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            30,
+            RdfReadLimits::default(),
+            &cancellation,
+            |view, coverage| {
+                assert_eq!(coverage.selected_records, 2);
+                assert_eq!(coverage.content_ready, 2);
+                assert!(coverage.complete());
+                view.named_graphs().collect::<Vec<_>>()
+            },
+        )
+        .unwrap();
+    scope.selection = QuerySelection::Evidence(vec![
+        a.id.clone(),
+        b.record_ids[0].clone(),
+        a.record_ids[0].clone(),
+    ]);
+    let explicit = store
+        .with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            30,
+            RdfReadLimits::default(),
+            &cancellation,
+            |view, coverage| {
+                assert_eq!(coverage.selected_records, 2);
+                view.named_graphs().collect::<Vec<_>>()
+            },
+        )
+        .unwrap();
+    assert_eq!(live, explicit);
+    scope.selection = QuerySelection::Pin {
+        id: pin.id.clone(),
+        expected_revision: Some(pin.revision),
+    };
+    store
+        .with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            31 * DAY,
+            RdfReadLimits::default(),
+            &cancellation,
+            |view, coverage| {
+                assert_eq!(coverage.selected_records, 2);
+                let sequence = view.snapshot_sequence_number();
+                let before = view.quads().collect::<Vec<_>>();
+                store
+                    .release_retry("rdf-scope-release", &pin.id, 31 * DAY)
+                    .unwrap();
+                store.expire(31 * DAY).unwrap();
+                store
+                    .ingest("rdf-scope-new", "scoped", "json", b"{}", 31 * DAY)
+                    .unwrap();
+                assert_eq!(view.snapshot_sequence_number(), sequence);
+                assert_eq!(before, view.quads().collect::<Vec<_>>());
+                assert!(matches!(
+                    view.operation_status(),
+                    purrdf::ViewOperationStatus::Ready { .. }
+                ));
+            },
+        )
+        .unwrap();
+    assert!(
+        store
+            .with_rdf_scope(
+                &scope,
+                RdfGraphLayers::ALL,
+                31 * DAY,
+                RdfReadLimits::default(),
+                &cancellation,
+                |_, _| ()
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn rdf_scope_refuses_exhaustion_and_cancellation_without_callback_prefix() {
+    use sparrow_core::{QueryCancellation, RdfGraphLayers, RdfReadLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("rdf-scope-refusal", "scoped", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    let mut scope = record_page_scope("scoped", 1);
+    scope.scan_budget = 1;
+    let called = std::cell::Cell::new(false);
+    let cancellation = QueryCancellation::default();
+    let error = store
+        .with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            2,
+            RdfReadLimits::default(),
+            &cancellation,
+            |_, _| called.set(true),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "RESOURCE_LIMIT");
+    assert!(!called.get());
+    scope.scan_budget = 100;
+    cancellation.cancel();
+    assert_eq!(
+        store
+            .with_rdf_scope(
+                &scope,
+                RdfGraphLayers::ALL,
+                2,
+                RdfReadLimits::default(),
+                &cancellation,
+                |_, _| called.set(true)
+            )
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+    assert!(!called.get());
+    let cancellation = QueryCancellation::default();
+    assert_eq!(
+        store
+            .with_rdf_scope(
+                &scope,
+                RdfGraphLayers::ALL,
+                2,
+                RdfReadLimits::default(),
+                &cancellation,
+                |_, _| {
+                    cancellation.cancel();
+                    "must not escape the fail-aware boundary"
+                }
+            )
+            .unwrap_err()
+            .code,
+        "CANCELLED"
+    );
+    store
+        .with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            2,
+            RdfReadLimits::default(),
+            &QueryCancellation::default(),
+            |_, coverage| assert_eq!(coverage.selected_records, 2),
+        )
+        .unwrap();
+}
+
+#[test]
+fn rdf_scope_reports_content_and_unknown_diagnostic_coverage_independently() {
+    use sparrow_core::{
+        DiagnosticDimension, QueryAlternatives, QueryCancellation, RdfGraphLayers, RdfReadLimits,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("rdf-scope-coverage-good", "scoped", "json", b"{}", 1)
+        .unwrap();
+    store
+        .ingest("rdf-scope-coverage-bad", "scoped", "json", b"{", 2)
+        .unwrap();
+    store
+        .ingest("rdf-scope-coverage-raw", "scoped", "log", b"raw\n", 3)
+        .unwrap();
+    let mut scope = record_page_scope("scoped", 1);
+    let cancellation = QueryCancellation::default();
+    store
+        .with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            4,
+            RdfReadLimits::default(),
+            &cancellation,
+            |_, coverage| {
+                assert_eq!(
+                    (
+                        coverage.selected_records,
+                        coverage.content_ready,
+                        coverage.content_failed,
+                        coverage.content_not_applicable
+                    ),
+                    (3, 1, 1, 1)
+                );
+                assert!(!coverage.complete());
+            },
+        )
+        .unwrap();
+    scope.require_complete_index = true;
+    assert_eq!(
+        store
+            .with_rdf_scope(
+                &scope,
+                RdfGraphLayers::ALL,
+                4,
+                RdfReadLimits::default(),
+                &cancellation,
+                |_, _| ()
+            )
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    let metadata = RdfGraphLayers {
+        metadata: true,
+        diagnostic: false,
+        content: false,
+    };
+    store
+        .with_rdf_scope(
+            &scope,
+            metadata,
+            4,
+            RdfReadLimits::default(),
+            &cancellation,
+            |_, coverage| assert!(coverage.complete()),
+        )
+        .unwrap();
+    scope.require_complete_index = false;
+    scope.diagnostics.insert(
+        DiagnosticDimension::Service,
+        QueryAlternatives::new(vec!["worker".into()]).unwrap(),
+    );
+    store
+        .with_rdf_scope(
+            &scope,
+            metadata,
+            4,
+            RdfReadLimits::default(),
+            &cancellation,
+            |_, coverage| {
+                assert_eq!(coverage.selected_records, 0);
+                assert_eq!(coverage.diagnostics.unknown, 3);
+                assert!(!coverage.complete());
+            },
+        )
+        .unwrap();
+}
+
 fn record_page_scope(source: &str, page_size: usize) -> sparrow_core::QueryScope {
     sparrow_core::QueryScope {
         selection: sparrow_core::QuerySelection::Live,

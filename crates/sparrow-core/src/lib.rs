@@ -53,7 +53,8 @@ pub use storage::producer_stream::{
 };
 pub use storage::publication::{ImportPreparation, RawPreparation};
 pub use storage::rdf_view::{
-    RdfGraphLayers, RdfReadEvidence, RdfReadLimits, ReadError as RdfReadError, StoredRdfView,
+    RdfGraphLayers, RdfReadEvidence, RdfReadLimits, RdfScopeCoverage, ReadError as RdfReadError,
+    ScopedSparqlResult, SparqlRead, StoredRdfView,
 };
 pub use storage::receiver_stream::{
     MAX_RECEIVER_REGISTRY_BYTES, MAX_RECEIVER_WINDOWS, ReceiverDiscard, ReceiverPosition,

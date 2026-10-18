@@ -3808,7 +3808,7 @@ names = ['^(render_retention_account_again|read_metrics_outside_sdk)$']
 id = "stored-rdf-owned-workspace"
 summary = "Sparrow's native retained reservation keeps the original scope/account alive, admits its erased control box before allocation and retains that charge through payload resize and final output release."
 home = "sparrow_core::storage::rdf_view::budget::Budget::reserve_owned"
-entry_points = ["sparrow_core::storage::rdf_view::StoredRdfView::reserve_owned_workspace", "sparrow_core::storage::rdf_view::budget::RetainedReservation::resize"]
+entry_points = ["sparrow_core::storage::rdf_view::StoredRdfView::reserve_owned_workspace", "sparrow_core::storage::rdf_view::budget::RetainedReservation::resize", "sparrow_core::storage::rdf_view::budget::Reservation::grow", "sparrow_core::storage::rdf_view::budget::Budget::new_cancellable"]
 spec = "docs/purrdf-integration-gaps.md: retained operational SPARQL integration."
 vectors = ["crates/sparrow-core/src/storage/rdf_view/budget.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -3831,3 +3831,45 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(try_boxed|try_boxed_one)$']
+
+[[job]]
+id = "stored-rdf-filtered-scope"
+summary = "Capture graph owners through shared retained evidence selection, temporal candidate ordering and diagnostic qualification; admission refusal and cancellation never publish a partial membership."
+home = "sparrow_core::storage::rdf_view::scope::Store::with_rdf_scope"
+entry_points = ["sparrow_core::storage::rdf_view::scope::Store::rdf_read_lease", "sparrow_core::storage::rdf_view::scope::StoredRdfView::include_record", "sparrow_core::storage::rdf_view::scope::StoredRdfView::include_owner", "sparrow_core::storage::rdf_view::scope::RdfScopeCoverage::complete"]
+spec = "docs/interfaces.md: SPARQL graph layers and independent read coverage."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(capture_rdf_scope_again|match_rdf_diagnostics_separately)$']
+
+[[job]]
+id = "admitted-query-candidate-order"
+summary = "One candidate ordering and temporal integrity law for ordinary record queries and graph capture with caller-admitted catalog decoding."
+home = "sparrow_core::storage::query_membership::Writer::query_candidates_from_members"
+entry_points = ["sparrow_core::storage::query_membership::Writer::query_candidates"]
+spec = "docs/interfaces.md: retained membership and half-open acceptance interval."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/query_membership.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(rdf_query_candidate_order|rdf_scope_temporal_candidates)$']
+
+[[job]]
+id = "scoped-native-sparql-read"
+summary = "Execute every native read form and typed substitutions through one governed stored-scope boundary, preserving retained complete/partial/error outcomes and independent coverage."
+home = "sparrow_core::storage::rdf_view::query::Store::sparql_query"
+entry_points = []
+spec = "docs/interfaces.md: native read forms and read receipts."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(evaluate_sparql_locally|parse_sparql_again)$']

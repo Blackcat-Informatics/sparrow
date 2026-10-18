@@ -197,7 +197,22 @@ impl Writer {
         now: u64,
         protected: &BTreeSet<String>,
     ) -> Result<Box<dyn Iterator<Item = Result<Record, Error>> + 'a>, Error> {
-        if let Some(members) = self.query_membership(scope, now, protected)? {
+        self.query_candidates_from_members(
+            scope,
+            self.query_membership(scope, now, protected)?,
+            |id| self.get(id),
+        )
+    }
+
+    /// Reuse candidate ordering with a caller-admitted catalog lookup. Membership
+    /// is resolved once under the same writer boundary before this iterator starts.
+    pub(super) fn query_candidates_from_members<'a>(
+        &'a self,
+        scope: &QueryScope,
+        members: Option<BTreeMap<String, u64>>,
+        mut lookup: impl FnMut(&str) -> Result<Record, Error> + 'a,
+    ) -> Result<Box<dyn Iterator<Item = Result<Record, Error>> + 'a>, Error> {
+        if let Some(members) = members {
             let mut timeline = members
                 .into_iter()
                 .filter(|(_, time)| *time >= scope.received_from && *time < scope.received_before)
@@ -205,14 +220,14 @@ impl Writer {
                 .collect::<Vec<_>>();
             timeline.sort_unstable();
             return Ok(Box::new(
-                timeline.into_iter().map(move |(_, id)| self.get(&id)),
+                timeline.into_iter().map(move |(_, id)| lookup(&id)),
             ));
         }
         Ok(Box::new(temporal_candidates(
             scope.received_from,
             scope.received_before,
             |mode, options| self.db.iterator_opt(mode, options),
-            |id| self.get(id),
+            lookup,
         )))
     }
 }
@@ -223,7 +238,7 @@ pub(super) fn temporal_candidates<'a, I>(
     from: u64,
     before: u64,
     scan: impl FnOnce(IteratorMode<'_>, ReadOptions) -> I,
-    lookup: impl Fn(&str) -> Result<Record, Error> + 'a,
+    mut lookup: impl FnMut(&str) -> Result<Record, Error> + 'a,
 ) -> impl Iterator<Item = Result<Record, Error>> + 'a
 where
     I: Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> + 'a,

@@ -355,9 +355,21 @@ layers, preserving its strict content-readiness behavior. A selected content
 projection must be ready; an excluded content projection's failed or corrupt
 state does not block metadata/diagnostic reads. Record identity, eligibility,
 pins and read admission remain mandatory even for an empty layer selection.
-This is a native storage integration seam, not a complete public SPARQL surface:
-CLI/MCP graph-layer queries, native admission for all required forms, diagnostic
-coverage/correlation and explanation contracts remain unfinished.
+`Store::with_rdf_scope` adds live, explicit artifact/record and revision-guarded
+pin membership with the shared source/time/diagnostic filters. Its coverage
+counts record occurrences independently of shared graph owners. Permissive reads
+expose ready content with failed/not-applicable coverage; strict reads refuse
+unavailable applicable content or unknown diagnostic membership. Exhausted
+capture admission refuses the whole selection, and the page-size limit never
+clips graph membership. The writer lock is released before native execution;
+membership and graph values remain on the same captured native snapshot.
+
+`Store::sparql_query` passes typed substitutions and governors to PurRDF's native
+SELECT, ASK, CONSTRUCT and DESCRIBE implementation. Complete, certified partial
+and diagnostic/failure outcomes retain native ownership and certainty. UPDATE is
+refused by native read preparation; federation is disabled. These are core
+integration surfaces. CLI/MCP/typed RPC graph queries, recordless artifact graphs,
+text relations, correlation and public explanation contracts remain unfinished.
 
 Storage formats 13/14/15/16 fence older writers for the basic, consumption,
 watch-registry and handoff states. Existing 9/10/11/12 stores durably advance to

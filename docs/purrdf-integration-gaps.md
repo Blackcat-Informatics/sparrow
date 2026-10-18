@@ -45,8 +45,45 @@ GRAPH, ASK, CONSTRUCT, DESCRIBE, broader algebra, substitutions and extension
 contexts was the upstream blocker; that historical refusal must not remain the
 expected success condition of Sparrow's tests.
 
-The complete production graph surface still requires scope capture and coverage,
-prepared bindings, selected metadata/diagnostic/content graph layers, native text
+The core's `with_rdf_scope` entry point captures graph owners from live membership,
+concrete record/artifact selections or a revision-guarded pin. It reuses the record
+query selection, temporal ordering/integrity checks and diagnostic matcher. The
+writer is held through membership capture and native snapshot creation, then
+released before the query callback. The result page size never truncates scope;
+catalog/scan/read admission exhaustion refuses capture before the callback.
+Content readiness follows one shared implementation with explicit-ID reads.
+Permissive scope reads expose ready graphs and independent failed/not-applicable
+occurrence counts; strict reads refuse failed applicable content. Unknown
+diagnostic membership remains unknown, independently of query certainty.
+
+Capture reserves the existing 32 MiB catalog allowance, charging decoded entries
+at the shared 64x encoded-byte law. It retains only admitted graph-owner IDs for
+execution, with the original owned workspace scope capability. It does not copy
+the selected RDF corpus into memory. Cooperative cancellation is checked during
+capture and by the native read-account checkpoints throughout execution.
+This is record-backed graph membership: it does not yet add independent metadata
+graphs for recordless artifacts or expose the RPC/CLI/MCP query operations.
+
+`Store::sparql_query` is the core execution caller. It accepts a native
+`SparqlRequest` with typed substitutions and explicit governors, invokes native
+governed execution over that captured scope, and retains native result ownership,
+certified partial outcomes and diagnostics. Its host envelope records the store,
+native sequence, eligibility clock and independent coverage. UPDATE stays on the
+native read-query refusal path. Remote requests are disabled; this entry point
+does not perform implicit federation reads.
+
+Local qualification of the scoped caller passes all four new regressions:
+native read forms and typed substitutions/governor stops/UPDATE refusal;
+shared selection and a snapshot surviving pin release/retirement; capture
+exhaustion and cancellation without a successful prefix; and independent failed
+content/unknown diagnostic coverage. The full `make check` gate passes release
+Clippy with warnings denied, all 172 storage tests, the existing 60 RPC tests,
+the other workspace tests, seeded census tests and the pinned cross gate
+(263 ownership jobs, zero distinct exceptions). Evidence is
+`.stage/native-graph-integration/scoped-graph-full-check.log`. Existing RPC tests
+do not establish a graph RPC surface; that remains unimplemented.
+
+The complete production graph surface still requires prepared bindings, native text
 relations and correlation, typed Cap'n Proto result publication, retained page
 handles, cancellation and CLI/MCP parity. Complete, certain, at-most, unknown and
 operational failure outcomes must retain the native distinction. A missing or

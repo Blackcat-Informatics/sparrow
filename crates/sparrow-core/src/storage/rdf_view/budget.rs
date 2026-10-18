@@ -12,6 +12,7 @@ pub(super) struct Budget {
     state: Mutex<State>,
     limits: RdfReadLimits,
     deadline: Instant,
+    cancellation: crate::QueryCancellation,
 }
 
 struct State {
@@ -31,7 +32,15 @@ struct RetainedReservation {
 }
 
 impl Budget {
+    #[cfg(test)]
     pub(super) fn new(limits: RdfReadLimits) -> Result<Arc<Self>, ReadError> {
+        Self::new_cancellable(limits, crate::QueryCancellation::default())
+    }
+
+    pub(super) fn new_cancellable(
+        limits: RdfReadLimits,
+        cancellation: crate::QueryCancellation,
+    ) -> Result<Arc<Self>, ReadError> {
         if limits.live_bytes == 0 || limits.lease_ms == 0 || limits.lease_ms > 60000 {
             return Err(Arc::new(Error::new(
                 "INVALID_ARGUMENT",
@@ -45,6 +54,7 @@ impl Budget {
             }),
             limits,
             deadline: Instant::now() + Duration::from_millis(limits.lease_ms),
+            cancellation,
         }))
     }
 
@@ -65,6 +75,9 @@ impl Budget {
     }
 
     fn ready(&self, state: &mut State) -> Result<(), ReadError> {
+        if let Err(error) = self.cancellation.checkpoint() {
+            state.error.get_or_insert_with(|| Arc::new(error));
+        }
         if Instant::now() >= self.deadline {
             state.error.get_or_insert_with(|| {
                 Arc::new(Error::new("RESULT_EXPIRED", "RDF read lease ended"))
@@ -155,6 +168,16 @@ impl Budget {
 
     pub(super) fn ceiling(&self) -> u64 {
         self.limits.live_bytes
+    }
+}
+
+impl Reservation {
+    pub(super) fn grow(&mut self, bytes: u64) -> Result<(), ReadError> {
+        let requested = self.bytes.checked_add(bytes).ok_or_else(|| {
+            self.budget
+                .fail(Error::new("RESOURCE_LIMIT", "RDF scope capacity overflow"))
+        })?;
+        self.resize(requested)
     }
 }
 

@@ -6,9 +6,11 @@ native full-text retrieval and bounded acceptance-time record context through
 shared CLI and stdio MCP clients are present. Native JSON/Markdown content and
 record metadata now persist through a canonical RDF dictionary and six physical
 quad permutations; typed inspection exposes projection state and stream counts.
-The native stored view now supports bounded lazy reads and governed basic-pattern
-SELECT through the Rust core API. Full governed SPARQL admission and its CLI/MCP
-surface remain required; the concrete native gap is recorded in
+The native stored view now supports bounded lazy reads and governed
+SELECT, ASK, CONSTRUCT and DESCRIBE through the Rust core API, with native typed
+substitutions, retained outcomes and scoped membership/coverage. The CLI/MCP and
+typed RPC graph surface, text relations, correlation and public explanations
+remain required; the integration state is recorded in
 [PurRDF integration gaps](purrdf-integration-gaps.md).
 The full server acceptance criteria remain unmet. Current executable surfaces
 and verification are recorded in [Development runtime](development-runtime.md).
