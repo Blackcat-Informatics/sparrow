@@ -14,6 +14,192 @@ use std::{
 // A child can briefly inherit CLOEXEC sockets before exec closes them.
 static PROCESS_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
 type TcpReservation = (std::net::TcpListener, std::sync::MutexGuard<'static, ()>);
+
+#[tokio::test(flavor = "current_thread")]
+async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture() {
+    use purrdf_lex::json::{self, Object};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let directory = tempfile::tempdir().unwrap();
+            let data = directory.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(directory.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let _daemon = start(&config, &socket).await;
+            let endpoint = format!("tcp://{address}");
+            let status = cli(&endpoint, &["status"]);
+            let store = status["store_id"].as_str().unwrap();
+            let definition = Object::new()
+                .with("source", "plain-clock")
+                .with("representation", "rfc3339")
+                .with(
+                    "log_capture",
+                    Object::new()
+                        .with("pattern", "([^ ]+) .*")
+                        .with("group", 1_u32)
+                        .with("flags", "s"),
+                );
+            let file = directory.path().join("time-profile.json");
+            std::fs::write(&file, json::write_compact(&definition.clone().into())).unwrap();
+            let defined = cli(&endpoint, &["source-time-define", file.to_str().unwrap()]);
+            assert_eq!(defined["extraction"]["kind"].as_str(), Some("log_capture"));
+            assert_eq!(
+                defined["extraction"]["match_steps"].as_str(),
+                Some("2000000")
+            );
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let repeated = mcp
+                .tool(2, "source_time_define", definition.clone().into())
+                .await;
+            assert_eq!(repeated["isError"].as_bool(), Some(false));
+            assert_eq!(repeated["structuredContent"], defined);
+            let lookup = mcp
+                .tool(
+                    3,
+                    "source_time_get",
+                    Object::new().with("source", "plain-clock").into(),
+                )
+                .await;
+            assert_eq!(
+                lookup["structuredContent"],
+                cli(&endpoint, &["source-time-get", "plain-clock"])
+            );
+            let input = directory.path().join("events.log");
+            let bytes =
+                b"2026-10-07T03:00:02.123Z late\r\n2026-10-07T05:00:01+02:00 early\nmissing\n";
+            std::fs::write(&input, bytes).unwrap();
+            let artifact = cli(
+                &endpoint,
+                &[
+                    "ingest",
+                    "plain-event-input",
+                    "plain-clock",
+                    "log",
+                    input.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(artifact["record_ids"].as_array().unwrap().len(), 3);
+            assert_eq!(
+                cli(&endpoint, &["status"])["store_format"].as_str(),
+                Some("sparrow.store/90")
+            );
+            let first = cli(
+                &endpoint,
+                &[
+                    "records",
+                    "--source",
+                    "plain-clock",
+                    "--event-from",
+                    "2026-10-07T03:00:00Z",
+                    "--event-before",
+                    "2026-10-07T03:00:03Z",
+                    "--page-size",
+                    "1",
+                ],
+            );
+            assert_eq!(first["time_basis"].as_str(), Some("event_time"));
+            assert_eq!(first["rows"][0]["record_id"], artifact["record_ids"][1]);
+            assert_eq!(first["event_coverage"]["unknown"].as_str(), Some("1"));
+            let mirrored = mcp
+                .tool(
+                    4,
+                    "records_search",
+                    Object::new()
+                        .with("source", "plain-clock")
+                        .with("event_from", "2026-10-07T03:00:00Z")
+                        .with("event_before", "2026-10-07T03:00:03Z")
+                        .with("page_size", 1_u32)
+                        .into(),
+                )
+                .await;
+            assert_eq!(mirrored["isError"].as_bool(), Some(false));
+            assert_eq!(mirrored["structuredContent"]["rows"], first["rows"]);
+            assert_eq!(
+                mirrored["structuredContent"]["receipt"]["scope"],
+                first["receipt"]["scope"]
+            );
+            let cursor = first["page"]["next_cursor"].as_str().unwrap();
+            let next = cli(&endpoint, &["result-next", store, cursor]);
+            let replay = mcp
+                .tool(
+                    5,
+                    "result_next",
+                    Object::new()
+                        .with("store_id", store)
+                        .with("cursor", cursor)
+                        .into(),
+                )
+                .await;
+            assert_eq!(replay["structuredContent"], next);
+            assert_eq!(next["rows"][0]["record_id"], artifact["record_ids"][0]);
+            for id in [
+                first["page"]["snapshot_id"].as_str().unwrap(),
+                mirrored["structuredContent"]["page"]["snapshot_id"]
+                    .as_str()
+                    .unwrap(),
+            ] {
+                assert_eq!(
+                    cli(&endpoint, &["result-release", store, id])["released"].as_bool(),
+                    Some(true)
+                );
+            }
+            let incompatible = mcp
+                .tool(
+                    6,
+                    "source_time_define",
+                    Object::new()
+                        .with("source", "plain-clock")
+                        .with("path", "/t")
+                        .with("representation", "unix_millis")
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                incompatible["structuredContent"]["error"]["code"].as_str(),
+                Some("CONFLICT")
+            );
+            let ambiguous = mcp
+                .tool(
+                    7,
+                    "source_time_define",
+                    Object::new()
+                        .with("source", "invalid-source")
+                        .with("path", "/t")
+                        .with(
+                            "log_capture",
+                            Object::new().with("pattern", "(x)").with("group", 1_u32),
+                        )
+                        .with("representation", "rfc3339")
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                ambiguous["structuredContent"]["error"]["code"].as_str(),
+                Some("INVALID_ARGUMENT")
+            );
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let mut old = client.capability().source_time_get_request();
+            old.get().set_source("plain-clock");
+            let reply = old.send().promise.await.unwrap();
+            let wire::result::Error(error) =
+                reply.get().unwrap().get_result().unwrap().which().unwrap()
+            else {
+                panic!("unversioned profile lookup succeeded")
+            };
+            assert_eq!(
+                error.unwrap().get_code().unwrap().to_str().unwrap(),
+                "UNSUPPORTED"
+            );
+            let final_status = cli(&endpoint, &["status"]);
+            assert_eq!(final_status["record_read_handles"].as_str(), Some("0"));
+            assert_eq!(final_status["sparql_read_handles"].as_str(), Some("0"));
+            mcp.close(true).await;
+        })
+        .await;
+}
+
 trait ProcessStart {
     type Child;
     fn native_spawn(&mut self) -> std::io::Result<Self::Child>;
@@ -6486,11 +6672,13 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         let response = request.send().promise.await.unwrap();
         assert!(matches!(response.get().unwrap().get_result().unwrap().which().unwrap(), wire::result::Error(_)));
         let mut request = producer.capability().source_time_get_request();
+        request.get().set_schema_version(sparrow_client::SCHEMA_VERSION);
         request.get().set_source("refused-wire-quota");
         let response = request.send().promise.await.unwrap();
         assert!(matches!(rpc_ok(response.get().unwrap().get_result().unwrap()).which().unwrap(), wire::optional_source_time_profile::Absent(())));
         let mut request = producer.capability().source_time_define_request();
         let mut definition = request.get().init_definition();
+        definition.set_schema_version(sparrow_client::SCHEMA_VERSION);
         definition.set_source("incompatible-events"); definition.set_path("/timestamp"); definition.set_representation(wire::TimeRepresentation::Rfc3339);
         let response = request.send().promise.await.unwrap();
         rpc_ok(response.get().unwrap().get_result().unwrap());

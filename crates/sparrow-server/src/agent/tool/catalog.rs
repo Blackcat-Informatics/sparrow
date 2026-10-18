@@ -428,7 +428,35 @@ pub(crate) fn definitions() -> Value {
                         Value::array(["rfc3339", "unix_millis", "unix_seconds"]),
                     ),
                 );
-                required.extend(["path", "representation"]);
+                properties = properties.with(
+                    "log_capture",
+                    Object::new()
+                        .with("type", "object")
+                        .with("additionalProperties", false)
+                        .with("required", vec!["pattern", "group"])
+                        .with(
+                            "properties",
+                            Object::new()
+                                .with(
+                                    "pattern",
+                                    Object::new()
+                                        .with("type", "string")
+                                        .with("maxLength", 4096_u32),
+                                )
+                                .with(
+                                    "group",
+                                    Object::new()
+                                        .with("type", "integer")
+                                        .with("minimum", 0_u32)
+                                        .with("maximum", 32_u32),
+                                )
+                                .with(
+                                    "flags",
+                                    Object::new().with("enum", vec!["", "i", "s", "is", "si"]),
+                                ),
+                        ),
+                );
+                required.push("representation");
             }
         }
         if *name == "records_search" {
@@ -592,12 +620,17 @@ pub(crate) fn definitions() -> Value {
             .with("properties", properties)
             .with("required", Value::array(required))
             .with("additionalProperties", false);
-        if *name == "pin_get" {
+        if ["pin_get", "source_time_define"].contains(name) {
+            let alternatives = if *name == "pin_get" {
+                ["pin_id", "name"]
+            } else {
+                ["path", "log_capture"]
+            };
             schema = schema.with(
                 "oneOf",
                 Value::array([
-                    Value::from(Object::new().with("required", Value::array(["pin_id"]))),
-                    Value::from(Object::new().with("required", Value::array(["name"]))),
+                    Value::from(Object::new().with("required", Value::array([alternatives[0]]))),
+                    Value::from(Object::new().with("required", Value::array([alternatives[1]]))),
                 ]),
             );
         }

@@ -249,6 +249,7 @@ impl<'a> RecordBatch<'a> {
             None => source_time::capture(
                 source_time_profile.as_ref(),
                 self.projections.get(&projection_id).map(|(facts, _)| facts),
+                (format, bytes),
                 start,
                 end,
             )?,

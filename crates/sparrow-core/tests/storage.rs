@@ -9,6 +9,316 @@ use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_
 const DAY: u64 = 86_400_000;
 
 #[test]
+fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_history() {
+    use sparrow_core::{EventInterval, EventTime, LogTimeCapture, RecordQuery, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let earlier = store
+        .ingest(
+            "log-before-map",
+            "log-clock",
+            "log",
+            b"[2026-10-07T03:00:00Z] before\n",
+            100,
+        )
+        .unwrap();
+    let capture = LogTimeCapture {
+        pattern: r".*\[([^ ]+)\] .*".into(),
+        group: 1,
+        flags: "s".into(),
+    };
+    let profile = store
+        .define_log_time_profile("log-clock", &capture, TimeRepresentation::Rfc3339)
+        .unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        Some("sparrow.store/88")
+    );
+    assert_eq!(
+        store
+            .define_log_time_profile("log-clock", &capture, TimeRepresentation::Rfc3339)
+            .unwrap(),
+        profile
+    );
+    assert_eq!(
+        store
+            .define_time_profile("log-clock", "/timestamp", TimeRepresentation::Rfc3339)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert!(matches!(
+        store.record(&earlier.record_ids[0]).unwrap().event_time,
+        EventTime::Unknown {
+            profile_id: None,
+            ..
+        }
+    ));
+    let mut bytes = "λ[2026-10-07T05:00:02.123+02:00] late\r\nλ[2026-10-07T03:00:01Z] early\n[2026-10-07T03:00:00.0001Z] precision\nno timestamp\n".as_bytes().to_vec();
+    bytes.extend_from_slice(b"invalid utf8 \xff\n");
+    let artifact = store
+        .ingest("log-after-map", "log-clock", "log", &bytes, 200)
+        .unwrap();
+    assert_eq!(artifact.record_ids.len(), 5);
+    for (index, instant) in ["2026-10-07T05:00:02.123+02:00", "2026-10-07T03:00:01Z"]
+        .into_iter()
+        .enumerate()
+    {
+        let record = store.record(&artifact.record_ids[index]).unwrap();
+        let EventTime::Known {
+            millis,
+            profile_id,
+            occurrence,
+            source_start,
+            source_end,
+        } = record.event_time
+        else {
+            panic!("native source timestamp missing")
+        };
+        assert_eq!(millis, sparrow_core::parse_instant(instant).unwrap());
+        assert_eq!(profile_id, profile.id);
+        assert_eq!(occurrence, 1);
+        assert_eq!(
+            &bytes[source_start as usize..source_end as usize],
+            instant.as_bytes()
+        );
+        assert_eq!(record.received_at, 200);
+        assert_eq!(record.expires_at, 30 * DAY + 200);
+    }
+    for (index, expected) in [
+        (2, "invalid_instant"),
+        (3, "log_no_match"),
+        (4, "log_invalid_utf8"),
+    ] {
+        assert!(
+            matches!(store.record(&artifact.record_ids[index]).unwrap().event_time, EventTime::Unknown { ref reason, .. } if reason == expected)
+        );
+    }
+    let opaque = store
+        .ingest(
+            "log-wrong-format",
+            "log-clock",
+            "opaque",
+            b"[2026-10-07T03:00:01Z] opaque",
+            201,
+        )
+        .unwrap();
+    assert!(
+        matches!(store.record(&opaque.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, .. } if reason == "log_wrong_format")
+    );
+    let scope = record_page_scope("log-clock", 1000);
+    let mut query = RecordQuery {
+        event_interval: Some(EventInterval {
+            from: sparrow_core::parse_instant("2026-10-07T03:00:00Z").unwrap(),
+            before: sparrow_core::parse_instant("2026-10-07T03:00:03Z").unwrap(),
+        }),
+        ..Default::default()
+    };
+    let rows = store.records_query(&scope, &query, 300).unwrap();
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        rows["rows"][0]["record_id"].as_str(),
+        Some(artifact.record_ids[1].as_str())
+    );
+    assert_eq!(rows["event_coverage"]["unknown"].as_str(), Some("5"));
+    query.require_complete_index = true;
+    assert_eq!(
+        store.records_query(&scope, &query, 300).unwrap()["event_coverage"]["unknown"].as_str(),
+        Some("5")
+    );
+    query.require_complete_index = false;
+    let mut strict_scope = scope.clone();
+    strict_scope.require_complete_index = true;
+    let correlated = store.correlate_read(
+        &sparrow_core::CorrelateRead {
+            scope: &strict_scope,
+            selector: &sparrow_core::CorrelationSelector::Evidence(vec![
+                artifact.record_ids[1].clone(),
+            ]),
+            relation: sparrow_core::CorrelationRelation::Time(sparrow_core::CorrelationInterval {
+                clock: sparrow_core::CorrelationClock::Event,
+                from: query.event_interval.as_ref().unwrap().from,
+                before: query.event_interval.as_ref().unwrap().before,
+            }),
+            governors: &purrdf::sparql::QueryGovernors::METERED,
+            limits: sparrow_core::RdfReadLimits::default(),
+        },
+        300,
+        &sparrow_core::QueryCancellation::default(),
+    );
+    assert_eq!(correlated.unwrap_err().code, "INDEX_NOT_READY");
+    let pin = store
+        .pin(
+            "log-time-pin",
+            "log-time-pin",
+            &[artifact.record_ids[1].clone()],
+            40,
+            300,
+        )
+        .unwrap();
+    store
+        .define_time_profile("other-json-source", "/t", TimeRepresentation::UnixMillis)
+        .unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        Some("sparrow.store/88")
+    );
+    store.watch_registry_replace(None, b"registered").unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        Some("sparrow.store/90")
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("store_format", b"sparrow.store/79").unwrap();
+    drop(db);
+    assert!(
+        Store::open(dir.path(), config())
+            .err()
+            .unwrap()
+            .message
+            .contains("log time")
+    );
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("store_format", b"sparrow.store/90").unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.time_profile("log-clock").unwrap(), Some(profile));
+    assert_eq!(
+        store.bytes(&artifact.id, 0, bytes.len(), 301).unwrap(),
+        bytes
+    );
+    store.expire(31 * DAY).unwrap();
+    let retained = store.records_query(&scope, &query, 31 * DAY).unwrap();
+    assert_eq!(retained["rows"].as_array().unwrap().len(), 1);
+    store.release(&pin.id).unwrap();
+    store.expire(31 * DAY).unwrap();
+    assert!(
+        store.records_query(&scope, &query, 31 * DAY).unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn native_log_time_refusals_do_not_publish_records_or_guess_optional_captures() {
+    use sparrow_core::{EventTime, LogTimeCapture, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for (pattern, group, flags) in [
+        ("(", 0, ""),
+        ("(x)", 2, ""),
+        ("(x)", 1, "m"),
+        ("(x)", 33, ""),
+    ] {
+        assert_eq!(
+            store
+                .define_log_time_profile(
+                    "invalid-log-map",
+                    &LogTimeCapture {
+                        pattern: pattern.into(),
+                        group,
+                        flags: flags.into()
+                    },
+                    TimeRepresentation::Rfc3339
+                )
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+        assert!(store.time_profile("invalid-log-map").unwrap().is_none());
+        assert_eq!(
+            store.properties().unwrap()["store_format"].as_str(),
+            Some("sparrow.store/77")
+        );
+    }
+    store
+        .define_log_time_profile(
+            "native-refusal",
+            &LogTimeCapture {
+                pattern: r"(a|aa)*c\1".into(),
+                group: 1,
+                flags: "".into(),
+            },
+            TimeRepresentation::Rfc3339,
+        )
+        .unwrap();
+    let failure = store
+        .ingest(
+            "refused-log-match",
+            "native-refusal",
+            "log",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+        )
+        .unwrap_err();
+    assert_eq!(failure.code, "RESOURCE_LIMIT");
+    assert_eq!(store.status(2).unwrap()["live_records"].as_str(), Some("0"));
+    assert_eq!(
+        store.status(2).unwrap()["unique_payload_chunks"].as_str(),
+        Some("0")
+    );
+    store
+        .define_log_time_profile(
+            "optional-time",
+            &LogTimeCapture {
+                pattern: r"(?:ts=([0-9]+) )?.*".into(),
+                group: 1,
+                flags: "s".into(),
+            },
+            TimeRepresentation::UnixSeconds,
+        )
+        .unwrap();
+    let missing = store
+        .ingest(
+            "optional-empty",
+            "optional-time",
+            "log",
+            b"no timestamp\n",
+            2,
+        )
+        .unwrap();
+    assert!(
+        matches!(store.record(&missing.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, .. } if reason == "log_capture_missing")
+    );
+    let exact = store
+        .ingest(
+            "optional-known",
+            "optional-time",
+            "log",
+            b"ts=123 seconds\n",
+            3,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .record(&exact.record_ids[0])
+            .unwrap()
+            .event_time
+            .millis(),
+        Some(123000)
+    );
+    store
+        .define_log_time_profile(
+            "whole-time",
+            &LogTimeCapture {
+                pattern: "([0-9]+)".into(),
+                group: 1,
+                flags: "".into(),
+            },
+            TimeRepresentation::UnixMillis,
+        )
+        .unwrap();
+    let partial = store
+        .ingest("partial-time", "whole-time", "log", b"123 trailing", 4)
+        .unwrap();
+    assert!(
+        matches!(store.record(&partial.record_ids[0]).unwrap().event_time, EventTime::Unknown { ref reason, .. } if reason == "log_no_match")
+    );
+}
+
+#[test]
 fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_and_retirement() {
     use purrdf::{SparqlRequest, TermValue, sparql::QueryGovernors};
     use sparrow_core::{

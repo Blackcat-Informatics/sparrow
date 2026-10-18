@@ -2,6 +2,48 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [[job]]
+id = "native-log-pattern-engine"
+summary = "Native dated XPath compilation, capture matching, finite work/storage refusal and single-program cache stay in PurRDF's public kernel API; no local regex engine or parser."
+home = "purrdf:purrdf_core::xsd_regex::xpath::compile::compile"
+entry_points = []
+spec = "docs/interfaces.md: schema 60 plain-log timestamp captures."
+vectors = []
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(parse_log_pattern_locally|run_log_regex_vm|tokenize_log_time)$']
+
+[[job]]
+id = "log-time-pattern-binding"
+summary = "One whole-record capture law binds native pattern/group/flags and finite budgets; only definitions and ingestion compile, while catalog reads verify immutable identity without running a compiler."
+home = "sparrow_core::storage::log_time::LogTimeCapture::compiled"
+entry_points = ["sparrow_core::storage::log_time::LogTimeCapture::capture", "sparrow_core::storage::log_time::LogTimeCapture::descriptor", "sparrow_core::storage::source_time::SourceTimeProfile::new_log", "sparrow_core::storage::source_time::validate_log_fence"]
+spec = "docs/interfaces.md: schema 60 plain-log timestamp captures."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(compile_log_time_elsewhere|match_log_time_elsewhere|guess_log_timezone)$']
+
+[[job]]
+id = "log-time-control-wire"
+summary = "Definitions and returned profiles share bounded capture wire encoding/decoding; CLI and MCP source time definitions share one closed native JSON input codec."
+home = "sparrow_server::time_wire::capture"
+entry_points = ["sparrow_server::time_wire::encode", "sparrow_server::agent::source_time::definition", "sparrow_server::agent::source_time::Input::decode"]
+spec = "docs/interfaces.md: schema 60 plain-log timestamp captures."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(decode_log_capture_elsewhere|encode_log_capture_elsewhere|parse_mcp_log_time_separately)$']
+
+[[job]]
 id = "tracing-observation-rdf"
 summary = "One occurrence-owned tracing projection uses native ordered JSON facts, unique mapped occurrences, native scalar/hex codecs and the native RDF builder. Context and lifecycle claims retain their observing record and source ranges; span identities remain producer-instance scoped."
 home = "sparrow_core::storage::tracing_rdf::append"
@@ -1621,9 +1663,9 @@ names = ['^matches_json_occurrence$']
 
 [[job]]
 id = "source-event-time"
-summary = "Capture explicit source timestamp representation from unique native occurrences with original byte evidence."
+summary = "Capture explicit source timestamp representation from unique native JSON occurrences or declared native log captures through one timestamp interpreter and byte-span owner."
 home = "sparrow_core::storage::source_time::capture"
-entry_points = []
+entry_points = ["sparrow_core::storage::source_time::interpret", "sparrow_core::storage::source_time::known"]
 spec = "docs/development-runtime.md: immutable source profiles, unknown diagnostics and explicit event-time intervals."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -1652,8 +1694,8 @@ names = ['^parse_epoch_integer$']
 [[job]]
 id = "source-time-profile"
 summary = "Durably bind one immutable source timestamp profile with content identity, capacity and conflicting-definition refusal."
-home = "sparrow_core::Store::define_time_profile"
-entry_points = []
+home = "sparrow_core::storage::source_time::Store::bind_time_profile"
+entry_points = ["sparrow_core::Store::define_time_profile", "sparrow_core::Store::define_log_time_profile"]
 spec = "docs/development-runtime.md: explicit immutable source-time registry and admission ceiling."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []

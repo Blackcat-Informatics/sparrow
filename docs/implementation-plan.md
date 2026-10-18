@@ -148,6 +148,12 @@ wall-clock meaning from a field name. Multiple admitted/start/terminal times in 
 receipt remain individually queryable; the profile states which, if any, becomes
 the diagnostic event time. Ambiguity produces a diagnostic, not a guessed value.
 
+Source schema 60 extends the immutable binding with explicit native whole-record
+log captures. JSON and log selectors share timestamp interpretation, byte
+evidence, temporal query paths and retention. Native work/storage refusals fail
+ingestion rather than publishing a prefix; ordinary absent/invalid source times
+remain unknown. See [the contract and limits](interfaces.md#plain-log-timestamp-captures-source-schema-60).
+
 An event-time interval excludes records with unknown event time and reports that
 excluded count separately when known. It never substitutes acceptance time.
 Chronological pages use the selected timestamp and a stable occurrence-ID

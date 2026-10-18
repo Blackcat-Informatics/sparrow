@@ -173,6 +173,7 @@ enum UnknownTimeReason {
   legacyUnprofiled @0; noProfile @1; notJson @2; projectionFailed @3;
   missingField @4; ambiguousField @5; wrongKind @6; invalidInstant @7;
   syslogMalformed @8; syslogLegacyTime @9; syslogNilTime @10; syslogSubmillisecond @11;
+  logInputUnavailable @12; logInvalidUtf8 @13; logNoMatch @14; logCaptureMissing @15; logWrongFormat @16;
 }
 struct KnownEventTime {
   instant @0 :Instant; profileId @1 :Text; occurrence @2 :UInt64;
@@ -183,9 +184,12 @@ struct EventTime { union { unknown @0 :UnknownEventTime; known @1 :KnownEventTim
 struct SourceTimeProfile {
   storeId @0 :Text; id @1 :Text; source @2 :Text; path @3 :Text;
   representation @4 :TimeRepresentation; durability @5 :Durability = durable;
+  extraction @6 :TimeExtraction;
 }
+struct LogTimeCapture { pattern @0 :Text; group @1 :UInt32; flags @2 :Text; }
+struct TimeExtraction { union { jsonPointer @0 :Void; logCapture @1 :LogTimeCapture; } }
 struct OptionalSourceTimeProfile { union { absent @0 :Void; value @1 :SourceTimeProfile; } }
-struct SourceTimeDefinition { source @0 :Text; path @1 :Text; representation @2 :TimeRepresentation; }
+struct SourceTimeDefinition { source @0 :Text; path @1 :Text; representation @2 :TimeRepresentation; extraction @3 :TimeExtraction; schemaVersion @4 :UInt32; }
 struct EventInterval { from @0 :Instant; before @1 :Instant; }
 struct OptionalEventInterval { union { absent @0 :Void; value @1 :EventInterval; } }
 enum TimeBasis { receivedAt @0; eventTime @1; }
@@ -649,7 +653,7 @@ interface Sparrow {
   pinRead @13 (query :PinReadQuery) -> (result :Result(PinReadPage));
   recordsSearch @14 (query :RecordQuery) -> (result :Result(RecordsResults));
   sourceTimeDefine @15 (definition :SourceTimeDefinition) -> (result :Result(SourceTimeProfile));
-  sourceTimeGet @16 (source :Text) -> (result :Result(OptionalSourceTimeProfile));
+  sourceTimeGet @16 (source :Text, schemaVersion :UInt32) -> (result :Result(OptionalSourceTimeProfile));
   importBegin @17 (request :ImportBegin) -> (result :Result(ImportStart));
   importAppend @18 (request :ImportChunk) -> (result :Result(ImportProgress));
   importGet @19 (import :ImportRef) -> (result :Result(ImportProgress));

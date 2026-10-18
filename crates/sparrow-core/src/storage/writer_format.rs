@@ -74,8 +74,43 @@ const TRACING: [&[u8]; 11] = [
     b"sparrow.store/87",
 ];
 
+const LOG_TIME: [&[u8]; 11] = [
+    b"sparrow.store/88",
+    b"sparrow.store/89",
+    b"sparrow.store/90",
+    b"sparrow.store/91",
+    b"sparrow.store/92",
+    b"sparrow.store/93",
+    b"sparrow.store/94",
+    b"sparrow.store/95",
+    b"sparrow.store/96",
+    b"sparrow.store/97",
+    b"sparrow.store/98",
+];
+
+pub(super) fn has_log_time(format: &[u8]) -> bool {
+    LOG_TIME.contains(&format)
+}
+
+pub(super) fn enable_log_time(format: &[u8]) -> Result<&'static [u8], Error> {
+    BASE.iter()
+        .chain(RDF.iter())
+        .chain(ALL_RDF.iter())
+        .chain(PROVENANCE.iter())
+        .chain(TRACING.iter())
+        .chain(LOG_TIME.iter())
+        .position(|identity| *identity == format)
+        .map(|index| LOG_TIME[index % BASE.len()])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "log time mapping requires a current authority family",
+            )
+        })
+}
+
 pub(super) fn has_tracing(format: &[u8]) -> bool {
-    TRACING.contains(&format)
+    TRACING.contains(&format) || has_log_time(format)
 }
 
 pub(super) fn enable_tracing(format: &[u8]) -> Result<&'static [u8], Error> {
@@ -128,6 +163,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
             .chain(ALL_RDF.iter())
             .chain(PROVENANCE.iter())
             .chain(TRACING.iter())
+            .chain(LOG_TIME.iter())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -166,7 +202,9 @@ pub(super) fn stage(db: &DB, batch: &mut WriteBatch, base: &[u8]) -> Result<(), 
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
     batch.put(
         "store_format",
-        if has_tracing(&current) {
+        if has_log_time(&current) {
+            enable_log_time(base)?
+        } else if has_tracing(&current) {
             enable_tracing(base)?
         } else if has_provenance(&current) {
             enable_provenance(base)?
@@ -188,7 +226,7 @@ mod tests {
     fn every_authority_transition_preserves_the_artifact_writer_fence() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
-        for family in [RDF, ALL_RDF, PROVENANCE, TRACING] {
+        for family in [RDF, ALL_RDF, PROVENANCE, TRACING, LOG_TIME] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
                 assert_eq!(read(&db).unwrap().as_deref(), Some(base));

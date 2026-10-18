@@ -322,6 +322,71 @@ sorting uses the selected timestamp and occurrence ID as a stable tiebreaker.
 Timestamp mappings, lexical/logical field matching, and text interpretation are
 advertised profiles rather than guesses based on names or file extensions.
 
+### Plain-log timestamp captures (source schema 60)
+
+`source-time-define REQUEST.json` and MCP `source_time_define` accept exactly one
+JSON `path` or one `log_capture`, with an explicit representation. The existing
+`source-time SOURCE POINTER REPRESENTATION` command shares the JSON binding owner.
+For a log whose first token is an RFC3339 timestamp:
+
+```json
+{
+  "source": "application-log-v2",
+  "representation": "rfc3339",
+  "log_capture": {"pattern": "([^ ]+) .*", "group": 1, "flags": "s"}
+}
+```
+
+`sparrow-log-time/1` uses PurRDF's native XPath 3.1 law, dated 2017-03-21.
+The complete original UTF-8 record must match, including retained line terminators.
+A native noncapturing wrapper preserves group numbering. Group 0 selects the
+whole record; groups 1..32 select a declared capture. Only native `i` and `s`
+flags are admitted; `s` allows the body to include a terminal newline.
+
+The capture uses the existing timestamp codecs: `rfc3339`, `unix_millis` or
+integer `unix_seconds`. RFC3339 must denote an exact millisecond instant. No
+timezone, epoch unit, missing date or timestamp format is inferred. Known evidence
+uses the native group number as `occurrence` and exact original artifact byte
+bounds, including UTF-8 prefixes and earlier records. Receipt time and retention
+remain unchanged.
+
+No match, absent optional capture, invalid UTF-8, invalid instant, unavailable
+materialized input and incompatible non-syslog format retain explicit unknown
+reasons: `log_no_match`, `log_capture_missing`, `log_invalid_utf8`,
+`invalid_instant`, `log_input_unavailable` and `log_wrong_format`. Raw bytes remain
+authoritative. Syslog retains its protocol timestamp interpretation. Event-time
+queries exclude unknown clocks and report their count without substituting receipt
+time. Strict index readiness does not promise every clock is known; event-time
+correlation separately enforces its interpretation-completeness contract.
+
+Patterns admit at most 4096 UTF-8 bytes. Compilation has finite native ceilings
+of 100,000 steps, 16,384 nodes and 65,536 construction slots. Each match has
+2,000,000 steps, 4096 pending states and 65,536 live slots. Native operational
+refusals remain `RESOURCE_LIMIT` failures and prevent successful ingestion-batch
+publication; they are not negative matches or partial success. Invalid syntax,
+unsupported controls and missing declared groups refuse the definition. PurRDF's
+single-program cache owns reuse. Catalog reads verify identity/control bounds
+without compiling; definitions and ingestion perform native admission/matching.
+
+Profile identity covers source, whole-record law, pattern, flags, group and
+representation. JSON identities are unchanged. Definitions do not reinterpret
+earlier records or split a staged import's captured interpretation. The existing
+1024-source registry ceiling applies to both selectors. Returned profiles expose
+an `extraction` descriptor; the legacy `path` is empty for a log capture.
+
+The first log definition atomically publishes its interpretation marker and
+writer fence 88..98, preserving the corresponding prior authority family 77..87.
+Other stores keep their format. Later watch/receiver/pressure/retirement
+transitions preserve the fence; marker/format disagreement fails on open. Older
+writers refuse the new family. Source time definition/lookup RPCs require schema
+60 explicitly; the CLI/MCP adapter performs discovery and supplies the version.
+
+The public native pattern API is in `purrdf-core`, rather than the facade.
+Sparrow directly references that same pinned kernel package already in the
+resolved graph, with no version or transitive dependency addition. There is no
+local regex or timestamp parser. Runtime adoption is recorded separately in
+Development runtime.
+
 The initial agent investigation surfaces include `keys_list`, `values_search`,
 and `records_context`, as detailed in the
 [implementation plan](implementation-plan.md). JSON fields use native RFC 6901

@@ -964,6 +964,12 @@ fn source_time_profile(
     out.set_id(&profile.id);
     out.set_source(&profile.source);
     out.set_path(&profile.path);
+    match &profile.log_capture {
+        Some(capture) => {
+            crate::time_wire::encode(out.reborrow().init_extraction().init_log_capture(), capture)
+        }
+        None => out.reborrow().init_extraction().set_json_pointer(()),
+    }
     out.set_representation(match profile.representation {
         sparrow_core::TimeRepresentation::Rfc3339 => wire::TimeRepresentation::Rfc3339,
         sparrow_core::TimeRepresentation::UnixMillis => wire::TimeRepresentation::UnixMillis,
@@ -1005,6 +1011,11 @@ fn event_time(
                 "syslog_legacy_time" => wire::UnknownTimeReason::SyslogLegacyTime,
                 "syslog_nil_time" => wire::UnknownTimeReason::SyslogNilTime,
                 "syslog_submillisecond" => wire::UnknownTimeReason::SyslogSubmillisecond,
+                "log_input_unavailable" => wire::UnknownTimeReason::LogInputUnavailable,
+                "log_invalid_utf8" => wire::UnknownTimeReason::LogInvalidUtf8,
+                "log_no_match" => wire::UnknownTimeReason::LogNoMatch,
+                "log_capture_missing" => wire::UnknownTimeReason::LogCaptureMissing,
+                "log_wrong_format" => wire::UnknownTimeReason::LogWrongFormat,
                 _ => {
                     return Err(capnp::Error::failed(
                         "invalid stored source time diagnostic".into(),
@@ -2326,13 +2337,54 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::SourceTimeDefineResults,
     ) -> capnp::Result<()> {
         let input = params.get()?.get_definition()?;
+        if input.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "source time definition requires the current schema",
+                ),
+            );
+            return Ok(());
+        }
+        if input.get_source()?.len() > 512 || input.get_path()?.len() > 4096 {
+            failure(
+                results.get().init_result(),
+                invalid("source time labels exceed their byte admission"),
+            );
+            return Ok(());
+        }
         let source = input.get_source()?.to_str()?.to_owned();
         let path = input.get_path()?.to_str()?.to_owned();
         let representation = time_representation(input.get_representation()?);
+        let capture = match input.get_extraction()?.which()? {
+            wire::time_extraction::JsonPointer(()) => None,
+            wire::time_extraction::LogCapture(value) => {
+                if !path.is_empty() {
+                    failure(
+                        results.get().init_result(),
+                        invalid("log time extraction cannot also name a JSON path"),
+                    );
+                    return Ok(());
+                }
+                match crate::time_wire::capture(value?) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        failure(results.get().init_result(), invalid(error));
+                        return Ok(());
+                    }
+                }
+            }
+        };
         match self
             .work(move |store, _| {
                 Ok((
-                    store.define_time_profile(&source, &path, representation)?,
+                    match &capture {
+                        Some(capture) => {
+                            store.define_log_time_profile(&source, capture, representation)?
+                        }
+                        None => store.define_time_profile(&source, &path, representation)?,
+                    },
                     store.store_id()?,
                 ))
             })
@@ -2350,7 +2402,25 @@ impl wire::sparrow::Server for Rpc {
         params: wire::sparrow::SourceTimeGetParams,
         mut results: wire::sparrow::SourceTimeGetResults,
     ) -> capnp::Result<()> {
-        let source = params.get()?.get_source()?.to_str()?.to_owned();
+        let input = params.get()?;
+        if input.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+            failure(
+                results.get().init_result(),
+                Error::new(
+                    "UNSUPPORTED",
+                    "source time lookup requires the current schema",
+                ),
+            );
+            return Ok(());
+        }
+        if input.get_source()?.len() > 512 {
+            failure(
+                results.get().init_result(),
+                invalid("source time label exceeds its byte admission"),
+            );
+            return Ok(());
+        }
+        let source = input.get_source()?.to_str()?.to_owned();
         match self
             .work(move |store, _| Ok((store.time_profile(&source)?, store.store_id()?)))
             .await

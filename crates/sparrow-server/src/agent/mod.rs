@@ -52,7 +52,7 @@ pub(super) const USAGE: &str = concat!(
     " | producer-stream STORE_ID STREAM_ID | receiver-window STORE_ID WINDOW_ID | syslog-listener STORE_ID SOURCE LISTENER_ID | file-generation STORE_ID GENERATION_ID | file-finish-prepare REQUEST_ID STORE_ID GENERATION_ID FINAL_FILE INTENT.capnp | file-finish INTENT.capnp | file-finish-status INTENT.capnp",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID... | pin-release REQUEST_ID STORE_ID PIN_ID | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
-    " | source-time SOURCE POINTER REPRESENTATION | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--group-by-artifact true|false] [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR | result-release STORE_ID SNAPSHOT_ID",
+    " | source-time SOURCE POINTER REPRESENTATION | source-time-define REQUEST.json | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--group-by-artifact true|false] [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR | result-release STORE_ID SNAPSHOT_ID",
     " [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--limit N] [--scan-budget N] [--require-complete-index true|false];",
     " values also accepts --path POINTER --kind KIND --lexical TEXT --decoded TEXT",
     "; administration: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp"
@@ -325,6 +325,14 @@ impl Command {
         if args == ["status"] {
             return Ok(Self::Status);
         }
+        if args.first().is_some_and(|arg| arg == "source-time-define") {
+            if args.len() != 2 {
+                return Err(invalid("source-time-define requires REQUEST.json"));
+            }
+            return Ok(Self::SourceTime(source_time::Input::decode(
+                &records::read_control_file(&args[1], 8)?,
+            )?));
+        }
         if args
             .first()
             .is_some_and(|arg| arg == "source-time" || arg == "source-time-get")
@@ -336,7 +344,7 @@ impl Command {
                 ));
             }
             let definition = if define {
-                Some((
+                Some(source_time::Definition::Json(
                     args[2].clone(),
                     source_time::representation(&args[3]).map_err(|e| invalid(e.to_string()))?,
                 ))

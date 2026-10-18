@@ -11,6 +11,45 @@ its adoption evidence and [persistent service adoption](#persistent-service-adop
 for unit configuration. Earlier
 transient-unit and schema sections below retain historical evidence.
 
+## Schema-60 plain-log time source qualification
+
+Source schema 60 adds explicit whole-record log capture profiles through the
+same immutable source binding, timestamp interpreter and byte-evidence owner as
+JSON mappings. It uses the public bounded native XPath API in the already locked
+PurRDF kernel, adding one direct dependency edge without a package/version change.
+The native compiler, matcher, single-program cache and operational-error
+classification retain their original owners. Catalog reads do not compile a
+pattern. JSON profile identities and their original catalog encoding are unchanged.
+
+Definitions atomically install the log interpretation marker and the matching
+88..98 writer fence. Existing stores keep their format until a log profile is
+defined; no historical timestamp or staged-import interpretation is rewritten.
+Marker/fence disagreement fails before startup mutation. Native matcher resource
+refusals fail batch publication without records or payload references. Unknown
+source clocks remain separately visible and are never replaced by receipt time.
+
+Release qualification includes 28 core unit, 189 storage and 66 RPC tests,
+formatting, warnings-denied Clippy, the other workspace tests, seeded census
+self-tests and 290 pinned ownership jobs with no distinct exceptions. New storage
+cases cover UTF-8/CRLF exact capture spans, timezone normalization, submillisecond
+rejection, chronological ordering, explicit unknown counts, strict correlation,
+immutable pre-profile history, marker/fence corruption, native resource refusal,
+optional captures, whole-record enforcement and pin/retention behavior. TCP CLI
+and Unix MCP share definition/lookup, native profile descriptors and chronological
+continuation/replay; conflicting selectors and unversioned lookup refuse.
+
+The first focused run exposed two fixture errors: strict index readiness does not
+promise all source clocks are known, and the core payload counter is named
+`unique_payload_chunks`. The corrected test preserves the existing readiness law
+and independently checks strict event-time correlation. Native-owned ledger jobs
+retain their evidence upstream; the ledger declaration was corrected accordingly.
+Logs remain under `.stage/native-graph-integration/log-time-*`, including the full
+release gate and final normal commit hook.
+
+The running service remains schema 59. Default-image build/qualification and live
+adoption are separate from this source milestone. Full architecture acceptance
+and the upstream-dependent requirements remain open.
+
 ## Schema-59 live adoption
 
 Signed source `293b495fbf4e22bcf4054a632807aa8110777baf` passed the complete

@@ -7,6 +7,27 @@ use super::{Error, Record, Store, Writer, blake3, field, hex, integer, json, par
 use purrdf_lex::json::{Object, Value, record::DecodeError};
 use rocksdb::WriteBatch;
 
+const LOG_FENCE: &str = "log-time-profile-law";
+
+pub(super) fn validate_log_fence(db: &rocksdb::DB) -> Result<(), Error> {
+    let format = db.get("store_format")?;
+    let law = db.get(LOG_FENCE)?;
+    if law
+        .as_deref()
+        .is_some_and(|law| law != super::log_time::LAW.as_bytes())
+        || format
+            .as_deref()
+            .is_some_and(super::writer_format::has_log_time)
+            != law.is_some()
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "log time interpretation law and writer fence disagree",
+        ));
+    }
+    Ok(())
+}
+
 /// Explicit native scalar interpretation; no field-name or unit inference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeRepresentation {
@@ -43,10 +64,12 @@ pub struct SourceTimeProfile {
     pub id: String,
     /// Exact source name, never inferred from a filename.
     pub source: String,
-    /// Exact concrete native RFC 6901 pointer.
+    /// JSON pointer; empty and inactive when `log_capture` is present.
     pub path: String,
     /// Declared units/representation.
     pub representation: TimeRepresentation,
+    /// Explicit whole-record log capture; absent for a JSON pointer mapping.
+    pub log_capture: Option<super::log_time::LogTimeCapture>,
 }
 
 impl SourceTimeProfile {
@@ -78,23 +101,78 @@ impl SourceTimeProfile {
             source: source.into(),
             path: path.into(),
             representation,
+            log_capture: None,
         })
     }
+    fn new_log(
+        source: &str,
+        capture: &super::log_time::LogTimeCapture,
+        representation: TimeRepresentation,
+    ) -> Result<Self, Error> {
+        let mut profile = Self::new(source, "", representation)?;
+        capture.validate_controls()?;
+        let mut bytes = Vec::new();
+        for part in [
+            super::log_time::LAW,
+            source,
+            &capture.pattern,
+            &capture.flags,
+            &capture.group.to_string(),
+            representation.name(),
+        ] {
+            purrdf_hash::frame::frame_le(&mut bytes, part.as_bytes());
+        }
+        profile.id = format!(
+            "time-profile:{}",
+            hex::encode(blake3::hash(&bytes).as_bytes())
+        );
+        profile.log_capture = Some(capture.clone());
+        Ok(profile)
+    }
     pub(crate) fn encode(&self) -> Value {
-        Object::new()
+        let mut value = Object::new()
             .with("id", self.id.clone())
             .with("source", self.source.clone())
             .with("path", self.path.clone())
-            .with("representation", self.representation.name())
-            .into()
+            .with("representation", self.representation.name());
+        if let Some(capture) = &self.log_capture {
+            value = value.with("log_capture", capture.descriptor());
+        }
+        value.into()
     }
     pub(super) fn decode(value: &Value) -> Result<Self, Error> {
         let source = read_field::<String>(value, "source")?;
         let path = read_field::<String>(value, "path")?;
         let representation =
             TimeRepresentation::decode(&read_field::<String>(value, "representation")?)?;
-        let profile = Self::new(&source, &path, representation)
-            .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+        let capture = value
+            .get("log_capture")
+            .filter(|v| !v.is_null())
+            .map(|value| -> Result<_, Error> {
+                if read_field::<String>(value, "law")? != super::log_time::LAW || !path.is_empty() {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "invalid log time extraction law",
+                    ));
+                }
+                Ok(super::log_time::LogTimeCapture {
+                    pattern: read_field(value, "pattern")?,
+                    group: read_field(value, "group")?,
+                    flags: read_field(value, "flags")?,
+                })
+            })
+            .transpose()?;
+        let profile = match capture {
+            Some(capture) => Self::new_log(&source, &capture, representation),
+            None => Self::new(&source, &path, representation),
+        }
+        .map_err(|e| {
+            if e.code == "RESOURCE_LIMIT" {
+                e
+            } else {
+                Error::new("STORAGE_FAILURE", e.to_string())
+            }
+        })?;
         if profile.id != read_field::<String>(value, "id")? {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -200,6 +278,11 @@ impl EventTime {
                     "syslog_legacy_time",
                     "syslog_nil_time",
                     "syslog_submillisecond",
+                    "log_input_unavailable",
+                    "log_invalid_utf8",
+                    "log_no_match",
+                    "log_capture_missing",
+                    "log_wrong_format",
                 ]
                 .contains(&reason.as_str())
                 {
@@ -327,6 +410,19 @@ impl Writer {
             return Ok(None);
         };
         let profile = SourceTimeProfile::decode(&parse(&bytes)?)?;
+        if profile.log_capture.is_some()
+            && !super::writer_format::has_log_time(
+                &self
+                    .db
+                    .get("store_format")?
+                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?,
+            )
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "log time mapping lacks its writer fence",
+            ));
+        }
         if profile.source != source {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -346,7 +442,22 @@ impl Store {
         path: &str,
         representation: TimeRepresentation,
     ) -> Result<SourceTimeProfile, Error> {
-        let profile = SourceTimeProfile::new(source, path, representation)?;
+        self.bind_time_profile(SourceTimeProfile::new(source, path, representation)?)
+    }
+
+    /// Bind an explicit native whole-record log timestamp capture durably.
+    pub fn define_log_time_profile(
+        &self,
+        source: &str,
+        capture: &super::log_time::LogTimeCapture,
+        representation: TimeRepresentation,
+    ) -> Result<SourceTimeProfile, Error> {
+        capture.compiled()?;
+        self.bind_time_profile(SourceTimeProfile::new_log(source, capture, representation)?)
+    }
+
+    fn bind_time_profile(&self, profile: SourceTimeProfile) -> Result<SourceTimeProfile, Error> {
+        let source = profile.source.as_str();
         let writer = self.lock()?;
         if let Some(previous) = writer.time_profile(source)? {
             if previous != profile {
@@ -370,6 +481,17 @@ impl Store {
             Ok(())
         })?;
         batch.put(source_key(source), encoded);
+        if profile.log_capture.is_some() {
+            let format = writer
+                .db
+                .get("store_format")?
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
+            batch.put(
+                "store_format",
+                super::writer_format::enable_log_time(&format)?,
+            );
+            batch.put(LOG_FENCE, super::log_time::LAW);
+        }
         writer.commit(batch)?;
         Ok(profile)
     }
@@ -388,12 +510,20 @@ impl Store {
 pub(super) fn capture(
     profile: Option<&SourceTimeProfile>,
     facts: Option<&Value>,
+    input: (&str, Option<&[u8]>),
     byte_start: u64,
     byte_end: u64,
 ) -> Result<EventTime, Error> {
     let Some(profile) = profile else {
         return Ok(EventTime::unknown("no_profile", None));
     };
+    if let Some(capture) = &profile.log_capture {
+        return if input.0 == "log" {
+            capture.capture(profile, input.1, byte_start, byte_end)
+        } else {
+            Ok(EventTime::unknown("log_wrong_format", Some(profile)))
+        };
+    }
     let Some(facts) = facts else {
         return Ok(EventTime::unknown("not_json", Some(profile)));
     };
@@ -428,12 +558,11 @@ pub(super) fn capture(
     {
         return Ok(EventTime::unknown("wrong_kind", Some(profile)));
     }
-    let parsed = match profile.representation {
+    let text = match profile.representation {
         TimeRepresentation::Rfc3339 => match value.get("decoded") {
             Some(value) => Some(value.as_str().ok_or_else(|| {
                 Error::new("STORAGE_FAILURE", "decoded timestamp must be a string")
-            })?)
-            .and_then(|text| crate::parse_instant(text).ok()),
+            })?),
             None if value.get("decoding_error").is_some() => None,
             None => {
                 return Err(Error::new(
@@ -442,36 +571,80 @@ pub(super) fn capture(
                 ));
             }
         },
-        representation => {
-            let lexical = read_field::<String>(value, "lexical")?;
-            match purrdf::xsd::numeric::parse_integer(&lexical) {
-                Ok(value) => Some(value),
-                Err(purrdf::xsd::XsdError::Storage(error)) => {
-                    return Err(Error::new("RESOURCE_LIMIT", error.to_string()));
-                }
-                Err(_) => None,
-            }
-            .and_then(|value| value.to_i128().ok())
-            .and_then(|value| u64::try_from(value).ok())
-            .and_then(|value| {
-                if representation == TimeRepresentation::UnixSeconds {
-                    value.checked_mul(1000)
-                } else {
-                    Some(value)
-                }
-            })
-        }
+        _ => Some(
+            value
+                .get("lexical")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::new(
+                        "STORAGE_FAILURE",
+                        "native timestamp number lacks lexical evidence",
+                    )
+                })?,
+        ),
     };
-    let Some(millis) = parsed.filter(|millis| crate::format_instant(*millis).is_ok()) else {
+    let parsed = text
+        .map(|text| interpret(text, profile.representation))
+        .transpose()?
+        .flatten();
+    let Some(millis) = parsed else {
         return Ok(EventTime::unknown("invalid_instant", Some(profile)));
     };
-    let source_start = byte_start
-        .checked_add(integer(value, "start")?)
+    known(
+        profile,
+        millis,
+        integer(value, "occurrence")?,
+        byte_start..byte_end,
+        integer(value, "start")?..integer(value, "end")?,
+    )
+}
+
+pub(super) fn interpret(
+    text: &str,
+    representation: TimeRepresentation,
+) -> Result<Option<u64>, Error> {
+    let parsed = match representation {
+        TimeRepresentation::Rfc3339 => match crate::parse_instant(text) {
+            Ok(millis) => Some(millis),
+            Err(error) if error.code == "RESOURCE_LIMIT" => return Err(error),
+            Err(_) => None,
+        },
+        representation => match purrdf::xsd::numeric::parse_integer(text) {
+            Ok(value) => Some(value),
+            Err(purrdf::xsd::XsdError::Storage(error)) => {
+                return Err(Error::new("RESOURCE_LIMIT", error.to_string()));
+            }
+            Err(_) => None,
+        }
+        .and_then(|value| value.to_i128().ok())
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(|value| {
+            if representation == TimeRepresentation::UnixSeconds {
+                value.checked_mul(1000)
+            } else {
+                Some(value)
+            }
+        }),
+    };
+    Ok(parsed.filter(|millis| crate::format_instant(*millis).is_ok()))
+}
+
+pub(super) fn known(
+    profile: &SourceTimeProfile,
+    millis: u64,
+    occurrence: u64,
+    record: std::ops::Range<u64>,
+    range: std::ops::Range<u64>,
+) -> Result<EventTime, Error> {
+    let source_start = record
+        .start
+        .checked_add(range.start)
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "source time span overflow"))?;
-    let source_end = byte_start
-        .checked_add(integer(value, "end")?)
+    let source_end = record
+        .start
+        .checked_add(range.end)
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "source time span overflow"))?;
-    if source_start > source_end || source_end > byte_end {
+    if source_start > source_end || source_end > record.end {
         return Err(Error::new(
             "STORAGE_FAILURE",
             "source time evidence outside record",
@@ -480,7 +653,7 @@ pub(super) fn capture(
     Ok(EventTime::Known {
         millis,
         profile_id: profile.id.clone(),
-        occurrence: integer(value, "occurrence")?,
+        occurrence,
         source_start,
         source_end,
     })

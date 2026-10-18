@@ -44,6 +44,19 @@ export over the nine original producer records was refused by the existing
 schema-58 workspace ceiling; complete content-export/resource acceptance is not
 claimed from the successful byte or metadata migration checks.
 
+Source schema 60 adds explicit plain-log timestamp captures using the public
+native XPath engine, sharing timestamp interpretation and byte evidence with
+JSON bindings. A direct reference to the already locked `purrdf-core` supplies
+that public API without a facade re-export or a second matcher. Source
+qualification is recorded in Development runtime; the installed version remains
+schema 59 until separate default-image and live qualification are recorded.
+
+On 2026-10-18 upstream main advanced to `9a6055e8a60d34656d9d47c70ba5b85270142a54`
+with OWL causal-dependency work. Its change set does not alter the SPARQL evaluator
+or property-function APIs below; #600 and #601 remain open. The existing probes
+against then-main `c75cbf94` remain historical evidence. Sparrow's runtime/census
+selection remains `7734b013`.
+
 ## Query-scoped stored text producers
 
 [PurRDF #601](https://github.com/Blackcat-Informatics/purrdf/issues/601) requests
@@ -94,7 +107,7 @@ normal workspace gate. Runtime adoption remains separate from source validation.
 
 Public governed EXPLAIN remains blocked on
 [PurRDF #600](https://github.com/Blackcat-Informatics/purrdf/issues/600).
-On 2026-10-18, pinned `7734b013` and current main `c75cbf94` expose retained
+On 2026-10-18, pinned `7734b013` and then-main `c75cbf94` expose retained
 fallible measured EXPLAIN, but its public inputs are text/base/options and an
 optional stop signal. Typed request substitutions are not accepted; options
 document prebinding as inert. The measuring body chooses METERED governors

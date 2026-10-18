@@ -192,11 +192,7 @@ impl Operation {
                 }
                 "source_time_define" | "source_time_get" => {
                     let definition = if name == "source_time_define" {
-                        let representation: String = fields.required("representation")?;
-                        Some((
-                            fields.required("path")?,
-                            super::source_time::representation(&representation)?,
-                        ))
+                        Some(super::source_time::definition(&mut fields)?)
                     } else {
                         None
                     };

@@ -34,6 +34,7 @@ pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
 pub(crate) mod ingest_status;
+pub(crate) mod log_time;
 mod manifest_retire;
 pub(crate) mod pin_read;
 pub(crate) mod pressure;
@@ -1135,6 +1136,7 @@ impl Store {
                 ColumnFamilyDescriptor::new("payload", payload),
             ],
         )?;
+        source_time::validate_log_fence(&db)?;
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
         let rdf_fingerprint = rdf_index::profile_identity()?;
         let id = match writer_format::read(&db)? {

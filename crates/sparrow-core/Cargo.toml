@@ -18,6 +18,7 @@ rocksdb.workspace = true
 purrdf.workspace = true
 purrdf-hash.workspace = true
 purrdf-lex.workspace = true
+purrdf-core.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
 
