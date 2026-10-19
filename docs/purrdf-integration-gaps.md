@@ -79,9 +79,21 @@ the borrowed-producer integration seam. It is now closed as completed: PR #615,
 commit `a47940e1f130bf3739c6d59aaf89643209905ea4`, adds query-scoped registries and
 cursors. That commit exists in the read-only supplier object database and is an
 ancestor of observed main `25de0d0de0856c7b88288d0ee65777bd1e95b34b`.
-Sparrow still selects `9b2bf3b`; adoption and stored-text consumer integration
+Sparrow source now selects `a47940e1f130bf3739c6d59aaf89643209905ea4` for
+runtime dependencies and census discovery. The installed schema-61 image still
+uses `9b2bf3b`. The analyzer and ranking implementations are unchanged between
+these revisions. Source qualification and stored-text consumer integration
 are the next work, not an upstream availability blocker. The observations below
 describe the preceding interface and its original acceptance requirements.
+
+Focused source qualification passes `cargo check --release -p sparrow-core`
+against the selected revision. The original borrowed-registration compile probe
+also passes after naming the registry's scoped lifetime in its return type;
+the temporary example is removed. Logs and source are retained under
+`.stage/native-graph-integration/scoped-producer-adoption-check.log` and
+`scoped-relation-landed-probe*`. These checks establish consumer compilation and
+the registration lifetime seam, not stored-text execution or runtime adoption.
+
 Sparrow's RDF operation borrows
 one native RocksDB snapshot and releases its catalog writer before evaluation.
 Its stored-text relation must use that same snapshot. On pinned `7734b013` and
@@ -102,6 +114,14 @@ coordination or replaying the corpus into a resident index. The shipped native
 `TextSearchRelation` and `TermOccurrenceRelation` hold a resident `TextIndex`;
 Sparrow's record-corpus adapter instead reuses public analyzer and
 `PreparedCorpus`/`PreparedQuery` scoring operations over persisted facts.
+
+The retained-record corpus is the declared raw-record/decoded-JSON text profile.
+Its positional evidence consists of persisted source byte spans, interpretation
+basis, JSON paths and coarse-alignment flags. The stored producer must expose
+that contract explicitly under caller-selected IRIs. The first-version source
+evidence requirement does not mandate a resident index's token-ordinal relation
+shape or an ordinal backfill. Ranking still uses the captured selected corpus
+and the native scoring law, with its corpus/profile identity in the receipt.
 
 The source branch now routes ordinary record/text searches through one
 `text_index::rank_postings` implementation accepting an explicit immutable

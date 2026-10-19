@@ -9,7 +9,7 @@ recorded = "2026-10-18"
 [[supplier]]
 name = "purrdf"
 version = "3.0.1"
-git_revision = "9b2bf3b71325154137bc1aa817b46356daadfe3a"
+git_revision = "a47940e1f130bf3739c6d59aaf89643209905ea4"
 repository = "../purrdf"
 role = "Reference tree for structural helper discovery and PurRDF-owned ledger jobs."
 
@@ -30,3 +30,9 @@ date = "2026-10-18"
 supplier = "purrdf"
 revision = "9b2bf3b71325154137bc1aa817b46356daadfe3a"
 reason = "Adopt committed main containing PR 609 actual-payload solution materialization (issue 605) and PR 611 governed request EXPLAIN parity (issue 600). Preserve native retained ownership, substitutions and caller governors; separately qualify Sparrow integration and rerun the pinned source census."
+
+[[event]]
+date = "2026-10-18"
+supplier = "purrdf"
+revision = "a47940e1f130bf3739c6d59aaf89643209905ea4"
+reason = "Select landed PR 615 (issue 601) for query-scoped property-function registries and cursors borrowing the original stored view. Analyzer and ranking implementations are unchanged from 9b2bf3b. Advance source discovery alongside the separate runtime dependency selection; stored-text consumer integration and deployed-image adoption require their own evidence."

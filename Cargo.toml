@@ -14,10 +14,10 @@ publish = false
 [workspace.dependencies]
 blake3 = "1"
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
-purrdf = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "9b2bf3b71325154137bc1aa817b46356daadfe3a" }
-purrdf-hash = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "9b2bf3b71325154137bc1aa817b46356daadfe3a" }
-purrdf-lex = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "9b2bf3b71325154137bc1aa817b46356daadfe3a" }
-purrdf-core = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "9b2bf3b71325154137bc1aa817b46356daadfe3a" }
+purrdf = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "a47940e1f130bf3739c6d59aaf89643209905ea4" }
+purrdf-hash = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "a47940e1f130bf3739c6d59aaf89643209905ea4" }
+purrdf-lex = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "a47940e1f130bf3739c6d59aaf89643209905ea4" }
+purrdf-core = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "a47940e1f130bf3739c6d59aaf89643209905ea4" }
 getrandom = "0.3"
 rustix = { version = "1.1.5", features = ["fs"] }
 tracing = "0.1.44"

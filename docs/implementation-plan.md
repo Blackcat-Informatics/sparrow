@@ -86,21 +86,23 @@ production capacity.
 
 | Required area | Evidence already present | Required work still NOT MET |
 | --- | --- | --- |
-| Graph queries | Deployed schema 61 supplies SELECT/ASK/CONSTRUCT/DESCRIBE and measured EXPLAIN through typed RPC/CLI/MCP, substitutions, certificates, frozen scope/coverage, correlation and tracing. Production-feature private/live qualification returns the original 2,990 triples in 43 pages under unchanged limits. | Adopt and integrate the landed query-scoped producer API from PR #615, closing [#601](https://github.com/Blackcat-Informatics/purrdf/issues/601), for stored-text relations. [Native integration evidence](purrdf-integration-gaps.md). |
+| Graph queries | Deployed schema 61 supplies SELECT/ASK/CONSTRUCT/DESCRIBE and measured EXPLAIN through typed RPC/CLI/MCP, substitutions, certificates, frozen scope/coverage, correlation and tracing. Production-feature private/live qualification returns the original 2,990 triples in 43 pages under unchanged limits. | Integrate stored-text relations through the landed query-scoped producer API from PR #615, closing [#601](https://github.com/Blackcat-Informatics/purrdf/issues/601). Source dependency selection has advanced; consumer qualification and implementation remain separate. [Native integration evidence](purrdf-integration-gaps.md). |
 | Reclamation | Shared native tombstone-compaction policy; real-pressure source regression with measured file decrease, successful retry, protected shared bytes and reopen; full release gate at signed 22ec801. The policy is now adopted by the qualified schema-61 daemon. | Sustained physical/resource qualification of the existing native compaction/blob-GC path. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
 | Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results, measured EXPLAIN and cancellation. Live schema 61 advertises 38 tools, with TCP/Unix/MCP parity and zero leftover handles/bytes after qualification. | Stored-text/SPARQL integration above and complete resource/latency qualification over the deployment corpus. Existing tools must not advertise unsupported native relations. [Interfaces](interfaces.md). |
-| Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Production envelope and producer contracts, hard-quota/resource and sustained/burst acceptance, bounded physical reclamation, host-reboot/power-loss acceptance and remaining watcher scheduling/kernel-watch-exhaustion scenarios. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
+| Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Measure sustained/burst input, queries and maintenance on a declared deployment envelope; finish the architecture's watcher acceptance scenarios and physical recovery measurements. Quota-specific checks apply when a strict filesystem ceiling is configured. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
 
 The qualified kernel-overflow fixture changes no host limits; configured
 directory-budget exhaustion is independent of exhausting the shared kernel
 watch quota. The SIGKILL matrix starts from durable reservation and does not
 prove power-loss persistence at arbitrary filesystem boundaries. The finite
 turnover corpus is 65,642,380 raw bytes per pin mode. None of these results closes
-the remaining production acceptance gates.
+the remaining production acceptance gates. Host reboot and power-loss trials
+are not additional first-version gates: the architecture's crash scenarios and
+the durability claims actually made determine the required checks.
 
 The initial upstream readback on 2026-10-18 found #600, #601 and #605 open.
 Later main landed actual-payload materialization (PR #609, closing #605) and
-governed request EXPLAIN (PR #611, closing #600). Source now selects committed
+governed request EXPLAIN (PR #611, closing #600). The preceding source selected
 `9b2bf3b71325154137bc1aa817b46356daadfe3a` for both runtime dependencies and
 census discovery. Three focused release consumer regressions and release Clippy
 pass, covering retained complete materialization and request/governor EXPLAIN
@@ -112,7 +114,9 @@ pass private-copy and live adoption with exact-byte, profile and generation
 continuity. A later upstream refresh finds #601 completed by PR #615 at
 `a47940e1f130bf3739c6d59aaf89643209905ea4`, an ancestor of observed main
 `25de0d0de0856c7b88288d0ee65777bd1e95b34b`. Its scoped registry/cursor API is
-available; dependency adoption and stored-text consumer implementation remain.
+available. Source dependencies and the census reference now select that exact
+landed commit. Source qualification and stored-text consumer implementation
+remain separate from the installed schema-61 image, which still uses `9b2bf3b`.
 The selected rust-rocksdb upstream remains
 `46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. The earlier inference that Sparrow
 required a new file-compaction API was unproven and is withdrawn. Existing native
