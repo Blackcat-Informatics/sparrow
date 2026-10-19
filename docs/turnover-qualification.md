@@ -56,8 +56,11 @@ This is a clock-injected correctness and physical-growth workload on real disk,
 not 60 days of wall-clock service activity. Daily status measures file bytes;
 the external collector records closed SST/blob/control/WAL sizes and sampled
 RSS separately. Zero logical ownership does not certify zero physical disk use.
-Automatic native compaction is allowed, but forced bounded reclamation remains
-subject to the [native binding gap](native-reclamation.md). This does not qualify
+Automatic native compaction is allowed. The installed schema-61 policy now marks
+deletion-heavy tables using existing APIs; the earlier proposed binding
+prerequisite is withdrawn. See [native reclamation](native-reclamation.md) for
+measured pressure recovery and its remaining qualification. The historical
+turnover reports below predate that policy and must not certify it. This does not qualify
 production-volume throughput, steady-state density, quota pressure or full
 architecture acceptance.
 

@@ -86,9 +86,9 @@ production capacity.
 
 | Required area | Evidence already present | Required work still NOT MET |
 | --- | --- | --- |
-| Graph queries | Deployed native SELECT/ASK/CONSTRUCT/DESCRIBE, typed substitutions, certified outcomes, frozen scope/coverage, correlation and tracing metadata. Source schema 61 adds measured EXPLAIN RPC/CLI/MCP with structured native ledger paging and shared query admission; public consumer regressions pass. | Default-image qualification and runtime adoption; query-local stored-text relations ([#601](https://github.com/Blackcat-Informatics/purrdf/issues/601)); default-image qualification of the landed materialization fix for the original complete synthetic content export within existing limits ([#605](https://github.com/Blackcat-Informatics/purrdf/issues/605)). [Native integration evidence](purrdf-integration-gaps.md). |
-| Reclamation | Shared native tombstone-compaction policy; real-pressure source regression with measured file decrease, successful retry, protected shared bytes and reopen; full release gate at signed 22ec801. | Runtime adoption and sustained physical/resource qualification of the existing native compaction/blob-GC path. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
-| Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results and cancellation. | The missing graph operations above and complete resource/latency qualification over the deployment corpus. Existing tools must not advertise unsupported native relations or explanations. [Interfaces](interfaces.md). |
+| Graph queries | Deployed schema 61 supplies SELECT/ASK/CONSTRUCT/DESCRIBE and measured EXPLAIN through typed RPC/CLI/MCP, substitutions, certificates, frozen scope/coverage, correlation and tracing. Production-feature private/live qualification returns the original 2,990 triples in 43 pages under unchanged limits. | Adopt and integrate the landed query-scoped producer API from PR #615, closing [#601](https://github.com/Blackcat-Informatics/purrdf/issues/601), for stored-text relations. [Native integration evidence](purrdf-integration-gaps.md). |
+| Reclamation | Shared native tombstone-compaction policy; real-pressure source regression with measured file decrease, successful retry, protected shared bytes and reopen; full release gate at signed 22ec801. The policy is now adopted by the qualified schema-61 daemon. | Sustained physical/resource qualification of the existing native compaction/blob-GC path. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
+| Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results, measured EXPLAIN and cancellation. Live schema 61 advertises 38 tools, with TCP/Unix/MCP parity and zero leftover handles/bytes after qualification. | Stored-text/SPARQL integration above and complete resource/latency qualification over the deployment corpus. Existing tools must not advertise unsupported native relations. [Interfaces](interfaces.md). |
 | Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Production envelope and producer contracts, hard-quota/resource and sustained/burst acceptance, bounded physical reclamation, host-reboot/power-loss acceptance and remaining watcher scheduling/kernel-watch-exhaustion scenarios. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
 
 The qualified kernel-overflow fixture changes no host limits; configured
@@ -107,9 +107,12 @@ pass, covering retained complete materialization and request/governor EXPLAIN
 parity, including host refusals. Signed `126248c` passed the full gate for that
 adoption. Source schema 61 adds the public EXPLAIN adapters, with three additional
 release consumer regressions, release Clippy and pinned census passing. The
-normal full gate is required before committing. Runtime adoption and #601
-stored-text integration remain required; a read-only upstream refresh still
-finds #601 open without a new implementation.
+normal full gate passed at signed `ffdfbbf`, and production-feature images now
+pass private-copy and live adoption with exact-byte, profile and generation
+continuity. A later upstream refresh finds #601 completed by PR #615 at
+`a47940e1f130bf3739c6d59aaf89643209905ea4`, an ancestor of observed main
+`25de0d0de0856c7b88288d0ee65777bd1e95b34b`. Its scoped registry/cursor API is
+available; dependency adoption and stored-text consumer implementation remain.
 The selected rust-rocksdb upstream remains
 `46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. The earlier inference that Sparrow
 required a new file-compaction API was unproven and is withdrawn. Existing native

@@ -5,13 +5,13 @@ scope. Sparrow must retain native semantics and bounded reads while resolving th
 
 ## Current integration state
 
-Schema 60 is deployed on format 92 with native SELECT, ASK, CONSTRUCT and
-DESCRIBE, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
+Schema 61 is deployed on format 92 with native SELECT, ASK, CONSTRUCT,
+DESCRIBE and measured EXPLAIN, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
-[Development runtime](development-runtime.md#schema-60-live-adoption).
-Native text relations, runtime adoption of public measured explanation and
-production resource/turnover acceptance remain required. Source now selects
+[Development runtime](development-runtime.md#schema-61-live-adoption).
+Native text relations and sustained production resource/turnover acceptance
+remain required. The installed source selects
 `9b2bf3b71325154137bc1aa817b46356daadfe3a`: upstream PR #609 closed
 [PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605) with
 actual-payload materialization, and PR #611 closed
@@ -20,10 +20,12 @@ request EXPLAIN. The source core adds `Store::sparql_explain` through the same
 capture/admission owner as query execution. Signed `126248c` passed the full
 release gate. Source schema 61 now adds typed explanation RPC, generated SDK,
 shared CLI/MCP rendering and immutable continuation under the existing native
-lease family. Three focused release consumer regressions, release Clippy and
-the pinned census pass. The normal full gate is required before committing.
-The installed image still uses the earlier native revision. The qualification
-evidence below records how these surfaces grew.
+lease family. Signed `ffdfbbf` passed the full gate (195 storage and 68 RPC tests,
+remaining workspace tests, release Clippy and census). Separate production images
+with core features empty passed private-copy recovery and live TCP/Unix CLI/MCP
+checks: the original 2,990-triple export completes in 43 pages under unchanged
+limits; all 253 byte targets match; timestamp profiles and generation receipts
+are unchanged. The qualification evidence below records how these surfaces grew.
 
 Source schema 57 shares frozen logical scope receipts across native graph,
 context and record/text/key/value captures. Graph receipt ownership uses the
@@ -73,7 +75,14 @@ historical evidence; current source selection is recorded above.
 ## Query-scoped stored text producers
 
 [PurRDF #601](https://github.com/Blackcat-Informatics/purrdf/issues/601) requests
-the remaining borrowed-producer integration seam. Sparrow's RDF operation borrows
+the borrowed-producer integration seam. It is now closed as completed: PR #615,
+commit `a47940e1f130bf3739c6d59aaf89643209905ea4`, adds query-scoped registries and
+cursors. That commit exists in the read-only supplier object database and is an
+ancestor of observed main `25de0d0de0856c7b88288d0ee65777bd1e95b34b`.
+Sparrow still selects `9b2bf3b`; adoption and stored-text consumer integration
+are the next work, not an upstream availability blocker. The observations below
+describe the preceding interface and its original acceptance requirements.
+Sparrow's RDF operation borrows
 one native RocksDB snapshot and releases its catalog writer before evaluation.
 Its stored-text relation must use that same snapshot. On pinned `7734b013` and
 by source inspection on main `c75cbf94`, `PropertyFunctionRegistry::register`
@@ -170,8 +179,8 @@ admission and remote-request policy through one execution boundary. Source
 schema 61 adds transport/CLI/MCP integration, preserving structured native
 entries under the same page/handle owner. Public consumer regressions pass for
 bindings, measured counters, stopped/failure outcomes, replay/release/expiry,
-shared admission and oversized-entry refusal. Runtime adoption and default-image
-qualification remain required.
+shared admission and oversized-entry refusal. Default-image and live adoption
+are qualified separately in the runtime evidence above.
 
 The selected-source consumer regressions pass: complete persisted materialization
 retains 2,605 rows after source closure under the unchanged 128 MiB workspace;

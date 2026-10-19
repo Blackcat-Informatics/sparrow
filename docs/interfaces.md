@@ -520,7 +520,7 @@ and diagnostic/failure outcomes retain native ownership and certainty. UPDATE is
 refused by native read preparation; federation is disabled. These are core
 integration surfaces. Schema 51 exposes the same native read through typed
 `Sparrow.sparqlQuery`, CLI `sparrow ENDPOINT sparql REQUEST.json`, and MCP
-`sparql_query`. Source schema 61 also provides the measured explanation surface
+`sparql_query`. Deployed schema 61 also provides the measured explanation surface
 below. Native stored-text relations remain unfinished.
 Native correlation is implemented in source schema 58, as specified below.
 Recordless artifact metadata is implemented and deployed in
@@ -1075,7 +1075,7 @@ Its nested `status` is a current operational read, with
 the same integrity checks and cost as explicit status; it is not the catalog-free
 typed `discover` operation used internally for compatibility admission.
 
-### Measured native explanation (source schema 61)
+### Measured native explanation (schema 61)
 
 `Sparrow.sparqlExplain`, CLI `sparrow ENDPOINT sparql-explain REQUEST.json` and
 MCP `sparql_explain` accept the same closed input schema as `sparql_query`:
@@ -1109,9 +1109,12 @@ relation or aggregate registry; empty declaration lists are explicit. An
 unexpected nonempty native registry is a hard integration failure before a
 report is published, never silently omitted metadata.
 
-The schema-61 adapters and consumer tests are source work; the installed schema-60
-image has not adopted them. Native stored-text integration and runtime/resource
-qualification remain required; see [native integration](purrdf-integration-gaps.md#retained-operational-sparql-integration).
+The installed schema-61 images passed default-image/private-copy and live
+TCP/Unix CLI/MCP qualification, including complete export of the original
+2,990-triple selection under unchanged budgets and exact-byte verification.
+See [runtime adoption](development-runtime.md#schema-61-live-adoption).
+Native stored-text integration and sustained runtime/resource qualification
+remain required; see [native integration](purrdf-integration-gaps.md#retained-operational-sparql-integration).
 
 The query interface supports read forms such as SELECT, ASK, CONSTRUCT, and
 DESCRIBE through PurRDF. Preserve RDF term kind, datatype, language, base

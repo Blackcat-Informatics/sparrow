@@ -2,15 +2,61 @@
 
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
-socket. It is running and both typed endpoints were verified on 2026-10-18 UTC
-after the approved checkpoint recovery and schema-60 adoption below. It uses
-schema 60 and store format 92. The stable installed
-client is `~/.local/bin/sparrow`, now built from `819ab66`; see
-[capability client adoption](#capability-client-adoption). The latest installed daemon source is
-`f3c8a63`; see [schema-60 live adoption](#schema-60-live-adoption) for
-its adoption evidence and [persistent service adoption](#persistent-service-adoption)
-for unit configuration. Earlier
-transient-unit and schema sections below retain historical evidence.
+socket. Both typed endpoints were verified on 2026-10-18 UTC after the
+[schema-61 adoption](#schema-61-live-adoption). It uses schema 61 and store
+format 92. The stable client is `~/.local/bin/sparrow`; the daemon alias is
+`~/.local/libexec/sparrow/sparrowd`. Both now select immutable production images
+from signed source `ffdfbbfaa0973edb8e0bf029a078536582739e6e`, with core features
+empty and PurRDF `9b2bf3b71325154137bc1aa817b46356daadfe3a`.
+PID `1492870` replaced `4001300` through the existing SIGINT drain path.
+[Persistent service adoption](#persistent-service-adoption) records the unchanged
+unit configuration. Earlier transient-unit and schema sections retain history.
+
+## Schema-61 live adoption
+
+Signed `ffdfbbf` passed the normal full gate: 195 storage tests, 68 RPC tests,
+the remaining workspace tests, release Clippy with warnings denied, seeded census
+self-tests and the pinned cross gate (294 ownership jobs, zero distinct rows).
+Default server/client images were rebuilt separately; compiler-artifact evidence
+confirms `core_features=[]`. Immutable daemon/client names are
+`sparrowd-schema61-ffdfbbf` and `sparrow-schema61-ffdfbbf` under
+`~/.local/libexec/sparrow/`. Their SHA-256 values are respectively
+`ae0313ad98713a02be0c3e22a0427cb0323a1b242cbe0a01b58dca282c30cf2a` and
+`ca5c2755beaf1bb908aec26770b4195e8d82140a5b9a4b8196fca853c1ebf305`.
+Only the daemon carries `cap_net_bind_service=ep`; the TCP binding remains
+`0.0.0.0:518`. No service configuration or producer definition changed.
+
+A hash-verified private copy first exercised the production binaries, including
+the explicit timestamp-binding transition from its older format 81 to 92.
+Its two persisted watch definitions were removed through the public opaque
+catalog API before starting any private consumer, so producer roots were never
+opened. After an initial harness SIGTERM stop, the same copy reopened and passed
+the full checks again with a clean SIGINT shutdown. Original backups stayed
+unchanged. The live service was then drained and its closed store copied and
+hash-verified (115 regular files) before the aliases were switched and the unit
+started. The original approved `identity_changed` generation receipts, offsets
+37/0, JSON/log timestamp profiles and store identity all remain unchanged.
+
+Live TCP and Unix CLI exports each return all 2,990 triples from the original
+nine records across 43 byte-bounded pages, with exact native certainty and frozen
+scope/lease receipts. Limits stayed at 128 MiB source workspace, 100,000 source
+requests and 256 KiB pages. Source evidence reports 83,804 requests, 25,010,629
+admitted bytes and a 115,740,672-byte peak; there was no governor stop. CLI and
+stdio MCP EXPLAIN work through each endpoint, preserving native measured rows,
+profile/schedule and independent source/coverage evidence without an answer
+certificate. All 38 tools are advertised through the shared capability catalog.
+
+All 253 retained byte targets (36,005,590 bytes) match the previous native content
+hashes through public TCP. Both watchers are covered without failure, pressure
+and durability report no failure, and all five result families have zero handles
+and bytes after release. Closed backups for schemas 59/60/61 remain unchanged
+(111/113/115 files). Evidence is under `.stage/native-graph-integration/`:
+`schema61-runtime-artifacts.json`, `schema61-private-qualification-v2.log`,
+`schema61-pre-adoption-closed-backup.json`, `schema61-cutover.json` and
+`schema61-live-qualified.json`. Private reports retain every export page and
+byte-check receipt. These checks close the original content-export workspace
+refusal and adopt the native reclamation policy below; they do not establish
+sustained production-volume or hard-quota acceptance.
 
 ## Public measured explanation source work (schema 61)
 
@@ -35,10 +81,9 @@ diagnostics. Release Clippy passes with warnings denied. The pinned census
 passes 294 ownership jobs with zero distinct exceptions; its duplicate optional
 writers were replaced with one implementation. The normal full gate is required
 before committing. Evidence is under
-`.stage/native-graph-integration/public-explain-*`. The installed schema-60
-daemon and client named above have not adopted this source; schema-61 clients
-require schema-61 discovery. Native stored-text integration, original-corpus
-default-image export and runtime/resource qualification remain open work.
+`.stage/native-graph-integration/public-explain-*`. The installed images now
+adopt this source; the separate default-image and live qualification is above.
+Native stored-text integration and sustained resource qualification remain work.
 
 ## Native materialization and request explanation source qualification
 
@@ -58,10 +103,8 @@ and cancellation remain refusals. Release Clippy passes with warnings denied.
 Evidence is under
 `.stage/native-graph-integration/native-request-adoption-core-explain-final-*`.
 
-The normal full gate is required before committing. These are source checks;
-the installed daemon/client remain on the images named above. No EXPLAIN RPC,
-CLI/MCP capability or complete original nine-record content export is claimed
-from these regressions. Public adapter and runtime qualification remain work.
+Signed `126248c` passed the full gate for this native adoption. These finite
+source regressions are distinct from the later default-image/live evidence above.
 
 ## Native reclamation source qualification
 
@@ -83,7 +126,9 @@ incompressible corpus, without external ballast removal or a hard quota.
 [Native reclamation](native-reclamation.md) records the method and remaining
 operational acceptance. Evidence is under
 `.stage/native-graph-integration/reclamation-existing-apis-*`.
-The installed daemon has not yet adopted this source change.
+The installed schema-61 daemon now adopts this policy. Sustained turnover,
+physical-resource and hard-quota acceptance remain separate from the finite
+source regression and live adoption.
 
 ## Completed-file process-crash qualification
 
