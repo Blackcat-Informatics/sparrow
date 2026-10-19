@@ -1122,6 +1122,61 @@ direction, and triple-term structure using its result serializers. SPARQL UPDATE
 does not provide arbitrary mutation of Sparrow's derived storage; it is refused
 by the read surface.
 
+### Stored-text graph relations (source schema 62)
+
+`sparql_query` and `sparql_explain` optionally accept the closed object
+`text_relations: {"ranked_iri":"urn:investigation:rank", "spans_iri":"urn:investigation:spans"}`.
+Both names must be distinct absolute IRIs, each at most 1024 UTF-8 bytes. The
+typed RPC uses the same optional pair. Omitting it registers no text relations.
+
+```sparql
+SELECT ?doc ?record_id ?score ?rank ?matched WHERE {
+  ?doc <urn:investigation:rank> ("needle" ?record_id ?score ?rank ?matched) .
+  ?doc a <urn:sparrow:vocab:Record> .
+} ORDER BY ?rank
+```
+
+The bound string needle uses the stored profile's native analyzer. Distinct
+analyzed terms match with OR semantics. Scores use native BM25 over the entire
+captured covered corpus, including when the document is bound. Ranks are global
+within that corpus, start at one, and break score ties by record ID. `matched`
+counts distinct matched terms. `doc` joins the existing occurrence graph;
+`record_id` is the opaque ID accepted by `bytes_read`.
+
+```sparql
+SELECT ?record_id ?term ?start ?end ?basis ?path ?coarse WHERE {
+  ?doc <urn:investigation:spans>
+    ("needle" ?record_id ?term ?start ?end ?basis ?path ?coarse) .
+}
+```
+
+Each span is persisted occurrence evidence, with record-local byte offsets
+`[start,end)`. `raw_record` spans identify original lexical bytes and have an
+empty path. `decoded_json_scalar` spans carry the native JSON pointer; escaped
+strings can have coarse spans covering the original string contents, excluding
+quotes. A span does not assert a token ordinal or a narrower exact alignment.
+The relation streams stored postings; it does not reanalyze retained payloads
+or rebuild a resident text index.
+
+Every response and continuation carries `text_corpus`: profile, analyzer and
+ranking identities, corpus ID, document/token counts, relation names and
+ready/failed-or-incomplete/not-applicable coverage. Counts use decimal strings.
+The corpus identity describes ordered covered records and their lengths; the
+snapshot sequence identifies this execution's storage version. Different
+corpora's scores are not directly comparable. Empty analyzed records contribute
+coverage but no scoring document. Membership completeness and projection
+coverage remain independent of native answer certainty. Strict requests refuse
+failed text interpretations. The original snapshot, finite host/native budgets,
+cancellation, storage-failure precedence and result lease apply to both relations.
+
+Measured explanations page the actual native relation descriptors (IRIs,
+arities, volatility and access modes) alongside node work. Custom aggregate and
+native ranked-retrieval declarations are not registered by this input.
+PurRDF's selected fallible-query return type does not expose its internal
+relation-witness ledger; Sparrow does not invent a returned generation or
+service-level attestation. Source schema 62 is not yet the installed schema;
+deployment and qualification evidence remain in Development runtime.
+
 ### Recordless artifact RDF writer authority
 
 Schema 52 adds independently captured metadata for complete zero-byte artifacts,

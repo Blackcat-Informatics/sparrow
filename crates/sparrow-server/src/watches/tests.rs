@@ -40,6 +40,91 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
     detector.scan_step().unwrap();
     detector.drain().unwrap();
     assert!(detector.covered);
+
+    // Read-only OPEN restarts observation, but CLOSE_NOWRITE does not turn the
+    // input into a completed source or change the observed stability clock.
+    let reader = File::open(&original).unwrap();
+    detector.drain().unwrap();
+    let opened = detector.candidates[Path::new("finished.bin")].stable_since;
+    drop(reader);
+    detector.drain().unwrap();
+    assert_eq!(
+        detector.candidates[Path::new("finished.bin")].stable_since,
+        opened
+    );
+    assert!(detector.ready().unwrap().is_none());
+
+    // Exercise real writes from two descriptors. Closing one writer gives no
+    // authority to ignore later activity from the other. Backdate only the
+    // candidate clock; all activity below still traverses the kernel queue.
+    use std::io::Write;
+    let activity = producer.join("activity.bin");
+    std::fs::write(&activity, b"initial").unwrap();
+    let mut first_writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&activity)
+        .unwrap();
+    let mut second_writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&activity)
+        .unwrap();
+    detector.drain().unwrap();
+    detector
+        .candidates
+        .get_mut(Path::new("activity.bin"))
+        .unwrap()
+        .stable_since = Instant::now() - Duration::from_secs(60);
+    let write_started = Instant::now();
+    first_writer.write_all(b" first").unwrap();
+    detector.drain().unwrap();
+    assert!(detector.candidates[Path::new("activity.bin")].stable_since >= write_started);
+    assert!(detector.ready().unwrap().is_none());
+    drop(first_writer);
+    detector.drain().unwrap();
+    detector
+        .candidates
+        .get_mut(Path::new("activity.bin"))
+        .unwrap()
+        .stable_since = Instant::now() - Duration::from_secs(60);
+    let write_started = Instant::now();
+    second_writer.write_all(b" second").unwrap();
+    detector.drain().unwrap();
+    assert!(detector.candidates[Path::new("activity.bin")].stable_since >= write_started);
+    assert!(detector.ready().unwrap().is_none());
+    drop(second_writer);
+    detector.drain().unwrap();
+    assert!(detector.ready().unwrap().is_none());
+    std::fs::remove_file(activity).unwrap();
+    detector.drain().unwrap();
+    assert!(!detector.candidates.contains_key(Path::new("activity.bin")));
+
+    // A file closed outside the watched root is discovered by MOVED_TO. Queued
+    // events for its old path cannot erase the surviving renamed generation.
+    let staged = directory.path().join("staged.bin");
+    std::fs::write(&staged, b"moved complete source").unwrap();
+    let arrived = producer.join("arrived.bin");
+    std::fs::rename(&staged, &arrived).unwrap();
+    let moved = Instant::now();
+    detector.drain().unwrap();
+    let moved_identity = detector.candidates[Path::new("arrived.bin")].identity;
+    assert!(detector.candidates[Path::new("arrived.bin")].stable_since >= moved);
+    assert!(detector.ready().unwrap().is_none());
+    let renamed = producer.join("renamed.bin");
+    std::fs::rename(&arrived, &renamed).unwrap();
+    std::fs::write(&arrived, b"temporary replacement").unwrap();
+    std::fs::remove_file(&arrived).unwrap();
+    detector.drain().unwrap();
+    assert!(!detector.candidates.contains_key(Path::new("arrived.bin")));
+    let renamed_identity = detector.candidates[Path::new("renamed.bin")].identity;
+    assert_eq!(renamed_identity.device, moved_identity.device);
+    assert_eq!(renamed_identity.inode, moved_identity.inode);
+    assert_eq!(std::fs::read(&renamed).unwrap(), b"moved complete source");
+    std::fs::remove_file(renamed).unwrap();
+    detector.drain().unwrap();
+    assert_eq!(detector.candidates.len(), 1);
+    assert!(store.consumption_pending().unwrap().is_empty());
+    assert!(store.records(crate::now().unwrap()).unwrap().is_empty());
+
     let candidate = detector
         .candidates
         .get_mut(Path::new("finished.bin"))

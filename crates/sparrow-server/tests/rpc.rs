@@ -9551,6 +9551,156 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn stored_text_graph_relations_preserve_corpus_spans_and_explanations_over_transports() {
+    use purrdf_lex::json::{self, Object, Value};
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("rpc.sock");
+        let config = write_server_config(dir.path(), &data, &socket);
+        let (address, reservation) = configure_tcp_listener(&config);
+        drop(reservation);
+        let _daemon = start(&config, &socket).await;
+        let endpoint = format!("tcp://{address}");
+        let client = sparrow_client::Client::connect_endpoint(
+            &sparrow_client::Endpoint::parse(&endpoint).unwrap()
+        ).await.unwrap();
+        let store = client.discovery().store_id.clone();
+        let input = br#"{"message":"nee\u0064le needle"}
+{"message":"needle more words"}
+"#;
+        let artifact = client.ingest("text-graph", "text-graph-source", wire::Format::Jsonl, input).await.unwrap();
+        client.ingest("text-outside", "outside", wire::Format::Log, b"needle needle needle\n").await.unwrap();
+        let mut mcp = Mcp::start(&socket);
+        mcp.initialize(1).await;
+        let rank = "SELECT ?doc ?id ?score ?rank ?matched WHERE { ?doc <urn:test:rank> (\"needle\" ?id ?score ?rank ?matched); a <urn:sparrow:vocab:Record> } ORDER BY ?rank";
+        let request = Object::new().with("store_id", store.clone())
+            .with("source", "text-graph-source").with("query", rank)
+            .with("layers", Object::new().with("metadata", true).with("diagnostic", false).with("content", false))
+            .with("text_relations", Object::new().with("ranked_iri", "urn:test:rank").with("spans_iri", "urn:test:spans"))
+            .with("page_size", 1_u32);
+        let path = dir.path().join("text-graph.json");
+        std::fs::write(&path, json::write_compact(&request.clone().into())).unwrap();
+        let first = cli(&endpoint, &["sparql", path.to_str().unwrap()]);
+        let response = mcp.tool(2, "sparql_query", request.clone().into()).await;
+        assert_eq!(response["isError"].as_bool(), Some(false), "{response:?}");
+        let other = &response["structuredContent"];
+        for key in ["rows", "text_corpus", "scope", "coverage", "native_governor", "execution_status", "answer_certainty"] {
+            assert_eq!(first[key], other[key], "CLI/MCP {key}");
+        }
+        assert_eq!(first["execution_status"].as_str(), Some("complete"), "{first:?}");
+        assert_eq!(first["answer_certainty"].as_str(), Some("exact"));
+        assert_eq!(first["text_corpus"]["documents"].as_str(), Some("2"));
+        assert_eq!(first["text_corpus"]["coverage"]["ready"].as_str(), Some("2"));
+        assert_eq!(first["text_corpus"]["membership_complete"].as_bool(), Some(true));
+        assert_eq!(first["total_items"].as_str(), Some("2"));
+        client.ingest("text-later", "text-graph-source", wire::Format::Log, b"needle\n").await.unwrap();
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let next = cli(&endpoint, &["result-next", &store, cursor]);
+        let replay = mcp.tool(3, "result_next", Object::new().with("store_id", store.clone()).with("cursor", cursor).into()).await;
+        assert_eq!(replay["isError"].as_bool(), Some(false), "{replay:?}");
+        assert_eq!(next, replay["structuredContent"]);
+        for key in ["text_corpus", "scope", "coverage", "native_governor", "sequence", "lease_expires_at"] {
+            assert_eq!(next[key], first[key], "frozen {key}");
+        }
+        assert_eq!(next["rows"]["native_result"]["results"]["bindings"][0]["rank"]["value"].as_str(), Some("2"));
+        for page in [&first, other] {
+            assert!(sparrow_client::release_result(client.capability(), &store, page["snapshot_id"].as_str().unwrap()).await.unwrap().released);
+        }
+
+        let spans = "SELECT ?id ?term ?start ?end ?basis ?path ?coarse WHERE { ?doc <urn:test:spans> (\"needle\" ?id ?term ?start ?end ?basis ?path ?coarse) }";
+        let span_request = request.clone().with("query", spans).with("page_size", 100_u32);
+        let response = mcp.tool(4, "sparql_query", span_request.into()).await;
+        assert_eq!(response["isError"].as_bool(), Some(false), "{response:?}");
+        let result = &response["structuredContent"];
+        assert_eq!(result["text_corpus"]["documents"].as_str(), Some("3"));
+        assert_ne!(result["text_corpus"]["corpus_id"], first["text_corpus"]["corpus_id"]);
+        let rows = result["rows"]["native_result"]["results"]["bindings"].as_array().unwrap();
+        let mut decoded = 0;
+        for row in rows {
+            let start = row["start"]["value"].as_str().unwrap().parse::<u64>().unwrap();
+            let end = row["end"]["value"].as_str().unwrap().parse::<u64>().unwrap();
+            let bytes = mcp.tool(5, "bytes_read", Object::new().with("store_id", store.clone())
+                .with("id", row["id"]["value"].as_str().unwrap()).with("offset", start.to_string()).with("length", end-start).into()).await;
+            assert_eq!(bytes["isError"].as_bool(), Some(false), "{bytes:?}");
+            if row["basis"]["value"].as_str() == Some("decoded_json_scalar") {
+                decoded += 1;
+                assert_eq!(row["path"]["value"].as_str(), Some("/message"));
+                if row["coarse"]["value"].as_str() == Some("true") {
+                    let expected: &[u8] = if row["id"]["value"].as_str() == Some(artifact.record_ids[0].as_str()) {
+                        br#"nee\u0064le needle"#
+                    } else {
+                        assert_eq!(row["id"]["value"].as_str(), Some(artifact.record_ids[1].as_str()));
+                        b"needle more words"
+                    };
+                    assert_eq!(bytes["structuredContent"]["data"].as_str(), Some(purrdf::xsd::canonical_base64(expected).as_str()));
+                } else {
+                    assert_eq!(bytes["structuredContent"]["data"].as_str(), Some(purrdf::xsd::canonical_base64(b"needle").as_str()));
+                }
+            } else {
+                assert_eq!(row["basis"]["value"].as_str(), Some("raw_record"));
+                assert_eq!(bytes["structuredContent"]["data"].as_str(), Some(purrdf::xsd::canonical_base64(b"needle").as_str()));
+            }
+        }
+        assert_eq!(decoded, 3);
+        sparrow_client::release_result(client.capability(), &store, result["snapshot_id"].as_str().unwrap()).await.unwrap();
+
+        std::fs::write(&path, json::write_compact(&request.clone().into())).unwrap();
+        let first = cli(&endpoint, &["sparql-explain", path.to_str().unwrap()]);
+        assert_eq!(first["execution_status"].as_str(), Some("measured"));
+        let mut page = first.clone();
+        let mut descriptors = Vec::new();
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages < 100);
+            assert_eq!(page["text_corpus"], first["text_corpus"]);
+            assert_eq!(page["explanation"]["relations"].as_array().unwrap().len(), 2);
+            for item in page["explanation"]["items"].as_array().unwrap() {
+                if item["kind"].as_str() == Some("relation") { descriptors.push(item.clone()); }
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else { break; };
+            let next = mcp.tool(6, "result_next", Object::new().with("store_id", store.clone()).with("cursor", cursor).into()).await;
+            assert_eq!(next["isError"].as_bool(), Some(false), "{next:?}");
+            assert_eq!(next["structuredContent"], cli(&endpoint, &["result-next", &store, cursor]));
+            page = next["structuredContent"].clone();
+        }
+        assert_eq!(descriptors.len(), 2);
+        for (descriptor, iri, object_arity) in [(&descriptors[0], "urn:test:rank", 5_u32), (&descriptors[1], "urn:test:spans", 8_u32)] {
+            assert_eq!(descriptor["iri"].as_str(), Some(iri));
+            assert_eq!(descriptor["subject_arity"], Value::from(1_u32));
+            assert_eq!(descriptor["object_arity"], Value::from(object_arity));
+            assert!(!descriptor["modes"].as_array().unwrap().is_empty());
+        }
+        assert!(sparrow_client::release_result(client.capability(), &store, first["snapshot_id"].as_str().unwrap()).await.unwrap().released);
+        client.ingest("text-incomplete", "text-incomplete-source", wire::Format::Json, br#"{"message":"needle""#).await.unwrap();
+        let incomplete = request.clone().with("source", "text-incomplete-source");
+        let response = mcp.tool(7, "sparql_query", incomplete.clone().into()).await;
+        assert_eq!(response["isError"].as_bool(), Some(false), "{response:?}");
+        let result = &response["structuredContent"];
+        assert_eq!(result["answer_certainty"].as_str(), Some("exact"));
+        assert_eq!(result["coverage"]["complete"].as_bool(), Some(false));
+        assert_eq!(result["text_corpus"]["coverage"]["failed_or_incomplete"].as_str(), Some("1"));
+        assert_eq!(result["text_corpus"]["membership_complete"].as_bool(), Some(false));
+        sparrow_client::release_result(client.capability(), &store, result["snapshot_id"].as_str().unwrap()).await.unwrap();
+        let response = mcp.tool(8, "sparql_query", incomplete.with("require_complete_index", true).into()).await;
+        assert_eq!(response["isError"].as_bool(), Some(true), "{response:?}");
+        assert_eq!(response["structuredContent"]["error"]["code"].as_str(), Some("INDEX_NOT_READY"));
+        for invalid in [
+            Object::new().with("ranked_iri", "urn:same").with("spans_iri", "urn:same"),
+            Object::new().with("ranked_iri", "relative").with("spans_iri", "urn:spans"),
+            Object::new().with("ranked_iri", "urn:rank").with("spans_iri", "urn:spans").with("invented", true),
+        ] {
+            let response = mcp.tool(7, "sparql_query", request.clone().with("text_relations", invalid).into()).await;
+            assert_eq!(response["isError"].as_bool(), Some(true), "{response:?}");
+        }
+        let status = cli(&socket, &["status"]);
+        assert_eq!(status["sparql_read_handles"].as_str(), Some("0"));
+        assert_eq!(status["sparql_read_bytes"].as_str(), Some("0"));
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn native_explanation_preserves_measured_work_over_tcp_cli_mcp_and_continuation() {
     use purrdf_lex::json::{self, Object, Value};
     tokio::task::LocalSet::new().run_until(async {

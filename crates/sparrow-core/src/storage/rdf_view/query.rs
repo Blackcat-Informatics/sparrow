@@ -22,6 +22,8 @@ pub struct SparqlRead<'a> {
     pub governors: &'a QueryGovernors,
     /// Source reads, workspace and lease ceilings.
     pub limits: RdfReadLimits,
+    /// Optional caller-selected stored-text relations over this exact snapshot.
+    pub text_relations: Option<&'a SparqlTextRelations>,
 }
 
 /// Native payload ownership beside independent host coverage evidence.
@@ -48,6 +50,8 @@ pub struct ScopedSparqlResult<
     pub limits: RdfReadLimits,
     /// Independent scope and applicable projection coverage.
     pub coverage: RdfScopeCoverage,
+    /// Independent stored-text corpus/profile evidence when relations were requested.
+    pub text: Option<SparqlTextCapture>,
     /// Native retained payload and evidence, or its typed diagnostic/failure.
     /// Query payloads carry answer certificates; explanations carry measured work.
     /// Retained carriers keep their original admitted owner after capture ends.
@@ -71,8 +75,22 @@ impl<Outcome: std::fmt::Debug> std::fmt::Debug for ScopedSparqlResult<Outcome> {
             .field("layers", &self.layers)
             .field("limits", &self.limits)
             .field("coverage", &self.coverage)
+            .field("text", &self.text)
             .field("outcome", &self.outcome)
             .finish_non_exhaustive()
+    }
+}
+
+impl<Outcome> ScopedSparqlResult<Outcome> {
+    /// Independent requested-index coverage; this never changes native answer certainty.
+    pub fn index_coverage_complete(&self) -> bool {
+        self.correlation.as_ref().map_or_else(
+            || self.coverage.complete(),
+            |capture| capture.complete(&self.coverage),
+        ) && self
+            .text
+            .as_ref()
+            .is_none_or(|text| text.membership_complete(&self.coverage))
     }
 }
 
@@ -116,11 +134,11 @@ impl Store {
             (read, None),
             now,
             cancellation,
-            |engine, view, governors| {
+            |engine, view, governors, environment| {
                 engine.explain_governed_fallible_view(
                     view,
                     read.request,
-                    QueryOptions::default(),
+                    QueryOptions::new().with_env(environment),
                     governors,
                 )
             },
@@ -143,11 +161,11 @@ impl Store {
             query,
             now,
             cancellation,
-            |engine, view, governors| {
+            |engine, view, governors, environment| {
                 engine.query_governed_fallible_view(
                     view,
                     query.0.request,
-                    QueryOptions::default(),
+                    QueryOptions::new().with_env(environment),
                     governors,
                 )
             },
@@ -160,10 +178,18 @@ impl Store {
         query: (&SparqlRead<'_>, Option<&crate::CorrelationCapture>),
         now: u64,
         cancellation: &QueryCancellation,
-        execute: impl FnOnce(&NativeSparqlEngine, &StoredRdfView<'_>, &QueryGovernors) -> Outcome,
+        execute: impl FnOnce(
+            &NativeSparqlEngine,
+            &StoredRdfView<'_>,
+            &QueryGovernors,
+            &purrdf::sparql::ExtensionEnv<'_>,
+        ) -> Outcome,
         publish: impl FnOnce(&StoredRdfView<'_>, ScopedSparqlResult<Outcome>) -> T,
     ) -> Result<T, ReadError> {
         let (read, correlation) = query;
+        if let Some(relations) = read.text_relations {
+            relations.validate().map_err(Arc::new)?;
+        }
         if read.request.query.len() > crate::query::RECORD_QUERY_TEXT_BYTES {
             return Err(Arc::new(Error::new(
                 "RESOURCE_LIMIT",
@@ -172,7 +198,7 @@ impl Store {
         }
         let store_id = self.store_id().map_err(Arc::new)?;
         self.capture_rdf_scope(
-            (read.scope, correlation),
+            (read.scope, correlation, read.text_relations.is_some()),
             read.layers,
             now,
             read.limits,
@@ -183,7 +209,7 @@ impl Store {
                 }
                 let scope_admission = view
                     .budget
-                    .reserve_owned(crate::QUERY_SCOPE_WORKSPACE_BYTES as u64, &view._scope)?;
+                    .reserve_owned((crate::QUERY_SCOPE_WORKSPACE_BYTES as u64).saturating_add(if read.text_relations.is_some() { 16384 } else { 0 }), &view._scope)?;
                 let scope = view
                     .scope_receipt
                     .as_ref()
@@ -196,7 +222,10 @@ impl Store {
                     .clone();
                 let engine = NativeSparqlEngine::new();
                 let governors = read.governors.clone().with_max_remote_requests(0);
-                let outcome = execute(&engine, view, &governors);
+                let text = read.text_relations.map(|relations| view.text_capture(&store_id, relations)).transpose()?;
+                let environment = text.as_ref().map(|text| view.text_environment(text)).transpose()?;
+                let environment = environment.as_ref().unwrap_or_else(|| purrdf::sparql::ExtensionEnv::empty());
+                let outcome = execute(&engine, view, &governors, environment);
                 drop(engine);
                 let result = ScopedSparqlResult {
                     store_id,
@@ -208,6 +237,7 @@ impl Store {
                     layers: read.layers,
                     limits: read.limits,
                     coverage: coverage.clone(),
+                    text,
                     outcome,
                 };
                 Ok(publish(view, result))

@@ -126,7 +126,7 @@ fn publish(
             "metadata term ownership disagrees with native closure",
         ));
     }
-    let subject_value = TermValue::iri(format!("urn:sparrow:{id}"));
+    let subject_value = TermValue::iri(super::rdf_index::entity_iri(id));
     let mut fields = BTreeMap::new();
     for row in primary {
         builder.push_quad(native[&row[0]], native[&row[1]], native[&row[2]], None)?;

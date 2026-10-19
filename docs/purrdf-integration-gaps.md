@@ -74,6 +74,34 @@ historical evidence; current source selection is recorded above.
 
 ## Query-scoped stored text producers
 
+The working schema-62 consumer now registers borrowed ranked and source-span
+producers against the original captured RocksDB snapshot. Ordinary and SPARQL
+ranking share one stored-posting reader and native scoring implementation.
+Four focused release core tests pass for score/corpus parity, Unicode/escaped
+source spans, bound-document rank stability, retained results after closure,
+snapshot reads after physical posting retirement, LIMIT/OPTIONAL/UNION storage
+fault precedence, posting-work governor stops and physical admission refusal.
+The log is `.stage/native-graph-integration/stored-text/core-tests-v3.log`.
+The focused daemon-backed transport regression also passes TCP CLI/Unix MCP
+parity, frozen continuation after later ingestion, byte reads using returned
+span IDs/offsets, native descriptor paging, incomplete interpretation coverage,
+strict refusal, closed relation configuration and zero retained result charge.
+Its log is `.stage/native-graph-integration/stored-text/transport-tests-v2.log`.
+The normal `make check` gate passes release Clippy with warnings denied, all
+195 storage tests, 69 RPC tests, 32 core tests, 18 server tests and the remaining
+workspace tests, seeded census self-tests and 300 pinned ownership jobs with
+zero distinct exceptions. Its log is
+`.stage/native-graph-integration/stored-text/full-check-v2.log`.
+See [the schema-62 contract](interfaces.md#stored-text-graph-relations-source-schema-62).
+This source work does not change the installed schema-61 images.
+
+The selected native `finish_governed_fallible_query` explicitly drops relation
+identities on both complete and budget-exhausted paths. Its public governed
+evidence contains view and governor receipts, without relation witnesses.
+Sparrow preserves the evidence this API returns and separately publishes its
+captured corpus, snapshot sequence and coverage. No new upstream API is made a
+prerequisite for these stored-text operations.
+
 [PurRDF #601](https://github.com/Blackcat-Informatics/purrdf/issues/601) requests
 the borrowed-producer integration seam. It is now closed as completed: PR #615,
 commit `a47940e1f130bf3739c6d59aaf89643209905ea4`, adds query-scoped registries and

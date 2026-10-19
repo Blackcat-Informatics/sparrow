@@ -21,6 +21,7 @@ pub(crate) mod pages;
 mod query;
 mod scope;
 mod sparse;
+mod text_relations;
 use budget::{Budget, Reservation};
 pub use explanation::SparqlExplanationItem;
 pub use pages::{
@@ -30,6 +31,10 @@ pub use pages::{
 pub use query::{ScopedSparqlExplanation, ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;
 use sparse::RowCursor;
+pub use text_relations::{
+    STORED_TEXT_CORPUS_PROFILE, STORED_TEXT_RELATION_PROFILE, SparqlTextCapture,
+    SparqlTextCoverage, SparqlTextRelations,
+};
 
 /// Host source law: bounded borrowed index entries and admitted encoded catalog bodies.
 pub const RDF_SOURCE_ADMISSION_PROFILE: &str = "sparrow-rdf-source-v4";
@@ -111,6 +116,7 @@ pub struct StoredRdfView<'a> {
     terms: u64,
     max_encoded: u64,
     scope_receipt: Option<super::Value>,
+    text_scope: Option<text_relations::TextScope>,
 }
 
 /// Owned native term carrier whose strings live through this admitted guard.
@@ -231,6 +237,7 @@ impl<'a> StoredRdfView<'a> {
             terms: 0,
             max_encoded: 0,
             scope_receipt: None,
+            text_scope: None,
         };
         for key in ["rdf:term-count", "rdf:max-encoded"] {
             let bytes = view.point(key.as_bytes(), 8)?.ok_or_else(|| {

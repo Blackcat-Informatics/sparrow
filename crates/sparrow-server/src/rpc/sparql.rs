@@ -24,6 +24,7 @@ struct Request {
     bindings: Vec<(String, TermValue)>,
     source: RdfReadLimits,
     governors: QueryGovernors,
+    text_relations: Option<sparrow_core::SparqlTextRelations>,
 }
 
 pub(super) fn query_scope(
@@ -97,6 +98,9 @@ fn request(rpc: &Rpc, input: wire::sparql_query::Reader<'_>) -> Result<Request, 
         bindings,
         source,
         governors,
+        text_relations: crate::text_wire::decode_relations(
+            input.get_text_relations().map_err(invalid)?,
+        )?,
     })
 }
 
@@ -487,6 +491,7 @@ fn receipt<Body, Outcome>(
         >,
     >,
 ) -> Result<(), Error> {
+    crate::text_wire::encode_capture(out.reborrow().init_text(), run.text.as_ref(), &run.coverage);
     match &run.correlation {
         Some(capture) => crate::correlation_wire::encode(
             out.reborrow().init_correlation().init_value(),
@@ -522,11 +527,7 @@ fn receipt<Body, Outcome>(
     coverage.set_content_failed(c.content_failed);
     coverage.set_content_not_applicable(c.content_not_applicable);
     coverage.set_catalog_entries(c.catalog_entries as u64);
-    coverage.set_complete(
-        run.correlation
-            .as_ref()
-            .map_or_else(|| c.complete(), |capture| capture.complete(c)),
-    );
+    coverage.set_complete(run.index_coverage_complete());
     coverage.set_event_time_known(c.event_time_known);
     let mut known = coverage
         .reborrow()
@@ -641,6 +642,7 @@ fn native_failure(
 impl Request {
     fn read(&self) -> SparqlRead<'_> {
         SparqlRead {
+            text_relations: self.text_relations.as_ref(),
             scope: &self.scope,
             layers: self.layers,
             request: SparqlRequest {
@@ -693,12 +695,16 @@ pub(super) fn explanation_page(
             target.set_reifier_targets(indexes.reifier_targets);
             target.set_reifier_components(indexes.reifier_components);
             target.set_annotation_values(indexes.annotation_values);
-            // Core validates that QueryOptions::default injected no registry.
-            data.reborrow().init_relations(0);
+            let mut relations = data
+                .reborrow()
+                .init_relations(value.relations().len() as u32);
+            for (index, relation) in value.relations().iter().enumerate() {
+                relations.set(index as u32, &relation.iri);
+            }
             data.reborrow().init_aggregates(0);
             let mut items = data.init_items(page.body.items().count() as u32);
             for (index, item) in page.body.items().enumerate() {
-                explanation_item(items.reborrow().get(index as u32), item);
+                explanation_item(items.reborrow().get(index as u32), item)?;
             }
         }
     }
@@ -708,12 +714,34 @@ pub(super) fn explanation_page(
 fn explanation_item(
     mut out: wire::native_explanation_item::Builder<'_>,
     item: sparrow_core::SparqlExplanationItem<'_>,
-) {
+) -> Result<(), Error> {
     use sparrow_core::SparqlExplanationItem as I;
     use wire::{optional_limit::Builder as Limit, optional_text::Builder as Text};
     match item {
         I::JoinOrder(text) => out.set_join_order(text),
         I::Statistic(text) => out.set_statistic(text),
+        I::Relation(relation) => {
+            let mut out = out.init_relation();
+            out.set_iri(&relation.iri);
+            out.set_subject_arity(relation.subject_arity as u32);
+            out.set_object_arity(relation.object_arity as u32);
+            out.set_volatility(match relation.volatility {
+                purrdf::sparql::Volatility::Stable => wire::NativeRelationVolatility::Stable,
+                purrdf::sparql::Volatility::Volatile => wire::NativeRelationVolatility::Volatile,
+                _ => {
+                    return Err(Error::new(
+                        "UNSUPPORTED",
+                        "unknown native relation volatility",
+                    ));
+                }
+            });
+            let mut modes = out.init_modes(relation.modes.len() as u32);
+            for (index, mode) in relation.modes.iter().enumerate() {
+                let mut row = modes.reborrow().get(index as u32);
+                row.set_code(&mode.code);
+                row.set_rows_per_invocation(mode.rows_per_invocation);
+            }
+        }
         I::Node(node) => {
             let mut out = out.init_node();
             out.set_ordinal(node.ordinal as u64);
@@ -800,6 +828,7 @@ fn explanation_item(
             }
         }
     }
+    Ok(())
 }
 
 fn explanation_optional<B, T>(

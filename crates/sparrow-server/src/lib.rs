@@ -12,6 +12,7 @@ pub mod syslog_listener;
 mod syslog_wire;
 mod tail_wire;
 mod tailing;
+mod text_wire;
 mod time_wire;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;

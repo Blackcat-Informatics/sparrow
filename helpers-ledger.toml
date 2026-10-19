@@ -4307,3 +4307,87 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(decode_artifact_metadata_elsewhere|copy_manifest_header_for_graph)$']
+
+[[job]]
+id = "stored-text-posting-reader"
+summary = "One snapshot-borrowing posting reader checks storage widths, applies captured membership before decoding frequencies, meters each source probe, and supplies ordinary ranking and streaming SPARQL spans. Native admitted maps, vectors and shared text retain the invoking workspace."
+home = "sparrow_core::storage::text_index::PostingReader::read_next"
+entry_points = ["sparrow_core::storage::text_index::PostingReader::new", "sparrow_core::storage::text_index::rank_postings", "sparrow_core::storage::rdf_view::text_relations::producer::Cursor::spans_row"]
+spec = "docs/architecture.md: persistent stored-text adapters and original query governors."
+vectors = ["crates/sparrow-core/src/storage/text_index.rs", "crates/sparrow-core/src/storage/rdf_view/text_relations/tests.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(sparql_posting_decoder|sparql_bm25)$']
+
+[[job]]
+id = "stored-text-corpus"
+summary = "Ordinary and SPARQL text reads share stored-profile validation and the original ordered corpus identity preimage, streamed through native framing and hashing. Coverage is independent of native answer certainty."
+home = "sparrow_core::storage::text_index::corpus_identity"
+entry_points = ["sparrow_core::storage::text_index::text_metadata", "sparrow_core::storage::rdf_view::text_relations::StoredRdfView::include_text", "sparrow_core::storage::rdf_view::text_relations::StoredRdfView::text_capture", "sparrow_core::storage::rdf_view::text_relations::SparqlTextCapture::membership_complete", "sparrow_core::storage::rdf_view::query::ScopedSparqlResult::index_coverage_complete"]
+spec = "docs/architecture.md: declared corpus, scope and ranking profiles."
+vectors = ["crates/sparrow-core/src/storage/rdf_view/text_relations/tests.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^sparql_corpus_fingerprint$']
+
+[[job]]
+id = "stored-text-native-producers"
+summary = "Caller-selected ranked and byte-span relations borrow the original captured snapshot through the public scoped extension environment. Native analysis, scoring, work contexts, admitted rows and retained results keep their owners; spans stream without BM25 ranking."
+home = "sparrow_core::storage::rdf_view::text_relations::producer::environment"
+entry_points = ["sparrow_core::storage::rdf_view::text_relations::producer::Relation::open_admitted", "sparrow_core::storage::rdf_view::text_relations::producer::Cursor::prepare", "sparrow_core::storage::rdf_view::text_relations::producer::Cursor::pull", "sparrow_core::storage::rdf_view::text_relations::producer::Cursor::ranked_row", "sparrow_core::storage::rdf_view::text_relations::producer::Cursor::span_row", "sparrow_core::storage::rdf_view::text_relations::producer::work"]
+spec = "docs/purrdf-integration-gaps.md: query-scoped stored text producers."
+vectors = ["crates/sparrow-core/src/storage/rdf_view/text_relations/tests.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(rebuild_text_index_for_query|copy_native_text_analyzer)$']
+
+[[job]]
+id = "entity-rdf-identity"
+summary = "One Sparrow-owned spelling maps opaque evidence and stream identities to the RDF entities used by metadata, provenance, correlation and stored-text rows."
+home = "sparrow_core::storage::rdf_index::entity_iri"
+entry_points = ["sparrow_core::storage::rdf_index::occurrence_metadata", "sparrow_core::storage::rdf_index::metadata", "sparrow_core::storage::rdf_view::text_relations::StoredRdfView::include_text"]
+spec = "docs/interfaces.md: returned opaque identities and native metadata joins."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/rdf_view/text_relations/tests.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^text_record_iri$']
+
+[[job]]
+id = "stored-text-wire"
+summary = "One typed codec carries caller-selected predicates and frozen corpus/profile/coverage receipts. CLI and MCP share closed input decoding and rendering, including exact native wide integers."
+home = "sparrow_server::text_wire::encode_capture"
+entry_points = ["sparrow_server::text_wire::decode_relations", "sparrow_server::text_wire::encode_relations", "sparrow_server::text_wire::render_capture", "sparrow_server::agent::sparql::Input::decode", "sparrow_server::agent::sparql::Input::execute"]
+spec = "docs/interfaces.md: typed native query and explanation contracts."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(mcp_text_registry|cli_text_registry)$']
+
+[[job]]
+id = "storage-fixture-defaults"
+summary = "Dev-only storage_config and record_scope macros own the common unit/integration fixture defaults. One locator supplies the native baseline lexicon artifacts to the macro and daemon configuration writer."
+home = "sparrow_test_support::text_lexicon_dir"
+entry_points = ["sparrow_test_support::write_server_config"]
+spec = "AGENTS.md: one dev-only home for shared test scaffolding."
+vectors = ["crates/sparrow-core/src/storage/rdf_view/text_relations/tests.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []

@@ -14,6 +14,7 @@ pub(crate) struct Input {
     base: Option<String>,
     layers: [bool; 3],
     bindings: Vec<(String, purrdf::TermValue)>,
+    text_relations: Option<sparrow_core::SparqlTextRelations>,
 }
 
 pub(super) struct Controls {
@@ -56,6 +57,24 @@ impl Input {
                 }
                 layer.deny_unknown()?;
             }
+            let text_relations = match fields.raw("text_relations")? {
+                None => None,
+                Some(value) => {
+                    let mut relation = Record::new(value, "stored-text relations")?;
+                    let ranked_iri: String = relation.required("ranked_iri")?;
+                    let spans_iri: String = relation.required("spans_iri")?;
+                    relation.deny_unknown()?;
+                    if ranked_iri.len() > 1024 || spans_iri.len() > 1024 {
+                        return Err(json::record::DecodeError::custom(
+                            "text relation IRI exceeds 1024 UTF-8 bytes",
+                        ));
+                    }
+                    Some(sparrow_core::SparqlTextRelations {
+                        ranked_iri,
+                        spans_iri,
+                    })
+                }
+            };
             let mut bindings = Vec::new();
             if let Some(value) = fields.raw("bindings")? {
                 let values = Vec::<Value>::from_json(value)?;
@@ -105,6 +124,7 @@ impl Input {
                 base,
                 layers,
                 bindings,
+                text_relations,
             })
         };
         decode().map_err(invalid)
@@ -123,6 +143,13 @@ impl Input {
         layers.set_metadata(self.layers[0]);
         layers.set_diagnostic(self.layers[1]);
         layers.set_content(self.layers[2]);
+        match &self.text_relations {
+            Some(value) => crate::text_wire::encode_relations(
+                query.reborrow().init_text_relations().init_value(),
+                value,
+            ),
+            None => query.reborrow().init_text_relations().set_absent(()),
+        }
         let refs = self
             .bindings
             .iter()
@@ -250,6 +277,14 @@ pub(super) fn schema() -> Value {
         .with("store_id", string())
         .with("query", string())
         .with("base_iri", string())
+        .with("text_relations", Object::new()
+            .with("type", "object")
+            .with("additionalProperties", false)
+            .with("required", vec!["ranked_iri", "spans_iri"])
+            .with("description", "Select both absolute IRIs. Call ranked_iri as ?doc <iri> (needle ?record_id ?score ?rank ?matched), or spans_iri as ?doc <iri> (needle ?record_id ?term ?start ?end ?basis ?path ?coarse). The bound string needle uses native lexical analysis and matches any analyzed term. Scores and 1-based ranks use the captured covered corpus, including bound-document calls. Span [start,end) offsets are record-local bytes; decoded scalar spans can be coarse. record_id is accepted by bytes_read; doc joins stored metadata.")
+            .with("properties", Object::new()
+                .with("ranked_iri", Object::new().with("type", "string").with("maxLength", 1024_u32))
+                .with("spans_iri", Object::new().with("type", "string").with("maxLength", 1024_u32))))
         .with("scope", super::selection::schema())
         .with("source", string())
         .with("received_from", string())
@@ -731,6 +766,8 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
         ),
     };
     let d = c.get_diagnostics()?;
+    let text =
+        crate::text_wire::render_capture(value.get_text()?, selected, d.get_membership_complete())?;
     let coverage = Object::new()
         .with("visited", c.get_visited().to_string())
         .with("artifacts_visited", c.get_artifacts_visited().to_string())
@@ -797,6 +834,7 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
         .with("interpretations", interpretations)
         .with("sequence", value.get_sequence().to_string())
         .with("coverage", coverage)
+        .with("text_corpus", text)
         .with("native_governor", g)
         .with("stop_reason", stop)
         .with(

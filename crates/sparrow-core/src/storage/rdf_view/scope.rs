@@ -306,25 +306,43 @@ impl Store {
         cancellation: &QueryCancellation,
         operation: impl FnOnce(&StoredRdfView<'_>, &RdfScopeCoverage) -> T,
     ) -> Result<T, ReadError> {
-        self.capture_rdf_scope((scope, None), layers, now, limits, cancellation, operation)
+        self.capture_rdf_scope(
+            (scope, None, false),
+            layers,
+            now,
+            limits,
+            cancellation,
+            operation,
+        )
     }
 
     pub(super) fn capture_rdf_scope<T>(
         &self,
-        selection: (&QueryScope, Option<&crate::CorrelationCapture>),
+        selection: (&QueryScope, Option<&crate::CorrelationCapture>, bool),
         layers: RdfGraphLayers,
         now: u64,
         limits: RdfReadLimits,
         cancellation: &QueryCancellation,
         operation: impl FnOnce(&StoredRdfView<'_>, &RdfScopeCoverage) -> T,
     ) -> Result<T, ReadError> {
-        let (scope, correlation) = selection;
+        let (scope, correlation, text) = selection;
         scope.validate().map_err(Arc::new)?;
         cancellation.checkpoint().map_err(Arc::new)?;
         let _lease = self.rdf_read_lease()?;
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new_cancellable(&db, limits, &[], cancellation.clone())?;
+        if text {
+            Arc::get_mut(&mut view._scope)
+                .expect("text setup precedes native owned-query admission")
+                .grow(4096)?;
+            view.text_scope = Some(super::text_relations::TextScope::new(
+                writer.config.text_analyzer.clone(),
+                scope.scan_budget,
+                &writer.id,
+                view.snapshot_sequence_number(),
+            ));
+        }
         // Shared catalog admission charges every decoded entry at 64x encoded
         // bytes. Keep this whole capture allowance live until temporary maps drop.
         let _catalog = view.budget.reserve(SCAN_BYTES as u64)?;
@@ -425,6 +443,7 @@ impl Store {
                 matched_artifacts.insert(record.artifact_id.clone());
             }
             view.include_record(&record, layers, scope.require_complete_index, &mut coverage)?;
+            view.include_text(&record, scope.require_complete_index)?;
         }
         drop(candidates);
         // Whole-artifact membership is independent of its record expansion.

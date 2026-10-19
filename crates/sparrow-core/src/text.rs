@@ -8,6 +8,8 @@ use purrdf::text::{Analyzer, AnalyzerProfile};
 use purrdf_lex::json::{Object, Value};
 use std::{collections::BTreeMap, io::Read, path::Path};
 
+pub(crate) const MAX_OCCURRENCES: u64 = 16384;
+
 pub(crate) const PROFILE: &str = "sparrow-record-raw-and-decoded-v1";
 
 /// Resolve PurRDF's standard law from exactly five supplied CBOR lexicons.
@@ -168,7 +170,7 @@ fn append(
         .projections(input)
         .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))?;
     for projection in analysis.lexical {
-        if *length == 16384 {
+        if *length == MAX_OCCURRENCES {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "text record exceeds 16,384 token occurrences",

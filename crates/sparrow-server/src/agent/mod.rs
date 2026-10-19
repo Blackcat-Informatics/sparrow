@@ -121,7 +121,7 @@ pub(super) struct Options {
     require_complete_index: bool,
 }
 
-fn invalid(message: impl Into<String>) -> AgentError {
+pub(super) fn invalid(message: impl Into<String>) -> AgentError {
     AgentError {
         code: "INVALID_ARGUMENT".into(),
         message: message.into(),

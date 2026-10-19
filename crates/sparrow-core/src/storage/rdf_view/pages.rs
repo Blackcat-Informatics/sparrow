@@ -750,6 +750,11 @@ fn metadata_bytes<Outcome>(
         )
     });
     let metadata = 8192usize
+        .saturating_add(
+            run.text
+                .as_ref()
+                .map_or(0, SparqlTextCapture::transport_bytes),
+        )
         .saturating_add(correlation_bytes)
         .saturating_add(scope_bytes)
         .saturating_add(size_of::<Published<Outcome>>())

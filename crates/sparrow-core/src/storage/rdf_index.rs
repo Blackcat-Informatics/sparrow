@@ -34,6 +34,10 @@ pub(crate) fn graph_iri(id: &str) -> String {
     format!("urn:sparrow:graph:{id}")
 }
 
+pub(crate) fn entity_iri(id: &str) -> String {
+    format!("urn:sparrow:{id}")
+}
+
 pub(super) fn profile_identity() -> Result<String, Error> {
     let mut bytes = Vec::new();
     for value in [
@@ -615,7 +619,7 @@ fn occurrence_metadata(
     use crate::RDF_VOCABULARY_NAMESPACE as NS;
     use purrdf::{RdfDatasetBuilder, RdfLiteral};
     let mut builder = RdfDatasetBuilder::new();
-    let subject = builder.intern_iri(&format!("urn:sparrow:{id}"))?;
+    let subject = builder.intern_iri(&entity_iri(id))?;
     let source_node = source_metadata(&mut builder, source)?;
     for (predicate, object) in [
         (
@@ -766,13 +770,7 @@ pub(super) fn metadata(
         }
     }
     if let Some((id, kind)) = origin {
-        stream_metadata(
-            &mut builder,
-            subject,
-            source,
-            &format!("urn:sparrow:{id}"),
-            kind,
-        )?;
+        stream_metadata(&mut builder, subject, source, &entity_iri(id), kind)?;
     }
     for (predicate, object) in [
         (
@@ -786,7 +784,7 @@ pub(super) fn metadata(
         ),
         (
             format!("{NS}artifact"),
-            builder.intern_iri(&format!("urn:sparrow:{}", record.artifact_id))?,
+            builder.intern_iri(&entity_iri(&record.artifact_id))?,
         ),
         (
             format!("{NS}sourceByteStart"),
@@ -922,7 +920,7 @@ mod tests {
             ("artifact:ordinary", "", ""),
         ] {
             let mut builder = RdfDatasetBuilder::new();
-            let subject = builder.intern_iri(&format!("urn:sparrow:{id}")).unwrap();
+            let subject = builder.intern_iri(&entity_iri(id)).unwrap();
             for (predicate, object) in [
                 ("source", builder.intern_iri(&source).unwrap()),
                 (

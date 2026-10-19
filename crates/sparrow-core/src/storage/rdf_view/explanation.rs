@@ -4,7 +4,7 @@
 //! Borrowed native explanation entries and transport capacity; no repricing.
 
 use super::Error;
-use purrdf::sparql::{NodeCharges, QueryExplanation, shapes::ShapeReport};
+use purrdf::sparql::{NodeCharges, PfDescriptor, QueryExplanation, shapes::ShapeReport};
 
 /// One structured native measured-work entry, retaining its original native owner.
 #[derive(Debug)]
@@ -17,6 +17,8 @@ pub enum SparqlExplanationItem<'a> {
     Statistic(&'a str),
     /// Native selected physical strategy and actual measured work.
     Shape(&'a ShapeReport),
+    /// Native ordinary property-function declaration, including its actual modes.
+    Relation(&'a PfDescriptor),
 }
 
 pub(super) fn items(
@@ -40,16 +42,27 @@ pub(super) fn items(
                     .map(|text| SparqlExplanationItem::Statistic(text)),
             )
             .chain(value.shapes().iter().map(SparqlExplanationItem::Shape))
+            .chain(
+                value
+                    .relations()
+                    .iter()
+                    .map(SparqlExplanationItem::Relation),
+            )
     })
 }
 
 pub(super) fn metadata_bytes(value: &QueryExplanation) -> Result<usize, Error> {
-    // This endpoint supplies QueryOptions::default(), so no host registry is in
-    // scope. Refuse an integration invariant change instead of dropping declarations.
-    if !value.relations().is_empty() || !value.aggregates().is_empty() {
+    // This input registers ordinary stored-text relations. Refuse a changed
+    // registry contract rather than omitting a declaration the wire cannot carry.
+    if !value.aggregates().is_empty()
+        || value
+            .relations()
+            .iter()
+            .any(|relation| relation.ranked.is_some())
+    {
         return Err(Error::new(
             "UNSUPPORTED",
-            "explanation transport requires descriptors for the injected native extension registry",
+            "this explanation transport requires ordinary property functions and no custom aggregates",
         ));
     }
     let profile = value.profile();
@@ -64,6 +77,11 @@ pub(super) fn metadata_bytes(value: &QueryExplanation) -> Result<usize, Error> {
         bytes = bytes
             .saturating_add(label.len().saturating_mul(6))
             .saturating_add(256);
+    }
+    for relation in value.relations() {
+        bytes = bytes
+            .saturating_add(256)
+            .saturating_add(relation.iri.len().saturating_mul(6));
     }
     Ok(bytes)
 }
@@ -82,6 +100,14 @@ pub(super) fn item_bytes(value: SparqlExplanationItem<'_>) -> Result<usize, Erro
                 .map_or(0, str::len)
                 .saturating_add(shape.provider.map_or(0, str::len))
                 .saturating_mul(6),
+        ),
+        SparqlExplanationItem::Relation(relation) => relation.modes.iter().fold(
+            4096usize.saturating_add(relation.iri.len().saturating_mul(6)),
+            |bytes, mode| {
+                bytes
+                    .saturating_add(256)
+                    .saturating_add(mode.code.len().saturating_mul(6))
+            },
         ),
     };
     Ok(bytes)

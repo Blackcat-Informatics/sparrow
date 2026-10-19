@@ -6,6 +6,58 @@
 /// Process-crash coordination for test-only production checkpoints.
 pub mod crash;
 
+/// Production flush default used by the shared storage fixture macro.
+pub use sparrow_core::DEFAULT_FLUSH_INTERVAL_MS as STORAGE_FLUSH_INTERVAL_MS;
+/// Native analyzer resolver used by the shared storage fixture macro.
+pub use sparrow_core::resolve_text_analyzer;
+
+/// Baseline native analyzer artifacts for workspace storage fixtures.
+pub fn text_lexicon_dir() -> &'static std::path::Path {
+    std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../purrdf/crates/text/lexicons/artifacts"
+    ))
+}
+
+/// One configuration law for core unit and integration fixtures.
+/// The caller supplies its local `Config` identity; native analyzer types are shared.
+#[macro_export]
+macro_rules! storage_config {
+    ($config:ident) => {{
+        static CONFIG: std::sync::OnceLock<$config> = std::sync::OnceLock::new();
+        CONFIG
+            .get_or_init(|| $config {
+                buffered_flush_interval_ms: $crate::STORAGE_FLUSH_INTERVAL_MS,
+                disk_budget: 128 * 1024 * 1024,
+                maintenance_reserve: 8 * 1024 * 1024,
+                max_artifact_bytes: 8 * 1024 * 1024,
+                max_records: 10_000,
+                max_pin_members: 100,
+                text_analyzer: $crate::resolve_text_analyzer($crate::text_lexicon_dir())
+                    .expect("standard storage fixture analyzer"),
+            })
+            .clone()
+    }};
+}
+
+/// One complete retained-record scope for storage unit and integration fixtures.
+#[macro_export]
+macro_rules! record_scope {
+    ($scope:ident, $source:expr, $limit:expr) => {
+        $scope {
+            selection: Default::default(),
+            source: Some($source.into()),
+            sources: None,
+            diagnostics: Default::default(),
+            require_complete_index: false,
+            received_from: 0,
+            received_before: u64::MAX,
+            limit: $limit,
+            scan_budget: 10000,
+        }
+    };
+}
+
 /// One discovered store for SDK acceptance and ingestion status certificates.
 pub fn client_discovery() -> capnp::message::Builder<capnp::message::HeapAllocator> {
     let mut message = capnp::message::Builder::new_default();
@@ -69,7 +121,7 @@ pub fn write_server_config(
     socket: &std::path::Path,
 ) -> std::path::PathBuf {
     let config = dir.join("server.toml");
-    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", concat!(env!("CARGO_MANIFEST_DIR"), "/../../../purrdf/crates/text/lexicons/artifacts"))).unwrap();
+    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", text_lexicon_dir())).unwrap();
     config
 }
 

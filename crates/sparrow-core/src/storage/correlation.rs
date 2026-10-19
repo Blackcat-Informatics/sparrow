@@ -249,7 +249,7 @@ fn prepare(
                         "seed_artifact"
                     }
                 ));
-                bindings.push((name, TermValue::iri(format!("urn:sparrow:{id}"))));
+                bindings.push((name, TermValue::iri(super::rdf_index::entity_iri(id))));
             }
             body.push_str(&format!("FILTER({}) ", alternatives.join(" || ")));
         }
@@ -370,6 +370,7 @@ impl Store {
         let prepared = prepare(read.selector, read.relation).map_err(std::sync::Arc::new)?;
         self.capture_sparql(
             &SparqlRead {
+                text_relations: None,
                 scope: read.scope,
                 layers: RdfGraphLayers {
                     metadata: true,

@@ -27,10 +27,23 @@ pub(super) fn render(value: wire::sparql_explanation::Reader<'_>) -> Result<Valu
                 .with("cost", cost.to_string()),
         ));
     }
-    if !value.get_relations()?.is_empty() || !value.get_aggregates()?.is_empty() {
+    let relations = value.get_relations()?;
+    if relations.len() > 2 || !value.get_aggregates()?.is_empty() {
         return Err(super::invalid(
-            "unexpected host extension registry in native explanation",
+            "native explanation exceeds its ordinary stored-text registry contract",
         ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut relation_names = Vec::new();
+    for relation in relations {
+        let relation = relation?;
+        let name = relation.to_str()?;
+        if name.is_empty() || name.len() > 1024 || !seen.insert(name) {
+            return Err(super::invalid(
+                "invalid native relation declaration inventory",
+            ));
+        }
+        relation_names.push(Value::from(name));
     }
     let indexes = value.get_indexes()?;
     let entries = value.get_items()?;
@@ -57,7 +70,7 @@ pub(super) fn render(value: wire::sparql_explanation::Reader<'_>) -> Result<Valu
                 .with("reifier_components", indexes.get_reifier_components())
                 .with("annotation_values", indexes.get_annotation_values()),
         )
-        .with("relations", Value::array(std::iter::empty::<Value>()))
+        .with("relations", Value::array(relation_names))
         .with("aggregates", Value::array(std::iter::empty::<Value>()))
         .with("items", Value::array(items))
         .into())
@@ -73,6 +86,44 @@ fn item(value: wire::native_explanation_item::Reader<'_>) -> Result<Value> {
             .with("kind", "statistic")
             .with("text", text?.to_str()?)
             .into(),
+        wire::native_explanation_item::Relation(value) => {
+            let value = value?;
+            let arity = value
+                .get_subject_arity()
+                .checked_add(value.get_object_arity())
+                .ok_or_else(|| super::invalid("native relation arity overflow"))?;
+            let source = value.get_modes()?;
+            if arity > 64 || source.is_empty() || source.len() > 64 {
+                return Err(super::invalid("invalid native relation modes"));
+            }
+            let mut modes = Vec::new();
+            for mode in source {
+                let code = mode.get_code()?.to_str()?;
+                if code.len() != arity as usize
+                    || !code.bytes().all(|byte| matches!(byte, b'b' | b'f'))
+                {
+                    return Err(super::invalid(
+                        "native relation mode disagrees with its arity",
+                    ));
+                }
+                modes.push(Value::from(Object::new().with("code", code).with(
+                    "rows_per_invocation",
+                    mode.get_rows_per_invocation().to_string(),
+                )));
+            }
+            let volatility = match value.get_volatility()? {
+                wire::NativeRelationVolatility::Stable => purrdf::sparql::Volatility::Stable,
+                wire::NativeRelationVolatility::Volatile => purrdf::sparql::Volatility::Volatile,
+            };
+            Object::new()
+                .with("kind", "relation")
+                .with("iri", value.get_iri()?.to_str()?)
+                .with("subject_arity", value.get_subject_arity())
+                .with("object_arity", value.get_object_arity())
+                .with("volatility", volatility.label())
+                .with("modes", Value::array(modes))
+                .into()
+        }
         wire::native_explanation_item::Node(node) => {
             let node = node?;
             let fuel = node.get_fuel()?;

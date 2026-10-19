@@ -709,7 +709,18 @@ struct SparqlQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; scope @2 :Scope;
   query @3 :Text; baseIri @4 :OptionalText; layers @5 :RdfLayers;
   terms @6 :List(RdfTermNode); bindings @7 :List(SparqlBinding); limits @8 :SparqlLimits;
+  textRelations @9 :OptionalStoredTextRelations;
 }
+struct StoredTextRelations { rankedIri @0 :Text; spansIri @1 :Text; }
+struct OptionalStoredTextRelations { union { absent @0 :Void; value @1 :StoredTextRelations; } }
+struct StoredTextCoverage { ready @0 :UInt64; failedOrIncomplete @1 :UInt64; notApplicable @2 :UInt64; }
+struct StoredTextCapture {
+  relations @0 :StoredTextRelations; corpusProfile @1 :Text; rankingProfile @2 :Text;
+  analyzer @3 :Text; corpusId @4 :Text; documents @5 :UInt64; tokens @6 :WideInteger;
+  coverage @7 :StoredTextCoverage; membershipComplete @8 :Bool;
+  profile @9 :Text;
+}
+struct OptionalStoredTextCapture { union { absent @0 :Void; value @1 :StoredTextCapture; } }
 enum GovernorDimension { fuel @0; answerRows @1; intermediateCells @2; scratchBytes @3; remoteRequests @4; udfDepth @5; pages @6; bytes @7; }
 struct GovernorUse { dimension @0 :GovernorDimension; consumed @1 :UInt64; ceiling @2 :UInt64; }
 struct GovernorBudget { dimension @0 :GovernorDimension; limit @1 :UInt64; consumed @2 :UInt64; }
@@ -780,14 +791,20 @@ struct NativeShapeReport {
   registry @3 :OptionalLimit; sourceVisits @4 :UInt64; transitions @5 :UInt64;
   outputRows @6 :UInt64; estimate @7 :OptionalNativeAccessEstimate;
 }
-struct NativeExplanationItem { union { node @0 :NativeNodeCharges; joinOrder @1 :Text; statistic @2 :Text; shape @3 :NativeShapeReport; } }
+enum NativeRelationVolatility { stable @0; volatile @1; }
+struct NativeRelationMode { code @0 :Text; rowsPerInvocation @1 :UInt64; }
+struct NativeRelationDescriptor {
+  iri @0 :Text; subjectArity @1 :UInt32; objectArity @2 :UInt32;
+  volatility @3 :NativeRelationVolatility; modes @4 :List(NativeRelationMode);
+}
+struct NativeExplanationItem { union { node @0 :NativeNodeCharges; joinOrder @1 :Text; statistic @2 :Text; shape @3 :NativeShapeReport; relation @4 :NativeRelationDescriptor; } }
 struct NativeStatementIndexes { reifierTargets @0 :Bool; reifierComponents @1 :Bool; annotationValues @2 :Bool; }
 struct SparqlExplanation {
   profile @0 :Text; version @1 :UInt32; digest @2 :Text; stopPollFuel @3 :UInt64;
   schedule @4 :List(NativeChargeRate); indexes @5 :NativeStatementIndexes;
   items @6 :List(NativeExplanationItem);
-  # This endpoint injects no custom relation/aggregate registry. Nonempty
-  # native declarations are refused before publishing instead of being omitted.
+  # Registered ordinary property functions are described in paged relation items.
+  # Native ranked declarations and custom aggregates are not injected here.
   relations @7 :List(Text); aggregates @8 :List(Text);
 }
 struct SparqlPage {
@@ -798,6 +815,7 @@ struct SparqlPage {
   scope @9 :QueryScopeReceipt;
   correlation @10 :OptionalCorrelationCapture;
   operation @11 :NativeReadOperation;
+  text @12 :OptionalStoredTextCapture;
 }
 enum NativeSeverity { error @0; warning @1; note @2; info @3; }
 enum NativeStorageFailure { absent @0; capacity @1; sizeOverflow @2; allocationFailed @3; admissionFailed @4; formattingFailed @5; }

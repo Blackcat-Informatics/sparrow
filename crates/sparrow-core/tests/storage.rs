@@ -3,7 +3,7 @@
 
 //! Persistent lifetime scenarios using temporary stores and injected UTC instants.
 
-use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, Store};
+use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, QueryScope, Store};
 use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_range_index};
 
 const DAY: u64 = 86_400_000;
@@ -384,6 +384,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     scope.source = None;
     let governors = QueryGovernors::METERED.with_fuel(1_000_000);
     let read = SparqlRead {
+        text_relations: None,
         scope: &scope,
         layers: RdfGraphLayers {
             metadata: true,
@@ -591,6 +592,7 @@ fn source_stream_rdf_deduplicates_union_and_follows_pinned_occurrence_lifetimes(
         let result = store
             .sparql_query(
                 &SparqlRead {
+                    text_relations: None,
                     scope,
                     layers,
                     request: SparqlRequest {
@@ -11844,27 +11846,7 @@ fn combined_ingest_status_refuses_corrupt_live_membership_and_projection_state()
 }
 
 fn config() -> Config {
-    Config {
-        buffered_flush_interval_ms: sparrow_core::DEFAULT_FLUSH_INTERVAL_MS,
-        disk_budget: 128 * 1024 * 1024,
-        maintenance_reserve: 8 * 1024 * 1024,
-        max_artifact_bytes: 8 * 1024 * 1024,
-        max_records: 10_000,
-        max_pin_members: 100,
-        text_analyzer: {
-            static ANALYZER: std::sync::OnceLock<purrdf::text::Analyzer> =
-                std::sync::OnceLock::new();
-            ANALYZER
-                .get_or_init(|| {
-                    sparrow_core::resolve_text_analyzer(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../../purrdf/crates/text/lexicons/artifacts"
-                    ))
-                    .unwrap()
-                })
-                .clone()
-        },
-    }
+    sparrow_test_support::storage_config!(Config)
 }
 
 #[test]
@@ -13152,6 +13134,7 @@ fn native_sparql_pages_bound_handle_capacity_and_expire_without_renewal() {
         .with_max_answers(100)
         .with_max_scratch_bytes(1024 * 1024);
     let read = SparqlRead {
+        text_relations: None,
         scope: &scope,
         layers: RdfGraphLayers::ALL,
         request: SparqlRequest {
@@ -13230,6 +13213,7 @@ fn native_sparql_pages_freeze_byte_boundaries_and_release_original_leases() {
         TermValue::iri(format!("urn:large:{}", "x".repeat(17000))),
     )];
     let read = SparqlRead {
+        text_relations: None,
         scope: &scope,
         layers: RdfGraphLayers::ALL,
         request: SparqlRequest {
@@ -13319,6 +13303,7 @@ fn native_sparql_pages_preserve_unknown_and_query_failures_without_rows() {
         .with_fuel(0)
         .with_max_scratch_bytes(1024 * 1024);
     let mut read = SparqlRead {
+        text_relations: None,
         scope: &scope,
         layers: RdfGraphLayers::ALL,
         request: SparqlRequest {
@@ -13423,6 +13408,7 @@ fn adopted_native_materialization_retains_complete_cells_after_source_close() {
     let result = store
         .sparql_query(
             &SparqlRead {
+                text_relations: None,
                 scope: &scope,
                 layers,
                 request: SparqlRequest {
@@ -13484,6 +13470,7 @@ fn adopted_native_explain_keeps_bindings_governors_and_retained_ledger() {
     ] {
         let substitutions = [("predicate".into(), TermValue::iri(predicate))];
         let read = SparqlRead {
+            text_relations: None,
             scope: &scope,
             layers,
             request: SparqlRequest {
@@ -13541,6 +13528,7 @@ fn adopted_native_explain_keeps_bindings_governors_and_retained_ledger() {
     let captured = store
         .sparql_explain(
             &SparqlRead {
+                text_relations: None,
                 scope: &scope,
                 layers,
                 request: SparqlRequest {
@@ -13589,6 +13577,7 @@ fn adopted_native_explain_preserves_read_only_and_host_refusals() {
     let scope = record_page_scope("explain-refusal", 1);
     let governors = QueryGovernors::METERED.with_fuel(1_000_000);
     let mut read = SparqlRead {
+        text_relations: None,
         scope: &scope,
         layers: RdfGraphLayers::ALL,
         request: SparqlRequest {
@@ -13648,6 +13637,7 @@ fn native_explanation_pages_keep_original_ledger_and_share_query_admission() {
     let scope = record_page_scope("explanation-pages", 1);
     let governors = QueryGovernors::METERED.with_fuel(1_000_000);
     let read = SparqlRead {
+        text_relations: None,
         scope: &scope,
         layers: RdfGraphLayers {
             metadata: true,
@@ -13813,6 +13803,7 @@ fn native_explanation_refuses_an_oversized_entry_without_a_result_handle() {
     let error = store
         .sparql_explanation_read(
             &SparqlRead {
+                text_relations: None,
                 scope: &scope,
                 layers: RdfGraphLayers {
                     metadata: false,
@@ -13865,6 +13856,7 @@ fn scoped_sparql_uses_native_read_forms_bindings_and_governor_outcomes() {
         TermValue::iri("urn:sparrow:vocab:payload"),
     )];
     let mut read = SparqlRead {
+        text_relations: None,
         scope: &scope,
         layers: RdfGraphLayers::ALL,
         request: SparqlRequest {
@@ -14195,17 +14187,7 @@ fn rdf_scope_reports_content_and_unknown_diagnostic_coverage_independently() {
 }
 
 fn record_page_scope(source: &str, page_size: usize) -> sparrow_core::QueryScope {
-    sparrow_core::QueryScope {
-        selection: sparrow_core::QuerySelection::Live,
-        source: Some(source.into()),
-        sources: None,
-        diagnostics: Default::default(),
-        require_complete_index: false,
-        received_from: 0,
-        received_before: u64::MAX,
-        limit: page_size,
-        scan_budget: 10000,
-    }
+    sparrow_test_support::record_scope!(QueryScope, source, page_size)
 }
 
 #[test]
@@ -15954,6 +15936,7 @@ fn recordless_rdf_scope_preserves_occurrences_filters_and_unknown_diagnostics() 
     let run = |scope: &sparrow_core::QueryScope, layers, now| {
         let governors = QueryGovernors::METERED.with_fuel(1_000_000);
         let result=store.sparql_query(&SparqlRead {
+text_relations: None,
             scope,layers,request:SparqlRequest { query:"SELECT ?artifact WHERE { ?artifact a <urn:sparrow:vocab:Artifact> } ORDER BY ?artifact",base_iri:None,substitutions:&[] },
             governors:&governors,limits:RdfReadLimits::default(),
         },now,&QueryCancellation::default()).unwrap();
@@ -16278,6 +16261,7 @@ fn rdf_scope_charges_admitted_catalog_bodies_and_keeps_large_occurrence_counts()
         let result = store
             .sparql_query(
                 &SparqlRead {
+                    text_relations: None,
                     scope: &scope,
                     layers: RdfGraphLayers {
                         metadata: true,
@@ -16331,6 +16315,7 @@ fn populated_artifact_rdf_follows_atomic_publication_and_independent_pin_lifetim
     let run = |store: &Store, scope: &QueryScope, now| {
         let governors = QueryGovernors::METERED.with_fuel(1_000_000);
         let result = store.sparql_query(&SparqlRead {
+text_relations: None,
             scope, layers: RdfGraphLayers { metadata: true, diagnostic: false, content: false },
             request: SparqlRequest { query: "SELECT ?artifact ?bytes WHERE { ?artifact a <urn:sparrow:vocab:Artifact> ; <urn:sparrow:vocab:byteLength> ?bytes } ORDER BY ?artifact", base_iri: None, substitutions: &[] },
             governors: &governors, limits: RdfReadLimits::default(),
@@ -16652,6 +16637,7 @@ fn graph_context_and_record_scopes_share_frozen_pin_evidence_through_renewal_and
         store
             .sparql_read(
                 &SparqlRead {
+                    text_relations: None,
                     scope,
                     layers: RdfGraphLayers {
                         metadata: true,

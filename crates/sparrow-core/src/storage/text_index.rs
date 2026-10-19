@@ -6,7 +6,139 @@
 use super::*;
 use purrdf::text::{FieldInput, PreparedCorpus, RankingProfile};
 
+use purrdf::sparql::{AdmittedOrderedMap, AdmittedVec, EvalError, WorkspaceCapability};
+use purrdf_lex::allocation::SharedText;
+
 pub(super) const MATCH_MEMBERSHIP_BYTES: usize = 64 * 1024 * 1024;
+
+pub(super) struct TextMetadata {
+    pub length: u64,
+    pub failed: bool,
+    pub not_applicable: bool,
+}
+
+pub(super) fn text_metadata(
+    facts: &Value,
+    analyzer_id: &str,
+    strict: bool,
+) -> Result<TextMetadata, Error> {
+    if facts["profile"].as_str() != Some(crate::text::PROFILE)
+        || facts["analyzer"].as_str() != Some(analyzer_id)
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "stored text profile or analyzer disagrees with the store",
+        ));
+    }
+    let state = facts["state"]
+        .as_str()
+        .ok_or_else(|| Error::new("STORAGE_FAILURE", "text projection state missing"))?;
+    let (failed, not_applicable) = match state {
+        "complete" => (false, false),
+        "incomplete" | "failed" => (true, false),
+        "not_applicable" => (false, true),
+        _ => {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "unknown text projection state",
+            ));
+        }
+    };
+    let length = integer(facts, "length")?;
+    if length > crate::text::MAX_OCCURRENCES
+        || ((not_applicable || state == "failed") && length != 0)
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "stored text length violates its declared profile",
+        ));
+    }
+    if strict && failed {
+        return Err(Error::new(
+            "INDEX_NOT_READY",
+            "selected text projection unavailable",
+        ));
+    }
+    Ok(TextMetadata {
+        length,
+        failed,
+        not_applicable,
+    })
+}
+
+/// The original corpus preimage, streamed through the native framing owner.
+pub(super) fn corpus_identity<'a>(
+    store_id: &str,
+    analyzer: &[u8; 32],
+    documents: impl IntoIterator<Item = (&'a str, u64)>,
+    mut checkpoint: impl FnMut() -> Result<(), Error>,
+) -> Result<String, Error> {
+    let mut digest = purrdf_hash::blake3::Hasher::new();
+    for part in [
+        store_id.as_bytes(),
+        crate::text::PROFILE.as_bytes(),
+        purrdf::text::RANKING_PROFILE_ID.as_bytes(),
+        analyzer,
+    ] {
+        purrdf_hash::frame::frame_le_into(&mut digest, part);
+    }
+    let mut previous = None;
+    for (id, length) in documents {
+        checkpoint()?;
+        if previous.is_some_and(|previous| previous >= id) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "captured text corpus is not in strict identity order",
+            ));
+        }
+        previous = Some(id);
+        purrdf_hash::frame::frame_le_into(&mut digest, id.as_bytes());
+        purrdf_hash::frame::frame_le_into(&mut digest, &length.to_be_bytes());
+    }
+    Ok(purrdf_hash::hex::encode(digest.finalize().as_bytes()))
+}
+
+/// Preserve the original source/native failure or the context's governor stop.
+#[derive(Debug)]
+pub(super) enum RankFailure {
+    Source(Error),
+    Native(EvalError),
+    Stopped,
+}
+
+impl From<Error> for RankFailure {
+    fn from(value: Error) -> Self {
+        Self::Source(value)
+    }
+}
+
+impl From<EvalError> for RankFailure {
+    fn from(value: EvalError) -> Self {
+        Self::Native(value)
+    }
+}
+
+impl RankFailure {
+    fn ordinary(self) -> Error {
+        match self {
+            Self::Source(error) => error,
+            Self::Native(error) => Error::new(
+                error.diagnostic_code().unwrap_or("NATIVE_TEXT_FAILURE"),
+                error.to_string(),
+            ),
+            Self::Stopped => Error::new(
+                "STORAGE_FAILURE",
+                "ranker stopped without an invoking native governor context",
+            ),
+        }
+    }
+}
+
+/// One finite source probe or scoring step, charged before the work starts.
+pub(super) enum PostingWork {
+    Probe { bytes: u64 },
+    Score,
+}
 
 /// Counts over the complete declared corpus, independently of matching postings.
 pub(super) struct CorpusStatistics {
@@ -14,114 +146,104 @@ pub(super) struct CorpusStatistics {
     pub tokens: u128,
 }
 
-/// Native scores and exact matched-term ordinals from one immutable posting view.
+/// Native scores and matched-term ordinals, retaining their original grants.
 pub(super) struct RankedPostings {
-    pub scored: Vec<(purrdf::text::BoundedScore, String)>,
-    pub candidates: BTreeMap<String, BTreeMap<usize, u64>>,
+    pub scored: AdmittedVec<(purrdf::text::BoundedScore, SharedText)>,
+    pub candidates: AdmittedOrderedMap<SharedText, AdmittedOrderedMap<usize, u64>>,
     pub posting_visits: usize,
 }
 
-/// One stored-posting ranker for ordinary searches and graph-snapshot adapters.
-/// The caller supplies its captured membership and cancellation/admission fence;
-/// PurRDF owns all numerical scoring. No payload is read or analyzed here.
+/// One ranker for ordinary reads and query-scoped stored-text producers.
+/// PurRDF owns all numerical scoring and admitted collection growth.
 pub(super) fn rank_postings(
     snapshot: &rocksdb::Snapshot<'_>,
     terms: &[String],
     statistics: CorpusStatistics,
     document_length: impl Fn(&str) -> Option<u64>,
     scan_budget: usize,
-    mut checkpoint: impl FnMut() -> Result<(), Error>,
-) -> Result<RankedPostings, Error> {
-    // The owned posting codec is exactly {"frequency":"<u64>"}; 64 bytes
-    // cover its maximum compact representation. Read borrowed native rows so a
-    // corrupt value cannot allocate an unrestricted Vec before this check.
-    const POSTING_BYTES: usize = 64;
-    let mut candidates = BTreeMap::<String, BTreeMap<usize, u64>>::new();
-    let mut frequencies = vec![0_u64; terms.len()];
+    workspace: &WorkspaceCapability,
+    mut checkpoint: impl FnMut(PostingWork) -> Result<(), RankFailure>,
+) -> Result<RankedPostings, RankFailure> {
+    let mut candidates =
+        AdmittedOrderedMap::<SharedText, AdmittedOrderedMap<usize, u64>>::new(workspace);
+    let mut frequencies = AdmittedVec::with_capacity(terms.len(), workspace)?;
+    for _ in terms {
+        frequencies.push(0_u64)?;
+    }
     let mut posting_visits = 0_usize;
     for (ordinal, term) in terms.iter().enumerate() {
-        checkpoint()?;
-        let prefix = term_key("post", term, "");
-        let mut cursor = snapshot.raw_iterator();
-        cursor.seek(prefix.as_bytes());
-        while cursor.valid() {
-            checkpoint()?;
-            let key = cursor
-                .key()
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "text posting key missing"))?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            if posting_visits == scan_budget {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "posting scan budget exhausted; narrow source/time scope or raise scan_budget; no ranked prefix returned",
-                ));
-            }
-            posting_visits += 1;
-            if key.len() > prefix.len().saturating_add(128) {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "text posting identity exceeds its encoding bound",
-                ));
-            }
-            let id = std::str::from_utf8(&key[prefix.len()..])
-                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid posting identity"))?;
-            if document_length(id).is_some() {
-                let bytes = cursor
-                    .value()
-                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "text posting value missing"))?;
-                if bytes.len() > POSTING_BYTES {
-                    return Err(Error::new(
-                        "STORAGE_FAILURE",
-                        "text posting exceeds its 64-byte encoding bound",
-                    ));
-                }
-                let posting = parse(bytes)?;
-                let frequency = integer(&posting, "frequency")?;
-                if frequency == 0 {
-                    return Err(Error::new("STORAGE_FAILURE", "zero-frequency text posting"));
-                }
-                frequencies[ordinal] += 1;
-                candidates
-                    .entry(id.to_owned())
-                    .or_default()
-                    .insert(ordinal, frequency);
-            }
-            cursor.next();
-        }
-        cursor.status()?;
+        let mut reader = PostingReader::new(snapshot, term, workspace)?;
+        while reader
+            .read_next(
+                |id| document_length(id).is_some(),
+                scan_budget,
+                &mut posting_visits,
+                &mut checkpoint,
+                |id, frequency| {
+                    frequencies[ordinal] += 1;
+                    if candidates.get(id).is_none() {
+                        candidates.insert(
+                            workspace.authored_text(id)?,
+                            AdmittedOrderedMap::new(workspace),
+                        )?;
+                    }
+                    candidates
+                        .get_mut(id)
+                        .expect("candidate inserted")
+                        .insert(ordinal, frequency)?;
+                    Ok(())
+                },
+            )?
+            .is_some()
+        {}
     }
+    // The public scorer owns its preparation. Its one-field fixed carrier and
+    // copied term spellings remain beneath this caller-held workspace grant.
+    // Collection buffers around it use the native admitted owners directly.
+    let preparation_bytes = terms
+        .iter()
+        .try_fold(4096_u64, |bytes, term| {
+            bytes.checked_add(512)?.checked_add(term.len() as u64)
+        })
+        .ok_or(EvalError::WorkspaceBoundOverflow)?;
+    let _preparation = workspace.charge(preparation_bytes)?;
     let profile = RankingProfile::single_field();
     let corpus = PreparedCorpus::new(&profile, statistics.documents, &[statistics.tokens])
-        .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-    let frequencies = terms
-        .iter()
-        .zip(&frequencies)
-        .map(|(term, frequency)| (term.as_str(), *frequency))
-        .collect::<Vec<_>>();
+        .map_err(EvalError::from)?;
+    let mut prepared_frequencies = AdmittedVec::with_capacity(terms.len(), workspace)?;
+    for (term, frequency) in terms.iter().zip(frequencies.iter()) {
+        prepared_frequencies.push((term.as_str(), *frequency))?;
+    }
     let query = corpus
-        .prepare_query(&frequencies)
-        .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-    let mut scored = Vec::new();
-    for (id, matches) in &candidates {
-        checkpoint()?;
+        .prepare_query(&prepared_frequencies)
+        .map_err(EvalError::from)?;
+    let mut scored = AdmittedVec::with_capacity(candidates.len(), workspace)?;
+    for (id, matches) in candidates.iter() {
+        checkpoint(PostingWork::Score)?;
         let length = document_length(id)
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "captured text document disappeared"))?;
-        let fields = (0..terms.len())
-            .map(|ordinal| {
-                vec![FieldInput {
-                    term_frequency: matches.get(&ordinal).copied().unwrap_or(0),
-                    length,
-                }]
-            })
-            .collect::<Vec<_>>();
-        let score = query
-            .score(&fields)
-            .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-        scored.push((score, id.clone()));
+        let input_bytes = (terms.len() as u64)
+            .checked_mul(size_of::<FieldInput>() as u64)
+            .ok_or(EvalError::WorkspaceBoundOverflow)?;
+        let _inputs = workspace.charge(input_bytes)?;
+        let mut fields = AdmittedVec::with_capacity(terms.len(), workspace)?;
+        for ordinal in 0..terms.len() {
+            let mut field = Vec::new();
+            field
+                .try_reserve_exact(1)
+                .map_err(|_| EvalError::AllocationFailed {
+                    construct: "stored-text field input",
+                })?;
+            field.push(FieldInput {
+                term_frequency: matches.get(&ordinal).copied().unwrap_or(0),
+                length,
+            });
+            fields.push(field)?;
+        }
+        let score = query.score(&fields).map_err(EvalError::from)?;
+        scored.push((score, id.clone()))?;
     }
-    scored.sort_by(|a, b| b.0.value.cmp(&a.0.value).then_with(|| a.1.cmp(&b.1)));
+    scored.sort_unstable_by(|a, b| b.0.value.cmp(&a.0.value).then_with(|| a.1.cmp(&b.1)));
     Ok(RankedPostings {
         scored,
         candidates,
@@ -129,7 +251,109 @@ pub(super) fn rank_postings(
     })
 }
 
-fn term_key(kind: &str, term: &str, id: &str) -> String {
+/// One physical posting decoder for ranking and streaming source spans.
+pub(super) struct PostingReader<'view, 'db> {
+    snapshot: &'view rocksdb::Snapshot<'db>,
+    cursor: Option<rocksdb::DBRawIteratorWithThreadMode<'view, rocksdb::DB>>,
+    prefix: String,
+    workspace: WorkspaceCapability,
+    _control: purrdf::sparql::WorkspaceAllocation,
+    finished: bool,
+}
+
+impl<'view, 'db> PostingReader<'view, 'db> {
+    pub(super) fn new(
+        snapshot: &'view rocksdb::Snapshot<'db>,
+        term: &str,
+        workspace: &WorkspaceCapability,
+    ) -> Result<Self, EvalError> {
+        let control =
+            workspace.charge(4096_u64.saturating_add((term.len() as u64).saturating_mul(4)))?;
+        Ok(Self {
+            snapshot,
+            cursor: None,
+            prefix: term_key("post", term, ""),
+            workspace: workspace.clone(),
+            _control: control,
+            finished: false,
+        })
+    }
+
+    pub(super) fn read_next<T>(
+        &mut self,
+        selected: impl Fn(&str) -> bool,
+        scan_budget: usize,
+        visits: &mut usize,
+        mut checkpoint: impl FnMut(PostingWork) -> Result<(), RankFailure>,
+        deliver: impl FnOnce(&str, u64) -> Result<T, RankFailure>,
+    ) -> Result<Option<T>, RankFailure> {
+        const POSTING_BYTES: usize = 64;
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            checkpoint(PostingWork::Probe {
+                bytes: (self.prefix.len() as u64).saturating_add(128 + POSTING_BYTES as u64),
+            })?;
+            match self.cursor.as_mut() {
+                Some(cursor) => cursor.next(),
+                None => {
+                    let mut cursor = self.snapshot.raw_iterator();
+                    cursor.seek(self.prefix.as_bytes());
+                    self.cursor = Some(cursor);
+                }
+            }
+            let cursor = self.cursor.as_ref().expect("posting cursor initialized");
+            if !cursor.valid() {
+                self.finished = true;
+                cursor.status().map_err(Error::from)?;
+                return Ok(None);
+            }
+            let key = cursor
+                .key()
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "text posting key missing"))?;
+            if !key.starts_with(self.prefix.as_bytes()) {
+                self.finished = true;
+                return Ok(None);
+            }
+            if *visits == scan_budget {
+                return Err(Error::new("RESOURCE_LIMIT", "posting scan budget exhausted; narrow source/time scope or raise scan_budget; no successful prefix returned").into());
+            }
+            *visits += 1;
+            if key.len() > self.prefix.len().saturating_add(128) {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "text posting identity exceeds its encoding bound",
+                )
+                .into());
+            }
+            let id = std::str::from_utf8(&key[self.prefix.len()..])
+                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid posting identity"))?;
+            let bytes = cursor
+                .value()
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "text posting value missing"))?;
+            if bytes.len() > POSTING_BYTES {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "text posting exceeds its 64-byte encoding bound",
+                )
+                .into());
+            }
+            if !selected(id) {
+                continue;
+            }
+            let _posting = self.workspace.charge((POSTING_BYTES * 64) as u64)?;
+            let posting = parse(bytes)?;
+            let frequency = integer(&posting, "frequency")?;
+            if frequency == 0 {
+                return Err(Error::new("STORAGE_FAILURE", "zero-frequency text posting").into());
+            }
+            return deliver(id, frequency).map(Some);
+        }
+    }
+}
+
+pub(super) fn term_key(kind: &str, term: &str, id: &str) -> String {
     format!("text-{kind}:{}:{id}", hex::encode(term.as_bytes()))
 }
 
@@ -257,6 +481,7 @@ impl Store {
         let strict = scope.require_complete_index || query.require_complete_index;
         let mut diagnostics = super::diagnostic::DiagnosticCoverage::default();
         let writer = self.lock()?;
+        let analyzer_id = hex::encode(&writer.config.text_analyzer.fingerprint());
         if let Some(stage) = stage.as_deref() {
             stage.checkpoint()?;
         }
@@ -419,27 +644,10 @@ impl Store {
                 .get(format!("text-record:{id}"))?
                 .ok_or_else(|| Error::new("STORAGE_FAILURE", "live text projection missing"))?;
             let facts = parse(&bytes)?;
-            let state = read_field::<String>(&facts, "state")?;
-            match state.as_str() {
-                "failed" | "incomplete" => {
-                    failed += 1;
-                    if strict {
-                        return Err(Error::new(
-                            "INDEX_NOT_READY",
-                            "selected text projection unavailable",
-                        ));
-                    }
-                }
-                "not_applicable" => not_applicable += 1,
-                "complete" => {}
-                _ => {
-                    return Err(Error::new(
-                        "STORAGE_FAILURE",
-                        "unknown text projection state",
-                    ));
-                }
-            }
-            let length = integer(&facts, "length")?;
+            let metadata = text_metadata(&facts, &analyzer_id, strict)?;
+            failed += u64::from(metadata.failed);
+            not_applicable += u64::from(metadata.not_applicable);
+            let length = metadata.length;
             if length > 0 {
                 total += u128::from(length);
                 capture_bytes = capture_bytes
@@ -535,23 +743,19 @@ impl Store {
             && not_applicable == 0
             && field_coverage.failed == 0
             && field_coverage.decoding_failures == 0;
-        let mut corpus_identity = Vec::new();
-        for part in [
-            writer.id.as_bytes(),
-            crate::text::PROFILE.as_bytes(),
-            purrdf::text::RANKING_PROFILE_ID.as_bytes(),
+        let corpus_id = corpus_identity(
+            &writer.id,
             &writer.config.text_analyzer.fingerprint(),
-        ] {
-            purrdf_hash::frame::frame_le(&mut corpus_identity, part);
-        }
-        for (id, (_, length)) in &documents {
-            if let Some(stage) = stage.as_deref() {
-                stage.checkpoint()?;
-            }
-            purrdf_hash::frame::frame_le(&mut corpus_identity, id.as_bytes());
-            purrdf_hash::frame::frame_le(&mut corpus_identity, &length.to_be_bytes());
-        }
-        let corpus_id = hex::encode(blake3::hash(&corpus_identity).as_bytes());
+            documents
+                .iter()
+                .map(|(id, (_, length))| (id.as_str(), *length)),
+            || {
+                if let Some(stage) = stage.as_deref() {
+                    stage.checkpoint()?;
+                }
+                Ok(())
+            },
+        )?;
         let snapshot = writer.db.snapshot();
         let RankedPostings {
             scored,
@@ -566,13 +770,15 @@ impl Store {
             },
             |id| documents.get(id).map(|(_, length)| *length),
             scope.scan_budget,
-            || {
+            &WorkspaceCapability::resident(),
+            |_| {
                 if let Some(stage) = stage.as_deref() {
                     stage.checkpoint()?;
                 }
                 Ok(())
             },
-        )?;
+        )
+        .map_err(RankFailure::ordinary)?;
         if capture && scored.len() > row_limit {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -583,10 +789,14 @@ impl Store {
         let mut rows = Vec::new();
         let mut response_bytes = 0_usize;
         for (score, id) in scored.into_iter().take(row_limit) {
-            let (record, _) = &documents[&id];
+            let (record, _) = &documents[id.as_str()];
             let mut evidence = Vec::<Value>::new();
             let mut evidence_limited = false;
-            for ordinal in candidates[&id].keys() {
+            for ordinal in candidates
+                .get(id.as_str())
+                .expect("ranked candidate")
+                .keys()
+            {
                 if evidence.len() == 64 {
                     evidence_limited = true;
                     break;
@@ -624,7 +834,7 @@ impl Store {
             }
             let row: Value = record_fields::matched_record_row(
                 record,
-                witnesses.remove(&id).ok_or_else(|| {
+                witnesses.remove(id.as_str()).ok_or_else(|| {
                     Error::new("STORAGE_FAILURE", "captured field witnesses missing")
                 })?,
             )?
@@ -748,7 +958,8 @@ mod snapshot_tests {
                 _ => None,
             },
             10,
-            || Ok(()),
+            &WorkspaceCapability::resident(),
+            |_| Ok(()),
         )
         .unwrap();
         assert_eq!(captured.posting_visits, 2);
@@ -771,7 +982,15 @@ mod snapshot_tests {
                 }]])
                 .unwrap();
             assert_eq!(score.value, oracle.value, "native scoring for {id}");
-            assert_eq!(captured.candidates[id][&0], 1);
+            assert_eq!(
+                *captured
+                    .candidates
+                    .get(id.as_str())
+                    .unwrap()
+                    .get(&0)
+                    .unwrap(),
+                1
+            );
         }
         let current = db.snapshot();
         let replacement = rank_postings(
@@ -783,12 +1002,21 @@ mod snapshot_tests {
             },
             |id| (id == "record:b").then_some(3),
             10,
-            || Ok(()),
+            &WorkspaceCapability::resident(),
+            |_| Ok(()),
         )
         .unwrap();
         assert_eq!(replacement.scored.len(), 1);
-        assert_eq!(replacement.scored[0].1, "record:b");
-        assert_eq!(replacement.candidates["record:b"][&0], 2);
+        assert_eq!(replacement.scored[0].1.as_str(), "record:b");
+        assert_eq!(
+            *replacement
+                .candidates
+                .get("record:b")
+                .unwrap()
+                .get(&0)
+                .unwrap(),
+            2
+        );
         assert!(db.get(a).unwrap().is_none());
     }
 
@@ -810,8 +1038,10 @@ mod snapshot_tests {
                     },
                     |_| Some(1),
                     10,
-                    || Ok(())
+                    &WorkspaceCapability::resident(),
+                    |_| Ok(())
                 )
+                .map_err(RankFailure::ordinary)
                 .err()
                 .unwrap()
                 .code,
@@ -829,8 +1059,10 @@ mod snapshot_tests {
                 },
                 |_| Some(1),
                 0,
-                || Ok(())
+                &WorkspaceCapability::resident(),
+                |_| Ok(())
             )
+            .map_err(RankFailure::ordinary)
             .err()
             .unwrap()
             .code,
@@ -851,18 +1083,20 @@ mod snapshot_tests {
             },
             |_| Some(1),
             10,
-            || {
+            &WorkspaceCapability::resident(),
+            |_| {
                 checkpoints += 1;
                 if checkpoints == 4 {
-                    Err(Error::new(
-                        "CANCELLED",
-                        "test cancellation after candidate collection",
-                    ))
+                    Err(
+                        Error::new("CANCELLED", "test cancellation after candidate collection")
+                            .into(),
+                    )
                 } else {
                     Ok(())
                 }
             },
         )
+        .map_err(RankFailure::ordinary)
         .err()
         .unwrap();
         assert_eq!(failure.code, "CANCELLED");
@@ -884,8 +1118,10 @@ mod snapshot_tests {
                 },
                 |_| None,
                 10,
-                || Ok(())
+                &WorkspaceCapability::resident(),
+                |_| Ok(())
             )
+            .map_err(RankFailure::ordinary)
             .err()
             .unwrap()
             .code,
