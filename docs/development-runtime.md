@@ -2,15 +2,86 @@
 
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
-socket. Both typed endpoints were verified on 2026-10-18 UTC after the
-[schema-61 adoption](#schema-61-live-adoption). It uses schema 61 and store
+socket. Both typed endpoints were verified on 2026-10-19 UTC after the
+[schema-62 adoption](#schema-62-live-adoption). It uses schema 62 and store
 format 92. The stable client is `~/.local/bin/sparrow`; the daemon alias is
 `~/.local/libexec/sparrow/sparrowd`. Both now select immutable production images
-from signed source `ffdfbbfaa0973edb8e0bf029a078536582739e6e`, with core features
-empty and PurRDF `9b2bf3b71325154137bc1aa817b46356daadfe3a`.
-PID `1492870` replaced `4001300` through the existing SIGINT drain path.
+from signed source `bee07bc1690fe7fe3b85e533153ee18fee9349fd`, with core features
+empty and PurRDF `a47940e1f130bf3739c6d59aaf89643209905ea4`.
+PID `539293` replaced `1492870` through the existing SIGINT drain path.
 [Persistent service adoption](#persistent-service-adoption) records the unchanged
 unit configuration. Earlier transient-unit and schema sections retain history.
+
+## Schema-62 live adoption
+
+Signed `bee07bc` and its normal commit hook pass `make check`: 195 storage tests,
+69 RPC tests, 32 core tests, 18 server tests and the remaining workspace tests,
+release Clippy with warnings denied, seeded census self-tests and 300 pinned
+ownership jobs with zero distinct exceptions. The expanded owned-kernel fixture
+covers read-only/writable closes, two writers, moved-in files, stale path events,
+actual queue overflow and configured directory-budget exhaustion/recovery.
+
+The production build independently records `core_features=[]`. Immutable images
+under `~/.local/libexec/sparrow/` are `sparrow-schema62-bee07bc`, SHA-256
+`1252723da989a3ffd0d2f24ed28af8d4267ad35bd350515edcd0e43b114e08de`, and
+`sparrowd-schema62-bee07bc`, SHA-256
+`eb7374423a70b96c008b977b963917f76893a02bac2220a5b2b60234e841c84a`.
+Only the daemon carries `cap_net_bind_service=ep`. The unchanged user unit and
+configuration retain public typed TCP at `0.0.0.0:518`, the private Unix socket,
+SIGINT draining, a 120-second stop timeout and no restart loop.
+
+A verified copy of the 115-file schema-61 closed backup qualified the production
+images before cutover. Only its copied watch definitions were removed through
+the public core API; no producer roots or intake listeners were activated.
+Two initial private launches refused invalid fixture socket paths. Shortening
+the owned copy's directory preserved all 116 prepared database files and met
+both Linux `SUN_LEN` and the required data-directory socket ownership. The
+qualifying daemon completed all checks and exited zero after SIGINT. The
+original backup and live PID were unchanged during this private trial.
+
+Cutover then stopped the original unit cleanly, took and hash-verified a new
+117-file closed backup, atomically switched both stable aliases and started
+PID `539293`. Store identity remains `store:46c88e949ccec658600b66c7becd5bb7`,
+with 217 records and format 92. Both watches are covered without failure.
+Timestamp profiles and original file-generation receipts remain unchanged;
+the approved earlier generation recovery was not reapplied.
+
+Live TCP and Unix each export all 2,990 original content triples in 43 pages,
+with the same 128 MiB source workspace and 100,000-request limits. Measured
+source evidence remains 83,804 requests, 25,010,629 admitted bytes and a
+115,740,672-byte peak. Existing measured EXPLAIN and CLI/MCP parity also pass.
+
+The new caller-selected stored-text relations borrow that same snapshot and
+retain the existing raw-record/decoded-JSON profile. Runtime qualification
+compares against the preceding schema-61 ordinary text search: nine documents,
+526 tokens, identical corpus ID and exact native scores/order. Ranked results
+and source spans each replay across nine pages. All nine returned record-local
+spans retrieve their original bytes; native explanation descriptions preserve
+both registered IRIs, arities and access modes across seven pages. CLI and
+stdio MCP query/explanation agree on both TCP and Unix.
+
+All 253 retained byte targets (36,005,590 bytes) match their prior native content
+hashes. Profiles, generation receipts, configuration and unit files are
+unchanged. Pressure/durability report no failure and all five result families
+have zero handles and byte charges after release. Closed backups for schemas
+59/60/61/62 remain unchanged (111/113/115/117 files).
+
+Evidence is under `.stage/native-graph-integration/`: `schema62-runtime-artifacts.json`,
+`schema62-private-qualified.json`, `schema62-pre-adoption-closed-backup.json`,
+`schema62-cutover.json` and `schema62-live-qualified.json`. Failed private launch
+logs and the hash-verified relocation receipt are retained too. Native query,
+stored-text and agent integration are deployed. Current-source
+[turnover/closure](turnover-qualification.md#schema-62-retention-and-native-compaction-policy)
+and [concurrent load/native queries](load-qualification.md#schema-62-native-graph-and-text-follow-up)
+also pass for their declared workloads, separately from this live acceptance.
+
+The requested graph, reclamation, agent-contract and final-test implementation
+is complete at this source. The measured boundary includes typed whole-store
+graph admission refusal on the larger load store and nonzero physical files
+after final turnover retirement. No new dependency API, token-offset migration,
+unconfigured quota trial or production SLA is required to close that work.
+The [acceptance boundary](implementation-plan.md#current-acceptance-boundary)
+distinguishes these completed checks from future production-capacity claims.
 
 ## Schema-61 live adoption
 

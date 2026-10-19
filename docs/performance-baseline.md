@@ -5,6 +5,16 @@ ingestion/query executable through the production SDK and agent renderers.
 It complements the copied-corpus and offline retention measurements below;
 none establishes full production-rate or density acceptance.
 
+The current schema-62 source has separate
+[concurrent load and native graph/text measurements](load-qualification.md#schema-62-native-graph-and-text-follow-up)
+and [sixty-day turnover results](turnover-qualification.md#schema-62-retention-and-native-compaction-policy).
+Those refresh the changed native integration and reclamation paths; the
+representative-corpus and four-importer burst measurements below remain
+historical evidence from their identified images. A whole-store graph COUNT
+on the new 8,320-record load store is explicitly refused at default catalog
+admission. No budget was raised or successful full count inferred from that
+refusal. No production throughput or density target has been supplied.
+
 This is measured preliminary qualification, not full performance acceptance.
 The initial 2026-10-08 experiment exposed broad chronological capture and
 caller-controlled retirement limits. Later installed sources address those

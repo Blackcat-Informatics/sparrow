@@ -1,5 +1,75 @@
 # Offline turnover qualification
 
+## Schema 62 retention and native compaction policy
+
+On 2026-10-19 the larger profile was rebuilt from signed source
+`bee07bc1690fe7fe3b85e533153ee18fee9349fd`, with PurRDF
+`a47940e1f130bf3739c6d59aaf89643209905ea4` and the shared native deletion
+collector in [Native reclamation](native-reclamation.md). The normal source gate
+passes 195 storage, 69 RPC, 32 core and 18 server tests, other workspace tests,
+release Clippy and 300 census ownership jobs without distinct exceptions.
+The frozen image is `turnover-schema62-bee07bc`, SHA-256
+`619729bb367b2f32571a06214d330cf61b295e068f42cd6a9d62d655484eea98`.
+Its core feature is `test-support`; default-daemon qualification is separate.
+
+The corpus remains 1,282 records per day, 60 simulated days, repeated and
+changing/malformed JSONL, CRLF logs and 1 MiB random opaque input per day:
+76,920 records and 65,642,380 raw bytes per mode. The shared Ryzen/Btrfs host,
+2 GiB application budget, 128 MiB reserve, 600-second per-mode deadline and
+8 GiB host free-space-delta guard remain unchanged. The guard is not a quota.
+All daily counts, independent byte checks, exact expiry boundaries, sparse
+parent expiry, protected native RDF, release and four reopen points pass.
+Final records, pins, payload/JSON references and all five read-handle/byte
+families are zero without resurrection. Final format is 86 for these stores
+without production watches or receiver definitions.
+
+| Mode | Evidence directory under `~/.local/state/sparrow/` | Records at day 59 | Sampled peak RSS KiB | Maximum daily file bytes | Closed file bytes | Wall seconds | Final expiry passes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | `turnover-v2-qualified-e1djmj65` | 38,460 | 167,696 | 358,536,414 | 13,525,535 | 535.909 | 1,212 |
+| Sparse record | `turnover-s62-qualified-fyt6j6kw` | 38,461 | 188,464 | 350,790,925 | 27,417,640 | 130.927 | 1,212 |
+| Dense all artifacts | `turnover-s62-qualified-lvglva9g` | 76,920 | 204,668 | 367,297,759 | 40,847,889 | 174.776 | 2,423 |
+
+The original sequential collector completed none mode but stopped sparse mode
+when the host free-space delta exceeded its 8 GiB guard after all 60 daily rows
+and before final cleanup. Sparse mode in that attempt is not qualified. Owned
+store/evidence sizes did not explain the whole filesystem delta; its cause was
+not attributed. The failed attempt is retained. Sparse and dense then ran in
+independent observation windows with the same numerical guards and workload;
+only mode selection changed. Passing none mode was not repeated. Collector
+source hashes and the method change are retained in
+`.stage/native-graph-integration/schema62-turnover-single-mode-collector-provenance.json`.
+Different cache/host activity makes timings unsuitable for causal comparisons.
+
+Final allocated bytes are 13,565,952 / 27,467,776 / 40,890,368. Each mode retains
+240 WAL bytes; final blob bytes are 11,553,706 / 22,056,906 / 35,711,128.
+Daily file samples and closed component totals expose physical reclamation lag
+after zero logical ownership. The separate real-pressure test proves file
+decrease and actual retry admission. Last sampled process write bytes are
+6,753,640,448 / 5,512,974,336 / 5,942,345,728, including input creation, reports,
+native WAL, indexes and maintenance rather than isolated engine amplification.
+RSS is sampled every 100 ms and files once per day, not at every allocation.
+
+These results qualify the declared finite turnover workload. They do not set a
+production SLA or establish 10 GiB/day density, hard-quota recovery or a hard
+native allocation bound. No new upstream API follows from those limits.
+Public PID 539293 remains unchanged throughout; no producer root or public
+store was used for generated input.
+
+The production RDF view and governed SPARQL API were also run at day 90 on
+SHA-256 verified closed copies of all three successful stores. Every copy has
+zero dictionary terms and selected records/artifacts, and completes
+`ASK { ?s ?p ?o }` with false. Original closed stores remain unopened by this
+probe and hash-identical (18/20/20 files). The temporary example was removed
+from the source tree after freezing the image; its source, selected build,
+copy manifest, reports and `schema62-turnover-graph-qualified.json` are archived
+under `.stage/native-graph-integration/`. Image SHA-256 is
+`a03cd94e8a8fe7a3ee048b1f1c8de1360ee238eb413d41521a7f8b47a334b38e`.
+Source admission uses its defaults; native ceilings are 100,000 fuel, 100 answers,
+10,000 intermediate cells, 1 MiB scratch and zero remote requests. This proves
+logical graph closure, independently of residual physical file bytes.
+
+## Workload and method
+
 The `turnover` example qualifies retention through production core operations
 using an injected UTC clock. It accepts a configuration and one pin mode:
 
@@ -56,7 +126,7 @@ This is a clock-injected correctness and physical-growth workload on real disk,
 not 60 days of wall-clock service activity. Daily status measures file bytes;
 the external collector records closed SST/blob/control/WAL sizes and sampled
 RSS separately. Zero logical ownership does not certify zero physical disk use.
-Automatic native compaction is allowed. The installed schema-61 policy now marks
+Automatic native compaction is allowed. The installed schema-62 policy marks
 deletion-heavy tables using existing APIs; the earlier proposed binding
 prerequisite is withdrawn. See [native reclamation](native-reclamation.md) for
 measured pressure recovery and its remaining qualification. The historical

@@ -4,7 +4,7 @@ Sparrow is a high-density, temporal diagnostic log and data server. It turns
 scattered operational artifacts into retained evidence that agents can discover,
 inspect, correlate, and query as a semantic graph.
 
-**Status: implementation in progress.** A RocksDB daemon, Cap'n Proto RPC,
+**Status: implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
 CLI with resumable typed file imports and bounded oversized-record preparation,
 stdio MCP, JSON field discovery, immutable JSON source-time and diagnostic profiles,
 mapped service/host/severity/trace/span filters,
@@ -17,21 +17,24 @@ quad indexes, a standalone typed producer client with bounded delivery and a
 composable tracing layer, bounded buffered/durable ingestion with session-scoped
 WAL flush controls, and helper-census tooling are implemented. Active tailing
 with explicit completed-generation retirement, typed public TCP
-ingestion, and syslog are implemented. Stored-view SPARQL and
-full architecture acceptance
-remain unfinished. See [Development runtime](docs/development-runtime.md) for
+ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
+DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
+implemented and deployed in schema 62. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
 
-The Rust core also exposes a bounded native stored RDF view. Full SPARQL remains
-unfinished because the pinned native engine does not yet price the required
-algebra on bounded views; see [PurRDF integration gaps](docs/purrdf-integration-gaps.md).
+The installed user service is `sparrow.service`, serving typed Cap'n Proto on
+`0.0.0.0:518` and a private Unix socket. The client is `~/.local/bin/sparrow`.
+Graph queries use PurRDF's native semantics and governors over bounded stored
+views, with explicit admission refusals; see
+[native integration evidence](docs/purrdf-integration-gaps.md).
 
 ## Operating model
 
-Sparrow will run as a Rust service on one Linux server with local storage. The
+Sparrow runs as a Rust service on one Linux server with local storage. The
 initial workload is under 10 GiB of new, uncompressed data per day, including
 large directories of JSONL and `.log` files. Sustained throughput, import bursts,
-and total storage density are measurements to establish during implementation.
+and total storage density have finite workload measurements, not a production
+capacity guarantee; see the [acceptance boundary](docs/implementation-plan.md#current-acceptance-boundary).
 
 The default retention window is **up to 30 days from server acceptance**. Source
 timestamps remain queryable but do not determine expiry. A configured disk budget

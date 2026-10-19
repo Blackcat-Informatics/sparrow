@@ -1104,17 +1104,20 @@ The shared agent renderer reports `operation="sparql_explain"` and
 `execution_status="measured"` or `"stopped"`. It deliberately omits
 `answer_certainty`: a stopped measured ledger does not certify query answers.
 Native parse/operational failures report `"failed"` with original diagnostics
-and evidence. The endpoint uses native default options with no injected custom
-relation or aggregate registry; empty declaration lists are explicit. An
-unexpected nonempty native registry is a hard integration failure before a
-report is published, never silently omitted metadata.
+and evidence. Without `text_relations`, declaration lists are explicitly empty.
+Schema 62 supplies the optional ordinary stored-text registry described below.
+Unsupported custom aggregate or native ranked-retrieval declarations fail
+before publication rather than being silently omitted.
 
 The installed schema-61 images passed default-image/private-copy and live
 TCP/Unix CLI/MCP qualification, including complete export of the original
 2,990-triple selection under unchanged budgets and exact-byte verification.
 See [runtime adoption](development-runtime.md#schema-61-live-adoption).
-Native stored-text integration and sustained runtime/resource qualification
-remain required; see [native integration](purrdf-integration-gaps.md#retained-operational-sparql-integration).
+The subsequent [schema-62 adoption](development-runtime.md#schema-62-live-adoption)
+adds stored-text integration. Separate current-source
+[load/native measurements](load-qualification.md#schema-62-native-graph-and-text-follow-up)
+and [turnover](turnover-qualification.md#schema-62-retention-and-native-compaction-policy)
+qualify their finite workloads; no production SLA is inferred.
 
 The query interface supports read forms such as SELECT, ASK, CONSTRUCT, and
 DESCRIBE through PurRDF. Preserve RDF term kind, datatype, language, base
@@ -1174,8 +1177,9 @@ arities, volatility and access modes) alongside node work. Custom aggregate and
 native ranked-retrieval declarations are not registered by this input.
 PurRDF's selected fallible-query return type does not expose its internal
 relation-witness ledger; Sparrow does not invent a returned generation or
-service-level attestation. Source schema 62 is not yet the installed schema;
-deployment and qualification evidence remain in Development runtime.
+service-level attestation. Schema 62 is installed and qualified through both
+typed transports and CLI/MCP; see
+[Development runtime](development-runtime.md#schema-62-live-adoption).
 
 ### Recordless artifact RDF writer authority
 

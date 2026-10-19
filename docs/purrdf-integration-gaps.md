@@ -1,24 +1,31 @@
 # PurRDF integration gaps
 
-These are unfinished first-version requirements, not exclusions from Sparrow's
-scope. Sparrow must retain native semantics and bounded reads while resolving them.
+The native integration tasks below are implemented and deployed. This file
+preserves their source-bound qualification and the remaining operational work.
+Historical versioned observations do not describe the newer installed images.
 
 ## Current integration state
 
-Schema 61 is deployed on format 92 with native SELECT, ASK, CONSTRUCT,
+Schema 62 is deployed on format 92 with native SELECT, ASK, CONSTRUCT,
 DESCRIBE and measured EXPLAIN, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
 certificates and source/coverage receipts. Metadata includes populated/recordless
 artifacts and retained Source/Stream declarations; the live qualification is in
-[Development runtime](development-runtime.md#schema-61-live-adoption).
-Native text relations and sustained production resource/turnover acceptance
-remain required. The installed source selects
-`9b2bf3b71325154137bc1aa817b46356daadfe3a`: upstream PR #609 closed
+[Development runtime](development-runtime.md#schema-62-live-adoption).
+Caller-selected stored-text rank/span relations are qualified through typed
+RPC, CLI/MCP and immutable continuation. They preserve native scores, captured
+corpus identity, original byte spans and independent coverage. Current-source
+[turnover](turnover-qualification.md#schema-62-retention-and-native-compaction-policy)
+and [load/native measurements](load-qualification.md#schema-62-native-graph-and-text-follow-up)
+pass for their declared finite envelopes; broader production capacity is not
+established. The installed source selects
+`a47940e1f130bf3739c6d59aaf89643209905ea4`; PR #615 supplied query-scoped
+producers for #601. Earlier upstream PR #609 closed
 [PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605) with
 actual-payload materialization, and PR #611 closed
 [#600](https://github.com/Blackcat-Informatics/purrdf/issues/600) with governed
 request EXPLAIN. The source core adds `Store::sparql_explain` through the same
 capture/admission owner as query execution. Signed `126248c` passed the full
-release gate. Source schema 61 now adds typed explanation RPC, generated SDK,
+release gate. Source schema 61 added typed explanation RPC, generated SDK,
 shared CLI/MCP rendering and immutable continuation under the existing native
 lease family. Signed `ffdfbbf` passed the full gate (195 storage and 68 RPC tests,
 remaining workspace tests, release Clippy and census). Separate production images
@@ -74,7 +81,7 @@ historical evidence; current source selection is recorded above.
 
 ## Query-scoped stored text producers
 
-The working schema-62 consumer now registers borrowed ranked and source-span
+The deployed schema-62 consumer registers borrowed ranked and source-span
 producers against the original captured RocksDB snapshot. Ordinary and SPARQL
 ranking share one stored-posting reader and native scoring implementation.
 Four focused release core tests pass for score/corpus parity, Unicode/escaped
@@ -93,7 +100,10 @@ workspace tests, seeded census self-tests and 300 pinned ownership jobs with
 zero distinct exceptions. Its log is
 `.stage/native-graph-integration/stored-text/full-check-v2.log`.
 See [the schema-62 contract](interfaces.md#stored-text-graph-relations-source-schema-62).
-This source work does not change the installed schema-61 images.
+Production-image and live TCP/Unix CLI/MCP qualification now pass as recorded
+in Development runtime. Nine runtime documents retain the preceding corpus
+identity, all scores/order and original record-local span bytes. The original
+2,990-triple export and all 253 byte targets are unchanged.
 
 The selected native `finish_governed_fallible_query` explicitly drops relation
 identities on both complete and budget-exhausted paths. Its public governed
@@ -108,10 +118,10 @@ commit `a47940e1f130bf3739c6d59aaf89643209905ea4`, adds query-scoped registries 
 cursors. That commit exists in the read-only supplier object database and is an
 ancestor of observed main `25de0d0de0856c7b88288d0ee65777bd1e95b34b`.
 Sparrow source now selects `a47940e1f130bf3739c6d59aaf89643209905ea4` for
-runtime dependencies and census discovery. The installed schema-61 image still
-uses `9b2bf3b`. The analyzer and ranking implementations are unchanged between
-these revisions. Source qualification and stored-text consumer integration
-are the next work, not an upstream availability blocker. The observations below
+runtime dependencies and census discovery. The preceding schema-61 image used
+`9b2bf3b`. The analyzer and ranking implementations are unchanged between
+these revisions. Source and runtime qualification are recorded above;
+there is no upstream availability blocker. The observations below
 describe the preceding interface and its original acceptance requirements.
 
 Focused source qualification passes `cargo check --release -p sparrow-core`

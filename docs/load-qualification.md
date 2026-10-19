@@ -1,5 +1,70 @@
 # Concurrent typed workload
 
+## Schema 62 native graph and text follow-up
+
+On 2026-10-19 signed source `bee07bc1690fe7fe3b85e533153ee18fee9349fd`
+was measured with the existing 64-cohort workload and unchanged runtime limits.
+PurRDF is locked to `a47940e1f130bf3739c6d59aaf89643209905ea4`.
+The frozen load image is `load-schema62-bee07bc`, SHA-256
+`104d2d08b68d693cc85a090f07d415114148626abb7feadc1eea86acb4ecbd51`.
+Private daemon/client copies match the default-feature production images in
+[Development runtime](development-runtime.md#schema-62-live-adoption), without
+file capabilities. The example enables core `test-support`; the daemon enables
+no core features.
+
+Evidence is `~/.local/state/sparrow/typed-load-qualification-v2ilghez`:
+collector/images, source identity, configuration, host/filesystem, saved inputs,
+native report, 100 ms RSS/I/O samples and closed files. The shared Ryzen/Btrfs
+host uses a fresh store, loopback TCP, 2 GiB application budget, 128 MiB reserve,
+four operation slots and no watch/syslog intake. No hard quota was configured.
+
+All 256 durable intakes and 28 concurrent complete captures pass, accepting
+17,358,454 raw bytes and 8,320 records in 23.336038 seconds, including fixture
+generation, exact SDK byte readback and final queries. Mean/maximum durable
+intake is 74.137/525.714 ms; mean/maximum concurrent full capture is
+792.234/6,481.934 ms. Individual microsecond observations are retained rather
+than extrapolated into guarantees. Final warm traversals return:
+
+| Operation | Rows | Pages | Milliseconds |
+| --- | ---: | ---: | ---: |
+| Records | 8,320 | 57 | 275.882 |
+| Text | 8,256 | 80 | 459.919 |
+| Keys | 5 | 1 | 192.477 |
+| Selective values | 64 | 1 | 165.300 |
+
+The initial collector failed in its later native-check harness because it
+assumed 129 ordinary text results fit one page; byte admission returned 101
+and a continuation. The passing intake report and failed collector outcome
+are both preserved. After correcting the harness to follow continuations,
+only the native phase was repeated on the same private store, reopened in a
+fresh daemon process with existing filesystem data. The successful report is
+`native-v2/report.json`; the original `native/` failure remains unchanged.
+The original reopen receipt mislabeled schema 62 as `source`; a separate
+`.stage/native-graph-integration/schema62-native-load-qualified.json` records
+both schema and full source commit without rewriting that receipt.
+
+The first four artifacts independently contain 130 records and 129 text
+documents. Metadata COUNT returns 130; stored native ranking returns all 129
+in two pages with exactly the ordinary ordering, decimal scores and corpus
+identity. Covered documents contain 900 tokens; the opaque record is not
+applicable rather than an index failure. Complete graph COUNT takes 495.775 ms;
+ranked text including continuation takes 826.819 ms; EXPLAIN takes 19.743 ms
+and returns five entries. Timings include client/rendering/paging overhead.
+Source/native certificates and limits are saved. All five read families finish
+with zero handles/bytes. Whole-store graph COUNT separately returns typed
+`RESOURCE_LIMIT: catalog capture exceeds operation admission` in 83.718 ms;
+this is a measured refusal, not a successful broad count or a missing API.
+
+Sampled daemon peak RSS is 243,508 KiB. After the initial clean shutdown, native
+file lengths total 34,292,575 bytes and allocated blocks total 34,320,384 bytes.
+Last sampled kernel write bytes are 557,989,888. Sampling includes the initial
+failed native phase and excludes the reopened native phase; file totals precede
+that reopen. These are not true peak bounds, isolated write amplification or
+steady-state compression ratios. Both private daemons shut down cleanly.
+Public PID 539293 and its 217-record store remain unchanged throughout.
+
+## Workload and method
+
 The `load` example measures durable ingestion concurrently with complete agent
 query captures against an empty private daemon. It uses the generated SDK and
 the same production command parser, typed operations, result renderers, cursor

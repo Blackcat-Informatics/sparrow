@@ -1,6 +1,6 @@
 # Sparrow implementation plan
 
-Status: implementation in progress. Helper-census tooling, a RocksDB storage
+Status: implementation and finite acceptance checks complete. Helper-census tooling, a RocksDB storage
 foundation, the Cap'n Proto daemon, bounded JSON occurrence discovery and persistent
 native full-text retrieval and bounded acceptance-time record context through
 shared CLI and stdio MCP clients are present. Native JSON/Markdown content and
@@ -12,8 +12,9 @@ substitutions, retained outcomes and scoped membership/coverage. The CLI/MCP and
 typed RPC graph surface is implemented and deployed. Recordless
 artifact RDF and independent artifact coverage are deployed in schema 52;
 native correlation is deployed in schema 58 through the same governed
-query and retained-result owners. Text relations and public explanations remain
-required. The
+query and retained-result owners. Public explanations are deployed in schema 61;
+schema 62 deploys the borrowed stored-text rank/span relations with corpus,
+coverage and original-byte evidence. The
 integration state is recorded in
 [PurRDF integration gaps](purrdf-integration-gaps.md).
 Independent Artifact-class metadata for populated artifacts and persisted
@@ -23,7 +24,8 @@ native JSON facts, including lifecycle observations, producer-scoped span IDs,
 ordered context, declared parent/follows-from evidence and exact context spans.
 Its bounded metadata backfill preserves existing authority families and retention.
 Runtime adoption and source qualification remain separate evidence surfaces.
-The full server acceptance criteria remain unmet. Current executable surfaces
+The requested implementation and finite acceptance checks are complete. Production
+capacity remains unqualified beyond the measured envelope. Current executable surfaces
 and verification are recorded in [Development runtime](development-runtime.md).
 Stable-ID pin renewal is implemented through the core, typed daemon, CLI and MCP,
 including durable retry receipts and optional revision guards. Pin discovery
@@ -79,26 +81,31 @@ lifetime first, then import, then query surfaces, then continuous producers.
 
 ## Current acceptance boundary
 
-The following gaps preserve the original first-version scope. Installed image
+The following evidence covers the original first-version scope. Installed image
 identities and source qualification are recorded separately in
 [Development runtime](development-runtime.md). Finite fixtures do not establish
 production capacity.
 
-| Required area | Evidence already present | Required work still NOT MET |
+| Required area | Evidence already present | Qualification boundary |
 | --- | --- | --- |
-| Graph queries | Deployed schema 61 supplies SELECT/ASK/CONSTRUCT/DESCRIBE and measured EXPLAIN through typed RPC/CLI/MCP, substitutions, certificates, frozen scope/coverage, correlation and tracing. Production-feature private/live qualification returns the original 2,990 triples in 43 pages under unchanged limits. Source schema 62 adds borrowed stored-text rank/span relations through PR #615; focused core/transport regressions and the full gate pass. | Finish schema-62 production-image qualification and runtime adoption. The landed scoped producer API resolves the prior availability gap; no further upstream API is a prerequisite. [Native integration evidence](purrdf-integration-gaps.md). |
-| Reclamation | Shared native tombstone-compaction policy; real-pressure source regression with measured file decrease, successful retry, protected shared bytes and reopen; full release gate at signed 22ec801. The policy is now adopted by the qualified schema-61 daemon. | Sustained physical/resource qualification of the existing native compaction/blob-GC path. No new upstream API is a prerequisite. [Native reclamation](native-reclamation.md). |
-| Agent contracts | Shared typed operations and CLI/MCP rendering, capability discovery, temporal/field/text/key/value/context evidence, pins, retained results, measured EXPLAIN and cancellation. Live schema 61 advertises 38 tools, with TCP/Unix/MCP parity and zero leftover handles/bytes after qualification. Working schema 62 carries stored-text corpus/profile/coverage receipts and actual native relation descriptors. | Qualify those new contracts over TCP/Unix CLI/MCP, then complete resource/latency qualification over the deployment corpus. [Interfaces](interfaces.md). |
-| Final qualification | Release gate, twelve real completed-file SIGKILL windows, actual owned-kernel queue overflow and configured directory-limit recovery; writable/read-only closes, multiple writers, moved-in files and stale path events; sixty-day synthetic retention/pin cohorts with final logical graph closure. | Measure sustained/burst input, queries and maintenance on a declared deployment envelope and complete physical recovery measurements. Quota-specific checks apply when a strict filesystem ceiling is configured. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
+| Graph queries | Deployed schema 62 supplies SELECT/ASK/CONSTRUCT/DESCRIBE, measured EXPLAIN and borrowed stored-text rank/span relations through typed RPC/CLI/MCP. Production-image private/live checks return 2,990 triples in 43 pages; native scores/corpus identity and nine record-local spans match the preceding ordinary-search oracle. | Qualified under unchanged limits. The separate 8,320-record load store refuses whole-store graph COUNT at catalog admission; selected COUNT/ranking/EXPLAIN pass. [Native integration](purrdf-integration-gaps.md), [load](load-qualification.md#schema-62-native-graph-and-text-follow-up). |
+| Reclamation | Native tombstone-compaction policy; real-pressure regression with measured decrease, successful retry, protected shared bytes and reopen; all three current-source 60-day turnover profiles pass. The full gate passes at bee07bc and the installed daemon adopts that policy. | Finite physical recovery and turnover are qualified. Closed files remain after zero logical ownership; no hard quota is configured and no new upstream API is required. [Native reclamation](native-reclamation.md), [turnover](turnover-qualification.md#schema-62-retention-and-native-compaction-policy). |
+| Agent contracts | Live schema 62 advertises 38 shared typed tools, including text corpus/profile/coverage receipts and native relation descriptors. TCP/Unix CLI/MCP agree; frozen continuations, profiles/generations, 217 records and all 253 byte targets are preserved with zero leftover handles/bytes. | Qualified through default images and load follow-up with exact independent counts/scores. Effective limits and typed refusals remain part of the contract. [Interfaces](interfaces.md), [load](load-qualification.md). |
+| Final qualification | Release gate; twelve completed-file SIGKILL windows; real owned-kernel queue overflow and configured directory-limit recovery; writable/read-only closes, multiple writers, moved-in files and stale events; current-source turnover and concurrent mixed-format load. | Declared finite workloads pass with measured resources and latencies. Historical representative-corpus/burst evidence retains its source identity. Production rate/density targets and strict quota acceptance are not established. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
 
 The qualified kernel-overflow fixture changes no host limits; configured
 directory-budget exhaustion is independent of exhausting the shared kernel
 watch quota. The SIGKILL matrix starts from durable reservation and does not
 prove power-loss persistence at arbitrary filesystem boundaries. The finite
 turnover corpus is 65,642,380 raw bytes per pin mode. None of these results closes
-the remaining production acceptance gates. Host reboot and power-loss trials
+production capacity acceptance. Host reboot and power-loss trials
 are not additional first-version gates: the architecture's crash scenarios and
 the durability claims actually made determine the required checks.
+
+The implementation scope is closed by the existing APIs and tests, not by a
+hypothetical dependency request. The remaining deployment inputs below determine
+future capacity claims; no numerical SLA, strict quota or production consume
+root has been inferred. Inaccessible corpus samples remain a coverage limit.
 
 The initial upstream readback on 2026-10-18 found #600, #601 and #605 open.
 Later main landed actual-payload materialization (PR #609, closing #605) and
@@ -116,7 +123,8 @@ continuity. A later upstream refresh finds #601 completed by PR #615 at
 `25de0d0de0856c7b88288d0ee65777bd1e95b34b`. Its scoped registry/cursor API is
 available. Source dependencies and the census reference now select that exact
 landed commit. Source qualification and stored-text consumer implementation
-remain separate from the installed schema-61 image, which still uses `9b2bf3b`.
+were separate from the preceding installed schema-61 image, which used `9b2bf3b`.
+The schema-62 adoption now selects `a47940e1` in the production images too.
 The selected rust-rocksdb upstream remains
 `46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. The earlier inference that Sparrow
 required a new file-compaction API was unproven and is withdrawn. Existing native

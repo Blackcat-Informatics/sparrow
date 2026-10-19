@@ -1,10 +1,11 @@
 # Sparrow architecture
 
 This is the design contract for Sparrow's first implementation. It defines
-required behavior, selected defaults, and qualification work. Implementation is
-in progress; current executable surfaces and qualified runtime evidence are
-recorded in [Development runtime](development-runtime.md). Full architecture
-acceptance remains unmet.
+required behavior, selected defaults, and qualification work. The implementation
+and finite acceptance checks are complete; executable surfaces and runtime
+evidence are recorded in [Development runtime](development-runtime.md).
+Production capacity claims remain limited to the measured envelopes in the
+[acceptance boundary](implementation-plan.md#current-acceptance-boundary).
 
 The external contracts and examples are defined in [Interfaces](interfaces.md).
 

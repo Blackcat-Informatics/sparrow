@@ -74,5 +74,11 @@ measurement.
 
 This finite test does not establish sustained production turnover, a hard-quota
 run, recovery of an already-stalled store created before this policy,
-snapshot-held recovery or every native storage-failure scenario. Those need
-separate evidence; none implies that a hypothetical upstream API is mandatory.
+or snapshot-held recovery. These are limits of that fixture's evidence, not
+additional acceptance gates for unencountered historical states or every possible
+native failure. The existing sixty-day workload now passes all three pin modes
+at the installed source; [the measured results](turnover-qualification.md#schema-62-retention-and-native-compaction-policy)
+include residual physical files after zero logical ownership. Sustained production
+capacity has no established target in this deployment;
+quota-specific qualification applies when a strict filesystem ceiling is
+configured. None implies that a hypothetical upstream API is mandatory.
