@@ -27,6 +27,7 @@ purrdf-hash.workspace = true
 purrdf.workspace = true
 capnp.workspace = true
 capnp-rpc.workspace = true
+getrandom.workspace = true
 futures.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true

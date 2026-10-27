@@ -408,7 +408,8 @@ with retryability and delivery state distinguishable from parser diagnostics.
 
 The daemon transport is Cap'n Proto RPC over a private Unix-domain socket and
 a public TCP socket, as directed on 2026-10-08. The selected public binding is
-`0.0.0.0:518`; ingestion does not require authentication. CLI, Rust clients and the stdio MCP adapter use the same
+`0.0.0.0:518`; ingestion does not require authentication, while reads, queries
+and administration over TCP require a shared-secret CHAP session. CLI, Rust clients and the stdio MCP adapter use the same
 generated schema. Requests, binary payloads, instants, integer counts, receipts
 and failures use typed fields and unions. No HTTP or JSON operation envelope is
 used between clients and the daemon. Durability comes from atomic storage

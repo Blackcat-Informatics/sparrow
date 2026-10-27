@@ -258,9 +258,32 @@ pub(crate) fn walk_external(tree: &dyn Tree, source: Source) -> Result<External,
     Ok(External { workspace, source })
 }
 
+/// The main checkout owning `root`'s Git common directory, so a linked worktree
+/// under `.worktrees/` names the same `../purrdf` sibling as the main checkout.
+fn canonical_root(root: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .map_err(|error| format!("git rev-parse in {}: {error}", root.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    common
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("Git common directory {} has no parent", common.display()))
+}
+
 /// Load the external scan for the Sparrow tree at `root`: `external_root` as
 /// given, or else purrdf at the pinned revision archived from `repository`
-/// (default `../purrdf` beside the Sparrow root).
+/// (default `../purrdf` beside the canonical repository root).
 pub(crate) fn load(
     root: &Path,
     repository: Option<&Path>,
@@ -281,7 +304,10 @@ pub(crate) fn load(
     let text = std::fs::read_to_string(&registry)
         .map_err(|error| format!("{}: {error}", registry.display()))?;
     let revision = pinned_revision(&text)?;
-    let repository = repository.map_or_else(|| root.join("../purrdf"), Path::to_path_buf);
+    let repository = match repository {
+        Some(repository) => repository.to_path_buf(),
+        None => canonical_root(root)?.join("../purrdf"),
+    };
     let tree = materialise(&repository, &revision, &root.join("target/helper-census"))?;
     walk_external(
         &Disk { root: tree.clone() },

@@ -23,7 +23,8 @@ implemented and deployed in schema 62. See [Development runtime](docs/developmen
 present commands, verified behavior and limits.
 
 The installed user service is `sparrow.service`, serving typed Cap'n Proto on
-`0.0.0.0:518` and a private Unix socket. The client is `~/.local/bin/sparrow`.
+`0.0.0.0:518` and a private Unix socket. Anonymous TCP peers may only discover,
+ingest and import; other TCP operations require `--secret-file` CHAP authentication. The client is `~/.local/bin/sparrow`.
 Graph queries use PurRDF's native semantics and governors over bounded stored
 views, with explicit admission refusals; see
 [native integration evidence](docs/purrdf-integration-gaps.md).

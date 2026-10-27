@@ -229,7 +229,7 @@ they do not specify their generated wire grammar.
 | Completed-file quiet interval | 30 seconds, configurable per watch; observed reopen/write activity postpones consumption. |
 | Pin duration | Required on every create/add/renew operation; no permanent or implicit pin. |
 | Disk capacity | An explicit deployment budget and maintenance reserve are required. |
-| RPC binding | Private Unix-domain socket: directory mode 0700, socket mode 0600; public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08, without an ingestion authentication requirement. |
+| RPC binding | Private Unix-domain socket: directory mode 0700, socket mode 0600; public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08. Anonymous TCP peers may only discover, ingest and import; every other operation requires a shared-secret CHAP session (2026-10-27). |
 | Pagination | Default 200 items, maximum 1,000, additionally limited by serialized response bytes. |
 | Structured response budget | Default 256 KiB, configurable under a server maximum. |
 | Byte-read chunk | Default 64 KiB; maximum 1 MiB per call. |
@@ -1501,13 +1501,39 @@ handoff; ordinary consumption admission cannot supply that authority.
 
 ### Public TCP and syslog packet interpretation
 
-`rpc_tcp_address` explicitly enables the same generated Cap'n Proto service as
-the Unix socket. Development binds `0.0.0.0:518` without authentication, as
-requested on 2026-10-08. Both listeners share connection and operation ceilings
-and the 60-second connection lease. The public listener exposes the same full
-capability, including queries and administration. Rust clients use
-`Client::connect_tcp(SocketAddr)` and the same discovery and durable retry checks.
-The existing CLI and stdio MCP continue using the Unix socket.
+`rpc_tcp_address` enables public Cap'n Proto TCP, as requested on 2026-10-08. It
+requires `rpc_tcp_secret_file`, and either setting without the other refuses
+startup. Both listeners share connection and operation ceilings and the
+60-second connection lease.
+
+A TCP connection bootstraps an anonymous `Sparrow` capability. Anonymous peers
+may call `discover`, `ingest`, `eventsIngest`, `flush` and the import operations
+(`importBegin` through `importCancel`). Every other operation, including
+`status`, returns a typed `UNAUTHENTICATED` failure. An operation added to the
+schema without an explicit admission decision returns Cap'n Proto `unimplemented`.
+The Unix socket serves the complete capability unchanged (rulings 2026-10-27).
+
+Shared-secret CHAP upgrades a connection. `authChallenge` returns a fresh 32-byte
+nonce. `authenticate(response)` consumes it and checks the BLAKE3 keyed hash of
+`nonce || storeId`, keyed by a key derived from the exact secret-file bytes. A
+correct response returns `TcpSession.session`, the complete typed service for
+that connection's lifetime. Each connection gets one attempt: a wrong response,
+a response without a challenge or any later attempt returns `UNAUTHENTICATED`,
+and the client must reconnect. Unix connections and sessions refuse both
+methods with `UNSUPPORTED`. The secret file must be a regular file with no group
+or world permissions, holding 32..4096 bytes. Rust clients use
+`Endpoint::AuthenticatedTcp(address, TcpSecret::read(path)?)`. The CLI, the stdio
+MCP adapter and the `bytes`, `handoff` and `load` examples accept a leading
+`--secret-file PATH`; `load` requires it. MCP
+reconnects for each tool call and authenticates each connection.
+
+CHAP authenticates only the start of a session. Traffic is not encrypted, the
+client does not authenticate the server, and an on-path attacker can observe or
+take over an authenticated connection. An observer of one exchange can test
+secret guesses offline, so the secret must be random rather than a passphrase.
+Anonymous imports share the import journal pool and request-ID space with
+authenticated clients, and anonymous ingestion consumes the disk budget. Both
+risks were accepted on 2026-10-27.
 
 Explicit `[[syslog]]` entries select TCP or UDP, source, loopback address,
 maximum message bytes (480..65536), maximum connections (TCP 1..16; UDP 1),
@@ -2090,17 +2116,18 @@ traversal. MCP marks this operation as an idempotent mutation that destroys the
 ephemeral replay result. It does not delete stored evidence. The schema changes
 to 42; storage format and helper-census/runtime dependency revisions are unchanged.
 
-The implemented client takes an endpoint as its first argument: a Unix socket
-path or `tcp://IP:PORT`. Numeric IPv4 and bracketed IPv6 addresses use the SDK's
+The implemented client takes an optional `--secret-file PATH` and then an endpoint:
+a Unix socket path or `tcp://IP:PORT`. Without the secret, a TCP endpoint admits
+only discovery, ingestion, flush and imports. Numeric IPv4 and bracketed IPv6 addresses use the SDK's
 native endpoint parser. CLI operations and every stdio MCP tool call use the same
 SDK client constructor and discovery certification over either transport. No
 HTTP envelope or alternate query implementation is involved.
 
 ```text
 sparrow /path/to/rpc.sock status
-sparrow tcp://192.168.2.4:518 status
-sparrow tcp://192.168.2.4:518 records --source SOURCE
-sparrow tcp://192.168.2.4:518 mcp --stdio
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 status
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 records --source SOURCE
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 mcp --stdio
 sparrow ENDPOINT pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID...
 sparrow ENDPOINT pin-release REQUEST_ID STORE_ID PIN_ID
 ```
@@ -2143,40 +2170,41 @@ a result. A governed query failure can emit its typed failed receipt on stdout
 and also exit nonzero; consumers must inspect the receipt and exit status.
 
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
-Every client invocation takes an endpoint first: a Unix socket path or
-`tcp://IP:PORT`. Commands emit JSON envelopes through the same owners as MCP.
+Every client invocation takes an optional `--secret-file PATH` and then an
+endpoint: a Unix socket path or `tcp://IP:PORT`. Operations other than discovery,
+ingestion, flush and imports need the secret over TCP. Commands emit JSON envelopes through the same owners as MCP.
 Byte reads save the exact range to an exclusively created output file and return
 its JSON receipt. Errors and diagnostics go to stderr.
 
 ```bash
 sparrowd --config /etc/sparrow/config.toml
-ENDPOINT=tcp://127.0.0.1:518
-sparrow "$ENDPOINT" capabilities
-sparrow "$ENDPOINT" status
+ENDPOINT="--secret-file $HOME/.config/sparrow/tcp.secret tcp://127.0.0.1:518"
+sparrow $ENDPOINT capabilities
+sparrow $ENDPOINT status
 
-sparrow "$ENDPOINT" ingest REQUEST_ID SOURCE jsonl /srv/dumps/run.jsonl
-sparrow "$ENDPOINT" watch list
-sparrow "$ENDPOINT" watch put REQUEST_ID 0 completed-watch.toml
-sparrow "$ENDPOINT" watch put REQUEST_ID CURRENT_REVISION updated-watch.toml
-sparrow "$ENDPOINT" watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
-sparrow "$ENDPOINT" watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp
-sparrow "$ENDPOINT" watch handoff INTENT.capnp
-sparrow "$ENDPOINT" watch handoff-status INTENT.capnp
+sparrow $ENDPOINT ingest REQUEST_ID SOURCE jsonl /srv/dumps/run.jsonl
+sparrow $ENDPOINT watch list
+sparrow $ENDPOINT watch put REQUEST_ID 0 completed-watch.toml
+sparrow $ENDPOINT watch put REQUEST_ID CURRENT_REVISION updated-watch.toml
+sparrow $ENDPOINT watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
+sparrow $ENDPOINT watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp
+sparrow $ENDPOINT watch handoff INTENT.capnp
+sparrow $ENDPOINT watch handoff-status INTENT.capnp
 # Save intents outside consumption roots; retry the same intent after uncertain delivery.
 # For a producer-finished tail, append TAIL_GENERATION_ID to handoff-prepare.
 
-sparrow "$ENDPOINT" records --source SOURCE --text timeout --page-size 100
-sparrow "$ENDPOINT" context STORE_ID RECORD_ID --before 2 --after 2
-sparrow "$ENDPOINT" bytes STORE_ID RECORD_ID 0 BYTE_LENGTH evidence.bin
+sparrow $ENDPOINT records --source SOURCE --text timeout --page-size 100
+sparrow $ENDPOINT context STORE_ID RECORD_ID --before 2 --after 2
+sparrow $ENDPOINT bytes STORE_ID RECORD_ID 0 BYTE_LENGTH evidence.bin
 
-sparrow "$ENDPOINT" pin REQUEST_ID STORE_ID problem_investigation_1 10 RECORD_ID
-sparrow "$ENDPOINT" pin ANOTHER_REQUEST_ID STORE_ID problem_investigation_1 10 ARTIFACT_ID
-sparrow "$ENDPOINT" pin-get STORE_ID --name problem_investigation_1
-sparrow "$ENDPOINT" pin-renew REQUEST_ID STORE_ID PIN_ID 10 EXPECTED_REVISION
-sparrow "$ENDPOINT" pin-release REQUEST_ID STORE_ID PIN_ID
+sparrow $ENDPOINT pin REQUEST_ID STORE_ID problem_investigation_1 10 RECORD_ID
+sparrow $ENDPOINT pin ANOTHER_REQUEST_ID STORE_ID problem_investigation_1 10 ARTIFACT_ID
+sparrow $ENDPOINT pin-get STORE_ID --name problem_investigation_1
+sparrow $ENDPOINT pin-renew REQUEST_ID STORE_ID PIN_ID 10 EXPECTED_REVISION
+sparrow $ENDPOINT pin-release REQUEST_ID STORE_ID PIN_ID
 
-sparrow "$ENDPOINT" sparql investigation.json
-sparrow "$ENDPOINT" mcp --stdio
+sparrow $ENDPOINT sparql investigation.json
+sparrow $ENDPOINT mcp --stdio
 ```
 
 Uppercase IDs, clocks, paths and lengths above are caller-supplied values from
@@ -2215,8 +2243,9 @@ The layer follows the public [tracing subscriber layer contract](https://docs.rs
 
 `DeliveryConfig::tcp(SocketAddr, source)` selects public Cap'n Proto for the
 same bounded logging worker; `DeliveryConfig::new(path, source)` selects Unix.
-The explicit `endpoint: Endpoint` field has one Unix/TCP variant; there is no
-second socket fallback. Direct clients and workers share discovery, retries,
+The explicit `endpoint: Endpoint` field selects Unix, anonymous TCP or
+CHAP-authenticated TCP; there is no second socket fallback. Logging producers
+only ingest, so anonymous TCP suffices. Direct clients and workers share discovery, retries,
 store identity checks and native field preservation. Both examples use the
 shared `Endpoint::parse` spelling, `tcp://IP:PORT` or a Unix path. The tracing
 example can therefore send to `tcp://192.168.2.4:518`.

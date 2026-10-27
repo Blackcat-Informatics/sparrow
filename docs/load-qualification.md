@@ -73,11 +73,12 @@ serialization use PurRDF's native codec. No evaluator or text analysis is copied
 
 ```bash
 cargo build --locked --release -p sparrow-server --example load
-target/release/examples/load tcp://127.0.0.1:10330 /new/input/directory 16 64 1024 > report.json
+target/release/examples/load --secret-file SECRET tcp://127.0.0.1:10330 /new/input/directory 16 64 1024 > report.json
 ```
 
 Start an owned private daemon separately with a new store, no watches or syslog,
-and a loopback TCP binding. The example refuses non-loopback endpoints, ports
+and a loopback TCP binding with its `rpc_tcp_secret_file`; pass that file as
+`SECRET`. The example refuses anonymous or non-loopback endpoints, ports
 at or below 1024, nonempty stores, active pins and configured producer sources.
 The input directory is created exclusively. It never starts or stops a service,
 deletes evidence, or opens a competing storage writer. Configuration limits and

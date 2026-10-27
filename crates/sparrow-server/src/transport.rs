@@ -27,11 +27,20 @@ where
     RpcSystem::new(Box::new(network), Some(client.client)).await
 }
 
+/// Who reached the daemon, which selects the bootstrap capability.
+pub enum Access {
+    /// The private Unix socket: the complete typed service.
+    Local,
+    /// Public TCP: the anonymous gate, upgraded by CHAP with this secret.
+    PublicTcp(sparrow_client::TcpSecret),
+}
+
 /// Apply the same connection ceiling and lease to Unix and public TCP streams.
 pub fn admit_connection<S>(
     stream: S,
     rpc: crate::Rpc,
     connections: std::sync::Arc<tokio::sync::Semaphore>,
+    access: Access,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
 {
@@ -41,7 +50,12 @@ pub fn admit_connection<S>(
     tokio::task::spawn_local(async move {
         let _permit = permit;
         let (rpc, _lifetime) = rpc.for_connection();
-        let client = capnp_rpc::new_client(rpc);
+        let client = match access {
+            Access::Local => capnp_rpc::new_client(rpc),
+            Access::PublicTcp(secret) => {
+                capnp_rpc::new_client(crate::tcp_gate::AnonymousTcp::new(rpc, secret))
+            }
+        };
         match tokio::time::timeout(
             std::time::Duration::from_secs(60),
             serve_connection(stream, client),

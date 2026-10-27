@@ -7,19 +7,19 @@ use std::io::Write;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 4 {
+    let all = std::env::args().skip(1).collect::<Vec<_>>();
+    let (endpoint, args) = sparrow_client::Endpoint::from_args(&all)?;
+    if args.len() != 3 {
         return Err(
-            "usage: bytes ENDPOINT EVIDENCE_ID OFFSET LENGTH; writes exact bytes to stdout".into(),
+            "usage: bytes [--secret-file PATH] ENDPOINT EVIDENCE_ID OFFSET LENGTH; writes exact bytes to stdout".into(),
         );
     }
-    let endpoint = sparrow_client::Endpoint::parse(&args[0])?;
-    let offset = args[2].parse()?;
-    let length = args[3].parse()?;
+    let offset = args[1].parse()?;
+    let length = args[2].parse()?;
     let bytes = tokio::task::LocalSet::new()
         .run_until(async {
             let client = sparrow_client::Client::connect_endpoint(&endpoint).await?;
-            client.bytes(&args[1], offset, length).await
+            client.bytes(&args[0], offset, length).await
         })
         .await?;
     std::io::stdout().lock().write_all(&bytes)?;

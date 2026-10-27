@@ -687,7 +687,14 @@ interface Sparrow {
   sparqlQuery @47 (query :SparqlQuery) -> (result :Result(SparqlPage));
   correlate @48 (query :CorrelateQuery) -> (result :Result(SparqlPage));
   sparqlExplain @49 (query :SparqlQuery) -> (result :Result(SparqlPage));
+  # Public TCP only: a fresh single-use 32-byte challenge for shared-secret CHAP.
+  authChallenge @50 () -> (result :Result(TcpChallenge));
+  # Public TCP only: consume the challenge; success grants an ungated session capability.
+  authenticate @51 (response :Data) -> (result :Result(TcpSession));
 }
+
+struct TcpChallenge { nonce @0 :Data; }
+struct TcpSession { session @0 :Sparrow; }
 
 # Page-local, child-before-parent term nodes. IDs never identify persisted terms.
 enum RdfDirection { absent @0; ltr @1; rtl @2; }

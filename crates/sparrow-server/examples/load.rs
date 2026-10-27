@@ -59,20 +59,23 @@ async fn capture(client: &Client, initial: &[&str]) -> Result<(usize, usize)> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 5 {
-        return Err("usage: load tcp://127.0.0.1:PORT NEW_INPUT_DIR BATCHES ROWS PADDING_BYTES (empty private daemon only)".into());
+    let all = std::env::args().skip(1).collect::<Vec<_>>();
+    let (endpoint, args) = Endpoint::from_args(&all)?;
+    if args.len() != 4 {
+        return Err("usage: load --secret-file PATH tcp://127.0.0.1:PORT NEW_INPUT_DIR BATCHES ROWS PADDING_BYTES (empty private daemon only)".into());
     }
-    let endpoint = Endpoint::parse(&args[0])?;
-    if !matches!(&endpoint, Endpoint::Tcp(address) if address.ip().is_loopback() && address.port() > 1024)
-    {
+    let Endpoint::AuthenticatedTcp(address, _) = &endpoint else {
+        return Err("qualification requires an authenticated TCP endpoint".into());
+    };
+    if !(address.ip().is_loopback() && address.port() > 1024) {
         return Err(
             "qualification requires a private loopback TCP endpoint above port 1024".into(),
         );
     }
-    let batches: usize = args[2].parse()?;
-    let rows: usize = args[3].parse()?;
-    let padding: usize = args[4].parse()?;
+    let endpoint_label = format!("tcp://{address}");
+    let batches: usize = args[1].parse()?;
+    let rows: usize = args[2].parse()?;
+    let padding: usize = args[3].parse()?;
     if !(1..=1000).contains(&batches)
         || !(1..=1000).contains(&rows)
         || padding > 65536
@@ -103,7 +106,7 @@ async fn main() -> Result<()> {
             {
                 return Err("qualification refuses nonempty stores or configured producers".into());
             }
-            let inputs = Path::new(&args[1]);
+            let inputs = Path::new(&args[0]);
             std::fs::create_dir(inputs)?;
             let started = Instant::now();
             let done = Cell::new(false);
@@ -230,7 +233,7 @@ async fn main() -> Result<()> {
             }
             let report = Object::new()
                 .with("complete", true)
-                .with("endpoint", &args[0])
+                .with("endpoint", &endpoint_label)
                 .with("batches", batches)
                 .with("rows_per_batch", rows)
                 .with("padding_bytes", padding)

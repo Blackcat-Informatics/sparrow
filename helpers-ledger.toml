@@ -170,6 +170,20 @@ fingerprints = []
 names = ['^(correlation_specific_governors|correlation_specific_query_delivery)$']
 
 [[job]]
+id = "public-tcp-chap-law"
+summary = "One shared-secret CHAP law: secret-file admission, PurRDF BLAKE3 key derivation and keyed response, and PurRDF's constant-time byte comparison. The daemon's anonymous TCP gate verifies through it and clients respond through it."
+home = "sparrow_client::tcp_secret::TcpSecret"
+entry_points = ["sparrow_client::tcp_secret::TcpSecret::read", "sparrow_client::tcp_secret::TcpSecret::respond", "sparrow_client::tcp_secret::TcpSecret::verify", "sparrow_server::tcp_gate::AnonymousTcp"]
+spec = "docs/interfaces.md: public TCP CHAP sessions."
+vectors = ["crates/sparrow-client/src/tcp_secret.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(server_chap_response|client_chap_response|another_secret_compare)$']
+
+[[job]]
 id = "bounded-occurrence-reference-codec"
 summary = "One SDK union decoder checks bounded artifact/record reference kinds for all RPC scope readers and correlation metadata; store ownership stays with the original RPC owner."
 home = "sparrow_client::bytes::decode_evidence"
@@ -4391,3 +4405,10 @@ enforced = true
 constants = []
 fingerprints = []
 names = []
+
+[[distinct]]
+members = ["sparrow_server::rpc::Rpc::auth_challenge", "sparrow_server::rpc::Rpc::authenticate"]
+kind = "body"
+criterion = "layering"
+anchor = "sparrow_server::rpc::chap_unsupported"
+reason = "The generated Sparrow server trait requires one method per schema ordinal with distinct result types; both CHAP methods refuse through the one shared chap_unsupported failure on Unix and session capabilities."
