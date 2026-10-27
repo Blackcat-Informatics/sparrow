@@ -2,15 +2,53 @@
 
 The installed server is the enabled persistent user unit `sparrow.service`,
 configured for typed Cap'n Proto at `0.0.0.0:518` and the existing private Unix
-socket. Both typed endpoints were verified on 2026-10-19 UTC after the
-[schema-62 adoption](#schema-62-live-adoption). It uses schema 62 and store
+socket. Anonymous TCP peers may only discover, ingest, flush and import; other
+TCP operations need a CHAP session through `~/.config/sparrow/tcp.secret`. Both
+typed endpoints were verified on 2026-10-27 after the
+[public TCP CHAP adoption](#public-tcp-chap-adoption). It uses schema 62 and store
 format 92. The stable client is `~/.local/bin/sparrow`; the daemon alias is
-`~/.local/libexec/sparrow/sparrowd`. Both now select immutable production images
-from signed source `bee07bc1690fe7fe3b85e533153ee18fee9349fd`, with core features
-empty and PurRDF `a47940e1f130bf3739c6d59aaf89643209905ea4`.
-PID `539293` replaced `1492870` through the existing SIGINT drain path.
-[Persistent service adoption](#persistent-service-adoption) records the unchanged
-unit configuration. Earlier transient-unit and schema sections retain history.
+`~/.local/libexec/sparrow/sparrowd`. Both select immutable production images
+from merged source `43e8f2a61b89df00201a4e60bb7f5d486902b5b1` on `fleet/sparrow`
+`main`, with PurRDF `a47940e1f130bf3739c6d59aaf89643209905ea4`. PID `1602834`
+serves the store. The unit restarts on failure.
+[Persistent service adoption](#persistent-service-adoption) records the original
+unit. Earlier transient-unit and schema sections retain history.
+
+## Public TCP CHAP adoption
+
+The schema-62 PID `539293` was killed by the host OOM killer on 2026-10-25 at
+16:51 MDT and stayed down under the former `Restart=no` policy. Its sampled peak
+was 137.6 MB. The host held about 133 GB of swap on 124 GB of RAM, and
+`systemd-oomd` is masked, so the kernel killed it under whole-host memory
+exhaustion. The kernel and journal records from that time had rotated away, so
+the selection itself is unverified.
+
+Public TCP previously served the complete typed service unauthenticated; any
+reachable peer could register a destructive consume watch. Issue #1 and PR #2 on
+the lab Forgejo `fleet/sparrow` (squash `43e8f2a`) added the anonymous gate and
+shared-secret CHAP; see [Interfaces](interfaces.md#public-tcp-and-syslog-packet-interpretation).
+Its commit hook passed `make check` in 974 seconds. The wire schema stays 62:
+the change adds methods only, so existing schema-62 producers keep ingesting
+anonymously.
+
+Immutable images under `~/.local/libexec/sparrow/` are `sparrow-schema62-43e8f2a`,
+SHA-256 `bc2a113f6b2b2290861c8f813f6b7e21e7d40e973399d679a76bf5ddc985824d`, and
+`sparrowd-schema62-43e8f2a`, SHA-256
+`afd2dd9fba71160feba047dfc3dcfd1899f5b1dd04ef1dcbf8f09d706d5728d2`, both matching
+the build. Only the daemon carries `cap_net_bind_service=ep`. The previous
+`bee07bc` images remain for rollback. The configuration was backed up as
+`~/.config/sparrow/server.toml.pre-chap-43e8f2a`. It gained `rpc_tcp_secret_file`
+for a new 32-byte random mode-0600 secret, and `disk_budget` rose from 512 MiB to
+50 GiB (`53687091200`) at Patrick's direction. The store filesystem had 353 GB free.
+
+No `sparrowd` process remained before cutover. Startup removed the refused stale
+socket under the store lock and reconciled both watches. Live checks preserve
+store `store:46c88e949ccec658600b66c7becd5bb7`, schema 62, format
+`sparrow.store/92` and all 217 records. Over LAN `192.168.2.4:518`, anonymous
+`status` and `watch list` return `UNAUTHENTICATED`, and both succeed with
+`--secret-file`. Unix status reports the 50 GiB budget. The unit now uses
+`Restart=on-failure`, `RestartSec=10` and at most five starts in ten minutes;
+it was installed with a daemon reload, without restarting the running daemon.
 
 ## Schema-62 live adoption
 

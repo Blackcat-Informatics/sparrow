@@ -125,9 +125,12 @@ unit validation alone.
 
 The unit uses SIGINT because the daemon implements worker drain and WAL fencing
 on that signal. It gives shutdown 120 seconds and reports failure if the process
-cannot exit. It deliberately does not automatically restart: a crash can leave
-an existing Unix socket, and missing dependencies or a refused store open need
-diagnosis. Do not remove a socket until the prior owner is proven terminal.
+cannot exit. It restarts on failure, including host OOM kills, after 10 seconds.
+Startup takes the store's exclusive lock before it removes a refused stale Unix
+socket, so a restart never creates a second writer. Five failed starts within
+ten minutes stop the unit for diagnosis, such as missing dependencies or a
+refused store open. Never remove a socket by hand until the prior owner is
+proven terminal.
 Journal output remains available through `journalctl --user -u sparrow.service`.
 
 This packaging does not establish whole-corpus throughput, physical reclamation,

@@ -3,6 +3,9 @@
 
 [Unit]
 Description=Sparrow typed diagnostic evidence server
+# Bound restarts so a persistently refused store open stops instead of looping.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,9 +16,11 @@ UMask=0077
 # through its SIGINT path. SIGTERM currently has no equivalent drain handler.
 KillSignal=SIGINT
 TimeoutStopSec=120
-# A crash may leave a Unix socket requiring diagnosis before another writer.
-# Do not loop on a failed store open or silently remove an existing endpoint.
-Restart=no
+# Recover from crashes and host OOM kills. Startup removes a stale Unix socket
+# only after it holds the store's exclusive lock, so a restart cannot open a
+# second writer.
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=default.target
