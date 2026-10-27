@@ -46,6 +46,14 @@ holds a transport lease without consuming a storage permit. The existing
 are disconnected before capability admission; storage saturation returns the
 existing typed operation refusal. These are separate finite resource budgets.
 
+Public TCP requires `rpc_tcp_secret_file`. Generate a random secret with mode
+0600, for example `(umask 077; head -c 32 /dev/urandom > ~/.config/sparrow/tcp.secret)`,
+and do not use a passphrase: an observer of one CHAP exchange can test guesses
+offline. Copy the same file privately to each remote agent host and pass it with
+`sparrow --secret-file PATH tcp://ADDRESS:518 COMMAND`. Producers that only
+discover, ingest and import need no secret. CHAP does not encrypt traffic or
+authenticate the server, so restrict the listener to trusted networks.
+
 Port 518 requires the daemon image to have `cap_net_bind_service=ep`, or another
 explicitly configured host privilege arrangement. Apply a file capability to the
 final installed image, not the symlink or a volatile build artifact; copying an
@@ -68,8 +76,8 @@ one store. Then load and enable the installed unit:
 systemctl --user daemon-reload
 systemctl --user enable --now sparrow.service
 systemctl --user status sparrow.service
-sparrow tcp://192.168.2.4:518 status
-sparrow tcp://192.168.2.4:518 mcp --stdio
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 status
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 mcp --stdio
 ```
 
 Use the actual reachable server address for remote clients. Verify store

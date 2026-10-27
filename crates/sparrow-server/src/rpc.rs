@@ -82,6 +82,14 @@ pub struct Rpc {
     watch_controller: Option<crate::WatchController>,
 }
 
+/// The full typed service is already authorized; only an anonymous TCP gate runs CHAP.
+fn chap_unsupported() -> Error {
+    Error::new(
+        "UNSUPPORTED",
+        "CHAP applies only to an anonymous public TCP connection".to_owned(),
+    )
+}
+
 pub(crate) struct CancelQuery(pub(crate) sparrow_core::QueryCancellation);
 impl Drop for CancelQuery {
     fn drop(&mut self) {
@@ -128,6 +136,11 @@ impl Rpc {
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
         }
+    }
+
+    /// Persistent store identity bound into CHAP responses.
+    pub(crate) fn store_id(&self) -> Result<String, Error> {
+        self.store.store_id()
     }
 
     pub(crate) fn for_connection(&self) -> (Self, CancelQuery) {
@@ -1583,6 +1596,24 @@ fn watch_mutation_result(
 }
 
 impl wire::sparrow::Server for Rpc {
+    async fn auth_challenge(
+        self: Rc<Self>,
+        _: wire::sparrow::AuthChallengeParams,
+        mut results: wire::sparrow::AuthChallengeResults,
+    ) -> capnp::Result<()> {
+        failure(results.get().init_result(), chap_unsupported());
+        Ok(())
+    }
+
+    async fn authenticate(
+        self: Rc<Self>,
+        _: wire::sparrow::AuthenticateParams,
+        mut results: wire::sparrow::AuthenticateResults,
+    ) -> capnp::Result<()> {
+        failure(results.get().init_result(), chap_unsupported());
+        Ok(())
+    }
+
     async fn tail_finish(
         self: Rc<Self>,
         params: wire::sparrow::TailFinishParams,

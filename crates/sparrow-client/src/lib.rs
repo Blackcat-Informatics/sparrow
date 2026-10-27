@@ -27,6 +27,8 @@ pub mod sparrow_capnp {
 
 mod transport;
 pub use transport::{Connection, Endpoint, connect, connect_tcp};
+mod tcp_secret;
+pub use tcp_secret::{CHAP_BYTES, TcpSecret};
 mod error;
 pub use error::Error;
 mod bytes;
@@ -187,11 +189,17 @@ impl Client {
     /// Connect and validate discovery through the selected typed transport.
     pub async fn connect_endpoint(endpoint: &Endpoint) -> Result<Self, Error> {
         endpoint.validate()?;
-        let connection = match endpoint {
+        let mut connection = match endpoint {
             Endpoint::Unix(socket) => transport::connect_typed(socket).await?,
-            Endpoint::Tcp(address) => transport::connect_tcp(*address).await?,
+            Endpoint::Tcp(address) | Endpoint::AuthenticatedTcp(address, _) => {
+                transport::connect_tcp(*address).await?
+            }
         };
         let discovery = Discovery::fetch(&connection.client).await?;
+        if let Endpoint::AuthenticatedTcp(_, secret) = endpoint {
+            connection.client =
+                tcp_secret::authenticate(&connection.client, &discovery.store_id, secret).await?;
+        }
         Ok(Self {
             connection,
             discovery,

@@ -186,7 +186,7 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
                 );
                 mcp.close(true).await;
                 let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-                    .arg(&endpoint)
+                    .args(endpoint_args(&endpoint))
                     .args(["capabilities", "unsupported"])
                     .admitted_output()
                     .unwrap();
@@ -414,6 +414,43 @@ impl ProcessOutput for Command {
 
 struct Daemon(Child);
 
+/// Secret files written by `configure_tcp_listener`, keyed by `tcp://` endpoint.
+static TCP_SECRETS: std::sync::Mutex<std::collections::BTreeMap<String, std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// CLI arguments for an endpoint; a configured test TCP endpoint authenticates by CHAP.
+fn endpoint_args(endpoint: impl AsRef<std::ffi::OsStr>) -> Vec<std::ffi::OsString> {
+    let endpoint = endpoint.as_ref().to_owned();
+    match endpoint
+        .to_str()
+        .and_then(|value| TCP_SECRETS.lock().unwrap().get(value).cloned())
+    {
+        Some(secret) => vec!["--secret-file".into(), secret.into(), endpoint],
+        None => vec![endpoint],
+    }
+}
+
+/// The typed endpoint for a test destination, authenticated like `endpoint_args`.
+fn test_endpoint(endpoint: impl AsRef<std::ffi::OsStr>) -> sparrow_client::Endpoint {
+    let args = endpoint_args(endpoint)
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect::<Vec<_>>();
+    sparrow_client::Endpoint::from_args(&args).unwrap().0
+}
+
+/// A CHAP-authenticated typed client for a test TCP listener.
+async fn tcp_client(
+    address: std::net::SocketAddr,
+) -> Result<sparrow_client::Client, sparrow_client::Error> {
+    let secret = TCP_SECRETS.lock().unwrap()[&format!("tcp://{address}")].clone();
+    sparrow_client::Client::connect_endpoint(&sparrow_client::Endpoint::AuthenticatedTcp(
+        address,
+        sparrow_client::TcpSecret::read(&secret)?,
+    ))
+    .await
+}
+
 fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, TcpReservation) {
     let guard = PROCESS_START.lock().unwrap();
     // Released bind(0) ports race the kernel's outbound ephemeral allocations.
@@ -445,10 +482,25 @@ fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, TcpReservatio
     }
     let reservation = reservation.expect("test TCP listener range is occupied");
     let port = reservation.local_addr().unwrap().port();
+    let secret = config.with_file_name("tcp.secret");
+    std::fs::write(&secret, b"sparrow test CHAP secret of 32+ bytes").unwrap();
+    std::fs::set_permissions(
+        &secret,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .unwrap();
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    TCP_SECRETS
+        .lock()
+        .unwrap()
+        .insert(format!("tcp://{address}"), secret.clone());
     let mut text = std::fs::read_to_string(config).unwrap();
-    text.push_str(&format!("rpc_tcp_address = \"0.0.0.0:{port}\"\n"));
+    text.push_str(&format!(
+        "rpc_tcp_address = \"0.0.0.0:{port}\"\nrpc_tcp_secret_file = \"{}\"\n",
+        secret.display()
+    ));
     std::fs::write(config, text).unwrap();
-    (([127, 0, 0, 1], port).into(), (reservation, guard))
+    (address, (reservation, guard))
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -468,7 +520,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         drop(reservation);
         append_tail_config(&config, &root, "log");
         let daemon = start(&config, &socket).await;
-        let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+        let client = tcp_client(address).await.unwrap();
         watch_until(client.capability(), |watch| watch.get_tail_checkpoint_records() == 1).await;
         let status = cli(&socket, &["status"]);
         let generation = status["consume_watches"][0]["tail_generation_ids"][0].as_str().unwrap().to_owned();
@@ -559,7 +611,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         drop(mcp); drop(client); drop(daemon);
         std::fs::remove_file(&socket).unwrap();
         let _daemon = start(&config, &socket).await;
-        let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+        let client = tcp_client(address).await.unwrap();
         assert_eq!(client.handoff(&intent).await.unwrap(), completed);
         assert_eq!(cli(&socket, &["watch", "handoff-status", intent_path.to_str().unwrap()]), rendered);
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
@@ -589,7 +641,7 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
             drop(reservation);
             append_tail_config(&config, &root, "log");
             let daemon = start(&config, &socket).await;
-            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let client = tcp_client(address).await.unwrap();
             watch_until(client.capability(), |watch| {
                 watch.get_tail_checkpoint_records() == 1
             })
@@ -716,7 +768,7 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
             drop(daemon);
             std::fs::remove_file(&socket).unwrap();
             let daemon = start(&config, &socket).await;
-            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let client = tcp_client(address).await.unwrap();
             watch_until(client.capability(), |watch| {
                 watch.get_coverage().unwrap() == wire::WatchCoverage::Covered
                     && watch.get_tail_descriptors() == 0
@@ -1217,7 +1269,7 @@ async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_s
             let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
-            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let client = tcp_client(address).await.unwrap();
             let result = cli(&socket, &["file-generation", &store_id, &generation_id]);
             assert_eq!(result["offset"].as_str(), Some("7"));
             assert_eq!(result["records"].as_str(), Some("1"));
@@ -1506,6 +1558,141 @@ async fn remote_agent_adapters_share_all_query_and_mutation_paths_and_report_con
         .await;
 }
 
+/// INVARIANT: an anonymous public TCP peer can discover and ingest but cannot read,
+/// report status or administer watches; one wrong CHAP response ends authentication on
+/// that connection; the right response grants the complete service; Unix runs no CHAP.
+#[tokio::test(flavor = "current_thread")]
+async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("victim");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("private.log"), b"must stay\n").unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let definition_file = dir.path().join("definition.toml");
+            let definition = watch_definition(&root, "victim", 300, 16, 16);
+            std::fs::write(&definition_file, toml::to_string(&definition).unwrap()).unwrap();
+            let daemon = start(&config, &socket).await;
+            let unauthenticated = |result: Result<_, sparrow_server::AgentError>| {
+                assert_eq!(result.unwrap_err().code, "UNAUTHENTICATED");
+            };
+
+            let anonymous =
+                sparrow_client::Client::connect_endpoint(&sparrow_client::Endpoint::Tcp(address))
+                    .await
+                    .unwrap();
+            let receipt = anonymous
+                .ingest(
+                    "anonymous-ingest",
+                    "anonymous",
+                    wire::Format::Log,
+                    b"accepted\n",
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                anonymous.bytes(&receipt.id, 0, 9).await,
+                Err(sparrow_client::Error::Domain { code, .. }) if code == "UNAUTHENTICATED"
+            ));
+            unauthenticated(
+                sparrow_server::run_cli(anonymous.capability(), &["status".into()]).await,
+            );
+            let put = [
+                "watch",
+                "put",
+                "anonymous-watch",
+                "0",
+                definition_file.to_str().unwrap(),
+            ]
+            .map(String::from);
+            unauthenticated(sparrow_server::run_cli(anonymous.capability(), &put).await);
+            assert!(
+                cli(&socket, &["watch", "list"])["watches"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(root.join("private.log").exists());
+
+            let challenge = anonymous
+                .capability()
+                .auth_challenge_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert!(
+                rpc_ok(challenge.get().unwrap().get_result().unwrap())
+                    .get_nonce()
+                    .unwrap()
+                    .len()
+                    == 32
+            );
+            let mut wrong = anonymous.capability().authenticate_request();
+            wrong.get().set_response(&[0; 32]);
+            let wrong = wrong.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_error_code(wrong.get().unwrap().get_result().unwrap()),
+                "UNAUTHENTICATED"
+            );
+            let retry = anonymous
+                .capability()
+                .auth_challenge_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert_eq!(
+                rpc_error_code(retry.get().unwrap().get_result().unwrap()),
+                "UNAUTHENTICATED"
+            );
+
+            let session = tcp_client(address).await.unwrap();
+            assert_eq!(
+                session.bytes(&receipt.id, 0, 9).await.unwrap(),
+                b"accepted\n"
+            );
+            assert_eq!(
+                sparrow_server::run_cli(session.capability(), &["status".into()])
+                    .await
+                    .unwrap()["store_id"]
+                    .as_str(),
+                Some(receipt.store_id.as_str())
+            );
+            let created = sparrow_server::run_cli(session.capability(), &put)
+                .await
+                .unwrap();
+            assert_eq!(created["watch"]["revision"].as_str(), Some("1"));
+            assert_eq!(
+                cli(&socket, &["watch", "list"])["watches"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+
+            let unix = sparrow_client::Client::connect(&socket).await.unwrap();
+            let local = unix
+                .capability()
+                .auth_challenge_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert_eq!(
+                rpc_error_code(local.get().unwrap().get_result().unwrap()),
+                "UNSUPPORTED"
+            );
+            drop(daemon);
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix() {
     tokio::task::LocalSet::new()
@@ -1517,7 +1704,7 @@ async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix
             let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
-            let tcp = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let tcp = tcp_client(address).await.unwrap();
             let unix = sparrow_client::Client::connect(&socket).await.unwrap();
             assert_eq!(tcp.discovery().store_id, unix.discovery().store_id);
             let receipt = tcp
@@ -1563,7 +1750,7 @@ async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix
             drop(daemon);
             std::fs::remove_file(&socket).unwrap();
             let daemon = start(&config, &socket).await;
-            let tcp = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let tcp = tcp_client(address).await.unwrap();
             assert_eq!(
                 tcp.ingest(
                     "tcp-retry",
@@ -1605,7 +1792,7 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
         let listeners = status.get_syslog_listeners().unwrap();
         assert_eq!(listeners.len(), 4);
-        let tcp = sparrow_client::Client::connect_tcp(rpc_address).await.unwrap();
+        let tcp = tcp_client(rpc_address).await.unwrap();
         let endpoint = format!("tcp://{rpc_address}");
         let store_id = client.discovery().store_id.clone();
         let first = cli(&endpoint, &["sources", &store_id, "--page-size", "1"]);
@@ -1946,7 +2133,7 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
             let mut idle = Vec::new();
             for index in 0..5 {
                 let client = if index % 2 == 0 {
-                    sparrow_client::Client::connect_tcp(address).await.unwrap()
+                    tcp_client(address).await.unwrap()
                 } else {
                     sparrow_client::Client::connect(&socket).await.unwrap()
                 };
@@ -1961,7 +2148,7 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                 idle.push(client);
             }
             // Five idle capabilities leave the single storage permit available to a sixth peer.
-            let sixth = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let sixth = tcp_client(address).await.unwrap();
             let response = sixth
                 .capability()
                 .status_request()
@@ -1972,7 +2159,7 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
             rpc_ok(response.get().unwrap().get_result().unwrap());
             // Unix and TCP share six transport leases; neither can over-admit a seventh peer.
             assert!(sparrow_client::Client::connect(&socket).await.is_err());
-            assert!(sparrow_client::Client::connect_tcp(address).await.is_err());
+            assert!(tcp_client(address).await.is_err());
             drop(sixth);
             let deadline = Instant::now() + Duration::from_secs(3);
             let recovered = loop {
@@ -5910,7 +6097,7 @@ async fn killed_owner_restarts_without_socket_unlink_and_preserves_durable_evide
             let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
-            let client = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let client = tcp_client(address).await.unwrap();
             let receipt = client
                 .ingest(
                     "socket-restart",
@@ -5939,7 +6126,7 @@ async fn killed_owner_restarts_without_socket_unlink_and_preserves_durable_evide
                 cli(&socket, &["records", "--source", "restart"])["rows"],
                 before["rows"]
             );
-            let tcp = sparrow_client::Client::connect_tcp(address).await.unwrap();
+            let tcp = tcp_client(address).await.unwrap();
             assert_eq!(tcp.discovery().store_id, receipt.store_id);
             let old = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                 .arg(&socket)
@@ -6108,7 +6295,7 @@ async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
             let text = std::fs::read_to_string(&config).unwrap();
             let text = text
                 .lines()
-                .filter(|line| !line.starts_with("rpc_tcp_address ="))
+                .filter(|line| !line.starts_with("rpc_tcp_"))
                 .collect::<Vec<_>>()
                 .join("\n");
             std::fs::write(&config, text).unwrap();
@@ -6287,6 +6474,21 @@ async fn start_with_stderr(config: &Path, socket: &Path, stderr: Stdio) -> Daemo
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     daemon
+}
+
+fn rpc_error_code<T: capnp::traits::Owned + 'static>(
+    result: wire::result::Reader<'_, T>,
+) -> String {
+    match result.which().unwrap() {
+        wire::result::Ok(_) => panic!("expected a typed RPC failure"),
+        wire::result::Error(error) => error
+            .unwrap()
+            .get_code()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned(),
+    }
 }
 
 fn rpc_ok<'a, T: capnp::traits::Owned + 'static>(
@@ -6885,7 +7087,7 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
 
 async fn exercise(endpoint: impl AsRef<std::ffi::OsStr>) -> (String, String, String) {
     let endpoint = endpoint.as_ref();
-    let target = sparrow_client::Endpoint::parse(endpoint.to_str().unwrap()).unwrap();
+    let target = test_endpoint(endpoint);
     let connection = sparrow_client::Client::connect_endpoint(&target)
         .await
         .unwrap();
@@ -7022,7 +7224,7 @@ async fn exercise(endpoint: impl AsRef<std::ffi::OsStr>) -> (String, String, Str
     );
     assert_eq!(std::fs::read(&exported).unwrap(), bytes);
     let overwrite = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-        .arg(endpoint)
+        .args(endpoint_args(endpoint))
         .args(["bytes", &store, &id, "0", "1", exported.to_str().unwrap()])
         .admitted_output()
         .unwrap();
@@ -7176,7 +7378,7 @@ async fn exercise(endpoint: impl AsRef<std::ffi::OsStr>) -> (String, String, Str
     let excluded = cli(endpoint, &["keys", "--source", "unrelated-source"]);
     assert!(excluded.get("rows").unwrap().as_array().unwrap().is_empty());
     let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-        .arg(endpoint)
+        .args(endpoint_args(endpoint))
         .args(["keys", "--decoded", "hello"])
         .admitted_output()
         .unwrap();
@@ -7379,7 +7581,7 @@ struct Mcp {
 impl Mcp {
     fn start(socket: impl AsRef<std::ffi::OsStr>) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow"))
-            .arg(socket)
+            .args(endpoint_args(socket))
             .args(["mcp", "--stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -8202,7 +8404,7 @@ async fn mcp_exercise(
         ),
     ] {
         let rejected = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-            .arg(socket)
+            .args(endpoint_args(socket))
             .args(args)
             .admitted_output()
             .unwrap();
@@ -8497,7 +8699,7 @@ async fn direct_promises_and_mcp_notifications_cancel_captures_without_closing_t
             for endpoint in [socket.to_str().unwrap(), tcp.as_str()] {
                 use futures::FutureExt;
                 let direct = if endpoint == tcp {
-                    sparrow_client::Client::connect_tcp(address).await.unwrap()
+                    tcp_client(address).await.unwrap()
                 } else {
                     sparrow_client::Client::connect(&socket).await.unwrap()
                 };
@@ -8998,7 +9200,7 @@ async fn mcp_pin_pages(socket: &Path, store: &str, artifact: &str, record: &str)
 
 fn cli(socket: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> purrdf_lex::json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
-        .arg(socket)
+        .args(endpoint_args(socket))
         .args(args)
         .admitted_output()
         .unwrap();
@@ -9063,7 +9265,7 @@ async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_sco
             let _daemon = start(&config, &socket).await;
             let endpoint = format!("tcp://{address}");
             let client = sparrow_client::Client::connect_endpoint(
-                &sparrow_client::Endpoint::parse(&endpoint).unwrap(),
+                &test_endpoint(&endpoint),
             )
             .await
             .unwrap();
@@ -9468,7 +9670,7 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
         let (address,reservation) = configure_tcp_listener(&config); drop(reservation);
         let _daemon = start(&config,&socket).await;
         let endpoint = format!("tcp://{address}");
-        let client = sparrow_client::Client::connect_endpoint(&sparrow_client::Endpoint::parse(&endpoint).unwrap()).await.unwrap();
+        let client = sparrow_client::Client::connect_endpoint(&test_endpoint(&endpoint)).await.unwrap();
         let store = client.discovery().store_id.clone();
         client.ingest("graph-input","graph-source",wire::Format::Json,br#"{"message":"native graph"}"#).await.unwrap();
         let mut mcp = Mcp::start(&socket); mcp.initialize(1).await;
@@ -9539,7 +9741,7 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
         let receipt = &failed["structuredContent"]; assert_eq!(receipt["execution_status"].as_str(),Some("failed")); assert!(receipt["diagnostic"]["code"].as_str().is_some()); assert!(receipt.get("native_governor").is_some());
         sparrow_client::release_result(client.capability(),&store,receipt["snapshot_id"].as_str().unwrap()).await.unwrap();
         std::fs::write(&path,json::write_compact(&Object::new().with("store_id",store.clone()).with("query","SELECT WHERE {").into())).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&endpoint).args(["sparql",path.to_str().unwrap()]).admitted_output().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_sparrow")).args(endpoint_args(&endpoint)).args(["sparql",path.to_str().unwrap()]).admitted_output().unwrap();
         assert!(!output.status.success());let output=json::read_slice(&output.stdout,json::Limits::default()).unwrap();assert_eq!(output["execution_status"].as_str(),Some("failed"));
         sparrow_client::release_result(client.capability(),&store,output["snapshot_id"].as_str().unwrap()).await.unwrap();
         let mut bad = client.capability().sparql_query_request(); let mut query=bad.get().init_query(); query.set_store_id(&store);query.set_schema_version(sparrow_client::SCHEMA_VERSION);query.set_query("SELECT ?x WHERE {}");let mut scope = query.reborrow().init_scope(); scope.set_schema_version(sparrow_client::SCHEMA_VERSION); scope.init_received_before().set_unix_millis(u64::MAX);
@@ -9563,7 +9765,7 @@ async fn stored_text_graph_relations_preserve_corpus_spans_and_explanations_over
         let _daemon = start(&config, &socket).await;
         let endpoint = format!("tcp://{address}");
         let client = sparrow_client::Client::connect_endpoint(
-            &sparrow_client::Endpoint::parse(&endpoint).unwrap()
+            &test_endpoint(&endpoint)
         ).await.unwrap();
         let store = client.discovery().store_id.clone();
         let input = br#"{"message":"nee\u0064le needle"}

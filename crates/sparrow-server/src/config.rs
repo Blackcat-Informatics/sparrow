@@ -16,9 +16,13 @@ pub(crate) const MAX_CONSUME_ROOTS: usize = 8;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Optional public Cap'n Proto TCP binding, without authentication.
+    /// Optional public Cap'n Proto TCP binding. Anonymous peers may only discover, ingest,
+    /// flush and import; other operations require a CHAP-authenticated session.
     #[serde(default)]
     pub rpc_tcp_address: Option<std::net::SocketAddr>,
+    /// Private shared-secret file, required exactly when `rpc_tcp_address` is set.
+    #[serde(default)]
+    pub rpc_tcp_secret_file: Option<PathBuf>,
     /// Explicit syslog intake listeners; none are opened by default.
     #[serde(default)]
     pub syslog: Vec<crate::syslog_listener::SyslogListener>,
@@ -122,7 +126,26 @@ impl ServerConfig {
         }
         ConsumeWatch::validate_fields(&config.consume)?;
         crate::syslog_listener::validate(&config.syslog)?;
+        if config.rpc_tcp_address.is_some() != config.rpc_tcp_secret_file.is_some() {
+            return Err(
+                "rpc_tcp_address and rpc_tcp_secret_file must be configured together".into(),
+            );
+        }
         Ok(config)
+    }
+
+    /// Read the configured TCP CHAP secret; a configured but unusable file is an error.
+    pub fn tcp_secret(
+        &self,
+    ) -> Result<Option<sparrow_client::TcpSecret>, Box<dyn std::error::Error>> {
+        self.rpc_tcp_secret_file
+            .as_deref()
+            .map(|path| {
+                sparrow_client::TcpSecret::read(path).map_err(|error| {
+                    format!("rpc_tcp_secret_file {}: {error}", path.display()).into()
+                })
+            })
+            .transpose()
     }
 
     /// Open the one storage owner with native analyzer artifacts and private permissions.
@@ -198,5 +221,46 @@ impl ConsumeWatch {
             roots.push(watch.root.clone());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    /// INVARIANT: public TCP never starts without its CHAP secret, a secret is never
+    /// configured without TCP, and an over-permissive secret file refuses startup.
+    #[test]
+    fn public_tcp_and_its_chap_secret_are_configured_together_and_privately() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        let secret = dir.path().join("tcp.secret");
+        std::fs::write(&secret, [9; 32]).unwrap();
+        let with = |extra: &str| {
+            std::fs::write(&config, format!("{base}{extra}")).unwrap();
+            ServerConfig::read(&config)
+        };
+        assert!(with("rpc_tcp_address = \"127.0.0.1:5180\"\n").is_err());
+        let secret_line = format!("rpc_tcp_secret_file = \"{}\"\n", secret.display());
+        assert!(with(&secret_line).is_err());
+        let both = with(&format!(
+            "rpc_tcp_address = \"127.0.0.1:5180\"\n{secret_line}"
+        ))
+        .unwrap();
+        std::fs::set_permissions(
+            &secret,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(both.tcp_secret().is_err());
+        std::fs::set_permissions(
+            &secret,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(both.tcp_secret().unwrap().is_some());
     }
 }

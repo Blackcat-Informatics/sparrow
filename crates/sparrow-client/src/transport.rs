@@ -14,8 +14,10 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 pub enum Endpoint {
     /// Private local Unix socket.
     Unix(std::path::PathBuf),
-    /// Numeric TCP address; no HTTP envelope or authentication negotiation.
+    /// Numeric TCP address used anonymously: discovery, ingestion, flush and imports only.
     Tcp(std::net::SocketAddr),
+    /// Numeric TCP address whose session is authenticated by the shared-secret CHAP law.
+    AuthenticatedTcp(std::net::SocketAddr, crate::TcpSecret),
 }
 
 impl Endpoint {
@@ -31,10 +33,37 @@ impl Endpoint {
         Ok(endpoint)
     }
 
+    /// Read `[--secret-file PATH] ENDPOINT` from the front of command arguments.
+    /// Returns the endpoint and the remaining arguments; a secret requires TCP.
+    pub fn from_args(args: &[String]) -> Result<(Self, &[String]), crate::Error> {
+        let (secret, rest) = match args {
+            [flag, path, rest @ ..] if flag == "--secret-file" => {
+                (Some(crate::TcpSecret::read(Path::new(path))?), rest)
+            }
+            rest => (None, rest),
+        };
+        let [endpoint, rest @ ..] = rest else {
+            return Err(crate::Error::InvalidArgument(
+                "arguments require [--secret-file PATH] ENDPOINT",
+            ));
+        };
+        let endpoint = Self::parse(endpoint)?;
+        let endpoint = match (endpoint, secret) {
+            (endpoint, None) => endpoint,
+            (Self::Tcp(address), Some(secret)) => Self::AuthenticatedTcp(address, secret),
+            (_, Some(_)) => {
+                return Err(crate::Error::InvalidArgument(
+                    "--secret-file applies only to a tcp:// endpoint",
+                ));
+            }
+        };
+        Ok((endpoint, rest))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
         if match self {
             Self::Unix(path) => path.as_os_str().is_empty() || path.as_os_str().len() > 4096,
-            Self::Tcp(address) => address.port() == 0,
+            Self::Tcp(address) | Self::AuthenticatedTcp(address, _) => address.port() == 0,
         } {
             return Err(crate::Error::InvalidArgument(
                 "endpoint requires a Unix path of 1..4096 bytes or a nonzero TCP port",

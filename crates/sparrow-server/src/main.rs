@@ -18,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: sparrowd --config FILE.toml".into());
     }
     let config = ServerConfig::read(Path::new(&args[1]))?;
+    let tcp_secret = config.tcp_secret()?;
     // Keep the subscription alive through startup and awaited maintenance work.
     // Recreating ctrl_c() inside select drops its listener when another branch wins.
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -139,12 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 accepted = endpoint.listener.accept() => {
                     let (stream, _) = accepted?;
-                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone());
+                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::Local);
                 }
                 accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if tcp_listener.is_some() => {
                     let (stream, _) = accepted?;
                     stream.set_nodelay(true)?;
-                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone());
+                    let secret = tcp_secret.clone().expect("configuration pairs TCP with its secret");
+                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::PublicTcp(secret));
                 }
             }
         }

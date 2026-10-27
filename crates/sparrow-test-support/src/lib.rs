@@ -11,12 +11,27 @@ pub use sparrow_core::DEFAULT_FLUSH_INTERVAL_MS as STORAGE_FLUSH_INTERVAL_MS;
 /// Native analyzer resolver used by the shared storage fixture macro.
 pub use sparrow_core::resolve_text_analyzer;
 
-/// Baseline native analyzer artifacts for workspace storage fixtures.
+/// Baseline native analyzer artifacts for workspace storage fixtures, read from the
+/// sibling PurRDF checkout of the canonical repository root. A linked worktree under
+/// `<root>/.worktrees/` resolves to the same sibling as the main checkout.
 pub fn text_lexicon_dir() -> &'static std::path::Path {
-    std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../purrdf/crates/text/lexicons/artifacts"
-    ))
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let checkout = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+        let root = match checkout.canonicalize() {
+            Ok(path)
+                if path.parent().and_then(std::path::Path::file_name)
+                    == Some(std::ffi::OsStr::new(".worktrees")) =>
+            {
+                path.parent()
+                    .and_then(std::path::Path::parent)
+                    .map(std::path::Path::to_path_buf)
+                    .expect("INVARIANT: a .worktrees directory has a parent repository root")
+            }
+            _ => checkout.to_path_buf(),
+        };
+        root.join("../purrdf/crates/text/lexicons/artifacts")
+    })
 }
 
 /// One configuration law for core unit and integration fixtures.

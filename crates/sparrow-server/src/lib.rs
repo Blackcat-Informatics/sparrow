@@ -18,10 +18,11 @@ pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;
 mod pressure;
+mod tcp_gate;
 mod transport;
 mod watch_admin;
 pub mod watches;
-pub use transport::{admit_connection, serve_connection};
+pub use transport::{Access, admit_connection, serve_connection};
 pub use watch_admin::WatchController;
 
 mod rdf_wire;

@@ -17,6 +17,7 @@ futures.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
 purrdf-hash.workspace = true
+purrdf-ed25519.workspace = true
 purrdf-lex.workspace = true
 rustix.workspace = true
 getrandom.workspace = true
