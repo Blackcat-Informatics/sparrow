@@ -3096,7 +3096,9 @@ with the unchanged request and bytes. Capacity and every other failure remain
 immediately observable. It additionally asserts one new artifact and one pending
 write after synchronization releases capacity. The focused release scenario
 passed (`/tmp/sparrow-accounting-test.log`); production accounting and admission
-limits were not changed. No hook bypass was used.
+limits were not changed. No hook bypass was used. Issue #4 later removed this
+refusal: the footprint walk counts a file deleted mid-walk as zero bytes, so
+RocksDB file turnover no longer fails accounting, and the retry was removed.
 
 ## Schema 38 daemon adoption and active file capture
 

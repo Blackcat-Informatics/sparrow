@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 run_mcp(&endpoint).await?;
             } else {
                 let client = Client::connect_endpoint(&endpoint).await?;
-                let output = run_cli(client.capability(), args).await?;
+                let output = run_cli(&client, args).await?;
                 println!("{}", json::write_compact(&output));
                 if output.get("execution_status").and_then(json::Value::as_str) == Some("failed") {
                     return Err("query failed; see the emitted typed failure receipt".into());

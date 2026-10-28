@@ -61,10 +61,10 @@ pub(super) const USAGE: &str = concat!(
 );
 
 /// Execute a CLI command through the same typed client and renderer as MCP.
-pub async fn run_cli(client: &wire::sparrow::Client, args: &[String]) -> Result<Value> {
-    match Command::parse(args)?.execute(client).await? {
+pub async fn run_cli(connection: &sparrow_client::Client, args: &[String]) -> Result<Value> {
+    match Command::parse(args)?.execute(connection).await? {
         Some(output) => Ok(output),
-        None => status::execute(client).await,
+        None => status::execute(connection.capability()).await,
     }
 }
 
@@ -548,7 +548,11 @@ impl Command {
         })
     }
 
-    pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Option<Value>> {
+    pub(super) async fn execute(
+        &self,
+        connection: &sparrow_client::Client,
+    ) -> Result<Option<Value>> {
+        let client = connection.capability();
         if let Self::Capabilities = self {
             return Ok(Some(capabilities::execute(client).await?));
         }
@@ -589,7 +593,7 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Ingest(input) = self {
-            return Ok(Some(input.execute(client).await?));
+            return Ok(Some(input.execute(connection.endpoint()).await?));
         }
         if let Self::IngestStatus(input) = self {
             return Ok(Some(input.execute(client).await?));

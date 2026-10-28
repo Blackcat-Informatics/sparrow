@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use crate::{ArtifactReceipt, Error, sparrow_capnp as wire};
+use crate::{ArtifactReceipt, Client, Endpoint, Error, sparrow_capnp as wire};
 use std::{
     fs::File,
     os::unix::fs::{FileExt, MetadataExt},
@@ -10,15 +10,104 @@ use std::{
 
 /// Stream a completed regular file through durable resumable checkpoints.
 /// The source file is never renamed or deleted. Retries preserve request identity.
+///
+/// A connection lost to the daemon's connection lease or a restart is replaced,
+/// waiting up to 30 seconds for the daemon to accept connections again, and the
+/// same request resumes from its durable checkpoint while each attempt advances it.
+/// A terminal failure cancels the staging journal, so an abandoned import never
+/// holds one of the daemon's import slots for the retry window.
 pub async fn import_file(
-    client: &wire::sparrow::Client,
+    endpoint: &Endpoint,
     request_id: &str,
     source: &str,
     format: wire::Format,
     path: &Path,
 ) -> Result<ArtifactReceipt, Error> {
     let mut file = open_completed_file(path)?;
-    import_open_file(client, request_id, source, format, &mut file).await
+    let mut checkpoint = Checkpoint::default();
+    let attempt = async |file: &mut File, checkpoint: &mut Checkpoint| {
+        let client = reconnect(endpoint).await?;
+        upload(
+            client.capability(),
+            client.discovery(),
+            request_id,
+            source,
+            format,
+            file,
+            checkpoint,
+        )
+        .await
+    };
+    let error = loop {
+        let before = checkpoint.progress;
+        match attempt(&mut file, &mut checkpoint).await {
+            Ok(receipt) => return Ok(receipt),
+            Err(error) if error.retryable() && checkpoint.progress > before => {}
+            Err(error) => break error,
+        }
+    };
+    let Some((store, id)) = checkpoint.import.clone() else {
+        return Err(error);
+    };
+    match cancel(endpoint, &store, &id).await {
+        Ok(()) => Err(error),
+        // Publication committed although its reply was lost; retrieve the receipt.
+        Err(Error::Domain { code, .. }) if code == "CONFLICT" => {
+            attempt(&mut file, &mut checkpoint).await
+        }
+        Err(cancel) => Err(Error::Domain {
+            code: "IMPORT_ABANDONED".into(),
+            message: format!(
+                "{error}; canceling import {id} also failed ({cancel}); its import slot may stay occupied until the retry window ends"
+            ),
+            retryable: false,
+        }),
+    }
+}
+
+/// Highest durable import progress observed across attempts: received bytes,
+/// then seal and layout, then prepared records and raw chunks of the next one.
+#[derive(Default)]
+pub(crate) struct Checkpoint {
+    import: Option<(String, String)>,
+    progress: (u64, u8, u64, u64),
+}
+
+impl Checkpoint {
+    fn observe(&mut self, progress: &crate::ImportProgress) {
+        let stage = u8::from(progress.sealed) + u8::from(progress.layout_complete);
+        self.import = Some((progress.store_id.clone(), progress.id.clone()));
+        self.progress = self.progress.max((progress.received_bytes, stage, 0, 0));
+    }
+}
+
+/// Connect, waiting a bounded time while a restarting daemon is not yet accepting.
+async fn reconnect(endpoint: &Endpoint) -> Result<Client, Error> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match Client::connect_endpoint(endpoint).await {
+            Err(error)
+                if crate::delivery::retryable(&error) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn cancel(endpoint: &Endpoint, store: &str, id: &str) -> Result<(), Error> {
+    let client = reconnect(endpoint).await?;
+    let mut request = client.capability().import_cancel_request();
+    import_reference(request.get().init_import(), store, id);
+    let response = request.send().promise.await?;
+    match response.get()?.get_result()?.which()? {
+        wire::result::Ok(value) => {
+            value?;
+            Ok(())
+        }
+        wire::result::Error(error) => Err(Error::domain(error?)),
+    }
 }
 
 /// Open a completed input without following any symlink or waiting on a FIFO.
@@ -51,7 +140,17 @@ pub async fn import_open_file(
 ) -> Result<ArtifactReceipt, Error> {
     // Discovery refuses an older daemon before allocating private staging.
     let discovery = crate::Discovery::fetch(client).await?;
-    upload(client, &discovery, request_id, source, format, file).await
+    let mut checkpoint = Checkpoint::default();
+    upload(
+        client,
+        &discovery,
+        request_id,
+        source,
+        format,
+        file,
+        &mut checkpoint,
+    )
+    .await
 }
 
 pub(crate) async fn upload(
@@ -61,6 +160,7 @@ pub(crate) async fn upload(
     source: &str,
     format: wire::Format,
     file: &mut File,
+    checkpoint: &mut Checkpoint,
 ) -> Result<ArtifactReceipt, Error> {
     if request_id.is_empty() || request_id.len() > 128 || source.is_empty() || source.len() > 512 {
         return Err(Error::InvalidArgument(
@@ -131,6 +231,7 @@ pub(crate) async fn upload(
             "import staging contradicts the discovered store or requested input",
         ));
     }
+    checkpoint.observe(&progress);
     let id = progress.id;
     let mut offset = progress.received_bytes;
     while offset < length {
@@ -154,6 +255,7 @@ pub(crate) async fn upload(
                 "daemon returned an unexpected durable append offset",
             ));
         }
+        checkpoint.observe(&value);
     }
     identity.require(file)?;
     let mut request = client.import_seal_request();
@@ -161,7 +263,9 @@ pub(crate) async fn upload(
     let response = request.send().promise.await?;
     match response.get()?.get_result()?.which()? {
         wire::result::Ok(value) => {
-            value?;
+            let value = crate::ImportProgress::decode(value?)?;
+            value.certify_identity(&store, &id)?;
+            checkpoint.observe(&value);
         }
         wire::result::Error(error) => return Err(Error::domain(error?)),
     }
@@ -170,7 +274,9 @@ pub(crate) async fn upload(
     let response = request.send().promise.await?;
     match response.get()?.get_result()?.which()? {
         wire::result::Ok(value) => {
-            value?;
+            let value = crate::ImportProgress::decode(value?)?;
+            value.certify_identity(&store, &id)?;
+            checkpoint.observe(&value);
         }
         wire::result::Error(error) => return Err(Error::domain(error?)),
     }
@@ -210,6 +316,10 @@ pub(crate) async fn upload(
             ));
         }
         previous = Some(progress);
+        checkpoint.progress =
+            checkpoint
+                .progress
+                .max((length, 2, expected, raw_chunks.unwrap_or(0)));
         if expected == value.get_total_records() {
             break;
         }

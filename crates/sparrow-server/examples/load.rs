@@ -23,7 +23,7 @@ async fn capture(client: &Client, initial: &[&str]) -> Result<(usize, usize)> {
         ]
         .map(str::to_owned),
     );
-    let mut value = sparrow_server::run_cli(client.capability(), &command).await?;
+    let mut value = sparrow_server::run_cli(client, &command).await?;
     let snapshot = value["page"]["snapshot_id"]
         .as_str()
         .ok_or("missing capture identity")?
@@ -44,7 +44,7 @@ async fn capture(client: &Client, initial: &[&str]) -> Result<(usize, usize)> {
             .ok_or("missing continuation cursor")?
             .to_owned();
         value = sparrow_server::run_cli(
-            client.capability(),
+            client,
             &[
                 "result-next".into(),
                 client.discovery().store_id.clone(),
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
             if producer.discovery().store_id != reader.discovery().store_id {
                 return Err("connections reached different stores".into());
             }
-            let before = sparrow_server::run_cli(producer.capability(), &["status".into()]).await?;
+            let before = sparrow_server::run_cli(&producer, &["status".into()]).await?;
             if before["live_records"].as_str() != Some("0")
                 || before["active_pins"].as_str() != Some("0")
                 || !before["consume_watches"]
@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
                         .with("query_us", began.elapsed().as_micros().to_string()),
                 ));
             }
-            let after = sparrow_server::run_cli(producer.capability(), &["status".into()]).await?;
+            let after = sparrow_server::run_cli(&producer, &["status".into()]).await?;
             if after["live_records"].as_str()
                 != Some((batches * (2 * rows + 2)).to_string().as_str())
                 || after["record_read_handles"].as_str() != Some("0")

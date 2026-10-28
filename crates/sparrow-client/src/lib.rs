@@ -125,6 +125,7 @@ pub fn format_label(value: Format) -> &'static str {
 pub struct Client {
     connection: Connection,
     discovery: Discovery,
+    endpoint: Endpoint,
 }
 
 impl Client {
@@ -203,7 +204,13 @@ impl Client {
         Ok(Self {
             connection,
             discovery,
+            endpoint: endpoint.clone(),
         })
+    }
+
+    /// Destination this connection was opened to; resumable imports reconnect through it.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 
     /// Persistent store identity and explicit server admission/profile information.
@@ -285,7 +292,9 @@ impl Client {
         flush_through(self.capability(), through).await
     }
 
-    /// Stream a completed regular file through the same implementation used by the CLI.
+    /// Upload a completed regular file once over this connection. Unlike the free
+    /// `import_file(endpoint, ...)` used by the CLI, it neither reconnects nor
+    /// cancels; a caller that abandons a failed import should cancel it.
     pub async fn import_file(
         &self,
         request_id: &str,
@@ -314,6 +323,7 @@ impl Client {
             source,
             format,
             file,
+            &mut imports::Checkpoint::default(),
         )
         .await
     }

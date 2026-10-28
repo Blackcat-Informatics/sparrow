@@ -1056,23 +1056,35 @@ impl Writer {
 }
 
 pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
-    fn failure(error: std::io::Error, path: &Path, root: &Path) -> Error {
-        Error::new(
-            if error.kind() == std::io::ErrorKind::NotFound && path != root {
-                "ACCOUNTING_CHANGED"
-            } else {
-                "STORAGE_FAILURE"
-            },
-            format!("{}: {error}", path.display()),
-        )
-    }
+    /// RocksDB deletes obsolete WAL and SST files while the walk runs. A file
+    /// removed between listing and inspection no longer occupies space, so it
+    /// counts as zero; only a missing database directory is a failure.
     fn directory(path: &Path, root: &Path) -> Result<u64, Error> {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && path != root => {
+                return Ok(0);
+            }
+            Err(error) => {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    format!("{}: {error}", path.display()),
+                ));
+            }
+        };
         let mut size = 0_u64;
-        for entry in std::fs::read_dir(path).map_err(|e| failure(e, path, root))? {
+        for entry in entries {
             let entry = entry.map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-            let metadata = entry
-                .metadata()
-                .map_err(|e| failure(e, &entry.path(), root))?;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        format!("{}: {error}", entry.path().display()),
+                    ));
+                }
+            };
             let bytes = if metadata.is_dir() {
                 directory(&entry.path(), root)?
             } else {
@@ -1084,20 +1096,7 @@ pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
         }
         Ok(size)
     }
-    let mut last = String::new();
-    for _ in 0..3 {
-        match directory(db.path(), db.path()) {
-            Ok(bytes) => return Ok(bytes),
-            Err(error) if error.code == "ACCOUNTING_CHANGED" => last = error.message,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(Error::new(
-        "STORAGE_PRESSURE",
-        format!(
-            "database footprint stayed unstable across 3 complete measurements; retry accounting before admission: {last}"
-        ),
-    ))
+    directory(db.path(), db.path())
 }
 
 fn put<T: Catalog>(batch: &mut WriteBatch, key: &str, value: &T) {

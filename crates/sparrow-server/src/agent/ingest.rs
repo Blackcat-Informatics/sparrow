@@ -25,10 +25,10 @@ impl Input {
         })
     }
 
-    pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
+    pub(super) async fn execute(&self, endpoint: &sparrow_client::Endpoint) -> Result<Value> {
         render_receipt(
             sparrow_client::import_file(
-                client,
+                endpoint,
                 &self.request,
                 &self.source,
                 self.format,

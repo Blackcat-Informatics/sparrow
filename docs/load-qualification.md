@@ -16,7 +16,8 @@ using 0.38 cores and its worker blocked on I/O. Fifteen chunks exceeded the
 60-second RPC connection lease and were disconnected. Each disconnect left its
 import journal occupied, and once 16 were held every later chunk was refused
 with `RESOURCE_LIMIT` ("16 import journals are occupied"). The CLI `ingest`
-neither resumes nor cancels its import after a disconnect.
+then neither resumed nor canceled its import after a disconnect; since issue #3
+it resumes over a new connection and cancels an import that stops advancing.
 
 The store then held 723,926,766 physical bytes for 64.6 MB of input, about 11
 times the raw size before any compaction. The abandoned imports account for at

@@ -489,11 +489,12 @@ impl Operation {
         decode().map_err(|e| invalid(e.to_string()))
     }
 
-    pub(crate) async fn execute(self, client: &wire::sparrow::Client) -> Result<Value> {
+    pub(crate) async fn execute(self, connection: &sparrow_client::Client) -> Result<Value> {
+        let client = connection.capability();
         match self {
             Self::Status => status::execute(client).await,
             Self::Query(command) => command
-                .execute(client)
+                .execute(connection)
                 .await?
                 .ok_or_else(|| invalid("query produced no result")),
             Self::Renew(input) => input.execute(client).await,

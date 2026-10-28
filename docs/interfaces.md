@@ -2169,6 +2169,18 @@ result with `RPC_FAILURE`. CLI argument/RPC/storage refusals exit nonzero withou
 a result. A governed query failure can emit its typed failed receipt on stdout
 and also exit nonzero; consumers must inspect the receipt and exit status.
 
+CLI `ingest` uploads over its own connection to the same endpoint. When that
+connection is lost, for example to the 60-second connection lease or a daemon
+restart, it reconnects, waiting up to 30 seconds for the daemon to accept
+connections again, and resumes the same request from its durable checkpoint for
+as long as each attempt advances the received bytes, seal, layout or
+preparation. A failure that is not retryable, or an attempt that advances
+nothing, cancels the staging journal with `importCancel`, so the daemon's bounded
+reclamation releases its import slot instead of holding it for the 48-hour retry
+window. Until then, retrying the canceled request ID fails with `IMPORT_EXPIRED`.
+If the cancellation also fails, the CLI reports `IMPORT_ABANDONED` with both
+causes. The SDK `import_file(endpoint, ...)` is this implementation.
+
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an
 endpoint: a Unix socket path or `tcp://IP:PORT`. Operations other than discovery,

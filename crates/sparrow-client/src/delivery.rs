@@ -805,7 +805,9 @@ async fn run(shared: &Shared) -> Result<(), Error> {
     }
 }
 
-fn retryable(error: &Error) -> bool {
+/// Whether reconnecting and retrying the same identity may succeed, including
+/// a daemon whose socket is briefly absent or refusing while it restarts.
+pub(crate) fn retryable(error: &Error) -> bool {
     match error {
         Error::Io(error) => matches!(
             error.kind(),

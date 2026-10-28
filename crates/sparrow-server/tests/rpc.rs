@@ -1599,9 +1599,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 anonymous.bytes(&receipt.id, 0, 9).await,
                 Err(sparrow_client::Error::Domain { code, .. }) if code == "UNAUTHENTICATED"
             ));
-            unauthenticated(
-                sparrow_server::run_cli(anonymous.capability(), &["status".into()]).await,
-            );
+            unauthenticated(sparrow_server::run_cli(&anonymous, &["status".into()]).await);
             let put = [
                 "watch",
                 "put",
@@ -1610,7 +1608,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 definition_file.to_str().unwrap(),
             ]
             .map(String::from);
-            unauthenticated(sparrow_server::run_cli(anonymous.capability(), &put).await);
+            unauthenticated(sparrow_server::run_cli(&anonymous, &put).await);
             assert!(
                 cli(&socket, &["watch", "list"])["watches"]
                     .as_array()
@@ -1658,15 +1656,13 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 b"accepted\n"
             );
             assert_eq!(
-                sparrow_server::run_cli(session.capability(), &["status".into()])
+                sparrow_server::run_cli(&session, &["status".into()])
                     .await
                     .unwrap()["store_id"]
                     .as_str(),
                 Some(receipt.store_id.as_str())
             );
-            let created = sparrow_server::run_cli(session.capability(), &put)
-                .await
-                .unwrap();
+            let created = sparrow_server::run_cli(&session, &put).await.unwrap();
             assert_eq!(created["watch"]["revision"].as_str(), Some("1"));
             assert_eq!(
                 cli(&socket, &["watch", "list"])["watches"]
@@ -5398,6 +5394,117 @@ impl wire::sparrow::Server for EventRelay {
         }
         Ok(())
     }
+}
+
+/// Forward each connection to the daemon and cut it after `limit` request
+/// bytes, as the daemon's connection lease cuts a long upload.
+fn lease_cutting_relay(
+    socket: &Path,
+    daemon: std::path::PathBuf,
+    limit: u64,
+    connections: std::rc::Rc<std::cell::Cell<u32>>,
+) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::UnixListener::bind(socket).unwrap();
+    tokio::task::spawn_local(async move {
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            connections.set(connections.get() + 1);
+            let daemon = tokio::net::UnixStream::connect(&daemon).await.unwrap();
+            tokio::task::spawn_local(async move {
+                let (client_read, mut client_write) = client.into_split();
+                let (mut daemon_read, mut daemon_write) = daemon.into_split();
+                let mut requests = tokio::io::AsyncReadExt::take(client_read, limit);
+                tokio::select! {
+                    _ = tokio::io::copy(&mut requests, &mut daemon_write) => {}
+                    _ = tokio::io::copy(&mut daemon_read, &mut client_write) => {}
+                }
+            });
+        }
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cli_ingest_resumes_across_lost_connections_and_cancels_a_stalled_import() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let input = dir.path().join("lease.log");
+            let mut line = vec![b'x'; 1023];
+            line.push(b'\n');
+            std::fs::write(
+                &input,
+                line.repeat(8 * sparrow_core::IMPORT_CHUNK_BYTES / line.len()),
+            )
+            .unwrap();
+            let path = input.to_str().unwrap().to_owned();
+            // About two append chunks fit in each connection before it is cut.
+            let resumed = dir.path().join("resumed.sock");
+            let connections = std::rc::Rc::new(std::cell::Cell::new(0));
+            let relay = lease_cutting_relay(
+                &resumed,
+                socket.clone(),
+                3 * sparrow_core::IMPORT_CHUNK_BYTES as u64,
+                connections.clone(),
+            );
+            let args = [
+                "ingest".into(),
+                "lease-cut".into(),
+                "lease".into(),
+                "log".into(),
+                path,
+            ];
+            let receipt = tokio::task::spawn_blocking(move || {
+                cli(
+                    &resumed,
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                )
+            })
+            .await
+            .unwrap();
+            assert!(connections.get() > 3, "{} connections", connections.get());
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let accepted = genuine
+                .import_file("lease-cut", "lease", wire::Format::Log, &input)
+                .await
+                .unwrap();
+            assert_eq!(receipt["artifact_id"].as_str(), Some(accepted.id.as_str()));
+            relay.abort();
+            // No request fits beside the first chunk: nothing advances, so the
+            // client stops resuming and cancels the journal it began.
+            let stalled = dir.path().join("stalled.sock");
+            let relay = lease_cutting_relay(&stalled, socket.clone(), 8 * 1024, connections);
+            let error = sparrow_client::import_file(
+                &sparrow_client::Endpoint::Unix(stalled),
+                "lease-stall",
+                "lease",
+                wire::Format::Log,
+                &input,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.retryable(), "{error}");
+            // A live journal would report its staging; a canceled one has ended
+            // its lease, and once reclaimed it is gone.
+            let status = sparrow_client::get_ingest_status(
+                genuine.capability(),
+                &genuine.discovery().store_id,
+                &sparrow_client::IngestSelector::Request("lease-stall".into()),
+                Default::default(),
+            )
+            .await;
+            assert!(
+                matches!(&status, Err(sparrow_client::Error::Domain { code, .. })
+                    if code == "IMPORT_EXPIRED" || code == "NOT_FOUND"),
+                "canceled staging still holds its import slot: {:?}",
+                status.err()
+            );
+            relay.abort();
+        })
+        .await;
 }
 
 fn relay(
@@ -9713,7 +9820,7 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
                 assert_eq!(page["snapshot_id"],first["snapshot_id"]); assert_eq!(page["native_governor"],first["native_governor"]); pages+=1; assert!(pages<100);
             }
             let released = sparrow_client::release_result(client.capability(),&store,first["snapshot_id"].as_str().unwrap()).await.unwrap(); assert_eq!(released.released,first["has_more"].as_bool().unwrap());
-            if let Some(cursor) = first["next_cursor"].as_str() { assert!(sparrow_server::run_cli(client.capability(),&["result-next".into(),store.clone(),cursor.into()]).await.is_err()); }
+            if let Some(cursor) = first["next_cursor"].as_str() { assert!(sparrow_server::run_cli(&client,&["result-next".into(),store.clone(),cursor.into()]).await.is_err()); }
         }
         for (id,query,fuel,certainty) in [(30,"SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }","0","certain"),(31,"ASK { ?s ?p ?o }","0","unknown")] {
             let response = mcp.tool(id,"sparql_query",Object::new().with("store_id",store.clone()).with("query",query).with("limits",Object::new().with("fuel",fuel)).into()).await;

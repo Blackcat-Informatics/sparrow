@@ -5819,7 +5819,9 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
 }
 
 #[test]
-fn physical_accounting_handles_directory_churn_with_bounded_measurement_failures() {
+fn physical_accounting_completes_while_files_churn() {
+    // INVARIANT: files removed during the footprint walk never fail accounting;
+    // RocksDB deletes obsolete WAL and SST files continuously under ingest.
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -5839,27 +5841,16 @@ fn physical_accounting_handles_directory_churn_with_bounded_measurement_failures
     stop.store(true, Ordering::Relaxed);
     worker.join().unwrap();
     for observation in observations {
-        match observation {
-            Ok(status) => assert!(
-                status["physical_bytes"]
-                    .as_str()
-                    .unwrap()
-                    .parse::<u64>()
-                    .unwrap()
-                    > 0
-            ),
-            Err(error) => {
-                assert_eq!(error.code, "STORAGE_PRESSURE");
-                assert!(
-                    error.message.starts_with(
-                        "database footprint stayed unstable across 3 complete measurements"
-                    ),
-                    "{error}"
-                );
-            }
-        }
+        let status = observation.unwrap();
+        assert!(
+            status["physical_bytes"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
     }
-    assert!(store.status(0).is_ok());
 }
 
 #[test]
@@ -6881,31 +6872,15 @@ fn buffered_ledger_refuses_the_next_write_without_publishing_a_prefix() {
 fn buffered_batch_byte_charge_refuses_new_unique_payloads_before_the_write_bound() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    // Native compaction may invalidate a complete physical measurement. Retry
-    // only that documented refusal, with the unchanged request and bytes;
-    // buffered capacity and every other refusal remain immediately observable.
     let ingest = |request: &str, bytes: &[u8]| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let result = store.ingest_with_durability(
-                request,
-                "byte-queue",
-                "opaque",
-                bytes,
-                0,
-                sparrow_core::Durability::Buffered,
-            );
-            let retry = result.as_ref().is_err_and(|error| {
-                error.code == "STORAGE_PRESSURE"
-                    && error.message.starts_with(
-                        "database footprint stayed unstable across 3 complete measurements",
-                    )
-            });
-            if !retry || std::time::Instant::now() >= deadline {
-                break result;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        store.ingest_with_durability(
+            request,
+            "byte-queue",
+            "opaque",
+            bytes,
+            0,
+            sparrow_core::Durability::Buffered,
+        )
     };
     let mut input = vec![b'x'; 512 * 1024];
     let mut accepted = 0;

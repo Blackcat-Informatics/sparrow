@@ -231,7 +231,7 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                                     sparrow_client::Error::Io(error) => AgentError::from(capnp::Error::from(error)),
                                     error => AgentError::from(error),
                                 })?;
-                                operation.execute(client.capability()).await
+                                operation.execute(&client).await
                             }).await.unwrap_or_else(|_| Err(AgentError { code: "RPC_TIMEOUT".into(), message: "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID".into(), retryable: true }));
                             let output = match result { Ok(value) => { let failed = value.get("execution_status").and_then(Value::as_str) == Some("failed"); tool_result(value, failed) }, Err(error) => tool_result(Object::new().with("error", error.json()).into(), true) };
                             response(id, output)
