@@ -1,0 +1,287 @@
+#!/usr/bin/python3 -I
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Copy finished producer files into Sparrow consume roots without touching originals.
+
+Consume watches take ownership of a file and delete it after publication, so a
+producer's own directory must never be a consume root. This shipper reads each
+configured source directory, selects files the producer has finished writing,
+and copies them into a private queue under `state_dir/queue/NAME`. Each run then
+feeds queued items into `intake_root/NAME`, where a consume watch with the same
+NAME ingests and removes them. Originals are only read.
+
+Small files are reflink copies, which share extents on btrfs. Line-oriented files
+above the chunk limits are split on line boundaries so that no artifact can
+exceed the per-artifact record limit or the consume publication deadline; a
+refused publication would otherwise be retried indefinitely.
+
+Feeding keeps the bytes waiting in all consume roots together within
+`max_pending_bytes`, so the backup's drain wait stays bounded however large a
+source file is. An item larger than the budget is fed only into empty roots.
+
+A ledger per source records each shipped identity (device, inode, size and
+modification time) after all of its copies are durably queued. A crash between
+those steps queues the file again; an identical item already waiting in a root
+is recognized and dropped, and a different one waits until Sparrow consumes the
+earlier copy. A finished file that later changes has a new identity and is
+shipped again whole.
+"""
+
+import fcntl
+import filecmp
+import os
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+RULES = ("daily", "sealed", "settled")
+LINE_FORMATS = ("jsonl", "log")
+
+
+def fail(message):
+    sys.exit(f"sparrow-ship: {message}")
+
+
+def load_config(path):
+    with open(path, "rb") as handle:
+        config = tomllib.load(handle)
+    for key in ("intake_root", "state_dir", "max_chunk_bytes", "max_chunk_lines",
+                "max_whole_bytes", "max_files_per_run", "max_pending_bytes",
+                "max_queue_bytes"):
+        if key not in config:
+            fail(f"{path}: missing required key `{key}`")
+    names = set()
+    for source in config.get("source", []):
+        for key in ("name", "dir", "pattern", "rule", "format", "settle_seconds"):
+            if key not in source:
+                fail(f"{path}: source missing required key `{key}`")
+        if source["rule"] not in RULES:
+            fail(f"{path}: source {source['name']}: rule must be one of {RULES}")
+        if source["name"] in names or "/" in source["name"] or source["name"].startswith("."):
+            fail(f"{path}: source names must be unique plain directory names")
+        names.add(source["name"])
+        if not Path(source["dir"]).is_dir():
+            fail(f"source {source['name']}: {source['dir']} is not a readable directory")
+    if not names:
+        fail(f"{path}: no [[source]] entries")
+    return config
+
+
+def identity(stat):
+    return f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def is_regular(stat):
+    return (stat.st_mode & 0o170000) == 0o100000
+
+
+def fsync_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def finished(source, now):
+    """Return (path, stat) for files the producer has finished, oldest name first."""
+    directory = Path(source["dir"])
+    candidates = sorted(
+        path for path in directory.glob(source["pattern"])
+        if not path.name.startswith(".") and path.name not in source.get("exclude", [])
+    )
+    if source["rule"] == "daily" and candidates:
+        # The newest dated file may still be appended to.
+        candidates = candidates[:-1]
+    selected = []
+    for path in candidates:
+        try:
+            stat = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not is_regular(stat):
+            continue
+        if now - stat.st_mtime < source["settle_seconds"]:
+            continue
+        if source["rule"] == "sealed" and not path.with_name(path.name + ".manifest.json").is_file():
+            continue
+        selected.append((path, stat))
+    return selected
+
+
+def waiting(directory):
+    """Return (name, size) for regular non-hidden files, tolerating concurrent removal."""
+    files = []
+    for entry in os.scandir(directory):
+        if entry.name.startswith("."):
+            continue
+        try:
+            stat = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue  # Sparrow claimed the file during the scan.
+        if is_regular(stat):
+            files.append((entry.name, stat.st_size))
+    return sorted(files)
+
+
+def chunks(path, max_bytes, max_lines):
+    """Yield successive lists of complete lines bounded by bytes and line count."""
+    lines, size = [], 0
+    with open(path, "rb") as handle:
+        for line in handle:
+            if lines and (size + len(line) > max_bytes or len(lines) >= max_lines):
+                yield lines
+                lines, size = [], 0
+            lines.append(line)
+            size += len(line)
+    if lines:
+        yield lines
+
+
+def enqueue(source, path, stat, config, queue, staging):
+    """Stage a complete copy of one finished file, verify it, then queue it durably.
+
+    Queue names carry an order prefix; the name fed into the consume root drops it.
+    """
+    flat = str(path.relative_to(source["dir"])).replace("/", "__")
+    max_bytes, max_lines = config["max_chunk_bytes"], config["max_chunk_lines"]
+    if source["format"] in LINE_FORMATS:
+        whole = stat.st_size <= max_bytes
+        if whole:
+            with open(path, "rb") as handle:
+                whole = handle.read().count(b"\n") <= max_lines
+    elif stat.st_size > config["max_whole_bytes"]:
+        raise RuntimeError(f"{path} exceeds {config['max_whole_bytes']} bytes and format {source['format']} cannot be split")
+    else:
+        whole = True
+    order = f"{time.time_ns():020d}"
+    staged, written = [], 0
+    if whole:
+        staged.append(staging / f"{order}-00000-{flat}")
+        subprocess.run(["cp", "--reflink=auto", "--", str(path), str(staged[0])], check=True)
+        written = staged[0].stat().st_size
+    else:
+        stem, dot, suffix = flat.rpartition(".")
+        if not dot:
+            stem, suffix = flat, source["format"]
+        for index, lines in enumerate(chunks(path, max_bytes, max_lines)):
+            staged.append(staging / f"{order}-{index:05d}-{stem}.part{index:05d}.{suffix}")
+            with open(staged[-1], "wb") as handle:
+                handle.writelines(lines)
+                written += handle.tell()
+    if written != stat.st_size or identity(path.stat()) != identity(stat):
+        for leftover in staged:
+            leftover.unlink()
+        raise RuntimeError(f"{path} changed while it was copied")
+    for item in staged:
+        with open(item, "rb") as handle:
+            os.fsync(handle.fileno())
+    for item in staged:
+        os.rename(item, queue / item.name)
+    fsync_directory(queue)
+    return written
+
+
+def feed(config, intake, queues):
+    """Move queued items into consume roots while all roots stay within the budget."""
+    budget = config["max_pending_bytes"]
+    pending = sum(size for name in queues for _, size in waiting(intake / name))
+    fed = dict.fromkeys(queues, 0)
+    blocked = set()
+    progress = True
+    while progress:
+        progress = False
+        for name, queue in queues.items():
+            if name in blocked:
+                continue
+            items = waiting(queue)
+            if not items:
+                continue
+            item, size = items[0]
+            root = intake / name
+            target = root / item.split("-", 2)[2]
+            if target.exists():
+                try:
+                    same = filecmp.cmp(queue / item, target, shallow=False)
+                except FileNotFoundError:
+                    blocked.add(name)  # Sparrow claimed the earlier copy; decide next run.
+                    continue
+                if same:
+                    (queue / item).unlink()  # Placed by an interrupted earlier run.
+                    fsync_directory(queue)
+                    progress = True
+                else:
+                    blocked.add(name)  # Wait until Sparrow consumes the earlier copy.
+                continue
+            if pending and pending + size > budget:
+                return fed
+            os.rename(queue / item, target)
+            fsync_directory(root)
+            fsync_directory(queue)
+            pending += size
+            fed[name] += 1
+            progress = True
+    return fed
+
+
+def run(config):
+    intake = Path(config["intake_root"])
+    state = Path(config["state_dir"])
+    state.mkdir(parents=True, exist_ok=True)
+    # The backup holds this lock while it copies the intake roots, queues and ledgers.
+    lock = open(state / "lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    staging = state / ".staging"
+    staging.mkdir(exist_ok=True)
+    for leftover in staging.iterdir():
+        leftover.unlink()
+    queues = {}
+    for source in config["source"]:
+        if not (intake / source["name"]).is_dir():
+            fail(f"consume root {intake / source['name']} is missing; create it and its watch first")
+        queues[source["name"]] = state / "queue" / source["name"]
+        queues[source["name"]].mkdir(parents=True, exist_ok=True)
+    queued = sum(size for queue in queues.values() for _, size in waiting(queue))
+    now = time.time()
+    failures = 0
+    for source in config["source"]:
+        ledger_path = state / f"{source['name']}.ledger"
+        shipped = set()
+        if ledger_path.exists():
+            shipped = {line.split("\t", 1)[0] for line in ledger_path.read_text().splitlines()}
+        count = 0
+        with open(ledger_path, "a") as ledger:
+            for path, stat in finished(source, now):
+                key = identity(stat)
+                if key in shipped:
+                    continue
+                if count >= config["max_files_per_run"]:
+                    print(f"sparrow-ship: {source['name']}: per-run file limit reached; resuming next run")
+                    break
+                if queued and queued >= config["max_queue_bytes"]:
+                    print(f"sparrow-ship: {source['name']}: queue full; resuming next run")
+                    break
+                try:
+                    queued += enqueue(source, path, stat, config, queues[source["name"]], staging)
+                except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+                    failures += 1
+                    print(f"sparrow-ship: {source['name']}: {path}: {error}", file=sys.stderr)
+                    continue
+                ledger.write(f"{key}\t{path.relative_to(source['dir'])}\n")
+                ledger.flush()
+                os.fsync(ledger.fileno())
+                shipped.add(key)
+                count += 1
+        print(f"sparrow-ship: {source['name']}: queued {count}")
+    for name, count in feed(config, intake, queues).items():
+        print(f"sparrow-ship: {name}: fed {count}")
+    if failures:
+        fail(f"{failures} file(s) failed; originals are untouched and will be retried")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        fail("usage: sparrow-ship CONFIG.toml")
+    run(load_config(sys.argv[1]))

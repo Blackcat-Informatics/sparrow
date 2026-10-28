@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[Unit]
+Description=Copy finished producer files into Sparrow consume roots
+After=sparrow.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/sparrow/sparrow-ship %h/.config/sparrow/ship.toml
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=512M

@@ -1,5 +1,42 @@
 # Concurrent typed workload
 
+## Real-corpus first capacity pass
+
+On 2026-10-27 the installed `43e8f2a` images served a private daemon with a fresh
+store, the production limits and no watches. The input was 1,095,583,063 bytes
+of sealed, deeply nested JSONL production segments, about 17 KiB per record, cut
+on line boundaries into 1,149 chunks of at most 1 MiB. One `sparrow ingest` per
+chunk ran sequentially over the Unix socket. The host was not idle: its load
+average was 37 to 45, 73 GB of swap was in use on the NVMe device that holds the
+store, and system I/O pressure (`some`) was 13 to 19 percent.
+
+Only 66 chunks (64,566,545 bytes, 3,230 records) published. Each took 4 to 58
+seconds, median 25.7 seconds and 95th percentile 51.4 seconds, with the daemon
+using 0.38 cores and its worker blocked on I/O. Fifteen chunks exceeded the
+60-second RPC connection lease and were disconnected. Each disconnect left its
+import journal occupied, and once 16 were held every later chunk was refused
+with `RESOURCE_LIMIT` ("16 import journals are occupied"). The CLI `ingest`
+neither resumes nor cancels its import after a disconnect.
+
+The store then held 723,926,766 physical bytes for 64.6 MB of input, about 11
+times the raw size before any compaction. The abandoned imports account for at
+most 16 MB of it. The daemon cgroup peaked at 839 MB, page cache included.
+
+Three findings bound production capacity until they are addressed:
+
+- Throughput for this data on this host is about 30 to 40 KiB per second,
+  roughly 3 GB per day, against the stated target of under 10 GiB per day.
+- On-disk expansion of deeply nested JSON is about 11 times raw, so 50 GiB holds
+  roughly 4.5 GB of such input, not 30 days at the target rate.
+- An ingest disconnected by the connection lease leaks its import journal; 16
+  leaks stop all further imports until they are reclaimed.
+
+Smaller earlier samples ran faster in isolation: 0.95 MB took 1.5 seconds, 2.2 MB
+19 seconds and 4.4 MB 47 seconds, so ingest time grows faster than artifact
+size. The causes (fsync cadence, RDF projection of deep JSON, host swap
+contention) were not separated; that needs an uncontended host and per-stage
+timing.
+
 ## Schema 62 native graph and text follow-up
 
 On 2026-10-19 signed source `bee07bc1690fe7fe3b85e533153ee18fee9349fd`

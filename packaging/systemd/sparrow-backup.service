@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[Unit]
+Description=Closed-store backup of the Sparrow service
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/bin:/bin
+# Keep three daily copies; reflinks share unchanged extents with the live store.
+# Hold the shipper lock so the copied store, intake roots and ledgers agree.
+ExecStart=/usr/bin/flock %h/.local/state/sparrow/ship/lock %h/.local/libexec/sparrow/sparrow-backup %h/.config/sparrow/server.toml %h/.local/share/sparrow/backups 3 %h/.local/state/sparrow/intake %h/.config/sparrow %h/.local/state/sparrow/ship %h/.local/state/sparrow/ship-watches
+# Restart Sparrow only if the script stopped it and was killed before restarting.
+ExecStopPost=/bin/sh -c 'if [ -e %t/sparrow-backup.stopped ]; then systemctl --user start sparrow.service && rm -f %t/sparrow-backup.stopped; fi'
+# Draining the intake roots may take up to 30 minutes before the copy.
+TimeoutStartSec=45min

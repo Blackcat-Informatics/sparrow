@@ -9,10 +9,73 @@ typed endpoints were verified on 2026-10-27 after the
 format 92. The stable client is `~/.local/bin/sparrow`; the daemon alias is
 `~/.local/libexec/sparrow/sparrowd`. Both select immutable production images
 from merged source `43e8f2a61b89df00201a4e60bb7f5d486902b5b1` on `fleet/sparrow`
-`main`, with PurRDF `a47940e1f130bf3739c6d59aaf89643209905ea4`. PID `1602834`
-serves the store. The unit restarts on failure.
+`main`, with PurRDF `a47940e1f130bf3739c6d59aaf89643209905ea4`. The daily backup
+restarts the daemon, so its PID changes daily. The unit restarts on failure and
+is memory-bounded; [production sources and backups](#production-sources-memory-limits-and-backups)
+are active.
 [Persistent service adoption](#persistent-service-adoption) records the original
 unit. Earlier transient-unit and schema sections retain history.
+
+## Production sources, memory limits and backups
+
+On 2026-10-27 the unit gained `MemoryHigh=2G` and `MemoryMax=4G` at Patrick's
+direction, installed with a daemon reload; the cgroup reports 2147483648 and
+4294967296 bytes.
+
+Patrick approved five lab-local sources, all fed through the
+[shipper](deployment.md#shipping-finished-files-from-producers-that-keep-them)
+into consume roots under `~/.local/state/sparrow/intake/`. Their watches
+(revisions 8 to 12) and sources share these names:
+
+| Watch | Producer files | Rule | Format |
+| --- | --- | --- | --- |
+| `lillith-corrections` | daily correction logs | `daily` | `jsonl` |
+| `lillith-coordinator-corrections` | daily coordinator corrections | `daily` | `jsonl` |
+| `lillith-discards` | daily discards, except one 833 MB day | `daily` | `jsonl` |
+| `lillith-refusals` | written-once refusal evidence | `settled` | `json` |
+| `lillith-mentation` | sealed mentation segments | `sealed` | `jsonl` |
+
+Inference evidence (about 812,000 files, 14,000 a day), opaque memory-bank
+state and the binary systemd journal are excluded. The configuration is
+`~/.config/sparrow/ship.toml`; the original files are only read.
+
+The first mentation chunks were 8 MiB and exceeded the 45-second consume
+deadline. Each expiry retried and resumed: a claimed chunk published after three
+attempts. Later chunks are 1 MiB. On the live store, records rose from 217 to
+4,182 and physical bytes to 656 MB within 30 minutes; the mentation backlog,
+3.2 GB, drains over days.
+
+The first [closed-store backup](deployment.md#closed-store-backups),
+`~/.local/share/sparrow/backups/20261028T015748Z`, cost 3.0 seconds of service
+downtime. The daemon restarted with the same store, and CHAP status over the LAN
+succeeded. A restore drill copied that backup to a disposable directory and ran
+the recovery example on seven records from seven sources, including both
+correction feeds. All seven BLAKE3 payload hashes equalled independent byte
+reads from the live store, 5,033 bytes in total, and every JSON and Markdown
+record's RDF state was complete. No daemon was started on the copy.
+
+Independent review then required five corrections, all made before commit: a
+changed file could be dropped when an older copy was still pending, the root
+directory was not synchronized before the ledger, a killed backup could leave
+the service stopped, the backup omitted the intake roots, and the docs wrongly
+said consume refuses hard links. A second review found that a backup holding
+an unfinished claim cannot be restored, because the claim binds intake inodes,
+and that the backup's restart could start a stopped service. The backup now
+refuses an inactive service and holds no unfinished claim. Backup
+`20261028T024241Z` paused intake by moving waiting files aside, which a third
+review showed can wedge a reserved claim, because the move changes the file's
+change time. It holds no in-flight claim and the 198 files then awaiting ingest,
+cost 15.0 seconds of downtime, and is the first whole-service restore point.
+The backup now waits for the intake roots to drain instead. A fourth review
+found that the shipper's per-root limit did not bound that wait, so the shipper
+now queues files privately and feeds the roots under one 16 MiB budget for all
+of them, every five minutes. About 286 MiB fed under the old limit remained in
+the roots, roughly 2.4 hours of ingest; backups fail safely, without stopping
+the service, until it drains. The two earlier
+backups lack the intake roots or hold an unfinished claim, and rotate out
+within two days. Both the
+shipper timer (five minutes after each run) and the backup timer (daily, 04:00 to 04:15)
+are enabled.
 
 ## Public TCP CHAP adoption
 

@@ -21,6 +21,10 @@ TimeoutStopSec=120
 # second writer.
 Restart=on-failure
 RestartSec=10
+# Throttle above 2 GiB and stop at 4 GiB, well above measured peaks (about 240 MB),
+# so Sparrow cannot deepen a host-wide memory crisis.
+MemoryHigh=2G
+MemoryMax=4G
 
 [Install]
 WantedBy=default.target

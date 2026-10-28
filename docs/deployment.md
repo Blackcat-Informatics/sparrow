@@ -131,7 +131,125 @@ socket, so a restart never creates a second writer. Five failed starts within
 ten minutes stop the unit for diagnosis, such as missing dependencies or a
 refused store open. Never remove a socket by hand until the prior owner is
 proven terminal.
+The kernel throttles the unit's memory above 2 GiB (`MemoryHigh`) and kills it
+at 4 GiB (`MemoryMax`). Both limits sit far above the measured peaks of about
+240 MB, so a leak cannot deepen host-wide memory pressure.
 Journal output remains available through `journalctl --user -u sparrow.service`.
+
+## Shipping finished files from producers that keep them
+
+A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
+`packaging/shipper/sparrow-ship` copies finished files from such directories
+into a private queue under its `state_dir`, then feeds queued items into
+Sparrow-owned roots. It only reads the originals. Each `[[source]]` in its
+TOML configuration (see `packaging/shipper/ship.example.toml`) names the consume
+root `intake_root/NAME`, the source directory, a glob and one finishing rule:
+
+- `daily`: dated files; the newest name may still be appended to.
+- `sealed`: rotated segments, finished once `NAME.manifest.json` exists.
+- `settled`: written-once documents, finished after a quiet period.
+
+Every rule also requires `settle_seconds` without modification. Small files are
+reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
+above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
+`NAME.partNNNNN.EXT` chunks. Unsplittable formats above `max_whole_bytes` are
+refused. The split matters for two reasons. The consume worker retries a
+refused publication every five seconds without limit, so a file over the
+record limit would be uploaded again and again; keep `max_chunk_lines` below
+the server's `max_records`. And a consume publication has a 45-second deadline.
+Retries resume the durable upload and preparation, but each expiry spends the
+single consume worker. Ingest time grows faster than artifact size for deeply
+nested JSON: on 2026-10-27, under a host load average near 45, 17 KiB-per-line
+records took 1.5 seconds for 0.95 MB, 19 seconds for 2.2 MB and 47 seconds for
+4.4 MB. The example's 1 MiB `max_chunk_bytes` keeps such chunks well inside the
+deadline.
+
+Each file is staged completely and checked against the original's size and
+identity before any part of it is queued. Its copies or chunks then enter the
+queue together, the queue directory is synchronized, and a per-source ledger
+under `state_dir` records the shipped identity (device, inode, size,
+modification time). A crash between the two queues the file again. Each run
+then feeds the oldest queued items into their roots while the bytes waiting in
+all roots together stay within `max_pending_bytes`; an item larger than that
+budget is fed only into empty roots. Each move synchronizes the root and the
+queue. An identical item already waiting under the same name is dropped as a
+leftover of an interrupted run, and a different one waits until Sparrow
+consumes the earlier copy. A finished file that changes later has a new
+identity and is shipped again whole, so its earlier records appear twice.
+`max_files_per_run` and `max_queue_bytes` bound queueing, so a backlog drains
+over successive runs. Failures exit nonzero and leave originals untouched for
+the next run.
+
+Create each consume root and its watch before the first run, then install:
+
+```bash
+install -m 0755 packaging/shipper/sparrow-ship ~/.local/libexec/sparrow/
+cp packaging/systemd/sparrow-ship.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now sparrow-ship.timer
+```
+
+The timer runs five minutes after each completed run. Shipped data arrives when
+its producer finishes a file, not as it is written.
+
+## Closed-store backups
+
+Sparrow has no online checkpoint, so a consistent backup needs a closed store.
+`packaging/backup/sparrow-backup` stops `sparrow.service` through its SIGINT
+drain, copies `data_dir`, the consume intake root, the server configuration and
+any extra paths, and starts the service again. It refuses to run when the
+service is not already active, so it never starts a service an operator
+stopped. Once it has stopped the service it restarts it after a failure or a
+SIGTERM, and the unit's `ExecStopPost` restarts it if the script is killed
+outright, guided by a marker in the runtime directory. On btrfs the copy is
+a reflink: it takes seconds at any store size and later writes never change
+it. A backup is renamed into place only after it is fully copied and
+synchronized, then the oldest beyond `KEEP` are removed. The script refuses to
+run unless free space covers twice the store plus 10 GiB, in case extents are
+not shared. Each backup lists its sources in `SOURCE`; the journal records the
+measured downtime. A lock prevents overlapping runs.
+
+```bash
+install -m 0755 packaging/backup/sparrow-backup ~/.local/libexec/sparrow/
+cp packaging/systemd/sparrow-backup.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now sparrow-backup.timer
+```
+
+An unfinished consume claim binds the inode of its intake root and claimed
+file, which no restored copy can reproduce, so a backup must contain no
+unfinished claims. Before stopping the service the script lets consumption
+drain: it holds the shipper's lock, so no new files arrive, and waits until
+every intake root is empty and every watch's `pending_claims` is zero. It never
+moves files under the running daemon, because a reserved claim binds the file's
+identity, including its change time. If the roots have not drained within 30
+minutes the run fails without stopping the service; a file that never drains is
+itself a fault to investigate. The shipper's global `max_pending_bytes` bounds
+the wait: with the example's 16 MiB budget, 1 MiB chunks and 16 MiB
+`max_whole_bytes`, the roots never hold more than 16 MiB, which drains in about
+eight minutes at the measured 30 seconds per MiB.
+
+The unit keeps three daily copies under `~/.local/share/sparrow/backups/`,
+taken between 04:00 and 04:15 local time. It also copies the shipper ledgers and
+watch definitions and holds the shipper's lock throughout, so the store, the
+files awaiting ingest and the ledgers all describe the same moment. Reflink copies share unchanged extents with the live
+store, but compaction rewrites files, so the copies gradually stop sharing.
+Budget up to three times the store size. A copy on the same disk protects
+against software faults and operator error, not disk loss.
+
+To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
+`sparrow.service`. Move the damaged `data_dir`, the intake root directory and
+the shipper's `state_dir` aside rather than deleting them. Copy `BACKUP/store`
+to `data_dir`, `BACKUP/intake` to the intake root and `BACKUP/config/ship` to
+`state_dir`, each with `cp -a --reflink=auto`, and restore any needed
+configuration from `BACKUP/config`. Then start the service and both timers. The
+three must come from the same backup, so that the files awaiting ingest match
+the ledgers. The shipper then resends every file shipped after the backup whose
+original still exists. Records that producers sent directly after the backup
+are lost unless they resend them. This whole-service procedure has not been
+exercised; the drill covers only reading a restored store. Before replacing a live store, qualify the backup on a disposable copy
+with the recovery example above. Never start `sparrowd` on such a copy: its
+watch catalog names the live consume roots.
 
 This packaging does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live
