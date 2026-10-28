@@ -3669,7 +3669,9 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
     use sparrow_core::DiagnosticDimension as D;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    let bytes = b"{\"svc\":\"worker\"}\n{\"svc\":\"worker\"}\n";
+    // One preparation checkpoint holds at most 256 records, so the 257th is
+    // prepared after the profile is defined and must use the captured absence.
+    let bytes = &b"{\"svc\":\"worker\"}\n".repeat(257)[..];
     let payload = format!(
         "blake3:{}",
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
@@ -3689,12 +3691,13 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
     store.import_prepare_layout(&stage.id, 0).unwrap();
     let checkpoint = store.import_prepare_record(&stage.id, 0, 1).unwrap();
     assert_eq!(checkpoint.diagnostic_profile, None);
+    assert_eq!(checkpoint.prepared_records, 256);
     store
         .define_diagnostic_profile("events", [(D::Service, "/svc".into())].into())
         .unwrap();
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
-    store.import_prepare_record(&stage.id, 1, 2).unwrap();
+    store.import_prepare_record(&stage.id, 256, 2).unwrap();
     let artifact = store.import_publish(&stage.id, 2).unwrap();
     assert!(
         artifact.record_ids.iter().all(|id| store
@@ -7443,7 +7446,10 @@ fn buffered_and_streamed_ingestion_share_request_identity() {
 fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    let input = b"{\"timestamp\":\"2026-09-27T00:13:37.406Z\",\"message\":\"alpha\"}\n{\"timestamp\":\"2026-09-27T00:13:37.406Z\",\"message\":\"alpha\"}\n";
+    // One preparation checkpoint holds at most 256 records; the 257th stays
+    // pending so the partially prepared state is observable.
+    let input =
+        &b"{\"timestamp\":\"2026-09-27T00:13:37.406Z\",\"message\":\"alpha\"}\n".repeat(257)[..];
     let digest = format!(
         "blake3:{}",
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
@@ -7479,7 +7485,7 @@ fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup
         "CONFLICT"
     );
     let progress = store.import_prepare_record(&journal.id, 0, 10).unwrap();
-    assert_eq!(progress.prepared_records, 1);
+    assert_eq!(progress.prepared_records, 256);
     assert!(store.records(10).unwrap().is_empty());
     assert_eq!(
         store.artifact(&progress.artifact_id).unwrap_err().code,
@@ -7497,16 +7503,16 @@ fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup
     );
     assert_eq!(
         store
-            .import_prepare_record(&journal.id, 2, 20)
+            .import_prepare_record(&journal.id, 257, 20)
             .unwrap_err()
             .code,
         "CONFLICT"
     );
-    let complete = store.import_prepare_record(&journal.id, 1, 20).unwrap();
-    assert_eq!(complete.prepared_records, 2);
+    let complete = store.import_prepare_record(&journal.id, 256, 20).unwrap();
+    assert_eq!(complete.prepared_records, 257);
     assert_eq!(complete.received_at, 10);
     let artifact = store.import_publish(&journal.id, 30).unwrap();
-    assert_eq!(artifact.record_ids.len(), 2);
+    assert_eq!(artifact.record_ids.len(), 257);
     assert_eq!(
         store.bytes(&artifact.id, 0, input.len(), 30).unwrap(),
         input
@@ -7522,7 +7528,7 @@ fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup
             Some("complete")
         );
     }
-    assert_eq!(store.records(30).unwrap().len(), 2);
+    assert_eq!(store.records(30).unwrap().len(), 257);
     // Publication transfers dependencies and preserves an independent receipt:
     // its staging can leave admission immediately, before either lease expires.
     while store.import_reclaim(31).unwrap() != 0 {}
@@ -7548,7 +7554,7 @@ fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup
     );
     // Expired private staging copies must never decrement published ownership.
     while store.import_reclaim(2 * DAY).unwrap() != 0 {}
-    assert_eq!(store.records(2 * DAY).unwrap().len(), 2);
+    assert_eq!(store.records(2 * DAY).unwrap().len(), 257);
     assert_eq!(
         store.bytes(&artifact.id, 0, input.len(), 2 * DAY).unwrap(),
         input
@@ -7582,7 +7588,8 @@ fn prepared_import_publishes_native_records_atomically_and_retries_after_cleanup
             .code,
         "CONFLICT"
     );
-    store.expire(31 * DAY).unwrap();
+    // Each bounded expiry pass retires at most 32 records.
+    while store.expire(31 * DAY).unwrap() != 0 {}
     assert_eq!(
         store.status(31 * DAY).unwrap()["unique_payload_chunks"].as_str(),
         Some("0")
@@ -11622,8 +11629,11 @@ fn combined_ingest_status_reads_private_preparation_and_original_publication_wit
     use sparrow_core::{IngestDeletion, IngestReadLimits, IngestSelector};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    let input = b"{\"message\":\"ready\"}\nnot-json\n";
-    let manifest = stage_fixture(&store, "inspect-upload", "jsonl", input);
+    // One preparation checkpoint holds at most 256 KiB of source records, so
+    // the invalid second record is still pending after the first checkpoint.
+    let mut input = format!("{{\"message\":\"{}\"}}\n", "r".repeat(60 * 1024)).into_bytes();
+    input.extend_from_slice(format!("not-json {}\n", "n".repeat(200 * 1024)).as_bytes());
+    let manifest = stage_fixture(&store, "inspect-upload", "jsonl", &input);
     let by_request = IngestSelector::Request(manifest.request_id.clone());
     let by_import = IngestSelector::Import(manifest.id.clone());
     let private = store

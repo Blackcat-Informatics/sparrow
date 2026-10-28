@@ -6454,6 +6454,10 @@ membership is written during preparation. Queries, metadata lookup and pins
 cannot treat a prepared prefix as published evidence. Retrying an older
 ordinal returns existing progress; skipped ordinals are conflicts. Reopen
 preserves progress, reserved artifact identity and all dependency ownership.
+Since issue #5, one call prepares a bounded run starting at the expected
+ordinal, in that single synced batch: at most 256 ordinary records, adding each
+record after the first only while their source stays within 256 KiB. An
+oversized record still advances alone through raw chunks.
 
 The first preparation attempt durably captures one server receipt clock and
 immutable source-time profile identity (including explicit absence). All

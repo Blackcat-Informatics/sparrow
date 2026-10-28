@@ -38,6 +38,43 @@ size. The causes (fsync cadence, RDF projection of deep JSON, host swap
 contention) were not separated; that needs an uncontended host and per-stage
 timing.
 
+## Per-record preparation cost (issue #5)
+
+A scratch daemon with the production limits ingested each input through the CLI
+on tmpfs and on the store's NVMe device on 2026-10-28, under load average 38 to
+54 and I/O pressure (`some`) of 20 to 26 percent. The inputs were 1 MiB of
+opaque bytes (one record), 1 MiB of synthetic log lines (5,180 records of about
+200 bytes), 4 MiB of the same lines (20,586 records), and one real deep-JSONL
+chunk (41 records in 904,586 bytes, about 21.5 KiB each).
+
+Before the change, short records were sync-bound. The 1 MiB log took 9.15
+seconds on tmpfs (about 1.8 ms per record) and did not finish within the
+60-second connection lease on NVMe. A completed syscall count of a 1,296-record
+log import on tmpfs found 1,361 `fdatasync` calls, 13,567 `statx` and 2,670
+`getdents64`: preparation committed one synced batch per record and per RPC,
+each with its own footprint measurement. Deep JSON costs more per record (about
+100 ms on tmpfs) but less per byte; that cost is JSON-specific and stays parked
+under the 2026-10-27 ruling.
+
+Preparation now commits up to 256 ordinary records per synced batch, adding
+records after the first only while their source stays within 256 KiB. Measured
+back to back under the same load:
+
+| Input (NVMe) | Before | After |
+| --- | --- | --- |
+| 1 MiB opaque | 0.6 s | 0.55 s |
+| 1 MiB log | over 60 s (lease cut) | 7.8 s |
+| 4 MiB log | over 60 s (lease cut) | 67.5 s (resumed after a lease cut) |
+| Deep-JSONL chunk | 5.7 s | 3.0 s |
+
+On tmpfs the same inputs now take 5.8, 27.8 and 2.0 seconds, so a short record
+costs about 1.1 ms of processing and 1.5 ms on NVMe. Three items remain open on
+issue #5. Per-stage timing (upload, seal, layout, prepare, publish) was not
+measured. Time still grows faster than size: the 4 MiB log costs about 3.3 ms
+per record on NVMe against 1.5 ms for 1 MiB. A 1 MiB log occupies about 100 MB
+of store, roughly 19 KiB per short record, and that footprint is not yet
+attributed. Harness and raw results: `/tmp/sparrow-deliver/perf/`.
+
 ## Schema 62 native graph and text follow-up
 
 On 2026-10-19 signed source `bee07bc1690fe7fe3b85e533153ee18fee9349fd`

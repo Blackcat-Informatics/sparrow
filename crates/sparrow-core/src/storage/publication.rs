@@ -14,6 +14,13 @@ use rocksdb::WriteBatch;
 mod raw;
 pub use raw::RawPreparation;
 const PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
+/// One preparation checkpoint covers at most this many ordinary records, and
+/// adds further records only while their source stays within the byte bound; a
+/// first record larger than the byte bound forms its own checkpoint. Each
+/// checkpoint costs one synced commit and one footprint measurement, so a record
+/// per checkpoint made small-record files sync-bound.
+const PREPARE_RECORDS: u64 = 256;
+const PREPARE_SOURCE_BYTES: usize = 256 * 1024;
 
 /// Durable private preparation progress. This is not an evidence receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,8 +278,10 @@ impl Store {
         preparation(&writer, &manifest)
     }
 
-    /// Prepare exactly the expected record and checkpoint its native dependencies
-    /// durably. Retrying an older ordinal returns progress without another occurrence.
+    /// Prepare a bounded run of ordinary records starting at the expected ordinal
+    /// and checkpoint their native dependencies in one durable batch. An oversized
+    /// record advances alone through raw chunks. Retrying an older ordinal returns
+    /// progress without another occurrence.
     pub fn import_prepare_record(
         &self,
         id: &str,
@@ -342,58 +351,79 @@ impl Store {
         {
             return Ok(progress);
         }
-        let page_index =
-            expected_index / IMPORT_LAYOUT_PAGE_RECORDS as u64 * IMPORT_LAYOUT_PAGE_RECORDS as u64;
-        let rows = writer.import_layout_rows(&manifest, page_index)?;
-        let span = &rows[(expected_index - page_index) as usize];
-        let length = usize::try_from(span.byte_end - span.byte_start).map_err(|_| {
-            Error::new(
-                "RESOURCE_LIMIT",
-                "record length exceeds addressable native preparation",
-            )
-        })?;
-        if length as u64 > crate::projection::RECORD_BYTES {
-            return raw::advance(&writer, &manifest, progress, span);
-        }
-        let first = span.byte_start / IMPORT_CHUNK_BYTES as u64;
-        let after = span.byte_end.div_ceil(IMPORT_CHUNK_BYTES as u64);
-        let bytes = read_chunk_range(
-            (first..after)
-                .map(|chunk| writer.import_chunk(&manifest, chunk * IMPORT_CHUNK_BYTES as u64)),
-            span.byte_start % IMPORT_CHUNK_BYTES as u64,
-            length,
-        )?;
-        if format!("blake3:{}", hex::encode(blake3::hash(&bytes).as_bytes())) != span.payload_id {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "prepared source record disagrees with its sealed byte identity",
-            ));
-        }
         let profile = progress.captured_profile(&writer, &manifest.source)?;
         let diagnostic_profile = progress.captured_diagnostic_profile(&writer, &manifest.source)?;
         let mut builder = ingest::RecordBatch::new(&writer)?;
-        let record = builder.record(ingest::RecordInput {
-            producer: None,
-            receiver: None,
-            tail: None,
-            id: random_id("record")?,
-            artifact_id: &progress.artifact_id,
-            source: &manifest.source,
-            format: &manifest.format,
-            byte_start: span.byte_start,
-            payload: ingest::RecordPayload::Buffered(&bytes),
-            received_at: progress.received_at,
-            expires_at: progress.expires_at,
-            source_time_profile: &profile,
-            diagnostic_profile: diagnostic_profile.as_ref(),
-        })?;
+        let mut records = Vec::new();
+        let mut source_bytes = 0;
+        let mut loaded = None;
+        let mut rows = Vec::new();
+        let mut index = expected_index;
+        while index < progress.total_records && index - expected_index < PREPARE_RECORDS {
+            let page_index =
+                index / IMPORT_LAYOUT_PAGE_RECORDS as u64 * IMPORT_LAYOUT_PAGE_RECORDS as u64;
+            if loaded != Some(page_index) {
+                rows = writer.import_layout_rows(&manifest, page_index)?;
+                loaded = Some(page_index);
+            }
+            let span = &rows[(index - page_index) as usize];
+            let length = usize::try_from(span.byte_end - span.byte_start).map_err(|_| {
+                Error::new(
+                    "RESOURCE_LIMIT",
+                    "record length exceeds addressable native preparation",
+                )
+            })?;
+            if length as u64 > crate::projection::RECORD_BYTES {
+                if records.is_empty() {
+                    return raw::advance(&writer, &manifest, progress, span);
+                }
+                break;
+            }
+            if !records.is_empty() && source_bytes + length > PREPARE_SOURCE_BYTES {
+                break;
+            }
+            let first = span.byte_start / IMPORT_CHUNK_BYTES as u64;
+            let after = span.byte_end.div_ceil(IMPORT_CHUNK_BYTES as u64);
+            let bytes = read_chunk_range(
+                (first..after)
+                    .map(|chunk| writer.import_chunk(&manifest, chunk * IMPORT_CHUNK_BYTES as u64)),
+                span.byte_start % IMPORT_CHUNK_BYTES as u64,
+                length,
+            )?;
+            if format!("blake3:{}", hex::encode(blake3::hash(&bytes).as_bytes())) != span.payload_id
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "prepared source record disagrees with its sealed byte identity",
+                ));
+            }
+            records.push(builder.record(ingest::RecordInput {
+                producer: None,
+                receiver: None,
+                tail: None,
+                id: random_id("record")?,
+                artifact_id: &progress.artifact_id,
+                source: &manifest.source,
+                format: &manifest.format,
+                byte_start: span.byte_start,
+                payload: ingest::RecordPayload::Buffered(&bytes),
+                received_at: progress.received_at,
+                expires_at: progress.expires_at,
+                source_time_profile: &profile,
+                diagnostic_profile: diagnostic_profile.as_ref(),
+            })?);
+            source_bytes += length;
+            index += 1;
+        }
         let ingest::PreparedRecords {
             mut batch,
             estimate,
             ..
         } = builder.prepare()?;
-        put(&mut batch, &record_key(id, expected_index), &record);
-        progress.prepared_records += 1;
+        for (ordinal, record) in (expected_index..).zip(&records) {
+            put(&mut batch, &record_key(id, ordinal), record);
+        }
+        progress.prepared_records = index;
         put(&mut batch, &preparation_key(id), &progress);
         if batch.size_in_bytes() > PUBLICATION_BYTES {
             return Err(Error::new(
