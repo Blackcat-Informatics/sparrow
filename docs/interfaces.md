@@ -160,9 +160,14 @@ previous serial maintenance path. Socket acceptance, worker health checks and
 SIGINT selection continue on the serving loop.
 
 Expiry retains its bounded pass limits and resumes an explicit continuation
-after yielding, without waiting one second between every pass. Exhausted
-traversals start again on the ordinary one-second tick. Pressure keeps its
-one-second tick, and buffered synchronization keeps its configured interval.
+after yielding, without waiting one second between every pass. The next
+traversal starts 60 seconds after an exhausted one ends. Each traversal parses
+the whole catalog under the writer lock, and restarting it every second starved
+ingest on a 10 GB store. Expiry already applies to reads, so only physical
+retirement waits.
+Import journal reclamation runs on its own one-second tick, because a published
+journal holds one of the 16 import slots until it is reclaimed. Pressure keeps
+its one-second tick, and buffered synchronization keeps its configured interval.
 Eligible duties are selected fairly, including when a short flush interval
 remains due; stop admission takes priority. An expiry refusal reports its error
 and returns to the ordinary tick rather than repeatedly retrying a busy loop.

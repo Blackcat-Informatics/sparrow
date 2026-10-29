@@ -7,6 +7,11 @@ use sparrow_core::{Error, EvictionLimits, Store};
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// Pause after each complete expiry traversal. Expiry affects reads immediately,
+/// so this only delays physical retirement. One traversal parses the whole
+/// catalog under the writer lock; restarting it every second starved ingest.
+const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 pub(super) struct Worker {
     stop: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
@@ -48,6 +53,7 @@ impl Drop for Worker {
 enum Job {
     Flush,
     Pressure,
+    Reclaim,
     Expiry,
 }
 
@@ -56,6 +62,7 @@ impl Job {
         match self {
             Self::Flush => "buffered WAL synchronization",
             Self::Pressure => "pressure maintenance",
+            Self::Reclaim => "import journal reclamation",
             Self::Expiry => "retention maintenance",
         }
     }
@@ -67,6 +74,8 @@ impl Job {
             Self::Pressure => store
                 .pressure_maintain(sparrow_server::now()?, EvictionLimits::default())
                 .map(|_| None),
+            // Published journals hold one of 16 import slots until reclaimed.
+            Self::Reclaim => store.import_reclaim(sparrow_server::now()?).map(|_| None),
             Self::Expiry => store
                 .expire_bounded(sparrow_server::now()?, EvictionLimits::default())
                 .map(|report| Some(report.continuation)),
@@ -81,8 +90,9 @@ async fn run(
 ) -> Result<(), String> {
     let mut flush = tokio::time::interval(flush_interval);
     let mut pressure = tokio::time::interval(Duration::from_secs(1));
-    let mut expiry = tokio::time::interval(Duration::from_secs(1));
-    for interval in [&mut flush, &mut pressure, &mut expiry] {
+    let mut reclaim = tokio::time::interval(Duration::from_secs(1));
+    let mut expiry = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
+    for interval in [&mut flush, &mut pressure, &mut reclaim, &mut expiry] {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     }
     // Buffered synchronization retains its configured initial delay.
@@ -98,6 +108,7 @@ async fn run(
                 tokio::select! {
                     _ = flush.tick() => Job::Flush,
                     _ = pressure.tick() => Job::Pressure,
+                    _ = reclaim.tick() => Job::Reclaim,
                     _ = expiry.tick(), if !continuation => Job::Expiry,
                     _ = tokio::task::yield_now(), if continuation => Job::Expiry,
                 }
@@ -109,7 +120,13 @@ async fn run(
             .await
             .map_err(|error| format!("{} join failed: {error}", job.name()))?;
         match result {
-            Ok(Some(more)) => continuation = more,
+            Ok(Some(more)) => {
+                // The pause runs from the end of a traversal, however long it took.
+                if !more {
+                    expiry.reset();
+                }
+                continuation = more;
+            }
             Ok(None) => {}
             Err(error) => {
                 eprintln!("sparrowd: {} failed: {error}", job.name());
@@ -185,6 +202,60 @@ mod tests {
         );
         assert_eq!(store.bytes(&fresh.id, 0, 8, now).unwrap(), b"buffered");
         assert_eq!(store.artifact(&artifact.id).unwrap_err().code, "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn import_journals_are_reclaimed_between_expiry_sweeps() {
+        // INVARIANT: a finished import frees its slot within seconds even though
+        // complete expiry traversals pause for a minute.
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let worker = Worker::start(store.clone(), Duration::from_millis(1));
+        // Let the first traversal finish so the next one is a minute away.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let input = b"cancelled import";
+        let payload = format!(
+            "blake3:{}",
+            purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+        );
+        let now = sparrow_server::now().unwrap();
+        let manifest = store
+            .import_begin(
+                "cancelled",
+                "source",
+                "opaque",
+                input.len() as u64,
+                &payload,
+                now,
+            )
+            .unwrap();
+        store.import_cancel(&manifest.id, now).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // A canceled journal reads as IMPORT_EXPIRED until it is reclaimed.
+            while store
+                .import_get(&manifest.id, sparrow_server::now().unwrap())
+                .err()
+                .is_none_or(|error| error.code != "NOT_FOUND")
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .import_get(&manifest.id, sparrow_server::now().unwrap())
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        worker.shutdown().await.unwrap();
     }
 
     #[tokio::test]

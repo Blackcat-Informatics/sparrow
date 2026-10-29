@@ -35,6 +35,9 @@ pub enum Access {
     PublicTcp(sparrow_client::TcpSecret),
 }
 
+/// Every Unix or TCP connection closes this long after admission.
+pub(crate) const CONNECTION_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Apply the same connection ceiling and lease to Unix and public TCP streams.
 pub fn admit_connection<S>(
     stream: S,
@@ -56,12 +59,7 @@ pub fn admit_connection<S>(
                 capnp_rpc::new_client(crate::tcp_gate::AnonymousTcp::new(rpc, secret))
             }
         };
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            serve_connection(stream, client),
-        )
-        .await
-        {
+        match tokio::time::timeout(CONNECTION_LEASE, serve_connection(stream, client)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => eprintln!("sparrowd: RPC connection failed: {error}"),
             Err(_) => eprintln!("sparrowd: RPC connection lease expired"),

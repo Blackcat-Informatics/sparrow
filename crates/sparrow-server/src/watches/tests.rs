@@ -250,3 +250,73 @@ fn failing_claim_retries_back_off_to_a_bounded_ceiling() {
     assert_eq!(retry_delay(9), RETRY_CEILING);
     assert_eq!(retry_delay(u32::MAX), RETRY_CEILING);
 }
+
+#[test]
+fn periodic_rescan_keeps_quiet_clocks_and_finds_missed_files() {
+    // INVARIANT: a periodic scan under continuous coverage never restarts a
+    // tracked candidate's quiet interval; it only adds what discovery missed.
+    let directory = tempfile::tempdir().unwrap();
+    let producer = directory.path().join("producer");
+    std::fs::create_dir_all(producer.join("nested")).unwrap();
+    std::fs::write(producer.join("finished.bin"), b"finished source\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut detector = Detector::open(
+        store,
+        ManagedWatch {
+            definition: ConsumeWatch {
+                id: "rescan".into(),
+                root: producer.clone(),
+                producer_contract: crate::ProducerContract::FinishedFiles,
+                source: "rescan".into(),
+                format: "opaque".into(),
+                quiet_ms: 30_000,
+                max_directories: 2,
+                max_candidates: 4,
+            },
+            revision: 1,
+            enabled: true,
+        },
+    )
+    .unwrap();
+    detector.scan_step().unwrap();
+    detector.drain().unwrap();
+    assert!(detector.covered);
+    let quiet_since = Instant::now() - Duration::from_secs(60);
+    detector
+        .candidates
+        .get_mut(Path::new("finished.bin"))
+        .unwrap()
+        .stable_since = quiet_since;
+
+    // Drop a discovered file from tracking, as a missed discovery race would.
+    std::fs::write(producer.join("nested/missed.bin"), b"missed source\n").unwrap();
+    detector.drain().unwrap();
+    detector.candidates.remove(Path::new("nested/missed.bin"));
+
+    detector.rescan("periodic scan").unwrap();
+    assert!(detector.covered);
+    assert!(detector.ready().unwrap().is_some());
+    detector.scan_step().unwrap();
+    detector.drain().unwrap();
+    assert_eq!(detector.reconciliations, 1);
+    assert_eq!(detector.directories.len(), 2);
+    assert_eq!(
+        detector.candidates[Path::new("finished.bin")].stable_since,
+        quiet_since
+    );
+    assert!(
+        detector
+            .candidates
+            .contains_key(Path::new("nested/missed.bin"))
+    );
+    assert_eq!(
+        detector.ready().unwrap().map(|(path, _)| path),
+        Some(PathBuf::from("finished.bin"))
+    );
+}

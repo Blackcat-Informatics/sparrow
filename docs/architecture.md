@@ -326,7 +326,9 @@ watch limits trigger visible reconciliation work; do not infer completion from
 the resulting silence. Until that work finishes, destructive claims require
 fresh stability/handoff evidence. Unsupported event coverage falls back to scans
 within the completed-file producer contract; active tailing remains
-non-destructive. Periodic reconciliation also covers missed discovery races.
+non-destructive. Periodic rescans also cover missed discovery races. Coverage
+was never lost, so a completed-file rescan keeps its kernel watches and each
+tracked candidate's quiet clock, and adds only what discovery missed.
 Validate the current file generation before acting on a path from an event.
 
 ### 6.3 Completed-file consumption

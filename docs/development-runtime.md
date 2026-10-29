@@ -64,6 +64,25 @@ The unit gained `CPUQuota=100%`, `IOWeight=20` and `Nice=10`. Under those
 limits the drain held the daemon near 40 percent of one core, with host I/O
 pressure (`some`) of 6 to 32 percent.
 
+On 2026-10-29 the refusal backlog consumed about four files a minute, although
+a 2 KB file publishes in one to three seconds. Tracing `cfdf2fa` found three
+causes:
+
+- Retention maintenance issued about 55 WAL syncs a second, with bursts above
+  200. A copy of the 4.2 GB backup needed 49 expiry passes per traversal, each
+  stopped by the 32 MiB catalog budget, and every exhausted traversal restarted
+  a second later. Each pass holds the writer lock. A traversal now starts 60
+  seconds after the previous one ends, and import journal reclamation keeps a
+  one-second tick of its own.
+- Every periodic rescan (61 seconds at the 30-second quiet interval) rebuilt
+  coverage and restarted every candidate's quiet clock, so no claim could start
+  for half of each minute. Completed-file rescans now keep their kernel watches
+  and quiet clocks.
+- The 60-second connection lease cut the consume worker's own connection once
+  a minute, failing the publication attempt in flight. The worker now
+  reconnects before a claim whose 45-second deadline would outlast its
+  connection's lease.
+
 The first [closed-store backup](deployment.md#closed-store-backups),
 `~/.local/share/sparrow/backups/20261028T015748Z`, cost 3.0 seconds of service
 downtime. The daemon restarted with the same store, and CHAP status over the LAN

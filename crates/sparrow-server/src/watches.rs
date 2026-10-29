@@ -40,6 +40,10 @@ const EVENT_QUANTUM: usize = 4096;
 const TICK: Duration = Duration::from_millis(50);
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_CEILING: Duration = Duration::from_secs(15 * 60);
+/// Longest consume publication. Its connection must outlive it under the lease.
+const PUBLICATION_DEADLINE: Duration = Duration::from_secs(45);
+const _: () =
+    assert!(PUBLICATION_DEADLINE.as_secs() < crate::transport::CONNECTION_LEASE.as_secs());
 
 /// Delay before retrying a claim after `failures` consecutive failed publication
 /// attempts: 5 seconds, doubling, at most 15 minutes. A claim that cannot finish
@@ -293,6 +297,32 @@ impl Detector {
         Ok(())
     }
 
+    fn rescan_interval(&self) -> Duration {
+        Duration::from_millis(60_000.max(u64::from(self.config.quiet_ms) * 2 + 1000))
+    }
+
+    /// Rediscover missed entries under continuous coverage. A consume watch keeps
+    /// its kernel watches and candidate quiet clocks: a full reconciliation would
+    /// restart every quiet interval and stall claims that long on each scan. Tail
+    /// watches keep full reconciliation, which also records missing generations.
+    fn rescan(&mut self, reason: &str) -> Result<(), Error> {
+        if matches!(self.owner, Owner::Tail(_)) {
+            return self.reconcile(reason);
+        }
+        self.owner.root_binding(&self.config.root)?;
+        self.todo = self
+            .directories
+            .values()
+            .map(|directory| directory.relative.clone())
+            .collect();
+        self.scan = None;
+        // A MOVED_FROM already removed its candidate; an unpaired cookie is stale.
+        self.renames.clear();
+        self.deferred = false;
+        self.next_reconcile = Instant::now() + self.rescan_interval();
+        Ok(())
+    }
+
     fn add_directory(&mut self, relative: &Path) -> Result<(), Error> {
         if self.directories.len() >= self.config.max_directories {
             return Err(Error::State(
@@ -391,10 +421,7 @@ impl Detector {
                             owner.reconcile_missing(&self.config.id)?;
                         }
                         self.covered = true;
-                        self.next_reconcile = now
-                            + Duration::from_millis(
-                                60_000.max(u64::from(self.config.quiet_ms) * 2 + 1000),
-                            );
+                        self.next_reconcile = now + self.rescan_interval();
                         eprintln!(
                             "sparrowd: watch={} covered directories={} candidates={}",
                             self.config.id,
@@ -440,7 +467,16 @@ impl Detector {
                 entry.file_type()
             };
             match kind {
-                fs::FileType::Directory => self.add_directory(&relative)?,
+                // A rescan revisits directories it already watches.
+                fs::FileType::Directory => {
+                    if !self
+                        .directories
+                        .values()
+                        .any(|directory| directory.relative == relative)
+                    {
+                        self.add_directory(&relative)?;
+                    }
+                }
                 fs::FileType::RegularFile => self.candidate(relative, false)?,
                 // FIFOs, devices, sockets and symlinks never become source authority.
                 _ => {}
@@ -922,7 +958,8 @@ async fn run(
     mut catalog: Catalog,
     mut control: Control,
 ) -> Result<(), Error> {
-    let mut client: Option<Client> = None;
+    // The consume connection and when it was opened; the daemon's lease runs from there.
+    let mut client: Option<(Client, Instant)> = None;
     // Next attempt and consecutive failures per pending claim.
     let mut retry = BTreeMap::<String, (Instant, u32)>::new();
     let mut connect_after = Instant::now();
@@ -969,8 +1006,12 @@ async fn run(
                 continue;
             }
             detector.drain()?;
-            if detector.covered && Instant::now() >= detector.next_reconcile {
-                detector.reconcile("periodic scan")?;
+            if detector.covered
+                && detector.todo.is_empty()
+                && detector.scan.is_none()
+                && Instant::now() >= detector.next_reconcile
+            {
+                detector.rescan("periodic scan")?;
             }
             detector.scan_step()?;
             detector.drain()?;
@@ -1060,20 +1101,29 @@ async fn run(
                 }
                 if detector.covered
                     && detector.deferred
+                    && detector.todo.is_empty()
+                    && detector.scan.is_none()
                     && detector.candidates.len() < detector.config.max_candidates
                 {
-                    detector.reconcile("deferred candidate capacity available")?;
+                    detector.rescan("deferred candidate capacity available")?;
                 }
             }
         }
         if let Some((watch, id, is_tail)) = work {
             if !is_tail {
+                // Replace a connection the lease would cut during this publication.
+                if client.as_ref().is_some_and(|(_, opened)| {
+                    opened.elapsed() + PUBLICATION_DEADLINE > crate::transport::CONNECTION_LEASE
+                }) {
+                    client = None;
+                }
                 if client.is_none() && Instant::now() >= connect_after {
+                    let opened = Instant::now();
                     tokio::select! {
                         _ = stopped(&stop) => break,
                         result = tokio::time::timeout(Duration::from_secs(10), Client::connect(&socket)) => {
                             match result {
-                                Ok(Ok(connected)) => client = Some(connected),
+                                Ok(Ok(connected)) => client = Some((connected, opened)),
                                 Ok(Err(error)) => eprintln!("sparrowd: consume RPC discovery failed: {error}"),
                                 Err(_) => eprintln!("sparrowd: consume RPC discovery timed out; sources remain owned"),
                             }
@@ -1121,9 +1171,10 @@ async fn run(
                             .owner
                             .claim()?
                             .publish(
-                                client
+                                &client
                                     .as_ref()
-                                    .ok_or(Error::State("consume RPC connection absent"))?,
+                                    .ok_or(Error::State("consume RPC connection absent"))?
+                                    .0,
                                 &mut claimed,
                             )
                             .await?;
@@ -1134,7 +1185,7 @@ async fn run(
             };
             let result = tokio::select! {
                 _ = stopped(&stop) => break,
-                result = tokio::time::timeout(Duration::from_secs(45), operation) => result.unwrap_or(Err(Error::State("consume publication deadline expired; retain the original journal and retry"))),
+                result = tokio::time::timeout(PUBLICATION_DEADLINE, operation) => result.unwrap_or(Err(Error::State("consume publication deadline expired; retain the original journal and retry"))),
             };
             if let Err(error) = result {
                 detector.failure = Some(error.to_string().chars().take(1024).collect());
