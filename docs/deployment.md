@@ -132,8 +132,10 @@ ten minutes stop the unit for diagnosis, such as missing dependencies or a
 refused store open. Never remove a socket by hand until the prior owner is
 proven terminal.
 The kernel throttles the unit's memory above 2 GiB (`MemoryHigh`) and kills it
-at 4 GiB (`MemoryMax`). Both limits sit far above the measured peaks of about
-240 MB, so a leak cannot deepen host-wide memory pressure.
+at 4 GiB (`MemoryMax`), so a leak cannot deepen host-wide memory pressure.
+`CPUQuota=100%` holds the daemon to one core and `IOWeight=20` gives it low disk
+priority; `Nice=10` only orders its own threads. A sustained deep-JSON backlog
+once saturated the host's CPU and disk; under these limits ingest slows instead.
 Journal output remains available through `journalctl --user -u sparrow.service`.
 
 ## Shipping finished files from producers that keep them
@@ -154,8 +156,10 @@ reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
 above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
 `NAME.partNNNNN.EXT` chunks. Unsplittable formats above `max_whole_bytes` are
 refused. The split matters for two reasons. The consume worker retries a
-refused publication every five seconds without limit, so a file over the
-record limit would be uploaded again and again; keep `max_chunk_lines` below
+refused publication without limit, backing off from five seconds to one attempt
+every 15 minutes after consecutive failures, so a file over the record limit
+would be uploaded again and again. Deadline expiries back off too, even when the
+resumed claim advances, so a chunk that needs many attempts finishes later; keep `max_chunk_lines` below
 the server's `max_records`. And a consume publication has a 45-second deadline.
 Retries resume the durable upload and preparation, but each expiry spends the
 single consume worker. Ingest time grows faster than artifact size for deeply

@@ -38,6 +38,17 @@ mod tests;
 const SCAN_QUANTUM: usize = 64;
 const EVENT_QUANTUM: usize = 4096;
 const TICK: Duration = Duration::from_millis(50);
+const RETRY_FIRST: Duration = Duration::from_secs(5);
+const RETRY_CEILING: Duration = Duration::from_secs(15 * 60);
+
+/// Delay before retrying a claim after `failures` consecutive failed publication
+/// attempts: 5 seconds, doubling, at most 15 minutes. A claim that cannot finish
+/// within the publication deadline otherwise repeats its work every few seconds.
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_FIRST
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(RETRY_CEILING)
+}
 
 /// Bounded operational state of an explicitly configured consumption root.
 #[derive(Clone)]
@@ -912,7 +923,8 @@ async fn run(
     mut control: Control,
 ) -> Result<(), Error> {
     let mut client: Option<Client> = None;
-    let mut retry = BTreeMap::<String, Instant>::new();
+    // Next attempt and consecutive failures per pending claim.
+    let mut retry = BTreeMap::<String, (Instant, u32)>::new();
     let mut connect_after = Instant::now();
     while !stop.load(Ordering::Acquire) {
         let pending = store.consumption_pending()?;
@@ -1004,7 +1016,7 @@ async fn run(
             .filter(|journal| {
                 retry
                     .get(&journal.import_id)
-                    .is_none_or(|at| *at <= Instant::now())
+                    .is_none_or(|(at, _)| *at <= Instant::now())
             })
             // A failed ordinary upload connection must not block checkpoint
             // acknowledgement, which has no transport dependency.
@@ -1070,7 +1082,8 @@ async fn run(
                     }
                 }
                 if client.is_none() {
-                    retry.insert(id, Instant::now() + TICK);
+                    let failures = retry.get(&id).map_or(0, |(_, failures)| *failures);
+                    retry.insert(id, (Instant::now() + TICK, failures));
                     tokio::time::sleep(TICK).await;
                     continue;
                 }
@@ -1126,7 +1139,11 @@ async fn run(
             if let Err(error) = result {
                 detector.failure = Some(error.to_string().chars().take(1024).collect());
                 eprintln!("sparrowd: watch={watch} claim={id} pending: {error}");
-                retry.insert(id, Instant::now() + Duration::from_secs(5));
+                let failures = retry
+                    .get(&id)
+                    .map_or(0, |(_, failures)| *failures)
+                    .saturating_add(1);
+                retry.insert(id, (Instant::now() + retry_delay(failures), failures));
                 if !is_tail {
                     client = None;
                 }

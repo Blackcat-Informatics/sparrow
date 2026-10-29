@@ -239,3 +239,14 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
         "PASS actual kernel overflow: capacity={capacity}, witnessed_events={events}, loss_counter=1; fresh readiness and bounded-directory repair"
     );
 }
+
+#[test]
+fn failing_claim_retries_back_off_to_a_bounded_ceiling() {
+    // INVARIANT: a claim that keeps failing slows to one attempt per 15 minutes
+    // instead of repeating its publication work every few seconds.
+    assert_eq!(retry_delay(1), RETRY_FIRST);
+    assert_eq!(retry_delay(2), 2 * RETRY_FIRST);
+    assert_eq!(retry_delay(8), 128 * RETRY_FIRST);
+    assert_eq!(retry_delay(9), RETRY_CEILING);
+    assert_eq!(retry_delay(u32::MAX), RETRY_CEILING);
+}

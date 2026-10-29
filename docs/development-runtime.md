@@ -33,7 +33,7 @@ into consume roots under `~/.local/state/sparrow/intake/`. Their watches
 | `lillith-coordinator-corrections` | daily coordinator corrections | `daily` | `jsonl` |
 | `lillith-discards` | daily discards, except one 833 MB day | `daily` | `jsonl` |
 | `lillith-refusals` | written-once refusal evidence | `settled` | `json` |
-| `lillith-mentation` | sealed mentation segments | `sealed` | `jsonl` |
+| `lillith-mentation` | sealed mentation segments (retired 2026-10-28) | `sealed` | `jsonl` |
 
 Inference evidence (about 812,000 files, 14,000 a day), opaque memory-bank
 state and the binary systemd journal are excluded. The configuration is
@@ -44,6 +44,25 @@ deadline. Each expiry retried and resumed: a claimed chunk published after three
 attempts. Later chunks are 1 MiB. On the live store, records rose from 217 to
 4,182 and physical bytes to 656 MB within 30 minutes; the mentation backlog,
 3.2 GB, drains over days.
+
+On 2026-10-28 the backlog saturated the host's disk and CPU. The installed
+`43e8f2a` daemon could not finish a 1 MiB deep-JSONL chunk within the 60-second
+connection lease, so every chunk was retried about once a minute, and the store
+grew to 10.1 GB in a day. Patrick stopped it. Mentation has moved to memetics
+and was retired at his direction:
+
+- Its source left `ship.toml`, and the shipper's 1,125 queued copies (1.1 GB,
+  all single-link files) were deleted. The producer's 130 original segments
+  were untouched.
+- The daemon `a09d523`, with batched preparation, drained the 16 copies already
+  in the intake root.
+- Watch removal then ran with zero pending claims and recorded revision 13.
+- Its watch definition file was deleted. Mentation artifacts already stored
+  remain until retention expires.
+
+The unit gained `CPUQuota=100%`, `IOWeight=20` and `Nice=10`. Under those
+limits the drain held the daemon near 40 percent of one core, with host I/O
+pressure (`some`) of 6 to 32 percent.
 
 The first [closed-store backup](deployment.md#closed-store-backups),
 `~/.local/share/sparrow/backups/20261028T015748Z`, cost 3.0 seconds of service

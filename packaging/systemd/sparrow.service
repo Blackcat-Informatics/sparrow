@@ -21,10 +21,16 @@ TimeoutStopSec=120
 # second writer.
 Restart=on-failure
 RestartSec=10
-# Throttle above 2 GiB and stop at 4 GiB, well above measured peaks (about 240 MB),
-# so Sparrow cannot deepen a host-wide memory crisis.
+# Throttle above 2 GiB and stop at 4 GiB so Sparrow cannot deepen a host-wide
+# memory crisis. A sustained deep-JSON backlog reached the 2 GiB throttle.
 MemoryHigh=2G
 MemoryMax=4G
+# At most one core and low disk priority: a sustained ingest backlog once
+# saturated the host's CPU and disk. Ingest slows instead. Nice only orders the
+# daemon's own threads; the quota is the CPU bound.
+CPUQuota=100%
+IOWeight=20
+Nice=10
 
 [Install]
 WantedBy=default.target
