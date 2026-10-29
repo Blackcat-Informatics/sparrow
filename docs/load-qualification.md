@@ -68,12 +68,76 @@ back to back under the same load:
 | Deep-JSONL chunk | 5.7 s | 3.0 s |
 
 On tmpfs the same inputs now take 5.8, 27.8 and 2.0 seconds, so a short record
-costs about 1.1 ms of processing and 1.5 ms on NVMe. Three items remain open on
-issue #5. Per-stage timing (upload, seal, layout, prepare, publish) was not
-measured. Time still grows faster than size: the 4 MiB log costs about 3.3 ms
-per record on NVMe against 1.5 ms for 1 MiB. A 1 MiB log occupies about 100 MB
-of store, roughly 19 KiB per short record, and that footprint is not yet
-attributed. Harness and raw results: `/tmp/sparrow-deliver/perf/`.
+costs about 1.1 ms of processing and 1.5 ms on NVMe.
+
+### Stage timing, store size and footprint (2026-10-29)
+
+A temporary probe drove the store's import calls directly and timed each stage
+on a reflink copy of the 4.2 GB production backup and on fresh stores.
+Preparation dominates. Every other stage of a small file takes milliseconds.
+A 1 MiB log on a fresh store spent 11.0 seconds preparing against 1.7 for
+append, 3.7 for layout and 0.9 for publish; on the large store a log's publish
+took 2 to 14 seconds. On the large store, preparing one 2 KB JSON record took 2 to 5
+seconds and read 77 to 117 MB, against 0.3 seconds on a fresh store. The
+projection graph write took 2.06 of 2.09 seconds; JSON facts took 6 ms and text
+2 ms.
+
+The cause of the store-size dependence is repeated dictionary reads. The
+projection of one new 2 KB record looked up about 14,000 terms, but only 2,237
+were distinct, and 95 percent were already stored. Each repeat of a stored term
+cost a reverse lookup and a forward verification read, and on a large store
+each such read can touch a block on every level. The term writer now remembers
+stored terms for the rest of its batch, under its own bound equal to the
+staging budget for new terms. Ten files took 4.1 to 4.2 seconds with the cache against 10.0 to 11.8
+without it, in both run orders, so the gain is 2.4 to 2.9 times. Bloom filters
+were tried and rejected: with filter and index blocks in a 256 MiB cache they
+thrashed and read 15 to 56 GB, and without that cache their gain was unproven
+while their memory would grow with about 331 million keys.
+
+The same 1 MiB log (14,743 records) on the large store shows the cache's effect
+on short records. Before it, preparation took 118.9 seconds with 1,234,857
+read calls and 1.84 GB read from the device. With it, three runs on fresh
+copies took 72.1 to 103.5 seconds with about 135,000 read calls and 0.55 to
+0.73 GB from the device. The spread is host noise under load averages of 25 to
+46: the slowest run had the lowest load but one. A
+fresh store prepares the same log in 11.0 seconds, so the large store still
+costs seven to nine times as much. Skipping the stored-count read for terms
+this batch creates was tried and rejected: it left the read calls unchanged,
+because those keys sort above every stored count, and its time and device
+reads stayed within the same noise.
+
+A 256 KiB log (3,715 records) spends 16.5 of 20 seconds in its records'
+metadata graphs while reading only about five keys per record, so that stage is
+CPU-bound. The profile has no single hotspot: text analysis, JSON catalog
+decoding, memtable insertion and hashing share it. The catalog decoding is
+parked with the other JSON work.
+
+The footprint was measured by importing 1,048,642 bytes of synthetic log lines
+(14,743 records of about 71 bytes) into a fresh store. The store directory held
+221 MB, but 190 MB of it was write-ahead log; compressed tables held 31 MB,
+about 2.1 KiB per record. The log is a bounded overhead rather than a
+per-record cost: the 11.8 GB production store retains 254 MB of it. The earlier
+estimate of about 100 MB per 1 MiB log measured small stores, where that
+overhead dominates. Uncompressed, the rows came to 181 MB, about 12.0 KiB per
+record:
+
+| Rows | Per record | Share |
+| --- | ---: | ---: |
+| RDF quad index keys (12 quads in 6 orders) | 72 | 31.1% |
+| Text evidence | 15 | 26.7% |
+| Text postings | 15 | 9.1% |
+| Import layout record copy | 1 | 5.2% |
+| Record metadata graph | 1 | 5.0% |
+| Record catalog entry | 1 | 4.7% |
+| RDF dictionary (term, reverse, reference) | 12 | 8.1% |
+| Other catalogs | 6 | 10.0% |
+
+Text evidence and postings values are catalog JSON, so shrinking them waits for
+the JSON plan. The six quad orders serve SPARQL access paths, and reducing them
+is a query design change rather than a fix. Issue #5 keeps two items open
+beyond the parked JSON work: short records on a large store still prepare seven
+to nine times slower than on a fresh one, and record metadata graphs are
+CPU-bound at about 4.4 ms per short log record.
 
 ## Schema 62 native graph and text follow-up
 

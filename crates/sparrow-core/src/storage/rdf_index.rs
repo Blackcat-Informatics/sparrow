@@ -225,6 +225,12 @@ pub(super) struct RdfWrite<'a> {
     db: &'a DB,
     next: u64,
     terms: BTreeMap<Vec<u8>, u64>,
+    /// Committed terms already resolved by this batch. The writer mutex, or
+    /// exclusive access while the store opens, keeps the database unchanged
+    /// until this batch commits, so repeats skip two point reads; one small
+    /// record's projection repeats each term about six times.
+    stored: BTreeMap<Vec<u8>, u64>,
+    stored_bytes: usize,
     references: BTreeMap<u64, u64>,
     owners: BTreeSet<String>,
     staged_bytes: usize,
@@ -237,6 +243,8 @@ impl<'a> RdfWrite<'a> {
             db,
             next: required_counter(db, "rdf:next")?,
             terms: BTreeMap::new(),
+            stored: BTreeMap::new(),
+            stored_bytes: 0,
             references: BTreeMap::new(),
             owners: BTreeSet::new(),
             staged_bytes: 0,
@@ -246,7 +254,7 @@ impl<'a> RdfWrite<'a> {
 
     fn intern(&mut self, value: &TermValue) -> Result<u64, Error> {
         let bytes = encoded(value)?;
-        if let Some(id) = self.terms.get(&bytes) {
+        if let Some(id) = self.terms.get(&bytes).or_else(|| self.stored.get(&bytes)) {
             return Ok(*id);
         }
         let reverse = reverse_key(&bytes);
@@ -262,6 +270,11 @@ impl<'a> RdfWrite<'a> {
                     "STORAGE_FAILURE",
                     "RDF forward/reverse identity mismatch",
                 ));
+            }
+            // Memory stays bounded; beyond the bound repeats read again.
+            if self.stored_bytes.saturating_add(bytes.len()) <= MAX_STAGING {
+                self.stored_bytes += bytes.len();
+                self.stored.insert(bytes, id);
             }
             return Ok(id);
         }
