@@ -447,7 +447,12 @@ spelling.
 
 Implement a storage-backed `DatasetView`/`FallibleDatasetView` over an immutable
 RocksDB read snapshot. Persist forward/reverse term dictionaries and indexed quad
-streams; resolve terms through bounded guards/cache entries. Preserve blank-node
+streams; resolve terms through bounded guards/cache entries. Reverse lookups
+live in their own `rdf_reverse` column family with a whole-key Bloom filter:
+they are the dictionary's only point reads that usually miss, and a filter over
+the much larger scanned index keys would cost far more memory. Opening a store
+moves any reverse lookups an older writer left in the default family, one
+atomic page at a time, and older writers cannot open a store with this family. Preserve blank-node
 scope, language and base direction, nested triple terms, graph declarations,
 reifiers, and annotations. Keep each native RDF stream distinguishable and
 advertise only capabilities the backend actually preserves.

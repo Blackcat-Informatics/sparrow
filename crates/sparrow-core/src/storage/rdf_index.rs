@@ -9,7 +9,7 @@ use purrdf::{
     projections::{ProjectionLimits, ProjectionTerm},
 };
 use purrdf_lex::json::{Object, Value};
-use rocksdb::{DB, WriteBatch};
+use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Initial bounded graph admission; raw evidence remains independent.
@@ -199,9 +199,60 @@ pub(super) fn term_key(id: u64) -> String {
 }
 pub(super) fn reverse_key(bytes: &[u8]) -> String {
     format!(
-        "rdf:reverse:{}",
+        "{REVERSE_PREFIX}{}",
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
     )
+}
+
+const REVERSE_PREFIX: &str = "rdf:reverse:";
+/// Reverse lookups are the dictionary's only point reads that usually miss: each
+/// new term's hashed key lands inside every level's range. Their own family
+/// carries a whole-key Bloom filter sized to the dictionary, not to the much
+/// larger index keys that are only ever scanned. Older writers cannot open a
+/// store that has this family.
+pub(super) const REVERSE_FAMILY: &str = "rdf_reverse";
+const REVERSE_PAGE: usize = 65536;
+
+pub(super) fn reverse_family_options(base: &Options) -> Options {
+    let mut table = rocksdb::BlockBasedOptions::default();
+    table.set_bloom_filter(10.0, false);
+    table.set_whole_key_filtering(true);
+    let mut options = base.clone();
+    options.set_block_based_table_factory(&table);
+    options
+}
+
+pub(super) fn reverse_family(db: &DB) -> Result<&ColumnFamily, Error> {
+    db.cf_handle(REVERSE_FAMILY)
+        .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF reverse lookup family missing"))
+}
+
+/// Move reverse keys that predate their family. Each page moves atomically, so
+/// an interrupted open resumes with exactly the keys that remain.
+pub(super) fn upgrade_reverse(db: &DB) -> Result<(), Error> {
+    let family = reverse_family(db)?;
+    let mut batch = WriteBatch::default();
+    for row in db.prefix_iterator(REVERSE_PREFIX) {
+        let (key, value) = row?;
+        if !key.starts_with(REVERSE_PREFIX.as_bytes()) {
+            break;
+        }
+        if value.len() != 8 {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "invalid RDF reverse identity during family upgrade",
+            ));
+        }
+        batch.put_cf(family, &key, &value);
+        batch.delete(&key);
+        if batch.len() >= REVERSE_PAGE * 2 {
+            super::catalog_upgrade::commit(db, std::mem::take(&mut batch))?;
+        }
+    }
+    if !batch.is_empty() {
+        super::catalog_upgrade::commit(db, batch)?;
+    }
+    Ok(())
 }
 
 pub(super) fn graph_key(graph: u64, owner: u64) -> Vec<u8> {
@@ -258,7 +309,7 @@ impl<'a> RdfWrite<'a> {
             return Ok(*id);
         }
         let reverse = reverse_key(&bytes);
-        if let Some(stored) = self.db.get(reverse)? {
+        if let Some(stored) = self.db.get_cf(reverse_family(self.db)?, reverse)? {
             let id = u64::from_be_bytes(
                 stored
                     .as_slice()
@@ -547,9 +598,10 @@ impl<'a> RdfWrite<'a> {
                 )
             })?;
         batch.put("rdf:term-count", count.to_be_bytes());
+        let family = reverse_family(self.db)?;
         for (bytes, id) in self.terms {
             batch.put(term_key(id), &bytes);
-            batch.put(reverse_key(&bytes), id.to_be_bytes());
+            batch.put_cf(family, reverse_key(&bytes), id.to_be_bytes());
         }
         for (id, count) in self.references {
             let key = format!("rdf:ref:{id:020}");
@@ -557,7 +609,7 @@ impl<'a> RdfWrite<'a> {
                 let bytes = self.db.get(term_key(id))?.ok_or_else(|| {
                     Error::new("STORAGE_FAILURE", "unreachable RDF term is missing")
                 })?;
-                batch.delete(reverse_key(&bytes));
+                batch.delete_cf(family, reverse_key(&bytes));
                 batch.delete(term_key(id));
                 batch.delete(key);
             } else {
@@ -904,9 +956,37 @@ pub(super) fn metadata(
     metadata_dataset(builder)
 }
 
+/// Bare test database with the column families RDF writes require.
+#[cfg(test)]
+pub(super) fn open_test_db(path: &std::path::Path) -> DB {
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    options.create_missing_column_families(true);
+    DB::open_cf_descriptors(
+        &options,
+        path,
+        [
+            rocksdb::ColumnFamilyDescriptor::new("default", Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(
+                REVERSE_FAMILY,
+                reverse_family_options(&Options::default()),
+            ),
+        ],
+    )
+    .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reverse_id(db: &DB, bytes: &[u8]) -> u64 {
+        let stored = db
+            .get_cf(reverse_family(db).unwrap(), reverse_key(bytes))
+            .unwrap()
+            .unwrap();
+        u64::from_be_bytes(stored.as_slice().try_into().unwrap())
+    }
 
     fn empty_dictionary(db: &DB) {
         for key in ["rdf:term-count", "rdf:max-encoded", "rdf:next"] {
@@ -918,7 +998,7 @@ mod tests {
     fn provenance_upgrade_covers_private_owners_and_preserves_native_rows_after_reopen() {
         use purrdf::{RdfDatasetBuilder, RdfLiteral};
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = open_test_db(dir.path());
         empty_dictionary(&db);
         db.put("store_format", b"sparrow.store/59").unwrap();
         let source = super::super::source_read::source_iri("original source");
@@ -1007,7 +1087,7 @@ mod tests {
         );
         db.put(missing_key, saved).unwrap();
         drop(db);
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = open_test_db(dir.path());
         super::super::provenance_rdf::upgrade(&db, 128 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
         assert_eq!(
             db.get("store_format").unwrap().unwrap(),
@@ -1037,7 +1117,7 @@ mod tests {
             );
         }
         drop(db);
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = open_test_db(dir.path());
         super::super::provenance_rdf::upgrade(&db, 128 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
         assert_eq!(
             db.iterator(rocksdb::IteratorMode::Start)
@@ -1066,7 +1146,7 @@ mod tests {
     fn scoped_full_streams_seek_selected_graphs_and_preserve_default_union_deduplication() {
         use purrdf::{DatasetView, FallibleDatasetView, GraphMatch};
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = open_test_db(dir.path());
         empty_dictionary(&db);
         let mut selected = purrdf::RdfDatasetBuilder::new();
         let s = selected.intern_iri("urn:selected").unwrap();
@@ -1142,7 +1222,7 @@ mod tests {
     fn refused_graphs_leave_dictionary_references_and_batch_unchanged() {
         use purrdf::{RdfDatasetBuilder, RdfLiteral};
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = open_test_db(dir.path());
         empty_dictionary(&db);
         let mut builder = RdfDatasetBuilder::new();
         let s = builder.intern_iri("urn:fixture:s").unwrap();
@@ -1206,7 +1286,7 @@ mod tests {
     fn dictionary_and_indexes_preserve_native_rdf12_layers_and_empty_graphs() {
         use purrdf::{BlankScope, RdfDatasetBuilder, RdfLiteral, RdfTextDirection};
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = open_test_db(dir.path());
         empty_dictionary(&db);
         let mut builder = RdfDatasetBuilder::new();
         let s = builder.intern_iri("urn:fixture:subject").unwrap();
@@ -1344,7 +1424,7 @@ mod tests {
             use purrdf::{DatasetView, FallibleDatasetView, ViewOperationStatus};
             let value = native.as_ref().term_value(literal);
             let identity = encoded(&value).unwrap();
-            let id = counter(&db, &reverse_key(&identity)).unwrap();
+            let id = reverse_id(&db, &identity);
             let key = term_key(id);
             let saved = db.get(&key).unwrap().unwrap();
             db.delete(&key).unwrap();
@@ -1365,16 +1445,11 @@ mod tests {
             ));
             drop(view);
             db.put(&key, saved).unwrap();
-            let owner = counter(
+            let owner = reverse_id(
                 &db,
-                &reverse_key(&encoded(&TermValue::iri(graph_iri("rdf12-fixture"))).unwrap()),
-            )
-            .unwrap();
-            let subject = counter(
-                &db,
-                &reverse_key(&encoded(&native.as_ref().term_value(s)).unwrap()),
-            )
-            .unwrap();
+                &encoded(&TermValue::iri(graph_iri("rdf12-fixture"))).unwrap(),
+            );
+            let subject = reverse_id(&db, &encoded(&native.as_ref().term_value(s)).unwrap());
             let subject_id = purrdf::ir::GlobalTermId::checked_from_index(subject - 1).unwrap();
             for (name, row, subject_filter) in [
                 ("SPOG", [subject, 0, 0, owner], Some(subject_id)),
@@ -1435,14 +1510,13 @@ mod tests {
         write.remove(&mut batch, "rdf12-fixture").unwrap();
         write.finish(&mut batch).unwrap();
         db.write(batch).unwrap();
-        for prefix in [
-            "rdf:term:",
-            "rdf:reverse:",
-            "rdf:ref:",
-            "rdf:q:",
-            "rdf:g:",
-            "rdf:graph:",
-        ] {
+        let family = reverse_family(&db).unwrap();
+        assert!(
+            db.iterator_cf(family, rocksdb::IteratorMode::Start)
+                .next()
+                .is_none()
+        );
+        for prefix in ["rdf:term:", "rdf:ref:", "rdf:q:", "rdf:g:", "rdf:graph:"] {
             assert!(
                 !db.prefix_iterator(prefix)
                     .any(|e| e.unwrap().0.starts_with(prefix.as_bytes()))

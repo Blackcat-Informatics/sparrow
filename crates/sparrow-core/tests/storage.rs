@@ -10800,6 +10800,60 @@ fn rdf_read_controls_and_selected_catalog_identity_are_verified() {
 }
 
 #[test]
+fn reverse_lookups_from_older_writers_move_into_their_family_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let bytes = br#"{"needle":"original"}"#;
+    let first = store
+        .ingest("rdf-reverse-first", "rdf", "json", bytes, 0)
+        .unwrap();
+    let inspection = store.rdf_inspect(&first.record_ids[0], 1).unwrap();
+    drop(store);
+    // Older writers kept every reverse lookup in the default family.
+    let db = catalog_db(dir.path()).unwrap();
+    let reverse = db.cf_handle("rdf_reverse").unwrap();
+    let mut legacy = rocksdb::WriteBatch::default();
+    for row in db.iterator_cf(reverse, rocksdb::IteratorMode::Start) {
+        let (key, value) = row.unwrap();
+        legacy.put(&key, &value);
+        legacy.delete_cf(reverse, &key);
+    }
+    assert!(!legacy.is_empty());
+    db.write(legacy).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.rdf_inspect(&first.record_ids[0], 1).unwrap(),
+        inspection
+    );
+    store
+        .ingest("rdf-reverse-second", "rdf", "json", bytes, 2)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    assert!(
+        !db.prefix_iterator(b"rdf:reverse:")
+            .any(|row| row.unwrap().0.starts_with(b"rdf:reverse:"))
+    );
+    // Reused terms resolve through the family instead of being minted again.
+    let lookups = db
+        .iterator_cf(
+            db.cf_handle("rdf_reverse").unwrap(),
+            rocksdb::IteratorMode::Start,
+        )
+        .count() as u64;
+    let terms = u64::from_be_bytes(
+        db.get("rdf:term-count")
+            .unwrap()
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(lookups, terms);
+}
+
+#[test]
 fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
     use purrdf::projections::{ProjectionLimits, ProjectionTerm};
     let dir = tempfile::tempdir().unwrap();
@@ -10906,7 +10960,9 @@ fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
                     purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&bytes).as_bytes())
                 );
                 assert_eq!(
-                    db.get(reverse).unwrap().unwrap(),
+                    db.get_cf(db.cf_handle("rdf_reverse").unwrap(), reverse)
+                        .unwrap()
+                        .unwrap(),
                     ids[position].to_be_bytes()
                 );
                 row[axis] = bytes;
@@ -10948,10 +11004,16 @@ fn persisted_json_rdf_matches_native_projection_and_all_six_indexes() {
     store.expire(32 * DAY).unwrap();
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
+    let reverse = db.cf_handle("rdf_reverse").unwrap();
+    assert!(
+        db.iterator_cf(reverse, rocksdb::IteratorMode::Start)
+            .next()
+            .is_none(),
+        "unreachable reverse lookups must be reclaimed"
+    );
     for prefix in [
         "rdf:q:",
         "rdf:term:",
-        "rdf:reverse:",
         "rdf:ref:",
         "rdf:graph:",
         "rdf:state:",

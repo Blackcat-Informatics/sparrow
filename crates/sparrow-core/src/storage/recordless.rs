@@ -369,7 +369,7 @@ mod tests {
     fn artifact_rdf_backfill_resumes_one_owner_batches_and_requires_its_writer_fence() {
         use super::super::{artifact_rdf, catalog_upgrade, rdf_index, writer_format};
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = super::super::rdf_index::open_test_db(dir.path());
         for key in ["rdf:next", "rdf:term-count", "rdf:max-encoded"] {
             db.put(key, 0_u64.to_be_bytes()).unwrap();
         }
@@ -427,7 +427,7 @@ mod tests {
         commit(&db, repair).unwrap();
         let next = rdf_index::required_counter(&db, "rdf:next").unwrap();
         drop(db);
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = super::super::rdf_index::open_test_db(dir.path());
         artifact_rdf::upgrade(&db, 512 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
         assert!(db.get("rdf:graph:artifact:b").unwrap().is_some());
         assert!(rdf_index::required_counter(&db, "rdf:next").unwrap() > next);
@@ -457,7 +457,7 @@ mod tests {
     fn populated_rdf_upgrade_keeps_one_owner_atomic_and_resumes_after_refusal() {
         use super::super::{artifact_rdf, catalog_upgrade, rdf_index, writer_format};
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = super::super::rdf_index::open_test_db(dir.path());
         for key in ["rdf:next", "rdf:term-count", "rdf:max-encoded"] {
             db.put(key, 0_u64.to_be_bytes()).unwrap();
         }
@@ -506,7 +506,7 @@ mod tests {
         db.put(&b.id, json::write_compact(&corrupt.encode()))
             .unwrap();
         drop(db);
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = super::super::rdf_index::open_test_db(dir.path());
         assert_eq!(
             catalog_upgrade::run(&db, &artifact_rdf::ALL_JOB, None)
                 .unwrap_err()
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn upgrade_resumes_durable_native_pages_after_reopen_and_rejects_missing_state() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = super::super::rdf_index::open_test_db(dir.path());
         db.put("store_format", b"sparrow.store/5").unwrap();
         for id in ["artifact:a", "artifact:b", "artifact:c"] {
             let mut batch = WriteBatch::default();
@@ -560,7 +560,7 @@ mod tests {
         assert!(db.get(key(&artifact("artifact:a"))).unwrap().is_some());
         assert!(db.get(key(&artifact("artifact:b"))).unwrap().is_none());
         drop(db);
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = super::super::rdf_index::open_test_db(dir.path());
         upgrade(&db).unwrap();
         for id in ["artifact:a", "artifact:b", "artifact:c"] {
             assert!(db.get(key(&artifact(id))).unwrap().is_some());
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn upgrade_error_commits_no_index_prefix_and_native_reader_skips_large_membership() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open_default(dir.path()).unwrap();
+        let db = super::super::rdf_index::open_test_db(dir.path());
         db.put("store_format", b"sparrow.store/5").unwrap();
         let mut batch = WriteBatch::default();
         super::super::put(&mut batch, "artifact:a", &artifact("artifact:a"));

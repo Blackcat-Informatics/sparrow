@@ -1099,6 +1099,20 @@ pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
     directory(db.path(), db.path())
 }
 
+/// Every column family. Flushes and native maintenance checks cover all of them:
+/// a log file is released only after every family with data in it flushes.
+pub(super) const FAMILIES: [&str; 3] = ["default", "payload", rdf_index::REVERSE_FAMILY];
+
+pub(super) fn family_handles(db: &DB) -> Result<Vec<&rocksdb::ColumnFamily>, Error> {
+    FAMILIES
+        .iter()
+        .map(|name| {
+            db.cf_handle(name)
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", format!("{name} family missing")))
+        })
+        .collect()
+}
+
 fn put<T: Catalog>(batch: &mut WriteBatch, key: &str, value: &T) {
     batch.put(key, json::write_compact(&value.encode()));
 }
@@ -1135,6 +1149,10 @@ impl Store {
             [
                 ColumnFamilyDescriptor::new("default", options.clone()),
                 ColumnFamilyDescriptor::new("payload", payload),
+                ColumnFamilyDescriptor::new(
+                    rdf_index::REVERSE_FAMILY,
+                    rdf_index::reverse_family_options(&options),
+                ),
             ],
         )?;
         source_time::validate_log_fence(&db)?;
@@ -1232,6 +1250,7 @@ impl Store {
                 ));
             }
         }
+        rdf_index::upgrade_reverse(&db)?;
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
         tail_ranges::upgrade(&db)?;
@@ -2109,16 +2128,13 @@ impl Store {
         Ok(receipt)
     }
 
-    /// Synchronize accepted writes and flush both catalog and payload families.
+    /// Synchronize accepted writes and flush every column family.
     pub fn flush(&self) -> Result<(), Error> {
         let writer = self.lock()?;
         writer.synchronize()?;
-        writer.db.flush()?;
-        writer.db.flush_cf(
-            writer
-                .db
-                .cf_handle("payload")
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?,
+        writer.db.flush_cfs_opt(
+            &family_handles(&writer.db)?,
+            &rocksdb::FlushOptions::default(),
         )?;
         Ok(())
     }

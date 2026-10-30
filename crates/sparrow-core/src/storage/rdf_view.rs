@@ -110,6 +110,7 @@ pub struct RdfReadEvidence {
 /// after releasing that owner, for this bounded callback lease.
 pub struct StoredRdfView<'a> {
     snapshot: Snapshot<'a>,
+    reverse: &'a rocksdb::ColumnFamily,
     owners: BTreeSet<u64>,
     budget: Arc<Budget>,
     _scope: Arc<Reservation>,
@@ -231,6 +232,7 @@ impl<'a> StoredRdfView<'a> {
         let scope = Arc::new(budget.reserve(4096 + (graph_ids.len() as u64).saturating_mul(256))?);
         let mut view = Self {
             snapshot: db.snapshot(),
+            reverse: rdf_index::reverse_family(db).map_err(|e| budget.fail(e))?,
             owners: BTreeSet::new(),
             budget,
             _scope: scope,
@@ -288,11 +290,25 @@ impl<'a> StoredRdfView<'a> {
         key: &[u8],
         maximum: u64,
     ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
+        self.point_in(None, key, maximum)
+    }
+
+    fn reverse_point(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
+        self.point_in(Some(self.reverse), key, 8)
+    }
+
+    fn point_in(
+        &self,
+        family: Option<&rocksdb::ColumnFamily>,
+        key: &[u8],
+        maximum: u64,
+    ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
         self.budget.request(key.len() as u64 + maximum, false)?;
-        let bytes = self
-            .snapshot
-            .get_pinned(key)
-            .map_err(|error| self.budget.fail(error.into()))?;
+        let bytes = match family {
+            Some(family) => self.snapshot.get_pinned_cf(family, key),
+            None => self.snapshot.get_pinned(key),
+        }
+        .map_err(|error| self.budget.fail(error.into()))?;
         if bytes
             .as_ref()
             .is_some_and(|bytes| bytes.len() as u64 > maximum)
@@ -312,7 +328,7 @@ impl<'a> StoredRdfView<'a> {
                 .fail(Error::new("INVALID_ARGUMENT", e.to_string()))
         })?;
         let key = rdf_index::reverse_key(&bytes);
-        let Some(stored) = self.point(key.as_bytes(), 8)? else {
+        let Some(stored) = self.reverse_point(key.as_bytes())? else {
             return Ok(None);
         };
         let id = stored
@@ -346,7 +362,7 @@ impl<'a> StoredRdfView<'a> {
                     .fail(Error::new("STORAGE_FAILURE", "RDF term missing or foreign"))
             })?;
         let reverse = rdf_index::reverse_key(&bytes);
-        let stored = self.point(reverse.as_bytes(), 8)?;
+        let stored = self.reverse_point(reverse.as_bytes())?;
         if stored.as_deref() != Some(ordinal(id).to_be_bytes().as_slice()) {
             return Err(self.budget.fail(Error::new(
                 "STORAGE_FAILURE",

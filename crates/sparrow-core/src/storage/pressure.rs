@@ -56,9 +56,9 @@ pub struct PressureStatus {
     pub evicted_recordless_artifacts: u64,
     /// Payload ownership references retired by this session's pressure worker.
     pub payload_refs_retired: u64,
-    /// Native flush pending/running observations across both families.
+    /// Native flush pending/running observations across every family.
     pub pending_flushes: u64,
-    /// Native compaction pending/running observations across both families.
+    /// Native compaction pending/running observations across every family.
     pub pending_compactions: u64,
     /// Native snapshot count at the last maintenance observation.
     pub snapshots: u64,
@@ -221,7 +221,7 @@ impl Writer {
         }
         state.status.pending_flushes = 0;
         state.status.pending_compactions = 0;
-        for family in ["default", "payload"] {
+        for family in super::FAMILIES {
             if self.native_property(family, "rocksdb.background-errors")? != 0 {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
@@ -278,15 +278,8 @@ impl Writer {
             // Automatic native compaction/blob GC remains limited to two background jobs.
             let mut options = FlushOptions::default();
             options.set_wait(false);
-            let default = self
-                .db
-                .cf_handle("default")
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "default family missing"))?;
-            let payload = self
-                .db
-                .cf_handle("payload")
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
-            self.db.flush_cfs_opt(&[&default, &payload], &options)?;
+            self.db
+                .flush_cfs_opt(&super::family_handles(&self.db)?, &options)?;
         } else if continuing {
             state.status.phase = PressurePhase::Requested;
         } else {

@@ -14,7 +14,7 @@ The selected `rocksdb 0.25.0` / `librocksdb-sys 0.19.0+11.8.1` already supplies:
 - Native automatic compaction and blob garbage collection. The store already
   enables blob GC and limits background jobs to two, with 8 MiB write buffers.
 - `Options::add_compact_on_deletion_collector_factory`, configured through one
-  helper for both column families: a 1,024-entry window, 128-deletion trigger and
+  helper for every column family: a 1,024-entry window, 128-deletion trigger and
   0.25 whole-table deletion ratio. This marks tombstone-heavy tables for native
   compaction even when level-size triggers are quiet.
 - `Options::set_blob_gc_force_threshold`, which can schedule targeted

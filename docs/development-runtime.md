@@ -4542,7 +4542,7 @@ queue pressure and administrative control-write refusal are separate signals.
 The daemon schedules one pressure pass per second, serialized with ingestion and
 pin mutations. It captures native flush/compaction and snapshot observations,
 uses the shared bounded oldest-unpinned retirement path, and requests nonwaiting
-native flushes of both families. Automatic RocksDB compaction and blob GC use
+native flushes of every column family. Automatic RocksDB compaction and blob GC use
 the configured two background jobs. Missing native properties, background errors
 and flush scheduling failures are actionable errors, retained in pressure status.
 The worker does not manufacture a successful physical reclamation receipt.

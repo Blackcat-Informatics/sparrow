@@ -106,11 +106,27 @@ this batch creates was tried and rejected: it left the read calls unchanged,
 because those keys sort above every stored count, and its time and device
 reads stayed within the same noise.
 
-A 256 KiB log (3,715 records) spends 16.5 of 20 seconds in its records'
-metadata graphs while reading only about five keys per record, so that stage is
-CPU-bound. The profile has no single hotspot: text analysis, JSON catalog
-decoding, memtable insertion and hashing share it. The catalog decoding is
-parked with the other JSON work.
+Counting the dictionary's reads showed where the rest went. Of 61.2 seconds of
+preparation, 44.7 went to 58,762 reverse lookups that missed, about 0.76 ms
+each; 1,508 hits, their forward verifications and 60,270 reference-count reads
+took 1.6 seconds together. Reverse keys are hashes, so each miss lands inside
+every level's key range. They now live in their own column family with a
+whole-key Bloom filter. A prototype on two fresh copies of the large store
+prepared the log in 7.7 and 20.8 seconds against 58.6 for the cache alone,
+with 10,049 to 12,096 read calls instead of 134,542 and 24 MB read from the
+device instead of 335 MB; a fresh store takes 11.0 seconds. The filter and
+index blocks for the store's 6,762,463 reverse keys need 12.5 MB, where a
+filter over the whole store would cover about 331 million keys. The prototype
+copied those keys into the family in 17 to 21 seconds; the shipped upgrade
+moves them once, when the store first opens.
+
+Before either change, a 256 KiB log (3,715 records) on the large store spent
+16.5 of 20 seconds in its records' metadata graphs. The thread's own read
+counters showed about five reads per record, which suggested CPU-bound work
+with no single profile hotspot. The dictionary count above shows those graphs
+were waiting on reverse misses. With the reverse family, two 256 KiB logs on a
+fresh copy of the large store prepared 3,663 records in 3.63 seconds and 3,714
+in 3.06, about 0.8 to 1.0 ms per record.
 
 The footprint was measured by importing 1,048,642 bytes of synthetic log lines
 (14,743 records of about 71 bytes) into a fresh store. The store directory held
@@ -134,10 +150,9 @@ record:
 
 Text evidence and postings values are catalog JSON, so shrinking them waits for
 the JSON plan. The six quad orders serve SPARQL access paths, and reducing them
-is a query design change rather than a fix. Issue #5 keeps two items open
-beyond the parked JSON work: short records on a large store still prepare seven
-to nine times slower than on a fresh one, and record metadata graphs are
-CPU-bound at about 4.4 ms per short log record.
+is a query design change rather than a fix. What remains open on issue #5 is
+the parked JSON work: the catalog codec, the deep-JSON projection cost and its
+expansion.
 
 ## Schema 62 native graph and text follow-up
 

@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn tracing_fence_requires_original_profile_and_checkpoint_without_reseeding() {
         let directory = tempfile::tempdir().unwrap();
-        let db = DB::open_default(directory.path()).unwrap();
+        let db = super::rdf_index::open_test_db(directory.path());
         db.put("store_format", b"sparrow.store/66").unwrap();
         upgrade(&db, 128 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
         assert_eq!(
