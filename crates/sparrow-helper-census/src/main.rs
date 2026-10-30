@@ -99,10 +99,10 @@ EXTERNAL (only with a purrdf scan; at most one):
                        skipping git and the pin (the report says UNPINNED)
 
 The purrdf revision is the git_revision of the purrdf supplier in
-registry/compatibility.toml; its crates/ and bindings/ are archived once into
-target/helper-census/purrdf-<rev>/ and reused. --root defaults to the workspace
-this binary was built from; --ledger defaults to helpers-ledger.toml under the
-root.
+registry/compatibility.toml; each run archives its crates/ and bindings/ into
+a private target/helper-census/purrdf-<rev>.<pid>/ and removes it after the
+walk. --root defaults to the workspace this binary was built from; --ledger
+defaults to helpers-ledger.toml under the root.
 ";
 
 /// What the arguments ask for.
@@ -1124,7 +1124,8 @@ fn cross_cases() -> Vec<(&'static str, bool)> {
         std::env::temp_dir().join(format!("helper-census-self-test-{}", std::process::id()));
     let missing = scratch.join("no-such-root");
     let archived = cross::materialise(&missing, &"0".repeat(40), &scratch);
-    let left_nothing = !scratch.join(format!("purrdf-{}", "0".repeat(40))).exists();
+    let left_nothing =
+        std::fs::read_dir(&scratch).map_or(true, |mut entries| entries.next().is_none());
     let _ = std::fs::remove_dir_all(&scratch);
     vec![
         (
@@ -1190,7 +1191,7 @@ fn cross_cases() -> Vec<(&'static str, bool)> {
             cross::load(&missing, None, Some(&missing)).is_err(),
         ),
         (
-            "a repository that cannot be archived fails loudly and leaves no cached tree",
+            "a repository that cannot be archived fails loudly and leaves no tree",
             archived.is_err_and(|error| {
                 error.contains("cannot materialise") && error.contains("git archive")
             }) && left_nothing,

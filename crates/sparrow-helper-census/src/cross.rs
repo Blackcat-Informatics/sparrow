@@ -11,8 +11,9 @@
 //! **What is scanned is purrdf at the revision Sparrow pins, never the live
 //! checkout.** The revision is the `git_revision` of the `purrdf` supplier
 //! in `registry/compatibility.toml`; its `crates/` and `bindings/` trees are
-//! materialised with `git archive <rev> crates bindings | tar -x` into
-//! `target/helper-census/purrdf-<rev>/`, which is reused when present. A checkout
+//! materialised with `git archive <rev> crates bindings | tar -x` into a
+//! directory private to the run, `target/helper-census/purrdf-<rev>.<pid>/`,
+//! which is removed once the walk has read it. A checkout
 //! moves under its owner; a pinned revision does not, and the report names it, so a
 //! result can be reproduced. `--external-root DIR` scans `DIR` instead and skips git
 //! entirely (for a tree prepared by hand); the report then says it is unpinned.
@@ -50,14 +51,12 @@ const CONSTANT_FLOOR: u128 = 0xffff;
 /// Where the external scan came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Source {
-    /// purrdf at the pinned revision, archived from `repository` into `tree`.
+    /// purrdf at the pinned revision, archived from `repository` for one scan.
     Pinned {
         /// The full 40-digit revision.
         revision: String,
         /// The purrdf repository it was archived from.
         repository: PathBuf,
-        /// The materialised tree.
-        tree: PathBuf,
     },
     /// A tree given with `--external-root`, not checked against any pin.
     Root(PathBuf),
@@ -78,11 +77,9 @@ impl Source {
             Self::Pinned {
                 revision,
                 repository,
-                tree,
             } => format!(
-                "purrdf {revision} (pinned by {REGISTRY} supplier `{SUPPLIER}`; archived from {} into {})",
-                repository.display(),
-                tree.display()
+                "purrdf {revision} (pinned by {REGISTRY} supplier `{SUPPLIER}`; archived from {})",
+                repository.display()
             ),
             Self::Root(root) => format!(
                 "purrdf tree {} (--external-root: UNPINNED, not checked against {REGISTRY})",
@@ -160,31 +157,26 @@ pub(crate) fn pinned_revision(text: &str) -> Result<String, String> {
     }
 }
 
-/// Materialise purrdf's package trees at `revision` under `cache`, or reuse them.
-///
-/// The archive is extracted into a directory private to this process and renamed
-/// into place only once git and tar have both succeeded, so an interrupted run
-/// never leaves a partial tree that a later run would reuse.
+/// Extract purrdf's package trees at `revision` into a directory under `scratch`
+/// private to this process. Nothing is reused: build directories are reaped
+/// automatically, and a reaped tree that still had its directories would scan
+/// as less of purrdf than the pin names.
 pub(crate) fn materialise(
     repository: &Path,
     revision: &str,
-    cache: &Path,
+    scratch: &Path,
 ) -> Result<PathBuf, String> {
-    let target = cache.join(format!("purrdf-{revision}"));
-    if target.is_dir() {
-        return Ok(target);
-    }
-    let partial = cache.join(format!("purrdf-{revision}.partial-{}", std::process::id()));
+    let tree = scratch.join(format!("purrdf-{revision}.{}", std::process::id()));
     let failed = |message: String| {
-        let _ = std::fs::remove_dir_all(&partial);
+        let _ = std::fs::remove_dir_all(&tree);
         Err(format!(
             "cannot materialise purrdf {revision} from {}: {message}",
             repository.display()
         ))
     };
-    let _ = std::fs::remove_dir_all(&partial);
-    if let Err(error) = std::fs::create_dir_all(&partial) {
-        return failed(format!("{}: {error}", partial.display()));
+    let _ = std::fs::remove_dir_all(&tree);
+    if let Err(error) = std::fs::create_dir_all(&tree) {
+        return failed(format!("{}: {error}", tree.display()));
     }
     let mut git = match Command::new("git")
         .arg("-C")
@@ -204,7 +196,7 @@ pub(crate) fn materialise(
     let tar = Command::new("tar")
         .arg("-x")
         .arg("-C")
-        .arg(&partial)
+        .arg(&tree)
         .stdin(archive)
         .stderr(Stdio::piped())
         .output();
@@ -226,15 +218,7 @@ pub(crate) fn materialise(
         }
         _ => {}
     }
-    if let Err(error) = std::fs::rename(&partial, &target) {
-        // Another run may have materialised the same revision meanwhile.
-        if target.is_dir() {
-            let _ = std::fs::remove_dir_all(&partial);
-        } else {
-            return failed(format!("{}: {error}", target.display()));
-        }
-    }
-    Ok(target)
+    Ok(tree)
 }
 
 /// Walk an external tree's packages, refusing a walk that found none or could
@@ -309,14 +293,20 @@ pub(crate) fn load(
         None => canonical_root(root)?.join("../purrdf"),
     };
     let tree = materialise(&repository, &revision, &root.join("target/helper-census"))?;
-    walk_external(
+    // The walk reads every file it needs, so the tree goes as soon as it ends.
+    let external = walk_external(
         &Disk { root: tree.clone() },
         Source::Pinned {
             revision,
             repository,
-            tree,
         },
-    )
+    );
+    let removed = std::fs::remove_dir_all(&tree)
+        .map_err(|error| format!("cannot remove scanned tree {}: {error}", tree.display()));
+    match (external, removed) {
+        (Err(walk), Err(removal)) => Err(format!("{walk}\n{removal}")),
+        (external, removed) => removed.and(external),
+    }
 }
 
 /// The grouping key of a unit: a thin forwarder by its shim form (unless

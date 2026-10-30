@@ -29,11 +29,13 @@ replace Stage hooks or change global configuration. Install it in each checkout.
 
 To use another PurRDF checkout, pass `--purrdf-repo /path/to/purrdf` with a cross
 mode or `--cross --check`. The tool archives `crates/` and `bindings/` at the
-recorded commit into `target/helper-census/purrdf-<revision>/`. It never modifies
-or scans the sibling's dirty working tree. Reports identify their reference.
-Archive publication uses a private temporary directory and an atomic rename;
-an interrupted extraction is not reused as a complete tree. The cache is local
-build output: remove it to recreate the archived reference if it was altered.
+recorded commit into a directory private to the run,
+`target/helper-census/purrdf-<revision>.<pid>/`, and removes it once the walk
+has read it. It never modifies or scans the sibling's dirty working tree.
+Reports identify their reference. Nothing is reused between runs: build
+directories are reaped automatically, and a reaped tree that kept its
+directories would scan as less of PurRDF than the pin names. Extraction adds
+about 1.4 seconds to a run.
 
 `--external-root DIR` is for prepared trees and fixtures. It bypasses the pin and
 reports **UNPINNED**. It is not the normal repository gate. A missing reference,
