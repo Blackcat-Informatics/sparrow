@@ -46,6 +46,24 @@ holds a transport lease without consuming a storage permit. The existing
 are disconnected before capability admission; storage saturation returns the
 existing typed operation refusal. These are separate finite resource budgets.
 
+`min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
+that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while
+other programs on the host can fill the same disk. A write that fails because
+the disk is full leaves durability uncertain until the store is reopened. To
+avoid that, every write is checked first: below the floor it is refused with a
+retriable `STORAGE_PRESSURE`, and buffered writes that were already accepted
+are still synchronized. The daemon checks free space every second. Below the
+floor it stops accepting Unix and TCP connections, including syslog TCP
+connections. It claims no consumed files and runs only WAL synchronization.
+Syslog UDP packets that still arrive are refused and counted in memory, and the
+listener status reports that those counts are not durable. The daemon logs one
+line when it pauses and one when it resumes. At startup it waits for the floor
+before opening the store, so a restart on a full disk does not use up the
+unit's bounded restarts. If a write
+still fails with durability uncertain, for example because another program
+filled the disk between checks, the daemon exits with an error and
+`Restart=on-failure` reopens the store.
+
 Public TCP requires `rpc_tcp_secret_file`. Generate a random secret with mode
 0600, for example `(umask 077; head -c 32 /dev/urandom > ~/.config/sparrow/tcp.secret)`,
 and do not use a passphrase: an observer of one CHAP exchange can test guesses

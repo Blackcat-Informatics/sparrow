@@ -285,13 +285,14 @@ async fn publish(
         let artifact = match store.ingest_received_syslog(&source, &receiver, &bytes, now) {
             Ok(artifact) => artifact,
             Err(error) if matches!(error.code, "RESOURCE_LIMIT" | "STORAGE_PRESSURE") => {
-                store.discard_syslog(
+                return record_discard(
+                    &store,
                     &source,
                     &receiver,
                     sparrow_core::ReceiverDiscard::Refused,
                     now,
-                )?;
-                return Ok(None);
+                )
+                .map(Err);
             }
             Err(error) => return Err(error),
         };
@@ -307,12 +308,12 @@ async fn publish(
                 "syslog publication has no protocol snapshot",
             )
         })?;
-        Ok::<_, sparrow_core::Error>(Some(snapshot.diagnostic.is_some()))
+        Ok::<_, sparrow_core::Error>(Ok(snapshot.diagnostic.is_some()))
     })
     .await
     .map_err(io::Error::other)?;
     match result {
-        Ok(Some(failed)) => {
+        Ok(Ok(failed)) => {
             metrics.update(|status| {
                 increment(&mut status.counts.accepted)?;
                 if failed {
@@ -322,15 +323,38 @@ async fn publish(
             })?;
             Ok(true)
         }
-        Ok(None) => {
+        Ok(Err(durable)) => {
             metrics.update(|status| {
                 increment(&mut status.counts.refused)?;
-                status.failure = Some("packet refused by storage admission".into());
+                status.failure = Some(if durable {
+                    "packet refused by storage admission".into()
+                } else {
+                    NOT_DURABLE.into()
+                });
                 Ok(())
             })?;
             Ok(false)
         }
         Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+const NOT_DURABLE: &str = "storage pressure refused the discard count; discards are counted in memory only until writes resume";
+
+/// Count a discard durably, or report `false` when storage pressure (including the
+/// free-space floor) refuses the count. Intake keeps running and the in-memory
+/// counters still advance.
+fn record_discard(
+    store: &sparrow_core::Store,
+    source: &str,
+    receiver: &sparrow_core::SyslogReceiver,
+    reason: sparrow_core::ReceiverDiscard,
+    now: u64,
+) -> Result<bool, sparrow_core::Error> {
+    match store.discard_syslog(source, receiver, reason, now) {
+        Ok(_) => Ok(true),
+        Err(error) if error.code == "STORAGE_PRESSURE" => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -348,9 +372,10 @@ async fn discard(
         .map_err(io::Error::other)?;
     let status = metrics.snapshot()?;
     let store = store.clone();
-    tokio::task::spawn_blocking(move || {
+    let durable = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        store.discard_syslog(
+        record_discard(
+            &store,
             &status.definition.source,
             &status.receiver,
             reason,
@@ -361,6 +386,9 @@ async fn discard(
     .map_err(io::Error::other)?
     .map_err(io::Error::other)?;
     metrics.update(|status| {
+        if !durable {
+            status.failure = Some(NOT_DURABLE.into());
+        }
         increment(match reason {
             sparrow_core::ReceiverDiscard::Refused => &mut status.counts.refused,
             sparrow_core::ReceiverDiscard::Truncated => &mut status.counts.truncated,
@@ -383,13 +411,17 @@ async fn listen(
         Socket::Tcp(listener) => {
             let connections = Arc::new(Semaphore::new(definition.max_connections));
             let mut tasks = JoinSet::new();
+            // Below the free-space floor every write is refused: accept no connections.
+            let mut space = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut space_ok = true;
             let serving = async {
             loop {
                 if *stop.borrow() { break; }
                 tokio::select! {
+                    _ = space.tick() => { space_ok = store.space_floor().shortfall().map_err(io::Error::other)?.is_none(); },
                     changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } },
                     result = tasks.join_next(), if !tasks.is_empty() => { if let Some(result) = result { result.map_err(io::Error::other)??; } },
-                    accepted = listener.accept() => {
+                    accepted = listener.accept(), if space_ok => {
                         let (stream, _) = accepted?;
                         let Ok(permit) = connections.clone().try_acquire_owned() else { metrics.update(|status| increment(&mut status.counts.rejected_connections))?; continue; };
                         metrics.update(|status| { status.active_connections += 1; Ok(()) })?;
@@ -686,6 +718,59 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// INVARIANT: below the free-space floor a packet is refused and counted in
+    /// memory; refusing its durable discard count does not fail the intake worker.
+    #[tokio::test]
+    async fn packet_refused_below_the_free_space_floor_keeps_intake_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        let floor = "min_free_bytes = 1048576";
+        assert!(base.contains(floor));
+        std::fs::write(
+            &config,
+            base.replace(floor, "min_free_bytes = 9223372036854775807"),
+        )
+        .unwrap();
+        let store = crate::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let definition = SyslogListener {
+            id: "listener".into(),
+            address: "127.0.0.1:0".parse().unwrap(),
+            source: "source".into(),
+            transport: SyslogTransport::Udp,
+            framing: None,
+            max_message_bytes: 480,
+            max_connections: 1,
+            read_timeout_ms: 1000,
+        };
+        let metrics = Metrics(Arc::new(Mutex::new(Status {
+            receiver: sparrow_core::SyslogReceiver::new("listener", "udp").unwrap(),
+            address: definition.address,
+            definition,
+            active_connections: 0,
+            counts: Counts::default(),
+            failure: None,
+        })));
+        let published = publish(
+            store.clone(),
+            "source".into(),
+            b"<34>refused".to_vec(),
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert!(!published);
+        let status = metrics.snapshot().unwrap();
+        assert_eq!(status.counts.refused, 1);
+        assert_eq!(status.failure.as_deref(), Some(NOT_DURABLE));
+        assert_eq!(store.durability_status().unwrap().failure, None);
     }
 
     #[tokio::test]

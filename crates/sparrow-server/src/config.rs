@@ -40,6 +40,9 @@ pub struct ServerConfig {
     pub disk_budget: u64,
     /// Reserved maintenance capacity.
     pub maintenance_reserve: u64,
+    /// Filesystem free space below which the daemon pauses connections and writes.
+    #[serde(default = "default_min_free")]
+    pub min_free_bytes: u64,
     /// Bounded direct ingestion admission.
     pub max_artifact_bytes: usize,
     /// Maximum records in a complete publication.
@@ -104,6 +107,11 @@ fn default_flush_interval() -> u32 {
     sparrow_core::DEFAULT_FLUSH_INTERVAL_MS
 }
 
+/// Room for RocksDB flushes and compaction after other writers fill the disk.
+fn default_min_free() -> u64 {
+    4 * 1024 * 1024 * 1024
+}
+
 fn default_rpc_connections() -> usize {
     16
 }
@@ -148,6 +156,12 @@ impl ServerConfig {
             .transpose()
     }
 
+    /// The free-space floor the store will enforce, available before it opens.
+    #[must_use]
+    pub fn space_floor(&self) -> sparrow_core::SpaceFloor {
+        sparrow_core::SpaceFloor::new(&self.data_dir, self.min_free_bytes)
+    }
+
     /// Open the one storage owner with native analyzer artifacts and private permissions.
     pub fn open_store(&self) -> Result<Store, Box<dyn std::error::Error>> {
         let store = Store::open(
@@ -156,6 +170,7 @@ impl ServerConfig {
                 buffered_flush_interval_ms: self.buffered_flush_interval_ms,
                 disk_budget: self.disk_budget,
                 maintenance_reserve: self.maintenance_reserve,
+                min_free_bytes: self.min_free_bytes,
                 max_artifact_bytes: self.max_artifact_bytes,
                 max_records: self.max_records,
                 max_pin_members: self.max_pin_members,

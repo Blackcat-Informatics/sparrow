@@ -85,6 +85,7 @@ pub use storage::source_read::{
     SourceWatchBinding, SourceWatchInfo,
 };
 pub use storage::source_time::{EventTime, SourceTimeProfile, TimeRepresentation};
+pub use storage::space::SpaceFloor;
 pub use storage::syslog::{
     SYSLOG_ELEMENTS, SYSLOG_MESSAGE_BYTES, SYSLOG_PARAMETERS, SyslogDialect, SyslogElement,
     SyslogField, SyslogParameter, SyslogSnapshot, syslog_profile_id,
