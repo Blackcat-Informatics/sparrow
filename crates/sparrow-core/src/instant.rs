@@ -39,6 +39,6 @@ pub fn format_instant(millis: u64) -> Result<String, Error> {
     })?;
     rfc3339::format(seconds, ((millis % 1000) * 1_000_000) as u32).map_err(|e| Error {
         code: "INVALID_ARGUMENT",
-        message: e.into(),
+        message: e.to_string(),
     })
 }

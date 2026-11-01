@@ -1056,7 +1056,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
     store.with_rdf_record_layers(&[first.record_ids[0].clone(), second.record_ids[0].clone()], sparrow_core::RdfGraphLayers { metadata: true, diagnostic: false, content: false }, 11, sparrow_core::RdfReadLimits::default(), |view| {
         let result = purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
             purrdf::SparqlRequest { query: "PREFIX sp: <urn:sparrow:vocab:> SELECT ?record ?window ?sequence WHERE { ?record sp:receiverWindow ?window ; sp:stream ?window ; sp:receiverSequence ?sequence . ?window a sp:Stream ; sp:streamKind \"receiver-window\" ; sp:source ?source . ?source a sp:Source }", base_iri: None, substitutions: &[] },
-            purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(100000).with_max_answers(10).with_max_intermediate_cells(1000).with_max_scratch_bytes(1024*1024).with_max_remote_requests(0)).unwrap().result;
+            &purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(100000).with_max_answers(10).with_max_intermediate_cells(1000).with_max_scratch_bytes(1024*1024).with_max_remote_requests(0)).unwrap().result;
         let (_, rows) = result.solutions().expect("receiver metadata did not produce solutions");
         assert_eq!(rows.len(), 2);
     }).unwrap();
@@ -2328,7 +2328,7 @@ fn tail_checkpoints_commit_exact_prefixes_and_retries_without_reimporting_or_fin
     store.with_rdf_records(&artifact.record_ids, 4, Default::default(), |view| {
         let run = purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
             purrdf::SparqlRequest { query: "PREFIX sp: <urn:sparrow:vocab:> SELECT ?generation WHERE { ?record sp:fileGeneration ?generation ; sp:stream ?generation . ?generation a sp:Stream ; sp:streamKind \"file-generation\" ; sp:source ?source . ?source a sp:Source }", base_iri: None, substitutions: &[] },
-            purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(100_000)).unwrap();
+            &purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(100_000)).unwrap();
         let rows = run.result.solutions().unwrap().1;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Some(purrdf::TermValue::iri(format!("urn:sparrow:{}", generation.id))));
@@ -2805,7 +2805,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
     let native = store.with_rdf_records(&a.record_ids, 2, Default::default(), |view| {
         purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
             purrdf::SparqlRequest { query: "PREFIX sp: <urn:sparrow:vocab:> SELECT ?record ?stream ?sequence WHERE { ?record sp:stream ?stream ; sp:producerSequence ?sequence . ?stream a sp:Stream ; sp:streamKind \"producer\" ; sp:source ?source . ?source a sp:Source }", base_iri: None, substitutions: &[] },
-            purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
+            &purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
                 .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0))
             .map_err(Box::new)
     }).unwrap().unwrap();
@@ -9305,7 +9305,7 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
                         base_iri: None,
                         substitutions: &[],
                     },
-                    QueryOptions::default(),
+                    &QueryOptions::default(),
                     &governors,
                 )
                 .map_err(Box::new)
@@ -9328,7 +9328,7 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
                         base_iri: None,
                         substitutions: &[],
                     },
-                    QueryOptions::default(),
+                    &QueryOptions::default(),
                     &governors.clone().with_fuel(0),
                 )
                 .map_err(Box::new)
@@ -9363,7 +9363,7 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
                             base_iri: None,
                             substitutions: &[],
                         },
-                        QueryOptions::default(),
+                        &QueryOptions::default(),
                         &governors,
                     )
                     .map_err(Box::new)
@@ -9389,10 +9389,17 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
                 assert_eq!(actual_rows, rows);
             }
             SparqlResult::Boolean(answer) => assert_eq!(result.result.boolean(), Some(answer)),
-            SparqlResult::Graph(graph) => assert!(purrdf::ir::datasets_isomorphic(
-                result.result.graph().unwrap(),
-                graph.as_ref(),
-            )),
+            SparqlResult::Graph(graph) => assert!(
+                purrdf::ir::datasets_isomorphic(
+                    result.result.graph().unwrap(),
+                    graph.as_ref(),
+                    &mut purrdf_core::CanonicalizationControl::new(
+                        purrdf_core::RDFC_V2_CORPUS_POLICY,
+                        None,
+                    ),
+                )
+                .unwrap()
+            ),
         }
     }
     let explanation = store.with_rdf_records(&ids, 3, Default::default(), |view| {
@@ -10042,7 +10049,7 @@ fn stored_rdf_layers_select_native_graph_owners_and_keep_failure_and_retention_b
                 "SELECT ?record ?service ?source WHERE { ?record <urn:sparrow:vocab:service> ?service . ?record <urn:sparrow:vocab:sourceName> ?source }",
             ].map(|query| purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
                 purrdf::SparqlRequest { query, base_iri: None, substitutions: &[] },
-                purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
+                &purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
                     .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0)).unwrap().result);
             (graphs, results)
         }).unwrap();
@@ -12683,7 +12690,7 @@ fn source_time_profiles_are_durable_immutable_and_do_not_reinterpret_old_records
         sparrow_core::RdfReadLimits::default(), |view| {
             purrdf::sparql::NativeSparqlEngine::new().query_governed_fallible_view(view,
                 purrdf::SparqlRequest { query: "SELECT ?record ?time ?profile WHERE { ?record <urn:sparrow:vocab:eventTime> ?time . ?record <urn:sparrow:vocab:sourceTimeProfile> ?profile }", base_iri: None, substitutions: &[] },
-                purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
+                &purrdf::sparql::QueryOptions::default(), &purrdf::sparql::QueryGovernors::METERED.with_fuel(1000000)
                     .with_max_answers(100).with_max_intermediate_cells(10000).with_max_scratch_bytes(1024 * 1024).with_max_remote_requests(0))
                     .map_err(Box::new)
         }).unwrap().unwrap();

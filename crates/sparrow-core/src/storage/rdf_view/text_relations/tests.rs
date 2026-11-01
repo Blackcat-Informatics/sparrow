@@ -275,7 +275,7 @@ fn stored_text_relations_keep_the_original_snapshot_after_live_retirement() {
                             base_iri: None,
                             substitutions: &[],
                         },
-                        QueryOptions::new().with_env(&environment),
+                        &QueryOptions::new().with_env(&environment),
                         &governors,
                     )
                     .unwrap()
