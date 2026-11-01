@@ -132,6 +132,9 @@ impl Writer {
         if buffered_id.is_none() && batch.is_empty() {
             return self.synchronize().map(|_| ());
         }
+        // A refused write leaves the session certifiable; a failed one does not.
+        self.durability.borrow().check()?;
+        self.space.check()?;
         let mut publication = super::eviction::Publication::default();
         batch.iterate_cf(&mut publication);
         publication.check()?;

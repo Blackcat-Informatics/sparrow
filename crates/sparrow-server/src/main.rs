@@ -11,6 +11,9 @@ mod local_endpoint;
 mod maintenance;
 mod shutdown;
 
+/// How often the daemon compares filesystem free space with its floor.
+const SPACE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -29,6 +32,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(listener) = &tcp_listener {
         eprintln!("sparrowd: capnp_tcp={}", listener.local_addr()?);
+    }
+    // Opening writes a manifest and WAL; on a full filesystem it would fail and
+    // spend systemd's bounded restarts. Wait for space instead.
+    let floor = config.space_floor();
+    if let Some(shortfall) = floor.shortfall()? {
+        eprintln!("sparrowd: waiting to open the store: {shortfall}");
+        let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
+        loop {
+            tokio::select! {
+                signal = interrupt.recv() => {
+                    signal.ok_or("daemon interrupt subscription terminated unexpectedly")?;
+                    return Ok(());
+                }
+                _ = space.tick() => {
+                    if floor.shortfall()?.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
     }
     let store = config.open_store()?;
     let store_id = store.store_id()?;
@@ -119,6 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut maintenance = Some(maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms))));
         let serving = async {
         let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
+        let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
+        // Below the floor every write is refused, so admit no new connections.
+        let mut space_ok = true;
         loop {
             tokio::select! {
                 signal = interrupt.recv() => {
@@ -138,11 +164,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("maintenance worker terminated unexpectedly".into());
                     }
                 }
-                accepted = endpoint.listener.accept() => {
+                _ = space.tick() => match (store.space_floor().shortfall()?, space_ok) {
+                    (None, false) => {
+                        eprintln!("sparrowd: free space restored; accepting connections and writes");
+                        space_ok = true;
+                    }
+                    (Some(shortfall), true) => {
+                        eprintln!("sparrowd: pausing connections and writes: {shortfall}");
+                        space_ok = false;
+                    }
+                    _ => {}
+                },
+                accepted = endpoint.listener.accept(), if space_ok => {
                     let (stream, _) = accepted?;
                     sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::Local);
                 }
-                accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if tcp_listener.is_some() => {
+                accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if space_ok && tcp_listener.is_some() => {
                     let (stream, _) = accepted?;
                     stream.set_nodelay(true)?;
                     let secret = tcp_secret.clone().expect("configuration pairs TCP with its secret");

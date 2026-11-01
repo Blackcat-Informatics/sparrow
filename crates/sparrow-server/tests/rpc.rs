@@ -6321,6 +6321,57 @@ fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
     }
 }
 
+/// INVARIANT: below the free-space floor the daemon neither opens its store nor
+/// accepts connections, and an interrupt while it waits for space exits cleanly.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_below_the_free_space_floor_waits_without_opening_the_store() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    let base = std::fs::read_to_string(&config).unwrap();
+    let floor = "min_free_bytes = 1048576";
+    assert!(base.contains(floor));
+    std::fs::write(
+        &config,
+        base.replace(floor, "min_free_bytes = 9223372036854775807"),
+    )
+    .unwrap();
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+        .arg("--config")
+        .arg(&config)
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .admitted_spawn()
+        .unwrap();
+    let pid = rustix::process::Pid::from_raw(daemon.id().unwrap() as i32).unwrap();
+    let mut stderr = tokio::io::BufReader::new(daemon.stderr.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(30), stderr.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        line.starts_with("sparrowd: waiting to open the store: only "),
+        "{line}"
+    );
+    assert!(!data.exists(), "store opened below the free-space floor");
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    stderr.read_to_string(&mut line).await.unwrap();
+    assert!(
+        status.success(),
+        "waiting startup refused interrupt: {status}: {line}"
+    );
+    assert!(!line.contains("sparrowd: store="), "{line}");
+    assert!(!data.exists(), "interrupted wait opened the store");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn interrupt_during_startup_is_retained_until_owned_teardown() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};

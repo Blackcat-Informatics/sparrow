@@ -11892,6 +11892,32 @@ fn combined_ingest_status_refuses_corrupt_live_membership_and_projection_state()
     }
 }
 
+/// INVARIANT: a write refused by the free-space floor is retriable. It leaves the
+/// session certifiable, unlike a write that fails with no space left.
+#[test]
+fn free_space_floor_refuses_writes_without_latching_durability() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut full = config();
+    full.min_free_bytes = u64::MAX;
+    let store = Store::open(&path, full).unwrap();
+    let refused = store
+        .ingest("floor", "source", "log", b"refused\n", 1000)
+        .unwrap_err();
+    assert_eq!(refused.code, "STORAGE_PRESSURE", "{}", refused.message);
+    assert_eq!(store.durability_status().unwrap().failure, None);
+    store.flush().unwrap();
+    drop(store);
+    let store = Store::open(&path, config()).unwrap();
+    let artifact = store
+        .ingest("floor", "source", "log", b"accepted\n", 1000)
+        .unwrap();
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 9, 1001).unwrap(),
+        b"accepted\n"
+    );
+}
+
 fn config() -> Config {
     sparrow_test_support::storage_config!(Config)
 }

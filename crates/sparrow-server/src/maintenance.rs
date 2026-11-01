@@ -114,11 +114,39 @@ async fn run(
                 }
             } => job,
         };
+        // Below the free-space floor every write is refused. Synchronizing
+        // accepted writes is still allowed and still needed.
+        if !matches!(job, Job::Flush)
+            && store
+                .space_floor()
+                .shortfall()
+                .map_err(|error| format!("free-space check failed: {error}"))?
+                .is_some()
+        {
+            continuation = false;
+            continue;
+        }
         let owner = store.clone();
         // Await this complete bounded native job before admitting another duty.
-        let result = tokio::task::spawn_blocking(move || job.execute(&owner))
-            .await
-            .map_err(|error| format!("{} join failed: {error}", job.name()))?;
+        let (result, latched) = tokio::task::spawn_blocking(move || {
+            let result = job.execute(&owner);
+            let latched = match &result {
+                Ok(_) => Ok(None),
+                Err(_) => owner.durability_status().map(|status| status.failure),
+            };
+            (result, latched)
+        })
+        .await
+        .map_err(|error| format!("{} join failed: {error}", job.name()))?;
+        // A failed write leaves durability uncertain until the store is reopened.
+        // Ending the daemon lets its supervisor reopen it instead of refusing every write.
+        if let Some(failure) =
+            latched.map_err(|error| format!("{} status failed: {error}", job.name()))?
+        {
+            return Err(format!(
+                "store durability uncertain; exiting so it is reopened: {failure}"
+            ));
+        }
         match result {
             Ok(Some(more)) => {
                 // The pause runs from the end of a traversal, however long it took.

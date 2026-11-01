@@ -964,8 +964,10 @@ async fn run(
     let mut retry = BTreeMap::<String, (Instant, u32)>::new();
     let mut connect_after = Instant::now();
     while !stop.load(Ordering::Acquire) {
+        // Below the free-space floor every write is refused: keep observing, write nothing.
+        let space_ok = store.space_floor().shortfall()?.is_none();
         let pending = store.consumption_pending()?;
-        if catalog.retire(&pending) {
+        if space_ok && catalog.retire(&pending) {
             catalog.persist(&store)?;
             detectors.retain(|detector| {
                 catalog
@@ -1015,6 +1017,9 @@ async fn run(
             }
             detector.scan_step()?;
             detector.drain()?;
+            if !space_ok {
+                continue;
+            }
             if let Owner::Tail(owner) = &mut detector.owner {
                 let _permit = match control.operations.try_acquire() {
                     Ok(permit) => {
@@ -1042,7 +1047,8 @@ async fn run(
         }
         let pending = store.consumption_pending()?;
         registry.update(&detectors, &pending)?;
-        if detectors.is_empty()
+        if !space_ok
+            || detectors.is_empty()
             || (pending.is_empty()
                 && detectors
                     .iter()

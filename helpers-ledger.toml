@@ -4412,3 +4412,17 @@ kind = "body"
 criterion = "layering"
 anchor = "sparrow_server::rpc::chap_unsupported"
 reason = "The generated Sparrow server trait requires one method per schema ordinal with distinct result types; both CHAP methods refuse through the one shared chap_unsupported failure on Unix and session capabilities."
+
+[[job]]
+id = "store-free-space-floor"
+summary = "One filesystem free-space floor refuses every store write before RocksDB can fail on a full disk, and tells daemon pause points a shortfall apart from a failed measurement."
+home = "sparrow_core::storage::space::SpaceFloor::shortfall"
+entry_points = ["sparrow_core::storage::space::SpaceFloor::check", "sparrow_core::storage::Writer::apply"]
+spec = "docs/deployment.md: min_free_bytes."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/syslog_listener.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(free_space_again|measure_free_space_again|statvfs_floor_again)$']

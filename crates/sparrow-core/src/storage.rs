@@ -48,6 +48,7 @@ mod record_fields;
 pub(crate) mod record_read;
 mod record_spool;
 mod scope_receipt;
+pub(crate) mod space;
 pub use scope_receipt::{QUERY_SCOPE_PROFILE, QUERY_SCOPE_WORKSPACE_BYTES};
 mod recordless;
 pub(crate) mod result_read;
@@ -207,6 +208,8 @@ pub struct Config {
     pub disk_budget: u64,
     /// Capacity withheld for compaction and control mutations.
     pub maintenance_reserve: u64,
+    /// Filesystem free space that must remain before any store write.
+    pub min_free_bytes: u64,
     /// Maximum bytes in a single bounded ingestion operation.
     pub max_artifact_bytes: usize,
     /// Maximum records published by one ingestion operation.
@@ -230,10 +233,11 @@ impl Config {
             || self.max_artifact_bytes == 0
             || self.max_records == 0
             || self.max_pin_members == 0
+            || self.min_free_bytes == 0
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "supply positive operation limits and a disk budget exceeding a maintenance reserve of at least 1 MiB",
+                "supply positive operation limits, a positive free-space floor and a disk budget exceeding a maintenance reserve of at least 1 MiB",
             ));
         }
         Ok(())
@@ -355,6 +359,7 @@ fn pin_deadline(days: u64, now: u64) -> Result<u64, Error> {
 #[derive(Clone)]
 pub struct Store {
     id: Arc<str>,
+    space: space::SpaceFloor,
     inner: Arc<Mutex<Writer>>,
     pin_reads: Arc<Mutex<pin_read::Reads>>,
     rdf_read: Arc<Mutex<()>>,
@@ -376,6 +381,7 @@ struct Writer {
     db: Arc<DB>,
     id: String,
     config: Config,
+    space: space::SpaceFloor,
     durability: std::cell::RefCell<durability::State>,
     pressure: std::cell::RefCell<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
@@ -1126,6 +1132,7 @@ impl Store {
     /// Open a single-writer RocksDB store with an explicit disk budget.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         config.validate()?;
+        let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
@@ -1274,10 +1281,12 @@ impl Store {
         source_context::rebuild(&db)?;
         let store = Self {
             id: Arc::from(id.as_str()),
+            space: space.clone(),
             inner: Arc::new(Mutex::new(Writer {
                 db: Arc::new(db),
                 id,
                 config,
+                space,
                 durability,
                 pressure: std::cell::RefCell::new(pressure),
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
@@ -1302,6 +1311,12 @@ impl Store {
     /// Return the immutable identity validated at open, without waiting for a writer.
     pub fn store_id(&self) -> Result<String, Error> {
         Ok(self.id.to_string())
+    }
+
+    /// The free-space floor every write checks, readable without the writer lock.
+    #[must_use]
+    pub fn space_floor(&self) -> &space::SpaceFloor {
+        &self.space
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Writer>, Error> {

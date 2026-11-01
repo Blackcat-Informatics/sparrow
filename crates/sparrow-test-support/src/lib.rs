@@ -45,6 +45,7 @@ macro_rules! storage_config {
                 buffered_flush_interval_ms: $crate::STORAGE_FLUSH_INTERVAL_MS,
                 disk_budget: 128 * 1024 * 1024,
                 maintenance_reserve: 8 * 1024 * 1024,
+                min_free_bytes: 1024 * 1024,
                 max_artifact_bytes: 8 * 1024 * 1024,
                 max_records: 10_000,
                 max_pin_members: 100,
@@ -136,7 +137,7 @@ pub fn write_server_config(
     socket: &std::path::Path,
 ) -> std::path::PathBuf {
     let config = dir.join("server.toml");
-    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", text_lexicon_dir())).unwrap();
+    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmin_free_bytes = 1048576\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", text_lexicon_dir())).unwrap();
     config
 }
 
