@@ -17,7 +17,8 @@ Patrick's rulings bind this design:
 - Sparrow never deletes unarchived evidence, even when the archive is down.
 - Archiving starts early, at 75% of the retention window or of the data budget.
   A record counts as archived only once its segment is written and verified.
-- The default root is `/net/synology/archives/sparrow`.
+- The archive root is `/net/synology/archives/sparrow`. The `dir` setting is
+  required and has no built-in default.
 - An unreachable archive at startup starts the daemon degraded; it does not refuse to start.
 - When archiving is enabled on an existing store, the whole retained backlog is
   archived before anything is deleted.
@@ -117,14 +118,20 @@ and remove them by record IRI (section 8).
 
 ## 4. Content
 
-A segment carries every published entry in its range, with its dependencies:
+A segment covers every eviction position after the previous watermark, up to and
+including its own last position. The first segment after archiving is enabled
+has no previous watermark, so it covers every retained position up to its last.
+That range can include an artifact's position even when the artifact is not
+itself an entry, because an artifact's position sorts before every record
+received in the same millisecond. A segment carries every published entry
+in its range, with its dependencies:
 
 | Content | Where |
 | --- | --- |
 | Record bytes `[byte_start, byte_end)` | One blob per record in `blobs.parquet`, keyed by lowercase hexadecimal SHA-256. A record's chunks are joined in order. |
 | Record metadata graph `urn:sparrow:graph:record:<hex>` | `quads.parquet`, including its provenance and tracing facts. |
 | Diagnostic graph | `quads.parquet`, under its recorded graph IRI. |
-| Artifact graph `urn:sparrow:graph:artifact:<hex>` | In the segment whose range contains the artifact's position. |
+| Artifact graph `urn:sparrow:graph:artifact:<hex>` | `quads.parquet` of the segment whose covered range contains the artifact's position. When artifacts share a millisecond, that can be an earlier segment that holds none of the artifact's records. The gate treats the artifact as archived once that segment commits. |
 | Content projection graphs | `quads.parquet`, under each projection's graph IRI. A projection shared by records in several segments appears in each of them. |
 | Link quads | One per record with bytes, in the graph `urn:sparrow:graph:archive-links`. |
 | Reifiers and annotations of these graphs | `reifiers.parquet` and `annotations.parquet`. |
@@ -213,8 +220,8 @@ refused with `CONFLICT`. A range larger than `max_segment_records` is refused
 with `RESOURCE_LIMIT`. An identical retry succeeds, while a different intent
 is refused until the one in flight commits. A commit names the segment
 identity. It advances the watermark to the intent's last position and deletes
-the intent in one synchronized batch. The next pressure pass then resumes from
-the old stopping point.
+the intent in one synchronized batch. The commit resets the pressure cursor, so
+the next pressure pass starts again from the beginning of the eviction order.
 
 A publication batch whose earliest position is at or before the watermark or the
 in-flight intent's end is refused with `STORAGE_FAILURE`. The message names

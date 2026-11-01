@@ -222,6 +222,10 @@ the deletion gate, the watermark and the writer fence. The archive worker and
 its NAS thread come later. Until then an archiving store retires nothing on
 its own.
 
+Do not enable `[archive]` on a production store before the worker ships. The
+fence is permanent: with no worker to advance the watermark, retention stops,
+and under disk pressure ingestion is eventually refused.
+
 ```toml
 [archive]
 dir = "/net/synology/archives/sparrow"  # required, absolute, outside data_dir
