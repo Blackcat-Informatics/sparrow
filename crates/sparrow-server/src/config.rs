@@ -56,6 +56,87 @@ pub struct ServerConfig {
     pub max_rpc_connections: usize,
     /// Required native analyzer artifact directory.
     pub text_lexicon_dir: PathBuf,
+    /// Archive-before-delete. A store that has archived requires this table thereafter.
+    #[serde(default)]
+    pub archive: Option<ArchiveConfig>,
+}
+
+/// Archive-before-delete destination and segment policy; unknown fields are errors.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveConfig {
+    /// Absolute archive root, outside `data_dir`. Startup probes it on its own thread.
+    pub dir: PathBuf,
+    /// Fraction of the retention window or data budget that starts archiving.
+    #[serde(default = "default_start_fraction")]
+    pub start_fraction: f64,
+    /// Payload bytes that close a segment.
+    #[serde(default = "default_segment_bytes")]
+    pub max_segment_bytes: u64,
+    /// Eviction entries that close a segment.
+    #[serde(default = "default_segment_records")]
+    pub max_segment_records: u64,
+    /// Seconds before an archive operation in flight is reported stalled.
+    #[serde(default = "default_stall_warn")]
+    pub stall_warn_secs: u64,
+    /// Seconds before an archive operation in flight marks the archive unavailable.
+    #[serde(default = "default_io_timeout")]
+    pub io_timeout_secs: u64,
+}
+
+fn default_start_fraction() -> f64 {
+    sparrow_core::ARCHIVE_START_FRACTION
+}
+fn default_segment_bytes() -> u64 {
+    sparrow_core::ARCHIVE_SEGMENT_BYTES
+}
+fn default_segment_records() -> u64 {
+    sparrow_core::ARCHIVE_SEGMENT_RECORDS
+}
+fn default_stall_warn() -> u64 {
+    120
+}
+fn default_io_timeout() -> u64 {
+    900
+}
+
+impl ArchiveConfig {
+    /// The store-side policy; the destination and timers stay with the daemon.
+    #[must_use]
+    pub fn policy(&self) -> sparrow_core::ArchivePolicy {
+        sparrow_core::ArchivePolicy {
+            start_fraction: self.start_fraction,
+            max_segment_bytes: self.max_segment_bytes,
+            max_segment_records: self.max_segment_records,
+        }
+    }
+
+    /// Lexical checks only: probing the archive device may block, so it is not done here.
+    fn validate(
+        &self,
+        data_dir: &Path,
+        max_artifact_bytes: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let normal = |path: &Path| {
+            path.is_absolute()
+                && path
+                    .components()
+                    .all(|part| !matches!(part, std::path::Component::ParentDir))
+        };
+        if !normal(&self.dir) || self.dir.as_os_str().len() > 2048 {
+            return Err(
+                "archive dir must be an absolute path of at most 2048 bytes without '..'".into(),
+            );
+        }
+        if self.dir.starts_with(data_dir) || data_dir.starts_with(&self.dir) {
+            return Err("archive dir must be outside data_dir and must not contain it".into());
+        }
+        if self.stall_warn_secs == 0 || self.io_timeout_secs <= self.stall_warn_secs {
+            return Err("archive requires 0 < stall_warn_secs < io_timeout_secs".into());
+        }
+        self.policy().validate(max_artifact_bytes)?;
+        Ok(())
+    }
 }
 
 /// Producer contract required before a watcher can claim or retire source files.
@@ -133,6 +214,9 @@ impl ServerConfig {
             return Err("consume requires at least two concurrent storage operations".into());
         }
         ConsumeWatch::validate_fields(&config.consume)?;
+        if let Some(archive) = &config.archive {
+            archive.validate(&config.data_dir, config.max_artifact_bytes)?;
+        }
         crate::syslog_listener::validate(&config.syslog)?;
         if config.rpc_tcp_address.is_some() != config.rpc_tcp_secret_file.is_some() {
             return Err(
@@ -175,6 +259,7 @@ impl ServerConfig {
                 max_records: self.max_records,
                 max_pin_members: self.max_pin_members,
                 text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
+                archive: self.archive.as_ref().map(ArchiveConfig::policy),
             },
         )?;
         std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o700))?;
@@ -277,5 +362,41 @@ mod tests {
         )
         .unwrap();
         assert!(both.tcp_secret().unwrap().is_some());
+    }
+
+    /// INVARIANT: the `[archive]` table is strict and lexically outside the store, and a
+    /// store that has been fenced for archiving refuses to open once the table is removed.
+    #[test]
+    fn archive_table_is_strict_and_a_fenced_store_requires_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        let with = |extra: &str| {
+            std::fs::write(&config, format!("{base}{extra}")).unwrap();
+            ServerConfig::read(&config)
+        };
+        let archive = dir.path().join("nas");
+        let table = format!("[archive]\ndir = \"{}\"\n", archive.display());
+        for refused in [
+            format!("{table}unknown = 1\n"),
+            format!("{table}start_fraction = 0.99\n"),
+            format!("{table}stall_warn_secs = 900\n"),
+            format!("{table}max_segment_bytes = 1\n"),
+            "[archive]\ndir = \"relative\"\n".to_owned(),
+            format!("[archive]\ndir = \"{}\"\n", data.join("archive").display()),
+            format!("[archive]\ndir = \"{}/../nas\"\n", data.display()),
+        ] {
+            assert!(with(&refused).is_err(), "{refused}");
+        }
+        let archiving = with(&table).unwrap();
+        assert_eq!(
+            archiving.archive.as_ref().unwrap().policy(),
+            sparrow_core::ArchivePolicy::default()
+        );
+        drop(archiving.open_store().unwrap());
+        let unconfigured = with("").unwrap();
+        assert!(unconfigured.open_store().is_err());
     }
 }

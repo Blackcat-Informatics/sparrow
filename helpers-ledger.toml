@@ -4426,3 +4426,45 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(free_space_again|measure_free_space_again|statvfs_floor_again)$']
+
+[[job]]
+id = "archive-deletion-gate"
+summary = "One archive watermark comparison decides every deletion of published evidence. Expiry and pressure eviction consult it before retirement, retirement asserts it, and stores without an archive policy pass it unchanged."
+home = "sparrow_core::storage::archive::ArchiveState::archived"
+entry_points = ["sparrow_core::storage::archive::Writer::archived", "sparrow_core::storage::archive::Writer::require_archived", "sparrow_core::storage::expiry::Writer::expire_bounded", "sparrow_core::storage::eviction::Writer::evict_oldest", "sparrow_core::storage::retire::Retirement::record"]
+spec = "docs/archive-format.md: deletion gate and store fence."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(retire_unarchived|bypass_archive_gate|archive_override|force_archive_through)$']
+
+[[job]]
+id = "archive-watermark-progress"
+summary = "One intent and commit owner advances the durable archive watermark after a verified segment; the same open owner loads it and fences the store format."
+home = "sparrow_core::storage::archive::Store::archive_commit"
+entry_points = ["sparrow_core::storage::archive::Store::archive_intend", "sparrow_core::storage::archive::Store::archive_state", "sparrow_core::storage::archive::open"]
+spec = "docs/archive-format.md: deletion gate and store fence."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/src/config.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(mark_archived|set_archive_watermark|archive_for_tests)$']
+
+[[job]]
+id = "archive-clock-regression-guard"
+summary = "Every publication batch is refused when its earliest eviction position is at or behind the archive watermark or the in-flight segment's end."
+home = "sparrow_core::storage::archive::ArchiveState::admit_publication"
+entry_points = ["sparrow_core::storage::archive::Writer::admit_archive_publication", "sparrow_core::storage::Writer::apply"]
+spec = "docs/archive-format.md: deletion gate and store fence."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(check_clock_regression|archive_clock_guard_again)$']

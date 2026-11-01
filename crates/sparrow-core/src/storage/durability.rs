@@ -138,6 +138,7 @@ impl Writer {
         let mut publication = super::eviction::Publication::default();
         batch.iterate_cf(&mut publication);
         publication.check()?;
+        self.admit_archive_publication(publication.earliest.as_deref())?;
         super::source_context::update(self, &mut batch)?;
         let manifest_features = super::manifest_retire::features(&self.db)?;
         if publication.manifest_retirement || manifest_features.is_some() {

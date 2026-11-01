@@ -30,18 +30,22 @@ lint:
 test:
 	cargo test --locked --release --workspace
 
+# The census defaults to the workspace its binary was compiled in. A shared
+# compile cache can reuse a binary built in another checkout, so name this one.
+CENSUS := cargo run -q --locked --release -p sparrow-helper-census -- --root $(CURDIR)
+
 census: tools-check
-	cargo run -q --locked --release -p sparrow-helper-census -- --self-test
-	cargo run -q --locked --release -p sparrow-helper-census -- --baseline
+	$(CENSUS) --self-test
+	$(CENSUS) --baseline
 
 census-cross: tools-check
-	cargo run -q --locked --release -p sparrow-helper-census -- --cross-baseline
-	cargo run -q --locked --release -p sparrow-helper-census -- --cross-report > target/helper-census/cross-report.txt
+	$(CENSUS) --cross-baseline
+	$(CENSUS) --cross-report > target/helper-census/cross-report.txt
 	@head -2 target/helper-census/cross-report.txt
 
 census-check: tools-check
-	cargo run -q --locked --release -p sparrow-helper-census -- --self-test
-	cargo run -q --locked --release -p sparrow-helper-census -- --cross --check
+	$(CENSUS) --self-test
+	$(CENSUS) --cross --check
 
 # Git 2.54's additive hooks preserve existing Stage and repository hooks.
 install-hooks:

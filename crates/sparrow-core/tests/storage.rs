@@ -17084,3 +17084,305 @@ fn native_correlation_recipes_bind_selectors_preserve_occurrences_and_report_unk
             .unwrap()
     );
 }
+
+fn archiving_config() -> Config {
+    Config {
+        archive: Some(sparrow_core::ArchivePolicy::default()),
+        ..config()
+    }
+}
+
+fn archive_position(received_at: u64, id: &str) -> String {
+    format!("{received_at:020}:{id}")
+}
+
+/// Commit one segment over the next `count` record positions, through the production gate API.
+fn archive_records(store: &Store, segment: u8, positions: &[String]) {
+    let intent = sparrow_core::ArchiveIntent {
+        segment_id: [segment; 32],
+        first: positions[0].clone(),
+        last: positions[positions.len() - 1].clone(),
+        records: positions.len() as u64,
+        artifacts: 0,
+    };
+    store.archive_intend(&intent).unwrap();
+    store.archive_commit(&intent.segment_id).unwrap();
+}
+
+/// INVARIANT: expiry never retires evidence a committed archive segment does not cover,
+/// retires it once the watermark passes it, and publication behind the watermark or an
+/// in-flight segment is refused as a clock regression.
+#[test]
+fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
+    use sparrow_core::{ArchiveIntent, EvictionLimits, RetentionReadLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving_config()).unwrap();
+    let first = store
+        .ingest("archive-first", "source", "log", b"a\nb\n", 1)
+        .unwrap();
+    let second = store
+        .ingest("archive-second", "source", "log", b"c\n", 2)
+        .unwrap();
+    let empty = store
+        .ingest("archive-empty", "source", "log", b"", 3)
+        .unwrap();
+    assert!(empty.record_ids.is_empty());
+    let mut covered = first
+        .record_ids
+        .iter()
+        .map(|id| archive_position(1, id))
+        .collect::<Vec<_>>();
+    covered.sort();
+    let later = 31 * DAY;
+    let owned = |store: &Store| {
+        store
+            .retention_metrics(later, RetentionReadLimits::default())
+            .unwrap()
+            .owned_payload_bytes
+    };
+    let before = owned(&store);
+    let waiting = store
+        .expire_bounded(later, EvictionLimits::default())
+        .unwrap();
+    assert_eq!((waiting.records, waiting.artifacts), (0, 0));
+    assert_eq!(waiting.archive_waiting, 6);
+    assert_eq!(owned(&store), before);
+
+    // An intent must start at the first unarchived entry and match the catalog.
+    let skipped = ArchiveIntent {
+        segment_id: [1; 32],
+        first: covered[1].clone(),
+        last: covered[1].clone(),
+        records: 1,
+        artifacts: 0,
+    };
+    assert_eq!(store.archive_intend(&skipped).unwrap_err().code, "CONFLICT");
+    let miscounted = ArchiveIntent {
+        first: covered[0].clone(),
+        records: 1,
+        ..skipped.clone()
+    };
+    assert_eq!(
+        store.archive_intend(&miscounted).unwrap_err().code,
+        "CONFLICT"
+    );
+    let intent = ArchiveIntent {
+        records: 2,
+        ..miscounted
+    };
+    store.archive_intend(&intent).unwrap();
+    store.archive_intend(&intent).unwrap();
+    // An in-flight segment does not authorize deletion.
+    let pending = store
+        .expire_bounded(later, EvictionLimits::default())
+        .unwrap();
+    assert_eq!((pending.records, pending.archive_waiting), (0, 6));
+    assert_eq!(store.archive_commit(&[2; 32]).unwrap_err().code, "CONFLICT");
+    store.archive_commit(&intent.segment_id).unwrap();
+    assert_eq!(
+        store.archive_state().unwrap().unwrap().through.as_deref(),
+        Some(covered[1].as_str())
+    );
+    let retired = store
+        .expire_bounded(later, EvictionLimits::default())
+        .unwrap();
+    assert_eq!((retired.records, retired.artifacts), (2, 1));
+    assert_eq!(retired.archive_waiting, 3);
+    assert!(owned(&store) < before);
+    assert_eq!(store.bytes(&second.record_ids[0], 0, 2, 3).unwrap(), b"c\n");
+
+    // Publication at or behind the watermark or an in-flight segment is a clock regression.
+    assert_eq!(
+        store
+            .ingest("archive-regressed", "source", "log", b"late\n", 0)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    let next = ArchiveIntent {
+        segment_id: [3; 32],
+        first: archive_position(2, &second.record_ids[0]),
+        last: archive_position(3, &empty.id),
+        records: 1,
+        artifacts: 1,
+    };
+    store.archive_intend(&next).unwrap();
+    assert_eq!(
+        store
+            .ingest("archive-in-flight", "source", "log", b"late\n", 2)
+            .unwrap_err()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    store
+        .ingest("archive-current", "source", "log", b"now\n", 4)
+        .unwrap();
+}
+
+/// INVARIANT: pressure retirement stops at the archive watermark, reports that it is
+/// waiting for the archive, and keeps refusing data writes until archiving catches up.
+#[test]
+fn pressure_stops_at_the_archive_watermark_and_keeps_refusing_ingest() {
+    use sparrow_core::{EvictionFrontier, EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = archiving_config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let old = store
+        .ingest("archive-pressure-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    store
+        .ingest("archive-pressure-next", "source", "log", b"next\n", 2)
+        .unwrap();
+    let ballast = dir.path().join("test-owned-pressure-ballast");
+    std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
+    let refused = |now| {
+        store
+            .ingest("archive-pressure-refused", "source", "log", b"later\n", now)
+            .unwrap_err()
+            .code
+    };
+    assert_eq!(refused(4), "STORAGE_PRESSURE");
+    let limits = EvictionLimits::default();
+    for now in [5, 6] {
+        let state = store.pressure_maintain(now, limits).unwrap();
+        assert_eq!(state.phase, PressurePhase::AwaitingArchive);
+        assert_eq!(state.evicted_records, 0);
+        let pass = state.last_pass.unwrap();
+        assert_eq!(pass.frontier, EvictionFrontier::ArchiveLag);
+        assert!(pass.continuation);
+        assert_eq!(refused(now), "STORAGE_PRESSURE");
+        assert_eq!(store.bytes(&old.id, 0, 4, now).unwrap(), b"old\n");
+    }
+    archive_records(&store, 1, &[archive_position(1, &old.record_ids[0])]);
+    let state = store.pressure_maintain(7, limits).unwrap();
+    assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
+    let pass = state.last_pass.unwrap();
+    assert_eq!(pass.records, old.record_ids);
+    assert_eq!(pass.frontier, EvictionFrontier::ArchiveLag);
+    assert_eq!(
+        store.bytes(&old.id, 0, 1, 7).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    std::fs::remove_file(ballast).unwrap();
+}
+
+/// INVARIANT: archiving never weakens a pin; archived pinned evidence survives expiry
+/// and eviction until its pin ends, then retires through the same gate.
+#[test]
+fn archived_pinned_record_survives_until_its_pin_ends() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving_config()).unwrap();
+    let artifact = store
+        .ingest("archive-pinned", "source", "log", b"keep\nother\n", 0)
+        .unwrap();
+    let keep = artifact.record_ids[0].clone();
+    store
+        .pin("archive-pin", "case", std::slice::from_ref(&keep), 40, 0)
+        .unwrap();
+    let mut positions = artifact
+        .record_ids
+        .iter()
+        .map(|id| archive_position(0, id))
+        .collect::<Vec<_>>();
+    positions.sort();
+    archive_records(&store, 1, &positions);
+    let evicted = store.evict_oldest(DAY, EvictionLimits::default()).unwrap();
+    assert_eq!(evicted.protected, 1);
+    let expired = store
+        .expire_bounded(31 * DAY, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(expired.archive_waiting, 0);
+    assert_eq!(store.bytes(&keep, 0, 5, 31 * DAY).unwrap(), b"keep\n");
+    let released = store
+        .expire_bounded(41 * DAY, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(released.records, 1);
+    assert_eq!(
+        store.bytes(&keep, 0, 1, 41 * DAY).unwrap_err().code,
+        "NOT_FOUND"
+    );
+}
+
+/// INVARIANT: a store fenced for archiving refuses to open without its policy, refuses
+/// a missing watermark, and carries an identity older binaries cannot open; stores
+/// without the fence open exactly as before.
+#[test]
+fn archive_fence_refuses_unconfigured_open_and_older_writers() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = Store::open(dir.path(), config()).unwrap();
+    let unfenced = plain.properties().unwrap()["store_format"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(plain.archive_state().unwrap(), None);
+    drop(plain);
+    let store = Store::open(dir.path(), archiving_config()).unwrap();
+    let fenced = store.properties().unwrap()["store_format"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = |format: &str| {
+        format
+            .strip_prefix("sparrow.store/")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    assert!((99..=109).contains(&number(&fenced)), "{fenced}");
+    assert_eq!(number(&fenced) - 99, (number(&unfenced) - 33) % 11);
+    assert_eq!(
+        store.archive_state().unwrap(),
+        Some(sparrow_core::ArchiveState::default())
+    );
+    // A later authority transition keeps the archive fence.
+    store.watch_registry_replace(None, b"registered").unwrap();
+    let watched = store.properties().unwrap()["store_format"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!((99..=109).contains(&number(&watched)), "{watched}");
+    drop(store);
+    let refused = Store::open(dir.path(), config()).err().unwrap();
+    assert_eq!(refused.code, "INVALID_ARGUMENT");
+    assert!(refused.message.contains("[archive]"));
+    let invalid = Config {
+        archive: Some(sparrow_core::ArchivePolicy {
+            start_fraction: 0.2,
+            ..sparrow_core::ArchivePolicy::default()
+        }),
+        ..config()
+    };
+    assert_eq!(
+        Store::open(dir.path(), invalid).err().unwrap().code,
+        "INVALID_ARGUMENT"
+    );
+    drop(Store::open(dir.path(), archiving_config()).unwrap());
+    let db = catalog_db(dir.path()).unwrap();
+    let through = db.get("archive:through").unwrap().unwrap();
+    db.delete("archive:through").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), archiving_config())
+            .err()
+            .unwrap()
+            .code,
+        "STORAGE_FAILURE"
+    );
+    // A writer that does not know an identity refuses it, as pre-archive binaries do.
+    // The log time law is removed so the format identity alone decides the refusal.
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("archive:through", through).unwrap();
+    db.put("store_format", b"sparrow.store/110").unwrap();
+    db.delete("log-time-profile-law").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), archiving_config())
+            .err()
+            .unwrap()
+            .code,
+        "UNSUPPORTED"
+    );
+}

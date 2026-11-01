@@ -215,6 +215,28 @@ not establish recovery. See [native reclamation](native-reclamation.md) for the
 available controls and qualification evidence. Hard disk ceilings remain the
 filesystem quota's responsibility.
 
+### 4.4 Archive before delete
+
+Sparrow keeps a 30-day searchable window of disposable logs. It can also
+archive aged-out evidence to a large, slower store, such as a NAS, before
+deleting it. The archive uses PurRDF's Parquet codec with N-Quads manifests, as
+specified in [the archive format](archive-format.md). Archiving is optional and
+configured by an `[archive]` table. Once a store has been fenced for archiving,
+it never deletes unarchived evidence. That holds when the archive is down, while
+it lags, and for the backlog present when archiving was enabled.
+
+A durable watermark over the eviction order is the single deletion gate. Expiry
+waits at it, and pressure eviction stops there with an `ArchiveLag` frontier.
+Pressure then reports `AwaitingArchive` and keeps refusing data writes, because
+safety comes before admission. Archiving starts early, at 75% of an entry's
+retention or of the data budget, so the gate is rarely reached in normal
+operation. Pins only delay deletion. Archiving ignores them, and an archived
+pinned record survives until its pin ends. A dedicated archive thread performs
+every NAS operation, one at a time, so a hung NAS degrades archiving without
+blocking queries, ingest or maintenance. A store format fence keeps older
+binaries away from an archiving store, and a clock-regression guard refuses
+publication behind the watermark.
+
 ## 5. Retention and named pins
 
 All deadlines are server UTC instants. One day means 24 hours, independently of
@@ -498,6 +520,7 @@ seams and caller-selected IRIs.
 | Retention | Use an injected clock to exercise the exact 30-day boundary; queries exclude expired entries while physical reclamation can lag. |
 | Pins | Exercise named creation, addition, renewal, overlap, release, expiry, name reuse, and rejected expired targets; record pins survive parent expiry without retaining unrelated records. |
 | Pressure | Evict oldest unpinned data; retain pins; backpressure when protected bytes or native reclamation prevent safe admission; keep status/release operations usable. |
+| Archive | Never retire unarchived evidence by expiry or pressure; retire it after its segment commits; keep archived pins; refuse unconfigured fenced stores, older binaries and clock regression. |
 | Consumption | Inject crashes before claim, mid-import, before publication, after durable publication, and around unlink; retain recoverability and avoid duplicate publication or deleting replacements. |
 | Linux watching | Exercise writable/read-only closes, reopen after close, multiple writers, moved-in publication, files closed before startup, new subdirectories, queue overflow, watch exhaustion, and stale path events; reconcile without treating missing events as completion. |
 | Tailing | Exercise append, unfinished records, rename rotation, completion, truncation, inode/path changes, and checkpoint recovery; expose observed gaps. |

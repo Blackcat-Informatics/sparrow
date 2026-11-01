@@ -263,7 +263,7 @@ pub(super) fn reclaim(
         .raw
         .take()
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "raw cleanup checkpoint missing"))?;
-    let mut retirement = retire::Retirement::new(writer)?;
+    let mut retirement = retire::Retirement::private(writer)?;
     let chunks = page(writer, &manifest.id, &raw, raw.reclaimed_chunks)?;
     retirement.payloads(&chunks, 2)?;
     let mut batch = retirement.finish()?;

@@ -15,6 +15,7 @@ use rocksdb::{
     ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions,
 };
 
+pub(crate) mod archive;
 mod artifact_rdf;
 mod provenance_rdf;
 mod tracing_rdf;
@@ -218,6 +219,8 @@ pub struct Config {
     pub max_pin_members: usize,
     /// Resolved standard native analysis law, shared across index and query callers.
     pub text_analyzer: purrdf::text::Analyzer,
+    /// Archive-before-delete policy. Once a store is fenced for archiving it requires one.
+    pub archive: Option<archive::ArchivePolicy>,
 }
 
 impl Config {
@@ -239,6 +242,9 @@ impl Config {
                 "INVALID_ARGUMENT",
                 "supply positive operation limits, a positive free-space floor and a disk budget exceeding a maintenance reserve of at least 1 MiB",
             ));
+        }
+        if let Some(policy) = &self.archive {
+            policy.validate(self.max_artifact_bytes)?;
         }
         Ok(())
     }
@@ -386,6 +392,8 @@ struct Writer {
     pressure: std::cell::RefCell<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
     expiry: std::cell::RefCell<expiry::Cursor>,
+    /// Present exactly when the store archives before deleting.
+    archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -1264,6 +1272,7 @@ impl Store {
         artifact_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         provenance_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         tracing_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
+        let archive = archive::open(&db, config.archive.as_ref())?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -1291,6 +1300,7 @@ impl Store {
                 pressure: std::cell::RefCell::new(pressure),
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
+                archive: archive.map(std::cell::RefCell::new),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),

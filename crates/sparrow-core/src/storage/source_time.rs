@@ -7,7 +7,7 @@ use super::{Error, Record, Store, Writer, blake3, field, hex, integer, json, par
 use purrdf_lex::json::{Object, Value, record::DecodeError};
 use rocksdb::WriteBatch;
 
-const LOG_FENCE: &str = "log-time-profile-law";
+pub(super) const LOG_FENCE: &str = "log-time-profile-law";
 
 pub(super) fn validate_log_fence(db: &rocksdb::DB) -> Result<(), Error> {
     let format = db.get("store_format")?;

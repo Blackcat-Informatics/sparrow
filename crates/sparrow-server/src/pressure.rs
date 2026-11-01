@@ -16,6 +16,7 @@ pub(crate) fn encode(
         PressurePhase::Requested => wire::PressurePhase::Requested,
         PressurePhase::AwaitingReclamation => wire::PressurePhase::AwaitingReclamation,
         PressurePhase::Blocked => wire::PressurePhase::Blocked,
+        PressurePhase::AwaitingArchive => wire::PressurePhase::AwaitingArchive,
     });
     out.set_requested_bytes(status.requested_bytes);
     out.set_passes(status.passes);
@@ -41,6 +42,7 @@ pub(crate) fn encode(
             EvictionFrontier::ScanBudget => wire::EvictionFrontier::ScanBudget,
             EvictionFrontier::PayloadBudget => wire::EvictionFrontier::PayloadBudget,
             EvictionFrontier::CatalogBudget => wire::EvictionFrontier::CatalogBudget,
+            EvictionFrontier::ArchiveLag => wire::EvictionFrontier::ArchiveLag,
         });
     } else {
         out.reborrow().init_last_pass().set_absent(());
@@ -60,6 +62,7 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
         wire::PressurePhase::Requested => "requested",
         wire::PressurePhase::AwaitingReclamation => "awaiting_reclamation",
         wire::PressurePhase::Blocked => "blocked",
+        wire::PressurePhase::AwaitingArchive => "awaiting_archive",
     };
     let pass = match value.get_last_pass()?.which()? {
         wire::pressure_pass::Absent(()) => Value::Null,
@@ -71,6 +74,7 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
                 wire::EvictionFrontier::ScanBudget => "scan_budget",
                 wire::EvictionFrontier::PayloadBudget => "payload_budget",
                 wire::EvictionFrontier::CatalogBudget => "catalog_budget",
+                wire::EvictionFrontier::ArchiveLag => "archive_lag",
             };
             Object::new()
                 .with("records", u64::from(pass.get_records()))
@@ -155,5 +159,20 @@ mod tests {
                 .as_u64(),
             Some(1)
         );
+        // Waiting for the archive is distinct from a blocked pass on every surface.
+        let waiting = PressureStatus {
+            phase: PressurePhase::AwaitingArchive,
+            last_pass: Some(sparrow_core::EvictionReport {
+                frontier: EvictionFrontier::ArchiveLag,
+                continuation: true,
+                ..sparrow_core::EvictionReport::default()
+            }),
+            ..PressureStatus::default()
+        };
+        let mut message = capnp::message::Builder::new_default();
+        encode(message.init_root(), &waiting).unwrap();
+        let value = decode(message.get_root_as_reader().unwrap()).unwrap();
+        assert_eq!(value["phase"].as_str(), Some("awaiting_archive"));
+        assert_eq!(value["last_pass"]["frontier"].as_str(), Some("archive_lag"));
     }
 }

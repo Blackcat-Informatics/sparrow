@@ -213,6 +213,64 @@ until durable pressure retirement requires the new invariant. Missing space,
 native failures and malformed or oversized recovery markers remain failures;
 logical retirement does not certify forced native physical reclamation.
 
+### Archive-before-delete gate (schema 63)
+
+An optional `[archive]` server table makes the store archive evidence before it
+deletes it. The format, schedule and write protocol are in
+[the archive format](archive-format.md). Phase P1 implements the store side:
+the deletion gate, the watermark and the writer fence. The archive worker and
+its NAS thread come later. Until then an archiving store retires nothing on
+its own.
+
+```toml
+[archive]
+dir = "/net/synology/archives/sparrow"  # required, absolute, outside data_dir
+start_fraction = 0.75                   # 0.5..0.95
+max_segment_bytes = 67108864            # max_artifact_bytes..192 MiB
+max_segment_records = 50000             # at least 1
+stall_warn_secs = 120                   # 0 < stall_warn_secs < io_timeout_secs
+io_timeout_secs = 900
+```
+
+Unknown fields are refused. Configuration checks are lexical: `dir` must be
+absolute, contain no `..`, and neither contain nor sit inside `data_dir`. The
+device and writability probes run at startup on the archive thread, because a
+hung NAS must not block startup. An unreachable archive starts the daemon
+degraded. Core `Config.archive` carries the store-side `ArchivePolicy`; the
+destination and timers stay in the daemon.
+
+The first open with a policy fences the store at formats 99 to 109. These keep
+the underlying authority family and include the log time law. Older binaries
+refuse them. The fence records `archive:through` with nothing archived, so an
+existing backlog is archived before anything is deleted. Reopening a fenced
+store without `[archive]` fails with `INVALID_ARGUMENT`. A fence without its
+watermark, or a watermark without its fence, fails with `STORAGE_FAILURE`.
+Stores without the fence or the table behave exactly as before.
+
+One gate guards every deletion. Expiry leaves entries the watermark does not
+cover and counts them in `ExpiryReport.archive_waiting`. Pressure eviction stops
+at the first unarchived, unprotected entry with frontier `archiveLag`. If that
+pass retired nothing, pressure reports phase `awaitingArchive` rather than
+`blocked`. Ingest above the data allowance still receives `STORAGE_PRESSURE`.
+Retirement asserts the gate itself; reaching unarchived evidence there is a
+`STORAGE_FAILURE` that commits nothing. Pins only delay deletion: an archived
+pinned record survives until its pin ends.
+
+`Store::archive_intend` durably records the segment about to be written. Its
+range must start at the first unarchived entry and match the catalog's
+counts (`CONFLICT` otherwise), and must fit `max_segment_records`
+(`RESOURCE_LIMIT`). Identical retries succeed. `Store::archive_commit(segment
+id)` advances the watermark and removes the intent in one synchronized batch.
+`Store::archive_state` reads both. A publication whose earliest receipt position
+is at or before the watermark or the in-flight intent's end is refused with
+`STORAGE_FAILURE`, and the message says to correct the clock.
+
+Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
+`EvictionFrontier.archiveLag`. CLI and MCP status render them as
+`awaiting_archive` and `archive_lag`. Archive worker status, with its phase,
+watermark, backlog age, last segment and quarantine listing, belongs to the
+worker phase and will use a later schema.
+
 ## 1. Common types and defaults
 
 | Type | Contract |
@@ -1277,6 +1335,12 @@ reference and index writer, then checkpoints atomically. Missing terms, conflict
 origin identities, unsupported metadata stream shapes or insufficient admission
 fail explicitly. The store is served only after both jobs complete. New graph
 publication and retirement maintain an atomic per-owner provenance marker.
+
+Archive manifests and link quads use the same namespace: `ArchiveStore`,
+`ArchiveSegment`, `ArchiveTable` and `QuarantineEntry` classes, and
+`payloadSha256`, `archiveFormat`, `storeId`, `table` and the other predicates
+listed in [the archive format](archive-format.md#9-manifest). Archive segments
+hold only these facts and the store's existing graphs.
 
 The API returns occurrence/graph IRIs; clients do not construct them by guessing
 an opaque ID's layout. PurRDF JSON and Markdown graphs retain their own explicitly
@@ -2360,7 +2424,8 @@ its durable acknowledgment law.
 
 Schema 17 adds typed `Status.pressureStatus`, shared by CLI and MCP status.
 It distinguishes physical disk admission from buffered WAL queue pressure.
-Its phases are `ready`, `requested`, `awaitingReclamation` and `blocked`;
+Its phases are `ready`, `requested`, `awaitingReclamation` and `blocked`, with
+`awaitingArchive` added by schema 63;
 integer fields report the outstanding write estimate, session-local retirement
 totals and sampled native activity. The last logical pass includes an explicit
 exhausted/record-limit/scan-budget/payload-budget frontier. Retirement counts do
@@ -2434,6 +2499,11 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
 | `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
 | `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface. Raw artifact preservation can still succeed independently of projection support. |
+
+`STORAGE_FAILURE` also covers a publication at or behind the archive watermark,
+which signals a clock regression, and retirement reaching unarchived evidence.
+`INVALID_ARGUMENT` covers opening an archiving store without its `[archive]`
+table.
 
 Expose API, store-format, codec/profile, and governor identities in discovery.
 Changes to filtering, certainty, retention, identity, or pin semantics require

@@ -162,6 +162,8 @@ pub enum EvictionFrontier {
     PayloadBudget,
     /// Catalog capture reached admission after a complete safe prefix.
     CatalogBudget,
+    /// The next unprotected entry is not yet covered by a committed archive segment.
+    ArchiveLag,
 }
 
 /// Durable logical changes, not a claim about physical disk bytes freed.
@@ -272,11 +274,16 @@ impl Writer {
                     next = Some((position.to_vec(), false));
                     continue;
                 }
+                if !writer.archived(artifact.received_at, &artifact.id) {
+                    next = Some((position.to_vec(), true));
+                    report.frontier = EvictionFrontier::ArchiveLag;
+                    break;
+                }
                 if report.records.len() + report.recordless_artifacts == limits.max_records {
                     report.frontier = EvictionFrontier::UnitLimit;
                     break;
                 }
-                retirement.artifact_graph(&artifact.id)?;
+                retirement.artifact_graph(&artifact.id, artifact.received_at)?;
                 retirement.batch.delete(&artifact.id);
                 super::manifest_retire::remove(&mut retirement.batch, &artifact.id);
                 retirement.batch.delete(&key);
@@ -330,6 +337,16 @@ impl Writer {
                     "eviction record missing from parent manifest",
                 ));
             }
+            // Oldest-first retirement stops at the archive watermark, never past it.
+            if !writer.archived(record.received_at, &record.id)
+                || parents
+                    .get(&record.artifact_id)
+                    .is_some_and(|parent| !writer.archived(parent.received_at, &parent.id))
+            {
+                next = Some((position.to_vec(), true));
+                report.frontier = EvictionFrontier::ArchiveLag;
+                break;
+            }
             if !record.evicted {
                 if report.records.len() + report.recordless_artifacts == limits.max_records {
                     report.frontier = EvictionFrontier::UnitLimit;
@@ -347,7 +364,7 @@ impl Writer {
                 if let Some(parent) = parents.get_mut(&record.artifact_id)
                     && !parent.evicted()
                 {
-                    retirement.artifact_graph(&parent.id)?;
+                    retirement.artifact_graph(&parent.id, parent.received_at)?;
                     parent.evict();
                     report.artifacts.push(parent.id.clone());
                 }
@@ -404,7 +421,10 @@ impl Writer {
 
     /// Merge two native ordered cursors by their identical timestamp/identity suffix.
     /// Only one entry from each index is peeked; no resident corpus is captured.
-    fn eviction_entries(&self, after: Option<&[u8]>) -> impl Iterator<Item = IndexEntry> + '_ {
+    pub(super) fn eviction_entries(
+        &self,
+        after: Option<&[u8]>,
+    ) -> impl Iterator<Item = IndexEntry> + '_ {
         let mut record_start = b"time:".to_vec();
         let mut empty_start = recordless::PREFIX.to_vec();
         if let Some(after) = after {

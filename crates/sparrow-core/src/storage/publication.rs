@@ -660,7 +660,7 @@ pub(super) fn reclaim_prepared(
         let key = record_key(&manifest.id, progress.reclaimed_records);
         let mut record: Record = writer.get(&key)?;
         let mut batch = if manifest.published_artifact.is_none() {
-            let mut retirement = retire::Retirement::new(writer)?;
+            let mut retirement = retire::Retirement::private(writer)?;
             retirement.record(&mut record, 2)?;
             retirement.finish()?
         } else {

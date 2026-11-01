@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 pub(super) struct Retirement<'a> {
     writer: &'a Writer,
+    /// Published evidence must pass the archive gate; private preparation never entered it.
+    published: bool,
     pub batch: WriteBatch,
     rdf: rdf_index::RdfWrite<'a>,
     removals: BTreeMap<String, u64>,
@@ -17,9 +19,20 @@ pub(super) struct Retirement<'a> {
 }
 
 impl<'a> Retirement<'a> {
+    /// Retire published evidence; every record and artifact asserts the archive gate.
     pub(super) fn new(writer: &'a Writer) -> Result<Self, Error> {
+        Self::with_scope(writer, true)
+    }
+
+    /// Release abandoned private preparation, which was never published or archived.
+    pub(super) fn private(writer: &'a Writer) -> Result<Self, Error> {
+        Self::with_scope(writer, false)
+    }
+
+    fn with_scope(writer: &'a Writer, published: bool) -> Result<Self, Error> {
         Ok(Self {
             writer,
+            published,
             batch: WriteBatch::default(),
             rdf: rdf_index::RdfWrite::new(&writer.db)?,
             removals: BTreeMap::new(),
@@ -29,6 +42,10 @@ impl<'a> Retirement<'a> {
     }
 
     pub(super) fn record(&mut self, record: &mut Record, owners: u64) -> Result<bool, Error> {
+        if self.published {
+            self.writer
+                .require_archived(record.received_at, &record.id)?;
+        }
         super::tail_ranges::retire(&mut self.batch, record);
         self.payloads(&record.chunks, owners)?;
         self.writer.remove_text(&mut self.batch, &record.id)?;
@@ -64,7 +81,8 @@ impl<'a> Retirement<'a> {
         Ok(true)
     }
 
-    pub(super) fn artifact_graph(&mut self, id: &str) -> Result<bool, Error> {
+    pub(super) fn artifact_graph(&mut self, id: &str, received_at: u64) -> Result<bool, Error> {
+        self.published_artifact(id, received_at)?;
         super::artifact_rdf::retire(&self.writer.db, &mut self.rdf, &mut self.batch, id)
     }
 
@@ -73,6 +91,7 @@ impl<'a> Retirement<'a> {
         artifact: &mut super::manifest_retire::Envelope,
         maximum: usize,
     ) -> Result<usize, Error> {
+        self.published_artifact(&artifact.id, artifact.received_at)?;
         let count = artifact.prefix.len().min(maximum);
         if count == 0 && maximum > 0 && artifact.pending() > 0 {
             return Err(Error::new(
@@ -84,6 +103,16 @@ impl<'a> Retirement<'a> {
         artifact.advance(count)?;
         artifact.stage(&mut self.batch);
         Ok(count)
+    }
+
+    fn published_artifact(&self, id: &str, received_at: u64) -> Result<(), Error> {
+        if !self.published {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "private preparation cannot retire a published artifact",
+            ));
+        }
+        self.writer.require_archived(received_at, id)
     }
 
     pub(super) fn payloads(&mut self, chunks: &[String], owners: u64) -> Result<(), Error> {

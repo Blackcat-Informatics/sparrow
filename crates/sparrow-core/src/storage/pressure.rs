@@ -39,6 +39,8 @@ pub enum PressurePhase {
     AwaitingReclamation,
     /// The bounded pass could make no progress, or encountered a hard failure.
     Blocked,
+    /// Retirement stopped at the archive watermark; writes stay refused until archiving catches up.
+    AwaitingArchive,
 }
 
 /// Durable phase/request recovery with session-local maintenance counters and observations.
@@ -269,6 +271,7 @@ impl Writer {
         let changed =
             !report.records.is_empty() || !report.artifacts.is_empty() || report.payload_refs != 0;
         let continuing = report.continuation;
+        let archive_lag = report.frontier == super::eviction::EvictionFrontier::ArchiveLag;
         state.status.last_pass = Some(report);
         state.status.failure = None;
         if changed {
@@ -280,6 +283,8 @@ impl Writer {
             options.set_wait(false);
             self.db
                 .flush_cfs_opt(&super::family_handles(&self.db)?, &options)?;
+        } else if archive_lag {
+            state.status.phase = PressurePhase::AwaitingArchive;
         } else if continuing {
             state.status.phase = PressurePhase::Requested;
         } else {

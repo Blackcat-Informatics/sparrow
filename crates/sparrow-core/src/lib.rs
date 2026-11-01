@@ -18,6 +18,10 @@ pub use query::{
     EventInterval, FieldConstraint, JSON_QUERY_PATH_BYTES, JsonPredicate, JsonQuery,
     QueryAlternatives, QueryScope, QuerySelection, RecordQuery,
 };
+pub use storage::archive::{
+    ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES, ARCHIVE_SEGMENT_RECORDS,
+    ARCHIVE_START_FRACTION, ArchiveIntent, ArchivePolicy, ArchiveState,
+};
 pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,
     ArtifactSummary,

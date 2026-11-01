@@ -51,6 +51,7 @@ macro_rules! storage_config {
                 max_pin_members: 100,
                 text_analyzer: $crate::resolve_text_analyzer($crate::text_lexicon_dir())
                     .expect("standard storage fixture analyzer"),
+                archive: None,
             })
             .clone()
     }};

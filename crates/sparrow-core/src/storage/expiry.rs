@@ -72,6 +72,8 @@ pub struct ExpiryReport {
     pub payload_refs: usize,
     /// Expired catalog and retry rows removed.
     pub deleted: usize,
+    /// Expired records and artifacts kept because no committed archive segment covers them yet.
+    pub archive_waiting: u64,
     /// Explicit bounded frontier.
     pub frontier: ExpiryFrontier,
     /// More work remains in this session's catalog traversal.
@@ -176,11 +178,17 @@ impl Writer {
                         now,
                         &protected,
                     ) {
+                        if !self.archived(artifact.received_at, &artifact.id) {
+                            report.archive_waiting += 1;
+                            position.next = Some((key.to_vec(), false));
+                            continue;
+                        }
                         if report.records + report.artifacts == limits.max_records as u64 {
                             report.frontier = ExpiryFrontier::UnitLimit;
                             break 'phases;
                         }
-                        let graph_retired = retirement.artifact_graph(&artifact.id)?;
+                        let graph_retired =
+                            retirement.artifact_graph(&artifact.id, artifact.received_at)?;
                         if graph_retired {
                             report.artifacts += 1;
                         }
@@ -254,7 +262,10 @@ impl Writer {
                                 "expiry record catalog identity mismatch",
                             ));
                         }
-                        if !self.live_record(&record, now, &protected) {
+                        let expired = !self.live_record(&record, now, &protected);
+                        if expired && !self.archived(record.received_at, &record.id) {
+                            report.archive_waiting += 1;
+                        } else if expired {
                             if report.records + report.artifacts == limits.max_records as u64 {
                                 report.frontier = ExpiryFrontier::UnitLimit;
                                 break 'phases;
