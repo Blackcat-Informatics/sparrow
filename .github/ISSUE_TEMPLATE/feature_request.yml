@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+name: Feature request
+description: Propose new functionality for Sparrow.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two constraints to know up front. Sparrow reuses PurRDF for RDF
+        semantics, codecs, SPARQL, text analysis and scoring, so proposals in
+        those areas may belong upstream in PurRDF. Sparrow also keeps its
+        claims bounded: new query or ingestion surfaces need explicit limits,
+        coverage reporting and typed refusals rather than best-effort results.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that Sparrow makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you would like it to work. An interface sketch (RPC, MCP tool or CLI), expected limits and prior art all help.
+    validations:
+      required: true
+  - type: checkboxes
+    id: surfaces
+    attributes:
+      label: Surface(s)
+      description: Where do you need this exposed?
+      options:
+        - label: CLI
+        - label: stdio MCP adapter
+        - label: Cap'n Proto RPC
+        - label: Rust client or tracing layer
+        - label: Ingestion (watches, syslog, imports)

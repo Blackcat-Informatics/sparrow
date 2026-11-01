@@ -178,7 +178,16 @@ pub(crate) fn materialise(
     if let Err(error) = std::fs::create_dir_all(&tree) {
         return failed(format!("{}: {error}", tree.display()));
     }
+    // A Git hook exports its own repository's location, and a linked worktree's
+    // is absolute, so an inherited value would override `-C` and archive from
+    // Sparrow instead of the PurRDF repository.
     let mut git = match Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .arg("-C")
         .arg(repository)
         .args(["archive", "--format=tar", revision])

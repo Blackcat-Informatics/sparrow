@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+cff-version: 1.2.0
+message: "If you use Sparrow, please cite it as below."
+title: "Sparrow: a temporal diagnostic log and data server"
+abstract: >-
+  Sparrow is a Rust service that turns scattered operational artifacts into
+  retained evidence that agents can discover, inspect, correlate and query as a
+  semantic graph. It ingests JSON/JSONL, Markdown, structured logs, syslog and
+  unformatted text through typed Cap'n Proto RPC, durable directory consumption
+  and active-log tailing. It stores exact source bytes in RocksDB with
+  content-addressed deduplication and compression, retains them for a bounded
+  window from acceptance under an explicit disk budget, and protects selected
+  evidence with named, expiring pins. Persistent full-text and RDF 1.2 quad
+  indexes, built on PurRDF, answer field, text and SPARQL 1.2 queries with
+  explicit coverage and refusal reporting, through a CLI, a stdio MCP adapter
+  and a Rust producer client with a composable tracing layer.
+type: software
+authors:
+  - name: "Blackcat Informatics® Inc."
+    website: "https://blackcatinformatics.ca/"
+  - family-names: "Audley"
+    given-names: "Patrick"
+    orcid: "https://orcid.org/0000-0003-4382-7625"
+license:
+  - MIT
+  - Apache-2.0
+  - MulanPSL-2.0
+keywords:
+  - logging
+  - diagnostics
+  - observability
+  - log-retention
+  - full-text-search
+  - rdf
+  - rdf-1.2
+  - sparql
+  - knowledge-graph
+  - rocksdb
+  - capnproto
+  - mcp
+  - agents
+  - rust
