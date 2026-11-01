@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 //! Compose Sparrow with an application-owned subscriber and explicitly drain.
 use sparrow_client::{Delivery, DeliveryConfig, TracingLayer};

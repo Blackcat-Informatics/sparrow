@@ -1,6 +1,6 @@
 #!/usr/bin/python3 -I
-# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 """Take a closed-store backup of the running Sparrow service and prune old ones.
 
 Sparrow has no online checkpoint, so a consistent copy needs a closed store.

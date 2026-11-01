@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+-->
+
 # PurRDF integration gaps
 
 The native integration tasks below are implemented and deployed. This file

@@ -1,6 +1,6 @@
 @0xdcc9fefce9188f9a;
-# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 struct Instant { unixMillis @0 :UInt64; }
 struct Failure { code @0 :Text; message @1 :Text; retryable @2 :Bool; }

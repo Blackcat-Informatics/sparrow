@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+-->
+
 # Helper census
 
 Sparrow adopts PurRDF functionality wherever its public API supplies the required
