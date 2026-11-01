@@ -179,6 +179,9 @@ pub(crate) fn materialise(
         return failed(format!("{}: {error}", tree.display()));
     }
     let mut git = match Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .arg("-C")
         .arg(repository)
         .args(["archive", "--format=tar", revision])
