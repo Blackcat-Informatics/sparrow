@@ -3,7 +3,22 @@ SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinform
 SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 -->
 
-# Sparrow
+<p align="center">
+  <img src="./docs/sparrow-logo.svg" alt="Sparrow logo: a black cat gently holding a sparrow" width="128" height="128">
+</p>
+
+<h1 align="center">Sparrow</h1>
+
+<p align="center">
+  <em>Temporal diagnostic evidence, carried gently: retained, pinned and queryable as a graph.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Blackcat-Informatics/sparrow/actions/workflows/ci.yaml"><img src="https://github.com/Blackcat-Informatics/sparrow/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
+  <a href="./LICENSING.md"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0%20OR%20MulanPSL--2.0-blue.svg" alt="License: MIT OR Apache-2.0 OR MulanPSL-2.0"></a>
+  <img src="https://img.shields.io/badge/MSRV-1.98-orange.svg" alt="MSRV 1.98">
+  <a href="https://github.com/Blackcat-Informatics/purrdf"><img src="https://img.shields.io/badge/built%20on-PurRDF-111214.svg" alt="Built on PurRDF"></a>
+</p>
 
 Sparrow is a high-density, temporal diagnostic log and data server. It turns
 scattered operational artifacts into retained evidence that agents can discover,
@@ -96,6 +111,30 @@ durability interval. Source-file deletion and successful pin mutations require
 durable commits. Parsing or indexing failures are visible independently of byte
 ingestion; successful raw import is sufficient to consume a completed source.
 
+## Build
+
+Sparrow builds on Linux with:
+
+- Rust 1.98 or newer, with rustfmt and Clippy
+- `capnp` (the Cap'n Proto compiler) and libclang
+- Git 2.54 or newer, and `tar`
+- A PurRDF checkout at `../purrdf`, beside this repository, containing the
+  revision pinned in `registry/compatibility.toml`. The tests read its text
+  lexicons and the helper census archives its source at that revision.
+
+```bash
+git clone https://github.com/Blackcat-Informatics/purrdf ../purrdf
+git -C ../purrdf checkout "$(sed -n 's/^git_revision = "\(.*\)"/\1/p' registry/compatibility.toml)"
+
+make check          # fmt, release Clippy (warnings denied), release tests, census
+make build-runtime  # release server and client binaries
+make install-hooks  # run make check before every commit
+```
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the gate, the PurRDF reuse rules
+and the helper ledger, and [Deployment](docs/deployment.md) for installing the
+user service.
+
 ## Architecture and interfaces
 
 The initial storage substrate is RocksDB, with content-addressed payloads,
@@ -140,3 +179,11 @@ prerequisite for performance claims.
 Per-class retention, clustering, embeddings, and a human dashboard are later
 extensions. The initial service focuses on agent access to disposable operational
 evidence.
+
+## License
+
+Sparrow is licensed under your choice of [MIT](./LICENSE-MIT),
+[Apache-2.0](./LICENSE-APACHE) or [MulanPSL-2.0](./LICENSE-MULAN). See
+[LICENSING.md](./LICENSING.md) for details, documentation licensing and
+contribution terms. Report vulnerabilities as described in
+[SECURITY.md](./SECURITY.md).

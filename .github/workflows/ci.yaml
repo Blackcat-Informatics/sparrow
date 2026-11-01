@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# A newer push to a pull request cancels the run the previous push started.
+# Runs on main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: make check
+    # Inert anywhere but github.com, so a Forgejo mirror that reads
+    # .github/workflows never runs it.
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    # Cold release builds of RocksDB and the workspace are slow; the cache
+    # shortens later runs.
+    timeout-minutes: 120
+    steps:
+      # The gate expects PurRDF beside the Sparrow checkout at ../purrdf: the
+      # tests read its text lexicons and the census archives its source.
+      - name: Checkout Sparrow
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: sparrow
+          persist-credentials: false
+
+      - name: Read the pinned PurRDF revision
+        id: purrdf
+        working-directory: sparrow
+        run: |
+          revision="$(sed -n 's/^git_revision = "\([0-9a-f]\{40\}\)"$/\1/p' registry/compatibility.toml)"
+          if [ "$(printf '%s\n' "$revision" | grep -c .)" != 1 ]; then
+            echo "error: registry/compatibility.toml must name exactly one 40-hex git_revision" >&2
+            exit 1
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PurRDF at the pinned revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: Blackcat-Informatics/purrdf
+          ref: ${{ steps.purrdf.outputs.revision }}
+          path: purrdf
+          persist-credentials: false
+
+      - name: Install capnp and libclang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends capnproto libclang-dev clang
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Cargo and target
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: sparrow
+
+      - name: make check
+        working-directory: sparrow
+        run: make check
