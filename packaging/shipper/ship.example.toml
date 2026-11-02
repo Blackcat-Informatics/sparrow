@@ -7,7 +7,7 @@ intake_root = "/home/USER/.local/state/sparrow/intake"
 state_dir = "/home/USER/.local/state/sparrow/ship"
 max_chunk_bytes = 1048576      # line formats are split above 1 MiB ...
 max_chunk_lines = 50000        # ... or above 50,000 lines (max_records is 100,000);
-                               # other formats ship whole at any size
+                               # other formats ship whole, up to 26.7 GiB
 max_files_per_run = 64         # per source
 max_pending_bytes = 16777216   # all consume roots together; bounds the backup's drain wait
 max_queue_bytes = 1073741824   # stop queueing new files while queues hold this much

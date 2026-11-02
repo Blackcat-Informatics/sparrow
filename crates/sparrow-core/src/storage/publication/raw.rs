@@ -127,13 +127,6 @@ pub(super) fn advance(
 ) -> Result<ImportPreparation, Error> {
     let length = span.byte_end - span.byte_start;
     let total = length.div_ceil(IMPORT_CHUNK_BYTES as u64);
-    // Native catalog decoding budgets all strings, including ordered chunk identities.
-    if total > (super::super::CATALOG_STRING_BYTES as u64 - 8192) / 64 {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
-            "raw record chunk manifest exceeds native catalog string budget",
-        ));
-    }
     let mut raw = match progress.raw.take() {
         Some(raw) => raw,
         None => RawPreparation {

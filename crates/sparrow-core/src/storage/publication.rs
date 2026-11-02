@@ -13,7 +13,7 @@ use rocksdb::WriteBatch;
 
 mod raw;
 pub use raw::RawPreparation;
-const PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
+pub(super) const PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
 /// One preparation checkpoint covers at most this many ordinary records, and
 /// adds further records only while their source stays within the byte bound; a
 /// first record larger than the byte bound forms its own checkpoint. Each

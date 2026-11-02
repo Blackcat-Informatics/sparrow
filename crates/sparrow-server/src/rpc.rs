@@ -1766,7 +1766,8 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        // Normalization is bounded independently of the configured storage admission.
+        // Batch validation bounds normalization by MAX_EVENT_BATCH_EVENTS and
+        // MAX_EVENT_BATCH_BYTES, well inside the store's inline ingest bound.
         let bytes = match input.source_bytes().map_err(invalid) {
             Ok(bytes) => bytes,
             Err(error) => {

@@ -50,7 +50,7 @@ pub use storage::expiry::{ExpiryFrontier, ExpiryReport};
 pub use storage::handoff::ConsumptionHandoff;
 pub use storage::import::{
     IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,
-    ImportRecordSpan, ImportStart,
+    ImportRecordSpan, ImportStart, MAX_IMPORT_BYTES, RAW_RECORD_BYTES,
 };
 pub use storage::ingest_status::{
     IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus,

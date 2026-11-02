@@ -275,41 +275,60 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 watermark, backlog age, last segment and quarantine listing, belongs to the
 worker phase and will use a later schema.
 
-### Artifacts of any size (schema 64)
+### Large artifacts (schema 64)
 
-Sparrow has no per-artifact byte limit. Patrick ruled on 2026-11-01: "Remove the
-limit". The server configuration no longer has `max_artifact_bytes`. A
-configuration that still sets it refuses to start, and the error says to
-delete the key. The disk budget, the maintenance reserve and the free-space
-floor still bound what the store admits, and `max_records` still bounds the
-records in one artifact.
+Patrick ruled on 2026-11-01: "Remove the limit". The configurable per-artifact
+limit is gone. The server configuration no longer has `max_artifact_bytes`. A
+configuration that still sets it refuses to start, and the error says to delete
+the key. The disk budget, the maintenance reserve and the free-space floor still
+bound what the store admits, and `max_records` still bounds the records in one
+artifact.
 
-An artifact of any size ingests through the staged import: the CLI `ingest`
-command, completed-file consumption and the SDK `import_file` calls append it
-in 64 KiB chunks. Sealing, layout, preparation and publication each read the
-staged chunks one at a time. A record above 16 MiB is stored raw in pages of
-128 chunks, with a recorded projection failure instead of a JSON projection.
-No step holds more than 16 MiB of an artifact's bytes in memory.
+One fixed bound remains until the v2 store format (#5). Publication commits an
+artifact's catalog in one atomic write batch of at most 128 MiB, and that batch
+carries every 64 KiB chunk identity four times: in the record rows, the artifact
+row, the saved publication receipt and the ingest receipt. `import_begin`
+therefore refuses a declared input above `MAX_IMPORT_BYTES`, which is
+28718530560 bytes (438210 chunks, about 26.7 GiB), before any byte is uploaded.
+The `RESOURCE_LIMIT` error states the bound and says to split the input. An
+artifact of many small records can still exceed the batch through its record
+rows; publication then refuses it with `RESOURCE_LIMIT`. Format #5 replaces the
+single batch, and with it this bound.
+
+A larger artifact ingests through the staged import: the CLI `ingest` command,
+completed-file consumption and the SDK `import_file` calls append it in 64 KiB
+chunks. Sealing, layout, preparation and publication each read the staged chunks
+one at a time. A record above 16 MiB is stored raw in pages of 128 chunks, with
+a recorded projection failure instead of a JSON projection. A record above
+128 MiB (2048 chunks) is laid out as consecutive raw records: every piece but
+the last holds 112 MiB, and the last holds more than 16 MiB and at most
+128 MiB. Each record's chunk manifest then fits one retirement pass and one
+catalog read, so expiry and eviction retire the pieces like any other records.
+Stores laid out before this change keep their records; only new layouts split.
+No step holds more than 16 MiB of an artifact's bytes in memory. Sealing,
+layout and publication of an input of many GiB each run as one call, so they
+can outlast the 45-second consumption deadline; resumable steps are also part
+of #5.
 
 One inline `ingest` message, and the single write batch behind it, carries at
-most 16 MiB. That fixed bound protects the daemon's memory; it is not an
-artifact limit. A larger inline message is refused with `RESOURCE_LIMIT`, and
-the message names the staged import. The SDK `ingest` and
-`ingest_with_durability` calls stream any larger input through the staged
-import, and the receipt is durable whatever durability was requested. The bound
-is advertised as `Discovery.maxInlineArtifactBytes` and
-`Status.maxInlineArtifactBytes`; CLI and MCP status render it as
+most 16 MiB. That fixed bound protects the daemon's memory. A larger inline
+message is refused with `RESOURCE_LIMIT`, and the message names the staged
+import. The SDK `ingest` and `ingest_with_durability` calls stream any larger
+input through the staged import, and the receipt is durable whatever durability
+was requested. The bound is advertised as `Discovery.maxInlineArtifactBytes`
+and `Status.maxInlineArtifactBytes`; CLI and MCP status render it as
 `max_inline_artifact_bytes`. These replace `maxArtifactBytes` at the same
 ordinals, so the schema advances to 64, and older endpoints fail the exact
 schema discovery check. The store format is unchanged.
 
 Byte reads of a record, or of an artifact with at most one record, go straight
-to the chunk that holds the requested offset. Each read costs its requested
-range, whatever the evidence's size. Reads of artifacts with several records
-still walk the manifest from the start. A tail capture keeps its fixed 1 MiB
-window. The archive's `max_segment_bytes` is a closing target from 1 MiB to
-192 MiB, and an entry larger than the target is archived in a segment of its
-own; see [the archive format](archive-format.md).
+to the chunk that holds the requested offset. An artifact with several records
+finds the record holding the offset by a binary search over its ordered record
+rows, then seeks within that record, so a document split into raw records reads
+back byte-exact at the cost of the requested range. A tail capture keeps its
+fixed 1 MiB window. The archive's `max_segment_bytes` is a closing target from
+1 MiB to 192 MiB, and an entry larger than the target is archived in a segment
+of its own; see [the archive format](archive-format.md).
 
 ## 1. Common types and defaults
 

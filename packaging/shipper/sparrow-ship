@@ -14,11 +14,15 @@ Small files are reflink copies, which share extents on btrfs. Line-oriented file
 above the chunk limits are split on line boundaries so that no artifact can
 exceed the per-artifact record limit or the consume publication deadline; a
 refused publication would otherwise be retried indefinitely. Every other format
-is shipped whole at any size: Sparrow has no per-artifact byte limit.
+is shipped whole up to `MAX_IMPORT_BYTES`, the 26.7 GiB that one atomic Sparrow
+publication can carry until the v2 store format (#5). Sparrow splits a whole
+document above 128 MiB into raw records itself. A larger file is reported as a
+failure on every run and never queued, because Sparrow refuses it before upload.
 
 Feeding keeps the bytes waiting in all consume roots together within
 `max_pending_bytes`, so the backup's drain wait stays bounded however large a
-source file is. An item larger than the budget is fed only into empty roots.
+source file is. An item larger than the budget is fed only when every consume
+root is empty, and then alone.
 
 A ledger per source records each shipped identity (device, inode, size and
 modification time) after all of its copies are durably queued. A crash between
@@ -38,6 +42,8 @@ import tomllib
 from pathlib import Path
 
 RULES = ("daily", "sealed", "settled")
+# sparrow_core::MAX_IMPORT_BYTES: the largest input one atomic publication carries.
+MAX_IMPORT_BYTES = 28718530560
 LINE_FORMATS = ("jsonl", "log")
 
 
@@ -50,7 +56,7 @@ def load_config(path):
         config = tomllib.load(handle)
     if "max_whole_bytes" in config:
         fail(f"{path}: `max_whole_bytes` was removed; unsplittable formats now ship whole "
-             "at any size. Delete the key and rerun")
+             f"up to Sparrow's {MAX_IMPORT_BYTES}-byte import bound. Delete the key and rerun")
     for key in ("intake_root", "state_dir", "max_chunk_bytes", "max_chunk_lines",
                 "max_files_per_run", "max_pending_bytes", "max_queue_bytes"):
         if key not in config:
@@ -156,6 +162,9 @@ def enqueue(source, path, stat, config, queue, staging):
         if whole:
             with open(path, "rb") as handle:
                 whole = handle.read().count(b"\n") <= max_lines
+    if whole and stat.st_size > MAX_IMPORT_BYTES:
+        raise RuntimeError(f"{stat.st_size} bytes exceeds Sparrow's {MAX_IMPORT_BYTES}-byte "
+                           "import bound (about 26.7 GiB); split the file and ship the parts")
     order = f"{time.time_ns():020d}"
     staged, written = [], 0
     if whole:

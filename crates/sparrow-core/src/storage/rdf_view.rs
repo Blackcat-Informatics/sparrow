@@ -293,8 +293,9 @@ impl<'a> StoredRdfView<'a> {
         self.point_in(None, key, maximum)
     }
 
-    /// A record row grows with its record's chunk count, so it has no fixed ceiling;
-    /// charge its measured length before the caller reserves decoding work.
+    /// A record row grows with its record's chunk count. New layouts cap that at
+    /// 2048 chunks, but stores laid out earlier may hold larger raw records, so
+    /// charge the measured length before the caller reserves decoding work.
     fn catalog_point(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
         let bytes = self
             .snapshot

@@ -236,9 +236,10 @@ impl Client {
             .await
     }
 
-    /// Accept a complete artifact of any size with explicit buffered or durable
-    /// acknowledgment. An input above the discovered inline bound is staged in
-    /// 64 KiB appends and acknowledged durably.
+    /// Accept a complete artifact with explicit buffered or durable acknowledgment.
+    /// An input above the discovered inline bound is staged in 64 KiB appends and
+    /// acknowledged durably; the store refuses one above `MAX_IMPORT_BYTES` before
+    /// any byte is uploaded.
     pub async fn ingest_with_durability(
         &self,
         request_id: &str,

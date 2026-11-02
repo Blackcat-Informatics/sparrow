@@ -72,8 +72,8 @@ const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
 const BYTE_READ_BYTES: usize = 1024 * 1024;
-/// Largest artifact accepted as one in-memory batch. Larger artifacts of any size
-/// stream through the staged import, bounded only by the disk budget.
+/// Largest artifact accepted as one in-memory batch. Larger artifacts stream
+/// through the staged import, within the disk budget and `MAX_IMPORT_BYTES`.
 pub const INLINE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const CATALOG_STRING_BYTES: usize = 16 * 1024 * 1024;
 const CATALOG_LIMITS: json::Limits = json::Limits {
@@ -82,6 +82,107 @@ const CATALOG_LIMITS: json::Limits = json::Limits {
     max_string_bytes: CATALOG_STRING_BYTES,
     unique_members: true,
 };
+
+fn in_range(offset: u64, length: usize, size: u64) -> Result<(), Error> {
+    offset
+        .checked_add(length as u64)
+        .filter(|end| *end <= size)
+        .map(|_| ())
+        .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range is outside evidence"))
+}
+
+/// Read one record's bytes, or those of an artifact holding at most one record.
+/// A record is chunked from its own start in full CHUNK pieces, so the read seeks
+/// straight to the chunk holding `offset` and costs the requested range at any size.
+/// Only the visited chunks are checked to be full; the skipped ones are trusted.
+fn record_bytes(
+    writer: &Writer,
+    chunks: Vec<String>,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, Error> {
+    let skip = offset / CHUNK as u64;
+    let last = chunks.len().saturating_sub(1);
+    let chunks = chunks
+        .into_iter()
+        .enumerate()
+        .skip(skip as usize)
+        .map(|(index, digest)| {
+            let payload = writer.payload_chunk(&digest)?;
+            if index != last && payload.len() != CHUNK {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "record manifest holds a short chunk before its end",
+                ));
+            }
+            Ok(payload)
+        });
+    read_chunk_range(chunks, offset - skip * CHUNK as u64, length)
+}
+
+/// Read a multi-record artifact through its ordered, contiguous record rows. A
+/// binary search on `byte_start` finds the record holding `offset`; each record
+/// then seeks like `record_bytes`, so a document laid out as several raw records
+/// reads back at the cost of the requested range plus a logarithmic row search.
+fn artifact_bytes(
+    writer: &Writer,
+    ids: &[String],
+    offset: u64,
+    length: usize,
+    now: u64,
+    protected: &BTreeSet<String>,
+) -> Result<Vec<u8>, Error> {
+    let record = |index: usize| -> Result<Record, Error> {
+        let record: Record = writer.get(&ids[index])?;
+        if !writer.live_record(&record, now, protected) || record.byte_end < record.byte_start {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "live artifact references an unreadable record",
+            ));
+        }
+        Ok(record)
+    };
+    let (mut low, mut high) = (0, ids.len());
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if record(middle)?.byte_start <= offset {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    let mut result = Vec::with_capacity(length);
+    let mut position = offset;
+    for index in low..ids.len() {
+        if result.len() == length {
+            break;
+        }
+        let record = record(index)?;
+        if record.byte_start > position
+            || record.byte_end <= position && record.byte_end != record.byte_start
+            || index != low && record.byte_start != position
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "artifact records do not cover its bytes contiguously",
+            ));
+        }
+        let start = position - record.byte_start;
+        let take = (record.byte_end - position).min((length - result.len()) as u64) as usize;
+        if take == 0 {
+            continue;
+        }
+        result.extend(record_bytes(writer, record.chunks, start, take)?);
+        position += take as u64;
+    }
+    if result.len() != length {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "artifact records do not cover the requested bytes",
+        ));
+    }
+    Ok(result)
+}
 
 fn read_chunk_range(
     chunks: impl IntoIterator<Item = Result<Vec<u8>, Error>>,
@@ -395,6 +496,9 @@ struct Writer {
     /// Present exactly when the store archives before deleting.
     archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
+    /// Longest record an import layout keeps whole; `import::RAW_RECORD_BYTES`
+    /// except where the dev-only test hook lowers it for one open store.
+    raw_record_bytes: std::cell::Cell<u64>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -1302,6 +1406,7 @@ impl Store {
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
                 archive: archive.map(std::cell::RefCell::new),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
             rdf_read: Arc::new(Mutex::new(())),
@@ -1900,7 +2005,7 @@ impl Store {
             return tail_ranges::bytes(&writer, id, offset, length, now);
         }
         let protected = writer.protected(now)?;
-        let (chunks, size, single_record) = if id.starts_with("artifact:") {
+        if id.starts_with("artifact:") {
             let artifact: Artifact = writer.get(id)?;
             if !writer.live_artifact(&artifact, now, &protected) {
                 return Err(Error::new(
@@ -1908,51 +2013,34 @@ impl Store {
                     "complete artifact expired or was evicted",
                 ));
             }
-            let single_record = artifact.record_ids.len() <= 1;
-            (artifact.chunks, artifact.byte_length, single_record)
-        } else if id.starts_with("record:") {
-            let record: Record = writer.get(id)?;
-            if !writer.live_record(&record, now, &protected) {
-                return Err(Error::new(
-                    "EVIDENCE_UNAVAILABLE",
-                    "record expired or was evicted",
-                ));
+            in_range(offset, length, artifact.byte_length)?;
+            if artifact.record_ids.len() <= 1 {
+                return record_bytes(&writer, artifact.chunks, offset, length);
             }
-            (record.chunks, record.byte_end - record.byte_start, true)
-        } else {
+            return artifact_bytes(
+                &writer,
+                &artifact.record_ids,
+                offset,
+                length,
+                now,
+                &protected,
+            );
+        }
+        if !id.starts_with("record:") {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "bytes target must be an artifact or record",
             ));
-        };
-        offset
-            .checked_add(length as u64)
-            .filter(|end| *end <= size)
-            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range is outside evidence"))?;
-        // Each record is chunked from its own start in full CHUNK pieces, so a record,
-        // or an artifact of at most one record, seeks straight to the chunk holding
-        // `offset`. Reads then cost the requested range at any evidence size.
-        let skip = if single_record {
-            offset / CHUNK as u64
-        } else {
-            0
-        };
-        let last = chunks.len().saturating_sub(1);
-        let chunks = chunks
-            .into_iter()
-            .enumerate()
-            .skip(skip as usize)
-            .map(|(index, digest)| {
-                let payload = writer.payload_chunk(&digest)?;
-                if single_record && index != last && payload.len() != CHUNK {
-                    return Err(Error::new(
-                        "STORAGE_FAILURE",
-                        "record manifest holds a short chunk before its end",
-                    ));
-                }
-                Ok(payload)
-            });
-        read_chunk_range(chunks, offset - skip * CHUNK as u64, length)
+        }
+        let record: Record = writer.get(id)?;
+        if !writer.live_record(&record, now, &protected) {
+            return Err(Error::new(
+                "EVIDENCE_UNAVAILABLE",
+                "record expired or was evicted",
+            ));
+        }
+        in_range(offset, length, record.byte_end - record.byte_start)?;
+        record_bytes(&writer, record.chunks, offset, length)
     }
 
     /// Create or extend a collection atomically; every target must be live.

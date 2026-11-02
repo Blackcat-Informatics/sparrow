@@ -43,8 +43,8 @@ pub struct Discovery {
     pub store_id: String,
     /// Generated wire contract version.
     pub schema_version: u32,
-    /// Largest artifact carried in one inline ingest message. Larger artifacts of
-    /// any size stream through the staged import; this is not an artifact limit.
+    /// Largest artifact carried in one inline ingest message. Larger artifacts
+    /// stream through the staged import, up to its fixed publication bound.
     pub max_inline_artifact_bytes: u64,
     /// Maximum record membership in one artifact.
     pub max_records_per_artifact: u64,

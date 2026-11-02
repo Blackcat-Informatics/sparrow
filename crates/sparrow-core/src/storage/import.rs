@@ -18,6 +18,17 @@ const RECLAIM_CHUNKS: u64 = 128;
 /// Maximum record spans in one immutable layout page.
 pub const IMPORT_LAYOUT_PAGE_RECORDS: usize = 128;
 const LAYOUT_BYTES: usize = 32 * 1024;
+/// Longest record a layout keeps whole: 2048 chunks (128 MiB). A longer record is
+/// laid out as consecutive raw records, so each chunk manifest fits one retirement
+/// pass and one catalog read while the artifact still reads back byte-exact.
+pub const RAW_RECORD_BYTES: u64 = 2048 * CHUNK as u64;
+/// Largest input one atomic publication batch can carry. `import_publish` writes
+/// every chunk identity four times (record row, artifact row, saved receipt and
+/// ingest receipt) as a 67-byte JSON string, within 128 MiB less 16 MiB for the
+/// fixed rows: 438,210 chunks, about 26.7 GiB. The v2 store format (#5) replaces
+/// this single batch.
+pub const MAX_IMPORT_BYTES: u64 =
+    (super::publication::PUBLICATION_BYTES as u64 - 16 * 1024 * 1024) / (4 * 67) * CHUNK as u64;
 
 /// Starting an upload either resumes private staging or returns accepted evidence.
 /// An accepted retry never allocates another staging journal or occurrence.
@@ -147,8 +158,15 @@ impl Catalog for ImportManifest {
             || (manifest.layout_complete
                 && lines
                 && (manifest.layout_records == 0) != (manifest.byte_length == 0))
-            || (!lines && manifest.layout_records > 1)
-            || (manifest.layout_complete && !lines && manifest.layout_records != 1)
+            // A document is one record unless layout split it into raw records,
+            // each longer than the 16 MiB projected record bound.
+            || (!lines
+                && manifest.layout_records
+                    > manifest
+                        .byte_length
+                        .div_ceil(crate::projection::RECORD_BYTES)
+                        .max(1))
+            || (manifest.layout_complete && !lines && manifest.layout_records == 0)
             || (manifest.published_artifact.is_some() && !manifest.layout_complete)
         {
             return Err(Error::new(
@@ -418,6 +436,23 @@ impl Store {
             .begin_import(request_id, source, format, byte_length, payload_id, now)
     }
 
+    /// Lower this open store's whole-record ceiling for import layouts so a test can
+    /// split a document without a 128 MiB input. Pieces must stay raw, so the ceiling
+    /// is a whole number of chunks above twice the projected record bound.
+    /// This entry point is absent unless the dev-only test-support feature is selected.
+    #[cfg(feature = "test-support")]
+    pub fn split_raw_records_above(&self, bytes: u64) -> Result<(), Error> {
+        let floor = 2 * crate::projection::RECORD_BYTES + CHUNK as u64;
+        if !bytes.is_multiple_of(CHUNK as u64) || !(floor..=RAW_RECORD_BYTES).contains(&bytes) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "raw record ceiling must be whole chunks above twice the projected record bound",
+            ));
+        }
+        self.lock()?.raw_record_bytes.set(bytes);
+        Ok(())
+    }
+
     /// Atomically recover a shared ingestion receipt or create/resume private staging.
     pub fn import_start(
         &self,
@@ -646,11 +681,18 @@ impl Store {
         if manifest.layout_complete {
             return Ok(manifest);
         }
-        let mut rows = Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS);
-        let mut record_hash = blake3::Hasher::new();
+        let split = writer.raw_record_bytes.get();
+        let mut layout = Layout {
+            writer: &writer,
+            rows: Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS),
+            next_index: 0,
+            record_start: 0,
+            record_hash: blake3::Hasher::new(),
+            pending: None,
+            split,
+            piece: split - crate::projection::RECORD_BYTES,
+        };
         let mut input_hash = blake3::Hasher::new();
-        let mut record_start = 0;
-        let mut next_index = 0;
         let count = manifest.chunk_count().max(1);
         for chunk in 0..count {
             let bytes = if manifest.byte_length == 0 {
@@ -659,36 +701,21 @@ impl Store {
                 writer.import_chunk(&manifest, chunk * CHUNK as u64)?
             };
             input_hash.update(&bytes);
+            let base = chunk * CHUNK as u64;
             let mut cursor = 0;
             for end in record_ends(&manifest.format, &bytes, chunk + 1 == count) {
-                if next_index >= writer.config.max_records as u64 {
-                    return Err(Error::new(
-                        "RESOURCE_LIMIT",
-                        "import layout exceeds configured record count; raw staging remains available for cancellation",
-                    ));
-                }
-                record_hash.update(&bytes[cursor..end]);
-                let byte_end = chunk * CHUNK as u64 + end as u64;
-                rows.push(ImportRecordSpan {
-                    index: next_index,
-                    byte_start: record_start,
-                    byte_end,
-                    payload_id: format!(
-                        "blake3:{}",
-                        hex::encode(record_hash.finalize().as_bytes())
-                    ),
-                });
-                record_hash = blake3::Hasher::new();
-                record_start = byte_end;
+                layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..end])?;
+                layout.finish_record(&mut manifest, base + end as u64)?;
                 cursor = end;
-                next_index += 1;
-                if rows.len() == IMPORT_LAYOUT_PAGE_RECORDS {
-                    writer.commit_layout_page(&mut manifest, &rows, false)?;
-                    rows.clear();
-                }
             }
-            record_hash.update(&bytes[cursor..]);
+            layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..])?;
         }
+        let Layout {
+            rows,
+            next_index,
+            record_start,
+            ..
+        } = layout;
         if next_index < manifest.layout_records
             || record_start != manifest.byte_length
             || format!("blake3:{}", hex::encode(input_hash.finalize().as_bytes()))
@@ -898,6 +925,14 @@ impl Writer {
             previous.require_live(now)?;
             return Ok(previous);
         }
+        if byte_length > MAX_IMPORT_BYTES {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                format!(
+                    "declared input of {byte_length} bytes exceeds {MAX_IMPORT_BYTES} bytes (about 26.7 GiB), the most one atomic publication can carry; split the input and import the parts"
+                ),
+            ));
+        }
         if byte_length > writer.config.disk_budget - writer.config.maintenance_reserve {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -937,6 +972,100 @@ impl Writer {
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
         Ok(manifest)
+    }
+}
+
+/// Streaming record layout. A record longer than `split` bytes is emitted as
+/// consecutive raw records: each full piece is `piece` bytes, a whole number of
+/// chunks, and the remainder keeps more than `RECORD_BYTES`, so every piece stays
+/// raw and none exceeds `split`.
+struct Layout<'a> {
+    writer: &'a Writer,
+    rows: Vec<ImportRecordSpan>,
+    next_index: u64,
+    record_start: u64,
+    /// Digest of the bytes since `record_start`.
+    record_hash: blake3::Hasher,
+    /// Candidate cut at `record_start + piece`, the digest of the bytes before it,
+    /// and the digest of the bytes after it.
+    pending: Option<(u64, String, blake3::Hasher)>,
+    split: u64,
+    piece: u64,
+}
+
+fn payload_id(hash: &blake3::Hasher) -> String {
+    format!("blake3:{}", hex::encode(hash.finalize().as_bytes()))
+}
+
+impl Layout<'_> {
+    /// Hash the bytes at artifact offset `at`, all inside the current record.
+    fn feed(&mut self, manifest: &mut ImportManifest, at: u64, bytes: &[u8]) -> Result<(), Error> {
+        let end = at + bytes.len() as u64;
+        let cut = self.record_start + self.piece;
+        match &mut self.pending {
+            None if at <= cut && cut < end => {
+                let (before, after) = bytes.split_at((cut - at) as usize);
+                self.record_hash.update(before);
+                let id = payload_id(&self.record_hash);
+                self.record_hash.update(after);
+                let mut tail = blake3::Hasher::new();
+                tail.update(after);
+                self.pending = Some((cut, id, tail));
+            }
+            None => {
+                self.record_hash.update(bytes);
+            }
+            Some((_, _, tail)) => {
+                self.record_hash.update(bytes);
+                tail.update(bytes);
+            }
+        }
+        if end - self.record_start > self.split {
+            let (cut, id, tail) = self
+                .pending
+                .take()
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "raw record split lost its cut"))?;
+            self.emit(manifest, cut, id)?;
+            self.record_hash = tail;
+        }
+        Ok(())
+    }
+
+    /// Close the current record, which `feed` has kept within `split` bytes.
+    fn finish_record(&mut self, manifest: &mut ImportManifest, byte_end: u64) -> Result<(), Error> {
+        self.pending = None;
+        let id = payload_id(&self.record_hash);
+        self.emit(manifest, byte_end, id)?;
+        self.record_hash = blake3::Hasher::new();
+        Ok(())
+    }
+
+    fn emit(
+        &mut self,
+        manifest: &mut ImportManifest,
+        byte_end: u64,
+        payload_id: String,
+    ) -> Result<(), Error> {
+        if self.next_index >= self.writer.config.max_records as u64 {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "import layout exceeds configured record count; raw staging remains available for cancellation",
+            ));
+        }
+        self.rows.push(ImportRecordSpan {
+            index: self.next_index,
+            byte_start: self.record_start,
+            byte_end,
+            payload_id,
+        });
+        self.record_start = byte_end;
+        self.next_index += 1;
+        if self.rows.len() == IMPORT_LAYOUT_PAGE_RECORDS {
+            self.writer
+                .commit_layout_page(manifest, &self.rows, false)?;
+            self.rows.clear();
+        }
+        Ok(())
     }
 }
 

@@ -7037,6 +7037,143 @@ fn stage_fixture(
     store.import_prepare_layout(&manifest.id, 0).unwrap()
 }
 
+/// Import and publish one JSON document of `size` bytes with distinct chunks,
+/// optionally under a lowered raw-record ceiling.
+fn json_document(
+    dir: &std::path::Path,
+    ceiling: Option<u64>,
+    size: usize,
+) -> (Store, sparrow_core::Artifact, Vec<u8>) {
+    let chunk = sparrow_core::IMPORT_CHUNK_BYTES;
+    let mut settings = config();
+    settings.disk_budget = 512 * 1024 * 1024;
+    let store = Store::open(dir, settings).unwrap();
+    if let Some(ceiling) = ceiling {
+        store.split_raw_records_above(ceiling).unwrap();
+    }
+    let mut input = b"{\"message\":\"".to_vec();
+    let start = input.len();
+    input.resize(size - 3, b'x');
+    for (index, piece) in input[start..].chunks_mut(chunk).enumerate() {
+        let marker = purrdf_hash::hex::encode(&(index as u64).to_le_bytes());
+        piece[..marker.len()].copy_from_slice(marker.as_bytes());
+    }
+    input.extend_from_slice(b"\"}\n");
+    let manifest = stage_fixture(&store, "json-document", "json", &input);
+    for ordinal in 0..manifest.layout_records {
+        let prepared = (0..64).any(|_| {
+            store
+                .import_prepare_record(&manifest.id, ordinal, 0)
+                .unwrap()
+                .prepared_records
+                > ordinal
+        });
+        assert!(prepared, "raw record {ordinal} prepares in bounded steps");
+    }
+    let artifact = store.import_publish(&manifest.id, 0).unwrap();
+    (store, artifact, input)
+}
+
+/// Lay out one 50 MiB JSON document under the smallest raw-record ceiling, which
+/// splits it into three raw records, then publish it.
+fn split_document(dir: &std::path::Path) -> (Store, sparrow_core::Artifact, Vec<u8>) {
+    let ceiling = 32 * 1024 * 1024 + sparrow_core::IMPORT_CHUNK_BYTES as u64;
+    let (store, artifact, input) = json_document(dir, Some(ceiling), 50 * 1024 * 1024);
+    let piece = ceiling - 16 * 1024 * 1024;
+    let bounds: Vec<_> = artifact
+        .record_ids
+        .iter()
+        .map(|id| store.record(id).unwrap())
+        .map(|record| (record.byte_start, record.byte_end))
+        .collect();
+    assert_eq!(
+        bounds,
+        [
+            (0, piece),
+            (piece, 2 * piece),
+            (2 * piece, input.len() as u64)
+        ]
+    );
+    (store, artifact, input)
+}
+
+#[test]
+fn rdf_record_view_charges_a_large_raw_record_row_by_its_measured_length() {
+    use purrdf_lex::json::record::ToJson;
+    let dir = tempfile::tempdir().unwrap();
+    // One 45 MiB document stays a single raw record of 721 chunks. Its catalog
+    // row exceeds the fixed bound the view once derived from a 16 MiB limit.
+    let (store, artifact, _) = json_document(dir.path(), None, 45 * 1024 * 1024);
+    let id = artifact.record_ids[0].clone();
+    let row = purrdf_lex::json::write_compact(&store.record(&id).unwrap().to_json()).len();
+    assert!(row > (16 * 1024 * 1024 / sparrow_core::IMPORT_CHUNK_BYTES + 1) * 128 + 8192);
+    let metadata = sparrow_core::RdfGraphLayers {
+        metadata: true,
+        diagnostic: false,
+        content: false,
+    };
+    store
+        .with_rdf_record_layers(&[id], metadata, 1, Default::default(), |_| ())
+        .unwrap();
+}
+
+#[test]
+fn split_raw_document_reads_back_exactly_and_both_expires_and_evicts() {
+    use sparrow_core::EvictionLimits;
+    // A pass budget below the whole document's 801 chunks, above each piece's.
+    let limits = EvictionLimits {
+        max_payload_refs: 600,
+        ..EvictionLimits::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (store, artifact, input) = split_document(dir.path());
+    let window = 1024 * 1024;
+    for offset in (0..input.len()).step_by(window) {
+        let length = window.min(input.len() - offset);
+        assert_eq!(
+            store.bytes(&artifact.id, offset as u64, length, 1).unwrap(),
+            input[offset..offset + length]
+        );
+    }
+    let refused = store
+        .import_begin(
+            "too-large",
+            "oversized",
+            "json",
+            sparrow_core::MAX_IMPORT_BYTES + 1,
+            &artifact.payload_id,
+            1,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert!(refused.message.contains("split the input"));
+    let mut expired = 0;
+    let drained = (0..64).any(|_| {
+        let report = store.expire_bounded(30 * DAY, limits).unwrap();
+        expired += report.records;
+        !report.continuation
+    });
+    assert!(drained && expired == 3, "{expired} records expired");
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, artifact, _) = split_document(dir.path());
+    let mut evicted = 0;
+    let drained = (0..64).any(|_| {
+        let report = store.evict_oldest(1, limits).unwrap();
+        evicted += report.records.len();
+        !report.continuation && report.pending_manifest_refs == 0
+    });
+    assert!(drained && evicted == 3, "{evicted} records evicted");
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 1).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+}
+
 #[test]
 fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_bytes() {
     let dir = tempfile::tempdir().unwrap();
