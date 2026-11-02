@@ -5,43 +5,82 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 # Installing Sparrow on Linux
 
-The repository supplies a persistent systemd user unit at
-`packaging/systemd/sparrow.service`. It runs the same typed daemon as the
-development unit, with a private Unix socket and configured public Cap'n Proto
-TCP socket. The selected public binding is `0.0.0.0:518`.
+The production deployment lives in [`deploy/`](../deploy/README.md): a system
+unit, `sparrow.service`, running as the `sparrow` user in the fleet's
+production slice, with its store and private socket under `/SPARROW/store`,
+its consume roots under `/SPARROW/intake` and its configuration in
+`/etc/sparrow`. `deploy/README.md` walks from a scratch clone to a running,
+verified service, `deploy/RECOVERY.md` covers failures, rollback and restore,
+and `deploy/MANUAL.md` runs the daemon by hand. This document explains the
+configuration and the behavior those procedures rely on.
+
+## Kept images and seeded builds
 
 Run `make check`, commit through the normal verification hook, then run
-`make build-runtime`. Install the explicitly selected release binaries under
-unique revision-qualified names in `~/.local/libexec/sparrow/`. Compare their
-hashes with the build artifacts. Keep previous images for an explicit rollback;
-do not overwrite an executing image. Installation and live verification are
-separate from the source gate.
+`make install-bin`. It builds the release daemon, CLI and recovery probe
+through the managed cargo wrapper and copies them into `./bin` with
+`cp --reflink=auto` under revision-qualified names:
+`bin/sparrowd-schemaN-REV`, `bin/sparrow-schemaN-REV` and
+`bin/sparrow-recovery-schemaN-REV`, where `N` is the client schema version and
+`REV` the short commit. It also copies the five native CBOR lexicons, with
+their provenance manifest, notices and licenses, from the PurRDF revision the
+lockfile resolves into `bin/lexicons-PURRDF_REV/`. It refuses an uncommitted
+tree and never overwrites a kept name with other bytes. `./bin` is ignored by
+Git, and a kept image survives the automatic cull of `target/`.
+`deploy/install.sh` and `deploy/start.sh` install from `./bin` into
+`/usr/local/libexec/sparrow` with `cp --reflink=auto`, so every deployed image
+has a kept source copy, and never overwrite an executing image.
 
-The unit uses these stable paths:
+Release builds and tests run through the managed cargo wrapper. On a new
+worktree's first build it seeds the managed `target` directory by reflink from
+the most reusable sibling checkout (`cargo --stage-seed-only` does only that
+step), so worktree builds start warm. Seeding copies every gitignored file of
+the primary checkout as well; `.config/wt.toml` excludes credentials (`/.env`,
+`/.env.*`, `*.secret`), kept images, stores, backups, intake roots and probe
+data, and `make seed-excludes-check` fails when an exclusion no longer names
+anything this host keeps. Do not set `STAGE_CARGO_SEED=off` except to measure
+a cold build.
 
-| Path | Contents |
-| --- | --- |
-| `~/.local/libexec/sparrow/sparrowd` | Symlink to the selected installed daemon image. |
-| `~/.local/bin/sparrow` | Symlink to the selected installed CLI image. |
-| `~/.config/sparrow/server.toml` | Reviewed deployment configuration with absolute paths. |
-| `~/.config/systemd/user/sparrow.service` | Copy of the repository unit. |
+Build times for `cargo build --locked --release -p sparrow-server`, measured
+the same way as the draws repository (cold, and seeded plus seeding), on the
+32-CPU host. The kache compiler cache stays active in every run, including the
+cold one; `STAGE_CARGO_SEED=off` only skips the reflink seeding of `target`.
 
-Create private configuration/state directories with mode 0700 and configuration
-with mode 0600. Existing paths belong to the operator: inspect them before
-installation or replacement. Copy the five required native CBOR lexicons and
-their provenance manifest, notices and licenses into a revision-qualified directory under
-`~/.local/share/sparrow/`; configure `text_lexicon_dir` to that installed bundle.
-Compare each copied artifact with its source. The daemon's existing native
-analyzer resolver verifies the required artifact identities before serving.
-Runtime configuration must not depend on an editable sibling checkout.
+| Run | Time | Load average (1, 5, 15 min) at start |
+| --- | --- | --- |
+| Seeding (`cargo --stage-seed-only`, new worktree) | 1201.8 s | 187.6, 154.4, 117.9 |
+| Seeded build | not measured: the link failed (below) | 97.5, 109.1, 125.6 |
+| Cold build (`STAGE_CARGO_SEED=off`) | not measured | |
+
+The seeded build of 2026-11-01 compiled for 6267.7 s, most of it queued
+behind other sessions' compilations in kache's scheduler, and then both
+binaries' links failed with SIGBUS in the linker. The `/opt` filesystem that
+holds every build directory had no unallocated space and full metadata, and
+other repositories' links failed the same way, so neither figure reflects
+Sparrow's build. Repeat both runs once `/opt` has unallocated space again
+(`btrfs filesystem usage /opt` shows it) and replace this paragraph with the
+figures:
+
+```bash
+STAGE_CARGO_SEED=off cargo build --locked --release -p sparrow-server   # in a new worktree: cold
+cargo build --locked --release -p sparrow-server                        # in another new worktree: seeding plus seeded
+```
+
+## Configuration
 
 Configuration supplies the store/socket paths, disk budget, maintenance reserve,
-operation ceilings and intake definitions. `config/development.toml` is a
-host-specific example for owned synthetic intake, not production source
-authority. Preserve an existing store's configuration and catalog watch
-revisions during migration. Consume entries seed only a missing catalog;
-typed watch administration controls later changes. Never add production sample
-directories as destructive watches merely because they were sample inputs.
+operation ceilings and intake definitions. `deploy/config/server.toml.example`
+is the production template; `config/development.toml` is a host-specific
+example for owned synthetic intake, not production source authority. Copy the
+lexicon bundle from `./bin` into a revision-qualified directory (install.sh
+does this under `/usr/local/share/sparrow/`) and configure `text_lexicon_dir`
+to that installed bundle; the daemon's native analyzer resolver verifies the
+required artifact identities before serving. Runtime configuration must not
+depend on an editable sibling checkout. Preserve an existing store's
+configuration and catalog watch revisions during migration. Consume entries
+seed only a missing catalog; typed watch administration controls later
+changes. Never add production sample directories as destructive watches merely
+because they were sample inputs.
 
 `max_concurrent_requests` admits simultaneous storage work, including intake
 workers (1..64). `max_rpc_connections` independently admits Unix and TCP RPC
@@ -70,45 +109,44 @@ filled the disk between checks, the daemon exits with an error and
 `Restart=on-failure` reopens the store.
 
 Public TCP requires `rpc_tcp_secret_file`. Generate a random secret with mode
-0600, for example `(umask 077; head -c 32 /dev/urandom > ~/.config/sparrow/tcp.secret)`,
+0600, for example `sudo sh -c 'umask 077; head -c 32 /dev/urandom > /etc/sparrow/tcp.secret'`,
 and do not use a passphrase: an observer of one CHAP exchange can test guesses
-offline. Copy the same file privately to each remote agent host and pass it with
+offline. The unit passes it to the daemon as a systemd credential, so
+`rpc_tcp_secret_file` names `/run/credentials/sparrow.service/tcp.secret`.
+Copy the same file privately to each remote agent host and pass it with
 `sparrow --secret-file PATH tcp://ADDRESS:518 COMMAND`. Producers that only
 discover, ingest and import need no secret. CHAP does not encrypt traffic or
 authenticate the server, so restrict the listener to trusted networks.
 
-Port 518 requires the daemon image to have `cap_net_bind_service=ep`, or another
-explicitly configured host privilege arrangement. Apply a file capability to the
-final installed image, not the symlink or a volatile build artifact; copying an
-image does not preserve that capability. Verify with `getcap` before cutover.
-The client needs no file capability. The unit does not run a privileged shell
-or introduce another transport.
+Port 518 is below 1024. The unit grants `CAP_NET_BIND_SERVICE` as an ambient
+capability and holds nothing else in its bounding set; no file capability is
+set on any image, and copying an image therefore needs no `setcap`. The client
+needs no capability.
 
-Validate the installed unit with:
+The private Unix socket is `rpc.sock` directly inside `data_dir`. The daemon
+sets `data_dir` to mode 0710 and the socket to 0660 each time it starts, so
+members of the daemon's group can connect and cannot list or read the store;
+store files stay owner-only under the unit's `UMask=0077`. Only the operator
+belongs to that group, for the CLI and administration. Fleet producers ingest
+through the ingest-only group socket of issue #10, not this socket.
+Validate the unit files, and their security exposure, without loading them:
 
 ```bash
-systemd-analyze --user verify ~/.config/systemd/user/sparrow.service
+systemd-analyze verify deploy/systemd/sparrow.service
+systemd-analyze security --offline=yes deploy/systemd/sparrow.service
 ```
 
 For a migration, capture the current typed status, image identity, unit and
-configuration. Stop the old Sparrow unit through its SIGINT shutdown path and
-verify it is terminal, with its Unix socket removed. Never open two owners on
-one store. Then load and enable the installed unit:
+configuration, and follow `deploy/README.md`, "Moving a running service". Stop
+the old Sparrow unit through its SIGINT shutdown path and verify it is
+terminal, with its Unix socket removed. Never open two owners on one store.
+Verify store identity, schema/format, retained counts, watches, byte reads and
+saved mutation retries over Unix and TCP after adoption. Stop the new unit
+before reverting an image/configuration; reverting a binary alone cannot undo a
+store-format upgrade. A closed-store backup is a recovery artifact, and its
+existence does not prove restoration has been exercised.
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now sparrow.service
-systemctl --user status sparrow.service
-sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 status
-sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 mcp --stdio
-```
-
-Use the actual reachable server address for remote clients. Verify store
-identity, schema/format, retained counts, watches, byte reads and saved mutation
-retries over Unix and TCP after adoption. Stop the new unit before reverting an
-image/configuration; reverting a binary alone cannot undo a store-format upgrade.
-A closed-store backup is a recovery artifact, and its existence does not prove
-restoration has been exercised.
+## Recovery qualification
 
 For isolated recovery qualification, copy a closed-store backup to a separate
 directory and copy the deployment configuration with `data_dir` and
@@ -117,9 +155,12 @@ example uses the existing configuration/store readers directly, without starting
 listeners, maintenance or saved watch workers:
 
 ```bash
-cargo build --locked --release -p sparrow-server --example recovery
-target/release/examples/recovery restored.toml EXPECTED_STORE RFC3339 EVIDENCE_ID...
+bin/sparrow-recovery-schemaN-REV restored.toml EXPECTED_STORE RFC3339 EVIDENCE_ID...
 ```
+
+`make install-bin` keeps the probe in `./bin`; without it, build it with
+`cargo build --locked --release -p sparrow-server --example recovery` and run
+`target/release/examples/recovery` instead.
 
 Supply explicit artifact, record or finished file-generation IDs from captured
 discovery pages, following every continuation. The example admits at most 1024
@@ -140,11 +181,7 @@ upgrades; always work on a disposable restored copy. A live store is protected
 by the existing single-owner database lock. The example never activates its
 saved source paths, even when the copied watch catalog names original roots.
 
-For boot startup independently of an interactive login, verify
-`loginctl show-user "$USER" -p Linger`. Enabling lingering when absent is a host
-administration action. The enabled unit and lingering establish boot
-configuration; a reboot test is separate evidence and must not be claimed from
-unit validation alone.
+## Unit behavior
 
 The unit uses SIGINT because the daemon implements worker drain and WAL fencing
 on that signal. It gives shutdown 120 seconds and reports failure if the process
@@ -153,21 +190,28 @@ Startup takes the store's exclusive lock before it removes a refused stale Unix
 socket, so a restart never creates a second writer. Five failed starts within
 ten minutes stop the unit for diagnosis, such as missing dependencies or a
 refused store open. Never remove a socket by hand until the prior owner is
-proven terminal.
-The kernel throttles the unit's memory above 2 GiB (`MemoryHigh`) and kills it
-at 4 GiB (`MemoryMax`), so a leak cannot deepen host-wide memory pressure.
-`CPUQuota=100%` holds the daemon to one core and `IOWeight=20` gives it low disk
-priority; `Nice=10` only orders its own threads. A sustained deep-JSON backlog
-once saturated the host's CPU and disk; under these limits ingest slows instead.
-Journal output remains available through `journalctl --user -u sparrow.service`.
+proven terminal. As a system unit enabled under `multi-user.target`, it starts
+at boot without a login session.
+
+The kernel protects 1 GiB of the daemon's memory from reclaim (`MemoryLow`),
+throttles it above 2 GiB (`MemoryHigh`) and kills it at 4 GiB (`MemoryMax`), so
+a leak cannot deepen host-wide memory pressure. The production slice outweighs
+development (`user.slice`) 100 to 1 in CPU and IO, and the daemon runs at nice
+-20 with best-effort IO priority 0, so development yields to it under
+contention. Within the slice, `CPUQuota=100%` holds the daemon to one core and
+`IOWeight=20` makes it yield disk to the other production services: a
+sustained deep-JSON backlog once saturated the host's CPU and disk, and under
+these limits ingest slows instead. `LimitNOFILE=65536` covers RocksDB, which
+keeps every table file open. Journal output is available through
+`journalctl -u sparrow.service`.
 
 ## Shipping finished files from producers that keep them
 
 A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
-`packaging/shipper/sparrow-ship` copies finished files from such directories
+`deploy/libexec/sparrow-ship` copies finished files from such directories
 into a private queue under its `state_dir`, then feeds queued items into
 Sparrow-owned roots. It only reads the originals. Each `[[source]]` in its
-TOML configuration (see `packaging/shipper/ship.example.toml`) names the consume
+TOML configuration (see `deploy/config/ship.toml.example`) names the consume
 root `intake_root/NAME`, the source directory, a glob and one finishing rule:
 
 - `daily`: dated files; the newest name may still be appended to.
@@ -207,14 +251,14 @@ identity and is shipped again whole, so its earlier records appear twice.
 over successive runs. Failures exit nonzero and leave originals untouched for
 the next run.
 
-Create each consume root and its watch before the first run, then install:
-
-```bash
-install -m 0755 packaging/shipper/sparrow-ship ~/.local/libexec/sparrow/
-cp packaging/systemd/sparrow-ship.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now sparrow-ship.timer
-```
+`state_dir` must be on the same filesystem as `intake_root`, because each
+queued item is renamed into its root; production keeps both under `/SPARROW`.
+The daemon runs as its own user and reads each item through its group, so the
+shipper sets every staged item to mode 0640, and `state_dir` is setgid to the
+daemon's group (`deploy/README.md`, "Permissions"). Create each consume root
+and its watch before the first run. `deploy/install.sh` installs the shipper
+and `sparrow-ship.service`, a system unit that runs it as the operator in the
+production slice, with `sparrow-ship.timer`.
 
 The timer runs five minutes after each completed run. Shipped data arrives when
 its producer finishes a file, not as it is written.
@@ -222,7 +266,7 @@ its producer finishes a file, not as it is written.
 ## Closed-store backups
 
 Sparrow has no online checkpoint, so a consistent backup needs a closed store.
-`packaging/backup/sparrow-backup` stops `sparrow.service` through its SIGINT
+`deploy/libexec/sparrow-backup` stops `sparrow.service` through its SIGINT
 drain, copies `data_dir`, the consume intake root, the server configuration and
 any extra paths, and starts the service again. It refuses to run when the
 service is not already active, so it never starts a service an operator
@@ -236,12 +280,10 @@ run unless free space covers twice the store plus 10 GiB, in case extents are
 not shared. Each backup lists its sources in `SOURCE`; the journal records the
 measured downtime. A lock prevents overlapping runs.
 
-```bash
-install -m 0755 packaging/backup/sparrow-backup ~/.local/libexec/sparrow/
-cp packaging/systemd/sparrow-backup.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now sparrow-backup.timer
-```
+`deploy/install.sh` installs it with `sparrow-backup.service`, a system unit
+that runs it as root, because it stops and starts the system unit and copies
+trees of several owners with their owners preserved; its writes are confined to
+the backup root.
 
 An unfinished consume claim binds the inode of its intake root and claimed
 file, which no restored copy can reproduce, so a backup must contain no
@@ -256,7 +298,7 @@ the wait: with the example's 16 MiB budget, 1 MiB chunks and 16 MiB
 `max_whole_bytes`, the roots never hold more than 16 MiB, which drains in about
 eight minutes at the measured 30 seconds per MiB.
 
-The unit keeps three daily copies under `~/.local/share/sparrow/backups/`,
+The unit keeps three daily copies under `/SPARROW/backups/`,
 taken between 04:00 and 04:15 local time. It also copies the shipper ledgers and
 watch definitions and holds the shipper's lock throughout, so the store, the
 files awaiting ingest and the ledgers all describe the same moment. Reflink copies share unchanged extents with the live
@@ -264,7 +306,8 @@ store, but compaction rewrites files, so the copies gradually stop sharing.
 Budget up to three times the store size. A copy on the same disk protects
 against software faults and operator error, not disk loss.
 
-To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
+The NAS archive (`/net/synology/archives/sparrow`) is the off-host backup,
+once its worker is enabled. To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
 `sparrow.service`. Move the damaged `data_dir`, the intake root directory and
 the shipper's `state_dir` aside rather than deleting them. Copy `BACKUP/store`
 to `data_dir`, `BACKUP/intake` to the intake root and `BACKUP/config/ship` to
@@ -274,10 +317,11 @@ three must come from the same backup, so that the files awaiting ingest match
 the ledgers. The shipper then resends every file shipped after the backup whose
 original still exists. Records that producers sent directly after the backup
 are lost unless they resend them. This whole-service procedure has not been
-exercised; the drill covers only reading a restored store. Before replacing a live store, qualify the backup on a disposable copy
-with the recovery example above. Never start `sparrowd` on such a copy: its
+exercised; the drill covers only reading a restored store. `deploy/RECOVERY.md`,
+"Restore from a backup", gives the commands. Before replacing a live store,
+qualify the backup on a disposable copy with the recovery probe above. Never start `sparrowd` on such a copy: its
 watch catalog names the live consume roots.
 
-This packaging does not establish whole-corpus throughput, physical reclamation,
+This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live
 acceptance evidence are recorded in [Development runtime](development-runtime.md).

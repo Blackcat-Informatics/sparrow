@@ -301,7 +301,7 @@ they do not specify their generated wire grammar.
 | Completed-file quiet interval | 30 seconds, configurable per watch; observed reopen/write activity postpones consumption. |
 | Pin duration | Required on every create/add/renew operation; no permanent or implicit pin. |
 | Disk capacity | An explicit deployment budget and maintenance reserve are required. |
-| RPC binding | Private Unix-domain socket: directory mode 0700, socket mode 0600; public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08. Anonymous TCP peers may only discover, ingest and import; every other operation requires a shared-secret CHAP session (2026-10-27). |
+| RPC binding | Private Unix-domain socket for the daemon's group: store directory mode 0710, socket mode 0660, so a group member can connect but not list or read the store (2026-11-01); public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08. Anonymous TCP peers may only discover, ingest and import; every other operation requires a shared-secret CHAP session (2026-10-27). |
 | Pagination | Default 200 items, maximum 1,000, additionally limited by serialized response bytes. |
 | Structured response budget | Default 256 KiB, configurable under a server maximum. |
 | Byte-read chunk | Default 64 KiB; maximum 1 MiB per call. |

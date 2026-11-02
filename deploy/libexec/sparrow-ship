@@ -176,6 +176,10 @@ def enqueue(source, path, stat, config, queue, staging):
             leftover.unlink()
         raise RuntimeError(f"{path} changed while it was copied")
     for item in staged:
+        # The daemon runs as its own user and reads the item through its group:
+        # state_dir is setgid to that group, and a reflink copy takes the
+        # producer's mode, which may give the group nothing. Set it explicitly.
+        os.chmod(item, 0o640)
         with open(item, "rb") as handle:
             os.fsync(handle.fileno())
     for item in staged:

@@ -262,7 +262,9 @@ impl ServerConfig {
                 archive: self.archive.as_ref().map(ArchiveConfig::policy),
             },
         )?;
-        std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o700))?;
+        // The daemon's group may traverse to the socket it binds here (mode 0660); it can
+        // neither list nor read the store, whose files the unit's umask keeps owner-only.
+        std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o710))?;
         Ok(store)
     }
 }

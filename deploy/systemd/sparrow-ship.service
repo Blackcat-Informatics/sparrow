@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# The shipper (deploy/libexec/sparrow-ship, installed as /usr/local/libexec/sparrow/sparrow-ship)
+# copies finished producer files into the consume roots. Installed verbatim as
+# /etc/systemd/system/sparrow-ship.service and run by sparrow-ship.timer.
+#
+# A system unit, not the operator's user unit, so that it runs in lillith.slice. It runs as the
+# operator, paudley, because it reads the producers' directories under /home/paudley read-only.
+# Its state (queue, ledgers, lock) is /SPARROW/ship, on the same filesystem as /SPARROW/intake,
+# because each queued item is renamed into its root. /SPARROW/ship is setgid sparrow, so every
+# item it stages belongs to the sparrow group, and the shipper sets each item to mode 0640 so the
+# daemon can read it.
+
+[Unit]
+Description=Copy finished producer files into Sparrow consume roots
+Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
+After=sparrow.service
+RequiresMountsFor=/SPARROW
+
+[Service]
+Type=oneshot
+User=paudley
+Group=paudley
+SyslogIdentifier=sparrow-ship
+ExecStart=/usr/local/libexec/sparrow/sparrow-ship /etc/sparrow/ship.toml
+UMask=0077
+MemoryMax=512M
+TimeoutStartSec=30min
+
+# Priority (PRODUCTION-LAUNCH section B): her slice, not real time.
+Slice=lillith.slice
+Nice=-20
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+OOMScoreAdjust=-900
+RestrictRealtime=yes
+
+# Not confined by AppArmor: it is a Python program that runs cp, and its profile is a follow-up
+# (deploy/RECOVERY.md, "Exposure"). The systemd sandbox below confines its writes to its own state
+# and the consume roots.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/SPARROW/ship /SPARROW/intake
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources

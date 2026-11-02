@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# The closed-store backup (deploy/libexec/sparrow-backup, installed as
+# /usr/local/libexec/sparrow/sparrow-backup), run daily by sparrow-backup.timer. Installed verbatim
+# as /etc/systemd/system/sparrow-backup.service.
+#
+# It runs as root: it stops and starts the system unit sparrow.service, and copies the store
+# (sparrow's, 0700 files), the intake roots, the shipper's state (paudley's) and /etc/sparrow with
+# their owners preserved. Its writes are confined to /SPARROW/backups. The NAS archive
+# (/net/synology/archives/sparrow) is the off-host backup (Patrick, 2026-11-01); these copies share
+# the store's disk and protect against software faults and operator error only.
+
+[Unit]
+Description=Closed-store backup of the Sparrow service
+Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
+RequiresMountsFor=/SPARROW
+
+[Service]
+Type=oneshot
+SyslogIdentifier=sparrow-backup
+Environment=PATH=/usr/local/bin:/usr/bin
+# The marker that tells ExecStopPost the script stopped Sparrow: $RUNTIME_DIRECTORY/stopped.
+RuntimeDirectory=sparrow-backup
+RuntimeDirectoryMode=0700
+UMask=0077
+# Keep three daily copies; reflinks share unchanged extents with the live store. Hold the
+# shipper's lock so the copied store, intake roots and ledgers agree.
+ExecStart=/usr/bin/flock /SPARROW/ship/lock /usr/local/libexec/sparrow/sparrow-backup /etc/sparrow/server.toml /SPARROW/backups 3 /SPARROW/intake /etc/sparrow /SPARROW/ship
+# Restart Sparrow only if the script stopped it and was killed before restarting.
+ExecStopPost=/bin/sh -c 'if [ -e /run/sparrow-backup/stopped ]; then systemctl start sparrow.service && rm -f /run/sparrow-backup/stopped; fi'
+# Draining the intake roots may take up to 30 minutes before the copy.
+TimeoutStartSec=45min
+
+# Priority (PRODUCTION-LAUNCH section B): her slice, not real time.
+Slice=lillith.slice
+Nice=-20
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+OOMScoreAdjust=-900
+RestrictRealtime=yes
+
+# Not confined by AppArmor: a Python program that runs cp, sync, systemctl and the sparrow CLI; its
+# profile is a follow-up (deploy/RECOVERY.md, "Exposure"). It keeps only the capabilities a copy
+# that preserves owners needs.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/SPARROW/backups
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# ~@privileged includes @chown, which a copy that preserves owners needs.
+SystemCallFilter=@chown

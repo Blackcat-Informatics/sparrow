@@ -27,6 +27,14 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
             let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
             let _daemon = start(&config, &socket).await;
+            // INVARIANT: the daemon's group can reach the socket and nothing else in the store.
+            let mode = |path: &std::path::Path| {
+                std::os::unix::fs::PermissionsExt::mode(
+                    &std::fs::symlink_metadata(path).unwrap().permissions(),
+                ) & 0o7777
+            };
+            assert_eq!(mode(&data), 0o710);
+            assert_eq!(mode(&socket), 0o660);
             let baseline = cli(&socket, &["capabilities"]);
             assert_eq!(baseline["transport"].as_str(), Some("capnp"));
             assert_eq!(baseline["transports"], Value::array(["unix", "tcp"]));

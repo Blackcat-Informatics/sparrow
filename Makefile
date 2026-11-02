@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 .DEFAULT_GOAL := check
-.PHONY: all check tools-check fmt fmt-check lint test census census-cross census-check install-hooks build-runtime
+.PHONY: all check tools-check fmt fmt-check lint test census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
 
 all: check
 check: tools-check fmt-check lint test census-check
@@ -11,6 +11,17 @@ check: tools-check fmt-check lint test census-check
 # managed Cargo targets may republish unselected artifacts from another lease.
 build-runtime: tools-check
 	cargo build --locked --release -p sparrow-server --bins
+
+# Keep the deployed images and lexicons in ./bin under revision-qualified names
+# (tools/install-bin.sh); deploy/install.sh installs from there.
+install-bin: tools-check
+	@git diff --quiet HEAD -- || { echo "error: commit first; ./bin names images for HEAD"; exit 1; }
+	cargo build --locked --release -p sparrow-server --bins --example recovery
+	tools/install-bin.sh
+
+# Every exclusion in .config/wt.toml names something this host keeps (tools/seed-excludes-check.sh).
+seed-excludes-check:
+	tools/seed-excludes-check.sh
 
 tools-check:
 	@command -v cargo >/dev/null || { echo "error: cargo is required (Rust 1.98 or newer)"; exit 1; }

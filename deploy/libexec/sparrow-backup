@@ -39,7 +39,8 @@ from pathlib import Path
 UNIT = "sparrow.service"
 STAMP = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
 QUIESCE_SECONDS = 30 * 60
-MARKER = Path(os.environ.get("XDG_RUNTIME_DIR", "/nonexistent")) / "sparrow-backup.stopped"
+# The unit's RuntimeDirectory=; its ExecStopPost reads the same name.
+MARKER_NAME = "stopped"
 
 
 def fail(message):
@@ -47,7 +48,7 @@ def fail(message):
 
 
 def systemctl(*args):
-    subprocess.run(["systemctl", "--user", *args], check=True)
+    subprocess.run(["systemctl", *args], check=True)
 
 
 def du(path):
@@ -92,13 +93,18 @@ def waiting_files(intake):
 
 
 def main(server_config, backup_root, keep, intake, extra):
+    runtime = os.environ.get("RUNTIME_DIRECTORY")
+    if not runtime or not Path(runtime).is_dir():
+        fail("RUNTIME_DIRECTORY is not set to a directory; run through sparrow-backup.service "
+             "or set it as deploy/MANUAL.md shows")
+    marker = Path(runtime) / MARKER_NAME
     signal.signal(signal.SIGTERM, terminated)
     with open(server_config, "rb") as handle:
         server = tomllib.load(handle)
     data_dir, socket = Path(server["data_dir"]), Path(server["socket_path"])
     if not data_dir.is_dir():
         fail(f"data_dir {data_dir} is missing")
-    if subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT]).returncode != 0:
+    if subprocess.run(["systemctl", "is-active", "--quiet", UNIT]).returncode != 0:
         fail(f"{UNIT} is not running; refusing to stop or start it")
     backup_root.mkdir(parents=True, exist_ok=True)
     if backup_root.resolve().is_relative_to(data_dir.resolve()):
@@ -137,7 +143,7 @@ def main(server_config, backup_root, keep, intake, extra):
             "waiting_files=0\npending_claims=0\n"
             + "".join(f"extra={path}\n" for path in extra)
         )
-        MARKER.write_text(f"{os.getpid()}\n")
+        marker.write_text(f"{os.getpid()}\n")
         started = time.monotonic()
         stopped = True
         systemctl("stop", UNIT)
@@ -154,7 +160,7 @@ def main(server_config, backup_root, keep, intake, extra):
     finally:
         if stopped:
             systemctl("start", UNIT)
-            MARKER.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
     downtime = time.monotonic() - started
     os.rename(partial, final)
     fsync_directory(backup_root)
