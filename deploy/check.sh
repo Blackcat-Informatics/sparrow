@@ -120,6 +120,8 @@ if [[ $SPARROW_SCOPE == system ]]; then
     done
     slice=$(systemctl show -p Slice --value "$SPARROW_UNIT")
     if [[ $slice == lillith.slice ]]; then pass "in $slice"; else fail "in $slice, not the production slice"; fi
+else
+    unchecked "AppArmor, the timers and the slice (a user-scope test unit has none of them)"
 fi
 
 if ((FAILED)); then

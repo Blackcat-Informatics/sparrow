@@ -90,7 +90,7 @@ IPv4 and IPv6 sockets and the bind capability. Exec of every file is denied.
 
 ## Load and live checks, not run
 
-These need root and the cutover window (the tracking issue's UAT, steps 6, 8
+These need root and the cutover window (the acceptance steps of issue #22, the cutover's tracking issue: steps 6, 8
 and 12):
 
 ```bash

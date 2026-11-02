@@ -58,7 +58,7 @@ the tree has it.
 ## The live secret
 
 The current secret is at `~/.config/sparrow/tcp.secret` under the user unit.
-The cutover moves it, it is not regenerated (the tracking issue's UAT, step 3):
+The cutover moves it, it is not regenerated (issue #22's acceptance steps, step 3):
 
 ```bash
 sudo install -m 0600 -o root -g root ~/.config/sparrow/tcp.secret /etc/sparrow/tcp.secret

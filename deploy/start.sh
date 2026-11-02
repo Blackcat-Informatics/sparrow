@@ -45,6 +45,7 @@ check_config() {
     socket=$(config_value socket_path)
     data=$(config_value data_dir)
     [[ $(dirname -- "$socket") == "$data" ]] || die "socket_path $socket must be directly inside data_dir $data"
+    require_socket_length "$socket"
     lexicons=$(config_value text_lexicon_dir)
     [[ $(find "$lexicons" -maxdepth 1 -name '*.cbor' | wc -l) == 5 ]] \
         || die "text_lexicon_dir $lexicons must hold the five native CBOR lexicons"

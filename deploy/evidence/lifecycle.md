@@ -297,10 +297,12 @@ PROBE='import ctypes,os,struct; libc=ctypes.CDLL(None,use_errno=True); how=struc
 The production unit therefore omits the setting;
 [RECOVERY.md](../RECOVERY.md#exposure) records why that is safe.
 
+The rehearsal ([rehearsal.md](rehearsal.md), gap G1) exercised `stop.sh` on a
+unit caught between restarts: `stop.sh: sparrow-deploytest.service was
+activating (no drain: the daemon was not serving); stopped`.
+
 ## Not run
 
-- `stop.sh` on a unit caught between restarts (the new `activating` branch):
-  the loop above had reached `failed` before the fix was exercised.
 - Everything that needs root: the system unit, the user and group, the slice,
   priority, the credential, the bind on 518 and AppArmor enforcement. The
-  tracking issue's UAT lists those steps.
+  acceptance steps of issue #22, the cutover's tracking issue, list those steps.

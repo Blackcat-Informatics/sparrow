@@ -45,29 +45,20 @@ anything this host keeps. Do not set `STAGE_CARGO_SEED=off` except to measure
 a cold build.
 
 Build times for `cargo build --locked --release -p sparrow-server`, measured
-the same way as the draws repository (cold, and seeded plus seeding), on the
-32-CPU host. The kache compiler cache stays active in every run, including the
-cold one; `STAGE_CARGO_SEED=off` only skips the reflink seeding of `target`.
+the same way as the draws repository (cold, and seeded plus seeding), each in a
+new worktree at commit `c894b19` on 2026-11-02, on the 32-CPU host. The kache
+compiler cache stays active in every run, including the cold one;
+`STAGE_CARGO_SEED=off` only skips the reflink seeding of `target`.
 
 | Run | Time | Load average (1, 5, 15 min) at start |
 | --- | --- | --- |
-| Seeding (`cargo --stage-seed-only`, new worktree) | 1201.8 s | 187.6, 154.4, 117.9 |
-| Seeded build | not measured: the link failed (below) | 97.5, 109.1, 125.6 |
-| Cold build (`STAGE_CARGO_SEED=off`) | not measured | |
+| Cold (`STAGE_CARGO_SEED=off`) | 361.7 s | 36.9, 40.3, 39.9 |
+| Seeded, including seeding | 232.4 s | 32.2, 39.0, 40.1 |
+| Of which seeding (the wrapper's report) | 6.2 s | |
 
-The seeded build of 2026-11-01 compiled for 6267.7 s, most of it queued
-behind other sessions' compilations in kache's scheduler, and then both
-binaries' links failed with SIGBUS in the linker. The `/opt` filesystem that
-holds every build directory had no unallocated space and full metadata, and
-other repositories' links failed the same way, so neither figure reflects
-Sparrow's build. Repeat both runs once `/opt` has unallocated space again
-(`btrfs filesystem usage /opt` shows it) and replace this paragraph with the
-figures:
-
-```bash
-STAGE_CARGO_SEED=off cargo build --locked --release -p sparrow-server   # in a new worktree: cold
-cargo build --locked --release -p sparrow-server                        # in another new worktree: seeding plus seeded
-```
+The seeded build still recompiled the workspace crates and the units whose
+cached paths named another checkout (the wrapper reported 20). An earlier
+seeding on 2026-11-01, at a load average near 188, took 1201.8 s.
 
 ## Configuration
 
@@ -131,8 +122,11 @@ sets `data_dir` to mode 0710 and the socket to 0660 each time it starts, so
 members of the daemon's group can connect and cannot list or read the store;
 store files stay owner-only under the unit's `UMask=0077`. Only the operator
 belongs to that group, for the CLI and administration. Fleet producers ingest
-through the ingest-only group socket of issue #10, not this socket.
-Validate the unit files, and their security exposure, without loading them:
+through the ingest-only group socket of Sparrow issue #10, not this socket.
+Validate the unit files, and their security exposure, without loading them.
+Before `install.sh` has run, `verify` reports that
+`/usr/local/libexec/sparrow/sparrowd` is missing; that line is expected, and
+only the exposure score is meaningful then:
 
 ```bash
 systemd-analyze verify deploy/systemd/sparrow.service

@@ -89,8 +89,9 @@ every watch in `consume_watches` names a root that exists.
 - Diagnose: the cause is in the failed starts' output:
   `journalctl -u sparrow.service -b --no-pager | tail -100`. Common causes are
   a refused open (below), an AppArmor denial, a missing lexicon bundle or
-  credential, a watch root that does not exist, or port 518 taken by another
-  process (`sudo ss -ltnp 'sport = :518'`).
+  credential, a watch root that does not exist, a `socket_path` longer than
+  107 bytes (`path must be shorter than SUN_LEN`; `start.sh` refuses one), or
+  port 518 taken by another process (`sudo ss -ltnp 'sport = :518'`).
 - Recover: fix the cause, then
   `sudo systemctl reset-failed sparrow.service && sudo deploy/start.sh`.
 - Reversible: yes.
@@ -210,7 +211,19 @@ sudo systemctl start sparrow-ship.timer sparrow-backup.timer
 ```
 
 `STORE_ID` is the identity recorded before the failure. Restore
-`/etc/sparrow` from `BACKUP/config/sparrow` only if it was lost. The shipper
+`/etc/sparrow` from `BACKUP/config/sparrow` only if it was lost; on a fresh
+host it always was, so run this before `deploy/start.sh`:
+
+```bash
+sudo cp -a --reflink=auto /SPARROW/backups/STAMP/config/sparrow/. /etc/sparrow/
+sudo stat -c '%U %a' /etc/sparrow/tcp.secret
+ls /usr/local/share/sparrow
+grep text_lexicon_dir /etc/sparrow/server.toml
+```
+
+Expect `root 600`, and a `text_lexicon_dir` naming a bundle that `install.sh`
+installed on this host: the same PurRDF revision, or the open is refused
+("Refused open"). The shipper
 then resends every file shipped after the backup whose original still exists;
 records producers sent directly after the backup are lost unless they resend
 them. On a fresh host, follow README.md steps 1 to 3 first, then this

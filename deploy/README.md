@@ -9,7 +9,10 @@ This directory holds everything a host needs to run Sparrow in production: the
 systemd units, the AppArmor profile, configuration templates, the helper
 scripts and these documents. After a restore from backups onto a fresh host,
 this directory and a clone of the repository are enough to deploy the service
-again. Secrets are never kept here; [Secrets](#secrets) names where each one
+again, given the build prerequisites of step 1 and network access to the
+PurRDF source that `Cargo.lock` names: the backups do not hold the images, so
+step 2 rebuilds them (or copy the old host's `./bin`, which holds every kept
+image and the recovery probe). Secrets are never kept here; [Secrets](#secrets) names where each one
 lives.
 
 | Path | Contents |
@@ -47,8 +50,9 @@ Patrick's decisions for this deployment, 2026-11-01:
   capability as an ambient capability; no file capability is set on images.
 - Only the operator (`paudley`) reaches the private socket, for the CLI and
   administration, through a group, with filesystem ACLs where they help.
-  Fleet producers ingest through the ingest-only group socket of issue #10,
-  never the private socket; this directory does not implement it.
+  Fleet producers ingest through the ingest-only group socket of Sparrow
+  issue #10 (Forgejo `fleet/sparrow`), never the private socket; this
+  directory does not implement it.
 - The NAS archive (`/net/synology/archives/sparrow`) is the backup. The unit
   allows writes there for the archive worker, which is not built yet.
 - Restarts of the live service are approved and announced by the coordination
@@ -58,13 +62,13 @@ Patrick's decisions for this deployment, 2026-11-01:
 
 | Path | Owner, mode | Contents |
 | --- | --- | --- |
-| `/usr/local/libexec/sparrow/sparrowd-schemaN-REV` | root, 0755 | Daemon images, one per revision, never overwritten. |
+| `/usr/local/libexec/sparrow/sparrowd-schemaN-REV` | root, 0755 | Daemon images, one per revision, never overwritten: `N` is the client schema version, `REV` the short Sparrow commit. |
 | `/usr/local/libexec/sparrow/sparrowd` | link | The selected daemon image; `sparrowd.previous` is the rollback. |
 | `/usr/local/libexec/sparrow/sparrow` | link | The matching CLI image; `sparrow.previous` is the rollback. |
 | `/usr/local/bin/sparrow` | link | The CLI on `PATH`, through the link above. |
 | `/usr/local/libexec/sparrow/sparrow-ship`, `sparrow-backup` | root, 0755 | The timers' helpers, from `libexec/`. |
-| `/usr/local/share/sparrow/lexicons-REV/` | root, 0755 | The five native CBOR lexicons for the PurRDF revision `REV`. |
-| `/usr/local/share/doc/sparrow/deploy/` | root, 0644 | Copies of these documents. |
+| `/usr/local/share/sparrow/lexicons-PURRDF_REV/` | root, 0755 | The five native CBOR lexicons; `PURRDF_REV` is the full PurRDF commit the images were built against. |
+| `/usr/local/share/doc/sparrow/deploy/` | root, 0644 | Copies of these documents and of `evidence/`. |
 | `/etc/sparrow/server.toml` | root:sparrow, 0640 | The daemon's configuration. |
 | `/etc/sparrow/ship.toml` | root:sparrow, 0640 | The shipper's sources. |
 | `/etc/sparrow/watches/` | root:sparrow, 0750 | The applied watch definitions, kept for a restore. |
@@ -164,12 +168,13 @@ Commands prefixed with `sudo` need root.
 - Linux with systemd 256 or newer, AppArmor enabled (`aa-enabled` prints
   `Yes`) and cgroup v2. btrfs is preferred, because images, backups and the
   shipper's copies are reflinks.
-- Packages: `git`, `tar`, `capnp` (Cap'n Proto compiler), `python3` 3.11 or
+- Packages: `git` 2.54 or newer (for `make install-hooks`), `tar`, `capnp` (Cap'n Proto compiler), `python3` 3.11 or
   newer, `util-linux` (`flock`, `setpriv`), `acl`, `apparmor`, a C/C++ compiler
   and `clang` (RocksDB and bindgen), and Rust 1.98 or newer through Stage's
   managed cargo wrapper or `rustup`.
-- Katamari's production slice, installed from Katamari's
-  `deploy/systemd/` as described in Katamari's `deploy/README.md`. `install.sh`
+- Katamari's production slice, installed from the Katamari repository's
+  `deploy/systemd/` (Forgejo `fleet/katamari`) as its `deploy/README.md`
+  describes. `install.sh`
   refuses to enable the units without it. Check:
 
   ```bash
@@ -180,6 +185,12 @@ Commands prefixed with `sudo` need root.
   `/etc/systemd/system/`.
 
 ### 2. Clone and build the kept images
+
+Clone from the lab Forgejo, `fleet/sparrow` (on the lab host itself,
+`http://127.0.0.1:7555/fleet/sparrow.git`; from another host, use the
+Forgejo's address). The build fetches PurRDF from
+`https://github.com/Blackcat-Informatics/purrdf` at the revision `Cargo.lock`
+names.
 
 ```bash
 git clone http://127.0.0.1:7555/fleet/sparrow.git ~/Active/sparrow
@@ -194,7 +205,10 @@ ls -l bin/
 CLI and recovery probe and copies them into `./bin` as
 `sparrowd-schemaN-REV`, `sparrow-schemaN-REV` and
 `sparrow-recovery-schemaN-REV`, with the lexicon bundle as
-`bin/lexicons-PURRDF_REV/`. `./bin` is ignored by Git.
+`bin/lexicons-PURRDF_REV/`. `./bin` is ignored by Git. A cold release build
+took 362 s on this host (docs/deployment.md, "Kept images and seeded builds");
+`make check` takes longer. The recovery probe stays in `./bin`; RECOVERY.md
+uses it from there.
 
 ### 3. Install
 
@@ -266,8 +280,10 @@ sudo systemctl start sparrow-ship.timer sparrow-backup.timer
 sudo deploy/check.sh
 ```
 
-The first argument after `put` is a fresh request ID; keep it if the call must
-be retried. `check.sh` exits 0 when every check passes: the unit, images,
+Run this as the operator in a new login session, so that the `sparrow` group
+membership from step 3 applies; `sparrow` is on `PATH` through the
+`/usr/local/bin/sparrow` link that `install.sh` made. The first argument after
+`put` is a fresh request ID; keep it if the call must be retried. `check.sh` exits 0 when every check passes: the unit, images,
 socket and store modes, pressure, durability, store identity, each watch's
 root, the unit's security exposure, AppArmor confinement with no denials, both
 timers and the slice. Exit 2 means a check needed root.
@@ -327,8 +343,8 @@ session.
    its removal is approved.
 
 Moving from the old user unit to this system unit adds a change of owner and
-of the consume roots' location. The tracking issue's acceptance steps give
-that cutover in full; in outline: drain, re-point each watch under
+of the consume roots' location. The acceptance steps of Sparrow issue #22,
+the cutover's tracking issue, give that cutover in full; in outline: drain, re-point each watch under
 `/SPARROW/intake` while the old unit still runs (the system unit cannot reach
 `/home`), stop the old unit and disable it, move the shipper's state to
 `/SPARROW/ship`, give `/SPARROW/store` and the roots to `sparrow` with
@@ -344,3 +360,20 @@ production sandbox minus what an unprivileged manager cannot apply. It prints
 the environment that points `start.sh`, `stop.sh`, `restart.sh` and `check.sh`
 at it; `deploy/test-instance.sh teardown` removes the unit.
 [evidence/lifecycle.md](evidence/lifecycle.md) records a run.
+
+```bash
+SPARROW_BIN=$PWD/bin deploy/test-instance.sh setup
+eval "$(SPARROW_BIN=$PWD/bin deploy/test-instance.sh env)"
+deploy/start.sh
+SPARROW_MAX_EXPOSURE=3.5 deploy/check.sh
+deploy/stop.sh
+deploy/test-instance.sh teardown
+```
+
+Set `SPARROW_BIN` when the kept images are not in this checkout's `./bin`.
+`check.sh` needs `SPARROW_MAX_EXPOSURE=3.5` because the test unit drops the
+root-only hardening, and it exits 2 with `NOT CHECKED` for AppArmor, the
+timers and the slice, which a user unit does not have. A Unix socket path is
+limited to 107 bytes; when the default scratch path makes the socket longer,
+`setup` refuses, so pass a shorter absolute `SCRATCH` as its second argument
+(and to `env` and `teardown`).

@@ -29,8 +29,9 @@ USAGE
 }
 (($# >= 1)) || { usage >&2; exit 2; }
 ACTION=$1
-DEPLOY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_DIR=$(cd -- "$DEPLOY_DIR/.." && pwd)
+# For DEPLOY_DIR, REPO_DIR, SPARROW_BIN, die and require_socket_length.
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 SCRATCH=${2:-$REPO_DIR/.stage/test-instance}
 UNIT=sparrow-deploytest.service
 UNIT_DIR=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}/systemd/user
@@ -46,9 +47,13 @@ environment() {
 case $ACTION in
     setup)
         [[ $SCRATCH == /* ]] || { echo "test-instance.sh: SCRATCH must be absolute" >&2; exit 2; }
+        require_socket_length "$DATA/store/rpc.sock"
         install -d -m 0700 -- "$SCRATCH" "$DATA" "$DATA/intake" "$DATA/intake/deploytest"
-        SPARROW_DESTDIR=$ROOT "$DEPLOY_DIR/install.sh" --no-enable
-        lexicons=$(find "$ROOT/usr/local/share/sparrow" -mindepth 1 -maxdepth 1 -type d -name 'lexicons-*' | head -n 1)
+        bundle=$(find "$SPARROW_BIN" -mindepth 1 -maxdepth 1 -type d -name 'lexicons-*' | head -n 1)
+        [[ -n $bundle ]] || die "no lexicon bundle in $SPARROW_BIN; run make install-bin"
+        lexicons=$ROOT/usr/local/share/sparrow/${bundle##*/}
+        # Written first, so install.sh keeps it instead of the production template and its secret.
+        install -d -m 0750 -- "$ROOT/etc/sparrow"
         cat >"$ROOT/etc/sparrow/server.toml" <<CONFIG
 # Test instance (deploy/test-instance.sh): scratch store and socket, no TCP listener.
 socket_path = "$DATA/store/rpc.sock"
@@ -73,6 +78,7 @@ quiet_ms = 1000
 max_directories = 1
 max_candidates = 64
 CONFIG
+        SPARROW_DESTDIR=$ROOT "$DEPLOY_DIR/install.sh" --no-enable
         install -d -m 0700 -- "$UNIT_DIR"
         sed -E \
             -e '/^(User|Group|LoadCredential|AppArmorProfile|AmbientCapabilities|CapabilityBoundingSet|Slice|Nice|OOMScoreAdjust|ManagedOOMPreference|RequiresMountsFor)=/d' \

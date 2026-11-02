@@ -48,6 +48,14 @@ config_value() {
     printf '%s\n' "$value"
 }
 
+# A Unix socket path must fit sockaddr_un's sun_path: 107 bytes and the terminating NUL. The daemon
+# refuses a longer one only after it has created the store, so check before starting it.
+require_socket_length() {
+    local socket=$1
+    ((${#socket} <= 107)) || die "socket path $socket is ${#socket} bytes; a Unix socket path is \
+limited to 107. Choose a shorter data_dir (for a test instance, a shorter SCRATCH)"
+}
+
 # The kept image pair for a revision, or the newest pair in ./bin. Prints "DAEMON CLI".
 select_images() {
     local rev=${1:-} daemon cli

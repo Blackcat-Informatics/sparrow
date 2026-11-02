@@ -67,7 +67,7 @@ LimitNOFILE=65536
 # Six threads in normal running; tokio's blocking pool may grow to 512 threads under load.
 TasksMax=1024
 
-# Priority (PRODUCTION-LAUNCH section B): first on the host, not real time. Her slice's weights,
+# Priority (fleet production-launch specification, section B): first on the host, not real time. Her slice's weights,
 # the highest nice and best-effort IO priority, and the OOM killer's last choice short of never.
 Slice=lillith.slice
 Nice=-20

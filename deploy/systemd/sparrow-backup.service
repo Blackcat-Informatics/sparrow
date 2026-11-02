@@ -32,7 +32,7 @@ ExecStopPost=/bin/sh -c 'if [ -e /run/sparrow-backup/stopped ]; then systemctl s
 # Draining the intake roots may take up to 30 minutes before the copy.
 TimeoutStartSec=45min
 
-# Priority (PRODUCTION-LAUNCH section B): her slice, not real time.
+# Priority (fleet production-launch specification, section B): her slice, not real time.
 Slice=lillith.slice
 Nice=-20
 IOSchedulingClass=best-effort

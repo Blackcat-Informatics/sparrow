@@ -28,7 +28,7 @@ UMask=0077
 MemoryMax=512M
 TimeoutStartSec=30min
 
-# Priority (PRODUCTION-LAUNCH section B): her slice, not real time.
+# Priority (fleet production-launch specification, section B): her slice, not real time.
 Slice=lillith.slice
 Nice=-20
 IOSchedulingClass=best-effort

@@ -163,8 +163,8 @@ for bundle in "$SPARROW_BIN"/lexicons-*; do
 done
 
 # 9. These documents, for the operator of a host without the repository.
-for document in "$DEPLOY_DIR"/*.md; do
-    if put "$document" "$PREFIX/share/doc/sparrow/deploy/${document##*/}" 0644; then :; fi
+for document in "$DEPLOY_DIR"/*.md "$DEPLOY_DIR"/evidence/*.md; do
+    if put "$document" "$PREFIX/share/doc/sparrow/deploy/${document#"$DEPLOY_DIR"/}" 0644; then :; fi
 done
 
 # 10. systemd.
@@ -172,7 +172,9 @@ if ((UNITS_CHANGED)); then
     host systemctl daemon-reload
 fi
 if ((ENABLE)); then
-    if [[ -z $DEST ]]; then
+    if [[ -n $DEST ]]; then
+        note "skipped while staging: the lillith.slice check and the old user unit check (README.md, step 1)"
+    else
         [[ -n $(systemctl show -p FragmentPath --value lillith.slice) ]] \
             || die "lillith.slice is not installed; install Katamari's deploy/systemd/lillith.slice first (README.md, step 1)"
         for wants in /home/*/.config/systemd/user/default.target.wants/sparrow.service; do
