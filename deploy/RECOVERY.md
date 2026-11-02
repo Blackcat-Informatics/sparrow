@@ -139,10 +139,13 @@ every watch in `consume_watches` names a root that exists.
 - Do: `sudo deploy/restart.sh --rollback`. It verifies the previous pair runs,
   stops through the drain, swaps the links (the bad pair becomes `.previous`),
   starts and checks the store identity.
-- Limit: an image cannot undo a store-format upgrade its successor made. If the
-  new image upgraded the format, the old one refuses the store (see "Refused
-  open"); stay on the new image and fix forward, or restore the closed-store
-  backup taken before the upgrade. Reverting `/etc/sparrow/server.toml` is a
+- Limit: an image cannot undo a store-format upgrade its successor made.
+  `start.sh` and `restart.sh` therefore refuse an image whose schema number
+  (`sparrowd-schemaN-REV`) is lower than the current image's, before stopping
+  anything. Stay on the new image and fix forward, or restore the closed-store
+  backup taken before the upgrade
+  ([evidence/lifecycle.md](evidence/lifecycle.md) shows a schema 62 image
+  refusing a store a schema 63 image had opened). Reverting `/etc/sparrow/server.toml` is a
   separate step, kept in its backup.
 - Reversible: yes; `--rollback` again swaps forward.
 

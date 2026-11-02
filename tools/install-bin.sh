@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
 # `make install-bin`: keep the deployed images in ./bin under revision-qualified names, so a
-# deployed image always has a source copy after target/ is culled. Copies are reflinks
-# (cp --reflink=auto); the release build itself runs through the managed cargo wrapper first.
+# deployed image always has a source copy after target/ is culled. Copies use cp --reflink=auto:
+# a reflink when target/ shares the checkout's filesystem, a full copy otherwise. The release build
+# itself runs through the managed cargo wrapper first.
 #
 #   bin/sparrowd-schemaN-REV          the daemon
 #   bin/sparrow-schemaN-REV           the CLI

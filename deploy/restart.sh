@@ -46,6 +46,8 @@ else
 fi
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
+refuse_schema_downgrade "$daemon"
+refuse_start_limit
 
 store=
 if unit_active; then

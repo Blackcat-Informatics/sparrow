@@ -26,7 +26,10 @@ through the managed cargo wrapper and copies them into `./bin` with
 their provenance manifest, notices and licenses, from the PurRDF revision the
 lockfile resolves into `bin/lexicons-PURRDF_REV/`. It refuses an uncommitted
 tree and never overwrites a kept name with other bytes. `./bin` is ignored by
-Git, and a kept image survives the automatic cull of `target/`.
+Git, and a kept image survives the automatic cull of `target/`. The copy is a
+reflink only when `target/` and the checkout share a filesystem; on this host
+the managed `target/` is on another one, so `./bin` holds full copies (about
+the size of the images, verified byte-identical with `cmp`).
 `deploy/install.sh` and `deploy/start.sh` install from `./bin` into
 `/usr/local/libexec/sparrow` with `cp --reflink=auto`, so every deployed image
 has a kept source copy, and never overwrite an executing image.

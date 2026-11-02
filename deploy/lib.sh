@@ -99,6 +99,29 @@ swap_link() {
     mv -T -- "$next" "$link"
 }
 
+# Refuse to start a unit that spent its start limit: the repeated failure needs diagnosis first,
+# and resetting it is the operator's decision (RECOVERY.md, "Unit start-limit hit").
+refuse_start_limit() {
+    [[ $("${SYSTEMCTL[@]}" show -p Result --value "$SPARROW_UNIT") != start-limit-hit ]] \
+        || die "$SPARROW_UNIT hit its start limit; diagnose it (RECOVERY.md, \"Unit start-limit hit\"), \
+then run: ${SYSTEMCTL[*]} reset-failed $SPARROW_UNIT"
+}
+
+# Refuse an image whose schema is older than the current one's: the current image may have upgraded
+# the store's format, which an older image cannot open (RECOVERY.md, "Rollback").
+refuse_schema_downgrade() {
+    local daemon=$1 current new old
+    current=$(readlink -- "$LIBEXEC/sparrowd" 2>/dev/null || true)
+    [[ -n $current ]] || return 0
+    new=${daemon##*/sparrowd-schema}; new=${new%%-*}
+    old=${current#sparrowd-schema}; old=${old%%-*}
+    [[ $new =~ ^[0-9]+$ && $old =~ ^[0-9]+$ ]] \
+        || die "cannot read the schema from image names ${daemon##*/} and $current"
+    ((new >= old)) || die "${daemon##*/} is schema $new, older than the current $current; \
+it cannot open a store that image upgraded. Fix forward, or restore the backup taken before the \
+upgrade (RECOVERY.md, \"Rollback\")"
+}
+
 # Point the stable names at an image pair, keeping the pair they named as .previous.
 select_current() {
     local daemon=$1 cli=$2 old
@@ -147,10 +170,19 @@ wait_ready() {
 drain_stop() {
     local socket main
     socket=$(config_value socket_path)
-    if ! unit_active; then
-        note "$SPARROW_UNIT is not active"
-        return 0
-    fi
+    local state
+    state=$("${SYSTEMCTL[@]}" is-active "$SPARROW_UNIT" || true)
+    case $state in
+        active) ;;
+        inactive | failed)
+            note "$SPARROW_UNIT is $state"
+            return 0 ;;
+        *)
+            # Activating covers a restart loop: stopping cancels the pending restart.
+            "${SYSTEMCTL[@]}" stop "$SPARROW_UNIT"
+            note "$SPARROW_UNIT was $state (no drain: the daemon was not serving); stopped"
+            return 0 ;;
+    esac
     if status_json >"$WORK/before-stop.json" 2>/dev/null; then
         python3 -I -c 'import json, sys
 for w in json.load(open(sys.argv[1]))["consume_watches"]:

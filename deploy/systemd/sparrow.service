@@ -19,7 +19,7 @@ Description=Sparrow typed diagnostic evidence server
 Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
 RequiresMountsFor=/SPARROW
 # Bound restarts so a persistently refused store open stops for diagnosis instead of looping
-# (deploy/RECOVERY.md, "Start limit hit"). A full disk does not spend them: the daemon waits for
+# (deploy/RECOVERY.md, "Unit start-limit hit"). A full disk does not spend them: the daemon waits for
 # its free-space floor before it opens the store.
 StartLimitIntervalSec=600
 StartLimitBurst=5

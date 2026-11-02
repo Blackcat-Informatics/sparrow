@@ -144,16 +144,128 @@ What it shows:
 - `install.sh` re-run against the staged root (`SPARROW_DESTDIR`) keeps the
   existing configuration and image links and reports nothing changed.
 
-`check.sh` failed three items, all expected on this instance:
+`check.sh` failed three items here, all expected: the socket (0600) and store
+(0700) modes, because these images predate the change on this branch that
+makes them 0660 and 0710, and the exposure of 3.5, because the test unit drops
+the root-only items above (the production unit scores 1.6,
+[systemd-analyze-security.md](systemd-analyze-security.md)). The branch image
+below passes the mode checks; test runs set `SPARROW_MAX_EXPOSURE=3.5`.
 
-- The socket (0600) and store (0700) modes: these images predate the change on
-  this branch that makes them 0660 and 0710. The branch image is the one the
-  check is written for. It was not run here, because release links on this
-  host failed while the work was finished (see "Not run" below).
-- The exposure of 3.5: the test unit drops the items above, which the
-  production unit sets. The production unit scores 1.6
-  ([systemd-analyze-security.md](systemd-analyze-security.md)). Test runs that
-  want a passing check set `SPARROW_MAX_EXPOSURE`.
+## The branch image, 2026-11-02
+
+Image `ba6ebe7` (schema 63), installed by `make install-bin` into `./bin`, on
+the same test store. `check.sh` passes every item. The rollback that follows
+went to the schema 62 image, which could not open the store the schema 63
+image had just upgraded; the unit then failed in a restart loop until its
+start limit:
+
+```text
+$ deploy/start.sh --rev ba6ebe7
+start.sh: starting sparrow-deploytest.service on sparrowd-schema63-ba6ebe7
+receipt: unit=sparrow-deploytest.service state=active pid=4066128
+receipt: daemon=sparrowd-schema63-ba6ebe7 cli=sparrow-schema63-ba6ebe7 previous=sparrowd-schema62-cfdf2fa
+receipt: store_id=store:18e49e9635f5ccaa99e1a7791e2fc638 schema=63 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ cp TEST/data/probe.jsonl TEST/data/intake/deploytest-moved/probe-4.jsonl
+[exit 0]
+
+$ timeout 120 bash -c while [ -e 'TEST/data/intake/deploytest-moved/probe-4.jsonl' ]; do sleep 1; done; echo consumed
+consumed
+[exit 0]
+
+$ stat -c %n %a %G TEST/data/store TEST/data/store/rpc.sock
+TEST/data/store 710 paudley
+TEST/data/store/rpc.sock 660 paudley
+[exit 0]
+
+$ env SPARROW_MAX_EXPOSURE=3.5 deploy/check.sh
+PASS  sparrow-deploytest.service active, pid 4066128, restarts 0
+PASS  daemon image sparrowd-schema63-ba6ebe7 (rollback: sparrowd-schema62-cfdf2fa)
+PASS  socket TEST/data/store/rpc.sock is mode 0660, group paudley
+PASS  store TEST/data/store is mode 0710, group paudley
+PASS  pressure phase ready
+PASS  no durability failure
+PASS  store store:18e49e9635f5ccaa99e1a7791e2fc638, schema 63
+PASS  watch deploytest: TEST/data/intake/deploytest-moved, 0 pending claim(s)
+PASS  systemd-analyze security exposure 3.5 (at most 3.5)
+[exit 0]
+
+$ deploy/restart.sh --rollback
+restart.sh: rolling back to sparrowd-schema62-cfdf2fa; an image cannot undo a store-format upgrade its successor made
+restart.sh: sparrow-deploytest.service stopped through its drain (pid 4066128); socket removed
+restart.sh: starting sparrow-deploytest.service on sparrowd-schema62-cfdf2fa
+● sparrow-deploytest.service - Sparrow deploy test instance (deploy/test-instance.sh)
+     Loaded: loaded (/run/user/1000/systemd/user/sparrow-deploytest.service; static)
+     Active: activating (auto-restart) (Result: exit-code) since Mon 2026-11-02 02:02:26 CST; 380ms ago
+ Invocation: 831eeaa8169747a2ac0b3e3d550ecf33
+       Docs: file:///usr/local/share/doc/sparrow/deploy/README.md
+    Process: 4068819 ExecStart=TEST/root/usr/local/libexec/sparrow/sparrowd --config TEST/root/etc/sparrow/server.toml (code=exited, status=1/FAILURE)
+   Main PID: 4068819 (code=exited, status=1/FAILURE)
+   Mem peak: 97.9M
+        CPU: 671ms
+restart.sh: sparrow-deploytest.service is not active
+[exit 1]
+```
+
+The daemon's journal for the refused rollback:
+
+```text
+sparrowd[4068819]: Error: Error { code: "STORAGE_FAILURE", message: "Invalid argument: Column families not opened: rdf_reverse" }
+```
+
+Three fixes followed, in `deploy/lib.sh`, `start.sh` and `restart.sh`: they
+refuse an image whose schema number is lower than the current image's before
+stopping anything; they refuse to start a unit that hit its start limit and
+name the reset command; and `stop.sh` stops a unit caught between restarts
+instead of reporting it inactive. The same instance afterwards:
+
+```text
+$ deploy/start.sh --rev ba6ebe7
+start.sh: sparrow-deploytest.service hit its start limit; diagnose it (RECOVERY.md, "Unit start-limit hit"), then run: systemctl --user reset-failed sparrow-deploytest.service
+[exit 1]
+
+$ systemctl --user reset-failed sparrow-deploytest.service
+[exit 0]
+
+$ deploy/start.sh --rev ba6ebe7
+start.sh: starting sparrow-deploytest.service on sparrowd-schema63-ba6ebe7
+receipt: unit=sparrow-deploytest.service state=active pid=4090833
+receipt: daemon=sparrowd-schema63-ba6ebe7 cli=sparrow-schema63-ba6ebe7 previous=sparrowd-schema62-cfdf2fa
+receipt: store_id=store:18e49e9635f5ccaa99e1a7791e2fc638 schema=63 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ deploy/restart.sh --rollback
+restart.sh: rolling back to sparrowd-schema62-cfdf2fa; an image cannot undo a store-format upgrade its successor made
+restart.sh: sparrowd-schema62-cfdf2fa is schema 62, older than the current sparrowd-schema63-ba6ebe7; it cannot open a store that image upgraded. Fix forward, or restore the backup taken before the upgrade (RECOVERY.md, "Rollback")
+[exit 1]
+
+$ env SPARROW_BIN=$PWD/.stage/test-bin deploy/restart.sh --rev cfdf2fa
+restart.sh: sparrowd-schema62-cfdf2fa is schema 62, older than the current sparrowd-schema63-ba6ebe7; it cannot open a store that image upgraded. Fix forward, or restore the backup taken before the upgrade (RECOVERY.md, "Rollback")
+[exit 1]
+
+$ env SPARROW_MAX_EXPOSURE=3.5 deploy/check.sh
+PASS  sparrow-deploytest.service active, pid 4090833, restarts 0
+PASS  daemon image sparrowd-schema63-ba6ebe7 (rollback: sparrowd-schema62-cfdf2fa)
+PASS  socket TEST/data/store/rpc.sock is mode 0660, group paudley
+PASS  store TEST/data/store is mode 0710, group paudley
+PASS  pressure phase ready
+PASS  no durability failure
+PASS  store store:18e49e9635f5ccaa99e1a7791e2fc638, schema 63
+PASS  watch deploytest: TEST/data/intake/deploytest-moved, 0 pending claim(s)
+PASS  systemd-analyze security exposure 3.5 (at most 3.5)
+[exit 0]
+
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service stopped through its drain (pid 4090833); socket removed
+[exit 0]
+```
+
+Before this run, a daemon left from the AppArmor trace (started by hand on the
+same store) was still running. The unit's daemon then failed with `IO error:
+While lock file: TEST/data/store/LOCK: Resource temporarily unavailable`: the
+store's exclusive lock refused a second writer, as designed. The traced daemon
+was stopped with SIGINT and removed its socket.
 
 ## RestrictSUIDSGID refuses openat2
 
@@ -187,11 +299,8 @@ The production unit therefore omits the setting;
 
 ## Not run
 
-- The branch image on the test instance, and `check.sh` passing its mode
-  checks. Release links on this host failed with SIGBUS in the linker while
-  this was written: the `/opt` filesystem that holds every build directory had
-  no unallocated space and its metadata was full, so writes to the linker's
-  output mapping failed. The same SIGBUS hit other repositories' builds.
+- `stop.sh` on a unit caught between restarts (the new `activating` branch):
+  the loop above had reached `failed` before the fix was exercised.
 - Everything that needs root: the system unit, the user and group, the slice,
   priority, the credential, the bind on 518 and AppArmor enforcement. The
   tracking issue's UAT lists those steps.

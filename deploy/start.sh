@@ -54,6 +54,8 @@ daemon=$(install_image "$daemon")
 cli=$(install_image "$cli")
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
+refuse_schema_downgrade "$daemon"
+refuse_start_limit
 select_current "$daemon" "$cli"
 note "starting $SPARROW_UNIT on ${daemon##*/}"
 "${SYSTEMCTL[@]}" start "$SPARROW_UNIT"
