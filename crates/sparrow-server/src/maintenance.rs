@@ -3,7 +3,7 @@
 
 //! One joined, serial maintenance owner; RPC retains its own request budget.
 
-use sparrow_core::{Error, EvictionLimits, Store};
+use sparrow_core::{Error, EvictionLimits, RECOMPRESSION_SETTLE_SECONDS, Store};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -11,6 +11,9 @@ use tokio::sync::watch;
 /// so this only delays physical retirement. One traversal parses the whole
 /// catalog under the writer lock; restarting it every second starved ingest.
 const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Pause between table rewrite steps. A step only observes progress and turns
+/// native periodic compaction on or off, so it never holds the loop for long.
+const RECOMPRESSION_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) struct Worker {
     stop: watch::Sender<bool>,
@@ -55,6 +58,7 @@ enum Job {
     Pressure,
     Reclaim,
     Expiry,
+    Recompress,
 }
 
 impl Job {
@@ -64,6 +68,7 @@ impl Job {
             Self::Pressure => "pressure maintenance",
             Self::Reclaim => "import journal reclamation",
             Self::Expiry => "retention maintenance",
+            Self::Recompress => "table rewrite",
         }
     }
 
@@ -79,6 +84,9 @@ impl Job {
             Self::Expiry => store
                 .expire_bounded(sparrow_server::now()?, EvictionLimits::default())
                 .map(|report| Some(report.continuation)),
+            Self::Recompress => store
+                .recompress_step(sparrow_server::now()?, RECOMPRESSION_SETTLE_SECONDS)
+                .map(|_| None),
         }
     }
 }
@@ -92,7 +100,14 @@ async fn run(
     let mut pressure = tokio::time::interval(Duration::from_secs(1));
     let mut reclaim = tokio::time::interval(Duration::from_secs(1));
     let mut expiry = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
-    for interval in [&mut flush, &mut pressure, &mut reclaim, &mut expiry] {
+    let mut recompress = tokio::time::interval(RECOMPRESSION_INTERVAL);
+    for interval in [
+        &mut flush,
+        &mut pressure,
+        &mut reclaim,
+        &mut expiry,
+        &mut recompress,
+    ] {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     }
     // Buffered synchronization retains its configured initial delay.
@@ -109,14 +124,16 @@ async fn run(
                     _ = flush.tick() => Job::Flush,
                     _ = pressure.tick() => Job::Pressure,
                     _ = reclaim.tick() => Job::Reclaim,
+                    _ = recompress.tick() => Job::Recompress,
                     _ = expiry.tick(), if !continuation => Job::Expiry,
                     _ = tokio::task::yield_now(), if continuation => Job::Expiry,
                 }
             } => job,
         };
         // Below the free-space floor every write is refused. Synchronizing
-        // accepted writes is still allowed and still needed.
-        if !matches!(job, Job::Flush)
+        // accepted writes is still allowed and still needed, and the table
+        // rewrite step must run to turn native rewriting off.
+        if !matches!(job, Job::Flush | Job::Recompress)
             && store
                 .space_floor()
                 .shortfall()

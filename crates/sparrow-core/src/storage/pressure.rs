@@ -72,7 +72,7 @@ pub struct PressureStatus {
 
 #[derive(Default)]
 pub(super) struct State {
-    status: PressureStatus,
+    pub(super) status: PressureStatus,
     awaiting_physical: Option<u64>,
 }
 
@@ -178,7 +178,7 @@ impl Writer {
         ))
     }
 
-    fn native_property(&self, family: &str, name: &str) -> Result<u64, Error> {
+    pub(super) fn native_property(&self, family: &str, name: &str) -> Result<u64, Error> {
         let cf = self
             .db
             .cf_handle(family)

@@ -159,6 +159,61 @@ is a query design change rather than a fix. What remains open on issue #5 is
 the parked JSON work: the catalog codec, the deep-JSON projection cost and its
 expansion.
 
+## Table options and dictionaries (issue #19)
+
+On 2026-11-01 a reflink copy of the live store was opened read-only and
+sampled in contiguous 32 MiB key slices: 1.18% of the default family, about
+half of `payload` and 8% of `rdf_reverse`. Under the former options the sample
+compressed 8.98 times, against 8.89 times for the live default family. Each
+candidate was loaded into a fresh store with the production family options,
+then compacted to the bottommost level. Table sizes repeated exactly across
+runs, and compaction CPU within 5%.
+
+| Candidate | default | payload | rdf_reverse | default compaction CPU |
+| --- | ---: | ---: | ---: | ---: |
+| Former: 4 KiB blocks, ZSTD level 3, no dictionary | 1.000 | 1.000 | 1.000 | 10.4 s |
+| 32 KiB blocks, level 3 | 0.795 | 0.833 | 0.950 | 11.4 s |
+| 64 KiB blocks, level 3 | 0.775 | 0.773 | 0.946 | 10.2 s |
+| 4 KiB blocks, 112 KiB dictionary, level 3 | 1.099 | 0.466 | 0.970 | 14.7 s |
+| 32 KiB blocks, level 6 | 0.723 | 0.796 | 0.946 | 12.0 s |
+| 32 KiB blocks, level 9 | 0.688 | 0.789 | 0.945 | 18.6 s |
+| 32 KiB blocks, level 6, 112 KiB dictionary | 0.724 | 0.435 | 0.951 | 17.1 s |
+
+Ratios are table bytes against the former options for the same family. The
+default family held 88% of table bytes. Its quad index keys are already
+prefix-delta encoded within each block, so a dictionary is neutral at level 6
+and adds 40% compaction CPU. Payload rows halve with a dictionary, but that
+family is about 1% of the store. Reverse keys are hashes, within about 5% of
+their entropy under every candidate, and 16 to 64 KiB blocks cost 10 to 70
+times the point-read CPU of 4 KiB blocks when lookups miss.
+
+The chosen options are owned by `storage::table_options`:
+
+- default and `payload`: 32 KiB blocks, LZ4 above the bottommost level and
+  ZSTD level 6 at it;
+- `payload` also trains a 112 KiB bottommost dictionary from up to 100 times
+  that many sample bytes;
+- `rdf_reverse`: 4 KiB blocks, its whole-key Bloom filter and the former
+  bottommost level;
+- info logs: at most 10 files of 8 MiB.
+
+Applied to the live level sizes, these options would store the 15.74 GB of
+tables and blobs in about 12.02 GB, 24% less. This is an extrapolation from the
+sample, and the default family is its reliable part. Default compaction costs
+about 15% more CPU. ZSTD above the bottommost level would save about 0.67 GB
+more at 1.6 times LZ4's CPU on every flush and upper compaction. It is not
+enabled. Level 9 saves 0.43 GB more than level 6 but cuts compaction throughput
+by 35%, and that throughput is also how fast pressure frees space.
+
+RocksDB rewrites a cold bottommost file only when a compaction from above
+overlaps it, and these stores set no periodic compaction, so the old tables do
+not convert on their own. The daemon rewrites the default and `payload`
+families once through periodic compaction, one file at a time, as described in
+[Architecture](architecture.md#42-deduplication-and-compression).
+
+Not measured: read latency under production cache sizes, ingest throughput
+under each option set, WAL compression and blob compression level.
+
 ## Schema 62 native graph and text follow-up
 
 On 2026-10-19 signed source `bee07bc1690fe7fe3b85e533153ee18fee9349fd`

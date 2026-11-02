@@ -161,6 +161,16 @@ priority; `Nice=10` only orders its own threads. A sustained deep-JSON backlog
 once saturated the host's CPU and disk; under these limits ingest slows instead.
 Journal output remains available through `journalctl --user -u sparrow.service`.
 
+After a release that changes the table options profile, the daemon rewrites
+older table files once in the background. `sparrow SOCKET status` reports it as
+`recompression`: `running`, `paused` with a `waiting` reason, or `complete`,
+with the older tables' `remaining_bytes` and any latched `failure`. RocksDB's
+own periodic compaction does the work one file at a time, below
+size-triggered compaction. The daemon turns it off while pressure maintenance
+is outstanding or a job's 1 GiB of headroom would not fit the data allowance
+or the free-space floor. The rewrite resumes after a restart, and a running
+job is aborted when the store closes, so shutdown does not wait for it.
+
 ## Shipping finished files from producers that keep them
 
 A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
