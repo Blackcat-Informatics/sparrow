@@ -32,12 +32,20 @@ ExecStopPost=/bin/sh -c 'if [ -e /run/sparrow-backup/stopped ]; then systemctl s
 # Draining the intake roots may take up to 30 minutes before the copy.
 TimeoutStartSec=45min
 
+# A copy job (cp, sync and the CLI): bounded so a stuck or runaway run cannot crowd the daemon in
+# the shared slice. Reflink copies need little memory.
+MemoryMax=1G
+TasksMax=64
+CPUQuota=100%
+
 # Priority (fleet production-launch specification, section B): her slice, not real time.
 Slice=lillith.slice
 Nice=-20
 IOSchedulingClass=best-effort
 IOSchedulingPriority=0
-OOMScoreAdjust=-900
+# Section B's OOM ranking (2026-11-02): a helper carries a less protective value than the core
+# service's -900, so a host OOM caused by its own work kills it, never the daemon. Value: -500.
+OOMScoreAdjust=-500
 RestrictRealtime=yes
 
 # Not confined by AppArmor: a Python program that runs cp, sync, systemctl and the sparrow CLI; its

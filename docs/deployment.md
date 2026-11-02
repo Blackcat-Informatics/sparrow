@@ -303,8 +303,9 @@ store, but compaction rewrites files, so the copies gradually stop sharing.
 Budget up to three times the store size. A copy on the same disk protects
 against software faults and operator error, not disk loss.
 
-The NAS archive (`/net/synology/archives/sparrow`) is the off-host backup,
-once its worker is enabled. To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
+The NAS archive (`/net/synology/archives/sparrow`) is the off-host backup
+once its worker is deployed (Sparrow issues #15 to #17); the unit does not
+grant its path until then. To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
 `sparrow.service`. Move the damaged `data_dir`, the intake root directory and
 the shipper's `state_dir` aside rather than deleting them. Copy `BACKUP/store`
 to `data_dir`, `BACKUP/intake` to the intake root and `BACKUP/config/ship` to

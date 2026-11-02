@@ -9,10 +9,11 @@ This directory holds everything a host needs to run Sparrow in production: the
 systemd units, the AppArmor profile, configuration templates, the helper
 scripts and these documents. After a restore from backups onto a fresh host,
 this directory and a clone of the repository are enough to deploy the service
-again, given the build prerequisites of step 1 and network access to the
-PurRDF source that `Cargo.lock` names: the backups do not hold the images, so
-step 2 rebuilds them (or copy the old host's `./bin`, which holds every kept
-image and the recovery probe). Secrets are never kept here; [Secrets](#secrets) names where each one
+again. Each backup keeps the image pair that last opened its store and the
+lexicon bundle it read, which is enough to start the restored store (RECOVERY.md, "Restore from a backup"). To
+build new images, and for the lexicon bundle and the recovery probe, step 2
+needs the build prerequisites of step 1 and network access to the PurRDF
+source that `Cargo.lock` names, or a copy of the old host's `./bin`. Secrets are never kept here; [Secrets](#secrets) names where each one
 lives.
 
 | Path | Contents |
@@ -53,8 +54,9 @@ Patrick's decisions for this deployment, 2026-11-01:
   Fleet producers ingest through the ingest-only group socket of Sparrow
   issue #10 (Forgejo `fleet/sparrow`), never the private socket; this
   directory does not implement it.
-- The NAS archive (`/net/synology/archives/sparrow`) is the backup. The unit
-  allows writes there for the archive worker, which is not built yet.
+- The NAS archive (`/net/synology/archives/sparrow`) is the backup. Its worker
+  is not deployed and nothing here grants its path; Sparrow issues #15 to #17
+  add it.
 - Restarts of the live service are approved and announced by the coordination
   session.
 
@@ -75,10 +77,9 @@ Patrick's decisions for this deployment, 2026-11-01:
 | `/etc/sparrow/tcp.secret` | root, 0600 | The CHAP secret (see [Secrets](#secrets)). |
 | `/SPARROW` | root:sparrow, 0750 | The service's tree. |
 | `/SPARROW/store` | sparrow, 0710 | The store and `rpc.sock` (0660). |
-| `/SPARROW/intake/NAME` | sparrow, 0770, ACL `group:sparrow:rwx` | One consume root per watch. |
+| `/SPARROW/intake/NAME` | the operator who made it (plain `mkdir`; the cutover gives existing roots to `sparrow`), 0770, ACL `group:sparrow:rwx` | One consume root per watch. |
 | `/SPARROW/ship` | paudley:sparrow, 2700 | The shipper's queue, staging, ledgers and lock. |
-| `/SPARROW/backups` | root, 0700 | Closed-store backups (three daily copies). |
-| `/net/synology/archives/sparrow` | sparrow (on the NAS) | The archive, once its worker is enabled. |
+| `/SPARROW/backups` | root, 0700 | Closed-store backups: three daily `STAMP` copies, and the named `pre-upgrade-IMAGE` copies, which the rotation never prunes. |
 | `/etc/systemd/system/sparrow*.{service,timer}` | root, 0644 | The units, from `systemd/`. |
 | `/etc/apparmor.d/sparrow` | root, 0644 | The profile, from `apparmor/`. |
 | `/etc/sysusers.d/sparrow.conf`, `/etc/tmpfiles.d/sparrow.conf` | root, 0644 | The user, group and layout, from `config/`. |
@@ -156,7 +157,12 @@ development. Within the slice Sparrow keeps `IOWeight=20` and `CPUQuota=100%`,
 so an ingest backlog cannot crowd out the other production services, which
 take precedence over it. Per process it runs at nice -20, best-effort IO
 priority 0 and OOM score adjustment -900, with real-time scheduling refused.
-The two timers' services run in the same slice with the same settings.
+The two timers' services run in the same slice at the same nice and IO
+priority, but with OOM score adjustment -500: under the specification's
+OOM ranking (section B, 2026-11-02) a helper is less protected than the
+service it serves, so a host OOM caused by a copy job kills the job. They are
+bounded too: the shipper at 512 MiB, 64 tasks and half a CPU, the backup at
+1 GiB, 64 tasks and one CPU.
 
 ## From a scratch clone to a running service
 
@@ -299,19 +305,42 @@ sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://SERVER_ADDRESS:518 stat
 
 ## Upgrades and rollback
 
+Build, then take a named closed-store backup of the store as the current image
+left it, then switch images:
+
 ```bash
 git pull && make check && make install-bin
+sudo systemctl stop sparrow-ship.timer
+sudo systemctl start sparrow-backup.service
+CURRENT=$(readlink /usr/local/libexec/sparrow/sparrowd)
+sudo sh -c 'cp -a --reflink=always "$(ls -d /SPARROW/backups/2*Z | tail -n 1)" "/SPARROW/backups/pre-upgrade-$1"' sh "$CURRENT"
+sudo grep -x "image=$CURRENT" "/SPARROW/backups/pre-upgrade-$CURRENT/SOURCE"
 sudo deploy/restart.sh
+sudo deploy/check.sh
+sudo systemctl start sparrow-ship.timer
 ```
+
+`sparrow-backup.service` stops the daemon through its drain, copies the store,
+intake and configuration with the image pair that last opened the store, and
+starts it again; its `SOURCE` records that image (`image=`), the store's
+identity, schema and format. The copy named `pre-upgrade-IMAGE` is never pruned
+by the three-day rotation; remove it by hand once the upgrade is settled.
 
 `restart.sh` installs and verifies the newest pair while the old daemon still
 runs, records the store identity, stops through the drain, points the links at
 the new pair (the old pair becomes `.previous`), starts, and fails unless the
-store identity is unchanged. `sudo deploy/restart.sh --rev REV` selects an
-older kept pair; `sudo deploy/restart.sh --rollback` swaps back to the previous
-pair. A newer image may upgrade the store's format, and an older image then
-refuses to open it, so rollback is safe only between images with the same
-store format (RECOVERY.md, "Rollback").
+store identity is unchanged. `sudo deploy/restart.sh --rev REV` selects another
+kept pair; `sudo deploy/restart.sh --rollback` swaps back to the previous pair.
+
+A newer image may upgrade the store's format, and an older image then refuses
+to open it. The scripts enforce this by the schema number in the image names
+(`sparrowd-schemaN-REV`), not by reading the store: `start.sh` and `restart.sh`
+refuse an image with a lower number than the current one, and refuse one with
+a higher number unless `/SPARROW/backups/pre-upgrade-CURRENT` exists and names
+the current image. The store's actual format is `store_format` in the daemon's
+status and in each backup's `SOURCE`. Going back across a schema change is a
+restore of the pre-upgrade backup, which starts exactly the image recorded in
+it (RECOVERY.md, "Restore from a backup").
 
 `sudo deploy/stop.sh` stops the service through the drain and reports what it
 still held.
@@ -346,7 +375,9 @@ Moving from the old user unit to this system unit adds a change of owner and
 of the consume roots' location. The acceptance steps of Sparrow issue #22,
 the cutover's tracking issue, give that cutover in full; in outline: drain, re-point each watch under
 `/SPARROW/intake` while the old unit still runs (the system unit cannot reach
-`/home`), stop the old unit and disable it, move the shipper's state to
+`/home`), stop the old unit and disable it, take the named pre-upgrade backup
+of the closed store with the old image recorded in its `SOURCE` (the
+issue's step 5a), move the shipper's state to
 `/SPARROW/ship`, give `/SPARROW/store` and the roots to `sparrow` with
 `chown -R`, run `install.sh`, then `start.sh` and `check.sh --store-id`.
 

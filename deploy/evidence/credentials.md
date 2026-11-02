@@ -58,11 +58,14 @@ the tree has it.
 ## The live secret
 
 The current secret is at `~/.config/sparrow/tcp.secret` under the user unit.
-The cutover moves it, it is not regenerated (issue #22's acceptance steps, step 3):
+The cutover copies it, it is not regenerated (issue #22's acceptance steps,
+step 7):
 
 ```bash
 sudo install -m 0600 -o root -g root ~/.config/sparrow/tcp.secret /etc/sparrow/tcp.secret
-shred -u ~/.config/sparrow/tcp.secret   # after the system unit passes check.sh
 ```
+
+`~/.config/sparrow/tcp.secret` stays, mode 0600, as the operator's copy for
+the CLI over TCP (README.md, "Secrets").
 
 Not run: it needs root and belongs to the cutover window.

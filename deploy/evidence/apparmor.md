@@ -83,10 +83,17 @@ Relative names are opened beneath a held directory descriptor (the store, a
 consume root or its claim directory). The `/home` components the daemon
 resolved while canonicalizing the test paths are omitted; in production those
 paths are under `/SPARROW`. The profile grants these and nothing else: its
-images and libraries, the configuration and credential, the lexicons, the store
-(including binding its socket), the consume roots, the archive, its own `/proc`
-entries, the CPU list and `/proc/sys/kernel/random/uuid`, time zones, Unix,
-IPv4 and IPv6 sockets and the bind capability. Exec of every file is denied.
+images and libraries, `/etc/sparrow/server.toml` alone and the credential, the
+lexicons, the store (including binding its socket), the consume roots, its own
+`/proc` entries, the CPU list and `/proc/sys/kernel/random/uuid`, time zones,
+Unix sockets (a stream `connect` only to a peer under the same profile, which
+is its own socket), IPv4 and IPv6 sockets and the bind capability. Exec of
+every file is denied. The NAS archive is not granted until its worker is
+deployed (Sparrow issues #15 to #17). The review of 2026-11-02 narrowed the
+configuration rule and the stream `connect` rule and added `create` to the
+Unix rules, which the trace-derived rules lacked; like the rest of the
+profile, these are parsed (`apparmor_parser -Q -K`, exit 0) but not yet loaded
+or exercised in enforce mode.
 
 ## Load and live checks, not run
 

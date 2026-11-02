@@ -11,6 +11,7 @@
 #   SPARROW_PREFIX    images, CLI link and lexicons         /usr/local
 #   SPARROW_CONFIG    the daemon's configuration            /etc/sparrow/server.toml
 #   SPARROW_BIN       the kept images (make install-bin)    <repository>/bin
+#   SPARROW_BACKUPS   closed-store backups                  /SPARROW/backups
 
 DEPLOY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$DEPLOY_DIR/.." && pwd)
@@ -19,6 +20,7 @@ SPARROW_SCOPE=${SPARROW_SCOPE:-system}
 SPARROW_PREFIX=${SPARROW_PREFIX:-/usr/local}
 SPARROW_CONFIG=${SPARROW_CONFIG:-/etc/sparrow/server.toml}
 SPARROW_BIN=${SPARROW_BIN:-$REPO_DIR/bin}
+SPARROW_BACKUPS=${SPARROW_BACKUPS:-/SPARROW/backups}
 LIBEXEC=$SPARROW_PREFIX/libexec/sparrow
 CLI_LINK=$SPARROW_PREFIX/bin/sparrow
 # The daemon takes up to TimeoutStopSec (120 s) to drain; startup can wait longer for disk space.
@@ -37,6 +39,39 @@ die() {
 
 note() {
     printf '%s: %s\n' "${0##*/}" "$*"
+}
+
+# While the old user unit exists, user scope with the default unit name would address it.
+[[ $SPARROW_SCOPE != user || $SPARROW_UNIT != sparrow.service ]] \
+    || die "SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit (deploy/test-instance.sh env), never sparrow.service"
+
+# The operators: the accounts config/sysusers-sparrow.conf adds to the sparrow group.
+operators() {
+    sed -n 's/^m \([^ ]*\) sparrow$/\1/p' "$DEPLOY_DIR/config/sysusers-sparrow.conf"
+}
+
+# What keeps OPERATOR's old user unit sparrow.service in the way, one line each: enabled, and
+# running. Read-only. Run as the operator or as root (through the operator's user manager).
+old_user_unit_problems() {
+    local operator=$1 home wants state uid
+    home=$(getent passwd "$operator" | cut -d: -f6)
+    [[ -n $home ]] || die "no account $operator"
+    wants=$home/.config/systemd/user/default.target.wants/sparrow.service
+    [[ ! -e $wants ]] || printf 'enabled (%s)\n' "$wants"
+    if [[ $(id -un) == "$operator" ]]; then
+        state=$(systemctl --user is-active sparrow.service || true)
+    else
+        state=$(systemctl --user --machine="$operator@" is-active sparrow.service 2>/dev/null || true)
+        if [[ -z $state ]]; then
+            uid=$(id -u "$operator")
+            # No answer is fine only when the operator has no user manager to run the unit.
+            ! systemctl is-active --quiet "user@$uid.service" \
+                || die "cannot query $operator's user manager for sparrow.service"
+        fi
+    fi
+    case $state in
+        active | activating | deactivating | reloading | refreshing) printf '%s\n' "$state" ;;
+    esac
 }
 
 # A string value of a top-level key in the daemon's TOML configuration.
@@ -115,19 +150,44 @@ refuse_start_limit() {
 then run: ${SYSTEMCTL[*]} reset-failed $SPARROW_UNIT"
 }
 
+# The schema number N in an image name sparrowd-schemaN-REV.
+image_schema() {
+    local name=${1##*/}
+    name=${name#sparrowd-schema}
+    name=${name%%-*}
+    [[ $name =~ ^[0-9]+$ ]] || die "cannot read the schema from image name ${1##*/}"
+    printf '%s\n' "$name"
+}
+
 # Refuse an image whose schema is older than the current one's: the current image may have upgraded
-# the store's format, which an older image cannot open (RECOVERY.md, "Rollback").
+# the store's format, which an older image cannot open (RECOVERY.md, "Rollback"). The rule compares
+# the schema numbers in the image names; it does not read the store's format.
 refuse_schema_downgrade() {
     local daemon=$1 current new old
     current=$(readlink -- "$LIBEXEC/sparrowd" 2>/dev/null || true)
     [[ -n $current ]] || return 0
-    new=${daemon##*/sparrowd-schema}; new=${new%%-*}
-    old=${current#sparrowd-schema}; old=${old%%-*}
-    [[ $new =~ ^[0-9]+$ && $old =~ ^[0-9]+$ ]] \
-        || die "cannot read the schema from image names ${daemon##*/} and $current"
-    ((new >= old)) || die "${daemon##*/} is schema $new, older than the current $current; \
-it cannot open a store that image upgraded. Fix forward, or restore the backup taken before the \
-upgrade (RECOVERY.md, \"Rollback\")"
+    new=$(image_schema "$daemon") || exit 1
+    old=$(image_schema "$current") || exit 1
+    ((new >= old)) || die "${daemon##*/} is schema $new, older than the current $current; it \
+cannot open a store that image upgraded. Fix forward, or restore the pre-upgrade backup \
+(RECOVERY.md, \"Rollback\")"
+}
+
+# Raising the schema may upgrade the store's format, after which only a backup taken before can go
+# back. Require the named pre-upgrade backup of the current image (README.md, "Upgrades and
+# rollback"); the backup rotation never prunes it.
+require_pre_upgrade_backup() {
+    local daemon=$1 current backup new old
+    current=$(readlink -- "$LIBEXEC/sparrowd" 2>/dev/null || true)
+    [[ -n $current ]] || return 0
+    new=$(image_schema "$daemon") || exit 1
+    old=$(image_schema "$current") || exit 1
+    ((new > old)) || return 0
+    backup=$SPARROW_BACKUPS/pre-upgrade-$current
+    grep -qx "image=$current" "$backup/SOURCE" 2>/dev/null || die "${daemon##*/} raises the schema \
+from $old to $new; take the named pre-upgrade backup $backup first (README.md, \"Upgrades and \
+rollback\")"
+    note "pre-upgrade backup $backup holds the store as $current left it"
 }
 
 # Point the stable names at an image pair, keeping the pair they named as .previous.

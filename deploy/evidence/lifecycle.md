@@ -301,8 +301,177 @@ The rehearsal ([rehearsal.md](rehearsal.md), gap G1) exercised `stop.sh` on a
 unit caught between restarts: `stop.sh: sparrow-deploytest.service was
 activating (no drain: the daemon was not serving); stopped`.
 
+## Rollback across a schema change, 2026-11-02
+
+The review of 2026-11-02 (R2) asked for a way back across a schema change. On a
+fresh test instance (`R4`, images from both revisions), started on the schema
+62 image: `sparrow-backup` took a backup through the unit, and its `SOURCE`
+records the image that last opened the store with the store's identity,
+schema and format, and keeps the image pair; `restart.sh` refused to raise the
+schema until the named `pre-upgrade-IMAGE` copy existed, then upgraded; after
+a further ingest, the store was replaced by the backup's and
+`start.sh --restored-from` started exactly the schema 62 image on it, with the
+same store identity, although the links named the schema 63 image. The test
+instance's links were reset to none before the first start (`setup` points
+them at the newest image), as on a host that runs schema 62 today. The
+backup ran from the worktree with the test instance's environment
+(`SPARROW_SCOPE`, `SPARROW_UNIT`, `SPARROW_PREFIX`, `RUNTIME_DIRECTORY`):
+
+```text
+$ deploy/start.sh --rev cfdf2fa
+start.sh: starting sparrow-deploytest.service on sparrowd-schema62-cfdf2fa
+receipt: unit=sparrow-deploytest.service state=active pid=1752772
+receipt: daemon=sparrowd-schema62-cfdf2fa cli=sparrow-schema62-cfdf2fa previous=none
+receipt: store_id=store:f5397155e72d7d906ba0028422b23973 schema=62 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ drop before-upgrade
+consumed before-upgrade
+[exit 0]
+
+$ backup
+sparrow-backup: R4/backups/20261102T161210Z complete; 4.8s service downtime; kept 1 backup(s)
+[exit 0]
+
+$ grep -E ^(image|store_id|schema_version|store_format)= R4/backups/20261102T161210Z//SOURCE
+image=sparrowd-schema62-cfdf2fa
+store_id=store:f5397155e72d7d906ba0028422b23973
+schema_version=62
+store_format=sparrow.store/79
+[exit 0]
+
+$ ls R4/backups/20261102T161210Z//images
+sparrow-schema62-cfdf2fa
+sparrowd-schema62-cfdf2fa
+[exit 0]
+
+$ deploy/restart.sh --rev ba6ebe7
+restart.sh: sparrowd-schema63-ba6ebe7 raises the schema from 62 to 63; take the named pre-upgrade backup R4/backups/pre-upgrade-sparrowd-schema62-cfdf2fa first (README.md, "Upgrades and rollback")
+[exit 1]
+
+$ cp -a --reflink=always R4/backups/20261102T161210Z/ R4/backups/pre-upgrade-sparrowd-schema62-cfdf2fa
+[exit 0]
+
+$ deploy/restart.sh --rev ba6ebe7
+restart.sh: pre-upgrade backup R4/backups/pre-upgrade-sparrowd-schema62-cfdf2fa holds the store as sparrowd-schema62-cfdf2fa left it
+restart.sh: sparrow-deploytest.service stopped through its drain (pid 1755944); socket removed
+restart.sh: starting sparrow-deploytest.service on sparrowd-schema63-ba6ebe7
+receipt: unit=sparrow-deploytest.service state=active pid=1756969
+receipt: daemon=sparrowd-schema63-ba6ebe7 cli=sparrow-schema63-ba6ebe7 previous=sparrowd-schema62-cfdf2fa
+receipt: store_id=store:f5397155e72d7d906ba0028422b23973 schema=63 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ drop after-upgrade
+consumed after-upgrade
+[exit 0]
+
+$ deploy/restart.sh --rollback
+restart.sh: rolling back to sparrowd-schema62-cfdf2fa; an image cannot undo a store-format upgrade its successor made
+restart.sh: sparrowd-schema62-cfdf2fa is schema 62, older than the current sparrowd-schema63-ba6ebe7; it cannot open a store that image upgraded. Fix forward, or restore the pre-upgrade backup (RECOVERY.md, "Rollback")
+[exit 1]
+
+$ deploy/start.sh
+start.sh: sparrow-deploytest.service already runs sparrowd-schema63-ba6ebe7
+receipt: unit=sparrow-deploytest.service state=active pid=1756969
+receipt: daemon=sparrowd-schema63-ba6ebe7 cli=sparrow-schema63-ba6ebe7 previous=sparrowd-schema62-cfdf2fa
+receipt: store_id=store:f5397155e72d7d906ba0028422b23973 schema=63 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service stopped through its drain (pid 1756969); socket removed
+[exit 0]
+
+$ mv R4/data/store R4/data/store.upgraded
+[exit 0]
+
+$ cp -a --reflink=always R4/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/store R4/data/store
+[exit 0]
+
+$ deploy/start.sh --restored-from R4/backups/pre-upgrade-sparrowd-schema62-cfdf2fa
+start.sh: restored store: starting sparrowd-schema62-cfdf2fa, the image that last opened it (R4/backups/pre-upgrade-sparrowd-schema62-cfdf2fa)
+start.sh: starting sparrow-deploytest.service on sparrowd-schema62-cfdf2fa
+receipt: unit=sparrow-deploytest.service state=active pid=1758446
+receipt: daemon=sparrowd-schema62-cfdf2fa cli=sparrow-schema62-cfdf2fa previous=sparrowd-schema63-ba6ebe7
+receipt: store_id=store:f5397155e72d7d906ba0028422b23973 schema=62 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ deploy/start.sh --restored-from R4/backups/pre-upgrade-sparrowd-schema62-cfdf2fa
+start.sh: sparrow-deploytest.service is running; stop it before starting a restored store
+[exit 1]
+
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service stopped through its drain (pid 1758446); socket removed
+[exit 0]
+
+$ deploy/test-instance.sh teardown R4
+test-instance.sh: sparrow-deploytest.service removed; R4 kept
+[exit 0]
+```
+
+A second instance (`R5`) after the backup also began keeping the lexicon
+bundle; the same sequence passed, and the backup holds:
+
+```text
+$ ls R5/backups/20261102T161543Z/ R5/backups/20261102T161543Z//images R5/backups/20261102T161543Z//lexicons
+R5/backups/20261102T161543Z/:
+SOURCE
+config
+images
+intake
+lexicons
+store
+
+R5/backups/20261102T161543Z//images:
+sparrow-schema62-cfdf2fa
+sparrowd-schema62-cfdf2fa
+
+R5/backups/20261102T161543Z//lexicons:
+lexicons-a47940e1f130bf3739c6d59aaf89643209905ea4
+[exit 0]
+```
+
+## Install preconditions and the user-scope guard, 2026-11-02
+
+`install.sh` now checks, before it changes anything, that the slice exists
+when enabling and that the operator's old user unit is neither enabled nor
+running (review R3). The check is read-only; run as the operator against this
+host, where the old user unit runs and the slice is not installed yet, it
+reports all three, so `sudo deploy/install.sh` would refuse and change nothing.
+That refusal itself needs root and was not run. The lifecycle scripts refuse
+`SPARROW_SCOPE=user` without a test unit name (review O10); the refusal comes
+from `lib.sh` as it is sourced, before any `systemctl` call:
+
+```text
+$ bash -c source deploy/lib.sh; operators
+paudley
+[exit 0]
+
+$ bash -c source deploy/lib.sh; old_user_unit_problems paudley
+enabled (/home/paudley/.config/systemd/user/default.target.wants/sparrow.service)
+active
+[exit 0]
+
+$ systemctl show -p FragmentPath --value lillith.slice
+
+[exit 0]
+
+$ env SPARROW_SCOPE=user deploy/stop.sh
+stop.sh: SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit (deploy/test-instance.sh env), never sparrow.service
+[exit 1]
+
+$ env SPARROW_SCOPE=user SPARROW_UNIT=sparrow.service deploy/check.sh
+check.sh: SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit (deploy/test-instance.sh env), never sparrow.service
+[exit 1]
+
+$ deploy/install.sh
+install.sh: run as root (sudo deploy/install.sh), or set SPARROW_DESTDIR to stage into a directory
+[exit 1]
+```
+
 ## Not run
 
+- `install.sh`'s refusal and its partial-change report as root, and the
+  backup as the root system unit.
 - Everything that needs root: the system unit, the user and group, the slice,
   priority, the credential, the bind on 518 and AppArmor enforcement. The
   acceptance steps of issue #22, the cutover's tracking issue, list those steps.

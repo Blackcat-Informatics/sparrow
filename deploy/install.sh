@@ -46,9 +46,40 @@ if [[ -z $DEST && $EUID -ne 0 ]]; then
     die "run as root (sudo deploy/install.sh), or set SPARROW_DESTDIR to stage into a directory"
 fi
 
-CHANGED=()
+# Preconditions, all read-only, before anything changes: enabling needs the production slice, and
+# the old user unit must be neither enabled nor running, because tmpfiles re-owns /SPARROW and its
+# daemon would lose its store.
+if [[ -n $DEST ]]; then
+    note "staging: the host preconditions (the slice, the old user unit) are not checked"
+else
+    problems=()
+    if ((ENABLE)) && [[ -z $(systemctl show -p FragmentPath --value lillith.slice) ]]; then
+        problems+=("lillith.slice is not installed; install it from Katamari's deploy/systemd first (README.md, step 1)")
+    fi
+    for operator in $(operators); do
+        while IFS= read -r problem; do
+            problems+=("$operator's old user unit sparrow.service is $problem; stop and disable it first (README.md, \"Moving a running service\")")
+        done < <(old_user_unit_problems "$operator")
+    done
+    if ((${#problems[@]})); then
+        printf 'install.sh: refused; nothing was changed:\n' >&2
+        printf '  %s\n' "${problems[@]}" >&2
+        exit 1
+    fi
+fi
+
+CHANGED=() RAN=()
 UNITS_CHANGED=0
 PROFILE_CHANGED=0
+# A failure part way still reports what had changed.
+report_partial() {
+    local status=$?
+    if ((status != 0 && ${#CHANGED[@]} + ${#RAN[@]})); then
+        printf 'install.sh: failed after changing:\n' >&2
+        printf '  %s\n' "${CHANGED[@]}" "${RAN[@]/#/ran: }" >&2
+    fi
+}
+trap report_partial EXIT
 
 # Run a host-changing command, or print it when staging.
 host() {
@@ -56,6 +87,7 @@ host() {
         note "staged, not run: $*"
     else
         "$@"
+        RAN+=("$*")
     fi
 }
 
@@ -121,7 +153,6 @@ if [[ -z $DEST ]] && ! grep -qx 'sparrow (enforce)' /sys/kernel/security/apparmo
 fi
 if ((PROFILE_CHANGED)); then
     host apparmor_parser -r -W /etc/apparmor.d/sparrow
-    [[ -n $DEST ]] || CHANGED+=("AppArmor profile sparrow loaded")
 fi
 
 # 6. Helpers run by the timers.
@@ -156,6 +187,8 @@ for bundle in "$SPARROW_BIN"/lexicons-*; do
     install -d -m 0755 -- "$(dirname -- "$target")"
     staging=$(mktemp -d "$(dirname -- "$target")/.lexicons.XXXXXX")
     cp -a --reflink=auto -- "$bundle/." "$staging/"
+    # cp -a keeps the builder's ownership; installed files are root's (README.md, "Layout").
+    [[ -n $DEST ]] || chown -R root:root -- "$staging"
     diff -r -q -- "$bundle" "$staging" >/dev/null || die "copy of $bundle does not match"
     chmod -R a+rX,go-w -- "$staging"
     mv -T -n -- "$staging" "$target"
@@ -172,15 +205,6 @@ if ((UNITS_CHANGED)); then
     host systemctl daemon-reload
 fi
 if ((ENABLE)); then
-    if [[ -n $DEST ]]; then
-        note "skipped while staging: the lillith.slice check and the old user unit check (README.md, step 1)"
-    else
-        [[ -n $(systemctl show -p FragmentPath --value lillith.slice) ]] \
-            || die "lillith.slice is not installed; install Katamari's deploy/systemd/lillith.slice first (README.md, step 1)"
-        for wants in /home/*/.config/systemd/user/default.target.wants/sparrow.service; do
-            [[ ! -e $wants ]] || die "the old user unit is still enabled ($wants); disable it first (README.md, Moving a running service)"
-        done
-    fi
     host systemctl enable sparrow.service sparrow-ship.timer sparrow-backup.timer
 fi
 
@@ -189,4 +213,11 @@ if ((${#CHANGED[@]})); then
     printf '  %s\n' "${CHANGED[@]}"
 else
     printf 'install.sh: nothing changed\n'
+fi
+# These re-assert state on every run, and their effects are not itemized: on a first run sysusers
+# creates the user and group and tmpfiles sets the owners, modes and ACLs that README.md, "Layout",
+# lists, re-owning /SPARROW and /SPARROW/store.
+if ((${#RAN[@]})); then
+    printf 'install.sh: ran (effects not itemized; README.md, "Layout", gives the result):\n'
+    printf '  %s\n' "${RAN[@]}"
 fi

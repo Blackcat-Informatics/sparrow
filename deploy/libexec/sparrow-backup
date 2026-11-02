@@ -18,6 +18,12 @@ lock, so no new files arrive, and waits until every intake root is empty and
 every watch reports no pending claims. Files are never moved under the running
 daemon, whose reserved claims bind each file's identity.
 
+Each backup records in SOURCE the image that last opened the store, with the
+store's identity, schema and format, and keeps that image pair under images/
+and the lexicon bundle it reads under lexicons/, so `deploy/start.sh --restored-from BACKUP` can start exactly that image. Only
+timestamp-named backups are pruned; a copy under another name (README.md,
+"Upgrades and rollback": pre-upgrade-IMAGE) is kept until removed by hand.
+
 The script refuses to touch a service that is not running. Once it has stopped
 the service it always restarts it, including after a failure or a SIGTERM; the
 unit's ExecStopPost restarts it after a SIGKILL, guided by a marker file. Any
@@ -36,7 +42,12 @@ import time
 import tomllib
 from pathlib import Path
 
-UNIT = "sparrow.service"
+# The unit and its manager, and where the image links live; the defaults are the production ones,
+# and deploy/lib.sh reads the same variables, so a test instance (deploy/test-instance.sh) can drive
+# this script too.
+UNIT = os.environ.get("SPARROW_UNIT", "sparrow.service")
+SCOPE = os.environ.get("SPARROW_SCOPE", "system")
+LIBEXEC = Path(os.environ.get("SPARROW_PREFIX", "/usr/local")) / "libexec" / "sparrow"
 STAMP = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
 QUIESCE_SECONDS = 30 * 60
 # The unit's RuntimeDirectory=; its ExecStopPost reads the same name.
@@ -47,8 +58,16 @@ def fail(message):
     sys.exit(f"sparrow-backup: {message}")
 
 
+def systemctl_command():
+    if SCOPE not in ("system", "user"):
+        fail(f"SPARROW_SCOPE must be system or user, not {SCOPE}")
+    if SCOPE == "user" and UNIT == "sparrow.service":
+        fail("SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit, never sparrow.service")
+    return ["systemctl"] + (["--user"] if SCOPE == "user" else [])
+
+
 def systemctl(*args):
-    subprocess.run(["systemctl", *args], check=True)
+    subprocess.run([*systemctl_command(), *args], check=True)
 
 
 def du(path):
@@ -75,11 +94,26 @@ def fsync_directory(path):
         os.close(directory)
 
 
-def pending_claims(socket):
-    """Sum pending consume claims from the CLI's status output."""
+def daemon_status(socket):
+    """The daemon's typed status, from the CLI."""
     status = subprocess.run(["sparrow", str(socket), "status"], check=True,
                             capture_output=True, text=True)
-    return sum(watch["pending_claims"] for watch in json.loads(status.stdout)["consume_watches"])
+    return json.loads(status.stdout)
+
+
+def pending_claims(socket):
+    """Sum pending consume claims from the daemon's status."""
+    return sum(watch["pending_claims"] for watch in daemon_status(socket)["consume_watches"])
+
+
+def selected_image():
+    """The daemon image the unit runs: start.sh and restart.sh point this link at the image they
+    start, and refuse to leave it naming any other while the unit runs."""
+    link = LIBEXEC / "sparrowd"
+    try:
+        return os.readlink(link)
+    except OSError as error:
+        fail(f"cannot read the image link {link}: {error}")
 
 
 def waiting_files(intake):
@@ -104,7 +138,7 @@ def main(server_config, backup_root, keep, intake, extra):
     data_dir, socket = Path(server["data_dir"]), Path(server["socket_path"])
     if not data_dir.is_dir():
         fail(f"data_dir {data_dir} is missing")
-    if subprocess.run(["systemctl", "is-active", "--quiet", UNIT]).returncode != 0:
+    if subprocess.run([*systemctl_command(), "is-active", "--quiet", UNIT]).returncode != 0:
         fail(f"{UNIT} is not running; refusing to stop or start it")
     backup_root.mkdir(parents=True, exist_ok=True)
     if backup_root.resolve().is_relative_to(data_dir.resolve()):
@@ -137,10 +171,16 @@ def main(server_config, backup_root, keep, intake, extra):
                     f"file(s) waiting, {pending_claims(socket)} claim(s) pending")
             time.sleep(5)
         waited = time.monotonic() - waited
+        # Which image last opened this store, so a restore can start exactly that image
+        # (deploy/start.sh --restored-from) rather than one that would upgrade it.
+        status = daemon_status(socket)
+        image = selected_image()
         (partial / "SOURCE").write_text(
             f"data_dir={data_dir}\nserver_config={server_config}\nintake={intake}\n"
             f"taken_utc={stamp}\ndrain_seconds={waited:.0f}\n"
             "waiting_files=0\npending_claims=0\n"
+            f"image={image}\nstore_id={status['store_id']}\n"
+            f"schema_version={status['schema_version']}\nstore_format={status['store_format']}\n"
             + "".join(f"extra={path}\n" for path in extra)
         )
         marker.write_text(f"{os.getpid()}\n")
@@ -149,6 +189,15 @@ def main(server_config, backup_root, keep, intake, extra):
         systemctl("stop", UNIT)
         copy_tree(data_dir, partial / "store")
         copy_tree(intake, partial / "intake")
+        # The image pair that last opened the store, so a restore needs nothing from ./bin.
+        images = partial / "images"
+        images.mkdir()
+        for name in (image, "sparrow-" + image.removeprefix("sparrowd-")):
+            shutil.copy2(LIBEXEC / name, images / name)
+        # And the lexicon bundle it reads (text_lexicon_dir is the bundle's artifacts directory).
+        bundle = Path(server["text_lexicon_dir"]).parent
+        (partial / "lexicons").mkdir()
+        copy_tree(bundle, partial / "lexicons" / bundle.name)
         config = partial / "config"
         config.mkdir()
         for path in [server_config, *extra]:
@@ -161,6 +210,16 @@ def main(server_config, backup_root, keep, intake, extra):
         if stopped:
             systemctl("start", UNIT)
             marker.unlink(missing_ok=True)
+    # Report success only once the restarted daemon answers on its socket.
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            daemon_status(socket)
+            break
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            if time.monotonic() > deadline:
+                fail(f"{UNIT} restarted but did not answer status within 120s")
+            time.sleep(1)
     downtime = time.monotonic() - started
     os.rename(partial, final)
     fsync_directory(backup_root)

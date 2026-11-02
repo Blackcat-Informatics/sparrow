@@ -78,15 +78,27 @@ sudo systemctl start sparrow.service
   before `/usr/local/libexec/sparrow/sparrowd`; `deploy/evidence/apparmor.md`
   shows how the profile's path list was derived this way.
 - With systemd working but the unit broken, run the same image under a
-  transient unit in the production slice instead:
+  transient unit in the production slice instead. Prepare `/run/sparrow-manual`
+  first, exactly as in "Foreground, confined, with the public listener" above
+  (its first three commands). A transient unit's credentials would land under
+  `/run/credentials/sparrow-manual.service/`, which neither the configuration
+  nor the profile names, so this recipe uses the prepared copies, which the
+  profile admits, and no `LoadCredential=`:
 
   ```bash
   sudo systemd-run --unit=sparrow-manual --slice=lillith.slice --uid=sparrow --gid=sparrow \
       -p AppArmorProfile=sparrow -p UMask=0077 -p KillSignal=SIGINT -p Nice=-20 \
-      -p AmbientCapabilities=CAP_NET_BIND_SERVICE -p LoadCredential=tcp.secret:/etc/sparrow/tcp.secret \
+      -p OOMScoreAdjust=-900 -p AmbientCapabilities=CAP_NET_BIND_SERVICE \
+      -p CapabilityBoundingSet=CAP_NET_BIND_SERVICE \
       -p WorkingDirectory=/SPARROW/store --wait --pty \
-      /usr/local/libexec/sparrow/sparrowd --config /etc/sparrow/server.toml
+      /usr/local/libexec/sparrow/sparrowd --config /run/sparrow-manual/server.toml
   ```
+
+  Afterwards remove the copies as above. Not tested: it needs root, the
+  system manager and the loaded profile. The path agreement was checked by
+  reading: the prepared configuration names
+  `/run/sparrow-manual/tcp.secret`, and the profile grants
+  `/run/sparrow-manual/*` read.
 
 ## The helpers by hand
 

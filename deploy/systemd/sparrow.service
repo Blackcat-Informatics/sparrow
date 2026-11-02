@@ -95,9 +95,10 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 ProtectSystem=strict
 ProtectHome=yes
-# The store and socket, the consume roots, and the NAS archive once the archive worker is
-# enabled ("-": absent until the share is mounted and the directory made).
-ReadWritePaths=/SPARROW/store /SPARROW/intake -/net/synology/archives/sparrow
+# The store and socket, and the consume roots. The NAS archive is not listed: its worker is not
+# deployed, and a hard NFS mount here would make every start wait on the NAS (Sparrow issues #15
+# to #17 add its path, without a start dependency).
+ReadWritePaths=/SPARROW/store /SPARROW/intake
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateIPC=yes

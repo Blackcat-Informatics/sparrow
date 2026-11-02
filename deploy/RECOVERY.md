@@ -13,16 +13,17 @@ Commands prefixed with `sudo` need root.
 
 | State | Location | Backed up by |
 | --- | --- | --- |
-| Store (catalog, bytes, indexes, WAL, watch catalog, consume journals) | `/SPARROW/store` | `sparrow-backup` (closed-store copy); the NAS archive once enabled |
+| Store (catalog, bytes, indexes, WAL, watch catalog, consume journals) | `/SPARROW/store` | `sparrow-backup` (closed-store copy) |
 | Files waiting in consume roots | `/SPARROW/intake/NAME` | `sparrow-backup`, taken only when every root is empty |
 | Shipper queue, ledgers, lock | `/SPARROW/ship` | `sparrow-backup` |
 | Configuration, watch definitions, CHAP secret | `/etc/sparrow` | `sparrow-backup` |
-| Images and lexicons | `/usr/local/libexec/sparrow`, `/usr/local/share/sparrow` | Rebuilt from the repository and `./bin` |
+| Images and lexicons | `/usr/local/libexec/sparrow`, `/usr/local/share/sparrow` | Each backup's `images/` and `lexicons/` keep the pair that last opened its store and its bundle; everything else is rebuilt from the repository into `./bin` |
 | Units, profile, layout | `/etc/systemd/system`, `/etc/apparmor.d`, `/etc/{sysusers,tmpfiles}.d` | This directory (`install.sh`) |
 
 The closed-store backups in `/SPARROW/backups` share the store's disk, so they
 protect against software faults and operator error, not against losing the
-disk. The NAS archive is the off-host backup.
+disk. The NAS archive, the off-host backup, is not deployed yet (Sparrow
+issues #15 to #17).
 
 ## Verify health
 
@@ -143,10 +144,11 @@ every watch in `consume_watches` names a root that exists.
 - Limit: an image cannot undo a store-format upgrade its successor made.
   `start.sh` and `restart.sh` therefore refuse an image whose schema number
   (`sparrowd-schemaN-REV`) is lower than the current image's, before stopping
-  anything. Stay on the new image and fix forward, or restore the closed-store
-  backup taken before the upgrade
+  anything. Stay on the new image and fix forward, or restore the named
+  pre-upgrade backup `/SPARROW/backups/pre-upgrade-IMAGE` ("Restore from a
+  backup"), which `restart.sh` requires before it raises the schema
   ([evidence/lifecycle.md](evidence/lifecycle.md) shows a schema 62 image
-  refusing a store a schema 63 image had opened). Reverting `/etc/sparrow/server.toml` is a
+  refusing a store a schema 63 image had opened, and the restore). Reverting `/etc/sparrow/server.toml` is a
   separate step, kept in its backup.
 - Reversible: yes; `--rollback` again swaps forward.
 
@@ -180,18 +182,17 @@ every watch in `consume_watches` names a root that exists.
 
 ## NAS archive unavailable
 
-- The archive worker is not built yet; this entry applies once `[archive]` is
-  configured. An unreachable archive at startup starts the daemon degraded; it
-  does not refuse to start, and no unarchived evidence is deleted while the
-  archive is down. A hung NFS mount can still delay the unit's start while
-  systemd sets up `ReadWritePaths=`; check with `findmnt /net/synology/archives`
-  and `timeout 5 stat /net/synology/archives/sparrow`.
+- Not applicable yet: the archive worker is not deployed, and neither the unit
+  nor the profile names the NAS, so a NAS outage does not affect the service.
+  Sparrow issues #15 to #17 add the archive and this entry's procedure.
 
 ## Restore from a backup
 
-A backup `/SPARROW/backups/STAMP` holds `store`, `intake` and `config` (the
-server configuration, `/etc/sparrow` with the secret, and `/SPARROW/ship`)
-from one moment. Qualify it on a disposable copy first with the recovery probe
+A backup `/SPARROW/backups/NAME` (a `STAMP`, or a named `pre-upgrade-IMAGE`)
+holds `store`, `intake` and `config` (the server configuration, `/etc/sparrow`
+with the secret, and `/SPARROW/ship`) from one moment, `images/` with the
+image pair that last opened the store, `lexicons/` with the bundle it read, and `SOURCE`, which names that image
+(`image=`) and the store's identity, schema and format. Qualify it on a disposable copy first with the recovery probe
 (docs/deployment.md, "Recovery qualification"), and never start `sparrowd` on
 such a copy: its watch catalog names the live consume roots.
 
@@ -201,34 +202,43 @@ sudo deploy/stop.sh
 sudo mv /SPARROW/store /SPARROW/store.damaged
 sudo mv /SPARROW/intake /SPARROW/intake.damaged
 sudo mv /SPARROW/ship /SPARROW/ship.damaged
-sudo cp -a --reflink=auto /SPARROW/backups/STAMP/store /SPARROW/store
-sudo cp -a --reflink=auto /SPARROW/backups/STAMP/intake /SPARROW/intake
-sudo cp -a --reflink=auto /SPARROW/backups/STAMP/config/ship /SPARROW/ship
+sudo cp -a --reflink=auto /SPARROW/backups/NAME/store /SPARROW/store
+sudo cp -a --reflink=auto /SPARROW/backups/NAME/intake /SPARROW/intake
+sudo cp -a --reflink=auto /SPARROW/backups/NAME/config/ship /SPARROW/ship
 sudo systemd-tmpfiles --create sparrow.conf
-sudo deploy/start.sh
+sudo deploy/start.sh --restored-from /SPARROW/backups/NAME
 sudo deploy/check.sh --store-id STORE_ID
 sudo systemctl start sparrow-ship.timer sparrow-backup.timer
 ```
 
-`STORE_ID` is the identity recorded before the failure. Restore
+`start.sh --restored-from` starts exactly the image `SOURCE` names, taken from
+`/usr/local/libexec/sparrow`, `./bin` or the backup's `images/`, and fails
+unless the daemon reports the store identity `SOURCE` records. Never start a
+restored store with plain `start.sh`: it picks the newest image, which may
+upgrade the restored store and lose the way back again. `STORE_ID` is the
+identity recorded before the failure. Restore
 `/etc/sparrow` from `BACKUP/config/sparrow` only if it was lost; on a fresh
 host it always was, so run this before `deploy/start.sh`:
 
 ```bash
-sudo cp -a --reflink=auto /SPARROW/backups/STAMP/config/sparrow/. /etc/sparrow/
+sudo cp -a --reflink=auto /SPARROW/backups/NAME/config/sparrow/. /etc/sparrow/
 sudo stat -c '%U %a' /etc/sparrow/tcp.secret
 ls /usr/local/share/sparrow
 grep text_lexicon_dir /etc/sparrow/server.toml
 ```
 
-Expect `root 600`, and a `text_lexicon_dir` naming a bundle that `install.sh`
-installed on this host: the same PurRDF revision, or the open is refused
-("Refused open"). The shipper
+Expect `root 600`, and a `text_lexicon_dir` naming a bundle installed on this
+host: the same PurRDF revision, or the open is refused ("Refused open"). If
+`install.sh` installed a different bundle, install the backup's:
+`sudo cp -a --no-preserve=ownership /SPARROW/backups/NAME/lexicons/. /usr/local/share/sparrow/`. The shipper
 then resends every file shipped after the backup whose original still exists;
 records producers sent directly after the backup are lost unless they resend
 them. On a fresh host, follow README.md steps 1 to 3 first, then this
-procedure with the backup copied onto the host. This whole-service restore has
-not been exercised; the drill covers reading a restored store only.
+procedure with the backup copied onto the host. The store part of this
+procedure (a backup by `sparrow-backup`, a schema raise, then the restored
+store started with `--restored-from` on the recorded image) was exercised on a
+test instance ([evidence/lifecycle.md](evidence/lifecycle.md)); the whole
+system-unit restore has not been.
 
 ## Exposure
 
@@ -248,6 +258,13 @@ Each remaining item and why it stays:
 | `sparrow` | `RestrictSUIDSGID=` | systemd implements it with a seccomp rule that cannot inspect `openat2`'s mode, so it refuses `openat2` outright, and the daemon needs `openat2` to open files beneath a consume root without following symlinks (measured, [evidence/lifecycle.md](evidence/lifecycle.md)). `NoNewPrivileges=yes` makes a setuid file inert, and the daemon creates every file with a fixed mode. |
 | `ship` | `ProtectHome=read-only` | It reads the producers' directories under `/home/paudley`. |
 | `backup` | `User=` root, `CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_*`, `@privileged` (`@chown`) | It stops and starts the system unit and copies trees owned by `sparrow`, `paudley` and root with their owners preserved. Its writes are confined to `/SPARROW/backups`. |
+
+Hardening settings the specification lists that the units do not use, and why:
+`StateDirectory=`, `RuntimeDirectory=`, `CacheDirectory=` and `LogsDirectory=`
+on `sparrow.service`, because the store is `/SPARROW/store` by ruling, the
+daemon keeps no runtime or cache files and it logs to the journal (the backup
+unit does use `RuntimeDirectory=` for its marker); `WatchdogSec=`, because the
+daemon does not implement the systemd notification protocol (`Type=exec`).
 
 The two timers' services are not confined by AppArmor: they are Python
 programs that run `cp`, `sync`, `systemctl` and the CLI, and their profiles are

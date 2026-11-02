@@ -47,10 +47,13 @@ fi
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
 refuse_schema_downgrade "$daemon"
+require_pre_upgrade_backup "$daemon"
 refuse_start_limit
 
 store=
 if unit_active; then
+    # A unit that has just started (by the backup, say) may not answer yet.
+    wait_ready
     store=$(status_json | status_field store_id)
     [[ $(readlink -- "$LIBEXEC/sparrowd") != "${daemon##*/}" ]] || note "already on ${daemon##*/}; restarting it"
 fi

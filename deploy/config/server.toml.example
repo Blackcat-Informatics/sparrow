@@ -34,7 +34,5 @@ text_lexicon_dir = "/usr/local/share/sparrow/lexicons-REV/artifacts"
 # Consume watches live in the store's catalog; an entry here only seeds a missing catalog. Add
 # roots with `sparrow /SPARROW/store/rpc.sock watch put ...` (deploy/config/watch.toml.example).
 
-# Archive before delete, once the archive worker is enabled. A store that has archived requires
-# this table thereafter. The unit already allows writes to this path.
-# [archive]
-# dir = "/net/synology/archives/sparrow"
+# The archive table is absent: the archive worker is not deployed, and the unit and profile do not
+# grant its path. Sparrow issues #15 to #17 add both.
