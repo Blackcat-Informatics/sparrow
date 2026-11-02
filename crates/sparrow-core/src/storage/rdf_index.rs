@@ -9,7 +9,7 @@ use purrdf::{
     projections::{ProjectionLimits, ProjectionTerm},
 };
 use purrdf_lex::json::{Object, Value};
-use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
+use rocksdb::{ColumnFamily, DB, WriteBatch};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Initial bounded graph admission; raw evidence remains independent.
@@ -208,19 +208,10 @@ const REVERSE_PREFIX: &str = "rdf:reverse:";
 /// Reverse lookups are the dictionary's only point reads that usually miss: each
 /// new term's hashed key lands inside every level's range. Their own family
 /// carries a whole-key Bloom filter sized to the dictionary, not to the much
-/// larger index keys that are only ever scanned. Older writers cannot open a
-/// store that has this family.
+/// larger index keys that are only ever scanned; `table_options` owns it. Older
+/// writers cannot open a store that has this family.
 pub(super) const REVERSE_FAMILY: &str = "rdf_reverse";
 const REVERSE_PAGE: usize = 65536;
-
-pub(super) fn reverse_family_options(base: &Options) -> Options {
-    let mut table = rocksdb::BlockBasedOptions::default();
-    table.set_bloom_filter(10.0, false);
-    table.set_whole_key_filtering(true);
-    let mut options = base.clone();
-    options.set_block_based_table_factory(&table);
-    options
-}
 
 pub(super) fn reverse_family(db: &DB) -> Result<&ColumnFamily, Error> {
     db.cf_handle(REVERSE_FAMILY)
@@ -959,17 +950,17 @@ pub(super) fn metadata(
 /// Bare test database with the column families RDF writes require.
 #[cfg(test)]
 pub(super) fn open_test_db(path: &std::path::Path) -> DB {
-    let mut options = Options::default();
+    let mut options = rocksdb::Options::default();
     options.create_if_missing(true);
     options.create_missing_column_families(true);
     DB::open_cf_descriptors(
         &options,
         path,
         [
-            rocksdb::ColumnFamilyDescriptor::new("default", Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new("default", rocksdb::Options::default()),
             rocksdb::ColumnFamilyDescriptor::new(
                 REVERSE_FAMILY,
-                reverse_family_options(&Options::default()),
+                super::table_options::family(REVERSE_FAMILY),
             ),
         ],
     )

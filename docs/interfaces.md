@@ -275,7 +275,22 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 watermark, backlog age, last segment and quarantine listing, belongs to the
 worker phase and will use a later schema.
 
-### Large artifacts (schema 64)
+### Table rewrite status (schema 64)
+
+Schema 64 adds `Status.recompression`, a `RecompressionStatus`. It reports the
+running binary's table options `profile` and a `phase` of `running`, `paused`
+or `complete`. It also reports `remainingBytes`, the table bytes of the
+rewritten families still written under an older profile as of the last step,
+and an optional `waiting` reason and latched `failure`. CLI and MCP status
+render it as `recompression`, with `remaining_bytes` as a decimal string. A new
+store reports `complete` with zero remaining bytes. A store whose files predate
+the profile reports `running` until the rewrite finishes, or `paused` while a
+step holds native rewriting off for pressure, the data allowance or the
+free-space floor. `Store::recompress_step(now, settle)` observes progress and
+turns RocksDB periodic compaction on or off without compacting anything
+itself. `Store::recompression_status` reads the last observation.
+
+### Large artifacts (schema 65)
 
 Patrick ruled on 2026-11-01: "Remove the limit". The configurable per-artifact
 limit is gone. The server configuration no longer has `max_artifact_bytes`. A
@@ -344,7 +359,7 @@ input through the staged import, and the receipt is durable whatever durability
 was requested. The bound is advertised as `Discovery.maxInlineArtifactBytes`
 and `Status.maxInlineArtifactBytes`; CLI and MCP status render it as
 `max_inline_artifact_bytes`. These replace `maxArtifactBytes` at the same
-ordinals, so the schema advances to 64, and older endpoints fail the exact
+ordinals, so the schema advances to 65, and older endpoints fail the exact
 schema discovery check. The store format is unchanged.
 
 Byte reads of a record, or of an artifact with at most one record, go straight

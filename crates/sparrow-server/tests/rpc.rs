@@ -3353,6 +3353,9 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
         assert_eq!(cli_status["pressure"]["evicted_recordless_artifacts"].as_str(), Some("1"));
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_recordless_artifacts"], cli_status["pressure"]["evicted_recordless_artifacts"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_records"], cli_status["pressure"]["evicted_records"]);
+        // A new store owes no table rewrite, and both adapters render the same status.
+        assert_eq!(cli_status["recompression"]["phase"].as_str(), Some("complete"));
+        assert_eq!(mcp_status["structuredContent"]["recompression"], cli_status["recompression"]);
         let retained = mcp.tool(4, "bytes_read", Object::new().with("store_id", &protected.store_id)
             .with("id", &protected.id).with("offset", "0").with("length", 7_u64).into()).await;
         assert_eq!(retained["isError"].as_bool(), Some(false));

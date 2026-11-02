@@ -2640,14 +2640,16 @@ impl wire::sparrow::Server for Rpc {
                     store.status(now)?,
                     store.durability_status()?,
                     store.pressure_status()?,
+                    store.recompression_status()?,
                 ))
             })
             .await
         {
             Err(e) => failure(results.get().init_result(), e),
-            Ok((value, durability, pressure)) => {
+            Ok((value, durability, pressure, recompression)) => {
                 let mut out = results.get().init_result().init_ok();
                 crate::pressure::encode(out.reborrow().init_pressure_status(), &pressure)?;
+                crate::recompression::encode(out.reborrow().init_recompression(), &recompression);
                 let watches = self
                     .watches
                     .snapshot()

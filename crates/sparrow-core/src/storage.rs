@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 use purrdf_hash::{blake3, hex};
 use purrdf_lex::json::record::{DecodeError, Record as JsonRecord};
 use purrdf_lex::json::{self, Object, Value};
-use rocksdb::{
-    ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions,
-};
+use rocksdb::{DB, IteratorMode, WriteBatch, WriteOptions};
 
 pub(crate) mod archive;
 mod artifact_rdf;
@@ -45,6 +43,7 @@ mod query_membership;
 mod rdf_index;
 pub(crate) mod rdf_view;
 pub(crate) mod receiver_stream;
+pub(crate) mod recompression;
 mod record_fields;
 pub(crate) mod record_read;
 mod record_spool;
@@ -60,6 +59,7 @@ mod source_context;
 pub(crate) mod source_read;
 pub(crate) mod source_time;
 pub(crate) mod syslog;
+mod table_options;
 pub(crate) mod tail;
 mod tail_ranges;
 mod temporal_index;
@@ -494,6 +494,7 @@ struct Writer {
     pressure: std::cell::RefCell<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
     expiry: std::cell::RefCell<expiry::Cursor>,
+    recompression: std::cell::RefCell<recompression::State>,
     /// Present exactly when the store archives before deleting.
     archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
@@ -1289,34 +1290,10 @@ impl Store {
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         config.validate()?;
         let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
-        let mut options = Options::default();
-        options.create_if_missing(true);
-        options.create_missing_column_families(true);
-        options.set_max_background_jobs(2);
-        options.set_write_buffer_size(8 * 1024 * 1024);
-        options.set_compression_type(DBCompressionType::Lz4);
-        options.set_bottommost_compression_type(DBCompressionType::Zstd);
-        pressure::native_compaction_options(&mut options);
-        let mut payload = Options::default();
-        payload.set_compression_type(DBCompressionType::Lz4);
-        payload.set_bottommost_compression_type(DBCompressionType::Zstd);
-        payload.set_enable_blob_files(true);
-        payload.set_min_blob_size(CHUNK as u64);
-        payload.set_blob_compression_type(DBCompressionType::Zstd);
-        payload.set_enable_blob_gc(true);
-        payload.set_write_buffer_size(8 * 1024 * 1024);
-        pressure::native_compaction_options(&mut payload);
         let db = DB::open_cf_descriptors(
-            &options,
+            &table_options::database(),
             path,
-            [
-                ColumnFamilyDescriptor::new("default", options.clone()),
-                ColumnFamilyDescriptor::new("payload", payload),
-                ColumnFamilyDescriptor::new(
-                    rdf_index::REVERSE_FAMILY,
-                    rdf_index::reverse_family_options(&options),
-                ),
-            ],
+            table_options::descriptors(),
         )?;
         source_time::validate_log_fence(&db)?;
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
@@ -1365,6 +1342,8 @@ impl Store {
                 batch.put("store_id", &id);
                 batch.put("text_analyzer", &fingerprint);
                 batch.put("rdf_profile", &rdf_fingerprint);
+                // A new store writes every table under the current options.
+                batch.put(recompression::PROFILE_KEY, table_options::PROFILE);
                 batch.put("rdf:term-count", 0_u64.to_be_bytes());
                 batch.put("rdf:max-encoded", 0_u64.to_be_bytes());
                 batch.put("rdf:next", 0_u64.to_be_bytes());
@@ -1435,6 +1414,7 @@ impl Store {
         ));
         manifest_retire::features(&db)?;
         let pressure = pressure::State::load(&db)?;
+        let recompression = recompression::State::load(&db)?;
         source_context::rebuild(&db)?;
         let store = Self {
             id: Arc::from(id.as_str()),
@@ -1448,6 +1428,7 @@ impl Store {
                 pressure: std::cell::RefCell::new(pressure),
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
+                recompression: std::cell::RefCell::new(recompression),
                 archive: archive.map(std::cell::RefCell::new),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),

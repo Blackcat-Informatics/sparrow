@@ -126,6 +126,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,
         )
+        .with("recompression", recompression(value.get_recompression()?)?)
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -299,4 +300,19 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             value.get_record_read_lease_ms().to_string(),
         );
     Ok(output.into())
+}
+
+fn recompression(value: wire::recompression_status::Reader<'_>) -> Result<Value> {
+    let phase = match value.get_phase()? {
+        wire::RecompressionPhase::Running => "running",
+        wire::RecompressionPhase::Paused => "paused",
+        wire::RecompressionPhase::Complete => "complete",
+    };
+    Ok(Object::new()
+        .with("profile", value.get_profile()?.to_str()?)
+        .with("phase", phase)
+        .with("remaining_bytes", value.get_remaining_bytes().to_string())
+        .with("waiting", super::optional_value(value.get_waiting()?)?)
+        .with("failure", super::optional_value(value.get_failure()?)?)
+        .into())
 }

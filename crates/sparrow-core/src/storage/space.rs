@@ -39,12 +39,23 @@ impl SpaceFloor {
     /// Describe a free-space shortfall, if any. A failed measurement is an error,
     /// never a shortfall, so callers that pause on low space cannot hide it.
     pub fn shortfall(&self) -> Result<Option<String>, Error> {
+        self.shortfall_after(0)
+    }
+
+    /// Describe the shortfall left after `extra` more bytes are written, for
+    /// maintenance that holds transient files above the floor.
+    pub(super) fn shortfall_after(&self, extra: u64) -> Result<Option<String>, Error> {
         let free = self.free()?;
-        Ok((free < self.min_free).then(|| {
+        let needed = self.min_free.saturating_add(extra);
+        let resumes = if extra == 0 {
+            "writes resume"
+        } else {
+            "it resumes"
+        };
+        Ok((free < needed).then(|| {
             format!(
-                "only {free} bytes free on the filesystem holding {}; writes resume at {} bytes",
+                "only {free} bytes free on the filesystem holding {}; {resumes} at {needed} bytes",
                 self.dir.display(),
-                self.min_free
             )
         }))
     }
