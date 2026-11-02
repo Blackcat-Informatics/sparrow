@@ -342,6 +342,9 @@ runs, records the store identity, stops through the drain, points the links at
 the new pair (the old pair becomes `.previous`), starts, and fails unless the
 store identity is unchanged. `sudo deploy/restart.sh --rev REV` selects another
 kept pair; `sudo deploy/restart.sh --rollback` swaps back to the previous pair.
+`start.sh` and `restart.sh` hold the backup's lock (`/SPARROW/backups/.lock`)
+while they run, and refuse while a backup holds it, so a backup and an image
+switch never interleave.
 
 A newer image may upgrade the store's format, and an older image then refuses
 to open it. The scripts enforce this by the schema number in the image names

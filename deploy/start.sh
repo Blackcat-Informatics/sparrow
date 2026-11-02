@@ -36,6 +36,7 @@ esac
 (($# == 0)) || die "unexpected arguments: $*"
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
+hold_backup_lock
 
 if [[ -n $RESTORED ]]; then
     [[ -r $RESTORED/SOURCE ]] || die "cannot read $RESTORED/SOURCE"

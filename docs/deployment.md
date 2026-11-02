@@ -277,7 +277,9 @@ it. The copy is synchronized after the
 service answers again, so the sync is outside the closed window. Only then is
 the backup renamed into place and the oldest beyond `KEEP` removed. The script refuses to
 run unless free space covers twice the store plus 10 GiB, in case extents are
-not shared. Each backup lists its sources in `SOURCE`. The journal records the measured
+not shared. Each backup lists its sources in `SOURCE`, with the image the link names. It
+refuses when that image's schema number differs from the running daemon's
+`schema_version`, because then the link does not name the running image. The journal records the measured
 downtime and each phase's time: the drain wait, the copy before the stop, the
 stop, the closed copy, the restart until ready, and the sync. A lock prevents overlapping runs.
 

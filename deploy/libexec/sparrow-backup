@@ -199,6 +199,11 @@ def main(server_config, backup_root, keep, intake, extra):
         status = daemon_status(socket)
         if selected_image() != image:
             raise RuntimeError(f"the image link moved from {image} during the backup")
+        # The link must name the image that runs: its schema number is the running daemon's.
+        named = re.fullmatch(r"sparrowd-schema([0-9]+)-.+", image)
+        if named is None or int(named.group(1)) != status["schema_version"]:
+            raise RuntimeError(f"the image link names {image}, but the running daemon reports "
+                               f"schema {status['schema_version']}; the link does not name it")
         (partial / "SOURCE").write_text(
             f"data_dir={data_dir}\nserver_config={server_config}\nintake={intake}\n"
             f"taken_utc={stamp}\ndrain_seconds={waited:.0f}\n"

@@ -275,6 +275,18 @@ the `sparrow` user and group, the installed images, `/SPARROW/ship` and
 `/SPARROW/backups` in place, and says so. Once `/SPARROW` is paudley's again,
 the user manager does not need the `sparrow` group.
 
+First, if the system unit still serves, drain it as the issue's step 3 does.
+Stop the timers, then repeat the two counts until both are `0`:
+
+```bash
+sudo systemctl stop sparrow-ship.timer sparrow-backup.timer
+sudo /usr/local/bin/sparrow /SPARROW/store/rpc.sock status | jq '[.consume_watches[].pending_claims] | add'
+sudo find /SPARROW/intake -type f -not -path '*/.sparrow-inflight/*' | wc -l
+```
+
+A unit that cannot serve is not drained. The steps below set its intake aside
+anyway.
+
 ```bash
 (
 set -euo pipefail
@@ -285,10 +297,14 @@ if [ -e /etc/systemd/system/sparrow.service ]; then
     sudo systemctl stop sparrow-ship.timer sparrow-backup.timer
     sudo deploy/stop.sh
 fi
-sudo deploy/uninstall.sh
+# The store and the intake both go back to step 5a, so they agree: the system unit's roots can
+# hold claims journaled only in its store, and the restored store's daemon then refuses to start.
 sudo mv -T /SPARROW/store /SPARROW/store.cutover
 sudo cp -a --reflink=always "$B/store" /SPARROW/store
-sudo chown -R paudley:paudley /SPARROW/store
+sudo mv -T /SPARROW/intake /SPARROW/intake.cutover
+sudo cp -a --reflink=always "$B/intake" /SPARROW/intake
+# Gives /SPARROW and the restored store and intake back to the operator.
+sudo deploy/uninstall.sh
 # The shipper renames queued items into the roots, so its state must share their mount; /home
 # is a separate mount. A fresh copy of the pre-cutover state, so it resends what the restored
 # store lacks.
@@ -325,8 +341,20 @@ before the cutover, served by `sparrowd-schema62-600ee97`. Then:
   before the cutover. Re-enable it only after its intake argument names
   `/SPARROW/intake`. Until then, the step 5a backup and
   `/SPARROW/store.cutover` are the copies.
-- The system unit. Records sent directly to it are lost. Keep
-  `/SPARROW/store.cutover` until that loss is accepted.
+- The intake. The system unit's roots go aside as `/SPARROW/intake.cutover`,
+  and the step 5a roots replace them. Those are empty, hold no claims, and
+  agree with the restored store. Kept roots could hold files claimed under
+  `.sparrow-inflight/` and journaled only in the system store. The restored
+  store does not know those claims, so its daemon refuses to start. It
+  reports "unrecognized private claim entry", or "private claim directory
+  exceeds its bounded journal registry" when the restored store journals no
+  claim for that root ([evidence/lifecycle.md](evidence/lifecycle.md)). Kept roots could also hold
+  waiting files that the user shipper then sends again, which ingests them
+  twice. Nothing in `intake.cutover` is lost: each file there is a copy that
+  the system shipper fed, and the user shipper resends it from its original.
+- The system unit. Records sent directly to it, not through the shipper, are
+  lost. Keep `/SPARROW/store.cutover` and `/SPARROW/intake.cutover` until that
+  loss is accepted.
 
 Reversible: run `install.sh` again.
 

@@ -262,6 +262,17 @@ select_current() {
     swap_link "$CLI_LINK" "$LIBEXEC/sparrow"
 }
 
+# Hold the backup's lock for the rest of the script, so a backup and an image switch cannot
+# interleave: the backup records the image the link names, and stops and starts the unit itself.
+# Refuses rather than waits, because a backup can hold the daemon stopped for minutes.
+hold_backup_lock() {
+    # No backup directory yet means no backup has ever run, so none can be running.
+    [[ -d $SPARROW_BACKUPS ]] || return 0
+    exec {BACKUP_LOCK}>>"$SPARROW_BACKUPS/.lock"
+    flock -n "$BACKUP_LOCK" || die "a backup holds $SPARROW_BACKUPS/.lock; wait for it to finish \
+(journalctl -u sparrow-backup.service) and run this again"
+}
+
 unit_active() {
     "${SYSTEMCTL[@]}" is-active --quiet "$SPARROW_UNIT"
 }

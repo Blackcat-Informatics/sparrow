@@ -742,6 +742,117 @@ lexicons-a47940e1f130bf3739c6d59aaf89643209905ea4
 [exit 0]
 ```
 
+## Reverting intake with the store, 2026-11-02
+
+A fresh instance `R8`, driven only through `sparrow-deploytest.service`
+(review N5). It ran on schema 62 and took the pre-upgrade backup, then went to
+schema 63 and ingested `after-upgrade`. After stopping, two leftovers were
+planted in its root, as a failed system unit could leave them: an entry in
+`.sparrow-inflight` that the restored store never journaled, and a waiting
+file. These are the results:
+
+- With the store restored and the roots kept (the round-3 revert), the
+  schema 62 daemon refuses to start.
+- With the intake also restored from the backup and the roots set aside as
+  `intake.cutover` (the round-4 revert), the daemon starts. It holds the
+  backup's single record and its watch has no pending claims.
+- The leftovers stay in `intake.cutover` for inspection.
+
+`check.sh`'s socket, store and exposure failures are the schema 62 image's and
+the test unit's, as in the runs above.
+
+```text
+# leftovers the system unit could leave: a claim journaled only in its store, and a waiting file
+$ install -m 0600 /dev/null R8/data/intake/deploytest/.sparrow-inflight/import-leftover
+[exit 0]
+
+$ install -m 0640 /dev/null R8/data/intake/deploytest/waiting.jsonl
+[exit 0]
+
+$ ls -A R8/data/intake/deploytest R8/data/intake/deploytest/.sparrow-inflight
+R8/data/intake/deploytest:
+.sparrow-inflight
+waiting.jsonl
+
+R8/data/intake/deploytest/.sparrow-inflight:
+.lock
+import-leftover
+[exit 0]
+
+# the round-3 revert: the store restored, the roots kept
+$ mv -T R8/data/store R8/data/store.cutover
+[exit 0]
+
+$ cp -a --reflink=always R8/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/store R8/data/store
+[exit 0]
+
+$ deploy/start.sh --restored-from R8/backups/pre-upgrade-sparrowd-schema62-cfdf2fa
+start.sh: restored store: starting sparrowd-schema62-cfdf2fa, the image that last opened it (R8/backups/pre-upgrade-sparrowd-schema62-cfdf2fa)
+start.sh: starting sparrow-deploytest.service on sparrowd-schema62-cfdf2fa
+● sparrow-deploytest.service - Sparrow deploy test instance (deploy/test-instance.sh)
+     Loaded: loaded (/run/user/1000/systemd/user/sparrow-deploytest.service; static)
+     Active: activating (auto-restart) (Result: exit-code) since Mon 2026-11-02 11:17:33 CST; 149ms ago
+       Docs: file:///usr/local/share/doc/sparrow/deploy/README.md
+
+start.sh: sparrow-deploytest.service is not active
+[exit 1]
+
+Error: State("private claim directory exceeds its bounded journal registry; reconciliation required")
+
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service was activating (no drain: the daemon was not serving); stopped
+[exit 0]
+
+# the round-4 revert: store and intake both from the backup, the roots set aside
+$ mv -T R8/data/store R8/data/store.failed
+[exit 0]
+
+$ cp -a --reflink=always R8/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/store R8/data/store
+[exit 0]
+
+$ mv -T R8/data/intake R8/data/intake.cutover
+[exit 0]
+
+$ cp -a --reflink=always R8/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/intake R8/data/intake
+[exit 0]
+
+$ deploy/start.sh --restored-from R8/backups/pre-upgrade-sparrowd-schema62-cfdf2fa
+start.sh: restored store: starting sparrowd-schema62-cfdf2fa, the image that last opened it (R8/backups/pre-upgrade-sparrowd-schema62-cfdf2fa)
+start.sh: starting sparrow-deploytest.service on sparrowd-schema62-cfdf2fa
+receipt: unit=sparrow-deploytest.service state=active pid=4145622
+receipt: daemon=sparrowd-schema62-cfdf2fa cli=sparrow-schema62-cfdf2fa previous=sparrowd-schema63-ba6ebe7
+receipt: store_id=store:9d62a5ff85bde673ff6b55f544581d8a schema=62 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ records
+live_records 1
+[exit 0]
+
+$ ls -A R8/data/intake.cutover/deploytest R8/data/intake.cutover/deploytest/.sparrow-inflight
+R8/data/intake.cutover/deploytest:
+.sparrow-inflight
+waiting.jsonl
+
+R8/data/intake.cutover/deploytest/.sparrow-inflight:
+.lock
+import-leftover
+[exit 0]
+
+# R1: start.sh and restart.sh refuse while a backup holds the lock
+$ deploy/restart.sh
+restart.sh: a backup holds R8/backups/.lock; wait for it to finish (journalctl -u sparrow-backup.service) and run this again
+[exit 1]
+```
+
+While another process holds `R8/backups/.lock`, `restart.sh` refuses (review
+R1):
+
+```text
+$ deploy/restart.sh
+restart.sh: a backup holds R8/backups/.lock; wait for it to finish (journalctl -u sparrow-backup.service) and run this again
+[exit 1]
+```
+
 ## Not run
 
 - As root: `install.sh`'s refusal and its partial-change report,

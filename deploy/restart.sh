@@ -33,6 +33,7 @@ esac
 (($# == 0)) || die "unexpected arguments: $*"
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
+hold_backup_lock
 
 if [[ $MODE == rollback ]]; then
     previous=$(readlink -- "$LIBEXEC/sparrowd.previous" 2>/dev/null) || die "no previous image to roll back to"
