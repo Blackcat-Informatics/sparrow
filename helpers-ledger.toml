@@ -2009,9 +2009,9 @@ names = ['^(reverse_family_options|payload_family_options|default_family_options
 
 [[job]]
 id = "one-time-table-rewrite"
-summary = "One bounded step rewrites a slice of table files written under an older options profile: it plans under the writer lock, compacts without it, confirms every input is gone and advances a durable cursor. It yields to pressure, native compaction, the data allowance and the free-space floor."
+summary = "One prompt step drives the one-time rewrite of table files written under an older options profile through RocksDB periodic compaction: it records a durable start, sets the rewritten families' periodic window to the time since it, and turns the window off for pressure, the data allowance or the free-space floor. It completes when no older file remains."
 home = "sparrow_core::storage::recompression::Store::recompress_step"
-entry_points = ["sparrow_core::storage::recompression::Store::recompression_status", "sparrow_core::storage::recompression::Writer::plan_recompression", "sparrow_core::storage::recompression::Writer::finish_recompression", "sparrowd::maintenance::recompress"]
+entry_points = ["sparrow_core::storage::recompression::Store::recompression_status", "sparrow_core::storage::recompression::Writer::recompress", "sparrow_core::storage::recompression::Writer::rewrite_window", "sparrow_core::storage::recompression::Writer::rewrite_gate", "sparrowd::maintenance::Job::execute"]
 spec = "docs/architecture.md: 4.2 deduplication and compression; docs/interfaces.md: table rewrite status (schema 64)."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2019,7 +2019,7 @@ enforced = true
 [job.forbidden]
 constants = []
 fingerprints = []
-names = ['^(compact_whole_store|rewrite_tables_elsewhere)$']
+names = ['^(compact_whole_store|rewrite_tables_elsewhere|recompress_slice)$']
 
 [[job]]
 id = "typed-recompression-status"
@@ -3876,9 +3876,9 @@ names = ['^(lookup_receiver_window_elsewhere|lookup_producer_window_elsewhere)$'
 
 [[job]]
 id = "joined-daemon-maintenance"
-summary = "One joined serial worker schedules bounded expiry continuations, pressure and buffered synchronization fairly. Native jobs run one at a time under existing storage limits; the one-time table rewrite runs beside it in its own joined lane. Both lanes share one blocking runner that exits on uncertain durability; stop prevents further work and joins each current job before final RPC drain and flush."
+summary = "One joined serial worker schedules bounded expiry continuations, pressure, buffered synchronization and table rewrite steps fairly. Native jobs run one at a time under existing storage limits; stop prevents further work and joins the current job before final RPC drain and flush."
 home = "sparrowd::maintenance::run"
-entry_points = ["sparrowd::maintenance::Worker::start", "sparrowd::maintenance::Worker::shutdown", "sparrowd::maintenance::Job::execute", "sparrowd::maintenance::blocking", "sparrowd::maintenance::recompress", "sparrowd::main", "sparrowd::shutdown::finish"]
+entry_points = ["sparrowd::maintenance::Worker::start", "sparrowd::maintenance::Worker::shutdown", "sparrowd::maintenance::Job::execute", "sparrowd::main", "sparrowd::shutdown::finish"]
 spec = "docs/interfaces.md: daemon maintenance scheduling."
 vectors = ["crates/sparrow-server/src/maintenance.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -4459,7 +4459,7 @@ reason = "The generated Sparrow server trait requires one method per schema ordi
 id = "store-free-space-floor"
 summary = "One filesystem free-space floor refuses every store write before RocksDB can fail on a full disk, and tells daemon pause points a shortfall apart from a failed measurement."
 home = "sparrow_core::storage::space::SpaceFloor::shortfall_after"
-entry_points = ["sparrow_core::storage::space::SpaceFloor::shortfall", "sparrow_core::storage::space::SpaceFloor::check", "sparrow_core::storage::Writer::apply", "sparrow_core::storage::recompression::Writer::plan_recompression"]
+entry_points = ["sparrow_core::storage::space::SpaceFloor::shortfall", "sparrow_core::storage::space::SpaceFloor::check", "sparrow_core::storage::Writer::apply", "sparrow_core::storage::recompression::Writer::rewrite_gate"]
 spec = "docs/deployment.md: min_free_bytes."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/syslog_listener.rs"]
 bench = []

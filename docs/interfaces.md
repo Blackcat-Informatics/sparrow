@@ -279,15 +279,16 @@ worker phase and will use a later schema.
 
 Schema 64 adds `Status.recompression`, a `RecompressionStatus`. It reports the
 running binary's table options `profile` and a `phase` of `running`, `paused`
-or `complete`. It also reports the `family` being rewritten, the durable
-`compactedBytes` of input tables rewritten under this profile, and an optional
-`waiting` reason and latched `failure`. CLI and MCP status render it as
-`recompression`, with `compacted_bytes` as a decimal string. A new store
-reports `complete`. A store whose files predate the profile reports `running`
-until the daemon's rewrite finishes, or `paused` while a step yields to
-pressure, native compaction, the data allowance or the free-space floor.
-`Store::recompress_step` rewrites at most one slice, and
-`Store::recompression_status` reads the state without rewriting.
+or `complete`. It also reports `remainingBytes`, the table bytes of the
+rewritten families still written under an older profile as of the last step,
+and an optional `waiting` reason and latched `failure`. CLI and MCP status
+render it as `recompression`, with `remaining_bytes` as a decimal string. A new
+store reports `complete` with zero remaining bytes. A store whose files predate
+the profile reports `running` until the rewrite finishes, or `paused` while a
+step holds native rewriting off for pressure, the data allowance or the
+free-space floor. `Store::recompress_step(now, settle)` observes progress and
+turns RocksDB periodic compaction on or off without compacting anything
+itself. `Store::recompression_status` reads the last observation.
 
 ## 1. Common types and defaults
 

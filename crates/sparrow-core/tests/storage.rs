@@ -17453,15 +17453,17 @@ fn every_column_family_uses_the_shared_table_options() {
     assert!(section("[CFOptions \"payload\"]").contains("enable_blob_files=true\n"));
     let status = store.recompression_status().unwrap();
     assert_eq!(status.phase, RecompressionPhase::Complete);
-    assert_eq!(status.family, None);
+    assert_eq!(status.remaining_bytes, 0);
 }
 
-/// A closed store whose files predate the current table options profile, with
-/// one table file per batch in each rewritten family. Each open may flush one
-/// more level-0 file; staying below four keeps native compaction idle.
-fn legacy_store(dir: &std::path::Path, settings: Config, batches: u64) {
-    let store = Store::open(dir, settings).unwrap();
-    for batch in 0..batches {
+/// A closed store whose table files predate the current table options profile.
+/// The rewritten families hold bottommost files and level-0 files, and
+/// `disk_budget` leaves room for a rewrite job's headroom.
+fn legacy_store(dir: &std::path::Path) -> Config {
+    let mut settings = config();
+    settings.disk_budget = 4 * 1024 * 1024 * 1024;
+    let ingest = |batch: u64| {
+        let store = Store::open(dir, settings.clone()).unwrap();
         let input = (0..200)
             .map(|line| {
                 format!("{{\"batch\":{batch},\"line\":{line},\"message\":\"repeated log text\"}}\n")
@@ -17477,109 +17479,148 @@ fn legacy_store(dir: &std::path::Path, settings: Config, batches: u64) {
             )
             .unwrap();
         store.flush().unwrap();
+    };
+    for batch in 0..3 {
+        ingest(batch);
     }
-    drop(store);
-    let db = catalog_db(dir).unwrap();
-    db.delete("table-options-profile").unwrap();
-    db.flush().unwrap();
+    {
+        // Former options, with small files so the bottom level holds several.
+        let mut options = rocksdb::Options::default();
+        options.set_target_file_size_base(16 * 1024);
+        let columns = rocksdb::DB::list_cf(&options, dir).unwrap();
+        let db = rocksdb::DB::open_cf(&options, dir, columns).unwrap();
+        for name in ["default", "payload"] {
+            let family = db.cf_handle(name).unwrap();
+            db.compact_range_cf(family, None::<&[u8]>, None::<&[u8]>);
+        }
+        db.delete("table-options-profile").unwrap();
+    }
+    ingest(3);
+    settings
 }
 
-/// Names of the live table files of the rewritten families in a closed store.
-fn rewritten_tables(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+/// Live table files of the rewritten families in a closed store, by name and level.
+fn rewritten_tables(dir: &std::path::Path) -> std::collections::BTreeMap<String, i32> {
     catalog_db(dir)
         .unwrap()
         .live_files()
         .unwrap()
         .into_iter()
         .filter(|file| file.column_family_name != "rdf_reverse")
-        .map(|file| file.name)
+        .map(|file| (file.name, file.level))
+        .collect()
+}
+
+fn wall_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Each rewritten family's periodic window in the newest native OPTIONS file.
+fn rewrite_windows(path: &std::path::Path) -> Vec<String> {
+    let options = native_options(path);
+    ["default", "payload"]
+        .iter()
+        .map(|family| {
+            options[&format!("[CFOptions \"{family}\"]")]
+                .lines()
+                .find_map(|line| line.strip_prefix("periodic_compaction_seconds="))
+                .unwrap()
+                .to_string()
+        })
         .collect()
 }
 
 #[test]
 fn table_rewrite_resumes_after_reopen_and_runs_once() {
-    // INVARIANT: the rewrite advances a durable cursor slice by slice, resumes
-    // where it stopped after an interrupt, rewrites every older table file of
-    // its families, and does not run again once complete.
+    // INVARIANT: the rewrite records its start durably, resumes from it after an
+    // interrupt, rewrites every older table file of its families at every level,
+    // and does not run again once complete.
     use sparrow_core::RecompressionPhase;
     let dir = tempfile::tempdir().unwrap();
-    legacy_store(dir.path(), config(), 2);
+    let settings = legacy_store(dir.path());
     let before = rewritten_tables(dir.path());
-    assert!(before.len() >= 4, "{before:?}");
-    let store = Store::open(dir.path(), config()).unwrap();
-    let start = store.recompression_status().unwrap();
-    assert_eq!(start.phase, RecompressionPhase::Running);
-    assert_eq!(start.family, Some("default"));
-    assert_eq!(start.compacted_bytes, 0);
-    let mut interrupted = None;
-    for _ in 0..32 {
-        let status = store.recompress_step(1).unwrap();
-        assert_eq!(status.failure, None);
-        if status.family == Some("payload") {
-            interrupted = Some(status);
-            break;
-        }
-    }
-    let interrupted = interrupted.unwrap();
-    assert!(interrupted.compacted_bytes > 0);
+    assert!(before.values().any(|level| *level == 0), "{before:?}");
+    assert!(before.values().any(|level| *level > 0), "{before:?}");
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let first = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(first.phase, RecompressionPhase::Running);
+    assert!(first.remaining_bytes > 0);
     drop(store);
-    let store = Store::open(dir.path(), config()).unwrap();
+    // Reopening may flush recovered writes; files after the start are not owed.
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
     let resumed = store.recompression_status().unwrap();
-    assert_eq!(resumed.family, Some("payload"));
-    assert_eq!(resumed.compacted_bytes, interrupted.compacted_bytes);
-    let mut complete = None;
-    for _ in 0..32 {
-        let status = store.recompress_step(1).unwrap();
+    assert_eq!(resumed.phase, RecompressionPhase::Running);
+    assert!(resumed.remaining_bytes <= first.remaining_bytes);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut steps = vec![resumed.remaining_bytes];
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let status = store.recompress_step(wall_millis(), 1).unwrap();
         assert_eq!(status.failure, None);
         if status.phase == RecompressionPhase::Complete {
-            complete = Some(status);
             break;
         }
+        assert!(
+            status.remaining_bytes <= *steps.last().unwrap(),
+            "{steps:?}"
+        );
+        steps.push(status.remaining_bytes);
+        assert!(std::time::Instant::now() < deadline, "{steps:?}");
     }
-    assert_eq!(complete.unwrap().family, None);
+    assert!(steps.len() > 1);
+    assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
     drop(store);
     let after = rewritten_tables(dir.path());
-    assert!(before.is_disjoint(&after), "{before:?} {after:?}");
-    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(
+        before.keys().all(|name| !after.contains_key(name)),
+        "{before:?} {after:?}"
+    );
+    let store = Store::open(dir.path(), settings).unwrap();
     assert_eq!(
-        store.recompress_step(1).unwrap().phase,
+        store.recompression_status().unwrap().phase,
         RecompressionPhase::Complete
     );
-    drop(store);
-    // Reopening may flush recovered writes; no rewritten file is rewritten again.
-    assert!(after.is_subset(&rewritten_tables(dir.path())));
+    let again = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(again.phase, RecompressionPhase::Complete);
+    assert_eq!(again.remaining_bytes, 0);
 }
 
 #[test]
-fn table_rewrite_waits_until_its_slice_fits_the_allowance_and_floor() {
-    // INVARIANT: a slice starts only when its input bytes fit both the data
-    // allowance and the free-space floor; a refused slice rewrites nothing.
+fn table_rewrite_stays_off_until_a_job_fits_the_allowance_and_floor() {
+    // INVARIANT: native rewriting is turned on only while one job's headroom
+    // fits both the data allowance and the free-space floor.
     use sparrow_core::RecompressionPhase;
     let dir = tempfile::tempdir().unwrap();
-    let mut settings = config();
-    settings.disk_budget = 64 * 1024 * 1024;
-    settings.maintenance_reserve = 8 * 1024 * 1024;
-    legacy_store(dir.path(), settings.clone(), 1);
-    let before = rewritten_tables(dir.path());
+    let settings = legacy_store(dir.path());
     let mut floor = settings.clone();
     floor.min_free_bytes = u64::MAX / 2;
     let store = Store::open(dir.path(), floor).unwrap();
-    let held = store.recompress_step(u64::MAX).unwrap();
+    let held = store.recompress_step(wall_millis(), 1).unwrap();
     assert_eq!(held.phase, RecompressionPhase::Paused);
     let waiting = held.waiting.unwrap();
     assert!(waiting.contains("bytes free"), "{waiting}");
     drop(store);
-    assert!(before.is_subset(&rewritten_tables(dir.path())));
-    let store = Store::open(dir.path(), settings).unwrap();
-    let ballast = dir.path().join("test-owned-rewrite-ballast");
-    std::fs::write(&ballast, vec![0_u8; 56 * 1024 * 1024]).unwrap();
-    let held = store.recompress_step(u64::MAX).unwrap();
+    let mut allowance = settings.clone();
+    allowance.disk_budget = 1024 * 1024 * 1024;
+    let store = Store::open(dir.path(), allowance).unwrap();
+    let held = store.recompress_step(wall_millis(), 1).unwrap();
     assert_eq!(held.phase, RecompressionPhase::Paused);
     let waiting = held.waiting.unwrap();
     assert!(waiting.contains("data allowance"), "{waiting}");
-    assert_eq!(held.compacted_bytes, 0);
-    std::fs::remove_file(&ballast).unwrap();
-    let running = store.recompress_step(u64::MAX).unwrap();
+    assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
+    drop(store);
+    let store = Store::open(dir.path(), settings).unwrap();
+    // The first ungated step records the start; the window opens a settle later.
+    let started = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(started.phase, RecompressionPhase::Running);
+    assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let running = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(running.phase, RecompressionPhase::Running);
     assert_eq!(running.waiting, None);
-    assert!(running.compacted_bytes > 0);
+    let windows = rewrite_windows(&store.data_path().unwrap());
+    assert!(windows.iter().all(|window| window != "0"), "{windows:?}");
 }

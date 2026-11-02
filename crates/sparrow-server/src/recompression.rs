@@ -16,7 +16,7 @@ pub(crate) fn encode(
         RecompressionPhase::Paused => wire::RecompressionPhase::Paused,
         RecompressionPhase::Complete => wire::RecompressionPhase::Complete,
     });
-    out.set_compacted_bytes(status.compacted_bytes);
+    out.set_remaining_bytes(status.remaining_bytes);
     let text = |field: wire::optional_text::Builder<'_>, value: Option<&str>| {
         sparrow_client::encode_optional(
             field,
@@ -25,7 +25,6 @@ pub(crate) fn encode(
             |mut field| field.set_absent(()),
         );
     };
-    text(out.reborrow().init_family(), status.family);
     text(out.reborrow().init_waiting(), status.waiting.as_deref());
     text(out.init_failure(), status.failure.as_deref());
 }

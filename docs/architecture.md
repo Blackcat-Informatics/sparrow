@@ -174,14 +174,25 @@ blob codec is not linked, and a linked Zstd always supports dictionary training.
 
 New options apply only to new table files. The catalog key
 `table-options-profile` names the profile whose files are all written. When it
-differs from the running binary's profile, the daemon rewrites the changed
-families once in a low-priority lane beside the serial maintenance owner. Each
-step plans one slice of about 256 MiB of input tables under the writer lock,
-forces it through a native manual compaction without the lock, and then records
-a durable cursor. A step yields while pressure maintenance is outstanding or
-native compaction is pending. It also yields while the slice's input bytes
-would exceed the data allowance or leave less than the free-space floor.
-Interrupted work resumes at the last recorded slice. RocksDB reads files
+differs from the running binary's profile, the default and payload families
+are rewritten once by RocksDB's periodic compaction. Manual range compaction
+does not fit this store: a range starts at the first level with keys in it,
+so a level-0 file or memtable flush, which spans every catalog prefix, merges
+the whole base level into every slice. A periodic job rewrites one marked file,
+into its own level at the bottom or into its overlap one level down. The native
+scheduler runs it below size-triggered compaction and aborts it when the store
+closes.
+
+The first step durably records the next table file number and a start second.
+Every five seconds a serial maintenance step sets the two families' periodic
+window to the seconds since the start, so only files created before it are
+marked. The window starts after 60 seconds and moves only after drifting by a
+minute or an eighth, which keeps native option writes rare. The step turns the
+window off while pressure maintenance is outstanding. It also turns it off
+while a job's 1 GiB of headroom would exceed the data allowance or leave less
+than the free-space floor. When no file numbered below the recorded boundary
+remains in those families, the profile key is written and the window is
+turned off. A restart resumes from the recorded start. RocksDB reads files
 written under either profile, so no store format fence is needed.
 
 Reference counts cover manifest children, live occurrences, shared projections,

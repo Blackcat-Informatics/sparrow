@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 //! One joined, serial maintenance owner; RPC retains its own request budget.
-//! The one-time table rewrite runs beside it in its own joined lane, because a
-//! native slice takes seconds and must not delay WAL synchronization.
 
-use sparrow_core::{Error, EvictionLimits, RECOMPRESSION_SLICE_BYTES, RecompressionPhase, Store};
+use sparrow_core::{Error, EvictionLimits, RECOMPRESSION_SETTLE_SECONDS, Store};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -13,13 +11,13 @@ use tokio::sync::watch;
 /// so this only delays physical retirement. One traversal parses the whole
 /// catalog under the writer lock; restarting it every second starved ingest.
 const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-/// Pause between table rewrite steps, and before a yielded step looks again.
-/// The gap also lets queued native compactions start between slices.
+/// Pause between table rewrite steps. A step only observes progress and turns
+/// native periodic compaction on or off, so it never holds the loop for long.
 const RECOMPRESSION_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) struct Worker {
     stop: watch::Sender<bool>,
-    tasks: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    task: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl Worker {
@@ -27,33 +25,23 @@ impl Worker {
         let (stop, stopped) = watch::channel(false);
         Self {
             stop,
-            tasks: vec![
-                tokio::spawn(run(store.clone(), stopped.clone(), flush)),
-                tokio::spawn(recompress(store, stopped)),
-            ],
+            task: Some(tokio::spawn(run(store, stopped, flush))),
         }
     }
 
     pub(super) fn is_finished(&self) -> bool {
-        self.tasks.iter().any(tokio::task::JoinHandle::is_finished)
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
-    /// Both lanes stop after their current native step; a running slice completes.
     pub(super) async fn shutdown(mut self) -> Result<(), String> {
         self.stop.send_replace(true);
-        let mut failures = Vec::new();
-        for task in self.tasks.drain(..) {
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => failures.push(error),
-                Err(error) => failures.push(format!("maintenance join failed: {error}")),
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
+        self.task
+            .take()
+            .ok_or("maintenance join owner missing")?
+            .await
+            .map_err(|error| format!("maintenance join failed: {error}"))?
     }
 }
 
@@ -70,6 +58,7 @@ enum Job {
     Pressure,
     Reclaim,
     Expiry,
+    Recompress,
 }
 
 impl Job {
@@ -79,6 +68,7 @@ impl Job {
             Self::Pressure => "pressure maintenance",
             Self::Reclaim => "import journal reclamation",
             Self::Expiry => "retention maintenance",
+            Self::Recompress => "table rewrite",
         }
     }
 
@@ -94,6 +84,9 @@ impl Job {
             Self::Expiry => store
                 .expire_bounded(sparrow_server::now()?, EvictionLimits::default())
                 .map(|report| Some(report.continuation)),
+            Self::Recompress => store
+                .recompress_step(sparrow_server::now()?, RECOMPRESSION_SETTLE_SECONDS)
+                .map(|_| None),
         }
     }
 }
@@ -107,7 +100,14 @@ async fn run(
     let mut pressure = tokio::time::interval(Duration::from_secs(1));
     let mut reclaim = tokio::time::interval(Duration::from_secs(1));
     let mut expiry = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
-    for interval in [&mut flush, &mut pressure, &mut reclaim, &mut expiry] {
+    let mut recompress = tokio::time::interval(RECOMPRESSION_INTERVAL);
+    for interval in [
+        &mut flush,
+        &mut pressure,
+        &mut reclaim,
+        &mut expiry,
+        &mut recompress,
+    ] {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     }
     // Buffered synchronization retains its configured initial delay.
@@ -124,14 +124,16 @@ async fn run(
                     _ = flush.tick() => Job::Flush,
                     _ = pressure.tick() => Job::Pressure,
                     _ = reclaim.tick() => Job::Reclaim,
+                    _ = recompress.tick() => Job::Recompress,
                     _ = expiry.tick(), if !continuation => Job::Expiry,
                     _ = tokio::task::yield_now(), if continuation => Job::Expiry,
                 }
             } => job,
         };
         // Below the free-space floor every write is refused. Synchronizing
-        // accepted writes is still allowed and still needed.
-        if !matches!(job, Job::Flush)
+        // accepted writes is still allowed and still needed, and the table
+        // rewrite step must run to turn native rewriting off.
+        if !matches!(job, Job::Flush | Job::Recompress)
             && store
                 .space_floor()
                 .shortfall()
@@ -141,8 +143,27 @@ async fn run(
             continuation = false;
             continue;
         }
+        let owner = store.clone();
         // Await this complete bounded native job before admitting another duty.
-        let result = blocking(&store, job.name(), move |store| job.execute(store)).await?;
+        let (result, latched) = tokio::task::spawn_blocking(move || {
+            let result = job.execute(&owner);
+            let latched = match &result {
+                Ok(_) => Ok(None),
+                Err(_) => owner.durability_status().map(|status| status.failure),
+            };
+            (result, latched)
+        })
+        .await
+        .map_err(|error| format!("{} join failed: {error}", job.name()))?;
+        // A failed write leaves durability uncertain until the store is reopened.
+        // Ending the daemon lets its supervisor reopen it instead of refusing every write.
+        if let Some(failure) =
+            latched.map_err(|error| format!("{} status failed: {error}", job.name()))?
+        {
+            return Err(format!(
+                "store durability uncertain; exiting so it is reopened: {failure}"
+            ));
+        }
         match result {
             Ok(Some(more)) => {
                 // The pause runs from the end of a traversal, however long it took.
@@ -161,62 +182,6 @@ async fn run(
             }
         }
         tokio::task::yield_now().await;
-    }
-}
-
-/// Run one bounded native duty off the async threads.
-async fn blocking<T: Send + 'static>(
-    store: &Store,
-    name: &'static str,
-    duty: impl FnOnce(&Store) -> Result<T, Error> + Send + 'static,
-) -> Result<Result<T, Error>, String> {
-    let owner = store.clone();
-    let (result, latched) = tokio::task::spawn_blocking(move || {
-        let result = duty(&owner);
-        let latched = match &result {
-            Ok(_) => Ok(None),
-            Err(_) => owner.durability_status().map(|status| status.failure),
-        };
-        (result, latched)
-    })
-    .await
-    .map_err(|error| format!("{name} join failed: {error}"))?;
-    // A failed write leaves durability uncertain until the store is reopened.
-    // Ending the daemon lets its supervisor reopen it instead of refusing every write.
-    if let Some(failure) = latched.map_err(|error| format!("{name} status failed: {error}"))? {
-        return Err(format!(
-            "store durability uncertain; exiting so it is reopened: {failure}"
-        ));
-    }
-    Ok(result)
-}
-
-/// The low-priority rewrite lane. Each step plans and records under the writer
-/// lock and compacts without it; the store yields to pressure, native work and
-/// space. A completed rewrite leaves the lane idle until shutdown.
-async fn recompress(store: Store, mut stopped: watch::Receiver<bool>) -> Result<(), String> {
-    const NAME: &str = "table rewrite";
-    let mut tick = tokio::time::interval(RECOMPRESSION_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            biased;
-            _ = stopped.changed() => return Ok(()),
-            _ = tick.tick() => {}
-        }
-        match blocking(&store, NAME, |store| {
-            store.recompress_step(RECOMPRESSION_SLICE_BYTES)
-        })
-        .await?
-        {
-            Ok(status) if status.phase == RecompressionPhase::Complete => {
-                // Ignore a closed channel: the owner has gone, so stop as well.
-                let _ = stopped.changed().await;
-                return Ok(());
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("sparrowd: {NAME} failed: {error}"),
-        }
     }
 }
 

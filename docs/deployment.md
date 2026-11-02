@@ -164,10 +164,12 @@ Journal output remains available through `journalctl --user -u sparrow.service`.
 After a release that changes the table options profile, the daemon rewrites
 older table files once in the background. `sparrow SOCKET status` reports it as
 `recompression`: `running`, `paused` with a `waiting` reason, or `complete`,
-with `compacted_bytes` and any latched `failure`. The rewrite yields to
-pressure, native compaction, the data allowance and the free-space floor, and
-resumes after a restart. Shutdown waits for the current slice, which is
-bounded at about 256 MiB of input tables.
+with the older tables' `remaining_bytes` and any latched `failure`. RocksDB's
+own periodic compaction does the work one file at a time, below
+size-triggered compaction. The daemon turns it off while pressure maintenance
+is outstanding or a job's 1 GiB of headroom would not fit the data allowance
+or the free-space floor. The rewrite resumes after a restart, and a running
+job is aborted when the store closes, so shutdown does not wait for it.
 
 ## Shipping finished files from producers that keep them
 

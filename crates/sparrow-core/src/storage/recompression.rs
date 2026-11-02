@@ -4,111 +4,125 @@
 //! One-time background rewrite of table files written under an older options profile.
 //!
 //! New options apply only to new table files, and RocksDB never revisits a cold
-//! bottommost file on its own. Each step forces one bounded key slice of one
-//! family through a native manual compaction, outside the writer lock, then
-//! durably advances a cursor. A whole-range compaction would hold every input
-//! file until it finished, so the slice bounds transient space instead. A
-//! slice starts only when pressure is ready, native compaction is idle, and its
-//! input bytes fit both the data allowance and the free-space floor.
+//! bottommost file on its own. The rewrite uses RocksDB's periodic compaction
+//! rather than manual range compaction. A manual range starts at the first
+//! level with keys in the range: a level-0 file or memtable flush spans every
+//! catalog prefix and merges the whole base level, and a wide upper-level file
+//! merges its whole overlap below it, on every slice. A periodic job instead
+//! rewrites one marked file, into its own level at the bottom or into its
+//! overlap one level down, in the native scheduler, which ranks it below
+//! size-triggered compaction and aborts it when the store closes.
+//!
+//! The rewrite starts by recording the next table file number and a start
+//! second. Each step sets the rewritten families' periodic window to the
+//! seconds elapsed since that start, so only files created before it are
+//! marked. A step turns the window off while pressure is outstanding, or while
+//! one job's headroom would exceed the data allowance or the free-space floor.
+//! When no table file numbered below the boundary remains in those families,
+//! the profile key is written and the window is turned off.
 
-use super::{Error, FAMILIES, Store, Writer, table_options};
-use rocksdb::{BottommostLevelCompaction, CompactOptions, DB, WriteBatch};
-use std::sync::Arc;
+use super::{Error, Store, Writer, table_options};
+use rocksdb::{DB, WriteBatch};
 
 /// Identity of the options profile whose rewrite is complete.
 pub(super) const PROFILE_KEY: &str = "table-options-profile";
-/// Durable rewrite position: profile, family, rewritten bytes and next key.
+/// Durable rewrite start: profile, first new table file number and start second.
 const CURSOR_KEY: &str = "table-options-rewrite";
-const CURSOR_BYTES: usize = 64 * 1024;
+/// Space one periodic job may hold above the store's settled size. A job
+/// rewrites one 64 MiB file together with its overlap one level down, about ten
+/// files at RocksDB's default tenfold level multiplier, so about 704 MiB.
+const JOB_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Input bytes the daemon rewrites per step. A slice runs to completion, so
-/// this also bounds how long shutdown waits for one.
-pub const RECOMPRESSION_SLICE_BYTES: u64 = 256 * 1024 * 1024;
+/// Smallest periodic window the daemon applies, in seconds.
+pub const RECOMPRESSION_SETTLE_SECONDS: u64 = 60;
 
 /// Progress of the one-time rewrite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecompressionPhase {
-    /// Files written under an older profile remain; the next step rewrites a slice.
+    /// Files written under an older profile remain and native rewriting is enabled.
     Running,
-    /// A rewrite is owed but the last step yielded; `waiting` says why.
+    /// A rewrite is owed but the last step turned it off; `waiting` says why.
     Paused,
-    /// Every family's files were rewritten under the current profile.
+    /// Every rewritten family's files were written under the current profile.
     Complete,
 }
 
-/// Durable rewrite position with this session's last gate and failure.
+/// Rewrite progress observed by the last step, with its gate and failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecompressionStatus {
     /// Identity of the running binary's table options.
     pub profile: &'static str,
     /// Current phase.
     pub phase: RecompressionPhase,
-    /// Family being rewritten; absent once complete.
-    pub family: Option<&'static str>,
-    /// Durable total of input table bytes rewritten under this profile.
-    pub compacted_bytes: u64,
-    /// Why the last step yielded instead of rewriting a slice.
+    /// Bytes of table files still written under an older profile; zero once complete.
+    pub remaining_bytes: u64,
+    /// Why the last step turned native rewriting off.
     pub waiting: Option<String>,
-    /// Latched failure; cleared by the next rewritten slice.
+    /// Latched failure; cleared by the next step that succeeds.
     pub failure: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cursor {
-    family: u8,
-    compacted_bytes: u64,
-    next: Vec<u8>,
+    /// Table files numbered below this predate the rewrite.
+    boundary: u64,
+    /// Unix second after every predating file was created.
+    started_at: u64,
 }
 
 impl Cursor {
-    fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(table_options::PROFILE.len() + 10 + self.next.len());
+    fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(table_options::PROFILE.len() + 17);
         bytes.extend_from_slice(table_options::PROFILE.as_bytes());
         bytes.push(0);
-        bytes.push(self.family);
-        bytes.extend_from_slice(&self.compacted_bytes.to_be_bytes());
-        bytes.extend_from_slice(&self.next);
+        bytes.extend_from_slice(&self.boundary.to_be_bytes());
+        bytes.extend_from_slice(&self.started_at.to_be_bytes());
         bytes
     }
 
     /// `None` when the cursor belongs to another profile, which restarts the rewrite.
     fn decode(bytes: &[u8]) -> Result<Option<Self>, Error> {
-        let corrupt = || {
-            Error::new(
-                "STORAGE_FAILURE",
-                "table options rewrite cursor is malformed; inspect or restore the catalog",
-            )
-        };
-        if bytes.len() > CURSOR_BYTES {
-            return Err(corrupt());
-        }
         let split = bytes
             .iter()
             .position(|byte| *byte == 0)
-            .ok_or_else(corrupt)?;
+            .ok_or_else(corrupt_cursor)?;
         if &bytes[..split] != table_options::PROFILE.as_bytes() {
             return Ok(None);
         }
         let rest = &bytes[split + 1..];
-        if rest.len() < 9 || usize::from(rest[0]) >= table_options::REWRITTEN.len() {
-            return Err(corrupt());
+        if rest.len() != 16 {
+            return Err(corrupt_cursor());
         }
-        let mut compacted = [0; 8];
-        compacted.copy_from_slice(&rest[1..9]);
+        let mut boundary = [0; 8];
+        let mut started_at = [0; 8];
+        boundary.copy_from_slice(&rest[..8]);
+        started_at.copy_from_slice(&rest[8..]);
         Ok(Some(Self {
-            family: rest[0],
-            compacted_bytes: u64::from_be_bytes(compacted),
-            next: rest[9..].to_vec(),
+            boundary: u64::from_be_bytes(boundary),
+            started_at: u64::from_be_bytes(started_at),
         }))
     }
 }
 
-/// The rewrite owed by this store, or `None` once complete.
+fn corrupt_cursor() -> Error {
+    Error::new(
+        "STORAGE_FAILURE",
+        "table options rewrite cursor is malformed; inspect or restore the catalog",
+    )
+}
+
+/// The rewrite owed by this store and this session's observations.
 #[derive(Default)]
 pub(super) struct State {
+    owed: bool,
     cursor: Option<Cursor>,
+    remaining_bytes: u64,
     waiting: Option<String>,
     failure: Option<String>,
+    /// Native background error count already reported.
+    background_errors: u64,
+    /// Periodic window this session last applied; zero is off.
+    window: u64,
 }
 
 impl State {
@@ -128,216 +142,163 @@ impl State {
             Some(bytes) => Cursor::decode(&bytes)?,
             None => None,
         };
+        let boundary = cursor.map_or(u64::MAX, |cursor| cursor.boundary);
         Ok(Self {
-            cursor: Some(cursor.unwrap_or(Cursor {
-                family: 0,
-                compacted_bytes: 0,
-                next: Vec::new(),
-            })),
+            owed: true,
+            cursor,
+            remaining_bytes: older_bytes(db, boundary)?.1,
             ..Self::default()
         })
     }
 
     fn status(&self) -> RecompressionStatus {
-        let (phase, family, compacted_bytes) = match &self.cursor {
-            None => (RecompressionPhase::Complete, None, 0),
-            Some(cursor) => (
-                if self.waiting.is_some() {
-                    RecompressionPhase::Paused
-                } else {
-                    RecompressionPhase::Running
-                },
-                Some(table_options::REWRITTEN[usize::from(cursor.family)]),
-                cursor.compacted_bytes,
-            ),
-        };
         RecompressionStatus {
             profile: table_options::PROFILE,
-            phase,
-            family,
-            compacted_bytes,
+            phase: if !self.owed {
+                RecompressionPhase::Complete
+            } else if self.waiting.is_some() {
+                RecompressionPhase::Paused
+            } else {
+                RecompressionPhase::Running
+            },
+            remaining_bytes: self.remaining_bytes,
             waiting: self.waiting.clone(),
             failure: self.failure.clone(),
         }
     }
 }
 
-/// One planned slice, compacted without the writer lock.
-struct Slice {
-    db: Arc<DB>,
-    family: &'static str,
-    start: Vec<u8>,
-    end: Vec<u8>,
-    inputs: Vec<String>,
-    bytes: u64,
-}
-
-/// One table file of a family with its key bounds.
-struct Table {
-    name: String,
-    size: u64,
-    start: Vec<u8>,
-    end: Vec<u8>,
-}
-
-fn tables(db: &DB, family: &str) -> Result<Vec<Table>, Error> {
-    let mut tables = Vec::new();
-    for file in db.live_files()? {
-        if file.column_family_name != family {
-            continue;
-        }
-        let (Some(start), Some(end)) = (file.start_key, file.end_key) else {
-            return Err(Error::new(
+fn file_number(name: &str) -> Result<u64, Error> {
+    name.trim_start_matches('/')
+        .strip_suffix(".sst")
+        .and_then(|number| number.parse().ok())
+        .ok_or_else(|| {
+            Error::new(
                 "STORAGE_FAILURE",
-                format!("live table {} has no key bounds", file.name),
-            ));
-        };
-        tables.push(Table {
-            name: file.name,
-            size: file.size as u64,
-            start,
-            end,
-        });
+                format!("live table file {name} has no table file number"),
+            )
+        })
+}
+
+/// The next table file number, and the bytes of rewritten-family table files
+/// numbered below `boundary`.
+fn older_bytes(db: &DB, boundary: u64) -> Result<(u64, u64), Error> {
+    let mut next = 0;
+    let mut older = 0_u64;
+    for file in db.live_files()? {
+        let number = file_number(&file.name)?;
+        next = next.max(number.saturating_add(1));
+        if number < boundary && table_options::REWRITTEN.contains(&file.column_family_name.as_str())
+        {
+            older = older.saturating_add(file.size as u64);
+        }
     }
-    tables.sort_by(|left, right| left.start.cmp(&right.start));
-    Ok(tables)
+    Ok((next, older))
 }
 
 impl Writer {
-    fn background_errors(&self, family: &str) -> Result<(), Error> {
-        if self.native_property(family, "rocksdb.background-errors")? != 0 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "RocksDB reports background errors; reopen and inspect storage before rewriting tables",
-            ));
+    /// Apply one periodic window to every rewritten family; zero turns it off.
+    fn rewrite_window(&self, state: &mut State, window: u64) -> Result<(), Error> {
+        if state.window == window {
+            return Ok(());
         }
+        let value = window.to_string();
+        for name in table_options::REWRITTEN {
+            let family = self
+                .db
+                .cf_handle(name)
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", format!("{name} family missing")))?;
+            self.db
+                .set_options_cf(&family, &[("periodic_compaction_seconds", &value)])?;
+        }
+        state.window = window;
         Ok(())
     }
 
-    fn native_idle(&self) -> Result<bool, Error> {
-        for family in FAMILIES {
-            self.background_errors(family)?;
-            if self.native_property(family, "rocksdb.compaction-pending")? != 0
-                || self.native_property(family, "rocksdb.num-running-compactions")? != 0
-            {
-                return Ok(false);
-            }
+    fn recompress(&self, state: &mut State, now_seconds: u64, settle: u64) -> Result<(), Error> {
+        if !state.owed {
+            return Ok(());
         }
-        Ok(true)
-    }
-
-    fn save_cursor(&self, cursor: &Cursor) -> Result<(), Error> {
-        let mut batch = WriteBatch::default();
-        batch.put(CURSOR_KEY, cursor.encode());
-        self.commit(batch)
-    }
-
-    /// Choose the next slice, or record why none may run now.
-    fn plan_recompression(&self, slice_bytes: u64) -> Result<Option<Slice>, Error> {
-        let mut state = self.recompression.borrow_mut();
-        let Some(mut cursor) = state.cursor.clone() else {
-            return Ok(None);
-        };
-        let pressure = self.pressure.borrow().status.clone();
-        if pressure.phase != super::pressure::PressurePhase::Ready || pressure.requested_bytes != 0
-        {
-            state.waiting = Some("pressure maintenance has priority".into());
-            return Ok(None);
+        let mut errors = 0_u64;
+        for name in table_options::REWRITTEN {
+            errors =
+                errors.saturating_add(self.native_property(name, "rocksdb.background-errors")?);
         }
-        if !self.native_idle()? {
-            state.waiting = Some("native compaction has priority".into());
-            return Ok(None);
-        }
-        loop {
-            let family = table_options::REWRITTEN[usize::from(cursor.family)];
-            let remaining = tables(&self.db, family)?
-                .into_iter()
-                .filter(|table| table.end >= cursor.next)
-                .collect::<Vec<_>>();
-            if remaining.is_empty() {
-                cursor.family += 1;
-                cursor.next.clear();
-                if usize::from(cursor.family) == table_options::REWRITTEN.len() {
-                    let mut batch = WriteBatch::default();
-                    batch.put(PROFILE_KEY, table_options::PROFILE);
-                    batch.delete(CURSOR_KEY);
-                    self.commit(batch)?;
-                    *state = State::default();
-                    return Ok(None);
-                }
-                self.save_cursor(&cursor)?;
-                state.cursor = Some(cursor.clone());
-                continue;
-            }
-            // Take whole files in key order until the slice is full; at least one.
-            let mut taken = 0_u64;
-            let mut end = Vec::new();
-            for table in &remaining {
-                if taken >= slice_bytes {
-                    break;
-                }
-                taken = taken.saturating_add(table.size);
-                end = end.max(table.end.clone());
-            }
-            // Every file overlapping the range is an input and stays until it finishes.
-            let inputs = remaining
-                .iter()
-                .filter(|table| table.start <= end)
-                .collect::<Vec<_>>();
-            let bytes = inputs
-                .iter()
-                .fold(0_u64, |sum, table| sum.saturating_add(table.size));
-            let physical = self.physical_bytes()?;
-            let allowance = self.config.disk_budget - self.config.maintenance_reserve;
-            if physical.saturating_add(bytes) > allowance {
-                state.waiting = Some(format!(
-                    "a {bytes}-byte slice does not fit the data allowance: {physical} of {allowance} bytes in use"
-                ));
-                return Ok(None);
-            }
-            if let Some(shortfall) = self.space.shortfall_after(bytes)? {
-                state.waiting = Some(shortfall);
-                return Ok(None);
-            }
-            state.waiting = None;
-            return Ok(Some(Slice {
-                db: Arc::clone(&self.db),
-                family,
-                start: cursor.next.clone(),
-                end,
-                inputs: inputs.iter().map(|table| table.name.clone()).collect(),
-                bytes,
-            }));
-        }
-    }
-
-    /// Advance past a slice only when none of its inputs remain.
-    fn finish_recompression(&self, slice: &Slice) -> Result<(), Error> {
-        self.background_errors(slice.family)?;
-        if let Some(kept) = tables(&self.db, slice.family)?
-            .into_iter()
-            .find(|table| slice.inputs.contains(&table.name))
-        {
+        if errors > state.background_errors {
+            // Report each native error once; a recovered store resumes next step.
+            let new = errors - state.background_errors;
+            state.background_errors = errors;
+            self.rewrite_window(state, 0)?;
             return Err(Error::new(
                 "STORAGE_FAILURE",
                 format!(
-                    "table {} in {} survived its rewrite; the slice will be retried",
-                    kept.name, slice.family
+                    "RocksDB reported {new} new background errors; the table rewrite paused and retries on the next step"
                 ),
             ));
         }
-        let mut state = self.recompression.borrow_mut();
-        let cursor = state.cursor.as_mut().ok_or_else(|| {
-            Error::new("STORAGE_FAILURE", "table options rewrite lost its cursor")
-        })?;
-        let mut next = cursor.clone();
-        next.next = slice.end.clone();
-        next.next.push(0);
-        next.compacted_bytes = next.compacted_bytes.saturating_add(slice.bytes);
-        self.save_cursor(&next)?;
-        *cursor = next;
-        state.failure = None;
+        // The gate comes first: below the floor the store refuses the writes
+        // that start or finish the rewrite, and the window must still go off.
+        let boundary = state.cursor.map_or(u64::MAX, |cursor| cursor.boundary);
+        state.remaining_bytes = older_bytes(&self.db, boundary)?.1;
+        state.waiting = self.rewrite_gate()?;
+        if state.waiting.is_some() {
+            return self.rewrite_window(state, 0);
+        }
+        if state.remaining_bytes == 0 {
+            self.rewrite_window(state, 0)?;
+            let mut batch = WriteBatch::default();
+            batch.put(PROFILE_KEY, table_options::PROFILE);
+            batch.delete(CURSOR_KEY);
+            self.commit(batch)?;
+            *state = State::default();
+            return Ok(());
+        }
+        let cursor = match state.cursor {
+            Some(cursor) => cursor,
+            None => {
+                // Every existing file was created no later than this second.
+                let cursor = Cursor {
+                    boundary: older_bytes(&self.db, u64::MAX)?.0,
+                    started_at: now_seconds.saturating_add(1),
+                };
+                let mut batch = WriteBatch::default();
+                batch.put(CURSOR_KEY, cursor.encode());
+                self.commit(batch)?;
+                state.cursor = Some(cursor);
+                cursor
+            }
+        };
+        // Periodic compaction marks files created before `now - window`. The
+        // window equal to the elapsed time marks exactly the older files. It
+        // starts only after `settle` seconds, so a fresh output is never
+        // marked, and moves only after drifting by `settle` or an eighth, so
+        // native option rewrites stay rare. The drift can mark files written
+        // in the first moments of the rewrite; they are rewritten once more.
+        let elapsed = now_seconds.saturating_sub(cursor.started_at);
+        if elapsed >= settle
+            && (state.window == 0
+                || elapsed.saturating_sub(state.window) > settle.max(state.window / 8))
+        {
+            self.rewrite_window(state, elapsed)?;
+        }
         Ok(())
+    }
+
+    /// Why native rewriting must stay off now, if it must.
+    fn rewrite_gate(&self) -> Result<Option<String>, Error> {
+        let pressure = self.pressure.borrow().status.clone();
+        if pressure.phase != super::pressure::PressurePhase::Ready || pressure.requested_bytes != 0
+        {
+            return Ok(Some("pressure maintenance has priority".into()));
+        }
+        let physical = self.physical_bytes()?;
+        let allowance = self.config.disk_budget - self.config.maintenance_reserve;
+        if physical.saturating_add(JOB_HEADROOM_BYTES) > allowance {
+            return Ok(Some(format!(
+                "a rewrite job's {JOB_HEADROOM_BYTES} bytes of headroom does not fit the data allowance: {physical} of {allowance} bytes in use"
+            )));
+        }
+        self.space.shortfall_after(JOB_HEADROOM_BYTES)
     }
 }
 
@@ -347,42 +308,25 @@ impl Store {
         Ok(self.lock()?.recompression.borrow().status())
     }
 
-    /// Rewrite at most one slice of about `slice_bytes` input bytes. The writer
-    /// lock is held only to plan and to record the slice, never during compaction.
-    pub fn recompress_step(&self, slice_bytes: u64) -> Result<RecompressionStatus, Error> {
-        if slice_bytes == 0 {
+    /// Observe the rewrite at `now` (Unix milliseconds) and turn native
+    /// rewriting on or off. `settle` is the smallest periodic window in
+    /// seconds; the daemon uses [`RECOMPRESSION_SETTLE_SECONDS`]. The step
+    /// compacts nothing itself and returns promptly.
+    pub fn recompress_step(&self, now: u64, settle: u64) -> Result<RecompressionStatus, Error> {
+        if settle == 0 {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "a table rewrite slice needs a positive byte bound",
+                "a table rewrite needs a positive settle time",
             ));
         }
-        let result = self.recompress_slice(slice_bytes);
         let writer = self.lock()?;
         let mut state = writer.recompression.borrow_mut();
-        if let Err(error) = &result {
-            state.failure = Some(error.to_string().chars().take(1024).collect());
+        let result = writer.recompress(&mut state, now / 1000, settle);
+        match &result {
+            Ok(()) => state.failure = None,
+            Err(error) => state.failure = Some(error.to_string().chars().take(1024).collect()),
         }
         let status = state.status();
         result.map(|()| status)
-    }
-
-    fn recompress_slice(&self, slice_bytes: u64) -> Result<(), Error> {
-        let Some(slice) = self.lock()?.plan_recompression(slice_bytes)? else {
-            return Ok(());
-        };
-        let family = slice
-            .db
-            .cf_handle(slice.family)
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "rewritten family missing"))?;
-        let mut options = CompactOptions::default();
-        // Rewrite bottommost files too, but not the ones this compaction just wrote.
-        options.set_bottommost_level_compaction(BottommostLevelCompaction::ForceOptimized);
-        // Automatic compactions keep running beside the slice.
-        options.set_exclusive_manual_compaction(false);
-        let start = (!slice.start.is_empty()).then_some(slice.start.as_slice());
-        slice
-            .db
-            .compact_range_cf_opt(family, start, Some(slice.end.as_slice()), &options);
-        self.lock()?.finish_recompression(&slice)
     }
 }

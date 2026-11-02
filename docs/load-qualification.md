@@ -207,10 +207,8 @@ by 35%, and that throughput is also how fast pressure frees space.
 
 RocksDB rewrites a cold bottommost file only when a compaction from above
 overlaps it, and these stores set no periodic compaction, so the old tables do
-not convert on their own. A whole-range manual compaction holds its inputs
-until it finishes, which would need about 12 GB of temporary space here.
-Instead the daemon rewrites the default and `payload` families once, in slices
-of about 256 MiB of input tables, as described in
+not convert on their own. The daemon rewrites the default and `payload`
+families once through periodic compaction, one file at a time, as described in
 [Architecture](architecture.md#42-deduplication-and-compression).
 
 Not measured: read latency under production cache sizes, ingest throughput

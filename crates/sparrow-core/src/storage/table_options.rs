@@ -63,6 +63,8 @@ pub(super) fn family(name: &str) -> Options {
     options.set_compression_type(DBCompressionType::Lz4);
     options.set_bottommost_compression_type(DBCompressionType::Zstd);
     pressure::native_compaction_options(&mut options);
+    // Off until the one-time rewrite turns it on for the families it rewrites.
+    options.set_periodic_compaction_seconds(0);
     let mut table = BlockBasedOptions::default();
     if name == rdf_index::REVERSE_FAMILY {
         // Lookups that miss must not decompress large blocks. The whole-key
