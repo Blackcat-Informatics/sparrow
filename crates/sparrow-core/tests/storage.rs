@@ -7009,6 +7009,16 @@ fn stage_fixture(
     format: &str,
     input: &[u8],
 ) -> sparrow_core::ImportManifest {
+    layout_fixture(store, request, format, input).unwrap()
+}
+
+/// Upload and seal `input`, then prepare its layout, returning the layout outcome.
+fn layout_fixture(
+    store: &Store,
+    request: &str,
+    format: &str,
+    input: &[u8],
+) -> Result<sparrow_core::ImportManifest, sparrow_core::Error> {
     let payload = format!(
         "blake3:{}",
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
@@ -7034,7 +7044,7 @@ fn stage_fixture(
             .unwrap();
     }
     store.import_seal(&manifest.id, 0).unwrap();
-    store.import_prepare_layout(&manifest.id, 0).unwrap()
+    store.import_prepare_layout(&manifest.id, 0)
 }
 
 /// Import and publish one JSON document of `size` bytes with distinct chunks,
@@ -7097,20 +7107,47 @@ fn split_document(dir: &std::path::Path) -> (Store, sparrow_core::Artifact, Vec<
     (store, artifact, input)
 }
 
-/// Open a store whose import bound derives from scaled retirement limits, and
-/// return those limits with the admitted bound.
-fn retirement_scaled_store(dir: &std::path::Path) -> (Store, sparrow_core::EvictionLimits, u64) {
+/// Open a store whose import bound and pin caps derive from scaled retirement
+/// limits, and return those limits with the derived bounds.
+fn retirement_scaled_store(
+    dir: &std::path::Path,
+) -> (
+    Store,
+    sparrow_core::EvictionLimits,
+    sparrow_core::RetirementBounds,
+) {
     let mut settings = config();
     settings.disk_budget = 512 * 1024 * 1024;
     let store = Store::open(dir, settings).unwrap();
     let limits = sparrow_core::EvictionLimits {
         max_catalog_bytes: 640 * 1024,
+        max_pin_catalog_bytes: 512 * 1024,
         max_payload_refs: 256,
         ..sparrow_core::EvictionLimits::default()
     };
-    let bound = store.bound_imports_by_retirement_limits(limits).unwrap();
-    assert!(bound < sparrow_core::MAX_IMPORT_BYTES);
-    (store, limits, bound)
+    let bounds = store
+        .scale_retirement_for_tests(limits, 128 * 1024)
+        .unwrap();
+    assert!(bounds.import_bytes < sparrow_core::MAX_IMPORT_BYTES);
+    assert!(bounds.pins < sparrow_core::MAX_PINS);
+    assert!(bounds.pinned_members < sparrow_core::MAX_PINNED_MEMBERS);
+    (store, limits, bounds)
+}
+
+/// Ingest a small log of `lines` records and pin all of them across
+/// `bounds.pins` pins of `days`, filling both store-wide pin caps exactly.
+fn pins_at_cap(store: &Store, bounds: sparrow_core::RetirementBounds, days: u64, now: u64) {
+    let lines = bounds.pinned_members;
+    let input: String = (0..lines).map(|line| format!("pinned {line}\n")).collect();
+    let artifact = store
+        .ingest("pinned-log", "pinned", "log", input.as_bytes(), now)
+        .unwrap();
+    assert_eq!(artifact.record_ids.len(), lines);
+    let share = lines.div_ceil(bounds.pins);
+    for (index, members) in artifact.record_ids.chunks(share).enumerate() {
+        let name = format!("cap-{index}");
+        store.pin(&name, &name, members, days, now).unwrap();
+    }
 }
 
 /// A log of `bytes` bytes in distinct lines of `line` bytes each, so every line is
@@ -7147,7 +7184,8 @@ fn publish_staged(
 fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more_is_refused() {
     let chunk = sparrow_core::IMPORT_CHUNK_BYTES;
     let dir = tempfile::tempdir().unwrap();
-    let (store, limits, bound) = retirement_scaled_store(dir.path());
+    let (store, limits, bounds) = retirement_scaled_store(dir.path());
+    let bound = bounds.import_bytes;
     // One chunk more than the admitted ceiling is refused before any upload.
     let refused = store
         .import_begin(
@@ -7168,6 +7206,9 @@ fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more
     // At the ceiling every chunk is its own record, the costliest admitted row.
     let input = log_lines(bound, chunk);
     let artifact = publish_staged(&store, "at-ceiling", &input).unwrap();
+    // Pins at both store-wide caps, expired by the time expiry runs: their rows are
+    // charged to the pin budget, not the artifact envelope, and expiry deletes them.
+    pins_at_cap(&store, bounds, 1, 0);
     let chunks = (bound / chunk as u64) as usize;
     assert_eq!(artifact.record_ids.len(), chunks);
     assert_eq!(
@@ -7176,20 +7217,24 @@ fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more
             .unwrap(),
         input[input.len() - 1024 * 1024..]
     );
+    let records = (chunks + bounds.pinned_members) as u64;
     let mut expired = 0;
     let drained = (0..20_000).any(|_| {
         let report = store.expire_bounded(30 * DAY, limits).unwrap();
         expired += report.records;
-        !report.continuation && expired == chunks as u64
+        !report.continuation && expired == records
     });
-    assert!(drained, "{expired} of {chunks} records expired");
+    assert!(drained, "{expired} of {records} records expired");
+    // Every pin row is gone, not merely expired.
+    assert!(store.pins(0).unwrap().is_empty());
     assert_eq!(
         store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
         "EVIDENCE_UNAVAILABLE"
     );
     // Within the byte bound, twice the records per chunk overflows the row read and
-    // publication refuses it.
-    let crowded = publish_staged(&store, "crowded", &log_lines(bound, chunk / 2)).unwrap_err();
+    // layout refuses it before publication work.
+    let crowded =
+        layout_fixture(&store, "crowded", "log", &log_lines(bound, chunk / 2)).unwrap_err();
     assert_eq!(crowded.code, "RESOURCE_LIMIT");
     assert!(
         crowded.message.contains("retirement pass"),
@@ -7200,8 +7245,10 @@ fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more
     drop(dir);
 
     let dir = tempfile::tempdir().unwrap();
-    let (store, limits, bound) = retirement_scaled_store(dir.path());
+    let (store, limits, bounds) = retirement_scaled_store(dir.path());
     let artifact = publish_staged(&store, "at-ceiling", &log_lines(bound, chunk)).unwrap();
+    // Live pins at both caps on newer evidence: eviction still drains the ceiling.
+    pins_at_cap(&store, bounds, 60, 0);
     let mut evicted = 0;
     let drained = (0..20_000).any(|_| {
         let report = store.evict_oldest(1, limits).unwrap();
@@ -7216,6 +7263,67 @@ fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more
         store.bytes(&artifact.id, 0, 1, 1).unwrap_err().code,
         "EVIDENCE_UNAVAILABLE"
     );
+}
+
+/// INVARIANT: pin creation and extension stop at the store-wide row and member caps
+/// that keep every retirement pass's pin capture inside its budget, and release is
+/// never refused, so freeing a slot restores admission.
+#[test]
+fn pins_beyond_the_store_wide_caps_are_refused_and_release_restores_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, bounds) = retirement_scaled_store(dir.path());
+    let lines = bounds.pinned_members + 1;
+    let input: String = (0..lines).map(|line| format!("pinned {line}\n")).collect();
+    let records = store
+        .ingest("pinned-log", "pinned", "log", input.as_bytes(), 0)
+        .unwrap()
+        .record_ids;
+    let share = bounds.pinned_members / bounds.pins;
+    let mut pins: Vec<_> = records[..bounds.pinned_members]
+        .chunks(share)
+        .enumerate()
+        .map(|(index, members)| {
+            let name = format!("full-{index}");
+            store.pin(&name, &name, members, 40, 0).unwrap()
+        })
+        .collect();
+    assert_eq!(pins.len(), bounds.pins);
+    let refused = |result: Result<sparrow_core::Pin, sparrow_core::Error>, held: &str| {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "RESOURCE_LIMIT");
+        assert!(
+            error.message.contains(&format!(
+                "capped at {} rows and {} members",
+                bounds.pins, bounds.pinned_members
+            )) && error.message.contains(held),
+            "{}",
+            error.message
+        );
+    };
+    let full = format!(
+        "holds {} rows with {} members",
+        bounds.pins, bounds.pinned_members
+    );
+    let last = records[bounds.pinned_members..].to_vec();
+    // At both caps neither a new pin nor one more member on an existing pin fits.
+    refused(store.pin("over-new", "over", &last, 40, 0), &full);
+    refused(store.pin("over-extend", "full-0", &last, 40, 0), &full);
+    // Release is admitted at the caps and frees a row and its members.
+    store.release(&pins.remove(0).id).unwrap();
+    store.pin("refill", "refill", &last, 40, 0).unwrap();
+    // The row cap alone refuses a further pin while members remain below their cap.
+    refused(
+        store.pin("over-rows", "over", &records[..1], 40, 0),
+        &format!(
+            "holds {} rows with {} members",
+            bounds.pins,
+            bounds.pinned_members - share + 1
+        ),
+    );
+    store.release(&pins.remove(0).id).unwrap();
+    store
+        .pin("after-release", "over", &records[..1], 40, 0)
+        .unwrap();
 }
 
 #[test]

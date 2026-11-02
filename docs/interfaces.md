@@ -288,22 +288,36 @@ One fixed bound remains until the v2 store format (#5). It is the smaller of
 two limits, and `MAX_IMPORT_BYTES` is derived from both, with a compile-time
 assertion that ties the admitted chunk count to each:
 
-- Expiry and eviction read an artifact's whole catalog row in one pass. Within
-  three quarters of the 32 MiB pass catalog budget, the row may carry 110695
-  chunk identities, counting a record identity for each chunk. This bound binds.
+- Expiry and eviction read an artifact's whole catalog row in one pass. The 32
+  MiB pass catalog budget, less a 4 MiB reserve for the record row the pass reads
+  with it, lets the row carry 129935 chunk identities, counting a record identity
+  for each chunk. This bound binds.
 - Publication commits an artifact's catalog in one atomic write batch of at most
   128 MiB, which carries every 64 KiB chunk identity four times: in the record
   rows, the artifact row, the saved publication receipt and the ingest receipt.
   That admits 438210 chunks.
 
 `import_begin` therefore refuses a declared input above `MAX_IMPORT_BYTES`,
-which is 7254507520 bytes (110695 chunks, about 6.76 GiB), before any byte is
+which is 8515420160 bytes (129935 chunks, about 7.93 GiB), before any byte is
 uploaded. The `RESOURCE_LIMIT` error states the bound and says to split the
 input. An artifact of many small records can still need more chunks or record
-identities than its size implies; publication then refuses it with
-`RESOURCE_LIMIT` when its row would exceed the retirement pass, or when its
-record rows would exceed the batch. Format #5 replaces the whole-row read and
-the single batch, and with them this bound.
+identities than its size implies. Layout preparation then refuses it with
+`RESOURCE_LIMIT` when its row would exceed the retirement pass, and publication
+checks again for layouts prepared earlier and refuses record rows that would
+exceed the batch. An inline `ingest` is held to the same retirement check.
+Format #5 replaces the whole-row read and the single batch, and with them this
+bound.
+
+Every expiry and eviction pass also reads every pin row, expired rows included,
+before any artifact. That capture has its own 64 MiB budget, apart from the
+artifact's share, so pins cannot crowd out an artifact row. To keep the capture
+inside that budget, a store holds at most `MAX_PINS` pin rows (606) and
+`MAX_PINNED_MEMBERS` members across all of them (36594), both derived from the
+budget with a compile-time assertion that a pin set at both caps fits. Creating
+or extending a pin past either cap fails with `RESOURCE_LIMIT`, and the error
+names the caps and the store's current totals. Expired rows count until expiry
+deletes them, which it does in its own batch before any phase that could stop the
+pass. Releasing a pin is never refused.
 
 A larger artifact ingests through the staged import: the CLI `ingest` command,
 completed-file consumption and the SDK `import_file` calls append it in 64 KiB
@@ -313,8 +327,9 @@ a recorded projection failure instead of a JSON projection. A record above
 128 MiB (2048 chunks) is laid out as consecutive raw records: every piece but
 the last holds 112 MiB, and the last holds more than 16 MiB and at most
 128 MiB. Each record's chunk manifest then fits one retirement pass and one
-catalog read. Within `MAX_IMPORT_BYTES`, expiry and eviction then retire the
-pieces and their artifact in bounded passes.
+catalog read. An artifact admitted under `MAX_IMPORT_BYTES` and the layout check
+fits one pass alongside a record row, and pins stay within their caps, so expiry
+and eviction retire the pieces and their artifact in bounded passes.
 Stores laid out before this change keep their records; only new layouts split.
 No step holds more than 16 MiB of an artifact's bytes in memory. Sealing,
 layout and publication of an input of many GiB each run as one call, so they
@@ -337,7 +352,7 @@ to the chunk that holds the requested offset. An artifact with several records
 finds the record holding the offset by a binary search over its ordered record
 rows, then seeks within that record, so a document split into raw records reads
 back byte-exact. Besides the requested chunks, every artifact read decodes the
-whole artifact row once, about 7.4 MB of chunk identities at the bound, and a
+whole artifact row once, about 8.7 MB of chunk identities at the bound, and a
 few record rows. A tail capture keeps its
 fixed 1 MiB window. The archive's `max_segment_bytes` is a closing target from
 1 MiB to 192 MiB, and an entry larger than the target is archived in a segment

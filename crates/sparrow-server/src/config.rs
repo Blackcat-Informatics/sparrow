@@ -200,7 +200,7 @@ impl ServerConfig {
             .contains_key("max_artifact_bytes")
         {
             return Err(format!(
-                "{}: max_artifact_bytes was removed; large artifacts now ingest through the staged import within disk_budget and min_free_bytes, up to the fixed 6.76 GiB import bound. Delete the key and restart",
+                "{}: max_artifact_bytes was removed; large artifacts now ingest through the staged import within disk_budget and min_free_bytes, up to the fixed 7.93 GiB import bound. Delete the key and restart",
                 path.display()
             )
             .into());

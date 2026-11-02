@@ -4,7 +4,7 @@
 //! Finite catalog expiry, sharing all dependency retirement with eviction.
 
 use super::eviction::EvictionLimits;
-use super::{Catalog, DAY, Error, Pin, Record, Store, Writer, parse, put, retire};
+use super::{Catalog, DAY, Error, Record, Store, Writer, parse, put, retire};
 use rocksdb::{Direction, IteratorMode};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -12,7 +12,6 @@ enum Phase {
     #[default]
     Artifacts,
     Records,
-    Pins,
     Requests,
 }
 
@@ -21,7 +20,6 @@ impl Phase {
         match self {
             Self::Artifacts => b"artifact:",
             Self::Records => b"record:",
-            Self::Pins => b"pin:",
             Self::Requests => b"request:",
         }
     }
@@ -29,8 +27,7 @@ impl Phase {
     fn following(self) -> Option<Self> {
         match self {
             Self::Artifacts => Some(Self::Records),
-            Self::Records => Some(Self::Pins),
-            Self::Pins => Some(Self::Requests),
+            Self::Records => Some(Self::Requests),
             Self::Requests => None,
         }
     }
@@ -103,8 +100,13 @@ impl Store {
 impl Writer {
     fn expire_bounded(&self, now: u64, limits: EvictionLimits) -> Result<ExpiryReport, Error> {
         let mut catalog = limits.max_catalog_bytes;
+        let mut pin_catalog = limits.max_pin_catalog_bytes;
         let mut pin_visits = 0;
-        let protected = self.protected_matching(
+        let mut expired_pins = Vec::new();
+        // Pin capture has its own budget, so pins never starve the evidence phases,
+        // and expired pin rows are deleted here, in their own batch, before any
+        // evidence phase can stop the pass.
+        let protected = self.capture_pins(
             now,
             |_| true,
             || {
@@ -119,12 +121,21 @@ impl Writer {
                 }
             },
             None,
-            Some(&mut catalog),
+            Some(&mut pin_catalog),
+            Some(&mut expired_pins),
         )?;
+        let mut report = ExpiryReport::default();
+        if !expired_pins.is_empty() {
+            let mut batch = rocksdb::WriteBatch::default();
+            for key in &expired_pins {
+                batch.delete(key);
+            }
+            self.commit(batch)?;
+            report.deleted += expired_pins.len();
+        }
         let mut saved = self.expiry.borrow_mut();
         let start = saved.clone();
         let mut position = start.clone();
-        let mut report = ExpiryReport::default();
         let mut retirement = retire::Retirement::new(self)?;
         'phases: loop {
             let prefix = position.phase.prefix();
@@ -293,19 +304,6 @@ impl Writer {
                                 ));
                                 report.deleted += 1;
                             }
-                        }
-                    }
-                    Phase::Pins => {
-                        let pin = Pin::decode(&value)?;
-                        if key.as_ref() != pin.id.as_bytes() {
-                            return Err(Error::new(
-                                "STORAGE_FAILURE",
-                                "expiry pin catalog identity mismatch",
-                            ));
-                        }
-                        if pin.expires_at <= now {
-                            retirement.batch.delete(&key);
-                            report.deleted += 1;
                         }
                     }
                     Phase::Artifacts | Phase::Requests => {

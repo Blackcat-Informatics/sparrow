@@ -45,7 +45,11 @@ pub use storage::durability::{
     DEFAULT_FLUSH_INTERVAL_MS, Durability, DurabilityStatus, DurabilityWatermark,
     MAX_BUFFERED_BYTES, MAX_BUFFERED_WRITES,
 };
-pub use storage::eviction::{EvictionFrontier, EvictionLimits, EvictionReport};
+#[cfg(feature = "test-support")]
+pub use storage::eviction::RetirementBounds;
+pub use storage::eviction::{
+    EvictionFrontier, EvictionLimits, EvictionReport, MAX_PINNED_MEMBERS, MAX_PINS,
+};
 pub use storage::expiry::{ExpiryFrontier, ExpiryReport};
 pub use storage::handoff::ConsumptionHandoff;
 pub use storage::import::{

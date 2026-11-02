@@ -110,8 +110,11 @@ pub struct EvictionLimits {
     pub scan_budget: usize,
     /// Maximum payload ownership references retired (1..=65536).
     pub max_payload_refs: usize,
-    /// Conservative catalog capture charge (1..=32 MiB).
+    /// Conservative catalog capture charge for retained evidence (1..=32 MiB).
     pub max_catalog_bytes: usize,
+    /// Conservative catalog capture charge for the pin rows every pass reads first,
+    /// separate from `max_catalog_bytes` (1..=64 MiB).
+    pub max_pin_catalog_bytes: usize,
     /// Maximum atomic native batch bytes (1..=128 MiB).
     pub max_batch_bytes: usize,
 }
@@ -129,6 +132,7 @@ impl EvictionLimits {
         scan_budget: 10000,
         max_payload_refs: 4096,
         max_catalog_bytes: 32 * 1024 * 1024,
+        max_pin_catalog_bytes: 64 * 1024 * 1024,
         max_batch_bytes: 128 * 1024 * 1024,
     };
 
@@ -138,6 +142,7 @@ impl EvictionLimits {
             (self.scan_budget, 100000),
             (self.max_payload_refs, 65536),
             (self.max_catalog_bytes, 32 * 1024 * 1024),
+            (self.max_pin_catalog_bytes, 64 * 1024 * 1024),
             (self.max_batch_bytes, 128 * 1024 * 1024),
         ] {
             if value == 0 || value > maximum {
@@ -150,6 +155,97 @@ impl EvictionLimits {
         Ok(())
     }
 }
+
+/// Catalog charge reserved, within a pass's evidence budget, for the record row an
+/// eviction pass reads before its parent artifact. A record row at the 2048-chunk
+/// raw ceiling charges eight times its bytes (2048 identities and a generous 64 KiB
+/// of fields) plus 1 KiB for each of its 2048 identities and 256 field events.
+pub(super) const RECORD_ROW_RESERVE: usize = 4 * 1024 * 1024;
+
+/// One pin row outside its members: `pin:` and 32 hex digits, a 128-character name
+/// escaped six bytes per character, two integers and the member names.
+const PIN_FIXED_BYTES: usize = 1024;
+/// Charged parse events of a pin row outside its members: the object, five member
+/// names, four scalars and the member array.
+const PIN_FIXED_EVENTS: usize = 11;
+/// One member identity in a pin row: `artifact:` and 32 hex digits, quoted, with a
+/// separator.
+const PIN_MEMBER_BYTES: usize = 44;
+
+/// What `charge_catalog_shape` takes for `pins` pin rows holding `members` members
+/// together: eight times the bytes, 8 KiB a row and 1 KiB a charged event.
+pub(super) const fn pin_capture_charge(pins: usize, members: usize) -> usize {
+    pins * (8 * PIN_FIXED_BYTES + 8192 + 1024 * PIN_FIXED_EVENTS)
+        + members * (8 * PIN_MEMBER_BYTES + 1024)
+}
+
+/// The retirement limits a store sizes admission from: what expiry and eviction run
+/// with, and the evidence-budget share reserved for one record row.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RetirementShare {
+    pub limits: EvictionLimits,
+    pub record_reserve: usize,
+}
+
+impl RetirementShare {
+    /// Production: the default pass limits and a reserve for a raw-ceiling record row.
+    pub(super) const DEFAULT: Self = Self {
+        limits: EvictionLimits::DEFAULT,
+        record_reserve: RECORD_ROW_RESERVE,
+    };
+
+    /// The evidence budget one artifact envelope may take: everything but the record
+    /// row reserve, because pin capture has its own budget.
+    pub(super) const fn envelope_budget(self) -> usize {
+        self.limits.max_catalog_bytes - self.record_reserve
+    }
+
+    /// Store-wide pin rows: a quarter of the pin budget.
+    pub(super) const fn max_pins(self) -> usize {
+        self.limits.max_pin_catalog_bytes / 4 / pin_capture_charge(1, 0)
+    }
+
+    /// Store-wide pinned members: the rest of the pin budget after `max_pins` rows.
+    pub(super) const fn max_pinned_members(self) -> usize {
+        (self.limits.max_pin_catalog_bytes - pin_capture_charge(self.max_pins(), 0))
+            / pin_capture_charge(0, 1)
+    }
+}
+
+/// Bounds a store derives from its retirement share; returned by the dev-only test
+/// hook that scales them.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug)]
+pub struct RetirementBounds {
+    /// Largest declared import.
+    pub import_bytes: u64,
+    /// Largest number of pin rows.
+    pub pins: usize,
+    /// Largest number of members across all pin rows.
+    pub pinned_members: usize,
+}
+
+/// Largest number of pin rows a store holds, expired rows included until expiry
+/// deletes them.
+pub const MAX_PINS: usize = RetirementShare::DEFAULT.max_pins();
+/// Largest number of members all pin rows of a store hold together.
+pub const MAX_PINNED_MEMBERS: usize = RetirementShare::DEFAULT.max_pinned_members();
+
+const _: () = {
+    let share = RetirementShare::DEFAULT;
+    // A pin set at both caps fits the pin budget, and every row fits one pass's
+    // pin visit allowance.
+    assert!(pin_capture_charge(MAX_PINS, MAX_PINNED_MEMBERS) <= share.limits.max_pin_catalog_bytes);
+    assert!(MAX_PINS < share.limits.scan_budget);
+    // The record row reserve covers a record row at the raw ceiling.
+    assert!(
+        8 * (2048 * super::manifest_retire::ROW_CHUNK_BYTES + 64 * 1024)
+            + 8192
+            + 1024 * (2048 + 256)
+            <= RECORD_ROW_RESERVE
+    );
+    assert!(RECORD_ROW_RESERVE < share.limits.max_catalog_bytes);
+};
 
 /// Why this pass stopped; a bounded frontier never certifies corpus exhaustion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,6 +309,7 @@ impl Writer {
         limits.validate()?;
         let writer = self;
         let mut catalog = limits.max_catalog_bytes;
+        let mut pin_catalog = limits.max_pin_catalog_bytes;
         let mut pins = 0;
         let protected = writer.protected_matching(
             now,
@@ -229,7 +326,7 @@ impl Writer {
                 }
             },
             None,
-            Some(&mut catalog),
+            Some(&mut pin_catalog),
         )?;
         let mut cursor = self.eviction.borrow_mut();
         if cursor.protected == protected && cursor.exhausted {

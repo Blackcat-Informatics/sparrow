@@ -500,9 +500,9 @@ struct Writer {
     /// Longest record an import layout keeps whole; `import::RAW_RECORD_BYTES`
     /// except where the dev-only test hook lowers it for one open store.
     raw_record_bytes: std::cell::Cell<u64>,
-    /// Retirement limits the import bound derives from: production defaults except
-    /// where the dev-only test hook scales them for one open store.
-    retirement_limits: std::cell::Cell<eviction::EvictionLimits>,
+    /// Retirement share the import bound and pin caps derive from: production
+    /// defaults except where the dev-only test hook scales them for one open store.
+    retirement: std::cell::Cell<eviction::RetirementShare>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -871,6 +871,30 @@ impl Writer {
         }
         Ok(bytes)
     }
+    /// Refuse a pin creation or extension that would take the store past its pin
+    /// caps. Every expiry and eviction pass charges all pin rows, expired ones
+    /// included until expiry deletes them, against the pin capture budget, and the
+    /// caps keep that charge inside it. Release never passes through here.
+    fn admit_pins(
+        &self,
+        pins: usize,
+        members: usize,
+        current_pins: usize,
+        current_members: usize,
+    ) -> Result<(), Error> {
+        let share = self.retirement.get();
+        let (max_pins, max_members) = (share.max_pins(), share.max_pinned_members());
+        if pins > max_pins || members > max_members {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                format!(
+                    "pins are capped at {max_pins} rows and {max_members} members store-wide, and the store holds {current_pins} rows with {current_members} members, expired rows included until expiry deletes them; release pins or wait for expiry"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn commit_pin(&self, key: &str, arguments: Value, pin: &Pin, now: u64) -> Result<(), Error> {
         let receipt: Value = Object::new()
             .with("arguments", arguments)
@@ -1106,9 +1130,23 @@ impl Writer {
         &self,
         now: u64,
         include: impl Fn(&str) -> bool,
+        admit: impl FnMut() -> Result<R, Error>,
+        maximum: Option<usize>,
+        remaining: Option<&mut usize>,
+    ) -> Result<BTreeSet<String>, Error> {
+        self.capture_pins(now, include, admit, maximum, remaining, None)
+    }
+
+    /// Capture live pin members, optionally collecting the keys of expired pin rows
+    /// so the caller can delete them.
+    fn capture_pins<R>(
+        &self,
+        now: u64,
+        include: impl Fn(&str) -> bool,
         mut admit: impl FnMut() -> Result<R, Error>,
         maximum: Option<usize>,
         mut remaining: Option<&mut usize>,
+        mut expired: Option<&mut Vec<Box<[u8]>>>,
     ) -> Result<BTreeSet<String>, Error> {
         let mut protected = BTreeSet::new();
         let mut iterator = self.db.prefix_iterator("pin:");
@@ -1133,6 +1171,8 @@ impl Writer {
             let pin: Pin = self.decode_evidence(&key, &bytes)?;
             if pin.expires_at > now {
                 protected.extend(pin.members.into_iter().filter(|member| include(member)));
+            } else if let Some(expired) = expired.as_deref_mut() {
+                expired.push(key);
             }
         }
         Ok(protected)
@@ -1411,7 +1451,7 @@ impl Store {
                 archive: archive.map(std::cell::RefCell::new),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
-                retirement_limits: std::cell::Cell::new(eviction::EvictionLimits::DEFAULT),
+                retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
             rdf_read: Arc::new(Mutex::new(())),
@@ -2113,19 +2153,28 @@ impl Store {
                 ));
             }
         }
-        let mut pin = writer
-            .catalog::<Pin>("pin:")
-            .try_fold(None, |found, pin| -> Result<_, Error> {
+        let (found, pins, members) = writer.catalog::<Pin>("pin:").try_fold(
+            (None, 0_usize, 0_usize),
+            |(found, pins, members), pin| -> Result<_, Error> {
                 let pin = pin?;
-                Ok(found.or_else(|| (pin.name == name && pin.expires_at > now).then_some(pin)))
-            })?
-            .unwrap_or(Pin {
+                let total = members + pin.members.len();
+                let found =
+                    found.or_else(|| (pin.name == name && pin.expires_at > now).then_some(pin));
+                Ok((found, pins + 1, total))
+            },
+        )?;
+        let extended = found.is_some();
+        let mut pin = match found {
+            Some(pin) => pin,
+            None => Pin {
                 id: random_id("pin")?,
                 name: name.to_owned(),
                 expires_at: deadline,
                 revision: 0,
                 members: BTreeSet::new(),
-            });
+            },
+        };
+        let before = pin.members.len();
         pin.members.extend(targets);
         if pin.members.len() > writer.config.max_pin_members {
             return Err(Error::new(
@@ -2133,6 +2182,12 @@ impl Store {
                 "pin exceeds direct membership limit",
             ));
         }
+        writer.admit_pins(
+            pins + usize::from(!extended),
+            members - before + pin.members.len(),
+            pins,
+            members,
+        )?;
         pin.extend(deadline)?;
         writer.commit_pin(&retry_key, arguments, &pin, now)?;
         Ok(pin)

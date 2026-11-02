@@ -48,12 +48,6 @@ pub(super) const fn envelope_charge(chunks: usize, records: usize, take: usize) 
     2 * row + 8192 + HEADER_FIXED_CHARGE + take * (2 * 66 + 2 * std::mem::size_of::<String>())
 }
 
-/// The share of a pass's catalog budget one artifact envelope may take. The other
-/// quarter covers pin capture and the record row each pass reads before its parent.
-pub(super) const fn envelope_budget(catalog: usize) -> usize {
-    catalog / 4 * 3
-}
-
 fn failure(message: &str) -> Error {
     Error::new("STORAGE_FAILURE", message)
 }
