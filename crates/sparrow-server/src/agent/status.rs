@@ -17,7 +17,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         || value.get_store_id()?.to_str()? != discovery.store_id
         || value.get_durability_status()?.get_session_id()?.to_str()?
             != discovery.durability_session
-        || value.get_max_artifact_bytes() != discovery.max_artifact_bytes
+        || value.get_max_inline_artifact_bytes() != discovery.max_inline_artifact_bytes
         || value.get_max_records_per_artifact() != discovery.max_records_per_artifact
         || value.get_text_analyzer()?.to_str()? != discovery.text_analyzer
         || value.get_text_profile()?.to_str()? != discovery.text_profile
@@ -163,8 +163,8 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             value.get_retry_window_seconds().to_string(),
         )
         .with(
-            "max_artifact_bytes",
-            value.get_max_artifact_bytes().to_string(),
+            "max_inline_artifact_bytes",
+            value.get_max_inline_artifact_bytes().to_string(),
         )
         .with(
             "max_records_per_artifact",

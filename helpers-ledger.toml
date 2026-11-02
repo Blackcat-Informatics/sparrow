@@ -1066,6 +1066,20 @@ fingerprints = []
 names = ['^(check_claim_upload_stability|check_client_file_stability)$']
 
 [[job]]
+id = "staged-import-upload"
+summary = "One resumable staged uploader streams completed files and SDK in-memory inputs above the inline batch bound through one positional input seam; no second chunked ingest loop."
+home = "sparrow_client::imports::upload"
+entry_points = ["sparrow_client::imports::import_file", "sparrow_client::imports::import_open_file", "sparrow_client::Client::ingest_with_durability", "sparrow_client::Client::import_open_file"]
+spec = "docs/interfaces.md: artifacts of any size (schema 64)."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(upload_bytes|stage_in_memory_artifact|chunked_ingest)$']
+
+[[job]]
 id = "query-membership"
 summary = "Resolve retained artifact/record/pin membership once, before filters, with revision guards and bounded expansion."
 home = "sparrow_core::storage::query_membership::Writer::query_selection_membership"

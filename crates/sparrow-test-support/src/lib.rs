@@ -46,7 +46,6 @@ macro_rules! storage_config {
                 disk_budget: 128 * 1024 * 1024,
                 maintenance_reserve: 8 * 1024 * 1024,
                 min_free_bytes: 1024 * 1024,
-                max_artifact_bytes: 8 * 1024 * 1024,
                 max_records: 10_000,
                 max_pin_members: 100,
                 text_analyzer: $crate::resolve_text_analyzer($crate::text_lexicon_dir())
@@ -81,7 +80,7 @@ pub fn client_discovery() -> capnp::message::Builder<capnp::message::HeapAllocat
     let mut out = message.init_root::<sparrow_client::sparrow_capnp::discovery::Builder<'_>>();
     out.set_store_id("store:test");
     out.set_schema_version(sparrow_client::SCHEMA_VERSION);
-    out.set_max_artifact_bytes(1024);
+    out.set_max_inline_artifact_bytes(1024);
     out.set_max_records_per_artifact(2);
     out.set_text_analyzer("native");
     out.set_text_profile("text");
@@ -138,7 +137,7 @@ pub fn write_server_config(
     socket: &std::path::Path,
 ) -> std::path::PathBuf {
     let config = dir.join("server.toml");
-    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmin_free_bytes = 1048576\nmax_artifact_bytes = 8388608\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", text_lexicon_dir())).unwrap();
+    std::fs::write(&config, format!("socket_path = {socket:?}\ndata_dir = {store:?}\ndisk_budget = 134217728\nmaintenance_reserve = 8388608\nmin_free_bytes = 1048576\nmax_records = 10000\nmax_pin_members = 100\nmax_concurrent_requests = 4\ntext_lexicon_dir = {:?}\n", text_lexicon_dir())).unwrap();
     config
 }
 

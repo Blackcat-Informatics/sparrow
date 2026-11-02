@@ -875,10 +875,6 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
             let socket = data.join("rpc.sock");
             let config_path = write_server_config(dir.path(), &data, &socket);
             append_tail_config(&config_path, &root, "log");
-            let text = std::fs::read_to_string(&config_path)
-                .unwrap()
-                .replace("max_artifact_bytes = 8388608", "max_artifact_bytes = 1024");
-            std::fs::write(&config_path, text).unwrap();
             let config = sparrow_server::ServerConfig::read(&config_path).unwrap();
             let store = config.open_store().unwrap();
             let store_id = store.store_id().unwrap();
@@ -886,10 +882,12 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
             let mut intents = Vec::new();
             for name in ["resume.log", "changed.log", "missing.log", "empty.log"] {
                 let path = root.join(name);
+                // 300 lines of 4 KiB need two 1 MiB tail captures to drain.
+                let line = [b"accepted".as_slice(), &[b'a'; 4087], b"\n"].concat();
                 let bytes = if name == "empty.log" {
                     Vec::new()
                 } else {
-                    let mut bytes = b"accepted\n".repeat(300);
+                    let mut bytes = line.repeat(300);
                     bytes.extend_from_slice(b"final-without-newline");
                     bytes
                 };
@@ -922,7 +920,7 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
                         .tail_append(
                             &generation.id,
                             0,
-                            &bytes[..9],
+                            &bytes[..line.len()],
                             false,
                             sparrow_server::now().unwrap(),
                         )
@@ -985,7 +983,7 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
             assert_eq!(receipts[1].gap.as_deref(), Some("identity_changed"));
             assert_eq!(receipts[2].gap.as_deref(), Some("read_gap"));
             for receipt in &receipts[1..3] {
-                assert_eq!(receipt.offset, 9);
+                assert_eq!(receipt.offset, 4096);
                 assert!(receipt.finished_at.is_none());
             }
             assert_eq!(receipts[3].offset, 0);
@@ -1020,16 +1018,12 @@ async fn tail_capture_refusal_preserves_bytes_and_missing_recovery_reports_a_dur
             std::fs::write(&outside, b"outside\n").unwrap();
             std::os::unix::fs::symlink(&outside, root.join("alias.log")).unwrap();
             let input = root.join("current.log");
-            let bytes = vec![b'x'; 1025];
+            let bytes = vec![b'x'; 1024 * 1024 + 1];
             std::fs::write(&input, &bytes).unwrap();
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
             append_tail_config(&config, &root, "log");
-            let text = std::fs::read_to_string(&config)
-                .unwrap()
-                .replace("max_artifact_bytes = 8388608", "max_artifact_bytes = 1024");
-            std::fs::write(&config, text).unwrap();
             let daemon = start(&config, &socket).await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();
             watch_until(client.capability(), |watch| {
@@ -1041,7 +1035,7 @@ async fn tail_capture_refusal_preserves_bytes_and_missing_recovery_reports_a_dur
             .await;
             let status = cli(&socket, &["status"]);
             let watch = &status["consume_watches"][0];
-            assert_eq!(watch["tail_read_bytes"].as_str(), Some("1024"));
+            assert_eq!(watch["tail_read_bytes"].as_str(), Some("1048576"));
             assert_eq!(watch["tail_descriptors"].as_u64(), Some(1));
             assert_eq!(watch["tail_checkpoint_records"].as_str(), Some("0"));
             let first_id = watch["tail_generation_ids"][0].as_str().unwrap().to_owned();
@@ -1995,7 +1989,6 @@ async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_pack
                 sparrow_server::Rpc::new(
                     store.clone(),
                     std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-                    1024 * 1024,
                     100,
                 )
                 .with_syslog(registry),
@@ -4192,6 +4185,147 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
         .await;
 }
 
+/// Run the packaged shipper once over `config`; it must only read the producer files.
+fn ship(config: &Path) -> std::process::Output {
+    Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packaging/shipper/sparrow-ship"
+    ))
+    .arg(config)
+    .admitted_output()
+    .unwrap()
+}
+
+/// INVARIANT: an artifact above the removed 16 MiB per-artifact limit ingests whole and
+/// reads back byte-exact. The shipper ships one single-object JSON file of 20 MiB whole,
+/// the consume watch publishes it, and the SDK stages an in-memory copy in bounded
+/// appends while one inline message stays refused at the store's batch bound.
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_single_json_ships_whole_ingests_and_reads_back_exactly() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let reports = dir.path().join("reports");
+            let intake = dir.path().join("intake");
+            std::fs::create_dir_all(&reports).unwrap();
+            std::fs::create_dir_all(intake.join("reports")).unwrap();
+            let mut json = br#"{"refusal":""#.to_vec();
+            json.resize(20 * 1024 * 1024, b'r');
+            json.extend_from_slice(br#""}"#);
+            let original = reports.join("refusal-evidence.json");
+            std::fs::write(&original, &json).unwrap();
+            let ship_config = dir.path().join("ship.toml");
+            let settings = format!(
+                "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
+                 max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+                 max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+                 [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
+                 rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
+                intake,
+                dir.path().join("ship"),
+                reports,
+            );
+            // The removed knob refuses with its removal rather than shipping anything.
+            std::fs::write(
+                &ship_config,
+                format!("max_whole_bytes = 16777216\n{settings}"),
+            )
+            .unwrap();
+            let refused = ship(&ship_config);
+            assert!(!refused.status.success());
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("`max_whole_bytes` was removed")
+            );
+            std::fs::write(&ship_config, &settings).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let mut watch = watch_definition(&intake.join("reports"), "completed", 0, 16, 16);
+            watch.format = "json".into();
+            append_watch_config(&config, &watch);
+            let _daemon = start(&config, &socket).await;
+            let shipped = ship(&ship_config);
+            assert!(
+                shipped.status.success(),
+                "{}",
+                String::from_utf8_lossy(&shipped.stderr)
+            );
+            let report = String::from_utf8_lossy(&shipped.stdout);
+            assert!(report.contains("reports: queued 1"), "{report}");
+            assert!(report.contains("reports: fed 1"), "{report}");
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_completed_claims() == 1 && watch.get_pending_claims() == 0
+            })
+            .await;
+            assert_eq!(std::fs::read(&original).unwrap(), json);
+            let store = client.discovery().store_id.clone();
+            let listed = cli(
+                &socket,
+                &["artifacts", &store, "--source", "consume-acceptance"],
+            );
+            let row = &listed["rows"][0];
+            assert_eq!(listed["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(row["complete_bytes_available"].as_bool(), Some(true));
+            assert_eq!(
+                row["origin"]["byte_length"].as_str(),
+                Some(json.len().to_string().as_str())
+            );
+            let consumed = row["artifact_id"].as_str().unwrap().to_owned();
+            let window = 1024 * 1024;
+            let mut read = Vec::with_capacity(json.len());
+            while read.len() < json.len() {
+                let length = window.min(json.len() - read.len());
+                read.extend(
+                    client
+                        .bytes(&consumed, read.len() as u64, length as u32)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert!(read == json, "consumed artifact bytes differ");
+            // One inline message stays bounded; the SDK stages the same input instead.
+            let mut request = client.capability().ingest_request();
+            let mut input = request.get().init_request();
+            input.set_request_id("inline-oversized");
+            input.set_source("sdk-oversized");
+            input.set_format(wire::Format::Json);
+            input.set_bytes(&json);
+            let response = request.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => {
+                    assert_eq!(
+                        error.unwrap().get_code().unwrap().to_str().unwrap(),
+                        "RESOURCE_LIMIT"
+                    );
+                }
+                wire::result::Ok(_) => panic!("an inline message above 16 MiB was accepted"),
+            }
+            let staged = client
+                .ingest("sdk-oversized", "sdk-oversized", wire::Format::Json, &json)
+                .await
+                .unwrap();
+            assert_eq!(staged.byte_length, json.len() as u64);
+            assert_eq!(staged.durability, wire::Durability::Durable);
+            let tail = json.len() - window;
+            assert_eq!(
+                client
+                    .bytes(&staged.id, tail as u64, window as u32)
+                    .await
+                    .unwrap(),
+                json[tail..]
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn configured_consumer_recovers_confirmed_journal_and_reports_late_write_without_retirement()
 {
@@ -4648,7 +4782,6 @@ async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_re
             let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
                 store.clone(),
                 Arc::new(tokio::sync::Semaphore::new(4)),
-                config.max_artifact_bytes,
                 config.max_pin_members,
             ));
             let serving = tokio::task::spawn_local(async move {

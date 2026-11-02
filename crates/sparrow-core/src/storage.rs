@@ -72,6 +72,9 @@ const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
 const CHUNK: usize = 64 * 1024;
 const BYTE_READ_BYTES: usize = 1024 * 1024;
+/// Largest artifact accepted as one in-memory batch. Larger artifacts of any size
+/// stream through the staged import, bounded only by the disk budget.
+pub const INLINE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const CATALOG_STRING_BYTES: usize = 16 * 1024 * 1024;
 const CATALOG_LIMITS: json::Limits = json::Limits {
     max_depth: 128,
@@ -211,8 +214,6 @@ pub struct Config {
     pub maintenance_reserve: u64,
     /// Filesystem free space that must remain before any store write.
     pub min_free_bytes: u64,
-    /// Maximum bytes in a single bounded ingestion operation.
-    pub max_artifact_bytes: usize,
     /// Maximum records published by one ingestion operation.
     pub max_records: usize,
     /// Maximum direct members in one pin collection.
@@ -233,7 +234,6 @@ impl Config {
         }
         if self.maintenance_reserve < 1024 * 1024
             || self.disk_budget <= self.maintenance_reserve
-            || self.max_artifact_bytes == 0
             || self.max_records == 0
             || self.max_pin_members == 0
             || self.min_free_bytes == 0
@@ -244,7 +244,7 @@ impl Config {
             ));
         }
         if let Some(policy) = &self.archive {
-            policy.validate(self.max_artifact_bytes)?;
+            policy.validate()?;
         }
         Ok(())
     }
@@ -708,8 +708,8 @@ impl Writer {
             )
             .with("disk_budget", self.config.disk_budget.to_string())
             .with(
-                "max_artifact_bytes",
-                self.config.max_artifact_bytes.to_string(),
+                "max_inline_artifact_bytes",
+                INLINE_ARTIFACT_BYTES.to_string(),
             )
             .with(
                 "max_records_per_artifact",
@@ -1424,10 +1424,10 @@ impl Store {
             ));
         }
         let writer = self.lock()?;
-        if bytes.len() > writer.config.max_artifact_bytes {
+        if bytes.len() > INLINE_ARTIFACT_BYTES {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
-                "artifact exceeds the configured bounded ingestion size",
+                "inline ingestion carries at most 16 MiB; stage a larger artifact through import_begin",
             ));
         }
         if let Some(input) = origin.tail()
@@ -1900,7 +1900,7 @@ impl Store {
             return tail_ranges::bytes(&writer, id, offset, length, now);
         }
         let protected = writer.protected(now)?;
-        let (chunks, size) = if id.starts_with("artifact:") {
+        let (chunks, size, single_record) = if id.starts_with("artifact:") {
             let artifact: Artifact = writer.get(id)?;
             if !writer.live_artifact(&artifact, now, &protected) {
                 return Err(Error::new(
@@ -1908,7 +1908,8 @@ impl Store {
                     "complete artifact expired or was evicted",
                 ));
             }
-            (artifact.chunks, artifact.byte_length)
+            let single_record = artifact.record_ids.len() <= 1;
+            (artifact.chunks, artifact.byte_length, single_record)
         } else if id.starts_with("record:") {
             let record: Record = writer.get(id)?;
             if !writer.live_record(&record, now, &protected) {
@@ -1917,7 +1918,7 @@ impl Store {
                     "record expired or was evicted",
                 ));
             }
-            (record.chunks, record.byte_end - record.byte_start)
+            (record.chunks, record.byte_end - record.byte_start, true)
         } else {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
@@ -1928,10 +1929,30 @@ impl Store {
             .checked_add(length as u64)
             .filter(|end| *end <= size)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range is outside evidence"))?;
+        // Each record is chunked from its own start in full CHUNK pieces, so a record,
+        // or an artifact of at most one record, seeks straight to the chunk holding
+        // `offset`. Reads then cost the requested range at any evidence size.
+        let skip = if single_record {
+            offset / CHUNK as u64
+        } else {
+            0
+        };
+        let last = chunks.len().saturating_sub(1);
         let chunks = chunks
             .into_iter()
-            .map(|digest| writer.payload_chunk(&digest));
-        read_chunk_range(chunks, offset, length)
+            .enumerate()
+            .skip(skip as usize)
+            .map(|(index, digest)| {
+                let payload = writer.payload_chunk(&digest)?;
+                if single_record && index != last && payload.len() != CHUNK {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "record manifest holds a short chunk before its end",
+                    ));
+                }
+                Ok(payload)
+            });
+        read_chunk_range(chunks, offset - skip * CHUNK as u64, length)
     }
 
     /// Create or extend a collection atomically; every target must be live.

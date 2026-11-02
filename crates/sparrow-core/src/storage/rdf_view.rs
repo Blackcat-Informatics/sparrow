@@ -293,6 +293,20 @@ impl<'a> StoredRdfView<'a> {
         self.point_in(None, key, maximum)
     }
 
+    /// A record row grows with its record's chunk count, so it has no fixed ceiling;
+    /// charge its measured length before the caller reserves decoding work.
+    fn catalog_point(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
+        let bytes = self
+            .snapshot
+            .get_pinned(key)
+            .map_err(|error| self.budget.fail(error.into()))?;
+        self.budget.request(
+            (key.len() as u64).saturating_add(bytes.as_ref().map_or(0, |bytes| bytes.len() as u64)),
+            false,
+        )?;
+        Ok(bytes)
+    }
+
     fn reverse_point(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
         self.point_in(Some(self.reverse), key, 8)
     }
@@ -828,9 +842,6 @@ impl Store {
         Arc::get_mut(&mut view._scope)
             .expect("scope capture precedes owned query admission")
             .resize(scope_bytes)?;
-        let catalog_bound = (writer.config.max_artifact_bytes / super::CHUNK + 1)
-            .saturating_mul(128)
-            .saturating_add(8192) as u64;
         let mut records = Vec::with_capacity(ids.len());
         let mut targets = BTreeSet::new();
         for id in ids {
@@ -840,11 +851,13 @@ impl Store {
                     "RDF selection requires bounded record IDs",
                 )));
             }
-            let _decode = view.budget.reserve(catalog_bound.saturating_mul(64))?;
-            let bytes = view.point(id.as_bytes(), catalog_bound)?.ok_or_else(|| {
+            let bytes = view.catalog_point(id.as_bytes())?.ok_or_else(|| {
                 view.budget
                     .fail(Error::new("NOT_FOUND", "RDF selected record missing"))
             })?;
+            let _decode = view
+                .budget
+                .reserve((bytes.len() as u64).saturating_mul(64))?;
             scope_bytes = scope_bytes.saturating_add(bytes.len() as u64 * 4);
             let record = Record::decode(&super::parse(&bytes).map_err(|e| view.budget.fail(e))?)
                 .map_err(|e| view.budget.fail(e))?;

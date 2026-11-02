@@ -23,6 +23,9 @@ pub const ARCHIVE_START_FRACTION: f64 = 0.75;
 pub const ARCHIVE_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest admitted segment payload, below the columnar codec's 256 MiB table bound.
 pub const ARCHIVE_MAX_SEGMENT_BYTES: u64 = 192 * 1024 * 1024;
+/// Smallest admitted segment closing size. An entry larger than the target forms
+/// its own segment and streams its bytes outside the codec tables.
+pub const ARCHIVE_MIN_SEGMENT_BYTES: u64 = 1024 * 1024;
 /// Default closing record count of one segment.
 pub const ARCHIVE_SEGMENT_RECORDS: u64 = 50_000;
 
@@ -31,7 +34,8 @@ pub const ARCHIVE_SEGMENT_RECORDS: u64 = 50_000;
 pub struct ArchivePolicy {
     /// Fraction of the retention window or data budget that starts archiving, 0.5..=0.95.
     pub start_fraction: f64,
-    /// Payload bytes that close a segment, from `max_artifact_bytes` to 192 MiB.
+    /// Payload bytes that close a segment, from 1 MiB to 192 MiB. A closing target,
+    /// not a capacity: an entry larger than it is archived in a segment of its own.
     pub max_segment_bytes: u64,
     /// Eviction entries that close a segment; at least one.
     pub max_segment_records: u64,
@@ -48,20 +52,20 @@ impl Default for ArchivePolicy {
 }
 
 impl ArchivePolicy {
-    /// Refuse a policy whose segments could not hold one admitted artifact or the codec bound.
-    pub fn validate(&self, max_artifact_bytes: usize) -> Result<(), Error> {
+    /// Refuse a policy outside the start window, the segment size range or the record floor.
+    pub fn validate(&self) -> Result<(), Error> {
         if !(0.5..=0.95).contains(&self.start_fraction) {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "archive start_fraction must be 0.5..0.95",
             ));
         }
-        if self.max_segment_bytes < max_artifact_bytes as u64
-            || self.max_segment_bytes > ARCHIVE_MAX_SEGMENT_BYTES
+        if !(ARCHIVE_MIN_SEGMENT_BYTES..=ARCHIVE_MAX_SEGMENT_BYTES)
+            .contains(&self.max_segment_bytes)
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "archive max_segment_bytes must be at least max_artifact_bytes and at most 192 MiB",
+                "archive max_segment_bytes must be 1 MiB..192 MiB",
             ));
         }
         if self.max_segment_records == 0 {

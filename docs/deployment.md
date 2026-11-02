@@ -51,6 +51,11 @@ holds a transport lease without consuming a storage permit. The existing
 are disconnected before capability admission; storage saturation returns the
 existing typed operation refusal. These are separate finite resource budgets.
 
+Sparrow has no per-artifact byte limit: an artifact of any size ingests within
+`disk_budget` and `min_free_bytes`. The removed `max_artifact_bytes` key must be
+deleted from `server.toml` before installing this binary; a configuration that
+still sets it refuses to start and names the key.
+
 `min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
 that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while
 other programs on the host can fill the same disk. A write that fails because
@@ -177,8 +182,10 @@ root `intake_root/NAME`, the source directory, a glob and one finishing rule:
 Every rule also requires `settle_seconds` without modification. Small files are
 reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
 above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
-`NAME.partNNNNN.EXT` chunks. Unsplittable formats above `max_whole_bytes` are
-refused. The split matters for two reasons. The consume worker retries a
+`NAME.partNNNNN.EXT` chunks. Other formats, such as single JSON documents, are
+shipped whole at any size. The removed `max_whole_bytes` key must be deleted
+from the shipper configuration; a configuration that still sets it is refused
+before anything ships. The split matters for two reasons. The consume worker retries a
 refused publication without limit, backing off from five seconds to one attempt
 every 15 minutes after consecutive failures, so a file over the record limit
 would be uploaded again and again. Deadline expiries back off too, even when the
@@ -252,9 +259,10 @@ moves files under the running daemon, because a reserved claim binds the file's
 identity, including its change time. If the roots have not drained within 30
 minutes the run fails without stopping the service; a file that never drains is
 itself a fault to investigate. The shipper's global `max_pending_bytes` bounds
-the wait: with the example's 16 MiB budget, 1 MiB chunks and 16 MiB
-`max_whole_bytes`, the roots never hold more than 16 MiB, which drains in about
-eight minutes at the measured 30 seconds per MiB.
+the wait: with the example's 16 MiB budget and 1 MiB chunks, the roots hold at
+most 16 MiB, which drains in about eight minutes at the measured 30 seconds per
+MiB. A whole file larger than the budget is fed alone into an empty root, so the
+wait then grows with that file.
 
 The unit keeps three daily copies under `~/.local/share/sparrow/backups/`,
 taken between 04:00 and 04:15 local time. It also copies the shipper ledgers and

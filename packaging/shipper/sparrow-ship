@@ -13,7 +13,8 @@ NAME ingests and removes them. Originals are only read.
 Small files are reflink copies, which share extents on btrfs. Line-oriented files
 above the chunk limits are split on line boundaries so that no artifact can
 exceed the per-artifact record limit or the consume publication deadline; a
-refused publication would otherwise be retried indefinitely.
+refused publication would otherwise be retried indefinitely. Every other format
+is shipped whole at any size: Sparrow has no per-artifact byte limit.
 
 Feeding keeps the bytes waiting in all consume roots together within
 `max_pending_bytes`, so the backup's drain wait stays bounded however large a
@@ -47,9 +48,11 @@ def fail(message):
 def load_config(path):
     with open(path, "rb") as handle:
         config = tomllib.load(handle)
+    if "max_whole_bytes" in config:
+        fail(f"{path}: `max_whole_bytes` was removed; unsplittable formats now ship whole "
+             "at any size. Delete the key and rerun")
     for key in ("intake_root", "state_dir", "max_chunk_bytes", "max_chunk_lines",
-                "max_whole_bytes", "max_files_per_run", "max_pending_bytes",
-                "max_queue_bytes"):
+                "max_files_per_run", "max_pending_bytes", "max_queue_bytes"):
         if key not in config:
             fail(f"{path}: missing required key `{key}`")
     names = set()
@@ -147,15 +150,12 @@ def enqueue(source, path, stat, config, queue, staging):
     """
     flat = str(path.relative_to(source["dir"])).replace("/", "__")
     max_bytes, max_lines = config["max_chunk_bytes"], config["max_chunk_lines"]
+    whole = True
     if source["format"] in LINE_FORMATS:
         whole = stat.st_size <= max_bytes
         if whole:
             with open(path, "rb") as handle:
                 whole = handle.read().count(b"\n") <= max_lines
-    elif stat.st_size > config["max_whole_bytes"]:
-        raise RuntimeError(f"{path} exceeds {config['max_whole_bytes']} bytes and format {source['format']} cannot be split")
-    else:
-        whole = True
     order = f"{time.time_ns():020d}"
     staged, written = [], 0
     if whole:

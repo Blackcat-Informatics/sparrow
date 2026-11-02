@@ -43,7 +43,6 @@ fn finish(config_path: &Path, import: &str) -> Snapshot {
         let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
             store.clone(),
             Arc::new(tokio::sync::Semaphore::new(4)),
-            config.max_artifact_bytes,
             config.max_pin_members,
         ));
         let serving = tokio::task::spawn_local(async move {

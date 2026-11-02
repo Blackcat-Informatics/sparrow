@@ -19,8 +19,8 @@ pub use query::{
     QueryAlternatives, QueryScope, QuerySelection, RecordQuery,
 };
 pub use storage::archive::{
-    ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES, ARCHIVE_SEGMENT_RECORDS,
-    ARCHIVE_START_FRACTION, ArchiveIntent, ArchivePolicy, ArchiveState,
+    ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_MIN_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES,
+    ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ArchiveIntent, ArchivePolicy, ArchiveState,
 };
 pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,
@@ -100,6 +100,7 @@ pub use storage::tail::{
 };
 pub use storage::watch_registry::MAX_WATCH_REGISTRY_BYTES;
 pub use storage::{
-    Artifact, Config, Error, Pin, QUERY_SCOPE_PROFILE, QUERY_SCOPE_WORKSPACE_BYTES, Record, Store,
+    Artifact, Config, Error, INLINE_ARTIFACT_BYTES, Pin, QUERY_SCOPE_PROFILE,
+    QUERY_SCOPE_WORKSPACE_BYTES, Record, Store,
 };
 pub use text::resolve_text_analyzer;

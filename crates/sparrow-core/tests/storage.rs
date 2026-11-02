@@ -3139,7 +3139,7 @@ fn admission_properties_share_status_metadata_without_evidence_catalog_scans() {
         "retry_window_seconds",
         "disk_budget",
         "maintenance_reserve",
-        "max_artifact_bytes",
+        "max_inline_artifact_bytes",
         "max_records_per_artifact",
         "max_pin_members",
     ] {
@@ -8546,9 +8546,6 @@ fn streaming_journal_bounds_recovery_metadata_and_reclaims_in_resumable_batches(
             .unwrap();
     }
     assert!(store.import_seal(&journal.id, 0).unwrap().sealed);
-    // Raw staging exceeds the original buffered artifact limit without a growing
-    // journal or an artifact-sized allocation.
-    assert!(journal.byte_length > config().max_artifact_bytes as u64);
     store.import_cancel(&journal.id, 10).unwrap();
     assert_eq!(
         store
@@ -12369,12 +12366,13 @@ fn shared_content_remains_until_last_occurrence_expires_and_ranges_are_exact() {
 fn bounded_admission_refuses_work_without_publishing_and_control_remains_available() {
     let dir = tempfile::tempdir().unwrap();
     let mut limits = config();
-    limits.max_artifact_bytes = 4;
     limits.max_records = 1;
     let store = Store::open(dir.path(), limits).unwrap();
+    // One inline batch is bounded; the staged import carries larger artifacts.
+    let inline = vec![0; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
     assert_eq!(
         store
-            .ingest("too-big", "source", "opaque", b"12345", 0)
+            .ingest("too-big", "source", "opaque", &inline, 0)
             .unwrap_err()
             .code,
         "RESOURCE_LIMIT"

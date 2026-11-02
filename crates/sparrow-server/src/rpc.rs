@@ -76,7 +76,6 @@ pub struct Rpc {
     syslog: crate::syslog_listener::SyslogRegistry,
     store: Store,
     requests: Arc<Semaphore>,
-    max_artifact_bytes: usize,
     max_pin_members: usize,
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
@@ -120,18 +119,12 @@ impl<B> Drop for QueryReply<B> {
 
 impl Rpc {
     /// Construct the one typed adapter with explicit admission limits.
-    pub fn new(
-        store: Store,
-        requests: Arc<Semaphore>,
-        max_artifact_bytes: usize,
-        max_pin_members: usize,
-    ) -> Self {
+    pub fn new(store: Store, requests: Arc<Semaphore>, max_pin_members: usize) -> Self {
         Self {
             connection: Default::default(),
             syslog: crate::syslog_listener::SyslogRegistry::default(),
             store,
             requests,
-            max_artifact_bytes,
             max_pin_members,
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
@@ -1781,16 +1774,6 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        if bytes.len() > self.max_artifact_bytes {
-            failure(
-                results.get().init_result(),
-                Error {
-                    code: "RESOURCE_LIMIT",
-                    message: "event batch exceeds configured artifact admission".into(),
-                },
-            );
-            return Ok(());
-        }
         match self
             .work(move |store, now| {
                 store.define_time_profile(
@@ -2621,7 +2604,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
-                out.set_max_artifact_bytes(number(&value, "max_artifact_bytes")?);
+                out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
@@ -2730,7 +2713,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_active_pins(number(&value, "active_pins")?);
                 out.set_unique_json_projections(number(&value, "unique_json_projections")?);
                 out.set_retry_window_seconds(number(&value, "retry_window_seconds")?);
-                out.set_max_artifact_bytes(number(&value, "max_artifact_bytes")?);
+                out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_pin_members(number(&value, "max_pin_members")?);
                 out.set_pin_read_handles(number(&value, "pin_read_handles")?);
@@ -2770,12 +2753,13 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let request = params.get()?.get_request()?;
         let bytes = request.get_bytes()?;
-        if bytes.len() > self.max_artifact_bytes {
+        // Refuse before copying; the store owns this bound and the staged import has none.
+        if bytes.len() > sparrow_core::INLINE_ARTIFACT_BYTES {
             failure(
                 results.get().init_result(),
                 Error {
                     code: "RESOURCE_LIMIT",
-                    message: "artifact exceeds configured ingestion bound".into(),
+                    message: "inline ingestion carries at most 16 MiB; stage a larger artifact through importBegin".into(),
                 },
             );
             return Ok(());
@@ -3931,7 +3915,7 @@ mod tests {
             .open_store()
             .unwrap();
         let admission = Arc::new(Semaphore::new(1));
-        let rpc = Arc::new(Rpc::new(store, admission.clone(), 1024 * 1024, 100));
+        let rpc = Arc::new(Rpc::new(store, admission.clone(), 100));
         let (entered, running) = tokio::sync::oneshot::channel();
         let (release, paused) = std::sync::mpsc::channel();
         let worker = rpc.clone();

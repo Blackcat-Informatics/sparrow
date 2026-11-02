@@ -230,7 +230,7 @@ and under disk pressure ingestion is eventually refused.
 [archive]
 dir = "/net/synology/archives/sparrow"  # required, absolute, outside data_dir
 start_fraction = 0.75                   # 0.5..0.95
-max_segment_bytes = 67108864            # max_artifact_bytes..192 MiB
+max_segment_bytes = 67108864            # 1 MiB..192 MiB; a larger entry gets its own segment
 max_segment_records = 50000             # at least 1
 stall_warn_secs = 120                   # 0 < stall_warn_secs < io_timeout_secs
 io_timeout_secs = 900
@@ -274,6 +274,42 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `awaiting_archive` and `archive_lag`. Archive worker status, with its phase,
 watermark, backlog age, last segment and quarantine listing, belongs to the
 worker phase and will use a later schema.
+
+### Artifacts of any size (schema 64)
+
+Sparrow has no per-artifact byte limit. Patrick ruled on 2026-11-01: "Remove the
+limit". The server configuration no longer has `max_artifact_bytes`. A
+configuration that still sets it refuses to start, and the error says to
+delete the key. The disk budget, the maintenance reserve and the free-space
+floor still bound what the store admits, and `max_records` still bounds the
+records in one artifact.
+
+An artifact of any size ingests through the staged import: the CLI `ingest`
+command, completed-file consumption and the SDK `import_file` calls append it
+in 64 KiB chunks. Sealing, layout, preparation and publication each read the
+staged chunks one at a time. A record above 16 MiB is stored raw in pages of
+128 chunks, with a recorded projection failure instead of a JSON projection.
+No step holds more than 16 MiB of an artifact's bytes in memory.
+
+One inline `ingest` message, and the single write batch behind it, carries at
+most 16 MiB. That fixed bound protects the daemon's memory; it is not an
+artifact limit. A larger inline message is refused with `RESOURCE_LIMIT`, and
+the message names the staged import. The SDK `ingest` and
+`ingest_with_durability` calls stream any larger input through the staged
+import, and the receipt is durable whatever durability was requested. The bound
+is advertised as `Discovery.maxInlineArtifactBytes` and
+`Status.maxInlineArtifactBytes`; CLI and MCP status render it as
+`max_inline_artifact_bytes`. These replace `maxArtifactBytes` at the same
+ordinals, so the schema advances to 64, and older endpoints fail the exact
+schema discovery check. The store format is unchanged.
+
+Byte reads of a record, or of an artifact with at most one record, go straight
+to the chunk that holds the requested offset. Each read costs its requested
+range, whatever the evidence's size. Reads of artifacts with several records
+still walk the manifest from the start. A tail capture keeps its fixed 1 MiB
+window. The archive's `max_segment_bytes` is a closing target from 1 MiB to
+192 MiB, and an entry larger than the target is archived in a segment of its
+own; see [the archive format](archive-format.md).
 
 ## 1. Common types and defaults
 
@@ -1557,8 +1593,8 @@ advanced while waiting.
 
 Each watch retains bounded opened regular files across rename/replacement and
 drains one descriptor per worker tick in round-robin order. One capture reads
-at most the smaller of 1 MiB and `max_artifact_bytes`; a line exceeding that
-window produces a visible failure and preserves the source/checkpoint. Complete
+at most 1 MiB; a line exceeding that window produces a visible failure and
+preserves the source/checkpoint. Complete
 prefixes use the one shared durable record pipeline. Idle and close events keep
 a final unterminated line pending. Observed truncation preserves the old offset
 and starts a new opaque generation. Same-length observed modification produces

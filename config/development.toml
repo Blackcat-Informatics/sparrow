@@ -9,7 +9,6 @@ rpc_tcp_secret_file = "/home/paudley/.config/sparrow/tcp.secret"
 data_dir = "/home/paudley/.local/state/sparrow/development-v5"
 disk_budget = 536870912
 maintenance_reserve = 67108864
-max_artifact_bytes = 16777216
 max_records = 100000
 max_pin_members = 10000
 max_concurrent_requests = 4
