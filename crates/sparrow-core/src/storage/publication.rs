@@ -13,7 +13,7 @@ use rocksdb::WriteBatch;
 
 mod raw;
 pub use raw::RawPreparation;
-const PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
+pub(super) const PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
 /// One preparation checkpoint covers at most this many ordinary records, and
 /// adds further records only while their source stays within the byte bound; a
 /// first record larger than the byte bound forms its own checkpoint. Each
@@ -574,6 +574,7 @@ impl Store {
             chunks,
             evicted: false,
         };
+        writer.require_retirable(artifact.chunks.len(), artifact.record_ids.len())?;
         parse(json::write_compact(&artifact.encode()).as_bytes())?;
         put(&mut batch, &artifact.id, &artifact);
         super::artifact_rdf::publish(&writer.db, &mut batch, &artifact)?;

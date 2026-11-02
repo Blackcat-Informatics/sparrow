@@ -5,7 +5,7 @@
 id = "native-retirement-compaction-policy"
 summary = "Catalog and payload families share one native tombstone collector configuration. RocksDB owns table marking, compaction and blob GC; pressure retains its existing measured-recovery and pin-safe retirement owner."
 home = "sparrow_core::storage::pressure::native_compaction_options"
-entry_points = ["sparrow_core::storage::Store::open"]
+entry_points = ["sparrow_core::storage::table_options::family"]
 spec = "docs/native-reclamation.md: existing native controls and real-pressure qualification."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -1066,6 +1066,20 @@ fingerprints = []
 names = ['^(check_claim_upload_stability|check_client_file_stability)$']
 
 [[job]]
+id = "staged-import-upload"
+summary = "One resumable staged uploader streams completed files and SDK in-memory inputs above the inline batch bound through one positional input seam; no second chunked ingest loop."
+home = "sparrow_client::imports::upload"
+entry_points = ["sparrow_client::imports::import_file", "sparrow_client::imports::import_open_file", "sparrow_client::Client::ingest_with_durability", "sparrow_client::Client::import_open_file"]
+spec = "docs/interfaces.md: large artifacts (schema 64)."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(upload_bytes|stage_in_memory_artifact|chunked_ingest)$']
+
+[[job]]
 id = "query-membership"
 summary = "Resolve retained artifact/record/pin membership once, before filters, with revision guards and bounded expansion."
 home = "sparrow_core::storage::query_membership::Writer::query_selection_membership"
@@ -1992,6 +2006,48 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(reclaim_direct_pressure|reclaim_import_pressure)$']
+
+[[job]]
+id = "column-family-table-options"
+summary = "One owner builds the database options and every column family's table and compression options from the measured profile, including the reverse family's small blocks and Bloom filter and the payload dictionary."
+home = "sparrow_core::storage::table_options::family"
+entry_points = ["sparrow_core::storage::table_options::database", "sparrow_core::storage::table_options::descriptors", "sparrow_core::storage::Store::open"]
+spec = "docs/architecture.md: 4.2 deduplication and compression; docs/load-qualification.md: table options and dictionaries."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(reverse_family_options|payload_family_options|default_family_options)$']
+
+[[job]]
+id = "one-time-table-rewrite"
+summary = "One prompt step drives the one-time rewrite of table files written under an older options profile through RocksDB periodic compaction: it records a durable start, sets the rewritten families' periodic window to the time since it, and turns the window off for pressure, the data allowance or the free-space floor. It completes when no older file remains."
+home = "sparrow_core::storage::recompression::Store::recompress_step"
+entry_points = ["sparrow_core::storage::recompression::Store::recompression_status", "sparrow_core::storage::recompression::Writer::recompress", "sparrow_core::storage::recompression::Writer::rewrite_window", "sparrow_core::storage::recompression::Writer::rewrite_gate", "sparrowd::maintenance::Job::execute"]
+spec = "docs/architecture.md: 4.2 deduplication and compression; docs/interfaces.md: table rewrite status (schema 64)."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(compact_whole_store|rewrite_tables_elsewhere|recompress_slice)$']
+
+[[job]]
+id = "typed-recompression-status"
+summary = "Encode the table rewrite's profile, phase, family, rewritten bytes, waiting reason and failure into one typed status contract; the agent renders it for CLI and MCP."
+home = "sparrow_server::recompression::encode"
+entry_points = ["sparrow_server::agent::status::recompression"]
+spec = "docs/interfaces.md: table rewrite status (schema 64)."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_cli_recompression|encode_mcp_recompression)$']
 
 [[job]]
 id = "typed-pressure-status"
@@ -3834,7 +3890,7 @@ names = ['^(lookup_receiver_window_elsewhere|lookup_producer_window_elsewhere)$'
 
 [[job]]
 id = "joined-daemon-maintenance"
-summary = "One joined serial worker schedules bounded expiry continuations, pressure and buffered synchronization fairly. Native jobs run one at a time under existing storage limits; stop prevents further work and joins the current job before final RPC drain and flush."
+summary = "One joined serial worker schedules bounded expiry continuations, pressure, buffered synchronization and table rewrite steps fairly. Native jobs run one at a time under existing storage limits; stop prevents further work and joins the current job before final RPC drain and flush."
 home = "sparrowd::maintenance::run"
 entry_points = ["sparrowd::maintenance::Worker::start", "sparrowd::maintenance::Worker::shutdown", "sparrowd::maintenance::Job::execute", "sparrowd::main", "sparrowd::shutdown::finish"]
 spec = "docs/interfaces.md: daemon maintenance scheduling."
@@ -4416,8 +4472,8 @@ reason = "The generated Sparrow server trait requires one method per schema ordi
 [[job]]
 id = "store-free-space-floor"
 summary = "One filesystem free-space floor refuses every store write before RocksDB can fail on a full disk, and tells daemon pause points a shortfall apart from a failed measurement."
-home = "sparrow_core::storage::space::SpaceFloor::shortfall"
-entry_points = ["sparrow_core::storage::space::SpaceFloor::check", "sparrow_core::storage::Writer::apply"]
+home = "sparrow_core::storage::space::SpaceFloor::shortfall_after"
+entry_points = ["sparrow_core::storage::space::SpaceFloor::shortfall", "sparrow_core::storage::space::SpaceFloor::check", "sparrow_core::storage::Writer::apply", "sparrow_core::storage::recompression::Writer::rewrite_gate"]
 spec = "docs/deployment.md: min_free_bytes."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/syslog_listener.rs"]
 bench = []

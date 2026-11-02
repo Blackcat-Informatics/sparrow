@@ -324,8 +324,10 @@ impl<'a> RecordBatch<'a> {
         mut artifact: super::Artifact,
     ) -> Result<(WriteBatch, super::Artifact, u64), Error> {
         super::artifact_rdf::stage(&self.writer.db, &mut self.rdf, &mut self.batch, &artifact)?;
+        let writer = self.writer;
         let prepared = self.prepare()?;
         artifact.chunks = prepared.chunks;
+        writer.require_retirable(artifact.chunks.len(), artifact.record_ids.len())?;
         Ok((prepared.batch, artifact, prepared.estimate))
     }
 

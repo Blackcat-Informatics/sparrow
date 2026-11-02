@@ -698,12 +698,6 @@ impl Store {
         complete: bool,
         now: u64,
     ) -> Result<TailPublication, Error> {
-        if input.len() > self.lock()?.config.max_artifact_bytes {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "tail read exceeds bounded ingestion admission; checkpoint is unchanged",
-            ));
-        }
         let generation = self.tail_generation(id)?;
         let length = super::record_ends(&generation.declaration.format, input, complete)
             .last()

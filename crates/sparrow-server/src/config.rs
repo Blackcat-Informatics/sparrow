@@ -43,8 +43,6 @@ pub struct ServerConfig {
     /// Filesystem free space below which the daemon pauses connections and writes.
     #[serde(default = "default_min_free")]
     pub min_free_bytes: u64,
-    /// Bounded direct ingestion admission.
-    pub max_artifact_bytes: usize,
     /// Maximum records in a complete publication.
     pub max_records: usize,
     /// Maximum direct members in a pin collection.
@@ -112,11 +110,7 @@ impl ArchiveConfig {
     }
 
     /// Lexical checks only: probing the archive device may block, so it is not done here.
-    fn validate(
-        &self,
-        data_dir: &Path,
-        max_artifact_bytes: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate(&self, data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let normal = |path: &Path| {
             path.is_absolute()
                 && path
@@ -134,7 +128,7 @@ impl ArchiveConfig {
         if self.stall_warn_secs == 0 || self.io_timeout_secs <= self.stall_warn_secs {
             return Err("archive requires 0 < stall_warn_secs < io_timeout_secs".into());
         }
-        self.policy().validate(max_artifact_bytes)?;
+        self.policy().validate()?;
         Ok(())
     }
 }
@@ -200,7 +194,18 @@ fn default_rpc_connections() -> usize {
 impl ServerConfig {
     /// Read and validate the same typed configuration used by the production daemon.
     pub fn read(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let config: Self = toml::from_str(&std::fs::read_to_string(path)?)?;
+        let text = std::fs::read_to_string(path)?;
+        if text
+            .parse::<toml::Table>()?
+            .contains_key("max_artifact_bytes")
+        {
+            return Err(format!(
+                "{}: max_artifact_bytes was removed; large artifacts now ingest through the staged import within disk_budget and min_free_bytes, up to the fixed 7.93 GiB import bound. Delete the key and restart",
+                path.display()
+            )
+            .into());
+        }
+        let config: Self = toml::from_str(&text)?;
         if !(1..=64).contains(&config.max_concurrent_requests) {
             return Err("max_concurrent_requests must be 1..64".into());
         }
@@ -215,7 +220,7 @@ impl ServerConfig {
         }
         ConsumeWatch::validate_fields(&config.consume)?;
         if let Some(archive) = &config.archive {
-            archive.validate(&config.data_dir, config.max_artifact_bytes)?;
+            archive.validate(&config.data_dir)?;
         }
         crate::syslog_listener::validate(&config.syslog)?;
         if config.rpc_tcp_address.is_some() != config.rpc_tcp_secret_file.is_some() {
@@ -255,7 +260,6 @@ impl ServerConfig {
                 disk_budget: self.disk_budget,
                 maintenance_reserve: self.maintenance_reserve,
                 min_free_bytes: self.min_free_bytes,
-                max_artifact_bytes: self.max_artifact_bytes,
                 max_records: self.max_records,
                 max_pin_members: self.max_pin_members,
                 text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
@@ -364,6 +368,21 @@ mod tests {
         )
         .unwrap();
         assert!(both.tcp_secret().unwrap().is_some());
+    }
+
+    /// INVARIANT: the removed `max_artifact_bytes` knob refuses startup with an
+    /// actionable message instead of a generic unknown-field error.
+    #[test]
+    fn removed_artifact_limit_key_refuses_with_its_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("max_artifact_bytes = 16777216\n{base}")).unwrap();
+        let error = ServerConfig::read(&config).err().unwrap().to_string();
+        assert!(error.contains("max_artifact_bytes was removed"), "{error}");
+        assert!(error.contains("Delete the key"), "{error}");
     }
 
     /// INVARIANT: the `[archive]` table is strict and lexically outside the store, and a

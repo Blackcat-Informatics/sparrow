@@ -113,14 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    let mut rpc = Rpc::new(
-        store.clone(),
-        operations.clone(),
-        config.max_artifact_bytes,
-        config.max_pin_members,
-    )
-    .with_watches(watches)
-    .with_syslog(syslog_registry);
+    let mut rpc = Rpc::new(store.clone(), operations.clone(), config.max_pin_members)
+        .with_watches(watches)
+        .with_syslog(syslog_registry);
     if config.max_concurrent_requests >= 2 {
         rpc = rpc.with_watch_controller(
             consumer

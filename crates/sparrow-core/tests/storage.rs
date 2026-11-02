@@ -3139,7 +3139,7 @@ fn admission_properties_share_status_metadata_without_evidence_catalog_scans() {
         "retry_window_seconds",
         "disk_budget",
         "maintenance_reserve",
-        "max_artifact_bytes",
+        "max_inline_artifact_bytes",
         "max_records_per_artifact",
         "max_pin_members",
     ] {
@@ -7009,6 +7009,16 @@ fn stage_fixture(
     format: &str,
     input: &[u8],
 ) -> sparrow_core::ImportManifest {
+    layout_fixture(store, request, format, input).unwrap()
+}
+
+/// Upload and seal `input`, then prepare its layout, returning the layout outcome.
+fn layout_fixture(
+    store: &Store,
+    request: &str,
+    format: &str,
+    input: &[u8],
+) -> Result<sparrow_core::ImportManifest, sparrow_core::Error> {
     let payload = format!(
         "blake3:{}",
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
@@ -7034,7 +7044,363 @@ fn stage_fixture(
             .unwrap();
     }
     store.import_seal(&manifest.id, 0).unwrap();
-    store.import_prepare_layout(&manifest.id, 0).unwrap()
+    store.import_prepare_layout(&manifest.id, 0)
+}
+
+/// Import and publish one JSON document of `size` bytes with distinct chunks,
+/// optionally under a lowered raw-record ceiling.
+fn json_document(
+    dir: &std::path::Path,
+    ceiling: Option<u64>,
+    size: usize,
+) -> (Store, sparrow_core::Artifact, Vec<u8>) {
+    let chunk = sparrow_core::IMPORT_CHUNK_BYTES;
+    let mut settings = config();
+    settings.disk_budget = 512 * 1024 * 1024;
+    let store = Store::open(dir, settings).unwrap();
+    if let Some(ceiling) = ceiling {
+        store.split_raw_records_above(ceiling).unwrap();
+    }
+    let mut input = b"{\"message\":\"".to_vec();
+    let start = input.len();
+    input.resize(size - 3, b'x');
+    for (index, piece) in input[start..].chunks_mut(chunk).enumerate() {
+        let marker = purrdf_hash::hex::encode(&(index as u64).to_le_bytes());
+        piece[..marker.len()].copy_from_slice(marker.as_bytes());
+    }
+    input.extend_from_slice(b"\"}\n");
+    let manifest = stage_fixture(&store, "json-document", "json", &input);
+    for ordinal in 0..manifest.layout_records {
+        let prepared = (0..64).any(|_| {
+            store
+                .import_prepare_record(&manifest.id, ordinal, 0)
+                .unwrap()
+                .prepared_records
+                > ordinal
+        });
+        assert!(prepared, "raw record {ordinal} prepares in bounded steps");
+    }
+    let artifact = store.import_publish(&manifest.id, 0).unwrap();
+    (store, artifact, input)
+}
+
+/// Lay out one 50 MiB JSON document under the smallest raw-record ceiling, which
+/// splits it into three raw records, then publish it.
+fn split_document(dir: &std::path::Path) -> (Store, sparrow_core::Artifact, Vec<u8>) {
+    let ceiling = 32 * 1024 * 1024 + sparrow_core::IMPORT_CHUNK_BYTES as u64;
+    let (store, artifact, input) = json_document(dir, Some(ceiling), 50 * 1024 * 1024);
+    let piece = ceiling - 16 * 1024 * 1024;
+    let bounds: Vec<_> = artifact
+        .record_ids
+        .iter()
+        .map(|id| store.record(id).unwrap())
+        .map(|record| (record.byte_start, record.byte_end))
+        .collect();
+    assert_eq!(
+        bounds,
+        [
+            (0, piece),
+            (piece, 2 * piece),
+            (2 * piece, input.len() as u64)
+        ]
+    );
+    (store, artifact, input)
+}
+
+/// Open a store whose import bound and pin caps derive from scaled retirement
+/// limits, and return those limits with the derived bounds.
+fn retirement_scaled_store(
+    dir: &std::path::Path,
+) -> (
+    Store,
+    sparrow_core::EvictionLimits,
+    sparrow_core::RetirementBounds,
+) {
+    let mut settings = config();
+    settings.disk_budget = 512 * 1024 * 1024;
+    let store = Store::open(dir, settings).unwrap();
+    let limits = sparrow_core::EvictionLimits {
+        max_catalog_bytes: 640 * 1024,
+        max_pin_catalog_bytes: 512 * 1024,
+        max_payload_refs: 256,
+        ..sparrow_core::EvictionLimits::default()
+    };
+    let bounds = store
+        .scale_retirement_for_tests(limits, 128 * 1024)
+        .unwrap();
+    assert!(bounds.import_bytes < sparrow_core::MAX_IMPORT_BYTES);
+    assert!(bounds.pins < sparrow_core::MAX_PINS);
+    assert!(bounds.pinned_members < sparrow_core::MAX_PINNED_MEMBERS);
+    (store, limits, bounds)
+}
+
+/// Ingest a small log of `lines` records and pin all of them across
+/// `bounds.pins` pins of `days`, filling both store-wide pin caps exactly.
+fn pins_at_cap(store: &Store, bounds: sparrow_core::RetirementBounds, days: u64, now: u64) {
+    let lines = bounds.pinned_members;
+    let input: String = (0..lines).map(|line| format!("pinned {line}\n")).collect();
+    let artifact = store
+        .ingest("pinned-log", "pinned", "log", input.as_bytes(), now)
+        .unwrap();
+    assert_eq!(artifact.record_ids.len(), lines);
+    let share = lines.div_ceil(bounds.pins);
+    for (index, members) in artifact.record_ids.chunks(share).enumerate() {
+        let name = format!("cap-{index}");
+        store.pin(&name, &name, members, days, now).unwrap();
+    }
+}
+
+/// A log of `bytes` bytes in distinct lines of `line` bytes each, so every line is
+/// one record of `line.div_ceil(64 KiB)` chunks.
+fn log_lines(bytes: u64, line: usize) -> Vec<u8> {
+    let mut input = Vec::with_capacity(bytes as usize);
+    let mut index = 0_u64;
+    while (input.len() as u64) < bytes {
+        let start = input.len();
+        input.extend_from_slice(format!("{index:016x}").as_bytes());
+        input.resize(start + line - 1, b'x');
+        input.push(b'\n');
+        index += 1;
+    }
+    assert_eq!(input.len() as u64, bytes);
+    input
+}
+
+fn publish_staged(
+    store: &Store,
+    request: &str,
+    input: &[u8],
+) -> Result<sparrow_core::Artifact, sparrow_core::Error> {
+    let manifest = stage_fixture(store, request, "log", input);
+    for ordinal in 0..manifest.layout_records {
+        store
+            .import_prepare_record(&manifest.id, ordinal, 0)
+            .unwrap();
+    }
+    store.import_publish(&manifest.id, 0)
+}
+
+#[test]
+fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more_is_refused() {
+    let chunk = sparrow_core::IMPORT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let (store, limits, bounds) = retirement_scaled_store(dir.path());
+    let bound = bounds.import_bytes;
+    // One chunk more than the admitted ceiling is refused before any upload.
+    let refused = store
+        .import_begin(
+            "over-ceiling",
+            "oversized",
+            "log",
+            bound + 1,
+            &format!("blake3:{}", "0".repeat(64)),
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert!(
+        refused.message.contains("split the input"),
+        "{}",
+        refused.message
+    );
+    // At the ceiling every chunk is its own record, the costliest admitted row.
+    let input = log_lines(bound, chunk);
+    let artifact = publish_staged(&store, "at-ceiling", &input).unwrap();
+    // Pins at both store-wide caps, expired by the time expiry runs: their rows are
+    // charged to the pin budget, not the artifact envelope, and expiry deletes them.
+    pins_at_cap(&store, bounds, 1, 0);
+    let chunks = (bound / chunk as u64) as usize;
+    assert_eq!(artifact.record_ids.len(), chunks);
+    assert_eq!(
+        store
+            .bytes(&artifact.id, bound - 1024 * 1024, 1024 * 1024, 1)
+            .unwrap(),
+        input[input.len() - 1024 * 1024..]
+    );
+    let records = (chunks + bounds.pinned_members) as u64;
+    let mut expired = 0;
+    let drained = (0..20_000).any(|_| {
+        let report = store.expire_bounded(30 * DAY, limits).unwrap();
+        expired += report.records;
+        !report.continuation && expired == records
+    });
+    assert!(drained, "{expired} of {records} records expired");
+    // Every pin row is gone, not merely expired.
+    assert!(store.pins(0).unwrap().is_empty());
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    // Within the byte bound, twice the records per chunk overflows the row read and
+    // layout refuses it before publication work.
+    let crowded =
+        layout_fixture(&store, "crowded", "log", &log_lines(bound, chunk / 2)).unwrap_err();
+    assert_eq!(crowded.code, "RESOURCE_LIMIT");
+    assert!(
+        crowded.message.contains("retirement pass"),
+        "{}",
+        crowded.message
+    );
+    drop(store);
+    drop(dir);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, limits, bounds) = retirement_scaled_store(dir.path());
+    let artifact = publish_staged(&store, "at-ceiling", &log_lines(bound, chunk)).unwrap();
+    // Live pins at both caps on newer evidence: eviction still drains the ceiling.
+    pins_at_cap(&store, bounds, 60, 0);
+    let mut evicted = 0;
+    let drained = (0..20_000).any(|_| {
+        let report = store.evict_oldest(1, limits).unwrap();
+        evicted += report.records.len();
+        !report.continuation && report.pending_manifest_refs == 0
+    });
+    assert!(
+        drained && evicted == chunks,
+        "{evicted} of {chunks} records evicted"
+    );
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 1).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+}
+
+/// INVARIANT: pin creation and extension stop at the store-wide row and member caps
+/// that keep every retirement pass's pin capture inside its budget, and release is
+/// never refused, so freeing a slot restores admission.
+#[test]
+fn pins_beyond_the_store_wide_caps_are_refused_and_release_restores_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, bounds) = retirement_scaled_store(dir.path());
+    let lines = bounds.pinned_members + 1;
+    let input: String = (0..lines).map(|line| format!("pinned {line}\n")).collect();
+    let records = store
+        .ingest("pinned-log", "pinned", "log", input.as_bytes(), 0)
+        .unwrap()
+        .record_ids;
+    let share = bounds.pinned_members / bounds.pins;
+    let mut pins: Vec<_> = records[..bounds.pinned_members]
+        .chunks(share)
+        .enumerate()
+        .map(|(index, members)| {
+            let name = format!("full-{index}");
+            store.pin(&name, &name, members, 40, 0).unwrap()
+        })
+        .collect();
+    assert_eq!(pins.len(), bounds.pins);
+    let refused = |result: Result<sparrow_core::Pin, sparrow_core::Error>, held: &str| {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "RESOURCE_LIMIT");
+        assert!(
+            error.message.contains(&format!(
+                "capped at {} rows and {} members",
+                bounds.pins, bounds.pinned_members
+            )) && error.message.contains(held),
+            "{}",
+            error.message
+        );
+    };
+    let full = format!(
+        "holds {} rows with {} members",
+        bounds.pins, bounds.pinned_members
+    );
+    let last = records[bounds.pinned_members..].to_vec();
+    // At both caps neither a new pin nor one more member on an existing pin fits.
+    refused(store.pin("over-new", "over", &last, 40, 0), &full);
+    refused(store.pin("over-extend", "full-0", &last, 40, 0), &full);
+    // Release is admitted at the caps and frees a row and its members.
+    store.release(&pins.remove(0).id).unwrap();
+    store.pin("refill", "refill", &last, 40, 0).unwrap();
+    // The row cap alone refuses a further pin while members remain below their cap.
+    refused(
+        store.pin("over-rows", "over", &records[..1], 40, 0),
+        &format!(
+            "holds {} rows with {} members",
+            bounds.pins,
+            bounds.pinned_members - share + 1
+        ),
+    );
+    store.release(&pins.remove(0).id).unwrap();
+    store
+        .pin("after-release", "over", &records[..1], 40, 0)
+        .unwrap();
+}
+
+#[test]
+fn rdf_record_view_charges_a_large_raw_record_row_by_its_measured_length() {
+    use purrdf_lex::json::record::ToJson;
+    let dir = tempfile::tempdir().unwrap();
+    // One 45 MiB document stays a single raw record of 721 chunks. Its catalog
+    // row exceeds the fixed bound the view once derived from a 16 MiB limit.
+    let (store, artifact, _) = json_document(dir.path(), None, 45 * 1024 * 1024);
+    let id = artifact.record_ids[0].clone();
+    let row = purrdf_lex::json::write_compact(&store.record(&id).unwrap().to_json()).len();
+    assert!(row > (16 * 1024 * 1024 / sparrow_core::IMPORT_CHUNK_BYTES + 1) * 128 + 8192);
+    let metadata = sparrow_core::RdfGraphLayers {
+        metadata: true,
+        diagnostic: false,
+        content: false,
+    };
+    store
+        .with_rdf_record_layers(&[id], metadata, 1, Default::default(), |_| ())
+        .unwrap();
+}
+
+#[test]
+fn split_raw_document_reads_back_exactly_and_both_expires_and_evicts() {
+    use sparrow_core::EvictionLimits;
+    // A pass budget below the whole document's 801 chunks, above each piece's.
+    let limits = EvictionLimits {
+        max_payload_refs: 600,
+        ..EvictionLimits::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (store, artifact, input) = split_document(dir.path());
+    let window = 1024 * 1024;
+    for offset in (0..input.len()).step_by(window) {
+        let length = window.min(input.len() - offset);
+        assert_eq!(
+            store.bytes(&artifact.id, offset as u64, length, 1).unwrap(),
+            input[offset..offset + length]
+        );
+    }
+    let refused = store
+        .import_begin(
+            "too-large",
+            "oversized",
+            "json",
+            sparrow_core::MAX_IMPORT_BYTES + 1,
+            &artifact.payload_id,
+            1,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert!(refused.message.contains("split the input"));
+    let mut expired = 0;
+    let drained = (0..64).any(|_| {
+        let report = store.expire_bounded(30 * DAY, limits).unwrap();
+        expired += report.records;
+        !report.continuation
+    });
+    assert!(drained && expired == 3, "{expired} records expired");
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, artifact, _) = split_document(dir.path());
+    let mut evicted = 0;
+    let drained = (0..64).any(|_| {
+        let report = store.evict_oldest(1, limits).unwrap();
+        evicted += report.records.len();
+        !report.continuation && report.pending_manifest_refs == 0
+    });
+    assert!(drained && evicted == 3, "{evicted} records evicted");
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 1).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
 }
 
 #[test]
@@ -8546,9 +8912,6 @@ fn streaming_journal_bounds_recovery_metadata_and_reclaims_in_resumable_batches(
             .unwrap();
     }
     assert!(store.import_seal(&journal.id, 0).unwrap().sealed);
-    // Raw staging exceeds the original buffered artifact limit without a growing
-    // journal or an artifact-sized allocation.
-    assert!(journal.byte_length > config().max_artifact_bytes as u64);
     store.import_cancel(&journal.id, 10).unwrap();
     assert_eq!(
         store
@@ -12369,12 +12732,13 @@ fn shared_content_remains_until_last_occurrence_expires_and_ranges_are_exact() {
 fn bounded_admission_refuses_work_without_publishing_and_control_remains_available() {
     let dir = tempfile::tempdir().unwrap();
     let mut limits = config();
-    limits.max_artifact_bytes = 4;
     limits.max_records = 1;
     let store = Store::open(dir.path(), limits).unwrap();
+    // One inline batch is bounded; the staged import carries larger artifacts.
+    let inline = vec![0; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
     assert_eq!(
         store
-            .ingest("too-big", "source", "opaque", b"12345", 0)
+            .ingest("too-big", "source", "opaque", &inline, 0)
             .unwrap_err()
             .code,
         "RESOURCE_LIMIT"
@@ -17385,4 +17749,242 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
             .code,
         "UNSUPPORTED"
     );
+}
+
+/// The sections of the newest native OPTIONS file, keyed by their header line.
+fn native_options(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let newest = std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("OPTIONS-") && !name.ends_with(".dbtmp"))
+        .max_by_key(|name| name["OPTIONS-".len()..].parse::<u64>().unwrap())
+        .unwrap();
+    let text = std::fs::read_to_string(path.join(newest)).unwrap();
+    let mut sections = std::collections::BTreeMap::new();
+    let mut header = String::new();
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            header = line.to_string();
+        }
+        sections
+            .entry(header.clone())
+            .or_insert_with(String::new)
+            .push_str(&format!("{line}\n"));
+    }
+    sections
+}
+
+#[test]
+fn every_column_family_uses_the_shared_table_options() {
+    // INVARIANT: each family is opened with its measured table and compression
+    // options, and a new store owes no rewrite.
+    use sparrow_core::RecompressionPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let options = native_options(&store.data_path().unwrap());
+    let section = |header: &str| options.get(header).unwrap().as_str();
+    let database = section("[DBOptions]");
+    assert!(database.contains("keep_log_file_num=10\n"));
+    assert!(database.contains("max_log_file_size=8388608\n"));
+    for (family, block, dictionary, training) in [
+        ("default", 32768, 0, 0),
+        ("payload", 32768, 114688, 11468800),
+    ] {
+        let family_options = section(&format!("[CFOptions \"{family}\"]"));
+        assert!(family_options.contains("compression=kLZ4Compression\n"));
+        assert!(family_options.contains("bottommost_compression=kZSTD\n"));
+        let bottommost = family_options
+            .lines()
+            .find(|line| line.starts_with("bottommost_compression_opts="))
+            .unwrap();
+        for setting in [
+            "enabled=true;".to_string(),
+            "level=6;".to_string(),
+            format!("max_dict_bytes={dictionary};"),
+            format!("zstd_max_train_bytes={training};"),
+        ] {
+            assert!(bottommost.contains(&setting), "{family}: {bottommost}");
+        }
+        let table = section(&format!("[TableOptions/BlockBasedTable \"{family}\"]"));
+        assert!(table.contains(&format!("block_size={block}\n")), "{family}");
+    }
+    let reverse = section("[CFOptions \"rdf_reverse\"]");
+    assert!(reverse.contains("bottommost_compression_opts={") && !reverse.contains("level=6;"));
+    let table = section("[TableOptions/BlockBasedTable \"rdf_reverse\"]");
+    assert!(table.contains("block_size=4096\n"));
+    assert!(table.contains("whole_key_filtering=true\n"));
+    assert!(table.contains("filter_policy=bloomfilter\n"));
+    assert!(section("[CFOptions \"payload\"]").contains("enable_blob_files=true\n"));
+    let status = store.recompression_status().unwrap();
+    assert_eq!(status.phase, RecompressionPhase::Complete);
+    assert_eq!(status.remaining_bytes, 0);
+}
+
+/// A closed store whose table files predate the current table options profile.
+/// The rewritten families hold bottommost files and level-0 files, and
+/// `disk_budget` leaves room for a rewrite job's headroom.
+fn legacy_store(dir: &std::path::Path) -> Config {
+    let mut settings = config();
+    settings.disk_budget = 4 * 1024 * 1024 * 1024;
+    let ingest = |batch: u64| {
+        let store = Store::open(dir, settings.clone()).unwrap();
+        let input = (0..200)
+            .map(|line| {
+                format!("{{\"batch\":{batch},\"line\":{line},\"message\":\"repeated log text\"}}\n")
+            })
+            .collect::<String>();
+        store
+            .ingest(
+                &format!("legacy-{batch}"),
+                "source",
+                "jsonl",
+                input.as_bytes(),
+                1 + batch,
+            )
+            .unwrap();
+        store.flush().unwrap();
+    };
+    for batch in 0..3 {
+        ingest(batch);
+    }
+    {
+        // Former options, with small files so the bottom level holds several.
+        let mut options = rocksdb::Options::default();
+        options.set_target_file_size_base(16 * 1024);
+        let columns = rocksdb::DB::list_cf(&options, dir).unwrap();
+        let db = rocksdb::DB::open_cf(&options, dir, columns).unwrap();
+        for name in ["default", "payload"] {
+            let family = db.cf_handle(name).unwrap();
+            db.compact_range_cf(family, None::<&[u8]>, None::<&[u8]>);
+        }
+        db.delete("table-options-profile").unwrap();
+    }
+    ingest(3);
+    settings
+}
+
+/// Live table files of the rewritten families in a closed store, by name and level.
+fn rewritten_tables(dir: &std::path::Path) -> std::collections::BTreeMap<String, i32> {
+    catalog_db(dir)
+        .unwrap()
+        .live_files()
+        .unwrap()
+        .into_iter()
+        .filter(|file| file.column_family_name != "rdf_reverse")
+        .map(|file| (file.name, file.level))
+        .collect()
+}
+
+fn wall_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Each rewritten family's periodic window in the newest native OPTIONS file.
+fn rewrite_windows(path: &std::path::Path) -> Vec<String> {
+    let options = native_options(path);
+    ["default", "payload"]
+        .iter()
+        .map(|family| {
+            options[&format!("[CFOptions \"{family}\"]")]
+                .lines()
+                .find_map(|line| line.strip_prefix("periodic_compaction_seconds="))
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn table_rewrite_resumes_after_reopen_and_runs_once() {
+    // INVARIANT: the rewrite records its start durably, resumes from it after an
+    // interrupt, rewrites every older table file of its families at every level,
+    // and does not run again once complete.
+    use sparrow_core::RecompressionPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = legacy_store(dir.path());
+    let before = rewritten_tables(dir.path());
+    assert!(before.values().any(|level| *level == 0), "{before:?}");
+    assert!(before.values().any(|level| *level > 0), "{before:?}");
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let first = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(first.phase, RecompressionPhase::Running);
+    assert!(first.remaining_bytes > 0);
+    drop(store);
+    // Reopening may flush recovered writes; files after the start are not owed.
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let resumed = store.recompression_status().unwrap();
+    assert_eq!(resumed.phase, RecompressionPhase::Running);
+    assert!(resumed.remaining_bytes <= first.remaining_bytes);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut steps = vec![resumed.remaining_bytes];
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let status = store.recompress_step(wall_millis(), 1).unwrap();
+        assert_eq!(status.failure, None);
+        if status.phase == RecompressionPhase::Complete {
+            break;
+        }
+        assert!(
+            status.remaining_bytes <= *steps.last().unwrap(),
+            "{steps:?}"
+        );
+        steps.push(status.remaining_bytes);
+        assert!(std::time::Instant::now() < deadline, "{steps:?}");
+    }
+    assert!(steps.len() > 1);
+    assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
+    drop(store);
+    let after = rewritten_tables(dir.path());
+    assert!(
+        before.keys().all(|name| !after.contains_key(name)),
+        "{before:?} {after:?}"
+    );
+    let store = Store::open(dir.path(), settings).unwrap();
+    assert_eq!(
+        store.recompression_status().unwrap().phase,
+        RecompressionPhase::Complete
+    );
+    let again = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(again.phase, RecompressionPhase::Complete);
+    assert_eq!(again.remaining_bytes, 0);
+}
+
+#[test]
+fn table_rewrite_stays_off_until_a_job_fits_the_allowance_and_floor() {
+    // INVARIANT: native rewriting is turned on only while one job's headroom
+    // fits both the data allowance and the free-space floor.
+    use sparrow_core::RecompressionPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = legacy_store(dir.path());
+    let mut floor = settings.clone();
+    floor.min_free_bytes = u64::MAX / 2;
+    let store = Store::open(dir.path(), floor).unwrap();
+    let held = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(held.phase, RecompressionPhase::Paused);
+    let waiting = held.waiting.unwrap();
+    assert!(waiting.contains("bytes free"), "{waiting}");
+    drop(store);
+    let mut allowance = settings.clone();
+    allowance.disk_budget = 1024 * 1024 * 1024;
+    let store = Store::open(dir.path(), allowance).unwrap();
+    let held = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(held.phase, RecompressionPhase::Paused);
+    let waiting = held.waiting.unwrap();
+    assert!(waiting.contains("data allowance"), "{waiting}");
+    assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
+    drop(store);
+    let store = Store::open(dir.path(), settings).unwrap();
+    // The first ungated step records the start; the window opens a settle later.
+    let started = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(started.phase, RecompressionPhase::Running);
+    assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let running = store.recompress_step(wall_millis(), 1).unwrap();
+    assert_eq!(running.phase, RecompressionPhase::Running);
+    assert_eq!(running.waiting, None);
+    let windows = rewrite_windows(&store.data_path().unwrap());
+    assert!(windows.iter().all(|window| window != "0"), "{windows:?}");
 }

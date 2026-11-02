@@ -61,7 +61,6 @@ socket_path = "$DATA/store/rpc.sock"
 data_dir = "$DATA/store"
 disk_budget = 1073741824
 maintenance_reserve = 67108864
-max_artifact_bytes = 16777216
 max_records = 100000
 max_pin_members = 10000
 max_concurrent_requests = 2

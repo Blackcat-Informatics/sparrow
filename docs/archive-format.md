@@ -24,6 +24,11 @@ Patrick's rulings bind this design:
   archived before anything is deleted.
 - An entry that cannot be encoded is quarantined, and archiving continues.
 - Content projection graphs are archived.
+- Sparrow has no configurable per-artifact byte limit (2026-11-01: "Remove the
+  limit"). Entries are records. New layouts cap a record at 128 MiB, but stores
+  laid out earlier may hold larger raw records, and either can exceed the
+  closing target, so a segment must be able to hold an entry larger than its
+  target.
 
 Phase status: the specification and the deletion gate with its store fence
 (phases P0 and P1) are implemented. Segment encoding (P2), the archive worker
@@ -41,6 +46,7 @@ under pressure ingest is refused with `STORAGE_PRESSURE`.
 <root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/annotations.parquet
 <root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/blobs.parquet
 <root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/manifest.nq
+<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/payloads/<n>.bin
 <root>/<store-hex>/quarantine/YYYY/MM/DD/<segment-id>/<n>.bin
 <root>/<store-hex>/.staging/<staging-id>/
 ```
@@ -52,6 +58,9 @@ under pressure ingest is refused with `STORAGE_PRESSURE`.
 - The five table files are exactly the files `purrdf::columnar::write`
   produces, with their PurRDF file names, in columnar schema 1 with Zstandard
   page compression.
+- `payloads/` holds the bytes of records too large for the tables (section 2).
+  `<n>` is the entry's decimal index in the segment's manifest. Most segments
+  have no `payloads/` directory.
 - `quarantine/` holds raw bytes of quarantined entries (section 6), grouped by
   the segment that covers them. `<n>` is the entry's decimal index in that
   segment's manifest.
@@ -84,10 +93,25 @@ A segment closes at the first of these limits:
 
 | Limit | Default | Bounds |
 | --- | --- | --- |
-| Raw payload bytes | 64 MiB (`max_segment_bytes`) | At least `max_artifact_bytes`, at most 192 MiB. |
+| Raw payload bytes | 64 MiB (`max_segment_bytes`) | At least 1 MiB, at most 192 MiB. |
 | Eviction entries | 50,000 (`max_segment_records`) | At least 1. |
 | UTC day | End of the first entry's receipt day | Fixed. |
 | Horizon | Section 5 | Fixed. |
+
+`max_segment_bytes` is a closing target, not a capacity. A segment closes before
+an entry whose record bytes would take its payload past the target, unless the
+segment is still empty. An entry whose bytes alone exceed the target therefore
+forms a segment of its own, and the segment is never split inside a record.
+
+Such an oversized record's bytes do not go into `blobs.parquet`. The writer
+streams them from the store, one 64 KiB chunk at a time, into
+`payloads/<n>.bin`, hashing as it writes. The record's metadata graph, its
+projection graphs and its link quad go into the tables as for any other record.
+The manifest lists the file as a `PayloadFile` entry (section 9), and the
+segment identity covers its digest (section 3). The tables then hold only
+metadata for that entry, so the encoder's memory stays bounded by the segment
+target, and the payload file costs one chunk of memory at any record size. A
+record within the target is always a blob.
 
 The 192 MiB ceiling keeps one table below the codec's 256 MiB table bound. It
 will be raised after the PurRDF upgrade that streams and compresses Parquet
@@ -105,11 +129,14 @@ segment-id = BLAKE3( frame("sparrow-archive/1")
                    ‖ frame(BLAKE3(reifiers.parquet)) ‖ frame(BLAKE3(annotations.parquet))
                    ‖ frame(BLAKE3(blobs.parquet))
                    ‖ frame(u64_le(quarantine-count))
-                   ‖ frame(BLAKE3(0.bin)) ‖ … )
+                   ‖ frame(BLAKE3(0.bin)) ‖ …
+                   ‖ frame(u64_le(payload-count))
+                   ‖ frame(BLAKE3(payloads/<n>.bin)) ‖ … )
 ```
 
 `frame` is PurRDF's `purrdf_hash::frame::frame_le`: an eight-byte little-endian
-length followed by the bytes. Digests are the raw 32 bytes. The PurRDF codec is
+length followed by the bytes. Digests are the raw 32 bytes. Quarantine and
+payload files appear in ascending entry index. The PurRDF codec is
 byte-deterministic, so the same range of the same store, encoded by the same
 PurRDF revision, always gives the same identity. A restored store backup
 therefore rebuilds and adopts its existing segments. A different PurRDF revision
@@ -128,7 +155,7 @@ in its range, with its dependencies:
 
 | Content | Where |
 | --- | --- |
-| Record bytes `[byte_start, byte_end)` | One blob per record in `blobs.parquet`, keyed by lowercase hexadecimal SHA-256. A record's chunks are joined in order. |
+| Record bytes `[byte_start, byte_end)` | One blob per record in `blobs.parquet`, keyed by lowercase hexadecimal SHA-256. A record's chunks are joined in order. A record larger than `max_segment_bytes` is a payload file instead (section 2). |
 | Record metadata graph `urn:sparrow:graph:record:<hex>` | `quads.parquet`, including its provenance and tracing facts. |
 | Diagnostic graph | `quads.parquet`, under its recorded graph IRI. |
 | Artifact graph `urn:sparrow:graph:artifact:<hex>` | `quads.parquet` of the segment whose covered range contains the artifact's position. When artifacts share a millisecond, that can be an earlier segment that holds none of the artifact's records. The gate treats the artifact as archived once that segment commits. |
@@ -136,7 +163,8 @@ in its range, with its dependencies:
 | Link quads | One per record with bytes, in the graph `urn:sparrow:graph:archive-links`. |
 | Reifiers and annotations of these graphs | `reifiers.parquet` and `annotations.parquet`. |
 
-A link quad ties a record to its blob:
+A link quad ties a record to its blob or payload file. Both use the same
+predicate and the SHA-256 of the record's bytes:
 
 ```text
 <urn:sparrow:record:HEX> <urn:sparrow:vocab:payloadSha256> "64 hex digits" <urn:sparrow:graph:archive-links> .
@@ -242,8 +270,9 @@ from a store is not supported in this version.
 The worker runs every archive operation on one dedicated thread,
 `sparrow-archive-nas`, with at most one operation in flight:
 
-1. Write each staged table into a fresh `.staging/<staging-id>/` directory and
-   fsync it.
+1. Write each staged table and payload file into a fresh
+   `.staging/<staging-id>/` directory and fsync it. Payload files are streamed
+   from the store chunk by chunk.
 2. Write `manifest.nq` last and fsync it.
 3. Fsync the staging directory.
 4. Create the missing parent directories, fsyncing each one and its parent.
@@ -285,7 +314,7 @@ the `urn:sparrow:vocab:` namespace, written `sp:` below.
 | Segment | `sp:purrdfRevision` | The full PurRDF commit that encoded the tables. |
 | Segment | `sp:firstPosition`, `sp:lastPosition` | Eviction positions, as strings. |
 | Segment | `sp:receivedFrom`, `sp:receivedThrough` | `xsd:dateTime` receipt instants of the first and last entries. |
-| Segment | `sp:recordCount`, `sp:artifactCount`, `sp:blobCount`, `sp:quarantineCount` | `xsd:nonNegativeInteger` counts. |
+| Segment | `sp:recordCount`, `sp:artifactCount`, `sp:blobCount`, `sp:quarantineCount`, `sp:payloadFileCount` | `xsd:nonNegativeInteger` counts. |
 | Segment | `sp:table` | One table IRI, `<segment>#<table name>`, per Parquet file. |
 | Table | `rdf:type` | `sp:ArchiveTable` |
 | Table | `sp:fileName` | For example `"quads.parquet"`. |
@@ -296,13 +325,19 @@ the `urn:sparrow:vocab:` namespace, written `sp:` below.
 | Entry | `sp:evidence` | The record or artifact IRI. |
 | Entry | `sp:quarantineReason` | `"encode"`, `"projection"` or `"retired"`. |
 | Entry | `sp:fileName`, `sp:blake3`, `sp:payloadSha256`, `sp:byteLength` | The quarantine file and its digests. |
+| Segment | `sp:payloadFile` | One entry IRI, `<segment>#payload-<n>`, per payload file. |
+| Payload entry | `rdf:type` | `sp:PayloadFile` |
+| Payload entry | `sp:evidence` | The record IRI. |
+| Payload entry | `sp:fileName`, `sp:blake3`, `sp:payloadSha256`, `sp:byteLength` | For example `"payloads/0.bin"`, and its digests and length. |
 
 ## 10. Readers
 
 PurRDF reads a segment directly. `purrdf::columnar::read` over the five files
 returns a validated dataset and its content store; every blob is checked
 against its SHA-256 digest. The result is ready for SPARQL. Readers verify each
-file's BLAKE3 against the manifest first.
+file's BLAKE3 against the manifest first. A record whose link digest is not a
+blob names a `PayloadFile` entry with the same `sp:payloadSha256`; readers
+stream that file and check its SHA-256 rather than loading it whole.
 
 DuckDB can query the tables without Sparrow. Term ids are local to one
 segment, so joins stay inside one segment. To find a record's bytes, join

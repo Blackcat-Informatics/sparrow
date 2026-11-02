@@ -230,7 +230,7 @@ and under disk pressure ingestion is eventually refused.
 [archive]
 dir = "/net/synology/archives/sparrow"  # required, absolute, outside data_dir
 start_fraction = 0.75                   # 0.5..0.95
-max_segment_bytes = 67108864            # max_artifact_bytes..192 MiB
+max_segment_bytes = 67108864            # 1 MiB..192 MiB; a larger entry gets its own segment
 max_segment_records = 50000             # at least 1
 stall_warn_secs = 120                   # 0 < stall_warn_secs < io_timeout_secs
 io_timeout_secs = 900
@@ -274,6 +274,104 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `awaiting_archive` and `archive_lag`. Archive worker status, with its phase,
 watermark, backlog age, last segment and quarantine listing, belongs to the
 worker phase and will use a later schema.
+
+### Table rewrite status (schema 64)
+
+Schema 64 adds `Status.recompression`, a `RecompressionStatus`. It reports the
+running binary's table options `profile` and a `phase` of `running`, `paused`
+or `complete`. It also reports `remainingBytes`, the table bytes of the
+rewritten families still written under an older profile as of the last step,
+and an optional `waiting` reason and latched `failure`. CLI and MCP status
+render it as `recompression`, with `remaining_bytes` as a decimal string. A new
+store reports `complete` with zero remaining bytes. A store whose files predate
+the profile reports `running` until the rewrite finishes, or `paused` while a
+step holds native rewriting off for pressure, the data allowance or the
+free-space floor. `Store::recompress_step(now, settle)` observes progress and
+turns RocksDB periodic compaction on or off without compacting anything
+itself. `Store::recompression_status` reads the last observation.
+
+### Large artifacts (schema 65)
+
+Patrick ruled on 2026-11-01: "Remove the limit". The configurable per-artifact
+limit is gone. The server configuration no longer has `max_artifact_bytes`. A
+configuration that still sets it refuses to start, and the error says to delete
+the key. The disk budget, the maintenance reserve and the free-space floor still
+bound what the store admits, and `max_records` still bounds the records in one
+artifact.
+
+One fixed bound remains until the v2 store format (#5). It is the smaller of
+two limits, and `MAX_IMPORT_BYTES` is derived from both, with a compile-time
+assertion that ties the admitted chunk count to each:
+
+- Expiry and eviction read an artifact's whole catalog row in one pass. The 32
+  MiB pass catalog budget, less a 4 MiB reserve for the record row the pass reads
+  with it, lets the row carry 129935 chunk identities, counting a record identity
+  for each chunk. This bound binds.
+- Publication commits an artifact's catalog in one atomic write batch of at most
+  128 MiB, which carries every 64 KiB chunk identity four times: in the record
+  rows, the artifact row, the saved publication receipt and the ingest receipt.
+  That admits 438210 chunks.
+
+`import_begin` therefore refuses a declared input above `MAX_IMPORT_BYTES`,
+which is 8515420160 bytes (129935 chunks, about 7.93 GiB), before any byte is
+uploaded. The `RESOURCE_LIMIT` error states the bound and says to split the
+input. An artifact of many small records can still need more chunks or record
+identities than its size implies. Layout preparation then refuses it with
+`RESOURCE_LIMIT` when its row would exceed the retirement pass, and publication
+checks again for layouts prepared earlier and refuses record rows that would
+exceed the batch. An inline `ingest` is held to the same retirement check.
+Format #5 replaces the whole-row read and the single batch, and with them this
+bound.
+
+Every expiry and eviction pass also reads every pin row, expired rows included,
+before any artifact. That capture has its own 64 MiB budget, apart from the
+artifact's share, so pins cannot crowd out an artifact row. To keep the capture
+inside that budget, a store holds at most `MAX_PINS` pin rows (606) and
+`MAX_PINNED_MEMBERS` members across all of them (36594), both derived from the
+budget with a compile-time assertion that a pin set at both caps fits. Creating
+or extending a pin past either cap fails with `RESOURCE_LIMIT`, and the error
+names the caps and the store's current totals. Expired rows count until expiry
+deletes them, which it does in its own batch before any phase that could stop the
+pass. Releasing a pin is never refused.
+
+A larger artifact ingests through the staged import: the CLI `ingest` command,
+completed-file consumption and the SDK `import_file` calls append it in 64 KiB
+chunks. Sealing, layout, preparation and publication each read the staged chunks
+one at a time. A record above 16 MiB is stored raw in pages of 128 chunks, with
+a recorded projection failure instead of a JSON projection. A record above
+128 MiB (2048 chunks) is laid out as consecutive raw records: every piece but
+the last holds 112 MiB, and the last holds more than 16 MiB and at most
+128 MiB. Each record's chunk manifest then fits one retirement pass and one
+catalog read. An artifact admitted under `MAX_IMPORT_BYTES` and the layout check
+fits one pass alongside a record row, and pins stay within their caps, so expiry
+and eviction retire the pieces and their artifact in bounded passes.
+Stores laid out before this change keep their records; only new layouts split.
+No step holds more than 16 MiB of an artifact's bytes in memory. Sealing,
+layout and publication of an input of many GiB each run as one call, so they
+can outlast the 45-second consumption deadline; resumable steps are also part
+of #5.
+
+One inline `ingest` message, and the single write batch behind it, carries at
+most 16 MiB. That fixed bound protects the daemon's memory. A larger inline
+message is refused with `RESOURCE_LIMIT`, and the message names the staged
+import. The SDK `ingest` and `ingest_with_durability` calls stream any larger
+input through the staged import, and the receipt is durable whatever durability
+was requested. The bound is advertised as `Discovery.maxInlineArtifactBytes`
+and `Status.maxInlineArtifactBytes`; CLI and MCP status render it as
+`max_inline_artifact_bytes`. These replace `maxArtifactBytes` at the same
+ordinals, so the schema advances to 65, and older endpoints fail the exact
+schema discovery check. The store format is unchanged.
+
+Byte reads of a record, or of an artifact with at most one record, go straight
+to the chunk that holds the requested offset. An artifact with several records
+finds the record holding the offset by a binary search over its ordered record
+rows, then seeks within that record, so a document split into raw records reads
+back byte-exact. Besides the requested chunks, every artifact read decodes the
+whole artifact row once, about 8.7 MB of chunk identities at the bound, and a
+few record rows. A tail capture keeps its
+fixed 1 MiB window. The archive's `max_segment_bytes` is a closing target from
+1 MiB to 192 MiB, and an entry larger than the target is archived in a segment
+of its own; see [the archive format](archive-format.md).
 
 ## 1. Common types and defaults
 
@@ -1557,8 +1655,8 @@ advanced while waiting.
 
 Each watch retains bounded opened regular files across rename/replacement and
 drains one descriptor per worker tick in round-robin order. One capture reads
-at most the smaller of 1 MiB and `max_artifact_bytes`; a line exceeding that
-window produces a visible failure and preserves the source/checkpoint. Complete
+at most 1 MiB; a line exceeding that window produces a visible failure and
+preserves the source/checkpoint. Complete
 prefixes use the one shared durable record pipeline. Idle and close events keep
 a final unterminated line pending. Observed truncation preserves the old offset
 and starts a new opaque generation. Same-length observed modification produces

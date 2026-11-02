@@ -207,7 +207,7 @@ struct Status {
   diskBudget @3 :UInt64; maintenanceReserve @4 :UInt64; liveRecords @5 :UInt64;
   uniquePayloadChunks @6 :UInt64; activePins @7 :UInt64;
   uniqueJsonProjections @8 :UInt64; retryWindowSeconds @9 :UInt64;
-  maxArtifactBytes @10 :UInt64; maxRecordsPerArtifact @11 :UInt64; maxPinMembers @12 :UInt64;
+  maxInlineArtifactBytes @10 :UInt64; maxRecordsPerArtifact @11 :UInt64; maxPinMembers @12 :UInt64;
   schemaVersion @13 :UInt32 = 1;
   textAnalyzer @14 :Text; textProfile @15 :Text;
   rdfProfile @16 :Text;
@@ -231,12 +231,13 @@ struct Status {
   sparqlReadHandles @44 :UInt64; sparqlReadBytes @45 :UInt64;
   maxSparqlReadHandles @46 :UInt64; maxSparqlReadBytes @47 :UInt64;
   sparqlReadLeaseMs @48 :UInt64;
+  recompression @49 :RecompressionStatus;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
 struct Discovery {
   storeId @0 :Text; schemaVersion @1 :UInt32;
-  maxArtifactBytes @2 :UInt64; maxRecordsPerArtifact @3 :UInt64;
+  maxInlineArtifactBytes @2 :UInt64; maxRecordsPerArtifact @3 :UInt64;
   textAnalyzer @4 :Text; textProfile @5 :Text; rdfProfile @6 :Text;
   maxEventBatchBytes @7 :UInt32; maxEventBatchEvents @8 :UInt32;
   durabilityStatus @9 :DurabilityStatus;
@@ -257,6 +258,13 @@ struct PressureStatus {
   pendingFlushes @5 :UInt64; pendingCompactions @6 :UInt64; snapshots @7 :UInt64;
   lastPass @8 :PressurePass; failure @9 :OptionalText;
   evictedRecordlessArtifacts @10 :UInt64;
+}
+
+# One-time rewrite of table files written under an older options profile.
+enum RecompressionPhase { running @0; paused @1; complete @2; }
+struct RecompressionStatus {
+  profile @0 :Text; phase @1 :RecompressionPhase; remainingBytes @2 :UInt64;
+  waiting @3 :OptionalText; failure @4 :OptionalText;
 }
 
 enum WatchCoverage { reconciling @0; covered @1; }

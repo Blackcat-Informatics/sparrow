@@ -14,6 +14,7 @@ use std::{
     path::Path,
 };
 
+/// One tail capture; a line longer than this fails visibly and keeps its checkpoint.
 const READ_BYTES: usize = 1024 * 1024;
 
 struct Held {
@@ -28,7 +29,6 @@ pub(crate) struct TailRoot {
     root: File,
     claim: std::cell::OnceCell<crate::consumption::ClaimRoot>,
     held: BTreeMap<(u64, u64), Held>,
-    read_bytes: usize,
     next: Option<(u64, u64)>,
 }
 
@@ -52,20 +52,12 @@ impl TailRoot {
                 ));
             }
         }
-        let limit = store
-            .properties()?
-            .get("max_artifact_bytes")
-            .and_then(|value| value.as_str())
-            .ok_or(Error::State("storage read limit missing"))?
-            .parse::<usize>()
-            .map_err(|_| Error::State("storage read limit invalid"))?;
         Ok(Self {
             store,
             watch: config.id.clone(),
             root,
             claim: std::cell::OnceCell::new(),
             held: BTreeMap::new(),
-            read_bytes: READ_BYTES.min(limit),
             next: None,
         })
     }
@@ -79,7 +71,7 @@ impl TailRoot {
         })?;
         Ok((
             generations.into_iter().map(|row| row.id).collect(),
-            self.read_bytes as u64,
+            READ_BYTES as u64,
             self.held.len() as u32,
             records,
         ))
@@ -296,9 +288,7 @@ impl TailRoot {
             .length
             .checked_sub(held.generation.offset)
             .ok_or(Error::State("tail checkpoint exceeds source size"))?;
-        let length = self
-            .read_bytes
-            .min(usize::try_from(available).unwrap_or(usize::MAX));
+        let length = READ_BYTES.min(usize::try_from(available).unwrap_or(usize::MAX));
         if length == 0 {
             if final_identity.is_some() {
                 self.store.tail_append(
@@ -369,7 +359,7 @@ impl TailRoot {
             self.held.remove(&key);
             return Ok(());
         }
-        if publication.artifact.is_none() && bytes.len() == self.read_bytes {
+        if publication.artifact.is_none() && bytes.len() == READ_BYTES {
             return Err(Error::State(
                 "unfinished tail record exceeds the bounded capture window; source and checkpoint remain unchanged",
             ));

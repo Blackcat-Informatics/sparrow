@@ -33,7 +33,7 @@ pub async fn import_file(
             request_id,
             source,
             format,
-            file,
+            &CompletedInput::capture(file)?,
             checkpoint,
         )
         .await
@@ -147,10 +147,68 @@ pub async fn import_open_file(
         request_id,
         source,
         format,
-        file,
+        &CompletedInput::capture(file)?,
         &mut checkpoint,
     )
     .await
+}
+
+/// Exact bytes staged through the resumable import, read positionally.
+pub(crate) trait StagedInput {
+    /// Complete byte length declared to the daemon.
+    fn length(&self) -> u64;
+    /// Fill `buffer` from `offset`; the range lies within `length`.
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error>;
+    /// Refuse an input that changed since its length was captured.
+    fn unchanged(&self) -> Result<(), Error>;
+}
+
+/// A completed regular file, bound to the identity observed before upload.
+pub(crate) struct CompletedInput<'a> {
+    file: &'a File,
+    identity: CompletedFileIdentity,
+}
+
+impl<'a> CompletedInput<'a> {
+    pub(crate) fn capture(file: &'a File) -> Result<Self, Error> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(Error::InvalidArgument(
+                "ingest requires a regular completed file; live tailing is a separate operation",
+            ));
+        }
+        Ok(Self {
+            file,
+            identity: CompletedFileIdentity::capture(&metadata),
+        })
+    }
+}
+
+impl StagedInput for CompletedInput<'_> {
+    fn length(&self) -> u64 {
+        self.identity.length
+    }
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error> {
+        Ok(self.file.read_exact_at(buffer, offset)?)
+    }
+    fn unchanged(&self) -> Result<(), Error> {
+        self.identity.require(self.file)
+    }
+}
+
+/// Caller-owned bytes are immutable for the borrow, so they never change.
+impl StagedInput for [u8] {
+    fn length(&self) -> u64 {
+        self.len() as u64
+    }
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error> {
+        let start = offset as usize;
+        buffer.copy_from_slice(&self[start..start + buffer.len()]);
+        Ok(())
+    }
+    fn unchanged(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub(crate) async fn upload(
@@ -159,7 +217,7 @@ pub(crate) async fn upload(
     request_id: &str,
     source: &str,
     format: wire::Format,
-    file: &mut File,
+    staged: &(impl StagedInput + ?Sized),
     checkpoint: &mut Checkpoint,
 ) -> Result<ArtifactReceipt, Error> {
     if request_id.is_empty() || request_id.len() > 128 || source.is_empty() || source.len() > 512 {
@@ -167,24 +225,17 @@ pub(crate) async fn upload(
             "require bounded nonempty request and source labels",
         ));
     }
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(Error::InvalidArgument(
-            "ingest requires a regular completed file; live tailing is a separate operation",
-        ));
-    }
-    let identity = CompletedFileIdentity::capture(&metadata);
-    let length = metadata.len();
+    let length = staged.length();
     let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
     let mut digest = purrdf_hash::blake3::Hasher::new();
     let mut remaining = length;
     while remaining != 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
-        file.read_exact_at(&mut buffer[..count], length - remaining)?;
+        staged.read_at(&mut buffer[..count], length - remaining)?;
         digest.update(&buffer[..count]);
         remaining -= count as u64;
     }
-    identity.require(file)?;
+    staged.unchanged()?;
     let payload = format!(
         "blake3:{}",
         purrdf_hash::hex::encode(digest.finalize().as_bytes())
@@ -213,7 +264,7 @@ pub(crate) async fn upload(
     let progress = match start.which()? {
         wire::import_start::Accepted(value) => {
             let receipt = acceptance.certify(ArtifactReceipt::decode(value?)?)?;
-            identity.require(file)?;
+            staged.unchanged()?;
             return Ok(receipt);
         }
         wire::import_start::Staging(value) => value?,
@@ -236,7 +287,7 @@ pub(crate) async fn upload(
     let mut offset = progress.received_bytes;
     while offset < length {
         let count = (length - offset).min(buffer.len() as u64) as usize;
-        file.read_exact_at(&mut buffer[..count], offset)?;
+        staged.read_at(&mut buffer[..count], offset)?;
         let mut request = client.import_append_request();
         let mut input = request.get().init_request();
         import_reference(input.reborrow().init_import(), &store, &id);
@@ -257,7 +308,7 @@ pub(crate) async fn upload(
         }
         checkpoint.observe(&value);
     }
-    identity.require(file)?;
+    staged.unchanged()?;
     let mut request = client.import_seal_request();
     import_reference(request.get().init_import(), &store, &id);
     let response = request.send().promise.await?;
@@ -324,14 +375,14 @@ pub(crate) async fn upload(
             break;
         }
     }
-    identity.require(file)?;
+    staged.unchanged()?;
     let mut request = client.import_publish_request();
     import_reference(request.get().init_import(), &store, &id);
     let response = request.send().promise.await?;
     match response.get()?.get_result()?.which()? {
         wire::result::Ok(value) => {
             let receipt = acceptance.certify(ArtifactReceipt::decode(value?)?)?;
-            identity.require(file)?;
+            staged.unchanged()?;
             Ok(receipt)
         }
         wire::result::Error(error) => Err(Error::domain(error?)),

@@ -84,6 +84,23 @@ holds a transport lease without consuming a storage permit. The existing
 are disconnected before capability admission; storage saturation returns the
 existing typed operation refusal. These are separate finite resource budgets.
 
+Sparrow has no configurable per-artifact byte limit. A large artifact ingests
+through the staged import within `disk_budget` and `min_free_bytes`, up to one
+fixed bound: an import above 8515420160 bytes (about 7.93 GiB) is refused before
+upload. That is the largest artifact whose catalog row one expiry or eviction
+pass can read, and it is below what one atomic publication can carry. The v2
+store format (#5) removes the bound. A single document above 128 MiB is stored
+as consecutive raw records, so within the bound expiry and eviction retire it in
+bounded passes. That guarantee also needs pins to stay within their store-wide
+caps of 606 pin rows and 36594 pinned members; creating or extending a pin past
+either cap is refused with `RESOURCE_LIMIT`, and releasing a pin always succeeds. A file above the bound that something other than `sparrow-ship`
+places in a consume root is refused on every claim attempt and retried with
+backoff indefinitely; the watch's failure in `status` names the refusal, and the
+file must be removed from the root and split. The
+removed `max_artifact_bytes` key must be deleted from `server.toml` before
+installing this binary; a configuration that still sets it refuses to start and
+names the key.
+
 `min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
 that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while
 other programs on the host can fill the same disk. A write that fails because
@@ -202,6 +219,16 @@ these limits ingest slows instead. `LimitNOFILE=65536` covers RocksDB, which
 keeps every table file open. Journal output is available through
 `journalctl -u sparrow.service`.
 
+After a release that changes the table options profile, the daemon rewrites
+older table files once in the background. `sparrow SOCKET status` reports it as
+`recompression`: `running`, `paused` with a `waiting` reason, or `complete`,
+with the older tables' `remaining_bytes` and any latched `failure`. RocksDB's
+own periodic compaction does the work one file at a time, below
+size-triggered compaction. The daemon turns it off while pressure maintenance
+is outstanding or a job's 1 GiB of headroom would not fit the data allowance
+or the free-space floor. The rewrite resumes after a restart, and a running
+job is aborted when the store closes, so shutdown does not wait for it.
+
 ## Shipping finished files from producers that keep them
 
 A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
@@ -218,8 +245,11 @@ root `intake_root/NAME`, the source directory, a glob and one finishing rule:
 Every rule also requires `settle_seconds` without modification. Small files are
 reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
 above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
-`NAME.partNNNNN.EXT` chunks. Unsplittable formats above `max_whole_bytes` are
-refused. The split matters for two reasons. The consume worker retries a
+`NAME.partNNNNN.EXT` chunks. Other formats, such as single JSON documents, are
+shipped whole up to Sparrow's 7.93 GiB import bound; a larger file is reported
+as a failed file on every run and never queued. The removed `max_whole_bytes` key must be deleted
+from the shipper configuration; a configuration that still sets it is refused
+before anything ships. The split matters for two reasons. The consume worker retries a
 refused publication without limit, backing off from five seconds to one attempt
 every 15 minutes after consecutive failures, so a file over the record limit
 would be uploaded again and again. Deadline expiries back off too, even when the
@@ -297,9 +327,10 @@ moves files under the running daemon, because a reserved claim binds the file's
 identity, including its change time. If the roots have not drained within 30
 minutes the run fails without stopping the service; a file that never drains is
 itself a fault to investigate. The shipper's global `max_pending_bytes` bounds
-the wait: with the example's 16 MiB budget, 1 MiB chunks and 16 MiB
-`max_whole_bytes`, the roots never hold more than 16 MiB, which drains in about
-eight minutes at the measured 30 seconds per MiB.
+the wait: with the example's 16 MiB budget and 1 MiB chunks, the roots hold at
+most 16 MiB, which drains in about eight minutes at the measured 30 seconds per
+MiB. A whole file larger than the budget is fed only when every consume root is
+empty, and then alone, so the wait then grows with that file.
 
 The unit keeps three daily copies under `/SPARROW/backups/`,
 taken between 04:00 and 04:15 local time. It also copies the shipper ledgers and
