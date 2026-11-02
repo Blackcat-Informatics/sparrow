@@ -302,25 +302,44 @@ set -euo pipefail
 OLD="$HOME/.local/bin/sparrow /SPARROW/store/rpc.sock"
 B=/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97
 sudo grep -x image=sparrowd-schema62-600ee97 "$B/SOURCE"
+# Names this revert in the marker each set-aside writes, so a .cutover left by anything else
+# (an earlier revert from another backup, or a hand move) is refused, not taken as done.
+MARK="revert from $B taken_utc=$(sudo sed -n 's/^taken_utc=//p' "$B/SOURCE")"
 # Before install.sh has run, and after uninstall.sh, there is no system unit to stop.
 if [ -e /etc/systemd/system/sparrow.service ]; then
     sudo systemctl stop sparrow-ship.timer sparrow-backup.timer
     # A helper run already under way finishes on its own: never stop sparrow-backup.service
-    # mid-run, because its ExecStopPost starts the daemon again. Its drain wait alone may take
-    # 30 minutes, so wait up to 60.
+    # mid-run, because its ExecStopPost starts the daemon again. Both helpers are oneshot units,
+    # "activating" while they run and "deactivating" during ExecStopPost, never "active", so
+    # test the state rather than is-active's exit status. The backup's drain wait alone may
+    # take 30 minutes, so wait up to 60, then stop here.
     waited=0
-    while systemctl is-active --quiet sparrow-ship.service sparrow-backup.service; do
-        [ "$waited" -lt 3600 ] || { echo "a Sparrow helper service is still active after 60 minutes" >&2; exit 1; }
+    while :; do
+        busy=
+        for helper in sparrow-ship.service sparrow-backup.service; do
+            state=$(systemctl show -p ActiveState --value "$helper")
+            case $state in inactive | failed) ;; *) busy="$busy $helper=$state" ;; esac
+        done
+        [ -z "$busy" ] && break
+        [ "$waited" -lt 3600 ] || { echo "still running after 60 minutes:$busy" >&2; exit 1; }
+        echo "waiting for$busy"
         sleep 10; waited=$((waited + 10))
     done
     sudo deploy/stop.sh
 fi
 # The store and the intake both go back to step 5a, so they agree: the system unit's roots can
 # hold claims journaled only in its store, and the restored store's daemon then refuses to start.
-# The live name is set aside once; the copy is made under .restoring and renamed into place only
-# when complete. So after the set-aside, an existing live name is always the full copy.
+# The live name is set aside once, after its marker is written; the copy is made under .restoring
+# and renamed into place only when complete. So after the set-aside, an existing live name is
+# always the full copy.
 for part in store intake; do
+    mark=/SPARROW/$part.cutover.revert
+    if [ -e "/SPARROW/$part.cutover" ] && [ "$(sudo cat "$mark" 2>/dev/null || true)" != "$MARK" ]; then
+        echo "/SPARROW/$part.cutover exists, but this revert did not set it aside ($mark); move it away first" >&2
+        exit 1
+    fi
     if [ ! -e "/SPARROW/$part.cutover" ]; then
+        printf '%s\n' "$MARK" | sudo tee "$mark" >/dev/null
         sudo mv -T "/SPARROW/$part" "/SPARROW/$part.cutover"
     fi
     if [ ! -e "/SPARROW/$part" ]; then
@@ -351,7 +370,11 @@ $OLD status | jq -r .store_id
 ```
 
 If it stops, fix the cause and run it again. For example, `uninstall.sh`
-refuses while a system unit is still active.
+refuses while a system unit is still active. Each set-aside first writes
+`/SPARROW/store.cutover.revert` or `/SPARROW/intake.cutover.revert`, naming
+the backup and its `taken_utc`. A `.cutover` directory without a matching
+marker was not made by this revert, so the subshell refuses it rather than
+skipping the swap.
 
 Expect `uninstall.sh` to list what it removed and ran, then the store identity
 recorded before the cutover, served by `sparrowd-schema62-600ee97`, the image
@@ -411,15 +434,20 @@ its watch catalog names the live roots.
 
 To reapply the watches, start from the definitions installed at step 7, which
 stay in `/etc/sparrow/watches/` (`uninstall.sh` keeps `/etc/sparrow`). The
-restored store already holds the step 4 watches. Compare them with
-`$OLD status | jq -r '.consume_watches[] | [.id, .revision, .root] | @tsv'`.
-Reapply each changed or missing definition with the restored store's current
-revision, or `0` for a new watch:
+restored store already holds the step 4 watches; the first command below lists
+them. Reapply each changed or missing definition with the restored store's
+current revision, or `0` for a new watch. A watch first applied after step 8
+names a root that the restored step 5a intake lacks, so create it first, with
+plain `mkdir` as the operator:
 
 ```bash
+OLD="$HOME/.local/bin/sparrow /SPARROW/store/rpc.sock"
+$OLD status | jq -r '.consume_watches[] | [.id, .revision, .root] | @tsv'
 f=/etc/sparrow/watches/NAME.toml
 sudo cat "$f" > ~/sparrow-revert-NAME.toml
 id=$(sed -n 's/^id = "\(.*\)"$/\1/p' ~/sparrow-revert-NAME.toml)
+root=$(sed -n 's/^root = "\(.*\)"$/\1/p' ~/sparrow-revert-NAME.toml)
+[ -d "$root" ] || mkdir "$root"
 rev=$($OLD status | jq -r --arg id "$id" '[.consume_watches[] | select(.id == $id) | .revision][0] // "0"')
 $OLD watch put "revert-$id-$(date +%s)" "$rev" ~/sparrow-revert-NAME.toml
 ```
@@ -431,7 +459,8 @@ Reversible: run `install.sh` again.
 Unverified: `uninstall.sh` was exercised only in staged mode
 (`SPARROW_DESTDIR`) against a test instance's root, where it removes the
 staged files and prints the host commands without running them. The swap
-loop, run twice, was rehearsed on a test instance's paths
+loop and the helper wait were rehearsed on a test instance's paths and a
+transient oneshot unit
 ([evidence/lifecycle.md](evidence/lifecycle.md)). Neither the script as root
 nor this revert has run on a host.
 

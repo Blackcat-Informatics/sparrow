@@ -53,12 +53,15 @@ if [[ -n $RESTORED ]]; then
         daemon=$RESTORED/images/$image cli=$RESTORED/images/sparrow-${image#sparrowd-}
         [[ -f $daemon && -f $cli ]] || die "no image pair for $image in $LIBEXEC, $SPARROW_BIN or $RESTORED/images"
     fi
-    ! unit_active || die "$SPARROW_UNIT is running; stop it before starting a restored store"
+    state=$(unit_state)
+    [[ $state == inactive || $state == failed ]] \
+        || die "$SPARROW_UNIT is $state; stop it before starting a restored store"
     note "restored store: starting $image, the image that last opened it ($RESTORED)"
 else
     images=$(select_images "$REV") || exit 1
     read -r daemon cli <<<"$images"
 fi
+require_settled
 if unit_active; then
     [[ $(readlink -- "$LIBEXEC/sparrowd") == "${daemon##*/}" ]] \
         || die "$SPARROW_UNIT already runs $(readlink -- "$LIBEXEC/sparrowd"); use restart.sh"

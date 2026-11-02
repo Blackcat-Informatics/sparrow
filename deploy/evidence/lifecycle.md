@@ -980,6 +980,133 @@ live_records 1
 [exit 0]
 ```
 
+## The revert's helper wait and set-aside markers, 2026-11-02
+
+This run used no Sparrow unit and no root (review V1 and Q1). The helper wait
+and the swap loop were taken verbatim from "Revert the cutover to the user
+unit" in RECOVERY.md, with three changes: `systemctl show` becomes
+`systemctl --user show`, the helper names become transient user oneshot units
+named `deploytest-probe-*` from `systemd-run --user`, and the 60-minute bound
+becomes `$LIMIT`. The swap loop also drops `sudo` and maps `/SPARROW` onto
+scratch directories.
+
+The results:
+
+- A running oneshot reports `activating`, and `is-active --quiet` exits 3 on
+  it, so round 5's loop would have ended at once.
+- The new wait holds while one probe runs (`activating`) and the other runs
+  its `ExecStopPost` (`deactivating`), then continues once both have settled.
+  Both `inactive` and `failed` count as settled.
+- With `LIMIT=20`, a probe still running at the bound stops the subshell
+  with exit 1.
+
+```text
+# the extracted wait
+set -euo pipefail
+    waited=0
+    while :; do
+        busy=
+        for helper in deploytest-probe-ship.service deploytest-probe-backup.service; do
+            state=$(systemctl --user show -p ActiveState --value "$helper")
+            case $state in inactive | failed) ;; *) busy="$busy $helper=$state" ;; esac
+        done
+        [ -z "$busy" ] && break
+        [ "$waited" -lt $LIMIT ] || { echo "still running after 60 minutes:$busy" >&2; exit 1; }
+        echo "waiting for$busy"
+        sleep 10; waited=$((waited + 10))
+    done
+
+# round 5's loop, for comparison: is-active --quiet while a oneshot runs
+state: activating
+$ systemctl --user is-active --quiet deploytest-probe-ship.service deploytest-probe-backup.service
+[exit 3]
+
+# the new wait: one helper running, one in ExecStopPost
+waiting for deploytest-probe-ship.service=activating deploytest-probe-backup.service=activating
+waiting for deploytest-probe-ship.service=activating deploytest-probe-backup.service=deactivating
+[exit 0 after 20s]
+
+states after: ship=inactive backup=failed
+
+# the bound: a helper still running when it is reached
+waiting for deploytest-probe-ship.service=activating
+waiting for deploytest-probe-ship.service=activating
+still running after 60 minutes: deploytest-probe-ship.service=activating
+[exit 1 after 20s]
+```
+
+The set-aside markers:
+
+- A `store.cutover` without a marker is refused, and nothing changes.
+- Without one, the swaps run and write their markers.
+- A rerun of the same revert changes nothing.
+- A revert from a backup with another `taken_utc` refuses the earlier
+  set-aside.
+
+```text
+# the swap markers
+set -euo pipefail
+MARK="revert from $B taken_utc=$(sed -n 's/^taken_utc=//p' "$B/SOURCE")"
+for part in store intake; do
+    mark=$D/$part.cutover.revert
+    if [ -e "$D/$part.cutover" ] && [ "$(cat "$mark" 2>/dev/null || true)" != "$MARK" ]; then
+        echo "$D/$part.cutover exists, but this revert did not set it aside ($mark); move it away first" >&2
+        exit 1
+    fi
+    if [ ! -e "$D/$part.cutover" ]; then
+        printf '%s\n' "$MARK" | tee "$mark" >/dev/null
+        mv -T "$D/$part" "$D/$part.cutover"
+    fi
+    if [ ! -e "$D/$part" ]; then
+        rm -rf "$D/$part.restoring"
+        cp -a --reflink=always "$B/$part" "$D/$part.restoring"
+        mv -T "$D/$part.restoring" "$D/$part"
+    fi
+done
+
+# a store.cutover this revert did not make
+$ bash R10/swap.sh
+R10/data/store.cutover exists, but this revert did not set it aside (R10/data/store.cutover.revert); move it away first
+[exit 1]
+
+$ ls -A R10/data
+intake
+store
+store.cutover
+[exit 0]
+
+# without it, the swaps run and write their markers
+$ bash R10/swap.sh
+[exit 0]
+
+$ ls -A R10/data
+intake
+intake.cutover
+intake.cutover.revert
+store
+store.cutover
+store.cutover.revert
+[exit 0]
+
+$ cat R10/data/store.cutover.revert R10/data/store/data R10/data/store.cutover/data
+revert from R10/backup taken_utc=20261102T120000Z
+backup
+live
+[exit 0]
+
+# a rerun of the same revert changes nothing
+$ bash R10/swap.sh
+[exit 0]
+
+$ diff R10/before.txt R10/after.txt
+[exit 0]
+
+# a revert from another backup (another taken_utc) refuses the earlier set-aside
+$ bash R10/swap.sh
+R10/data/store.cutover exists, but this revert did not set it aside (R10/data/store.cutover.revert); move it away first
+[exit 1]
+```
+
 ## Not run
 
 - As root: `install.sh`'s refusal and its partial-change report,

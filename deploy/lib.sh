@@ -96,7 +96,7 @@ operators() {
 # What keeps OPERATOR's old user unit sparrow.service in the way, one line each: enabled, and
 # running. Read-only. Run as the operator or as root (through the operator's user manager).
 old_user_unit_problems() {
-    local operator=$1 home wants state uid
+    local operator=$1 home wants state uid manager
     home=$(getent passwd "$operator" | cut -d: -f6)
     [[ -n $home ]] || die "no account $operator"
     wants=$home/.config/systemd/user/default.target.wants/sparrow.service
@@ -107,9 +107,11 @@ old_user_unit_problems() {
         state=$(systemctl --user --machine="$operator@" is-active sparrow.service 2>/dev/null || true)
         if [[ -z $state ]]; then
             uid=$(id -u "$operator")
-            # No answer is fine only when the operator has no user manager to run the unit.
-            ! systemctl is-active --quiet "user@$uid.service" \
-                || die "cannot query $operator's user manager for sparrow.service"
+            # No answer is fine only when the operator has no user manager to run the unit. The
+            # state, not is-active's exit status: a manager still starting is "activating".
+            manager=$(systemctl show -p ActiveState --value "user@$uid.service")
+            [[ $manager == inactive || $manager == failed ]] \
+                || die "cannot query $operator's user manager ($manager) for sparrow.service"
         fi
     fi
     case $state in
@@ -271,6 +273,23 @@ hold_backup_lock() {
     exec {BACKUP_LOCK}>>"$SPARROW_BACKUPS/.lock"
     flock -n "$BACKUP_LOCK" || die "a backup holds $SPARROW_BACKUPS/.lock; wait for it to finish \
 (journalctl -u sparrow-backup.service) and run this again"
+}
+
+# The unit's ActiveState. is-active's exit status is 0 only for "active", so gating on it treats a
+# unit that is starting, stopping or between automatic restarts as stopped.
+unit_state() {
+    "${SYSTEMCTL[@]}" show -p ActiveState --value "$SPARROW_UNIT"
+}
+
+# Refuse unless the unit is settled, active or stopped: switching image links under a unit that is
+# starting, draining or between automatic restarts would race its start.
+require_settled() {
+    local state
+    state=$(unit_state)
+    case $state in
+        active | inactive | failed) ;;
+        *) die "$SPARROW_UNIT is $state; wait until it is active or stopped (deploy/stop.sh stops it)" ;;
+    esac
 }
 
 unit_active() {
