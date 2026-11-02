@@ -17386,3 +17386,200 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
         "UNSUPPORTED"
     );
 }
+
+/// The sections of the newest native OPTIONS file, keyed by their header line.
+fn native_options(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let newest = std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("OPTIONS-") && !name.ends_with(".dbtmp"))
+        .max_by_key(|name| name["OPTIONS-".len()..].parse::<u64>().unwrap())
+        .unwrap();
+    let text = std::fs::read_to_string(path.join(newest)).unwrap();
+    let mut sections = std::collections::BTreeMap::new();
+    let mut header = String::new();
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            header = line.to_string();
+        }
+        sections
+            .entry(header.clone())
+            .or_insert_with(String::new)
+            .push_str(&format!("{line}\n"));
+    }
+    sections
+}
+
+#[test]
+fn every_column_family_uses_the_shared_table_options() {
+    // INVARIANT: each family is opened with its measured table and compression
+    // options, and a new store owes no rewrite.
+    use sparrow_core::RecompressionPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let options = native_options(&store.data_path().unwrap());
+    let section = |header: &str| options.get(header).unwrap().as_str();
+    let database = section("[DBOptions]");
+    assert!(database.contains("keep_log_file_num=10\n"));
+    assert!(database.contains("max_log_file_size=8388608\n"));
+    for (family, block, dictionary, training) in [
+        ("default", 32768, 0, 0),
+        ("payload", 32768, 114688, 11468800),
+    ] {
+        let family_options = section(&format!("[CFOptions \"{family}\"]"));
+        assert!(family_options.contains("compression=kLZ4Compression\n"));
+        assert!(family_options.contains("bottommost_compression=kZSTD\n"));
+        let bottommost = family_options
+            .lines()
+            .find(|line| line.starts_with("bottommost_compression_opts="))
+            .unwrap();
+        for setting in [
+            "enabled=true;".to_string(),
+            "level=6;".to_string(),
+            format!("max_dict_bytes={dictionary};"),
+            format!("zstd_max_train_bytes={training};"),
+        ] {
+            assert!(bottommost.contains(&setting), "{family}: {bottommost}");
+        }
+        let table = section(&format!("[TableOptions/BlockBasedTable \"{family}\"]"));
+        assert!(table.contains(&format!("block_size={block}\n")), "{family}");
+    }
+    let reverse = section("[CFOptions \"rdf_reverse\"]");
+    assert!(reverse.contains("bottommost_compression_opts={") && !reverse.contains("level=6;"));
+    let table = section("[TableOptions/BlockBasedTable \"rdf_reverse\"]");
+    assert!(table.contains("block_size=4096\n"));
+    assert!(table.contains("whole_key_filtering=true\n"));
+    assert!(table.contains("filter_policy=bloomfilter\n"));
+    assert!(section("[CFOptions \"payload\"]").contains("enable_blob_files=true\n"));
+    let status = store.recompression_status().unwrap();
+    assert_eq!(status.phase, RecompressionPhase::Complete);
+    assert_eq!(status.family, None);
+}
+
+/// A closed store whose files predate the current table options profile, with
+/// one table file per batch in each rewritten family. Each open may flush one
+/// more level-0 file; staying below four keeps native compaction idle.
+fn legacy_store(dir: &std::path::Path, settings: Config, batches: u64) {
+    let store = Store::open(dir, settings).unwrap();
+    for batch in 0..batches {
+        let input = (0..200)
+            .map(|line| {
+                format!("{{\"batch\":{batch},\"line\":{line},\"message\":\"repeated log text\"}}\n")
+            })
+            .collect::<String>();
+        store
+            .ingest(
+                &format!("legacy-{batch}"),
+                "source",
+                "jsonl",
+                input.as_bytes(),
+                1 + batch,
+            )
+            .unwrap();
+        store.flush().unwrap();
+    }
+    drop(store);
+    let db = catalog_db(dir).unwrap();
+    db.delete("table-options-profile").unwrap();
+    db.flush().unwrap();
+}
+
+/// Names of the live table files of the rewritten families in a closed store.
+fn rewritten_tables(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    catalog_db(dir)
+        .unwrap()
+        .live_files()
+        .unwrap()
+        .into_iter()
+        .filter(|file| file.column_family_name != "rdf_reverse")
+        .map(|file| file.name)
+        .collect()
+}
+
+#[test]
+fn table_rewrite_resumes_after_reopen_and_runs_once() {
+    // INVARIANT: the rewrite advances a durable cursor slice by slice, resumes
+    // where it stopped after an interrupt, rewrites every older table file of
+    // its families, and does not run again once complete.
+    use sparrow_core::RecompressionPhase;
+    let dir = tempfile::tempdir().unwrap();
+    legacy_store(dir.path(), config(), 2);
+    let before = rewritten_tables(dir.path());
+    assert!(before.len() >= 4, "{before:?}");
+    let store = Store::open(dir.path(), config()).unwrap();
+    let start = store.recompression_status().unwrap();
+    assert_eq!(start.phase, RecompressionPhase::Running);
+    assert_eq!(start.family, Some("default"));
+    assert_eq!(start.compacted_bytes, 0);
+    let mut interrupted = None;
+    for _ in 0..32 {
+        let status = store.recompress_step(1).unwrap();
+        assert_eq!(status.failure, None);
+        if status.family == Some("payload") {
+            interrupted = Some(status);
+            break;
+        }
+    }
+    let interrupted = interrupted.unwrap();
+    assert!(interrupted.compacted_bytes > 0);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let resumed = store.recompression_status().unwrap();
+    assert_eq!(resumed.family, Some("payload"));
+    assert_eq!(resumed.compacted_bytes, interrupted.compacted_bytes);
+    let mut complete = None;
+    for _ in 0..32 {
+        let status = store.recompress_step(1).unwrap();
+        assert_eq!(status.failure, None);
+        if status.phase == RecompressionPhase::Complete {
+            complete = Some(status);
+            break;
+        }
+    }
+    assert_eq!(complete.unwrap().family, None);
+    drop(store);
+    let after = rewritten_tables(dir.path());
+    assert!(before.is_disjoint(&after), "{before:?} {after:?}");
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.recompress_step(1).unwrap().phase,
+        RecompressionPhase::Complete
+    );
+    drop(store);
+    // Reopening may flush recovered writes; no rewritten file is rewritten again.
+    assert!(after.is_subset(&rewritten_tables(dir.path())));
+}
+
+#[test]
+fn table_rewrite_waits_until_its_slice_fits_the_allowance_and_floor() {
+    // INVARIANT: a slice starts only when its input bytes fit both the data
+    // allowance and the free-space floor; a refused slice rewrites nothing.
+    use sparrow_core::RecompressionPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 64 * 1024 * 1024;
+    settings.maintenance_reserve = 8 * 1024 * 1024;
+    legacy_store(dir.path(), settings.clone(), 1);
+    let before = rewritten_tables(dir.path());
+    let mut floor = settings.clone();
+    floor.min_free_bytes = u64::MAX / 2;
+    let store = Store::open(dir.path(), floor).unwrap();
+    let held = store.recompress_step(u64::MAX).unwrap();
+    assert_eq!(held.phase, RecompressionPhase::Paused);
+    let waiting = held.waiting.unwrap();
+    assert!(waiting.contains("bytes free"), "{waiting}");
+    drop(store);
+    assert!(before.is_subset(&rewritten_tables(dir.path())));
+    let store = Store::open(dir.path(), settings).unwrap();
+    let ballast = dir.path().join("test-owned-rewrite-ballast");
+    std::fs::write(&ballast, vec![0_u8; 56 * 1024 * 1024]).unwrap();
+    let held = store.recompress_step(u64::MAX).unwrap();
+    assert_eq!(held.phase, RecompressionPhase::Paused);
+    let waiting = held.waiting.unwrap();
+    assert!(waiting.contains("data allowance"), "{waiting}");
+    assert_eq!(held.compacted_bytes, 0);
+    std::fs::remove_file(&ballast).unwrap();
+    let running = store.recompress_step(u64::MAX).unwrap();
+    assert_eq!(running.waiting, None);
+    assert!(running.compacted_bytes > 0);
+}

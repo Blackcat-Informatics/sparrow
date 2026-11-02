@@ -275,6 +275,20 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 watermark, backlog age, last segment and quarantine listing, belongs to the
 worker phase and will use a later schema.
 
+### Table rewrite status (schema 64)
+
+Schema 64 adds `Status.recompression`, a `RecompressionStatus`. It reports the
+running binary's table options `profile` and a `phase` of `running`, `paused`
+or `complete`. It also reports the `family` being rewritten, the durable
+`compactedBytes` of input tables rewritten under this profile, and an optional
+`waiting` reason and latched `failure`. CLI and MCP status render it as
+`recompression`, with `compacted_bytes` as a decimal string. A new store
+reports `complete`. A store whose files predate the profile reports `running`
+until the daemon's rewrite finishes, or `paused` while a step yields to
+pressure, native compaction, the data allowance or the free-space floor.
+`Store::recompress_step` rewrites at most one slice, and
+`Store::recompression_status` reads the state without rewriting.
+
 ## 1. Common types and defaults
 
 | Type | Contract |

@@ -231,6 +231,7 @@ struct Status {
   sparqlReadHandles @44 :UInt64; sparqlReadBytes @45 :UInt64;
   maxSparqlReadHandles @46 :UInt64; maxSparqlReadBytes @47 :UInt64;
   sparqlReadLeaseMs @48 :UInt64;
+  recompression @49 :RecompressionStatus;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
@@ -257,6 +258,13 @@ struct PressureStatus {
   pendingFlushes @5 :UInt64; pendingCompactions @6 :UInt64; snapshots @7 :UInt64;
   lastPass @8 :PressurePass; failure @9 :OptionalText;
   evictedRecordlessArtifacts @10 :UInt64;
+}
+
+# One-time rewrite of table files written under an older options profile.
+enum RecompressionPhase { running @0; paused @1; complete @2; }
+struct RecompressionStatus {
+  profile @0 :Text; phase @1 :RecompressionPhase; family @2 :OptionalText;
+  compactedBytes @3 :UInt64; waiting @4 :OptionalText; failure @5 :OptionalText;
 }
 
 enum WatchCoverage { reconciling @0; covered @1; }

@@ -162,10 +162,27 @@ reuse an incompatible projection.
 
 Use LZ4 for hot table levels and Zstd for colder levels; use Zstd for payload
 blobs. This is recompression during storage transitions, not an extra compression
-wrapper around already compressed bytes. Test trained dictionaries on repetitive
-inputs after the baseline is measured. Startup must verify that requested codecs
-are available rather than accept a silent uncompressed fallback. [Compression
-configuration](https://github.com/facebook/rocksdb/wiki/Compression).
+wrapper around already compressed bytes. The default and payload families use
+32 KiB table blocks and Zstd level 6 at the bottommost level; payload also trains
+a 112 KiB dictionary there. The reverse lookup family keeps 4 KiB blocks and its
+Bloom filter, because its point reads usually miss. The measured ratios are in
+[load qualification](load-qualification.md#table-options-and-dictionaries-issue-19).
+Startup must verify that requested codecs are available rather than accept a
+silent uncompressed fallback: RocksDB refuses to open when LZ4 or the payload
+blob codec is not linked, and a linked Zstd always supports dictionary training.
+[Compression configuration](https://github.com/facebook/rocksdb/wiki/Compression).
+
+New options apply only to new table files. The catalog key
+`table-options-profile` names the profile whose files are all written. When it
+differs from the running binary's profile, the daemon rewrites the changed
+families once in a low-priority lane beside the serial maintenance owner. Each
+step plans one slice of about 256 MiB of input tables under the writer lock,
+forces it through a native manual compaction without the lock, and then records
+a durable cursor. A step yields while pressure maintenance is outstanding or
+native compaction is pending. It also yields while the slice's input bytes
+would exceed the data allowance or leave less than the free-space floor.
+Interrupted work resumes at the last recorded slice. RocksDB reads files
+written under either profile, so no store format fence is needed.
 
 Reference counts cover manifest children, live occurrences, shared projections,
 and pin-protected evidence. Term references include nested RDF terms. Garbage

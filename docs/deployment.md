@@ -161,6 +161,14 @@ priority; `Nice=10` only orders its own threads. A sustained deep-JSON backlog
 once saturated the host's CPU and disk; under these limits ingest slows instead.
 Journal output remains available through `journalctl --user -u sparrow.service`.
 
+After a release that changes the table options profile, the daemon rewrites
+older table files once in the background. `sparrow SOCKET status` reports it as
+`recompression`: `running`, `paused` with a `waiting` reason, or `complete`,
+with `compacted_bytes` and any latched `failure`. The rewrite yields to
+pressure, native compaction, the data allowance and the free-space floor, and
+resumes after a restart. Shutdown waits for the current slice, which is
+bounded at about 256 MiB of input tables.
+
 ## Shipping finished files from producers that keep them
 
 A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
