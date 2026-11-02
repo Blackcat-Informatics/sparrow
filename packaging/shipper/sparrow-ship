@@ -14,8 +14,9 @@ Small files are reflink copies, which share extents on btrfs. Line-oriented file
 above the chunk limits are split on line boundaries so that no artifact can
 exceed the per-artifact record limit or the consume publication deadline; a
 refused publication would otherwise be retried indefinitely. Every other format
-is shipped whole up to `MAX_IMPORT_BYTES`, the 26.7 GiB that one atomic Sparrow
-publication can carry until the v2 store format (#5). Sparrow splits a whole
+is shipped whole up to `MAX_IMPORT_BYTES`, about 6.76 GiB, the largest artifact
+whose catalog row one Sparrow retirement pass can read, until the v2 store format
+(#5). Sparrow splits a whole
 document above 128 MiB into raw records itself. A larger file is reported as a
 failure on every run and never queued, because Sparrow refuses it before upload.
 
@@ -42,8 +43,9 @@ import tomllib
 from pathlib import Path
 
 RULES = ("daily", "sealed", "settled")
-# sparrow_core::MAX_IMPORT_BYTES: the largest input one atomic publication carries.
-MAX_IMPORT_BYTES = 28718530560
+# sparrow_core::MAX_IMPORT_BYTES: the largest input one retirement pass can read back
+# as an artifact. A Rust test asserts that this literal equals the constant.
+MAX_IMPORT_BYTES = 7254507520
 LINE_FORMATS = ("jsonl", "log")
 
 
@@ -164,7 +166,7 @@ def enqueue(source, path, stat, config, queue, staging):
                 whole = handle.read().count(b"\n") <= max_lines
     if whole and stat.st_size > MAX_IMPORT_BYTES:
         raise RuntimeError(f"{stat.st_size} bytes exceeds Sparrow's {MAX_IMPORT_BYTES}-byte "
-                           "import bound (about 26.7 GiB); split the file and ship the parts")
+                           "import bound (about 6.76 GiB); split the file and ship the parts")
     order = f"{time.time_ns():020d}"
     staged, written = [], 0
     if whole:

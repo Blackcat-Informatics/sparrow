@@ -118,17 +118,20 @@ pub struct EvictionLimits {
 
 impl Default for EvictionLimits {
     fn default() -> Self {
-        Self {
-            max_records: 32,
-            scan_budget: 10000,
-            max_payload_refs: 4096,
-            max_catalog_bytes: 32 * 1024 * 1024,
-            max_batch_bytes: 128 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 
 impl EvictionLimits {
+    /// The limits production expiry and pressure passes run with.
+    pub(super) const DEFAULT: Self = Self {
+        max_records: 32,
+        scan_budget: 10000,
+        max_payload_refs: 4096,
+        max_catalog_bytes: 32 * 1024 * 1024,
+        max_batch_bytes: 128 * 1024 * 1024,
+    };
+
     pub(super) fn validate(self) -> Result<(), Error> {
         for (value, maximum) in [
             (self.max_records, 128),

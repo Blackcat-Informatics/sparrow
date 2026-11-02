@@ -53,10 +53,15 @@ existing typed operation refusal. These are separate finite resource budgets.
 
 Sparrow has no configurable per-artifact byte limit. A large artifact ingests
 through the staged import within `disk_budget` and `min_free_bytes`, up to one
-fixed bound: an import above 28718530560 bytes (about 26.7 GiB), the most one
-atomic publication can carry, is refused before upload. The v2 store format
-(#5) removes that bound. A single document above 128 MiB is stored as
-consecutive raw records, so retention retires it like any other evidence. The
+fixed bound: an import above 7254507520 bytes (about 6.76 GiB) is refused before
+upload. That is the largest artifact whose catalog row one expiry or eviction
+pass can read, and it is below what one atomic publication can carry. The v2
+store format (#5) removes the bound. A single document above 128 MiB is stored
+as consecutive raw records, so within the bound expiry and eviction retire it in
+bounded passes. A file above the bound that something other than `sparrow-ship`
+places in a consume root is refused on every claim attempt and retried with
+backoff indefinitely; the watch's failure in `status` names the refusal, and the
+file must be removed from the root and split. The
 removed `max_artifact_bytes` key must be deleted from `server.toml` before
 installing this binary; a configuration that still sets it refuses to start and
 names the key.
@@ -188,7 +193,7 @@ Every rule also requires `settle_seconds` without modification. Small files are
 reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
 above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
 `NAME.partNNNNN.EXT` chunks. Other formats, such as single JSON documents, are
-shipped whole up to Sparrow's 26.7 GiB import bound; a larger file is reported
+shipped whole up to Sparrow's 6.76 GiB import bound; a larger file is reported
 as a failed file on every run and never queued. The removed `max_whole_bytes` key must be deleted
 from the shipper configuration; a configuration that still sets it is refused
 before anything ships. The split matters for two reasons. The consume worker retries a

@@ -27,6 +27,33 @@ pub(super) fn features(db: &rocksdb::DB) -> Result<Option<bool>, Error> {
     }
 }
 
+/// One chunk identity in an artifact row: 64 hex digits, quotes and a separator.
+pub(super) const ROW_CHUNK_BYTES: usize = 67;
+/// One record identity in an artifact row: `record:` and 32 hex digits, quoted,
+/// with a separator.
+pub(super) const ROW_RECORD_BYTES: usize = 42;
+/// An encoded artifact row outside its two arrays, with the longest source label
+/// escaped six bytes per byte, the identities and three 20-digit integers.
+const ROW_FIXED_BYTES: usize = 4096;
+/// `header` charges each member name and scalar 64 times its encoded length plus
+/// 1024; ten names and eight scalars together encode within `ROW_FIXED_BYTES`.
+const HEADER_FIXED_CHARGE: usize = 64 * ROW_FIXED_BYTES + 18 * 1024;
+
+/// Upper bound of what `Envelope::read` reserves from a pass's catalog budget for
+/// an artifact row of `chunks` chunk and `records` record identities while taking
+/// `take` chunk identities: twice the row, 8 KiB, the header's scalar charge and
+/// the retained prefix.
+pub(super) const fn envelope_charge(chunks: usize, records: usize, take: usize) -> usize {
+    let row = ROW_FIXED_BYTES + chunks * ROW_CHUNK_BYTES + records * ROW_RECORD_BYTES;
+    2 * row + 8192 + HEADER_FIXED_CHARGE + take * (2 * 66 + 2 * std::mem::size_of::<String>())
+}
+
+/// The share of a pass's catalog budget one artifact envelope may take. The other
+/// quarter covers pin capture and the record row each pass reads before its parent.
+pub(super) const fn envelope_budget(catalog: usize) -> usize {
+    catalog / 4 * 3
+}
+
 fn failure(message: &str) -> Error {
     Error::new("STORAGE_FAILURE", message)
 }

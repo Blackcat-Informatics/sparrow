@@ -122,8 +122,8 @@ fn record_bytes(
 
 /// Read a multi-record artifact through its ordered, contiguous record rows. A
 /// binary search on `byte_start` finds the record holding `offset`; each record
-/// then seeks like `record_bytes`, so a document laid out as several raw records
-/// reads back at the cost of the requested range plus a logarithmic row search.
+/// then seeks like `record_bytes`. Beyond the requested chunks, a read decodes the
+/// whole artifact row once and a logarithmic number of record rows.
 fn artifact_bytes(
     writer: &Writer,
     ids: &[String],
@@ -158,17 +158,18 @@ fn artifact_bytes(
             break;
         }
         let record = record(index)?;
-        if record.byte_start > position
-            || record.byte_end <= position && record.byte_end != record.byte_start
-            || index != low && record.byte_start != position
-        {
-            return Err(Error::new(
+        let gap = || {
+            Error::new(
                 "STORAGE_FAILURE",
                 "artifact records do not cover its bytes contiguously",
-            ));
+            )
+        };
+        if index != low && record.byte_start != position {
+            return Err(gap());
         }
-        let start = position - record.byte_start;
-        let take = (record.byte_end - position).min((length - result.len()) as u64) as usize;
+        let start = position.checked_sub(record.byte_start).ok_or_else(gap)?;
+        let rest = record.byte_end.checked_sub(position).ok_or_else(gap)?;
+        let take = rest.min((length - result.len()) as u64) as usize;
         if take == 0 {
             continue;
         }
@@ -499,6 +500,9 @@ struct Writer {
     /// Longest record an import layout keeps whole; `import::RAW_RECORD_BYTES`
     /// except where the dev-only test hook lowers it for one open store.
     raw_record_bytes: std::cell::Cell<u64>,
+    /// Retirement limits the import bound derives from: production defaults except
+    /// where the dev-only test hook scales them for one open store.
+    retirement_limits: std::cell::Cell<eviction::EvictionLimits>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -1407,6 +1411,7 @@ impl Store {
                 archive: archive.map(std::cell::RefCell::new),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
+                retirement_limits: std::cell::Cell::new(eviction::EvictionLimits::DEFAULT),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
             rdf_read: Arc::new(Mutex::new(())),

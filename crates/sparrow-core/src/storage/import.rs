@@ -3,6 +3,7 @@
 
 //! Durable raw staging, separate from accepted evidence and derived indexes.
 
+use super::eviction::EvictionLimits;
 use super::{
     BYTE_READ_BYTES, CHUNK, Catalog, Error, RETRY_WINDOW, Store, Writer, blake3, hex, integer,
     json, parse, put, read_chunk_range, read_field, record_ends, validate_ingest_labels,
@@ -22,13 +23,71 @@ const LAYOUT_BYTES: usize = 32 * 1024;
 /// laid out as consecutive raw records, so each chunk manifest fits one retirement
 /// pass and one catalog read while the artifact still reads back byte-exact.
 pub const RAW_RECORD_BYTES: u64 = 2048 * CHUNK as u64;
-/// Largest input one atomic publication batch can carry. `import_publish` writes
-/// every chunk identity four times (record row, artifact row, saved receipt and
-/// ingest receipt) as a 67-byte JSON string, within 128 MiB less 16 MiB for the
-/// fixed rows: 438,210 chunks, about 26.7 GiB. The v2 store format (#5) replaces
-/// this single batch.
-pub const MAX_IMPORT_BYTES: u64 =
-    (super::publication::PUBLICATION_BYTES as u64 - 16 * 1024 * 1024) / (4 * 67) * CHUNK as u64;
+/// Chunks one atomic publication batch carries. `import_publish` writes every
+/// chunk identity four times (record row, artifact row, saved receipt and ingest
+/// receipt) within 128 MiB, less 16 MiB for the fixed rows.
+const PUBLICATION_CHUNKS: usize = (super::publication::PUBLICATION_BYTES - 16 * 1024 * 1024)
+    / (4 * super::manifest_retire::ROW_CHUNK_BYTES);
+
+/// Chunks whose artifact row one retirement pass under `limits` can read, counting
+/// a record identity for every chunk, as an artifact of one-chunk records has.
+pub(super) const fn envelope_chunks(limits: EvictionLimits) -> usize {
+    use super::manifest_retire::{
+        ROW_CHUNK_BYTES, ROW_RECORD_BYTES, envelope_budget, envelope_charge,
+    };
+    let budget = envelope_budget(limits.max_catalog_bytes);
+    let fixed = envelope_charge(0, 0, limits.max_payload_refs);
+    if budget <= fixed {
+        0
+    } else {
+        (budget - fixed) / (2 * (ROW_CHUNK_BYTES + ROW_RECORD_BYTES))
+    }
+}
+
+/// Chunks an import may declare: the smaller of the publication batch and the
+/// retirement envelope under `limits`.
+const fn admitted_chunks(limits: EvictionLimits) -> usize {
+    let envelope = envelope_chunks(limits);
+    if envelope < PUBLICATION_CHUNKS {
+        envelope
+    } else {
+        PUBLICATION_CHUNKS
+    }
+}
+
+/// Largest input `import_begin` admits. Expiry and eviction read an artifact's
+/// whole catalog row in one pass, within three quarters of the 32 MiB pass budget,
+/// and that is the binding bound: 110,695 chunks, about 6.76 GiB. The four chunk
+/// copies of publication fit at this size. The v2 store format (#5) replaces both
+/// the whole-row read and the single publication batch.
+pub const MAX_IMPORT_BYTES: u64 = admitted_chunks(EvictionLimits::DEFAULT) as u64 * CHUNK as u64;
+
+const _: () = {
+    use super::manifest_retire::{envelope_budget, envelope_charge};
+    let limits = EvictionLimits::DEFAULT;
+    let chunks = admitted_chunks(limits);
+    let budget = envelope_budget(limits.max_catalog_bytes);
+    // The admitted artifact's row fits one pass, and one chunk more would not.
+    assert!(envelope_charge(chunks, chunks, limits.max_payload_refs) <= budget);
+    assert!(
+        chunks < PUBLICATION_CHUNKS
+            || envelope_charge(chunks + 1, chunks + 1, limits.max_payload_refs) > budget
+    );
+    // Its four copies fit the publication batch.
+    assert!(chunks <= PUBLICATION_CHUNKS);
+    assert!(
+        16 * 1024 * 1024 + chunks * 4 * super::manifest_retire::ROW_CHUNK_BYTES
+            <= super::publication::PUBLICATION_BYTES
+    );
+    // The reserved quarter covers a record row at the raw ceiling: eight times its
+    // bytes (2048 identities and a generous 64 KiB of fields) plus 1 KiB for each
+    // of its 2048 identities and 256 field events.
+    let record = 8 * (2048 * super::manifest_retire::ROW_CHUNK_BYTES + 64 * 1024)
+        + 8192
+        + 1024 * (2048 + 256);
+    assert!(limits.max_catalog_bytes - budget >= record);
+    assert!(RAW_RECORD_BYTES == 2048 * CHUNK as u64);
+};
 
 /// Starting an upload either resumes private staging or returns accepted evidence.
 /// An accepted retry never allocates another staging journal or occurrence.
@@ -329,6 +388,29 @@ impl Writer {
         self.admit_data_write(super::pressure::data_batch_estimate(batch))
     }
 
+    /// Largest declared input: `MAX_IMPORT_BYTES` under production retirement limits.
+    fn import_bytes_bound(&self) -> u64 {
+        admitted_chunks(self.retirement_limits.get()) as u64 * CHUNK as u64
+    }
+
+    /// Refuse an artifact whose catalog row one retirement pass could not read. The
+    /// declared-size bound covers documents; this covers many-record artifacts.
+    pub(super) fn require_retirable(&self, chunks: usize, records: usize) -> Result<(), Error> {
+        use super::manifest_retire::{envelope_budget, envelope_charge};
+        let limits = self.retirement_limits.get();
+        if envelope_charge(chunks, records, limits.max_payload_refs)
+            > envelope_budget(limits.max_catalog_bytes)
+        {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                format!(
+                    "an artifact of {chunks} chunks and {records} records exceeds what one retirement pass can read; split the input and import the parts"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn commit_layout_page(
         &self,
         manifest: &mut ImportManifest,
@@ -451,6 +533,18 @@ impl Store {
         }
         self.lock()?.raw_record_bytes.set(bytes);
         Ok(())
+    }
+
+    /// Derive this open store's import bound from scaled retirement `limits`, so a test
+    /// can reach the admitted ceiling without a multi-GiB input; returns the bound.
+    /// Expiry and eviction must then run with the same limits.
+    /// This entry point is absent unless the dev-only test-support feature is selected.
+    #[cfg(feature = "test-support")]
+    pub fn bound_imports_by_retirement_limits(&self, limits: EvictionLimits) -> Result<u64, Error> {
+        limits.validate()?;
+        let writer = self.lock()?;
+        writer.retirement_limits.set(limits);
+        Ok(writer.import_bytes_bound())
     }
 
     /// Atomically recover a shared ingestion receipt or create/resume private staging.
@@ -925,11 +1019,13 @@ impl Writer {
             previous.require_live(now)?;
             return Ok(previous);
         }
-        if byte_length > MAX_IMPORT_BYTES {
+        let admitted = writer.import_bytes_bound();
+        if byte_length > admitted {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 format!(
-                    "declared input of {byte_length} bytes exceeds {MAX_IMPORT_BYTES} bytes (about 26.7 GiB), the most one atomic publication can carry; split the input and import the parts"
+                    "declared input of {byte_length} bytes exceeds {admitted} bytes (about {:.2} GiB), the most one retirement pass can read back as an artifact; split the input and import the parts",
+                    admitted as f64 / (1u64 << 30) as f64
                 ),
             ));
         }

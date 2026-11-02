@@ -4196,6 +4196,65 @@ fn ship(config: &Path) -> std::process::Output {
     .unwrap()
 }
 
+/// INVARIANT: the shipper never queues a whole file the store would refuse before
+/// upload, and its literal bound is the store's `MAX_IMPORT_BYTES`.
+#[test]
+fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packaging/shipper/sparrow-ship"
+    ))
+    .unwrap();
+    assert!(
+        script.contains(&format!(
+            "\nMAX_IMPORT_BYTES = {}\n",
+            sparrow_core::MAX_IMPORT_BYTES
+        )),
+        "the shipper's MAX_IMPORT_BYTES must equal sparrow_core::MAX_IMPORT_BYTES"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let reports = dir.path().join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::create_dir_all(dir.path().join("intake/reports")).unwrap();
+    // A sparse file costs no blocks, so the bound is cheap to cross.
+    let original = reports.join("huge.json");
+    std::fs::File::create(&original)
+        .unwrap()
+        .set_len(sparrow_core::MAX_IMPORT_BYTES + 1)
+        .unwrap();
+    let config = dir.path().join("ship.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
+             max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+             max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+             [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
+             rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
+            dir.path().join("intake"),
+            dir.path().join("ship"),
+            reports,
+        ),
+    )
+    .unwrap();
+    let refused = ship(&config);
+    assert!(!refused.status.success());
+    let errors = String::from_utf8_lossy(&refused.stderr);
+    assert!(errors.contains("import bound"), "{errors}");
+    let report = String::from_utf8_lossy(&refused.stdout);
+    assert!(report.contains("reports: queued 0"), "{report}");
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("ship/queue/reports"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(&original).unwrap().len(),
+        sparrow_core::MAX_IMPORT_BYTES + 1
+    );
+}
+
 /// INVARIANT: an artifact above the removed 16 MiB per-artifact limit ingests whole and
 /// reads back byte-exact. The shipper ships one single-object JSON file of 20 MiB whole,
 /// the consume watch publishes it, and the SDK stages an in-memory copy in bounded

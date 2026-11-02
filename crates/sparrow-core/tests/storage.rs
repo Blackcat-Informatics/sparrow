@@ -7097,6 +7097,127 @@ fn split_document(dir: &std::path::Path) -> (Store, sparrow_core::Artifact, Vec<
     (store, artifact, input)
 }
 
+/// Open a store whose import bound derives from scaled retirement limits, and
+/// return those limits with the admitted bound.
+fn retirement_scaled_store(dir: &std::path::Path) -> (Store, sparrow_core::EvictionLimits, u64) {
+    let mut settings = config();
+    settings.disk_budget = 512 * 1024 * 1024;
+    let store = Store::open(dir, settings).unwrap();
+    let limits = sparrow_core::EvictionLimits {
+        max_catalog_bytes: 640 * 1024,
+        max_payload_refs: 256,
+        ..sparrow_core::EvictionLimits::default()
+    };
+    let bound = store.bound_imports_by_retirement_limits(limits).unwrap();
+    assert!(bound < sparrow_core::MAX_IMPORT_BYTES);
+    (store, limits, bound)
+}
+
+/// A log of `bytes` bytes in distinct lines of `line` bytes each, so every line is
+/// one record of `line.div_ceil(64 KiB)` chunks.
+fn log_lines(bytes: u64, line: usize) -> Vec<u8> {
+    let mut input = Vec::with_capacity(bytes as usize);
+    let mut index = 0_u64;
+    while (input.len() as u64) < bytes {
+        let start = input.len();
+        input.extend_from_slice(format!("{index:016x}").as_bytes());
+        input.resize(start + line - 1, b'x');
+        input.push(b'\n');
+        index += 1;
+    }
+    assert_eq!(input.len() as u64, bytes);
+    input
+}
+
+fn publish_staged(
+    store: &Store,
+    request: &str,
+    input: &[u8],
+) -> Result<sparrow_core::Artifact, sparrow_core::Error> {
+    let manifest = stage_fixture(store, request, "log", input);
+    for ordinal in 0..manifest.layout_records {
+        store
+            .import_prepare_record(&manifest.id, ordinal, 0)
+            .unwrap();
+    }
+    store.import_publish(&manifest.id, 0)
+}
+
+#[test]
+fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more_is_refused() {
+    let chunk = sparrow_core::IMPORT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let (store, limits, bound) = retirement_scaled_store(dir.path());
+    // One chunk more than the admitted ceiling is refused before any upload.
+    let refused = store
+        .import_begin(
+            "over-ceiling",
+            "oversized",
+            "log",
+            bound + 1,
+            &format!("blake3:{}", "0".repeat(64)),
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert!(
+        refused.message.contains("split the input"),
+        "{}",
+        refused.message
+    );
+    // At the ceiling every chunk is its own record, the costliest admitted row.
+    let input = log_lines(bound, chunk);
+    let artifact = publish_staged(&store, "at-ceiling", &input).unwrap();
+    let chunks = (bound / chunk as u64) as usize;
+    assert_eq!(artifact.record_ids.len(), chunks);
+    assert_eq!(
+        store
+            .bytes(&artifact.id, bound - 1024 * 1024, 1024 * 1024, 1)
+            .unwrap(),
+        input[input.len() - 1024 * 1024..]
+    );
+    let mut expired = 0;
+    let drained = (0..20_000).any(|_| {
+        let report = store.expire_bounded(30 * DAY, limits).unwrap();
+        expired += report.records;
+        !report.continuation && expired == chunks as u64
+    });
+    assert!(drained, "{expired} of {chunks} records expired");
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    // Within the byte bound, twice the records per chunk overflows the row read and
+    // publication refuses it.
+    let crowded = publish_staged(&store, "crowded", &log_lines(bound, chunk / 2)).unwrap_err();
+    assert_eq!(crowded.code, "RESOURCE_LIMIT");
+    assert!(
+        crowded.message.contains("retirement pass"),
+        "{}",
+        crowded.message
+    );
+    drop(store);
+    drop(dir);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, limits, bound) = retirement_scaled_store(dir.path());
+    let artifact = publish_staged(&store, "at-ceiling", &log_lines(bound, chunk)).unwrap();
+    let mut evicted = 0;
+    let drained = (0..20_000).any(|_| {
+        let report = store.evict_oldest(1, limits).unwrap();
+        evicted += report.records.len();
+        !report.continuation && report.pending_manifest_refs == 0
+    });
+    assert!(
+        drained && evicted == chunks,
+        "{evicted} of {chunks} records evicted"
+    );
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 1).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+}
+
 #[test]
 fn rdf_record_view_charges_a_large_raw_record_row_by_its_measured_length() {
     use purrdf_lex::json::record::ToJson;

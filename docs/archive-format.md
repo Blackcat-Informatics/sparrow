@@ -25,8 +25,10 @@ Patrick's rulings bind this design:
 - An entry that cannot be encoded is quarantined, and archiving continues.
 - Content projection graphs are archived.
 - Sparrow has no configurable per-artifact byte limit (2026-11-01: "Remove the
-  limit"). An artifact may reach the 26.7 GiB publication bound, so a segment
-  must be able to hold an entry far larger than its closing target.
+  limit"). Entries are records. New layouts cap a record at 128 MiB, but stores
+  laid out earlier may hold larger raw records, and either can exceed the
+  closing target, so a segment must be able to hold an entry larger than its
+  target.
 
 Phase status: the specification and the deletion gate with its store fence
 (phases P0 and P1) are implemented. Segment encoding (P2), the archive worker

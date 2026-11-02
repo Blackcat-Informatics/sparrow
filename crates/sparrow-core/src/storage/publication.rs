@@ -574,6 +574,7 @@ impl Store {
             chunks,
             evicted: false,
         };
+        writer.require_retirable(artifact.chunks.len(), artifact.record_ids.len())?;
         parse(json::write_compact(&artifact.encode()).as_bytes())?;
         put(&mut batch, &artifact.id, &artifact);
         super::artifact_rdf::publish(&writer.db, &mut batch, &artifact)?;
