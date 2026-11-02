@@ -39,7 +39,9 @@ pub const RECOMPRESSION_SETTLE_SECONDS: u64 = 60;
 /// Progress of the one-time rewrite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecompressionPhase {
-    /// Files written under an older profile remain and native rewriting is enabled.
+    /// Files written under an older profile remain and no gate has paused the
+    /// rewrite. The native window may still be off during the first 60 s settle
+    /// or just after a reopen.
     Running,
     /// A rewrite is owed but the last step turned it off; `waiting` says why.
     Paused,
@@ -272,8 +274,10 @@ impl Writer {
         // window equal to the elapsed time marks exactly the older files. It
         // starts only after `settle` seconds, so a fresh output is never
         // marked, and moves only after drifting by `settle` or an eighth, so
-        // native option rewrites stay rare. The drift can mark files written
-        // in the first moments of the rewrite; they are rewritten once more.
+        // native option rewrites stay rare. Because the window lags the
+        // elapsed time by up to an eighth, files written during roughly the
+        // first eighth of the rewrite can be marked and rewritten again,
+        // possibly more than once; that costs extra work, not completion.
         let elapsed = now_seconds.saturating_sub(cursor.started_at);
         if elapsed >= settle
             && (state.window == 0

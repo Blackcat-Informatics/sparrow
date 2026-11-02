@@ -187,7 +187,7 @@ The first step durably records the next table file number and a start second.
 Every five seconds a serial maintenance step sets the two families' periodic
 window to the seconds since the start, so only files created before it are
 marked. The window starts after 60 seconds and moves only after drifting by a
-minute or an eighth, which keeps native option writes rare. The step turns the
+minute or an eighth, which keeps native option writes rare. Files written in roughly the first eighth of the rewrite can be marked again and rewritten more than once; that adds work but does not delay completion. The step turns the
 window off while pressure maintenance is outstanding. It also turns it off
 while a job's 1 GiB of headroom would exceed the data allowance or leave less
 than the free-space floor. When no file numbered below the recorded boundary
