@@ -853,6 +853,133 @@ restart.sh: a backup holds R8/backups/.lock; wait for it to finish (journalctl -
 [exit 1]
 ```
 
+## Rerunning the revert's swaps, 2026-11-02
+
+A fresh instance `R9`, driven only through `sparrow-deploytest.service`
+(review P2). The revert's swap loop and its `ship.user` block were taken
+verbatim from "Revert the cutover to the user unit" in RECOVERY.md. In the
+copies below, `/SPARROW` is mapped to the test data directory, `sudo` is
+dropped, and the shipper's state is a scratch directory:
+
+```bash
+set -euo pipefail
+for part in store intake; do
+    if [ ! -e "$D/$part.cutover" ]; then
+        mv -T "$D/$part" "$D/$part.cutover"
+    fi
+    if [ ! -e "$D/$part" ]; then
+        rm -rf "$D/$part.restoring"
+        cp -a --reflink=always "$B/$part" "$D/$part.restoring"
+        mv -T "$D/$part.restoring" "$D/$part"
+    fi
+done
+```
+
+```bash
+set -euo pipefail
+if [ ! -e $D/ship.user ]; then
+    rm -rf $D/ship.user.partial
+    cp -a --reflink=auto $SHIPSRC $D/ship.user.partial
+    mv -T $D/ship.user.partial $D/ship.user
+fi
+```
+
+The instance ran on schema 62, took the pre-upgrade backup `B`, went to schema
+63 with a second record (`live_records 2`), and stopped. An unjournaled claim
+entry was planted in its root. A first revert run was then cut short: the store
+was set aside and its copy left half made. These are the results:
+
+- The rerun completes both swaps. The half-made copy is discarded, and the
+  store and intake equal the backup's.
+- The leftover claim stays in `intake.cutover`.
+- A second rerun changes nothing. A listing of every path, type, size and
+  mtime is identical.
+- `ship.user` is made once, and a rerun keeps it.
+- The restored daemon starts with the backup's one record.
+- A rerun while that daemon serves leaves its store alone.
+
+```text
+# a first run interrupted: the store set aside, its copy half made
+$ mv -T R9/data/store R9/data/store.cutover
+[exit 0]
+
+$ mkdir R9/data/store.restoring
+[exit 0]
+
+$ touch R9/data/store.restoring/half-copied
+[exit 0]
+
+# the rerun completes the swaps
+$ bash R9/swap.sh
+[exit 0]
+
+$ ls -A R9/data
+intake
+intake.cutover
+store
+store.cutover
+[exit 0]
+
+$ test -e R9/data/store/half-copied
+[exit 1]
+
+$ diff -r R9/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/store R9/data/store
+[exit 0]
+
+$ diff -r R9/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/intake R9/data/intake
+[exit 0]
+
+$ test -e R9/data/intake.cutover/deploytest/.sparrow-inflight/import-leftover
+[exit 0]
+
+# a second rerun changes nothing
+$ bash R9/swap.sh
+[exit 0]
+
+$ diff R9/before.txt R9/after.txt
+[exit 0]
+
+# ship.user: made once, kept on a rerun
+$ bash R9/ship.sh
+[exit 0]
+
+$ bash R9/ship.sh
+[exit 0]
+
+$ cat R9/data/ship.user/ledger
+changed
+[exit 0]
+
+$ ls -A R9/data
+intake
+intake.cutover
+ship.user
+store
+store.cutover
+[exit 0]
+
+# the restored store and intake serve
+$ deploy/start.sh --restored-from R9/backups/pre-upgrade-sparrowd-schema62-cfdf2fa
+start.sh: restored store: starting sparrowd-schema62-cfdf2fa, the image that last opened it (R9/backups/pre-upgrade-sparrowd-schema62-cfdf2fa)
+start.sh: starting sparrow-deploytest.service on sparrowd-schema62-cfdf2fa
+receipt: unit=sparrow-deploytest.service state=active pid=501535
+receipt: daemon=sparrowd-schema62-cfdf2fa cli=sparrow-schema62-cfdf2fa previous=sparrowd-schema63-ba6ebe7
+receipt: store_id=store:c725807a9ea33af6f39dcd83f1851114 schema=62 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ records
+live_records 1
+[exit 0]
+
+# a rerun while the restored daemon serves leaves its store alone
+$ bash R9/swap.sh
+[exit 0]
+
+$ records
+live_records 1
+[exit 0]
+```
+
 ## Not run
 
 - As root: `install.sh`'s refusal and its partial-change report,

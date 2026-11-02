@@ -275,53 +275,87 @@ the `sparrow` user and group, the installed images, `/SPARROW/ship` and
 `/SPARROW/backups` in place, and says so. Once `/SPARROW` is paudley's again,
 the user manager does not need the `sparrow` group.
 
-First, if the system unit still serves, drain it as the issue's step 3 does.
-Stop the timers, then repeat the two counts until both are `0`:
+Optionally, drain a system unit that still serves. This only lets it consume
+what its shipper already fed, so those records land in `store.cutover` rather
+than waiting as bytes in `intake.cutover`. The restored store gains nothing
+either way, so skip the drain when the unit cannot serve. It gives up after
+10 minutes (60 rounds of 10 s). If either count is still above `0` then,
+continue with the revert anyway; whatever remains stays in `intake.cutover`.
 
 ```bash
 sudo systemctl stop sparrow-ship.timer sparrow-backup.timer
-sudo /usr/local/bin/sparrow /SPARROW/store/rpc.sock status | jq '[.consume_watches[].pending_claims] | add'
-sudo find /SPARROW/intake -type f -not -path '*/.sparrow-inflight/*' | wc -l
+for i in $(seq 60); do
+    claims=$(sudo /usr/local/bin/sparrow /SPARROW/store/rpc.sock status | jq '[.consume_watches[].pending_claims] | add') || claims=unknown
+    waiting=$(sudo find /SPARROW/intake -type f -not -path '*/.sparrow-inflight/*' | wc -l)
+    echo "pending claims $claims, waiting files $waiting"
+    [ "$claims" = 0 ] && [ "$waiting" = 0 ] && break
+    sleep 10
+done
 ```
 
-A unit that cannot serve is not drained. The steps below set its intake aside
-anyway.
+Then revert. The subshell stops at the first failure and is safe to run
+again after one: each step skips once it is done.
 
 ```bash
 (
 set -euo pipefail
+OLD="$HOME/.local/bin/sparrow /SPARROW/store/rpc.sock"
 B=/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97
 sudo grep -x image=sparrowd-schema62-600ee97 "$B/SOURCE"
-# Before install.sh has run there is no system unit to stop.
+# Before install.sh has run, and after uninstall.sh, there is no system unit to stop.
 if [ -e /etc/systemd/system/sparrow.service ]; then
     sudo systemctl stop sparrow-ship.timer sparrow-backup.timer
+    # A helper run already under way finishes on its own: never stop sparrow-backup.service
+    # mid-run, because its ExecStopPost starts the daemon again. Its drain wait alone may take
+    # 30 minutes, so wait up to 60.
+    waited=0
+    while systemctl is-active --quiet sparrow-ship.service sparrow-backup.service; do
+        [ "$waited" -lt 3600 ] || { echo "a Sparrow helper service is still active after 60 minutes" >&2; exit 1; }
+        sleep 10; waited=$((waited + 10))
+    done
     sudo deploy/stop.sh
 fi
 # The store and the intake both go back to step 5a, so they agree: the system unit's roots can
 # hold claims journaled only in its store, and the restored store's daemon then refuses to start.
-sudo mv -T /SPARROW/store /SPARROW/store.cutover
-sudo cp -a --reflink=always "$B/store" /SPARROW/store
-sudo mv -T /SPARROW/intake /SPARROW/intake.cutover
-sudo cp -a --reflink=always "$B/intake" /SPARROW/intake
+# The live name is set aside once; the copy is made under .restoring and renamed into place only
+# when complete. So after the set-aside, an existing live name is always the full copy.
+for part in store intake; do
+    if [ ! -e "/SPARROW/$part.cutover" ]; then
+        sudo mv -T "/SPARROW/$part" "/SPARROW/$part.cutover"
+    fi
+    if [ ! -e "/SPARROW/$part" ]; then
+        sudo rm -rf "/SPARROW/$part.restoring"
+        sudo cp -a --reflink=always "$B/$part" "/SPARROW/$part.restoring"
+        sudo mv -T "/SPARROW/$part.restoring" "/SPARROW/$part"
+    fi
+done
 # Gives /SPARROW and the restored store and intake back to the operator.
 sudo deploy/uninstall.sh
 # The shipper renames queued items into the roots, so its state must share their mount; /home
 # is a separate mount. A fresh copy of the pre-cutover state, so it resends what the restored
 # store lacks.
-test ! -e /SPARROW/ship.user
-cp -a --reflink=auto ~/.local/state/sparrow/ship /SPARROW/ship.user
+if [ ! -e /SPARROW/ship.user ]; then
+    rm -rf /SPARROW/ship.user.partial
+    cp -a --reflink=auto ~/.local/state/sparrow/ship /SPARROW/ship.user.partial
+    mv -T /SPARROW/ship.user.partial /SPARROW/ship.user
+fi
 sed -i -e 's|^intake_root = .*|intake_root = "/SPARROW/intake"|' \
     -e 's|^state_dir = .*|state_dir = "/SPARROW/ship.user"|' ~/.config/sparrow/ship.toml
 grep -qx 'intake_root = "/SPARROW/intake"' ~/.config/sparrow/ship.toml
 grep -qx 'state_dir = "/SPARROW/ship.user"' ~/.config/sparrow/ship.toml
 # The old backup timer stays disabled: its unit drains the old intake root (see below).
 systemctl --user enable --now sparrow.service sparrow-ship.timer
-~/.local/bin/sparrow /SPARROW/store/rpc.sock status | jq -r .store_id
+for i in $(seq 60); do $OLD status >/dev/null 2>&1 && break; sleep 2; done
+$OLD status | jq -r .store_id
 )
 ```
 
-The subshell stops at the first failure. Expect the store identity recorded
-before the cutover, served by `sparrowd-schema62-600ee97`. Then:
+If it stops, fix the cause and run it again. For example, `uninstall.sh`
+refuses while a system unit is still active.
+
+Expect `uninstall.sh` to list what it removed and ran, then the store identity
+recorded before the cutover, served by `sparrowd-schema62-600ee97`, the image
+the backup's `SOURCE` names.
 
 - The shipper. The backup was taken after the watches moved to
   `/SPARROW/intake`, so the user shipper's `intake_root` moves there too.
@@ -348,20 +382,58 @@ before the cutover, served by `sparrowd-schema62-600ee97`. Then:
   store does not know those claims, so its daemon refuses to start. It
   reports "unrecognized private claim entry", or "private claim directory
   exceeds its bounded journal registry" when the restored store journals no
-  claim for that root ([evidence/lifecycle.md](evidence/lifecycle.md)). Kept roots could also hold
+  claim for that root (rehearsed on a test instance,
+  [evidence/lifecycle.md](evidence/lifecycle.md)). Kept roots could also hold
   waiting files that the user shipper then sends again, which ingests them
-  twice. Nothing in `intake.cutover` is lost: each file there is a copy that
-  the system shipper fed, and the user shipper resends it from its original.
-- The system unit. Records sent directly to it, not through the shipper, are
-  lost. Keep `/SPARROW/store.cutover` and `/SPARROW/intake.cutover` until that
-  loss is accepted.
+  twice. A file in `intake.cutover` is not lost if its original still exists:
+  the user shipper resends it.
+
+What the revert loses. The served store is the step 5a backup plus what the
+user unit ingests afterwards. Three kinds of change made after the cutover
+are not in it:
+
+1. Records sent directly to the system unit, over TCP or its socket, not
+   through the shipper. They survive only in `store.cutover`.
+2. Files shipped after the cutover whose originals no longer exist, because a
+   producer rotated or deleted them. The user shipper resends only files
+   whose original still exists. Their records survive only in
+   `store.cutover`, or as bytes in `intake.cutover` if the file was still
+   waiting there. The longer the system unit ran, the more of these there
+   are.
+3. Catalog changes made on the system unit after step 8: watch definitions
+   applied with `watch put`, pins, and other mutations. The restored catalog
+   is the one from step 5a.
+
+Keep `/SPARROW/store.cutover` and `/SPARROW/intake.cutover` until that loss is
+accepted. Read `store.cutover` only on a copy with the recovery probe
+(docs/deployment.md, "Recovery qualification"). Never start a daemon on it:
+its watch catalog names the live roots.
+
+To reapply the watches, start from the definitions installed at step 7, which
+stay in `/etc/sparrow/watches/` (`uninstall.sh` keeps `/etc/sparrow`). The
+restored store already holds the step 4 watches. Compare them with
+`$OLD status | jq -r '.consume_watches[] | [.id, .revision, .root] | @tsv'`.
+Reapply each changed or missing definition with the restored store's current
+revision, or `0` for a new watch:
+
+```bash
+f=/etc/sparrow/watches/NAME.toml
+sudo cat "$f" > ~/sparrow-revert-NAME.toml
+id=$(sed -n 's/^id = "\(.*\)"$/\1/p' ~/sparrow-revert-NAME.toml)
+rev=$($OLD status | jq -r --arg id "$id" '[.consume_watches[] | select(.id == $id) | .revision][0] // "0"')
+$OLD watch put "revert-$id-$(date +%s)" "$rev" ~/sparrow-revert-NAME.toml
+```
+
+Pins and other mutations have no such record and must be redone by hand.
 
 Reversible: run `install.sh` again.
 
 Unverified: `uninstall.sh` was exercised only in staged mode
 (`SPARROW_DESTDIR`) against a test instance's root, where it removes the
-staged files and prints the host commands without running them. Neither the
-script as root nor this revert has run on a host.
+staged files and prints the host commands without running them. The swap
+loop, run twice, was rehearsed on a test instance's paths
+([evidence/lifecycle.md](evidence/lifecycle.md)). Neither the script as root
+nor this revert has run on a host.
 
 ## Exposure
 
