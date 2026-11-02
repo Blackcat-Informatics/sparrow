@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# A disposable test instance for rehearsing start.sh, stop.sh, restart.sh and check.sh without
-# root and without touching the production unit: install.sh stages the files under SCRATCH/root,
-# the configuration gets a scratch store and socket and no TCP listener, and a user unit
-# sparrow-deploytest.service is rendered from deploy/systemd/sparrow.service into the user
+# A disposable test instance for rehearsing start.sh, stop.sh, restart.sh, pre-upgrade-backup.sh and
+# check.sh without root and without touching the production unit: install.sh stages the files under
+# SCRATCH/root, the configuration gets a scratch store and socket and no TCP listener, and a user
+# unit sparrow-deploytest.service is rendered from deploy/systemd/sparrow.service into the user
 # manager's runtime directory ($XDG_RUNTIME_DIR/systemd/user, gone at logout).
 #
 # The rendered unit keeps the production sandbox (seccomp filter, MemoryDenyWriteExecute,
@@ -42,6 +42,7 @@ environment() {
     printf 'export SPARROW_SCOPE=user SPARROW_UNIT=%s\n' "$UNIT"
     printf 'export SPARROW_PREFIX=%q SPARROW_CONFIG=%q\n' "$ROOT/usr/local" "$ROOT/etc/sparrow/server.toml"
     printf 'export SPARROW_BIN=%q\n' "${SPARROW_BIN:-$REPO_DIR/bin}"
+    printf 'export SPARROW_BACKUPS=%q SPARROW_INTAKE=%q\n' "$SCRATCH/backups" "$DATA/intake"
 }
 
 case $ACTION in

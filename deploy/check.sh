@@ -71,21 +71,25 @@ if status=$(status_json 2>&1); then
     if [[ $phase == ready ]]; then pass "pressure phase ready"; else fail "pressure phase $phase"; fi
     if [[ $durability == None ]]; then pass "no durability failure"; else fail "durability failure: $durability"; fi
     if [[ -z $EXPECTED_STORE ]]; then
-        pass "store $store, schema $(status_field schema_version <<<"$status")"
+        schema=$(status_field schema_version <<<"$status")
+        pass "store $store, schema $schema"
     elif [[ $store == "$EXPECTED_STORE" ]]; then
         pass "store identity $store as expected"
     else
         fail "store identity $store, expected $EXPECTED_STORE"
     fi
+    # Captured first: a failure inside <(...) would read as no watches at all.
+    watches=$(python3 -I -c 'import json,sys
+for w in json.load(sys.stdin)["consume_watches"]:
+    print(w["id"], w["enabled"], w["root"], w["pending_claims"], sep="\t")' <<<"$status")
     while IFS=$'\t' read -r id enabled root pending; do
+        [[ -n $id ]] || continue
         if [[ $enabled == True && -d $root ]]; then
             pass "watch $id: $root, $pending pending claim(s)"
         else
             fail "watch $id: enabled=$enabled root=$root"
         fi
-    done < <(python3 -I -c 'import json,sys
-for w in json.load(sys.stdin)["consume_watches"]:
-    print(w["id"], w["enabled"], w["root"], w["pending_claims"], sep="\t")' <<<"$status")
+    done <<<"$watches"
 else
     fail "status over $socket: $status"
 fi

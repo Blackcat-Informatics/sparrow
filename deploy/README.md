@@ -22,6 +22,8 @@ lives.
 | `RECOVERY.md` | Failure modes, how to diagnose and recover each, rollback, restore, exposure. |
 | `MANUAL.md` | Running the daemon by hand without systemd, with the unit's environment. |
 | `install.sh` | Idempotent install of everything below onto the host; prints what changed. |
+| `uninstall.sh` | Undoes `install.sh`'s host changes so the old user unit can serve `/SPARROW` again. |
+| `pre-upgrade-backup.sh` | Takes the named backup `restart.sh` requires before raising the schema. |
 | `start.sh`, `stop.sh`, `restart.sh` | The lifecycle scripts; `restart.sh --rollback` swaps back. |
 | `check.sh` | Post-deploy verification. |
 | `test-instance.sh` | A disposable unprivileged test instance for rehearsing the scripts. |
@@ -231,6 +233,13 @@ starts nothing. Run it again at any time: it changes only what differs and
 prints what it changed. Log in again so the operator's new group membership
 applies.
 
+Every check that can refuse runs before the first change: the image pair and
+lexicon bundle in `./bin`, an installed image or bundle of the same name that
+differs, the secret's owner and mode, the slice and the old user unit. A
+refusal lists every problem and changes nothing. A failure after that point
+lists what had changed. `sudo deploy/uninstall.sh` undoes the host changes
+(Sparrow issue #22, the revert).
+
 ### 4. Configure
 
 Generate the CHAP secret, once per host:
@@ -311,20 +320,22 @@ left it, then switch images:
 ```bash
 git pull && make check && make install-bin
 sudo systemctl stop sparrow-ship.timer
-sudo systemctl start sparrow-backup.service
-CURRENT=$(readlink /usr/local/libexec/sparrow/sparrowd)
-sudo sh -c 'cp -a --reflink=always "$(ls -d /SPARROW/backups/2*Z | tail -n 1)" "/SPARROW/backups/pre-upgrade-$1"' sh "$CURRENT"
-sudo grep -x "image=$CURRENT" "/SPARROW/backups/pre-upgrade-$CURRENT/SOURCE"
-sudo deploy/restart.sh
-sudo deploy/check.sh
+sudo deploy/pre-upgrade-backup.sh && sudo deploy/restart.sh && sudo deploy/check.sh
 sudo systemctl start sparrow-ship.timer
 ```
 
-`sparrow-backup.service` stops the daemon through its drain, copies the store,
-intake and configuration with the image pair that last opened the store, and
-starts it again; its `SOURCE` records that image (`image=`), the store's
-identity, schema and format. The copy named `pre-upgrade-IMAGE` is never pruned
-by the three-day rotation; remove it by hand once the upgrade is settled.
+`pre-upgrade-backup.sh` runs `sparrow-backup.service` once and stops at the
+first failure. The service stops the daemon through its drain, copies the
+store, intake and configuration with the image pair that last opened the
+store, and starts it again. Its `SOURCE` records that image (`image=`), the
+store's identity, schema and format, and `taken_utc`. The script accepts only
+the backup this run took, with `taken_utc` at or after its own start and
+`image=` equal to the current image, and renames it to
+`/SPARROW/backups/pre-upgrade-CURRENT`, which the three-day rotation never
+prunes. It refuses if that name already exists, as it does after a restore of
+it: rename the old copy first, for example
+`sudo mv -T /SPARROW/backups/pre-upgrade-CURRENT /SPARROW/backups/pre-upgrade-CURRENT.retired-STAMP`.
+Remove a pre-upgrade copy by hand once the upgrade is settled.
 
 `restart.sh` installs and verifies the newest pair while the old daemon still
 runs, records the store identity, stops through the drain, points the links at
@@ -336,8 +347,15 @@ A newer image may upgrade the store's format, and an older image then refuses
 to open it. The scripts enforce this by the schema number in the image names
 (`sparrowd-schemaN-REV`), not by reading the store: `start.sh` and `restart.sh`
 refuse an image with a lower number than the current one, and refuse one with
-a higher number unless `/SPARROW/backups/pre-upgrade-CURRENT` exists and names
-the current image. The store's actual format is `store_format` in the daemon's
+a higher number unless `/SPARROW/backups/pre-upgrade-CURRENT` exists, names
+the current image and is fresh. Fresh means two things:
+
+- its `taken_utc` is at or after the time the image link was last set (every
+  start and restart sets it, a restore's start included), so a copy older
+  than a restore is refused;
+- it was taken within the last 24 hours (`SPARROW_PRE_UPGRADE_MAX_HOURS`).
+
+The store's actual format is `store_format` in the daemon's
 status and in each backup's `SOURCE`. Going back across a schema change is a
 restore of the pre-upgrade backup, which starts exactly the image recorded in
 it (RECOVERY.md, "Restore from a backup").
@@ -379,7 +397,10 @@ the cutover's tracking issue, give that cutover in full; in outline: drain, re-p
 of the closed store with the old image recorded in its `SOURCE` (the
 issue's step 5a), move the shipper's state to
 `/SPARROW/ship`, give `/SPARROW/store` and the roots to `sparrow` with
-`chown -R`, run `install.sh`, then `start.sh` and `check.sh --store-id`.
+`chown -R`, run `install.sh`, then `start.sh` and `check.sh --store-id`. The
+issue's revert goes back to the user unit: `uninstall.sh` removes the system
+units, the profile, the tmpfiles entry and the CLI link, and returns `/SPARROW`
+to the operator; then the step 5a backup's store replaces the cutover store.
 
 ## Test instance
 
@@ -388,8 +409,9 @@ issue's step 5a), move the shipper's state to
 scratch store and socket, no TCP listener, and a user unit
 `sparrow-deploytest.service` rendered from `systemd/sparrow.service` with the
 production sandbox minus what an unprivileged manager cannot apply. It prints
-the environment that points `start.sh`, `stop.sh`, `restart.sh` and `check.sh`
-at it; `deploy/test-instance.sh teardown` removes the unit.
+the environment that points `start.sh`, `stop.sh`, `restart.sh`,
+`pre-upgrade-backup.sh` and `check.sh` at it;
+`deploy/test-instance.sh teardown` removes the unit.
 [evidence/lifecycle.md](evidence/lifecycle.md) records a run.
 
 ```bash

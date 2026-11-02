@@ -55,7 +55,8 @@ if [[ -n $RESTORED ]]; then
     ! unit_active || die "$SPARROW_UNIT is running; stop it before starting a restored store"
     note "restored store: starting $image, the image that last opened it ($RESTORED)"
 else
-    read -r daemon cli < <(select_images "$REV")
+    images=$(select_images "$REV") || exit 1
+    read -r daemon cli <<<"$images"
 fi
 if unit_active; then
     [[ $(readlink -- "$LIBEXEC/sparrowd") == "${daemon##*/}" ]] \
@@ -76,8 +77,7 @@ check_config() {
         || die "text_lexicon_dir $lexicons must hold the five native CBOR lexicons"
 }
 check_config
-daemon=$(install_image "$daemon")
-cli=$(install_image "$cli")
+# The checks run on the chosen images before anything is installed, so a refusal changes nothing.
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
 if [[ -z $RESTORED ]]; then
@@ -85,6 +85,8 @@ if [[ -z $RESTORED ]]; then
     require_pre_upgrade_backup "$daemon"
 fi
 refuse_start_limit
+daemon=$(install_image "$daemon")
+cli=$(install_image "$cli")
 select_current "$daemon" "$cli"
 note "starting $SPARROW_UNIT on ${daemon##*/}"
 "${SYSTEMCTL[@]}" start "$SPARROW_UNIT"

@@ -468,10 +468,242 @@ install.sh: run as root (sudo deploy/install.sh), or set SPARROW_DESTDIR to stag
 [exit 1]
 ```
 
+## Round-2 review fixes, 2026-11-02
+
+A fresh instance `R6` from `.stage/combo-bin` (the schema 62 image `cfdf2fa`
+and the schema 63 image `ba6ebe7`), driven only through
+`sparrow-deploytest.service`. `check.sh` results are omitted: they match the
+earlier runs (the schema 62 image keeps 0700 and 0600; the test unit's exposure
+is 3.5). The sequence covers four things:
+
+- `pre-upgrade-backup.sh`: it succeeds once, then refuses the existing name.
+- The guard's age bound, with `SPARROW_PRE_UPGRADE_MAX_HOURS=0`.
+- A restore of the pre-upgrade backup. After it, the guard refuses that same
+  copy, because it predates the restore's start. Once it is retired, a new
+  backup lets the upgrade through.
+- A staged `uninstall.sh` of the test root, run twice.
+
+The daemon's `live_records` was 1 before the upgrade, 2 after the
+`after-upgrade` record, and 1 again after the restore. So the restored store
+does not hold the record ingested after the backup (review P3).
+
+```text
+$ drop before-upgrade
+consumed before-upgrade
+[exit 0]
+
+## N4: take it; a second run is refused
+$ deploy/pre-upgrade-backup.sh
+pre-upgrade-backup.sh: backing up the store as sparrowd-schema62-cfdf2fa left it (started 20261102T164539Z)
+sparrow-backup: R6/backups/20261102T164539Z complete; 4.3s service downtime; kept 1 backup(s)
+pre-upgrade-backup.sh: pre-upgrade backup R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa:
+  taken_utc=20261102T164539Z
+  image=sparrowd-schema62-cfdf2fa
+  store_id=store:d1ee69672ce02902ecf77cd44adbe6e9
+  schema_version=62
+  store_format=sparrow.store/79
+[exit 0]
+
+$ deploy/pre-upgrade-backup.sh
+pre-upgrade-backup.sh: R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa already exists (taken_utc=20261102T164539Z); a new pre-upgrade backup never reuses it. Retire it first: mv -T R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa.retired-20261102T164544Z
+[exit 1]
+
+## N4: the age bound
+$ env SPARROW_PRE_UPGRADE_MAX_HOURS=0 deploy/restart.sh --rev ba6ebe7
+restart.sh: R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa was taken at 20261102T164539Z, more than 0 hours ago; retire it (mv -T R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa.retired-20261102T164539Z) and take a new one: sudo deploy/pre-upgrade-backup.sh
+[exit 1]
+
+## upgrade
+$ deploy/restart.sh --rev ba6ebe7
+restart.sh: pre-upgrade backup R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa (taken 20261102T164539Z) holds the store as sparrowd-schema62-cfdf2fa left it
+restart.sh: sparrow-deploytest.service stopped through its drain (pid 3430117); socket removed
+restart.sh: starting sparrow-deploytest.service on sparrowd-schema63-ba6ebe7
+receipt: unit=sparrow-deploytest.service state=active pid=3430948
+receipt: daemon=sparrowd-schema63-ba6ebe7 cli=sparrow-schema63-ba6ebe7 previous=sparrowd-schema62-cfdf2fa
+receipt: store_id=store:d1ee69672ce02902ecf77cd44adbe6e9 schema=63 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ drop after-upgrade
+consumed after-upgrade
+[exit 0]
+
+## restore the pre-upgrade backup
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service stopped through its drain (pid 3430948); socket removed
+[exit 0]
+
+$ mv R6/data/store R6/data/store.upgraded
+[exit 0]
+
+$ cp -a --reflink=always R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/store R6/data/store
+[exit 0]
+
+$ deploy/start.sh --restored-from R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa
+start.sh: restored store: starting sparrowd-schema62-cfdf2fa, the image that last opened it (R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa)
+start.sh: starting sparrow-deploytest.service on sparrowd-schema62-cfdf2fa
+receipt: unit=sparrow-deploytest.service state=active pid=3431714
+receipt: daemon=sparrowd-schema62-cfdf2fa cli=sparrow-schema62-cfdf2fa previous=sparrowd-schema63-ba6ebe7
+receipt: store_id=store:d1ee69672ce02902ecf77cd44adbe6e9 schema=62 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+## N4: the old pre-upgrade backup predates the restore's start
+$ deploy/restart.sh --rev ba6ebe7
+restart.sh: R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa was taken at 20261102T164539Z, before sparrowd-schema62-cfdf2fa was last started (20261102T164554Z); it may predate a restore. Retire it (mv -T R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa.retired-20261102T164539Z) and take a new one: sudo deploy/pre-upgrade-backup.sh
+[exit 1]
+
+$ deploy/pre-upgrade-backup.sh
+pre-upgrade-backup.sh: R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa already exists (taken_utc=20261102T164539Z); a new pre-upgrade backup never reuses it. Retire it first: mv -T R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa.retired-20261102T164603Z
+[exit 1]
+
+$ mv -T R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa.retired-20261102T164539Z
+[exit 0]
+
+$ deploy/pre-upgrade-backup.sh
+pre-upgrade-backup.sh: backing up the store as sparrowd-schema62-cfdf2fa left it (started 20261102T164603Z)
+sparrow-backup: R6/backups/20261102T164603Z complete; 29.9s service downtime; kept 1 backup(s)
+pre-upgrade-backup.sh: pre-upgrade backup R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa:
+  taken_utc=20261102T164603Z
+  image=sparrowd-schema62-cfdf2fa
+  store_id=store:d1ee69672ce02902ecf77cd44adbe6e9
+  schema_version=62
+  store_format=sparrow.store/79
+[exit 0]
+
+$ deploy/restart.sh --rev ba6ebe7
+restart.sh: pre-upgrade backup R6/backups/pre-upgrade-sparrowd-schema62-cfdf2fa (taken 20261102T164603Z) holds the store as sparrowd-schema62-cfdf2fa left it
+restart.sh: sparrow-deploytest.service stopped through its drain (pid 3441725); socket removed
+restart.sh: starting sparrow-deploytest.service on sparrowd-schema63-ba6ebe7
+receipt: unit=sparrow-deploytest.service state=active pid=3443165
+receipt: daemon=sparrowd-schema63-ba6ebe7 cli=sparrow-schema63-ba6ebe7 previous=sparrowd-schema62-cfdf2fa
+receipt: store_id=store:d1ee69672ce02902ecf77cd44adbe6e9 schema=63 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service stopped through its drain (pid 3443165); socket removed
+[exit 0]
+
+$ ls R6/backups
+pre-upgrade-sparrowd-schema62-cfdf2fa
+pre-upgrade-sparrowd-schema62-cfdf2fa.retired-20261102T164539Z
+[exit 0]
+
+$ deploy/test-instance.sh teardown R6
+test-instance.sh: sparrow-deploytest.service removed; R6 kept
+[exit 0]
+
+## N2: staged uninstall of the test root
+$ find R6/root/etc R6/root/usr/local/bin ( -type f -o -type l )
+R6/root/etc/sparrow/server.toml
+R6/root/etc/sparrow/ship.toml
+R6/root/etc/sysusers.d/sparrow.conf
+R6/root/etc/tmpfiles.d/sparrow.conf
+R6/root/etc/systemd/system/sparrow-backup.service
+R6/root/etc/systemd/system/sparrow-ship.service
+R6/root/etc/systemd/system/sparrow.service
+R6/root/etc/systemd/system/sparrow-backup.timer
+R6/root/etc/systemd/system/sparrow-ship.timer
+R6/root/etc/apparmor.d/sparrow
+R6/root/usr/local/bin/sparrow
+[exit 0]
+
+$ env -u SPARROW_PREFIX -u SPARROW_CONFIG SPARROW_DESTDIR=R6/root deploy/uninstall.sh
+uninstall.sh: staging: the units' states and the loaded profile are not checked
+uninstall.sh: staged, not run: systemctl disable sparrow.service sparrow-ship.timer sparrow-backup.timer
+uninstall.sh: staged, not run: systemctl daemon-reload
+uninstall.sh: staged, not run: chown paudley:root /SPARROW
+uninstall.sh: staged, not run: chmod 0700 /SPARROW
+uninstall.sh: staged, not run: setfacl -b /SPARROW
+uninstall.sh: staged, not run: chown -R paudley:paudley /SPARROW/store
+uninstall.sh: staged, not run: setfacl -R -b /SPARROW/store
+uninstall.sh: staged, not run: find /SPARROW/store -type d -exec chmod 0700 {} +
+uninstall.sh: staged, not run: chown -R paudley:paudley /SPARROW/intake
+uninstall.sh: staged, not run: setfacl -R -b /SPARROW/intake
+uninstall.sh: staged, not run: find /SPARROW/intake -type d -exec chmod 0700 {} +
+uninstall.sh: changed:
+  removed /etc/systemd/system/sparrow-backup.service
+  removed /etc/systemd/system/sparrow-ship.service
+  removed /etc/systemd/system/sparrow.service
+  removed /etc/systemd/system/sparrow-backup.timer
+  removed /etc/systemd/system/sparrow-ship.timer
+  removed /etc/apparmor.d/sparrow
+  removed /etc/tmpfiles.d/sparrow.conf
+  removed /usr/local/bin/sparrow
+uninstall.sh: kept: /etc/sparrow, the sparrow user and group (/etc/sysusers.d/sparrow.conf), the images, helpers, lexicons and documents under /usr/local, /SPARROW/ship and /SPARROW/backups
+[exit 0]
+
+$ env -u SPARROW_PREFIX -u SPARROW_CONFIG SPARROW_DESTDIR=R6/root deploy/uninstall.sh
+uninstall.sh: staging: the units' states and the loaded profile are not checked
+uninstall.sh: staged, not run: chown paudley:root /SPARROW
+uninstall.sh: staged, not run: chmod 0700 /SPARROW
+uninstall.sh: staged, not run: setfacl -b /SPARROW
+uninstall.sh: staged, not run: chown -R paudley:paudley /SPARROW/store
+uninstall.sh: staged, not run: setfacl -R -b /SPARROW/store
+uninstall.sh: staged, not run: find /SPARROW/store -type d -exec chmod 0700 {} +
+uninstall.sh: staged, not run: chown -R paudley:paudley /SPARROW/intake
+uninstall.sh: staged, not run: setfacl -R -b /SPARROW/intake
+uninstall.sh: staged, not run: find /SPARROW/intake -type d -exec chmod 0700 {} +
+uninstall.sh: nothing changed
+uninstall.sh: kept: /etc/sparrow, the sparrow user and group (/etc/sysusers.d/sparrow.conf), the images, helpers, lexicons and documents under /usr/local, /SPARROW/ship and /SPARROW/backups
+[exit 0]
+```
+
+After the staged uninstall, `R6/root/etc` holds only `sparrow/server.toml`,
+`sparrow/ship.toml` and `sysusers.d/sparrow.conf`, and `R6/root/usr/local/bin`
+is empty.
+
+`install.sh` refusals in staged mode change nothing (review P1). The first
+stages into a directory that does not exist yet, and it stays absent. The
+second stages over `R6/root`, and a listing of every path, mtime and size is
+identical before and after:
+
+```text
+$ env -u SPARROW_PREFIX -u SPARROW_CONFIG SPARROW_BIN=R6/bin-nolex SPARROW_DESTDIR=R6/stage-nolex deploy/install.sh --no-enable
+install.sh: staging: the host preconditions (the slice, the old user unit) are not checked
+install.sh: refused; nothing was changed:
+  no lexicon bundle in R6/bin-nolex; run make install-bin
+[exit 1]
+
+$ test -e R6/stage-nolex
+[exit 1]
+
+$ env -u SPARROW_PREFIX -u SPARROW_CONFIG SPARROW_BIN=R6/bin-clash SPARROW_DESTDIR=R6/root deploy/install.sh --no-enable --rev ba6ebe7
+install.sh: staging: the host preconditions (the slice, the old user unit) are not checked
+install.sh: refused; nothing was changed:
+  R6/root/usr/local/libexec/sparrow/sparrowd-schema63-ba6ebe7 exists and differs from R6/bin-clash/sparrowd-schema63-ba6ebe7; an installed image is never overwritten
+[exit 1]
+
+$ diff R6/before.txt R6/after.txt
+[exit 0]
+```
+
+The old user-unit check now refuses when it cannot tell (review N1). This
+probe calls `old_user_unit_problems` for an account that does not exist, so it
+dies, through the new capture and through the old process substitution. It
+reads only `getent` and addresses no unit:
+
+```text
+$ SPARROW_SCOPE=system bash -c 'set -euo pipefail; source deploy/lib.sh; found=$(old_user_unit_problems nosuchaccount_r2) || exit 1; echo CONTINUED'
+bash: no account nosuchaccount_r2
+[exit 1]
+
+$ SPARROW_SCOPE=system bash -c 'set -euo pipefail; source deploy/lib.sh; while read -r p; do echo "problem $p"; done < <(old_user_unit_problems nosuchaccount_r2); echo CONTINUED'
+CONTINUED
+[exit 0]
+```
+
+The user-scope guard (review P2) compares the unit name without its
+`.service` suffix: `sparrow` and `sparrow.service` are refused and
+`sparrow-deploytest.service` is allowed. This was checked by evaluating the
+guard expressions of `lib.sh` and `sparrow-backup` on the three names, without
+running a script against any unit.
+
 ## Not run
 
-- `install.sh`'s refusal and its partial-change report as root, and the
-  backup as the root system unit.
+- As root: `install.sh`'s refusal and its partial-change report,
+  `uninstall.sh` (only staged here), `pre-upgrade-backup.sh` through
+  `sparrow-backup.service` (only the user-scope path ran here), the backup as
+  the root system unit, and the revert to the user unit
+  (RECOVERY.md, "Revert the cutover to the user unit").
 - Everything that needs root: the system unit, the user and group, the slice,
   priority, the credential, the bind on 518 and AppArmor enforcement. The
   acceptance steps of issue #22, the cutover's tracking issue, list those steps.

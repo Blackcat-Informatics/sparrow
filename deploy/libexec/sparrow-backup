@@ -61,7 +61,8 @@ def fail(message):
 def systemctl_command():
     if SCOPE not in ("system", "user"):
         fail(f"SPARROW_SCOPE must be system or user, not {SCOPE}")
-    if SCOPE == "user" and UNIT == "sparrow.service":
+    # systemctl reads "sparrow" as "sparrow.service", so both spellings are refused.
+    if SCOPE == "user" and UNIT.removesuffix(".service") == "sparrow":
         fail("SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit, never sparrow.service")
     return ["systemctl"] + (["--user"] if SCOPE == "user" else [])
 

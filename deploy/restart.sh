@@ -40,15 +40,19 @@ if [[ $MODE == rollback ]]; then
     cli=$LIBEXEC/$(readlink -- "$LIBEXEC/sparrow.previous")
     note "rolling back to $previous; an image cannot undo a store-format upgrade its successor made"
 else
-    read -r daemon cli < <(select_images "$REV")
-    daemon=$(install_image "$daemon")
-    cli=$(install_image "$cli")
+    images=$(select_images "$REV") || exit 1
+    read -r daemon cli <<<"$images"
 fi
+# The checks run on the kept images before anything is installed, so a refusal changes nothing.
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
 refuse_schema_downgrade "$daemon"
 require_pre_upgrade_backup "$daemon"
 refuse_start_limit
+if [[ $MODE != rollback ]]; then
+    daemon=$(install_image "$daemon") || exit 1
+    cli=$(install_image "$cli") || exit 1
+fi
 
 store=
 if unit_active; then

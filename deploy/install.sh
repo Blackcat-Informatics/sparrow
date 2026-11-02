@@ -46,50 +46,59 @@ if [[ -z $DEST && $EUID -ne 0 ]]; then
     die "run as root (sudo deploy/install.sh), or set SPARROW_DESTDIR to stage into a directory"
 fi
 
-# Preconditions, all read-only, before anything changes: enabling needs the production slice, and
-# the old user unit must be neither enabled nor running, because tmpfiles re-owns /SPARROW and its
-# daemon would lose its store.
+# Preconditions, all read-only, before anything changes. Every check that can refuse runs here, so a
+# refusal leaves the host as it was. A substitution is captured before use, because a die inside
+# <(...) or inside a command's arguments would end only a subshell.
+problems=()
+images=$(select_images "$REV") || exit 1
+read -r daemon cli <<<"$images"
+verify_image "$daemon" 'usage: sparrowd --config'
+verify_image "$cli" 'usage: sparrow'
+for image in "$daemon" "$cli"; do
+    target=$LIBEXEC/${image##*/}
+    [[ ! -e $target ]] || cmp -s -- "$image" "$target" \
+        || problems+=("$target exists and differs from $image; an installed image is never overwritten")
+done
+bundles=()
+for bundle in "$SPARROW_BIN"/lexicons-*; do
+    if [[ -d $bundle ]]; then bundles+=("$bundle"); fi
+done
+((${#bundles[@]})) || problems+=("no lexicon bundle in $SPARROW_BIN; run make install-bin")
+for bundle in "${bundles[@]}"; do
+    target=$DEST$PREFIX/share/sparrow/${bundle##*/}
+    [[ ! -d $target ]] || diff -r -q -- "$bundle" "$target" >/dev/null \
+        || problems+=("$target differs from $bundle; an installed lexicon bundle is never replaced")
+done
+secret=$DEST/etc/sparrow/tcp.secret
+if [[ -z $DEST && -f $secret ]]; then
+    mode=$(stat -c '%U:%a' -- "$secret")
+    [[ $mode == root:600 ]] || problems+=("$secret must be root-owned mode 0600, not $mode")
+fi
 if [[ -n $DEST ]]; then
     note "staging: the host preconditions (the slice, the old user unit) are not checked"
 else
-    problems=()
+    # Enabling needs the production slice, and the old user unit must be neither enabled nor
+    # running, because tmpfiles re-owns /SPARROW and its daemon would lose its store.
     if ((ENABLE)) && [[ -z $(systemctl show -p FragmentPath --value lillith.slice) ]]; then
         problems+=("lillith.slice is not installed; install it from Katamari's deploy/systemd first (README.md, step 1)")
     fi
-    for operator in $(operators); do
+    accounts=$(operators) || exit 1
+    for operator in $accounts; do
+        found=$(old_user_unit_problems "$operator") || exit 1
         while IFS= read -r problem; do
-            problems+=("$operator's old user unit sparrow.service is $problem; stop and disable it first (README.md, \"Moving a running service\")")
-        done < <(old_user_unit_problems "$operator")
+            [[ -z $problem ]] || problems+=("$operator's old user unit sparrow.service is $problem; stop and disable it first (README.md, \"Moving a running service\")")
+        done <<<"$found"
     done
-    if ((${#problems[@]})); then
-        printf 'install.sh: refused; nothing was changed:\n' >&2
-        printf '  %s\n' "${problems[@]}" >&2
-        exit 1
-    fi
+fi
+if ((${#problems[@]})); then
+    printf 'install.sh: refused; nothing was changed:\n' >&2
+    printf '  %s\n' "${problems[@]}" >&2
+    exit 1
 fi
 
-CHANGED=() RAN=()
 UNITS_CHANGED=0
 PROFILE_CHANGED=0
-# A failure part way still reports what had changed.
-report_partial() {
-    local status=$?
-    if ((status != 0 && ${#CHANGED[@]} + ${#RAN[@]})); then
-        printf 'install.sh: failed after changing:\n' >&2
-        printf '  %s\n' "${CHANGED[@]}" "${RAN[@]/#/ran: }" >&2
-    fi
-}
 trap report_partial EXIT
-
-# Run a host-changing command, or print it when staging.
-host() {
-    if [[ -n $DEST ]]; then
-        note "staged, not run: $*"
-    else
-        "$@"
-        RAN+=("$*")
-    fi
-}
 
 # Install SOURCE as TARGET with MODE and OWNER unless it is already identical.
 put() {
@@ -132,13 +141,8 @@ else
 fi
 template "$DEPLOY_DIR/config/server.toml.example" /etc/sparrow/server.toml
 template "$DEPLOY_DIR/config/ship.toml.example" /etc/sparrow/ship.toml
-if grep -q '^rpc_tcp_address' "$DEST/etc/sparrow/server.toml"; then
-    secret=$DEST/etc/sparrow/tcp.secret
-    if [[ ! -f $secret ]]; then
-        note "MISSING $secret: the public listener needs it (README.md, step 4); the unit will not start without it"
-    elif [[ -z $DEST && $(stat -c '%U:%a' -- "$secret") != root:600 ]]; then
-        die "$secret must be root-owned mode 0600, not $(stat -c '%U:%a' -- "$secret")"
-    fi
+if grep -q '^rpc_tcp_address' "$DEST/etc/sparrow/server.toml" && [[ ! -f $secret ]]; then
+    note "MISSING $secret: the public listener needs it (README.md, step 4); the unit will not start without it"
 fi
 
 # 4. Units.
@@ -161,7 +165,6 @@ for helper in sparrow-ship sparrow-backup; do
 done
 
 # 7. The image pair, under its own names; the stable links only when none exist yet.
-read -r daemon cli < <(select_images "$REV")
 for image in "$daemon" "$cli"; do
     [[ -e $LIBEXEC/${image##*/} ]] || CHANGED+=("$PREFIX/libexec/sparrow/${image##*/}")
 done
@@ -177,13 +180,9 @@ else
 fi
 
 # 8. The lexicon bundle for the PurRDF revision the images were built against.
-for bundle in "$SPARROW_BIN"/lexicons-*; do
-    [[ -d $bundle ]] || die "no lexicon bundle in $SPARROW_BIN; run make install-bin"
+for bundle in "${bundles[@]}"; do
     target=$DEST$PREFIX/share/sparrow/${bundle##*/}
-    if [[ -d $target ]]; then
-        diff -r -q -- "$bundle" "$target" >/dev/null || die "$target differs from $bundle; refusing to replace it"
-        continue
-    fi
+    [[ ! -d $target ]] || continue
     install -d -m 0755 -- "$(dirname -- "$target")"
     staging=$(mktemp -d "$(dirname -- "$target")/.lexicons.XXXXXX")
     cp -a --reflink=auto -- "$bundle/." "$staging/"
@@ -208,16 +207,7 @@ if ((ENABLE)); then
     host systemctl enable sparrow.service sparrow-ship.timer sparrow-backup.timer
 fi
 
-if ((${#CHANGED[@]})); then
-    printf 'install.sh: changed:\n'
-    printf '  %s\n' "${CHANGED[@]}"
-else
-    printf 'install.sh: nothing changed\n'
-fi
-# These re-assert state on every run, and their effects are not itemized: on a first run sysusers
-# creates the user and group and tmpfiles sets the owners, modes and ACLs that README.md, "Layout",
-# lists, re-owning /SPARROW and /SPARROW/store.
-if ((${#RAN[@]})); then
-    printf 'install.sh: ran (effects not itemized; README.md, "Layout", gives the result):\n'
-    printf '  %s\n' "${RAN[@]}"
-fi
+# The commands under "ran" re-assert state on every run, and their effects are not itemized: on a
+# first run sysusers creates the user and group and tmpfiles sets the owners, modes and ACLs that
+# README.md, "Layout", lists, re-owning /SPARROW and /SPARROW/store. deploy/uninstall.sh undoes them.
+report_changes

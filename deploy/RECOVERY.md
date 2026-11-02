@@ -146,7 +146,9 @@ every watch in `consume_watches` names a root that exists.
   (`sparrowd-schemaN-REV`) is lower than the current image's, before stopping
   anything. Stay on the new image and fix forward, or restore the named
   pre-upgrade backup `/SPARROW/backups/pre-upgrade-IMAGE` ("Restore from a
-  backup"), which `restart.sh` requires before it raises the schema
+  backup"). `deploy/pre-upgrade-backup.sh` takes it, and `restart.sh` requires
+  it before it raises the schema. It must be no older than the image link's
+  last start and no older than 24 hours (README.md, "Upgrades and rollback")
   ([evidence/lifecycle.md](evidence/lifecycle.md) shows a schema 62 image
   refusing a store a schema 63 image had opened, and the restore). Reverting `/etc/sparrow/server.toml` is a
   separate step, kept in its backup.
@@ -239,6 +241,73 @@ procedure (a backup by `sparrow-backup`, a schema raise, then the restored
 store started with `--restored-from` on the recorded image) was exercised on a
 test instance ([evidence/lifecycle.md](evidence/lifecycle.md)); the whole
 system-unit restore has not been.
+
+A restored `pre-upgrade-IMAGE` copy is older than the start that used it, so
+the schema guard refuses it before the next upgrade. Rename it
+(`.retired-STAMP`) and take a new one with `sudo deploy/pre-upgrade-backup.sh`.
+
+## Revert the cutover to the user unit
+
+- When: the system unit cannot serve after the cutover of Sparrow issue #22,
+  and the operator's old user unit must serve `/SPARROW` again.
+- Needs: the issue's step 5a backup,
+  `/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97`, taken from the
+  closed store before `install.sh` ran, and the user units, disabled but not
+  removed.
+- Before the cutover (`stat`, 2026-11-02), `/SPARROW` was `paudley:root` 0700
+  with no ACL entries, `/SPARROW/store` was `paudley:paudley` 0700, and
+  nothing else existed under `/SPARROW`.
+
+`deploy/uninstall.sh` makes the host changes needed to return to that state:
+
+- It disables and removes the system units.
+- It unloads and removes the AppArmor profile.
+- It removes `/etc/tmpfiles.d/sparrow.conf`, which would re-own `/SPARROW` at
+  the next boot, and the `/usr/local/bin/sparrow` link.
+- It runs `daemon-reload`.
+- It gives `/SPARROW` back to the operator as `paudley:root` 0700 without
+  ACLs. `/SPARROW/store` and `/SPARROW/intake` go to `paudley:paudley`, with
+  directories at 0700 and no ACLs.
+
+It checks first, changing nothing, that no Sparrow system unit is active and
+that the sysusers file names exactly one operator. It leaves `/etc/sparrow`,
+the `sparrow` user and group, the installed images, `/SPARROW/ship` and
+`/SPARROW/backups` in place, and says so. Once `/SPARROW` is paudley's again,
+the user manager does not need the `sparrow` group.
+
+```bash
+(
+set -euo pipefail
+B=/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97
+sudo grep -x image=sparrowd-schema62-600ee97 "$B/SOURCE"
+# Before install.sh has run there is no system unit to stop.
+if [ -e /etc/systemd/system/sparrow.service ]; then
+    sudo systemctl stop sparrow-ship.timer sparrow-backup.timer
+    sudo deploy/stop.sh
+fi
+sudo deploy/uninstall.sh
+sudo mv -T /SPARROW/store /SPARROW/store.cutover
+sudo cp -a --reflink=always "$B/store" /SPARROW/store
+sudo chown -R paudley:paudley /SPARROW/store
+sed -i 's|^intake_root = .*|intake_root = "/SPARROW/intake"|' ~/.config/sparrow/ship.toml
+systemctl --user enable --now sparrow.service sparrow-ship.timer sparrow-backup.timer
+~/.local/bin/sparrow /SPARROW/store/rpc.sock status | jq -r .store_id
+)
+```
+
+The subshell stops at the first failure. Expect the store identity recorded
+before the cutover, served by `sparrowd-schema62-600ee97`. The backup was
+taken after the watches moved to `/SPARROW/intake`, so the user shipper's
+`intake_root` moves there too. Its state under `~/.local/state/sparrow/ship`
+predates the cutover, so it resends every file shipped since whose original
+still exists. Records sent directly to the system unit are lost. Keep
+`/SPARROW/store.cutover` until that loss is accepted. Reversible: run
+`install.sh` again.
+
+Unverified: `uninstall.sh` was exercised only in staged mode
+(`SPARROW_DESTDIR`) against a test instance's root, where it removes the
+staged files and prints the host commands without running them. Neither the
+script as root nor this revert has run on a host.
 
 ## Exposure
 

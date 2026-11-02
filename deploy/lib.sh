@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# Shared by start.sh, stop.sh, restart.sh, install.sh and check.sh; sourced, never run. Every
+# Shared by the deploy scripts; sourced, never run. Every
 # location below has a production default and an environment override, so the same scripts drive
 # a test instance (deploy/test-instance.sh) without editing them.
 #
@@ -12,6 +12,8 @@
 #   SPARROW_CONFIG    the daemon's configuration            /etc/sparrow/server.toml
 #   SPARROW_BIN       the kept images (make install-bin)    <repository>/bin
 #   SPARROW_BACKUPS   closed-store backups                  /SPARROW/backups
+#   SPARROW_INTAKE    the watched intake tree                /SPARROW/intake
+#   SPARROW_PRE_UPGRADE_MAX_HOURS  the oldest pre-upgrade backup accepted        24
 
 DEPLOY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$DEPLOY_DIR/.." && pwd)
@@ -21,10 +23,12 @@ SPARROW_PREFIX=${SPARROW_PREFIX:-/usr/local}
 SPARROW_CONFIG=${SPARROW_CONFIG:-/etc/sparrow/server.toml}
 SPARROW_BIN=${SPARROW_BIN:-$REPO_DIR/bin}
 SPARROW_BACKUPS=${SPARROW_BACKUPS:-/SPARROW/backups}
+SPARROW_INTAKE=${SPARROW_INTAKE:-/SPARROW/intake}
 LIBEXEC=$SPARROW_PREFIX/libexec/sparrow
 CLI_LINK=$SPARROW_PREFIX/bin/sparrow
 # The daemon takes up to TimeoutStopSec (120 s) to drain; startup can wait longer for disk space.
 READY_SECONDS=${SPARROW_READY_SECONDS:-120}
+PRE_UPGRADE_MAX_HOURS=${SPARROW_PRE_UPGRADE_MAX_HOURS:-24}
 
 case $SPARROW_SCOPE in
     system) SYSTEMCTL=(systemctl) ;;
@@ -41,9 +45,48 @@ note() {
     printf '%s: %s\n' "${0##*/}" "$*"
 }
 
-# While the old user unit exists, user scope with the default unit name would address it.
-[[ $SPARROW_SCOPE != user || $SPARROW_UNIT != sparrow.service ]] \
+# While the old user unit exists, user scope with the default unit name would address it. systemctl
+# reads "sparrow" as "sparrow.service", so both spellings are refused.
+[[ $SPARROW_SCOPE != user || ${SPARROW_UNIT%.service} != sparrow ]] \
     || die "SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit (deploy/test-instance.sh env), never sparrow.service"
+
+# Host changes made so far, for the final report and for report_partial: CHANGED lists files and
+# links written, RAN the host commands run (their effects are not itemized).
+CHANGED=() RAN=()
+
+# Run a host-changing command, or print it when staging (DEST set, as install.sh and uninstall.sh
+# do for SPARROW_DESTDIR).
+host() {
+    if [[ -n ${DEST:-} ]]; then
+        note "staged, not run: $*"
+    else
+        "$@"
+        RAN+=("$*")
+    fi
+}
+
+# An EXIT trap: a failure part way still reports what had changed.
+report_partial() {
+    local status=$?
+    if ((status != 0 && ${#CHANGED[@]} + ${#RAN[@]})); then
+        printf '%s: failed after changing:\n' "${0##*/}" >&2
+        printf '  %s\n' "${CHANGED[@]}" "${RAN[@]/#/ran: }" >&2
+    fi
+}
+
+# The final report of a script that changes the host.
+report_changes() {
+    if ((${#CHANGED[@]})); then
+        printf '%s: changed:\n' "${0##*/}"
+        printf '  %s\n' "${CHANGED[@]}"
+    else
+        printf '%s: nothing changed\n' "${0##*/}"
+    fi
+    if ((${#RAN[@]})); then
+        printf '%s: ran (effects not itemized; README.md, "Layout", gives the result):\n' "${0##*/}"
+        printf '  %s\n' "${RAN[@]}"
+    fi
+}
 
 # The operators: the accounts config/sysusers-sparrow.conf adds to the sparrow group.
 operators() {
@@ -175,9 +218,11 @@ cannot open a store that image upgraded. Fix forward, or restore the pre-upgrade
 
 # Raising the schema may upgrade the store's format, after which only a backup taken before can go
 # back. Require the named pre-upgrade backup of the current image (README.md, "Upgrades and
-# rollback"); the backup rotation never prunes it.
+# rollback"); the backup rotation never prunes it. It must also be fresh: taken after the image link
+# was last set (start.sh and restart.sh set it at every start, a restore included), so a copy that
+# predates a restore is refused, and within PRE_UPGRADE_MAX_HOURS of now.
 require_pre_upgrade_backup() {
-    local daemon=$1 current backup new old
+    local daemon=$1 current backup new old taken taken_at linked_at
     current=$(readlink -- "$LIBEXEC/sparrowd" 2>/dev/null || true)
     [[ -n $current ]] || return 0
     new=$(image_schema "$daemon") || exit 1
@@ -185,9 +230,22 @@ require_pre_upgrade_backup() {
     ((new > old)) || return 0
     backup=$SPARROW_BACKUPS/pre-upgrade-$current
     grep -qx "image=$current" "$backup/SOURCE" 2>/dev/null || die "${daemon##*/} raises the schema \
-from $old to $new; take the named pre-upgrade backup $backup first (README.md, \"Upgrades and \
-rollback\")"
-    note "pre-upgrade backup $backup holds the store as $current left it"
+from $old to $new; take the named pre-upgrade backup first: sudo deploy/pre-upgrade-backup.sh \
+(README.md, \"Upgrades and rollback\")"
+    taken=$(sed -n 's/^taken_utc=//p' "$backup/SOURCE")
+    [[ $taken =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$ ]] \
+        || die "$backup/SOURCE records no taken_utc; retire it and take a new one with deploy/pre-upgrade-backup.sh"
+    taken_at=$(date -u -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} \
+${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s)
+    # The link's own time (no -L): when start.sh or restart.sh last pointed it at the image.
+    linked_at=$(stat -c %Y -- "$LIBEXEC/sparrowd")
+    ((taken_at >= linked_at)) || die "$backup was taken at $taken, before $current was last started \
+($(date -u -d "@$linked_at" +%Y%m%dT%H%M%SZ)); it may predate a restore. Retire it \
+(mv -T $backup $backup.retired-$taken) and take a new one: sudo deploy/pre-upgrade-backup.sh"
+    ((EPOCHSECONDS - taken_at <= PRE_UPGRADE_MAX_HOURS * 3600)) || die "$backup was taken at $taken, \
+more than $PRE_UPGRADE_MAX_HOURS hours ago; retire it (mv -T $backup $backup.retired-$taken) and take \
+a new one: sudo deploy/pre-upgrade-backup.sh"
+    note "pre-upgrade backup $backup (taken $taken) holds the store as $current left it"
 }
 
 # Point the stable names at an image pair, keeping the pair they named as .previous.
@@ -210,7 +268,9 @@ unit_active() {
 
 # The daemon's typed status over its private socket, as JSON on stdout.
 status_json() {
-    "$LIBEXEC/sparrow" "$(config_value socket_path)" status
+    local socket
+    socket=$(config_value socket_path) || exit 1
+    "$LIBEXEC/sparrow" "$socket" status
 }
 
 # One field of status_json's output.
@@ -272,16 +332,23 @@ for w in json.load(open(sys.argv[1]))["consume_watches"]:
 }
 
 # The receipt every lifecycle script ends with.
+# Each value is captured on its own line, so a failure stops the script rather than printing blank.
 receipt() {
-    local status
+    local status state pid daemon cli previous fields store schema pressure watches durability
     status=$(status_json)
-    printf 'receipt: unit=%s state=%s pid=%s\n' "$SPARROW_UNIT" \
-        "$("${SYSTEMCTL[@]}" is-active "$SPARROW_UNIT" || true)" \
-        "$("${SYSTEMCTL[@]}" show -p MainPID --value "$SPARROW_UNIT")"
-    printf 'receipt: daemon=%s cli=%s previous=%s\n' "$(readlink -- "$LIBEXEC/sparrowd")" \
-        "$(readlink -- "$LIBEXEC/sparrow")" "$(readlink -- "$LIBEXEC/sparrowd.previous" 2>/dev/null || echo none)"
+    state=$("${SYSTEMCTL[@]}" is-active "$SPARROW_UNIT" || true)
+    pid=$("${SYSTEMCTL[@]}" show -p MainPID --value "$SPARROW_UNIT")
+    daemon=$(readlink -- "$LIBEXEC/sparrowd")
+    cli=$(readlink -- "$LIBEXEC/sparrow")
+    previous=$(readlink -- "$LIBEXEC/sparrowd.previous" 2>/dev/null || echo none)
+    fields=$(python3 -I -c 'import json, sys
+v = json.load(sys.stdin)
+print(v["store_id"], v["schema_version"], v["pressure"]["phase"], len(v["consume_watches"]),
+      v["durability"]["failure"])' <<<"$status")
+    # The failure, last, may hold spaces.
+    read -r store schema pressure watches durability <<<"$fields"
+    printf 'receipt: unit=%s state=%s pid=%s\n' "$SPARROW_UNIT" "$state" "$pid"
+    printf 'receipt: daemon=%s cli=%s previous=%s\n' "$daemon" "$cli" "$previous"
     printf 'receipt: store_id=%s schema=%s pressure=%s durability_failure=%s watches=%s\n' \
-        "$(status_field store_id <<<"$status")" "$(status_field schema_version <<<"$status")" \
-        "$(status_field pressure phase <<<"$status")" "$(status_field durability failure <<<"$status")" \
-        "$(python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["consume_watches"]))' <<<"$status")"
+        "$store" "$schema" "$pressure" "$durability" "$watches"
 }
