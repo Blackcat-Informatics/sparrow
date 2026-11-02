@@ -164,32 +164,11 @@ def main(server_config, backup_root, keep, intake, extra):
     partial.mkdir()
     stopped = False
     try:
-        waited = time.monotonic()
-        while waiting_files(intake) or pending_claims(socket):
-            if time.monotonic() - waited > QUIESCE_SECONDS:
-                raise RuntimeError(
-                    f"intake not drained after {QUIESCE_SECONDS}s: {waiting_files(intake)} "
-                    f"file(s) waiting, {pending_claims(socket)} claim(s) pending")
-            time.sleep(5)
-        waited = time.monotonic() - waited
-        # Which image last opened this store, so a restore can start exactly that image
-        # (deploy/start.sh --restored-from) rather than one that would upgrade it.
-        status = daemon_status(socket)
+        # Everything that does not change while the daemon runs is copied first, before the drain
+        # wait, so the closed-store window holds only the store and the intake, and nothing slow
+        # runs between the drain check and the stop.
+        prepared = time.monotonic()
         image = selected_image()
-        (partial / "SOURCE").write_text(
-            f"data_dir={data_dir}\nserver_config={server_config}\nintake={intake}\n"
-            f"taken_utc={stamp}\ndrain_seconds={waited:.0f}\n"
-            "waiting_files=0\npending_claims=0\n"
-            f"image={image}\nstore_id={status['store_id']}\n"
-            f"schema_version={status['schema_version']}\nstore_format={status['store_format']}\n"
-            + "".join(f"extra={path}\n" for path in extra)
-        )
-        marker.write_text(f"{os.getpid()}\n")
-        started = time.monotonic()
-        stopped = True
-        systemctl("stop", UNIT)
-        copy_tree(data_dir, partial / "store")
-        copy_tree(intake, partial / "intake")
         # The image pair that last opened the store, so a restore needs nothing from ./bin.
         images = partial / "images"
         images.mkdir()
@@ -206,7 +185,36 @@ def main(server_config, backup_root, keep, intake, extra):
                 copy_tree(path, config / path.name)
             else:
                 shutil.copy2(path, config / path.name)
-        sync_tree(partial)
+        prepared = time.monotonic() - prepared
+        waited = time.monotonic()
+        while waiting_files(intake) or pending_claims(socket):
+            if time.monotonic() - waited > QUIESCE_SECONDS:
+                raise RuntimeError(
+                    f"intake not drained after {QUIESCE_SECONDS}s: {waiting_files(intake)} "
+                    f"file(s) waiting, {pending_claims(socket)} claim(s) pending")
+            time.sleep(5)
+        waited = time.monotonic() - waited
+        # Which image last opened this store, so a restore can start exactly that image
+        # (deploy/start.sh --restored-from) rather than one that would upgrade it.
+        status = daemon_status(socket)
+        if selected_image() != image:
+            raise RuntimeError(f"the image link moved from {image} during the backup")
+        (partial / "SOURCE").write_text(
+            f"data_dir={data_dir}\nserver_config={server_config}\nintake={intake}\n"
+            f"taken_utc={stamp}\ndrain_seconds={waited:.0f}\n"
+            "waiting_files=0\npending_claims=0\n"
+            f"image={image}\nstore_id={status['store_id']}\n"
+            f"schema_version={status['schema_version']}\nstore_format={status['store_format']}\n"
+            + "".join(f"extra={path}\n" for path in extra)
+        )
+        marker.write_text(f"{os.getpid()}\n")
+        started = time.monotonic()
+        stopped = True
+        systemctl("stop", UNIT)
+        stop_seconds = time.monotonic() - started
+        copy_tree(data_dir, partial / "store")
+        copy_tree(intake, partial / "intake")
+        copy_seconds = time.monotonic() - started - stop_seconds
     finally:
         if stopped:
             systemctl("start", UNIT)
@@ -222,11 +230,19 @@ def main(server_config, backup_root, keep, intake, extra):
                 fail(f"{UNIT} restarted but did not answer status within 120s")
             time.sleep(1)
     downtime = time.monotonic() - started
+    ready_seconds = downtime - stop_seconds - copy_seconds
+    # The copy becomes durable after the daemon is back, and before the rename publishes it.
+    synced = time.monotonic()
+    sync_tree(partial)
+    sync_seconds = time.monotonic() - synced
     os.rename(partial, final)
     fsync_directory(backup_root)
     backups = sorted(path for path in backup_root.iterdir() if STAMP.match(path.name))
     for old in backups[:-keep]:
         shutil.rmtree(old)
+    print(f"sparrow-backup: phases: drain wait {waited:.1f}s, copy before stop {prepared:.1f}s, "
+          f"stop {stop_seconds:.1f}s, closed copy {copy_seconds:.1f}s, restart until ready "
+          f"{ready_seconds:.1f}s, sync {sync_seconds:.1f}s")
     print(f"sparrow-backup: {final} complete; {downtime:.1f}s service downtime; "
           f"kept {min(len(backups), keep)} backup(s)")
 

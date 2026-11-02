@@ -325,9 +325,9 @@ sudo systemctl start sparrow-ship.timer
 ```
 
 `pre-upgrade-backup.sh` runs `sparrow-backup.service` once and stops at the
-first failure. The service stops the daemon through its drain, copies the
-store, intake and configuration with the image pair that last opened the
-store, and starts it again. Its `SOURCE` records that image (`image=`), the
+first failure. While the daemon runs, the service copies the configuration
+and the image pair that last opened the store. It then stops the daemon
+through its drain, copies the store and intake, and starts it again. Its `SOURCE` records that image (`image=`), the
 store's identity, schema and format, and `taken_utc`. The script accepts only
 the backup this run took, with `taken_utc` at or after its own start and
 `image=` equal to the current image, and renames it to

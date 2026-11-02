@@ -289,20 +289,46 @@ sudo deploy/uninstall.sh
 sudo mv -T /SPARROW/store /SPARROW/store.cutover
 sudo cp -a --reflink=always "$B/store" /SPARROW/store
 sudo chown -R paudley:paudley /SPARROW/store
-sed -i 's|^intake_root = .*|intake_root = "/SPARROW/intake"|' ~/.config/sparrow/ship.toml
-systemctl --user enable --now sparrow.service sparrow-ship.timer sparrow-backup.timer
+# The shipper renames queued items into the roots, so its state must share their mount; /home
+# is a separate mount. A fresh copy of the pre-cutover state, so it resends what the restored
+# store lacks.
+test ! -e /SPARROW/ship.user
+cp -a --reflink=auto ~/.local/state/sparrow/ship /SPARROW/ship.user
+sed -i -e 's|^intake_root = .*|intake_root = "/SPARROW/intake"|' \
+    -e 's|^state_dir = .*|state_dir = "/SPARROW/ship.user"|' ~/.config/sparrow/ship.toml
+grep -qx 'intake_root = "/SPARROW/intake"' ~/.config/sparrow/ship.toml
+grep -qx 'state_dir = "/SPARROW/ship.user"' ~/.config/sparrow/ship.toml
+# The old backup timer stays disabled: its unit drains the old intake root (see below).
+systemctl --user enable --now sparrow.service sparrow-ship.timer
 ~/.local/bin/sparrow /SPARROW/store/rpc.sock status | jq -r .store_id
 )
 ```
 
 The subshell stops at the first failure. Expect the store identity recorded
-before the cutover, served by `sparrowd-schema62-600ee97`. The backup was
-taken after the watches moved to `/SPARROW/intake`, so the user shipper's
-`intake_root` moves there too. Its state under `~/.local/state/sparrow/ship`
-predates the cutover, so it resends every file shipped since whose original
-still exists. Records sent directly to the system unit are lost. Keep
-`/SPARROW/store.cutover` until that loss is accepted. Reversible: run
-`install.sh` again.
+before the cutover, served by `sparrowd-schema62-600ee97`. Then:
+
+- The shipper. The backup was taken after the watches moved to
+  `/SPARROW/intake`, so the user shipper's `intake_root` moves there too.
+  The shipper moves each queued item into a root with `rename`, which fails
+  across mounts, and `/home` is a separate mount from `/`, where `/SPARROW`
+  lives. So `state_dir` moves onto that mount as well, as
+  `/SPARROW/ship.user`. That is a copy of the pre-cutover state from
+  `~/.local/state/sparrow/ship`, not the system shipper's `/SPARROW/ship`.
+  The system shipper's ledgers mark everything it shipped as delivered, and
+  the restored store lacks those records. From the older state, the user
+  shipper resends every file shipped since the backup whose original still
+  exists. `/SPARROW/ship` does not exist before `install.sh` runs, and is
+  empty until the issue's step 7.
+- The backup timer. The old user `sparrow-backup.timer` stays disabled. Its
+  unit passes `~/.local/state/sparrow/intake` as the intake root, so its drain
+  check would ignore files waiting under `/SPARROW/intake`; it had also failed
+  before the cutover. Re-enable it only after its intake argument names
+  `/SPARROW/intake`. Until then, the step 5a backup and
+  `/SPARROW/store.cutover` are the copies.
+- The system unit. Records sent directly to it are lost. Keep
+  `/SPARROW/store.cutover` until that loss is accepted.
+
+Reversible: run `install.sh` again.
 
 Unverified: `uninstall.sh` was exercised only in staged mode
 (`SPARROW_DESTDIR`) against a test instance's root, where it removes the

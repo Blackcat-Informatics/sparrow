@@ -263,19 +263,23 @@ its producer finishes a file, not as it is written.
 ## Closed-store backups
 
 Sparrow has no online checkpoint, so a consistent backup needs a closed store.
-`deploy/libexec/sparrow-backup` stops `sparrow.service` through its SIGINT
-drain, copies `data_dir`, the consume intake root, the server configuration and
-any extra paths, and starts the service again. It refuses to run when the
+`deploy/libexec/sparrow-backup` first copies, while the service still runs,
+what the daemon does not change: the image pair, the lexicon bundle, the server
+configuration and any extra paths. It then waits for the intake to drain, stops
+`sparrow.service` through its SIGINT drain, copies `data_dir` and the consume
+intake root, and starts the service again. It refuses to run when the
 service is not already active, so it never starts a service an operator
 stopped. Once it has stopped the service it restarts it after a failure or a
 SIGTERM, and the unit's `ExecStopPost` restarts it if the script is killed
 outright, guided by a marker in the runtime directory. On btrfs the copy is
 a reflink: it takes seconds at any store size and later writes never change
-it. A backup is renamed into place only after it is fully copied and
-synchronized, then the oldest beyond `KEEP` are removed. The script refuses to
+it. The copy is synchronized after the
+service answers again, so the sync is outside the closed window. Only then is
+the backup renamed into place and the oldest beyond `KEEP` removed. The script refuses to
 run unless free space covers twice the store plus 10 GiB, in case extents are
-not shared. Each backup lists its sources in `SOURCE`; the journal records the
-measured downtime. A lock prevents overlapping runs.
+not shared. Each backup lists its sources in `SOURCE`. The journal records the measured
+downtime and each phase's time: the drain wait, the copy before the stop, the
+stop, the closed copy, the restart until ready, and the sync. A lock prevents overlapping runs.
 
 `deploy/install.sh` installs it with `sparrow-backup.service`, a system unit
 that runs it as root, because it stops and starts the system unit and copies

@@ -697,6 +697,51 @@ The user-scope guard (review P2) compares the unit name without its
 guard expressions of `lib.sh` and `sparrow-backup` on the three names, without
 running a script against any unit.
 
+## Backup phases, 2026-11-02
+
+A fresh instance `R7`, driven only through `sparrow-deploytest.service`.
+`sparrow-backup` now copies the image pair, the lexicon bundle and the
+configuration before the drain wait, while the daemon runs. The closed window
+holds only the stop and the copy of the store and intake. The sync runs after
+the daemon answers again and before the rename that publishes the backup. It
+logs each phase's time (review Q1). After this run, the schema raise passed
+the guard, as in the run above.
+
+```text
+$ deploy/pre-upgrade-backup.sh
+pre-upgrade-backup.sh: backing up the store as sparrowd-schema62-cfdf2fa left it (started 20261102T170342Z)
+sparrow-backup: phases: drain wait 0.0s, copy before stop 0.2s, stop 0.1s, closed copy 0.0s, restart until ready 2.1s, sync 0.9s
+sparrow-backup: R7/backups/20261102T170342Z complete; 2.2s service downtime; kept 1 backup(s)
+pre-upgrade-backup.sh: pre-upgrade backup R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa:
+  taken_utc=20261102T170342Z
+  image=sparrowd-schema62-cfdf2fa
+  store_id=store:eec84b2318a4c60cc80b874e248d9739
+  schema_version=62
+  store_format=sparrow.store/79
+[exit 0]
+
+$ ls R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/images R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/lexicons R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/config
+R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa:
+SOURCE
+config
+images
+intake
+lexicons
+store
+
+R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/config:
+server.toml
+sparrow
+
+R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/images:
+sparrow-schema62-cfdf2fa
+sparrowd-schema62-cfdf2fa
+
+R7/backups/pre-upgrade-sparrowd-schema62-cfdf2fa/lexicons:
+lexicons-a47940e1f130bf3739c6d59aaf89643209905ea4
+[exit 0]
+```
+
 ## Not run
 
 - As root: `install.sh`'s refusal and its partial-change report,
