@@ -236,16 +236,22 @@ query-only daemon never does. `sparrow-backup` does not read the count while
 the service runs, when ingestion, expiry and eviction could still change it.
 After every worker has stopped and the final flush has succeeded, `sparrowd`
 logs `sparrowd: closed store=ID unique_payload_chunks=N`. `sparrow-backup`
-reads that line from the journal of the invocation it stopped and records `N`,
-which is exactly what the copied store holds. A backup run fails if the line is
-missing, because the daemon did not stop cleanly or its image predates the
-line. For the clock reason above, the `records` and
+reads that line from the journal of the invocation it stopped, through
+`journalctl --invocation=`, which needs systemd 257 or newer. It records `N` only
+when that daemon then exited 0; `N` is exactly what the copied store holds. Before
+the stop, it reads the running image for the line's text. An image that prints the
+line and then exits nonzero, or never logs it (a SIGKILL, for example), fails the
+backup, and nothing is published. An image that predates the line (schema 65 and
+older) still gets a published backup, which records
+`payload_chunks=unrecorded (image predates the closing count)` instead of a count.
+So a pre-upgrade backup of an older image, and nightly backups after a restore to
+one, keep working. For the clock reason above, the `records` and
 `artifact` checks run only while the window is younger than the retention window
 the daemon reports (`retention_seconds`, 30 days). After that its records have
 expired, and the script prints that both were skipped.
 
-A backup whose `SOURCE` has no `unique_payload_chunks` predates the count: the
-script skips that check, runs the others and still exits 1 as not verified. An
+A backup whose `SOURCE` has no `unique_payload_chunks` predates the count, or
+was taken from an image that predates it: the script skips that check, runs the others and still exits 1 as not verified. An
 image without query-only mode (schema 65 and older) is refused before it starts,
 because it would consume the live intake folders. Such a backup can be opened
 with a newer image instead, with `--image DAEMON`; the newer image may upgrade

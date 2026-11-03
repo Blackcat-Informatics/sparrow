@@ -311,7 +311,13 @@ the backup renamed into place and the oldest beyond `KEEP` removed. The script r
 run unless free space covers twice the store plus 10 GiB, in case extents are
 not shared. Each backup lists its sources in `SOURCE`, with the image the link names and
 the store's `live_records` before the stop and the `unique_payload_chunks` the
-stopped daemon logged in its closing line. It
+stopped daemon logged in its closing line, taken only when the daemon exited 0.
+The script reads the journal of the stopped invocation with
+`journalctl --invocation=`, which needs systemd 257 or newer. An image that
+predates the closing line (schema 65 and older) is recognised before the stop,
+from the line's text missing in the image. Its backup is still published, and
+records `payload_chunks=unrecorded (image predates the closing count)`. For an
+image that prints the line, a missing line or a nonzero exit fails the backup. It
 refuses when that image's schema number differs from the running daemon's
 `schema_version`, because then the link does not name the running image. The journal records the measured
 downtime and each phase's time: the drain wait, the copy before the stop, the

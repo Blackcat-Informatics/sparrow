@@ -269,7 +269,7 @@ chunks=$(json_field unique_payload_chunks <<<"$status") || exit 1
 unrecorded=0
 if [[ -z $expected_chunks ]]; then
     unrecorded=1
-    printf 'verify-backup: SKIP payload-chunks: %s chunks; SOURCE records no unique_payload_chunks, so this backup predates the count\n' "$chunks"
+    printf 'verify-backup: SKIP payload-chunks: %s chunks; SOURCE records no unique_payload_chunks, so this backup or its image predates the count\n' "$chunks"
 elif [[ $chunks == "$expected_chunks" ]]; then
     pass payload-chunks "$chunks unique payload chunks, as SOURCE recorded"
 else
