@@ -19,7 +19,8 @@ every watch reports no pending claims. Files are never moved under the running
 daemon, whose reserved claims bind each file's identity.
 
 Each backup records in SOURCE the image that last opened the store, with the
-store's identity, schema, format, live records and stored payload chunks, and keeps that image pair under images/
+store's identity, schema, format and live records, and the stored payload chunks
+the daemon logged once it had stopped, and keeps that image pair under images/
 and the lexicon bundle it reads under lexicons/, so `deploy/start.sh --restored-from BACKUP` can start exactly that image. Only
 timestamp-named backups are pruned; a copy under another name (README.md,
 "Upgrades and rollback": pre-upgrade-IMAGE) is kept until removed by hand.
@@ -105,6 +106,39 @@ def daemon_status(socket):
 def pending_claims(socket):
     """Sum pending consume claims from the daemon's status."""
     return sum(watch["pending_claims"] for watch in daemon_status(socket)["consume_watches"])
+
+
+def invocation_id():
+    """The running unit's invocation, whose journal the stop will write."""
+    shown = subprocess.run([*systemctl_command(), "show", "-p", "InvocationID", "--value", UNIT],
+                           check=True, capture_output=True, text=True).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", shown):
+        raise RuntimeError(f"{UNIT} reports no invocation ID ({shown!r})")
+    return shown
+
+
+CLOSED = re.compile(r"sparrowd: closed store=(\S+) unique_payload_chunks=([0-9]+)")
+
+
+def closing_chunks(invocation, store_id):
+    """The unique_payload_chunks the stopped daemon logged after its final flush. journald can
+    lag the stop briefly, so the read is retried for a bounded time."""
+    journal = ["journalctl"] + (["--user"] if SCOPE == "user" else [])
+    deadline = time.monotonic() + 30
+    while True:
+        lines = subprocess.run([*journal, "-u", UNIT, f"--invocation={invocation}", "-o", "cat",
+                                "--no-pager"], check=True, capture_output=True, text=True).stdout
+        found = [CLOSED.fullmatch(line.strip()) for line in lines.splitlines()]
+        found = [match for match in found if match]
+        if found:
+            closed_store, chunks = found[-1].groups()
+            if closed_store != store_id:
+                fail(f"the stopped daemon closed {closed_store}, not {store_id}")
+            return int(chunks)
+        if time.monotonic() > deadline:
+            fail(f"the journal of {UNIT} invocation {invocation} has no closing count; the "
+                 "daemon did not stop cleanly, or its image predates the closing count")
+        time.sleep(1)
 
 
 def selected_image():
@@ -204,16 +238,17 @@ def main(server_config, backup_root, keep, intake, extra):
         if named is None or int(named.group(1)) != status["schema_version"]:
             raise RuntimeError(f"the image link names {image}, but the running daemon reports "
                                f"schema {status['schema_version']}; the link does not name it")
-        (partial / "SOURCE").write_text(
+        source = (
             f"data_dir={data_dir}\nserver_config={server_config}\nintake={intake}\n"
             f"taken_utc={stamp}\ndrain_seconds={waited:.0f}\n"
             "waiting_files=0\npending_claims=0\n"
             f"image={image}\nstore_id={status['store_id']}\n"
             f"schema_version={status['schema_version']}\nstore_format={status['store_format']}\n"
             f"live_records={int(status['live_records'])}\n"
-            f"unique_payload_chunks={int(status['unique_payload_chunks'])}\n"
             + "".join(f"extra={path}\n" for path in extra)
         )
+        # The stopped daemon logs its closing count; this invocation's journal holds it.
+        invocation = invocation_id()
         marker.write_text(f"{os.getpid()}\n")
         started = time.monotonic()
         stopped = True
@@ -237,6 +272,10 @@ def main(server_config, backup_root, keep, intake, extra):
                 fail(f"{UNIT} restarted but did not answer status within 120s")
             time.sleep(1)
     downtime = time.monotonic() - started
+    # Read after the restart, so it adds no downtime. The count was taken once every worker
+    # had stopped, so it is exactly what the copied store holds.
+    chunks = closing_chunks(invocation, status["store_id"])
+    (partial / "SOURCE").write_text(source + f"unique_payload_chunks={chunks}\n")
     ready_seconds = downtime - stop_seconds - copy_seconds
     # The copy becomes durable after the daemon is back, and before the rename publishes it.
     synced = time.monotonic()

@@ -58,20 +58,28 @@ BACKUP=$(realpath -e -- "$1") || die "backup $1 does not exist"
 [[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup"
 [[ ! -L $BACKUP/store ]] || die "$BACKUP/store is a symbolic link; a backup holds its store itself"
 [[ -d $BACKUP/store ]] || die "$BACKUP holds no store; it is not a backup"
-# A link inside the store could lead the copy to files outside the backup.
-escapes=$(find "$BACKUP/store" -type l -printf '%p\n' | while IFS= read -r link; do
-    target=$(realpath -m -- "$link") || exit 1
-    [[ $target == "$BACKUP" || $target == "$BACKUP"/* ]] || printf '%s -> %s\n' "$link" "$target"
-done) || die "cannot inspect the links under $BACKUP/store"
-[[ -z $escapes ]] || die "$BACKUP/store holds links that resolve outside the backup: $escapes"
+# sparrow-backup copies no links, and the copy keeps an absolute one, which the daemon would
+# then follow out of the scratch directory; so a store holding any link is refused.
+link=$(find "$BACKUP/store" -type l -print -quit) || die "cannot inspect the links under $BACKUP/store"
+[[ -z $link ]] || die "$BACKUP/store holds the symbolic link $link; a backup's store holds no links"
 
 # The paths the copy must never open: the live store and socket, the intake, and the backup.
 [[ -r $SPARROW_CONFIG ]] || die "cannot read the live configuration $SPARROW_CONFIG (set \
 SPARROW_CONFIG); its data_dir and socket_path are the paths a copy must never touch"
 live_data=$(config_value data_dir) || exit 1
 live_socket=$(config_value socket_path) || exit 1
+# Also the store and intake the backup itself came from, in case SPARROW_INTAKE names another.
+recorded=()
+for key in data_dir intake; do
+    value=$(sed -n "s/^$key=//p" "$BACKUP/SOURCE" | head -n 1)
+    [[ -z $value ]] || recorded+=("$value")
+done
+if [[ -r $BACKUP/config/server.toml ]]; then
+    value=$(sed -n -e '/^\[/q' -e 's/^data_dir *= *"\([^"]*\)".*/\1/p' "$BACKUP/config/server.toml" | head -n 1)
+    [[ -z $value ]] || recorded+=("$value")
+fi
 guarded=()
-for path in "$live_data" "$live_socket" "$SPARROW_INTAKE" "$BACKUP"; do
+for path in "$live_data" "$live_socket" "$SPARROW_INTAKE" "$BACKUP" "${recorded[@]}"; do
     resolved=$(realpath -m -- "$path") || exit 1
     guarded+=("$resolved")
 done
@@ -327,7 +335,10 @@ stopped=0
 wait "$PID" || stopped=$?
 PID=''
 ((stopped == 0)) || fail shutdown "the daemon exited with status $stopped after SIGINT"
-pass shutdown "the daemon stopped cleanly; removing $SCRATCH"
+# The closing count sparrow-backup records comes from this same line of the live daemon.
+grep -qx "sparrowd: closed store=$store unique_payload_chunks=$chunks" -- "$LOG" \
+    || fail shutdown "the daemon did not log its closing count of $chunks unique payload chunks"
+pass shutdown "the daemon stopped cleanly and logged $chunks unique payload chunks; removing $SCRATCH"
 if ((unrecorded)); then
     printf 'verify-backup: NOT VERIFIED: SOURCE records no unique_payload_chunks; take a new backup with sparrow-backup\n' >&2
     exit 1

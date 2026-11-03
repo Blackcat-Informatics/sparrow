@@ -201,12 +201,13 @@ deploy/verify-backup.sh /SPARROW/backups/NAME; echo "exit=$?"
 The script reads the live `data_dir` and `socket_path` from `SPARROW_CONFIG`
 (default `/etc/sparrow/server.toml`) and refuses to run when it cannot read
 them, since those are the paths a copy must never touch. It refuses a
-`BACKUP/store` that is a symbolic link or holds a link leading outside the
-backup. It reflinks `BACKUP/store` into a scratch directory below
+`BACKUP/store` that is a symbolic link or holds one: `sparrow-backup` copies no
+links, and a copied absolute link would lead the daemon out of the copy. It reflinks `BACKUP/store` into a scratch directory below
 `/SPARROW/verify/` (`SPARROW_VERIFY` overrides it), so the backup itself is
 never opened. Before it creates that directory, and again on the copy, it
 refuses any path that resolves under the live store, the live socket, the intake
-or the backup. It writes a configuration for the copy with its own socket and
+(`SPARROW_INTAKE`), the backup, or the `data_dir` and `intake` the backup itself
+records in `SOURCE` and its configuration copy. It writes a configuration for the copy with its own socket and
 the lexicon bundle the backup keeps, and starts the image in `BACKUP/images/`
 that `SOURCE` names with `--query-only`. In that mode the daemon opens no watch
 root, claims no file, runs no retention or eviction and refuses every write
@@ -222,7 +223,7 @@ copy. The script then prints one line per check:
 | `payload-chunks` | The copy's `unique_payload_chunks` equals the count `SOURCE` recorded |
 | `records` | A `records` window over the hour before `taken_utc` returns rows |
 | `artifact` | The first row's artifact reads back to the BLAKE3 digest its catalog row records |
-| `shutdown` | The daemon exits 0 after SIGINT |
+| `shutdown` | The daemon exits 0 after SIGINT and logs its closing payload chunk count |
 
 It exits 1 at the first failed check, and always stops the daemon and removes
 the scratch copy.
@@ -231,10 +232,14 @@ The count check uses stored payload chunks rather than live records. A record is
 live only until its retention deadline, measured by the reader's clock, so a
 copy verified later reports fewer live records than the backup recorded, even
 when it is intact. Payload chunks change only when evidence is retired, which a
-query-only daemon never does. `sparrow-backup` reads the count just before it
-stops the service. A producer that ingests through TCP, or pressure eviction,
-in the second before the stop can change it, and then the check fails on an
-intact backup; take another backup. For the same reason, the `records` and
+query-only daemon never does. `sparrow-backup` does not read the count while
+the service runs, when ingestion, expiry and eviction could still change it.
+After every worker has stopped and the final flush has succeeded, `sparrowd`
+logs `sparrowd: closed store=ID unique_payload_chunks=N`. `sparrow-backup`
+reads that line from the journal of the invocation it stopped and records `N`,
+which is exactly what the copied store holds. A backup run fails if the line is
+missing, because the daemon did not stop cleanly or its image predates the
+line. For the clock reason above, the `records` and
 `artifact` checks run only while the window is younger than the retention window
 the daemon reports (`retention_seconds`, 30 days). After that its records have
 expired, and the script prints that both were skipped.

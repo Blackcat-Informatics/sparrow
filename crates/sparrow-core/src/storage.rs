@@ -2349,6 +2349,12 @@ impl Store {
         })
     }
 
+    /// Count stored payload chunks, the `unique_payload_chunks` of status, without the
+    /// record census. It changes only when evidence is ingested or retired.
+    pub fn unique_payload_chunks(&self) -> Result<u64, Error> {
+        self.lock()?.count_prefix("ref:")
+    }
+
     /// Report measured database bytes and deduplicated live payload references.
     pub fn status(&self, now: u64) -> Result<Value, Error> {
         let ReadLeaseStats {

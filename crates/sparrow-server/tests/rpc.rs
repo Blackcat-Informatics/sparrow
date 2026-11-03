@@ -4282,9 +4282,9 @@ fn verify_backup_fails_on_wrong_store_id() {
 }
 
 /// INVARIANT: verify-backup.sh never starts a daemon that could reach the live store or the
-/// live intake: it refuses a backup whose store is a link (here, to the live data_dir), and it
-/// refuses the backup's own image when that image has no query-only mode, without running it
-/// with a configuration.
+/// live intake: it refuses a backup whose store is or holds a link (here, to the live
+/// data_dir), and it refuses the backup's own image when that image has no query-only mode,
+/// without running it with a configuration.
 #[test]
 fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
     use std::os::unix::fs::PermissionsExt;
@@ -4313,6 +4313,23 @@ fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
         0,
         "the live store is untouched"
     );
+
+    // A link inside the store is refused too, even one that stays inside the backup.
+    let inner = backup.join("store").join("inner-link");
+    std::os::unix::fs::symlink(backup.join("SOURCE"), &inner).unwrap();
+    let (code, stdout, stderr) = verify_backup(
+        &backup,
+        &verify,
+        &live,
+        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("holds the symbolic link"), "{stderr}");
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
+    std::fs::remove_file(&inner).unwrap();
 
     // The backup's own pre-query-only image: it prints the old usage line, and marks any run
     // that passes it arguments.

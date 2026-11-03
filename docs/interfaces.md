@@ -420,7 +420,9 @@ as when the store was closed. Opening a store last written by the schema 62
 image left its format, `sparrow.store/92`, unchanged. A store that still owes the
 table rewrite reports `recompression` as `running`, but the rewrite never runs.
 The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
-at shutdown. Query captures use anonymous temporary files that leave no name
+at shutdown. Every daemon, query-only or not, ends a clean shutdown by logging
+`sparrowd: closed store=ID unique_payload_chunks=N` once its workers have stopped
+and its final flush has succeeded; `sparrow-backup` records that count. Query captures use anonymous temporary files that leave no name
 behind.
 
 Schema 66 adds `Status.queryOnly`, true in this mode, and

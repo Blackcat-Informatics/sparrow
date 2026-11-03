@@ -310,7 +310,8 @@ service answers again, so the sync is outside the closed window. Only then is
 the backup renamed into place and the oldest beyond `KEEP` removed. The script refuses to
 run unless free space covers twice the store plus 10 GiB, in case extents are
 not shared. Each backup lists its sources in `SOURCE`, with the image the link names and
-the store's `live_records` and `unique_payload_chunks` before the stop. It
+the store's `live_records` before the stop and the `unique_payload_chunks` the
+stopped daemon logged in its closing line. It
 refuses when that image's schema number differs from the running daemon's
 `schema_version`, because then the link does not name the running image. The journal records the measured
 downtime and each phase's time: the drain wait, the copy before the stop, the
