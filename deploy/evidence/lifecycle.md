@@ -1107,6 +1107,180 @@ R10/data/store.cutover exists, but this revert did not set it aside (R10/data/st
 [exit 1]
 ```
 
+## The closing count through a real stop, 2026-11-03
+
+A fresh instance, `TEST` as above, on images built from `a3b53f1` (store schema
+66) by `make install-bin`, driven only through `sparrow-deploytest.service` in
+user scope. `sparrow-backup` runs as `pre-upgrade-backup.sh` runs it in user
+scope, with `RUNTIME_DIRECTORY` and the scope, unit, prefix, configuration,
+backups and intake from `deploy/test-instance.sh env`. The live
+`sparrow.service` kept one invocation through the whole run.
+
+A clean stop. The backup reads the unit's invocation ID before the stop, then
+reads that invocation's journal under the user manager after the restart, and
+records the count the stopped daemon logged:
+
+```text
+$ deploy/start.sh
+start.sh: starting sparrow-deploytest.service on sparrowd-schema66-a3b53f1
+receipt: unit=sparrow-deploytest.service state=active pid=2826181
+receipt: daemon=sparrowd-schema66-a3b53f1 cli=sparrow-schema66-a3b53f1 previous=none
+receipt: store_id=store:0f986cf28d35acc1e163479422f5dcf0 schema=66 pressure=ready durability_failure=None watches=1
+[exit 0]
+
+$ cp $TEST/data/probe.jsonl $TEST/data/intake/deploytest/probe-1.jsonl
+[exit 0]
+
+$ timeout 120 bash -c "while [ -e $TEST/data/intake/deploytest/probe-1.jsonl ]; do sleep 1; done; echo consumed"
+consumed
+[exit 0]
+
+$ systemctl --user show -p InvocationID --value $SPARROW_UNIT
+d155b82a63c2464a915d6fe8ba2c825a
+[exit 0]
+
+$ mkdir -p $TEST/rt && RUNTIME_DIRECTORY=$TEST/rt python3 -I $SPARROW_PREFIX/libexec/sparrow/sparrow-backup $SPARROW_CONFIG $SPARROW_BACKUPS 3 $SPARROW_INTAKE $(dirname $SPARROW_CONFIG)
+sparrow-backup: phases: drain wait 0.0s, copy before stop 0.1s, stop 0.1s, closed copy 0.0s, restart until ready 2.2s, sync 0.7s
+sparrow-backup: TEST/backups/20261103T141651Z complete; 2.3s service downtime; kept 1 backup(s)
+[exit 0]
+
+$ ls $SPARROW_BACKUPS
+20261103T141651Z
+[exit 0]
+
+$ cat $SPARROW_BACKUPS/2*Z/SOURCE
+data_dir=TEST/data/store
+server_config=TEST/root/etc/sparrow/server.toml
+intake=TEST/data/intake
+taken_utc=20261103T141651Z
+drain_seconds=0
+waiting_files=0
+pending_claims=0
+image=sparrowd-schema66-a3b53f1
+store_id=store:0f986cf28d35acc1e163479422f5dcf0
+schema_version=66
+store_format=sparrow.store/79
+live_records=1
+extra=TEST/root/etc/sparrow
+unique_payload_chunks=1
+[exit 0]
+```
+
+The invocation lookup by hand, under the user manager, and the restarted unit's
+new invocation:
+
+```text
+$ journalctl --user -u $SPARROW_UNIT --invocation=d155b82a63c2464a915d6fe8ba2c825a -o cat --no-pager | grep -E "^sparrowd: closed "
+sparrowd: closed store=store:0f986cf28d35acc1e163479422f5dcf0 unique_payload_chunks=1
+[exit 0]
+
+$ systemctl --user show -p ActiveState,InvocationID $SPARROW_UNIT
+ActiveState=active
+InvocationID=a720989a538847e28988a3773228e7d3
+[exit 0]
+```
+
+`verify-backup.sh` refuses a scratch root under `TEST`, since the copy's socket
+path would exceed the Unix limit; nothing is copied:
+
+```text
+$ mkdir -p $TEST/verify && SPARROW_VERIFY=$TEST/verify deploy/verify-backup.sh $SPARROW_BACKUPS/20261103T141651Z
+verify-backup.sh: socket path TEST/verify/verify-pelFrT/store/verify.sock is 110 bytes; a Unix socket path is limited to 107. Choose a shorter data_dir (for a test instance, a shorter SCRATCH)
+[exit 1]
+
+$ ls -A $TEST/verify
+[exit 0]
+```
+
+Under the default scratch root `/SPARROW/verify`, which is on the backup's
+btrfs filesystem and outside the live store, every check passes and the copy is
+removed:
+
+```text
+$ SPARROW_VERIFY=/SPARROW/verify deploy/verify-backup.sh $SPARROW_BACKUPS/20261103T141651Z
+verify-backup: PASS query-only: status and startup report query_only; no stored watch root is open
+verify-backup: PASS store-id: store:0f986cf28d35acc1e163479422f5dcf0
+verify-backup: PASS status: ready, schema 66, format sparrow.store/79
+verify-backup: PASS payload-chunks: 1 unique payload chunks, as SOURCE recorded
+verify-backup: PASS records: 1 rows on the first page between 2026-11-03T13:16:51Z and 2026-11-03T14:16:52Z
+verify-backup: PASS artifact: artifact:86bda214ee7d63314b6ae01f03383cda: 37 bytes read back to blake3:e7617fa7ba21e504e9c328ae68da4293500dbe566ce74c89f6143e0da2b5a52b
+verify-backup: PASS shutdown: the daemon stopped cleanly and logged 1 unique payload chunks; removing /SPARROW/verify/verify-TWucCS
+verify-backup: TEST/backups/20261103T141651Z verified
+[exit 0]
+
+$ ls -A /SPARROW/verify
+[exit 0]
+```
+
+A SIGKILL instead of a clean stop. A drop-in that exists only for the test
+unit sets `KillSignal=SIGKILL`, so the `systemctl stop` that `sparrow-backup`
+issues kills the daemon before it can flush and log its closing count. The
+backup waits 30 seconds for the count, fails, and publishes nothing: only the
+unpublished `.partial-STAMP` stays, and the unit runs again on a new
+invocation:
+
+```text
+$ mkdir -p $DROPIN && printf "[Service]\nKillSignal=SIGKILL\n" > $DROPIN/kill.conf && systemctl --user daemon-reload && systemctl --user show -p KillSignal,ActiveState,InvocationID $SPARROW_UNIT
+ActiveState=active
+InvocationID=a720989a538847e28988a3773228e7d3
+KillSignal=9
+[exit 0]
+
+$ RUNTIME_DIRECTORY=$TEST/rt python3 -I $SPARROW_PREFIX/libexec/sparrow/sparrow-backup $SPARROW_CONFIG $SPARROW_BACKUPS 3 $SPARROW_INTAKE $(dirname $SPARROW_CONFIG)
+sparrow-backup: the journal of sparrow-deploytest.service invocation a720989a538847e28988a3773228e7d3 has no closing count; the daemon did not stop cleanly, or its image predates the closing count
+[exit 1]
+
+$ ls -A $SPARROW_BACKUPS
+.lock
+.partial-20261103T141731Z
+20261103T141651Z
+[exit 0]
+
+$ systemctl --user show -p ActiveState,InvocationID $SPARROW_UNIT
+ActiveState=active
+InvocationID=58a862963f8a4d15ae27f855b091cb15
+[exit 0]
+
+$ rm -r $DROPIN && systemctl --user daemon-reload && systemctl --user show -p KillSignal $SPARROW_UNIT
+KillSignal=2
+[exit 0]
+```
+
+The journal of the run so far holds one closing line, from the clean stop, and
+none for the killed invocation. The next clean backup removes the leftover
+partial copy and publishes normally:
+
+```text
+$ journalctl --user -u $SPARROW_UNIT --since "-5min" -o cat --no-pager | grep -E "Main process exited|closed store|Stopped|Started"
+Started Sparrow deploy test instance (deploy/test-instance.sh).
+sparrowd: closed store=store:0f986cf28d35acc1e163479422f5dcf0 unique_payload_chunks=1
+Stopped Sparrow deploy test instance (deploy/test-instance.sh).
+Started Sparrow deploy test instance (deploy/test-instance.sh).
+sparrow-deploytest.service: Main process exited, code=killed, status=9/KILL
+Stopped Sparrow deploy test instance (deploy/test-instance.sh).
+Started Sparrow deploy test instance (deploy/test-instance.sh).
+[exit 0]
+
+$ RUNTIME_DIRECTORY=$TEST/rt python3 -I $SPARROW_PREFIX/libexec/sparrow/sparrow-backup $SPARROW_CONFIG $SPARROW_BACKUPS 3 $SPARROW_INTAKE $(dirname $SPARROW_CONFIG)
+sparrow-backup: phases: drain wait 0.7s, copy before stop 6.6s, stop 0.4s, closed copy 0.0s, restart until ready 2.2s, sync 4.0s
+sparrow-backup: TEST/backups/20261103T141834Z complete; 2.6s service downtime; kept 2 backup(s)
+[exit 0]
+
+$ ls -A $SPARROW_BACKUPS
+.lock
+20261103T141651Z
+20261103T141834Z
+[exit 0]
+
+$ grep -h unique_payload_chunks $SPARROW_BACKUPS/2*Z/SOURCE
+unique_payload_chunks=1
+unique_payload_chunks=1
+[exit 0]
+```
+
+`deploy/test-instance.sh teardown` then removed the test unit; the live
+`sparrow.service` reported the same invocation ID before and after.
+
 ## Not run
 
 - As root: `install.sh`'s refusal and its partial-change report,
