@@ -140,14 +140,15 @@ impl Rpc {
         self
     }
 
-    /// The typed service a connection receives: the complete one, or behind the
-    /// query-only write refusal. Every Unix connection and CHAP session takes this path.
+    /// The write gate in front of this service; every connection's capability is one.
+    pub(crate) fn into_gate(self) -> crate::query_only::WriteGate {
+        let query_only = self.query_only;
+        crate::query_only::WriteGate::new(self, query_only)
+    }
+
+    /// The typed service a Unix connection or CHAP session receives, behind the write gate.
     pub(crate) fn into_client(self) -> wire::sparrow::Client {
-        if self.query_only {
-            capnp_rpc::new_client(crate::query_only::QueryOnly::new(self))
-        } else {
-            capnp_rpc::new_client(self)
-        }
+        capnp_rpc::new_client(self.into_gate())
     }
 
     /// Persistent store identity bound into CHAP responses.
@@ -2736,6 +2737,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_active_pins(number(&value, "active_pins")?);
                 out.set_unique_json_projections(number(&value, "unique_json_projections")?);
                 out.set_retry_window_seconds(number(&value, "retry_window_seconds")?);
+                out.set_retention_seconds(number(&value, "retention_seconds")?);
                 out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_pin_members(number(&value, "max_pin_members")?);

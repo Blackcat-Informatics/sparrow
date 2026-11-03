@@ -5,8 +5,8 @@
 
 use super::import::{IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportManifest};
 use super::{
-    Artifact, Catalog, DAY, Error, RETRY_WINDOW, Record, Store, Writer, blake3, field, hex, ingest,
-    integer, json, parse, put, random_id, read_chunk_range, read_field, retire,
+    Artifact, Catalog, Error, RETENTION_MS, RETRY_WINDOW, Record, Store, Writer, blake3, field,
+    hex, ingest, integer, json, parse, put, random_id, read_chunk_range, read_field, retire,
 };
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
@@ -90,7 +90,7 @@ impl Catalog for ImportPreparation {
         if !progress.artifact_id.starts_with("artifact:")
             || progress.prepared_records > progress.total_records
             || progress.reclaimed_records > progress.prepared_records
-            || progress.received_at.checked_add(30 * DAY) != Some(progress.expires_at)
+            || progress.received_at.checked_add(RETENTION_MS) != Some(progress.expires_at)
             || progress.raw.as_ref().is_some_and(|raw| {
                 raw.record_index != progress.prepared_records
                     || progress.prepared_records == progress.total_records
@@ -312,7 +312,7 @@ impl Store {
                         "preparation begins at record ordinal zero",
                     ));
                 }
-                let expires_at = now.checked_add(30 * DAY).ok_or_else(|| {
+                let expires_at = now.checked_add(RETENTION_MS).ok_or_else(|| {
                     Error::new("INVALID_ARGUMENT", "publication retention overflow")
                 })?;
                 crate::format_instant(expires_at)

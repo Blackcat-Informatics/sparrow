@@ -310,7 +310,7 @@ service answers again, so the sync is outside the closed window. Only then is
 the backup renamed into place and the oldest beyond `KEEP` removed. The script refuses to
 run unless free space covers twice the store plus 10 GiB, in case extents are
 not shared. Each backup lists its sources in `SOURCE`, with the image the link names and
-the store's `live_records` before the stop. It
+the store's `live_records` and `unique_payload_chunks` before the stop. It
 refuses when that image's schema number differs from the running daemon's
 `schema_version`, because then the link does not name the running image. The journal records the measured
 downtime and each phase's time: the drain wait, the copy before the stop, the
@@ -360,8 +360,8 @@ exercised; the drill covers only reading a restored store. `deploy/RECOVERY.md`,
 verify the backup with `deploy/verify-backup.sh BACKUP` (`deploy/RECOVERY.md`,
 "Verify a backup"). It opens a reflinked copy with `sparrowd --query-only`,
 which opens no watch root and refuses every write, and checks the store
-identity, status, the live record count, a records window and one artifact's
-bytes. A backup counts as verified only after the script passes on it.
+identity, status, the stored payload chunk count, and, within the retention
+window, a records window and one artifact's bytes. A backup counts as verified only after the script passes on it.
 
 This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live

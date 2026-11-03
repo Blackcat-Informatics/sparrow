@@ -5,34 +5,46 @@
 # Verify a closed-store backup end to end (RECOVERY.md, "Verify a backup"). The backup's store is
 # reflinked into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), and the image
 # the backup recorded opens that copy in query-only mode, so no watch root is opened, no file is
-# claimed and nothing is retired. The script checks the store identity, status, the live record
-# count, a records window over the backup's newest hour and one artifact's bytes against its
-# catalog digest, then stops the daemon with SIGINT and removes the copy. It prints one line per
-# check and exits 1 at the first failed one. It never starts a daemon on the live store, socket or
-# intake: it refuses a scratch path that resolves under /SPARROW/store or SPARROW_INTAKE.
+# claimed and nothing is retired. The script checks the store identity, status and the stored
+# payload chunk count, and, while the backup is younger than the retention window, a records window
+# over its newest hour and one artifact's bytes against its catalog digest. It then stops the
+# daemon with SIGINT and removes the copy. It prints one line per check and exits 1 at the first
+# failed one. It never starts a daemon on the live store, socket or intake: the live data_dir and
+# socket_path come from SPARROW_CONFIG, and it refuses without them, refuses a backup store that is
+# or holds a symlink leading outside the backup, and refuses any scratch path that resolves under
+# the live store, socket, intake or the backup.
 set -euo pipefail
 umask 077
 
 usage() {
     cat <<'USAGE'
-Usage: deploy/verify-backup.sh [--time-records] [--image DAEMON] BACKUP
+Usage: deploy/verify-backup.sh [--time-records] [--window FROM BEFORE] [--image DAEMON] BACKUP
 
 Copy BACKUP/store into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), open
 the copy query-only with the image BACKUP/SOURCE records, and check it. A backup counts as
-verified only once this exits 0.
+verified only once this exits 0. SPARROW_CONFIG (default /etc/sparrow/server.toml) must be
+readable: its data_dir and socket_path are the live paths the copy must never touch.
 
---time-records  after the checks, print five elapsed times of the one-hour records window
+--time-records  after the checks, print five elapsed times of the records window
+--window FROM BEFORE
+                the RFC 3339 records window to check and time (default: the hour before
+                taken_utc); it must be younger than the retention window
 --image DAEMON  open the copy with DAEMON instead (its CLI is the sibling sparrow or
                 sparrow-SUFFIX); a newer image may upgrade the disposable copy as it opens it
 USAGE
 }
 
-TIME_RECORDS=0 IMAGE_OVERRIDE=''
+TIME_RECORDS=0 IMAGE_OVERRIDE='' WINDOW_FROM='' WINDOW_BEFORE=''
 while (($#)); do
     case $1 in
         -h | --help) usage; exit 0 ;;
         --time-records) TIME_RECORDS=1; shift ;;
         --image) IMAGE_OVERRIDE=${2:?--image needs a daemon image}; shift 2 ;;
+        --window)
+            WINDOW_FROM=${2:?--window needs FROM and BEFORE}
+            WINDOW_BEFORE=${3:?--window needs FROM and BEFORE}
+            shift 3
+            ;;
         -*) printf 'verify-backup.sh: unknown option %s (see --help)\n' "$1" >&2; exit 2 ;;
         *) break ;;
     esac
@@ -41,10 +53,36 @@ done
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
-LIVE_STORE=/SPARROW/store
 VERIFY_ROOT=${SPARROW_VERIFY:-/SPARROW/verify}
 BACKUP=$(realpath -e -- "$1") || die "backup $1 does not exist"
-[[ -r $BACKUP/SOURCE && -d $BACKUP/store ]] || die "$BACKUP holds no SOURCE and store; it is not a backup"
+[[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup"
+[[ ! -L $BACKUP/store ]] || die "$BACKUP/store is a symbolic link; a backup holds its store itself"
+[[ -d $BACKUP/store ]] || die "$BACKUP holds no store; it is not a backup"
+# A link inside the store could lead the copy to files outside the backup.
+escapes=$(find "$BACKUP/store" -type l -printf '%p\n' | while IFS= read -r link; do
+    target=$(realpath -m -- "$link") || exit 1
+    [[ $target == "$BACKUP" || $target == "$BACKUP"/* ]] || printf '%s -> %s\n' "$link" "$target"
+done) || die "cannot inspect the links under $BACKUP/store"
+[[ -z $escapes ]] || die "$BACKUP/store holds links that resolve outside the backup: $escapes"
+
+# The paths the copy must never open: the live store and socket, the intake, and the backup.
+[[ -r $SPARROW_CONFIG ]] || die "cannot read the live configuration $SPARROW_CONFIG (set \
+SPARROW_CONFIG); its data_dir and socket_path are the paths a copy must never touch"
+live_data=$(config_value data_dir) || exit 1
+live_socket=$(config_value socket_path) || exit 1
+guarded=()
+for path in "$live_data" "$live_socket" "$SPARROW_INTAKE" "$BACKUP"; do
+    resolved=$(realpath -m -- "$path") || exit 1
+    guarded+=("$resolved")
+done
+# Refuse PATH (as RESOLVED) when it is, or lies under, a guarded path.
+guard() {
+    local path=$1 resolved=$2 protected
+    for protected in "${guarded[@]}"; do
+        [[ $resolved != "$protected" && $resolved != "$protected"/* ]] \
+            || die "$path resolves to $resolved, under $protected; refusing to start a daemon there"
+    done
+}
 
 pass() { printf 'verify-backup: PASS %s: %s\n' "$1" "$2"; }
 fail() {
@@ -70,7 +108,7 @@ print(json.dumps(v) if isinstance(v,(dict,list,bool)) or v is None else v)' "$@"
 
 expected_store=$(source_value store_id)
 [[ -n $expected_store ]] || die "$BACKUP/SOURCE records no store_id"
-expected_records=$(source_value live_records)
+expected_chunks=$(source_value unique_payload_chunks)
 taken=$(source_value taken_utc)
 [[ -n $taken ]] || die "$BACKUP/SOURCE records no taken_utc"
 # sparrow-backup writes a compact stamp (20261103T014038Z); older backups an RFC 3339 instant.
@@ -78,8 +116,15 @@ if [[ $taken =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$
     taken="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}T${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}Z"
 fi
 taken_seconds=$(date -u -d "$taken" +%s) || die "$BACKUP/SOURCE taken_utc $taken is not a time"
-window_from=$(date -u -d "@$((taken_seconds - 3600))" +%Y-%m-%dT%H:%M:%SZ) || exit 1
-window_before=$(date -u -d "@$((taken_seconds + 1))" +%Y-%m-%dT%H:%M:%SZ) || exit 1
+if [[ -n $WINDOW_FROM ]]; then
+    from_seconds=$(date -u -d "$WINDOW_FROM" +%s) || die "--window FROM $WINDOW_FROM is not a time"
+    before_seconds=$(date -u -d "$WINDOW_BEFORE" +%s) || die "--window BEFORE $WINDOW_BEFORE is not a time"
+    ((from_seconds < before_seconds)) || die "--window FROM must be earlier than BEFORE"
+else
+    from_seconds=$((taken_seconds - 3600)) before_seconds=$((taken_seconds + 1))
+fi
+window_from=$(date -u -d "@$from_seconds" +%Y-%m-%dT%H:%M:%SZ) || exit 1
+window_before=$(date -u -d "@$before_seconds" +%Y-%m-%dT%H:%M:%SZ) || exit 1
 
 if [[ -n $IMAGE_OVERRIDE ]]; then
     daemon=$(realpath -e -- "$IMAGE_OVERRIDE") || die "image $IMAGE_OVERRIDE does not exist"
@@ -130,6 +175,8 @@ for key in min_free_bytes buffered_flush_interval_ms; do
     [[ -z $value ]] || limits+=("$key = $value")
 done
 
+verify_root=$(realpath -m -- "$VERIFY_ROOT") || exit 1
+guard "$VERIFY_ROOT" "$verify_root"
 mkdir -p -- "$VERIFY_ROOT"
 SCRATCH=$(mktemp -d -- "$VERIFY_ROOT/verify-XXXXXX") || exit 1
 DATA=$SCRATCH/store SOCKET=$SCRATCH/store/verify.sock CONFIG=$SCRATCH/server.toml LOG=$SCRATCH/daemon.log
@@ -150,16 +197,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# Every path the daemon will own resolves outside the live store, the intake and the backup.
-live=$(realpath -m -- "$LIVE_STORE") || exit 1
-intake=$(realpath -m -- "$SPARROW_INTAKE") || exit 1
-for path in "$DATA" "$SOCKET"; do
-    resolved=$(realpath -m -- "$path") || exit 1
-    for guarded in "$live" "$intake" "$BACKUP"; do
-        [[ $resolved != "$guarded" && $resolved != "$guarded"/* ]] \
-            || die "scratch path $path resolves to $resolved, under $guarded; refusing to start a daemon there"
-    done
-done
+# Every path the daemon will own resolves outside the guarded paths, before and after the copy.
+scratch=$(realpath -e -- "$SCRATCH") || exit 1
+guard "$SCRATCH" "$scratch"
 require_socket_length "$SOCKET"
 
 cp -a --reflink=always -- "$BACKUP/store" "$DATA" \
@@ -170,6 +210,13 @@ cp -a --reflink=always -- "$BACKUP/store" "$DATA" \
     printf 'max_concurrent_requests = 4\nmax_rpc_connections = 16\n'
     printf '%s\n' "${limits[@]}"
 } >"$CONFIG"
+for path in "$DATA" "$CONFIG"; do
+    resolved=$(realpath -e -- "$path") || die "the scratch copy $path is missing"
+    guard "$path" "$resolved"
+done
+socket_dir=$(realpath -e -- "${SOCKET%/*}") || exit 1
+guard "$SOCKET" "$socket_dir/${SOCKET##*/}"
+[[ ! -L $DATA && ! -e $SOCKET ]] || die "the scratch copy $DATA is a link or already holds $SOCKET"
 
 "$daemon" --config "$CONFIG" --query-only 2>"$LOG" >/dev/null &
 PID=$!
@@ -208,48 +255,61 @@ durability=$(json_field durability failure <<<"$status") || exit 1
     || fail status "pressure phase $phase, durability failure $durability"
 pass status "ready, schema $(json_field schema_version <<<"$status"), format $(json_field store_format <<<"$status")"
 
-records=$(json_field live_records <<<"$status") || exit 1
+# Unique payload chunks change only when evidence is retired, which a query-only daemon never
+# does, so the copy holds exactly the count sparrow-backup recorded, however old it is.
+chunks=$(json_field unique_payload_chunks <<<"$status") || exit 1
 unrecorded=0
-if [[ -z $expected_records ]]; then
+if [[ -z $expected_chunks ]]; then
     unrecorded=1
-    printf 'verify-backup: SKIP live-records: %s live; SOURCE records no live_records, so this backup predates the count\n' "$records"
-elif ((records >= expected_records)); then
-    pass live-records "$records live, SOURCE recorded $expected_records"
+    printf 'verify-backup: SKIP payload-chunks: %s chunks; SOURCE records no unique_payload_chunks, so this backup predates the count\n' "$chunks"
+elif [[ $chunks == "$expected_chunks" ]]; then
+    pass payload-chunks "$chunks unique payload chunks, as SOURCE recorded"
 else
-    fail live-records "$records live, fewer than the $expected_records SOURCE recorded"
+    fail payload-chunks "the copy holds $chunks unique payload chunks, but SOURCE recorded $expected_chunks"
 fi
 
+# Records expire by the reader's clock, so the window answers only while all of it is younger
+# than the retention window the daemon reports.
+retention=$(json_field retention_seconds <<<"$status") || exit 1
+[[ $retention =~ ^[0-9]+$ ]] || fail status "status reports no retention_seconds"
+now_seconds=$(date -u +%s) || exit 1
 window=(records --received-from "$window_from" --received-before "$window_before")
-page=$("$cli" "$SOCKET" "${window[@]}") || fail records "the records window did not answer"
-rows=$(json_field rows <<<"$page" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))') || exit 1
-((rows > 0)) || fail records "no records were received between $window_from and $window_before"
-pass records "$rows rows on the first page between $window_from and $window_before"
+if ((now_seconds < from_seconds + retention)); then
+    page=$("$cli" "$SOCKET" "${window[@]}") || fail records "the records window did not answer"
+    rows=$(json_field rows <<<"$page" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))') || exit 1
+    ((rows > 0)) || fail records "no records were received between $window_from and $window_before"
+    pass records "$rows rows on the first page between $window_from and $window_before"
 
-artifact=$(json_field rows 0 artifact_id <<<"$page") || exit 1
-# The CLI has no artifact command; MCP artifact_get reads the same typed catalog row.
-metadata=$(printf '%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"verify-backup","version":"1"}}}' \
-    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"artifact_get\",\"arguments\":{\"store_id\":\"$store\",\"id\":\"$artifact\"}}}" \
-    | "$cli" "$SOCKET" mcp --stdio) || fail artifact "MCP artifact_get did not answer"
-read -r payload length < <(python3 -I -c 'import json,sys
+    artifact=$(json_field rows 0 artifact_id <<<"$page") || exit 1
+    # The CLI has no artifact command; MCP artifact_get reads the same typed catalog row.
+    metadata=$(printf '%s\n' \
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"verify-backup","version":"1"}}}' \
+        '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"artifact_get\",\"arguments\":{\"store_id\":\"$store\",\"id\":\"$artifact\"}}}" \
+        | "$cli" "$SOCKET" mcp --stdio) || fail artifact "MCP artifact_get did not answer"
+    read -r payload length < <(python3 -I -c 'import json,sys
 for line in sys.stdin:
     reply=json.loads(line)
     if reply.get("id")==2:
         value=reply["result"]["structuredContent"]
         print(value["payload_id"], value["byte_length"])' <<<"$metadata") || fail artifact "no catalog row for $artifact"
-[[ $payload == blake3:* && $length =~ ^[0-9]+$ ]] || fail artifact "malformed catalog row for $artifact"
-bytes=$SCRATCH/artifact.bytes chunk=$SCRATCH/artifact.chunk
-: >"$bytes"
-for ((offset = 0; offset < length; offset += 1048576)); do
-    size=$((length - offset < 1048576 ? length - offset : 1048576))
-    "$cli" "$SOCKET" bytes "$store" "$artifact" "$offset" "$size" "$chunk" >/dev/null \
-        || fail artifact "reading $artifact at offset $offset failed"
-    cat -- "$chunk" >>"$bytes"
-done
-digest=$(b3sum --no-names -- "$bytes") || exit 1
-[[ blake3:$digest == "$payload" ]] || fail artifact "$artifact reads back as blake3:$digest, but its catalog records $payload"
-pass artifact "$artifact: $length bytes read back to $payload"
+    [[ $payload == blake3:* && $length =~ ^[0-9]+$ ]] || fail artifact "malformed catalog row for $artifact"
+    bytes=$SCRATCH/artifact.bytes chunk=$SCRATCH/artifact.chunk
+    : >"$bytes"
+    for ((offset = 0; offset < length; offset += 1048576)); do
+        size=$((length - offset < 1048576 ? length - offset : 1048576))
+        "$cli" "$SOCKET" bytes "$store" "$artifact" "$offset" "$size" "$chunk" >/dev/null \
+            || fail artifact "reading $artifact at offset $offset failed"
+        cat -- "$chunk" >>"$bytes"
+    done
+    digest=$(b3sum --no-names -- "$bytes") || exit 1
+    [[ blake3:$digest == "$payload" ]] || fail artifact "$artifact reads back as blake3:$digest, but its catalog records $payload"
+    pass artifact "$artifact: $length bytes read back to $payload"
+else
+    ((TIME_RECORDS == 0)) || fail time-records "the window from $window_from has aged out of the ${retention}s retention window"
+    printf 'verify-backup: SKIP records: the window from %s is older than the %ss retention window, so its records have expired\n' "$window_from" "$retention"
+    printf 'verify-backup: SKIP artifact: no retained window to take an artifact from\n'
+fi
 
 if ((TIME_RECORDS)); then
     printf 'verify-backup: timing: sparrow SOCKET %s\n' "${window[*]}"
@@ -269,7 +329,7 @@ PID=''
 ((stopped == 0)) || fail shutdown "the daemon exited with status $stopped after SIGINT"
 pass shutdown "the daemon stopped cleanly; removing $SCRATCH"
 if ((unrecorded)); then
-    printf 'verify-backup: NOT VERIFIED: SOURCE records no live_records; take a new backup with sparrow-backup\n' >&2
+    printf 'verify-backup: NOT VERIFIED: SOURCE records no unique_payload_chunks; take a new backup with sparrow-backup\n' >&2
     exit 1
 fi
 printf 'verify-backup: %s verified\n' "$BACKUP"

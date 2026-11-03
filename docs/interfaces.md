@@ -381,9 +381,9 @@ store, such as a backup, can be opened and queried. A copy's watch catalog names
 the live intake folders, and a normal daemon on the copy would consume them.
 
 A query-only daemon starts no consume or tail worker, syslog listener, TCP
-listener or maintenance worker. No buffered flush, expiry, pressure eviction,
-import reclamation or table rewrite runs, so retention and eviction never
-change the store. A configuration that also sets `consume`, `syslog`,
+listener or maintenance worker. No periodic buffered flush, expiry, pressure
+eviction, import reclamation or table rewrite runs, so retention and eviction
+never change the store. The shutdown flush still runs. A configuration that also sets `consume`, `syslog`,
 `rpc_tcp_address` or `archive` refuses to start before the store is opened, and
 the error names the conflicting key. A store fenced for archiving requires the
 `[archive]` table to open, so it cannot be opened query-only.
@@ -394,9 +394,10 @@ catalog, but no root is opened. Each watch reports coverage `reconciling`, no
 directories or candidates, its pending claims from the stored journals, and no
 worker counters.
 
-One gate, `sparrow_server::query_only::QueryOnly`, wraps the service of every
-connection. It forwards each read and refuses each write before decoding its
-request. The writes are `ingest`, `eventsIngest`, `importBegin` through
+One gate, `sparrow_server::query_only::WriteGate`, wraps the service of every
+connection: Unix connections, CHAP sessions and the anonymous TCP gate's
+forwards. It classifies every operation once. It forwards each read, and on a
+query-only daemon it refuses each write before decoding its request. The writes are `ingest`, `eventsIngest`, `importBegin` through
 `importCancel` (except `importGet`), `flush`, `pin`, `pinRenew`, `pinRelease`,
 `watchPut`, `watchRemove`, `watchHandoff`, `tailFinish`, `sourceTimeDefine` and
 `diagnosticDefine`. Each returns the typed error `READ_ONLY`, whose message says
@@ -405,20 +406,27 @@ query capture held in memory and writes nothing to the store. An operation added
 to the schema without a decision in the gate returns Cap'n Proto
 `unimplemented`.
 
-Opening uses the normal open path. RocksDB still writes its own files in
-`data_dir` (the write-ahead log, `MANIFEST`, `OPTIONS` and `LOG`), and replays
-and flushes a write-ahead log left by an unclean stop. The open also applies any
-catalog upgrade that a store written by an older image still needs, so open
-only a disposable copy, never the only one. RocksDB may also compact the files
-such a replay flushes. Opening a store last written by the schema 62 image left
-its format, `sparrow.store/92`, unchanged. A store that still owes the table
-rewrite reports `recompression` as `running`, but the rewrite never runs. The
-daemon sets `data_dir` to mode
-0710, creates its socket name and removes it at shutdown. Query captures use
-anonymous temporary files that leave no name behind.
+A query-only daemon still modifies the store directory, so open only a
+disposable copy, never the only one. Every open, including one of a current
+store, deletes and rebuilds the source-context catalog rows and their job
+checkpoint in synchronous batches. Opening also applies any catalog upgrade that
+a store written by an older image still needs, and RocksDB writes its own files
+in `data_dir` (the write-ahead log, `MANIFEST`, `OPTIONS` and `LOG`). It replays
+a write-ahead log left by an unclean stop and may compact the files that replay
+flushes. At shutdown the daemon synchronizes and flushes every column family into
+new table files. None of this adds or removes evidence: record, artifact and
+payload chunk rows are unchanged, so `Status.uniquePayloadChunks` reads the same
+as when the store was closed. Opening a store last written by the schema 62
+image left its format, `sparrow.store/92`, unchanged. A store that still owes the
+table rewrite reports `recompression` as `running`, but the rewrite never runs.
+The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
+at shutdown. Query captures use anonymous temporary files that leave no name
+behind.
 
-Schema 66 adds `Status.queryOnly`, true in this mode. CLI and MCP status render
-it as `query_only`. `deploy/verify-backup.sh` relies on the mode to verify a
+Schema 66 adds `Status.queryOnly`, true in this mode, and
+`Status.retentionSeconds`, how long an unpinned record is retained after it is
+received (`sparrow_core::RETENTION_MS`, 30 days). CLI and MCP status render them
+as `query_only` and `retention_seconds`, the latter as a decimal string. `deploy/verify-backup.sh` relies on the mode to verify a
 backup; see `deploy/RECOVERY.md`, "Verify a backup".
 
 ## 1. Common types and defaults

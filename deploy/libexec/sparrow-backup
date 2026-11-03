@@ -19,7 +19,7 @@ every watch reports no pending claims. Files are never moved under the running
 daemon, whose reserved claims bind each file's identity.
 
 Each backup records in SOURCE the image that last opened the store, with the
-store's identity, schema, format and live record count, and keeps that image pair under images/
+store's identity, schema, format, live records and stored payload chunks, and keeps that image pair under images/
 and the lexicon bundle it reads under lexicons/, so `deploy/start.sh --restored-from BACKUP` can start exactly that image. Only
 timestamp-named backups are pruned; a copy under another name (README.md,
 "Upgrades and rollback": pre-upgrade-IMAGE) is kept until removed by hand.
@@ -211,6 +211,7 @@ def main(server_config, backup_root, keep, intake, extra):
             f"image={image}\nstore_id={status['store_id']}\n"
             f"schema_version={status['schema_version']}\nstore_format={status['store_format']}\n"
             f"live_records={int(status['live_records'])}\n"
+            f"unique_payload_chunks={int(status['unique_payload_chunks'])}\n"
             + "".join(f"extra={path}\n" for path in extra)
         )
         marker.write_text(f"{os.getpid()}\n")

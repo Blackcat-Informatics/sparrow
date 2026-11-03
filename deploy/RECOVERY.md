@@ -191,44 +191,67 @@ every watch in `consume_watches` names a root that exists.
 ## Verify a backup
 
 A backup counts as verified only after `deploy/verify-backup.sh` passes on it.
-Run it as the operator, who must be able to read the backup:
+Run it as the operator, who must be able to read the backup and the live server
+configuration:
 
 ```bash
 deploy/verify-backup.sh /SPARROW/backups/NAME; echo "exit=$?"
 ```
 
-The script reflinks `BACKUP/store` into a scratch directory below
+The script reads the live `data_dir` and `socket_path` from `SPARROW_CONFIG`
+(default `/etc/sparrow/server.toml`) and refuses to run when it cannot read
+them, since those are the paths a copy must never touch. It refuses a
+`BACKUP/store` that is a symbolic link or holds a link leading outside the
+backup. It reflinks `BACKUP/store` into a scratch directory below
 `/SPARROW/verify/` (`SPARROW_VERIFY` overrides it), so the backup itself is
-never opened. It writes a configuration for that copy with its own socket and the
-lexicon bundle the backup keeps, and starts the image in `BACKUP/images/` that
-`SOURCE` names with `--query-only`. In that mode the daemon opens no watch root,
-claims no file, runs no retention or eviction and refuses every write
-(docs/interfaces.md, "Query-only daemon"). The script refuses to start when a
-scratch path resolves under `/SPARROW/store`, the intake or the backup. It then
-prints one line per check:
+never opened. Before it creates that directory, and again on the copy, it
+refuses any path that resolves under the live store, the live socket, the intake
+or the backup. It writes a configuration for the copy with its own socket and
+the lexicon bundle the backup keeps, and starts the image in `BACKUP/images/`
+that `SOURCE` names with `--query-only`. In that mode the daemon opens no watch
+root, claims no file, runs no retention or eviction and refuses every write
+(docs/interfaces.md, "Query-only daemon"). Opening still rewrites some catalog
+rows and table files in the copy, which is why it works only on a disposable
+copy. The script then prints one line per check:
 
 | Check | Passes when |
 | --- | --- |
 | `query-only` | Status and the startup line report `query_only`, and no stored watch root is open |
 | `store-id` | The copy's store identity equals `store_id` in `SOURCE` |
 | `status` | `pressure.phase` is `ready` and `durability.failure` is `null` |
-| `live-records` | The copy holds at least the `live_records` that `SOURCE` recorded |
+| `payload-chunks` | The copy's `unique_payload_chunks` equals the count `SOURCE` recorded |
 | `records` | A `records` window over the hour before `taken_utc` returns rows |
 | `artifact` | The first row's artifact reads back to the BLAKE3 digest its catalog row records |
 | `shutdown` | The daemon exits 0 after SIGINT |
 
 It exits 1 at the first failed check, and always stops the daemon and removes
-the scratch copy. A backup whose `SOURCE` has no `live_records` predates the
-count: the script skips that check, runs the others and still exits 1 as not
-verified. An image without query-only mode (schema 65 and older) is refused
-before it starts, because it would consume the live intake folders. Such a
-backup can be opened with a newer image instead, with `--image DAEMON`; the
-newer image may upgrade the disposable copy as it opens it.
+the scratch copy.
+
+The count check uses stored payload chunks rather than live records. A record is
+live only until its retention deadline, measured by the reader's clock, so a
+copy verified later reports fewer live records than the backup recorded, even
+when it is intact. Payload chunks change only when evidence is retired, which a
+query-only daemon never does. `sparrow-backup` reads the count just before it
+stops the service. A producer that ingests through TCP, or pressure eviction,
+in the second before the stop can change it, and then the check fails on an
+intact backup; take another backup. For the same reason, the `records` and
+`artifact` checks run only while the window is younger than the retention window
+the daemon reports (`retention_seconds`, 30 days). After that its records have
+expired, and the script prints that both were skipped.
+
+A backup whose `SOURCE` has no `unique_payload_chunks` predates the count: the
+script skips that check, runs the others and still exits 1 as not verified. An
+image without query-only mode (schema 65 and older) is refused before it starts,
+because it would consume the live intake folders. Such a backup can be opened
+with a newer image instead, with `--image DAEMON`; the newer image may upgrade
+the disposable copy as it opens it.
 
 `--time-records` prints, after the checks, five elapsed times of the same
-one-hour `records` window, for comparing read latency on an older store format
-with the live service. The script prints the exact command, so the live times
-can be taken the same way.
+`records` window, for comparing read latency on an older store format with the
+live service. `--window FROM BEFORE` selects that window (RFC 3339 instants), so
+it can be an hour held by both the backup and the live store. The window must be
+younger than the retention window, or the timing fails. The script prints the
+exact command, so the live times can be taken the same way.
 
 ## Restore from a backup
 

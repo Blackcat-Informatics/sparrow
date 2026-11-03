@@ -1,23 +1,36 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! The one write refusal of a query-only daemon.
+//! The one write gate every connection's typed service passes through.
 //!
-//! Every operation is classified here, once: a read is forwarded to the typed service
-//! unchanged, and a write returns a typed `READ_ONLY` failure before its request is decoded.
-//! An operation added to the schema without a decision here falls back to the generated
-//! `unimplemented` error, so no new operation can write by omission.
+//! Every operation is classified here, once. A read is forwarded to the typed service
+//! unchanged. A write is forwarded too, unless the daemon is query-only; then it returns a
+//! typed `READ_ONLY` failure before its request is decoded. Unix connections, CHAP sessions
+//! and the anonymous TCP gate all forward through this type. An operation added to the schema
+//! without a decision here falls back to the generated `unimplemented` error, so no new
+//! operation can write by omission.
 
 use crate::{rpc::failure, sparrow_capnp::sparrow};
 use sparrow_core::Error;
 use std::rc::Rc;
 
-/// The complete typed service of a query-only daemon, with every write refused.
-pub(crate) struct QueryOnly(Rc<crate::Rpc>);
+/// The complete typed service of one connection, with writes refused in query-only mode.
+pub(crate) struct WriteGate {
+    rpc: Rc<crate::Rpc>,
+    query_only: bool,
+}
 
-impl QueryOnly {
-    pub(crate) fn new(rpc: crate::Rpc) -> Self {
-        Self(Rc::new(rpc))
+impl WriteGate {
+    pub(crate) fn new(rpc: crate::Rpc, query_only: bool) -> Self {
+        Self {
+            rpc: Rc::new(rpc),
+            query_only,
+        }
+    }
+
+    /// The service behind the gate, for the store identity CHAP binds and its sessions.
+    pub(crate) fn rpc(&self) -> &crate::Rpc {
+        &self.rpc
     }
 }
 
@@ -33,24 +46,27 @@ macro_rules! classify {
         reads { $($read:ident: $read_params:ident, $read_results:ident;)* }
         writes { $($write:ident: $write_params:ident, $write_results:ident;)* }
     ) => {
-        impl sparrow::Server for QueryOnly {
+        impl sparrow::Server for WriteGate {
             $(
                 async fn $read(
                     self: Rc<Self>,
                     params: sparrow::$read_params,
                     results: sparrow::$read_results,
                 ) -> capnp::Result<()> {
-                    <crate::Rpc as sparrow::Server>::$read(self.0.clone(), params, results).await
+                    <crate::Rpc as sparrow::Server>::$read(self.rpc.clone(), params, results).await
                 }
             )*
             $(
                 async fn $write(
                     self: Rc<Self>,
-                    _: sparrow::$write_params,
+                    params: sparrow::$write_params,
                     mut results: sparrow::$write_results,
                 ) -> capnp::Result<()> {
-                    failure(results.get().init_result(), read_only());
-                    Ok(())
+                    if self.query_only {
+                        failure(results.get().init_result(), read_only());
+                        return Ok(());
+                    }
+                    <crate::Rpc as sparrow::Server>::$write(self.rpc.clone(), params, results).await
                 }
             )*
         }

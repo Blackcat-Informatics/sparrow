@@ -165,6 +165,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             value.get_retry_window_seconds().to_string(),
         )
         .with(
+            "retention_seconds",
+            value.get_retention_seconds().to_string(),
+        )
+        .with(
             "max_inline_artifact_bytes",
             value.get_max_inline_artifact_bytes().to_string(),
         )

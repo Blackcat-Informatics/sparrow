@@ -4145,13 +4145,44 @@ fn query_only_refuses_conflicting_configuration() {
     refused(&tcp, true, "rpc_tcp_address");
 }
 
-/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a reflinked copy,
-/// and fails, removing its scratch copy, when SOURCE names another store.
-#[test]
-fn verify_backup_fails_on_wrong_store_id() {
-    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let backup = dir.path().join("backup");
+/// Run deploy/verify-backup.sh with a scratch root and the given live configuration.
+fn verify_backup(
+    backup: &Path,
+    verify: &Path,
+    live: &Path,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let output = Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/verify-backup.sh"
+    ))
+    .args(args)
+    .arg(backup)
+    .env("SPARROW_VERIFY", verify)
+    .env("SPARROW_CONFIG", live)
+    .admitted_output()
+    .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A live configuration for verify-backup's guard, and a backup of a two-record store.
+/// Returns the live configuration, the live data_dir, the backup and its store identity.
+fn backup_fixture(
+    dir: &Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
+    let live_data = dir.join("live").join("store");
+    std::fs::create_dir_all(&live_data).unwrap();
+    let live = write_server_config(&dir.join("live"), &live_data, &live_data.join("rpc.sock"));
+    let backup = dir.join("backup");
     let data = backup.join("store");
     std::fs::create_dir_all(backup.join("config")).unwrap();
     let config = write_server_config(&backup.join("config"), &data, &data.join("rpc.sock"));
@@ -4170,45 +4201,40 @@ fn verify_backup_fails_on_wrong_store_id() {
         )
         .unwrap();
     let identity = store.store_id().unwrap();
+    let chunks = store.status(now).unwrap()["unique_payload_chunks"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     drop(store);
+    std::fs::write(
+        backup.join("SOURCE"),
+        format!(
+            "taken_utc={}\nimage=sparrowd-test\nstore_id={identity}\nunique_payload_chunks={chunks}\ntext_lexicon_dir={}\n",
+            sparrow_core::format_instant(now + 1000).unwrap(),
+            sparrow_test_support::text_lexicon_dir().display()
+        ),
+    )
+    .unwrap();
+    (live, live_data, backup, identity)
+}
+
+/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a reflinked copy,
+/// still passes on its clock-independent chunk count once the backup has aged out of
+/// retention, and fails, removing its scratch copy, when SOURCE names another store.
+#[test]
+fn verify_backup_fails_on_wrong_store_id() {
+    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, _, backup, identity) = backup_fixture(dir.path());
     let verify = dir.path().join("verify");
-    let run = |store_id: &str| {
-        std::fs::write(
-            backup.join("SOURCE"),
-            format!(
-                "taken_utc={}\nimage=sparrowd-test\nstore_id={store_id}\nlive_records=2\ntext_lexicon_dir={}\n",
-                sparrow_core::format_instant(now + 1000).unwrap(),
-                sparrow_test_support::text_lexicon_dir().display()
-            ),
-        )
-        .unwrap();
-        let output = Command::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/verify-backup.sh"
-        ))
-        .args(["--image", env!("CARGO_BIN_EXE_sparrowd")])
-        .arg(&backup)
-        .env("SPARROW_VERIFY", &verify)
-        .admitted_output()
-        .unwrap();
-        assert_eq!(
-            std::fs::read_dir(&verify).unwrap().count(),
-            0,
-            "the scratch copy is removed"
-        );
-        (
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
-    };
-    let (code, stdout, stderr) = run(&identity);
+    let image = ["--image", env!("CARGO_BIN_EXE_sparrowd")];
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     for check in [
         "query-only",
         "store-id",
         "status",
-        "live-records",
+        "payload-chunks",
         "records",
         "artifact",
         "shutdown",
@@ -4218,10 +4244,104 @@ fn verify_backup_fails_on_wrong_store_id() {
             "{check}: {stdout}"
         );
     }
-    let (code, stdout, stderr) = run("store:00000000000000000000000000000000");
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+    // Once the backup's newest hour is older than retention, its records have expired by the
+    // reader's clock; the chunk count still holds, and the window checks are skipped.
+    let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
+    let taken = source.lines().next().unwrap().to_owned();
+    let aged =
+        sparrow_core::format_instant(sparrow_server::now().unwrap() - sparrow_core::RETENTION_MS)
+            .unwrap();
+    std::fs::write(
+        backup.join("SOURCE"),
+        source.replace(&taken, &format!("taken_utc={aged}")),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("PASS payload-chunks:"), "{stdout}");
+    assert!(stdout.contains("SKIP records:"), "{stdout}");
+    std::fs::write(
+        backup.join("SOURCE"),
+        source.replace(&identity, "store:00000000000000000000000000000000"),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("FAIL store-id:"), "{stderr}");
     assert!(!stdout.contains("PASS records"), "{stdout}");
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+}
+
+/// INVARIANT: verify-backup.sh never starts a daemon that could reach the live store or the
+/// live intake: it refuses a backup whose store is a link (here, to the live data_dir), and it
+/// refuses the backup's own image when that image has no query-only mode, without running it
+/// with a configuration.
+#[test]
+fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, live_data, backup, _) = backup_fixture(dir.path());
+    let verify = dir.path().join("verify");
+
+    let linked = dir.path().join("linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::copy(backup.join("SOURCE"), linked.join("SOURCE")).unwrap();
+    std::os::unix::fs::symlink(&live_data, linked.join("store")).unwrap();
+    let (code, stdout, stderr) = verify_backup(
+        &linked,
+        &verify,
+        &live,
+        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("store is a symbolic link"), "{stderr}");
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
+    assert_eq!(
+        std::fs::read_dir(&live_data).unwrap().count(),
+        0,
+        "the live store is untouched"
+    );
+
+    // The backup's own pre-query-only image: it prints the old usage line, and marks any run
+    // that passes it arguments.
+    let images = backup.join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    let started = dir.path().join("old-image-started");
+    for name in ["sparrowd-test", "sparrow-test"] {
+        let stub = images.join(name);
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n[ $# -eq 0 ] || touch '{}'\necho 'usage: sparrowd --config FILE.toml' >&2\nexit 1\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("predates query-only mode"), "{stderr}");
+    assert!(
+        !started.exists(),
+        "the old image never ran with a configuration"
+    );
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
 }
 
 #[test]
