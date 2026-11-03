@@ -79,6 +79,7 @@ pub struct Rpc {
     max_pin_members: usize,
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
+    query_only: bool,
 }
 
 /// The full typed service is already authorized; only an anonymous TCP gate runs CHAP.
@@ -128,6 +129,24 @@ impl Rpc {
             max_pin_members,
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
+            query_only: false,
+        }
+    }
+
+    /// Serve reads only: every connection's service refuses writes with `READ_ONLY`.
+    #[must_use]
+    pub fn query_only(mut self) -> Self {
+        self.query_only = true;
+        self
+    }
+
+    /// The typed service a connection receives: the complete one, or behind the
+    /// query-only write refusal. Every Unix connection and CHAP session takes this path.
+    pub(crate) fn into_client(self) -> wire::sparrow::Client {
+        if self.query_only {
+            capnp_rpc::new_client(crate::query_only::QueryOnly::new(self))
+        } else {
+            capnp_rpc::new_client(self)
         }
     }
 
@@ -2698,6 +2717,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                out.set_query_only(self.query_only);
                 let mut syslog_rows = out.reborrow().init_syslog_listeners(syslog.len() as u32);
                 for (index, status) in syslog.iter().enumerate() {
                     status.encode(syslog_rows.reborrow().get(index as u32));

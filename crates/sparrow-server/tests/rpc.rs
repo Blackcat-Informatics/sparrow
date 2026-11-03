@@ -3939,6 +3939,291 @@ async fn removed_watch_keeps_durable_claim_recovery_and_refuses_root_rebinding()
         .await;
 }
 
+/// The typed failure of one refused write: its code and message.
+fn rpc_failure<T: capnp::traits::Owned + 'static>(
+    result: wire::result::Reader<'_, T>,
+) -> (String, String) {
+    match result.which().unwrap() {
+        wire::result::Ok(_) => panic!("expected a typed RPC failure"),
+        wire::result::Error(error) => {
+            let error = error.unwrap();
+            (
+                error.get_code().unwrap().to_str().unwrap().to_owned(),
+                error.get_message().unwrap().to_str().unwrap().to_owned(),
+            )
+        }
+    }
+}
+
+/// INVARIANT: a query-only daemon on a copy of a store with a registered watch answers reads
+/// as a normal daemon does, opens and claims nothing in the stored watch root, and refuses
+/// writes with `READ_ONLY` before acting on them.
+#[tokio::test(flavor = "current_thread")]
+async fn query_only_daemon_serves_reads_and_refuses_writes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 0, 16, 16);
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let consumed = root.join("consumed.jsonl");
+            std::fs::write(&consumed, b"{\"copy\":1}\n").unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_completed_claims() == 1 && watch.get_pending_claims() == 0
+            })
+            .await;
+            assert!(!consumed.exists(), "the normal daemon owns the root");
+            drop(client);
+            drop(daemon);
+
+            let copy = dir.path().join("copy");
+            std::fs::create_dir(&copy).unwrap();
+            let copied = copy.join("store");
+            let status = Command::new("cp")
+                .args(["-a", "--reflink=auto", "--"])
+                .arg(&data)
+                .arg(&copied)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let copy_socket = copied.join("rpc.sock");
+            let copy_config = write_server_config(&copy, &copied, &copy_socket);
+            let _query = start_with(
+                &copy_config,
+                &copy_socket,
+                Stdio::inherit(),
+                &["--query-only"],
+            )
+            .await;
+            let waiting = root.join("waiting.jsonl");
+            std::fs::write(&waiting, b"{\"copy\":2}\n").unwrap();
+            let client = sparrow_client::Client::connect(&copy_socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+
+            let response = client
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            assert!(status.get_query_only());
+            let watches = status.get_consume_watches().unwrap();
+            assert_eq!(watches.len(), 1, "the stored watch is reported");
+            assert_eq!(
+                watches.get(0).get_id().unwrap().to_str().unwrap(),
+                "completed"
+            );
+            assert_eq!(
+                watches.get(0).get_directories(),
+                0,
+                "its root is never opened"
+            );
+            assert_eq!(
+                cli(&copy_socket, &["status"])["query_only"].as_bool(),
+                Some(true)
+            );
+            let rows =
+                cli(&copy_socket, &["records", "--source", "consume-acceptance"])["rows"].clone();
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                1,
+                "reads answer from the copy"
+            );
+            let record = rows[0]["record_id"].as_str().unwrap().to_owned();
+
+            let mut ingest = client.capability().ingest_request();
+            let mut input = ingest.get().init_request();
+            input.set_request_id("query-only-ingest");
+            input.set_source("query-only");
+            input.set_format(wire::Format::Jsonl);
+            input.set_bytes(b"{\"refused\":true}\n");
+            let response = ingest.send().promise.await.unwrap();
+            let (code, message) = rpc_failure(response.get().unwrap().get_result().unwrap());
+            assert_eq!(code, "READ_ONLY");
+            assert!(message.contains("query-only mode"), "{message}");
+
+            let response = client
+                .capability()
+                .watch_list_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let list = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let listed = list.get_watches().unwrap().get(0);
+            let mut put = client.capability().watch_put_request();
+            let mut input = put.get().init_request();
+            input.set_store_id(&store);
+            input.set_request_id("query-only-watch");
+            input.set_expected_revision(listed.get_revision());
+            input
+                .set_definition(listed.get_definition().unwrap())
+                .unwrap();
+            let response = put.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_failure(response.get().unwrap().get_result().unwrap()).0,
+                "READ_ONLY"
+            );
+
+            let mut pin = client.capability().pin_request();
+            let mut input = pin.get().init_request();
+            input.set_request_id("query-only-pin");
+            input.set_name("refused");
+            input.set_days(1);
+            let mut target = input.init_targets(1).get(0);
+            target.set_store_id(&store);
+            target.set_record(&record);
+            let response = pin.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_failure(response.get().unwrap().get_result().unwrap()).0,
+                "READ_ONLY"
+            );
+
+            // The normal daemon consumed a quiet_ms = 0 file within one poll; give the copy longer.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                std::fs::read(&waiting).unwrap(),
+                b"{\"copy\":2}\n",
+                "the copy claimed nothing"
+            );
+            assert_eq!(
+                cli(&copy_socket, &["status"])["live_records"].as_str(),
+                Some("1")
+            );
+        })
+        .await;
+}
+
+/// INVARIANT: query-only mode starts no intake, public listener or archive, so a
+/// configuration that names one refuses startup with the conflicting key, whether the flag
+/// or the `query_only` key selects the mode, before any store or socket is created.
+#[test]
+fn query_only_refuses_conflicting_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    let base = std::fs::read_to_string(&config).unwrap();
+    let refused = |extra: &str, flag: bool, key: &str| {
+        std::fs::write(&config, format!("{base}{extra}")).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sparrowd"));
+        command.arg("--config").arg(&config);
+        if flag {
+            command.arg("--query-only");
+        }
+        let output = command.admitted_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{extra}");
+        assert!(
+            stderr.contains(&format!("query_only refuses the configured `{key}`")),
+            "{stderr}"
+        );
+        assert!(!data.exists(), "refused before opening the store");
+    };
+    let root = dir.path().join("completed");
+    std::fs::create_dir(&root).unwrap();
+    let consume = toml::to_string(&watch_definition(&root, "completed", 0, 16, 16)).unwrap();
+    refused(&format!("\n[[consume]]\n{consume}"), true, "consume");
+    refused(
+        &format!("query_only = true\n\n[[consume]]\n{consume}"),
+        false,
+        "consume",
+    );
+    let secret = dir.path().join("tcp.secret");
+    std::fs::write(&secret, [7; 32]).unwrap();
+    let tcp = format!(
+        "rpc_tcp_address = \"127.0.0.1:9\"\nrpc_tcp_secret_file = \"{}\"\n",
+        secret.display()
+    );
+    refused(&tcp, true, "rpc_tcp_address");
+}
+
+/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a reflinked copy,
+/// and fails, removing its scratch copy, when SOURCE names another store.
+#[test]
+fn verify_backup_fails_on_wrong_store_id() {
+    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let backup = dir.path().join("backup");
+    let data = backup.join("store");
+    std::fs::create_dir_all(backup.join("config")).unwrap();
+    let config = write_server_config(&backup.join("config"), &data, &data.join("rpc.sock"));
+    let store = sparrow_server::ServerConfig::read(&config)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let now = sparrow_server::now().unwrap();
+    store
+        .ingest(
+            "verify-backup",
+            "verify",
+            "jsonl",
+            b"{\"backup\":1}\n{\"backup\":2}\n",
+            now,
+        )
+        .unwrap();
+    let identity = store.store_id().unwrap();
+    drop(store);
+    let verify = dir.path().join("verify");
+    let run = |store_id: &str| {
+        std::fs::write(
+            backup.join("SOURCE"),
+            format!(
+                "taken_utc={}\nimage=sparrowd-test\nstore_id={store_id}\nlive_records=2\ntext_lexicon_dir={}\n",
+                sparrow_core::format_instant(now + 1000).unwrap(),
+                sparrow_test_support::text_lexicon_dir().display()
+            ),
+        )
+        .unwrap();
+        let output = Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/verify-backup.sh"
+        ))
+        .args(["--image", env!("CARGO_BIN_EXE_sparrowd")])
+        .arg(&backup)
+        .env("SPARROW_VERIFY", &verify)
+        .admitted_output()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_dir(&verify).unwrap().count(),
+            0,
+            "the scratch copy is removed"
+        );
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (code, stdout, stderr) = run(&identity);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    for check in [
+        "query-only",
+        "store-id",
+        "status",
+        "live-records",
+        "records",
+        "artifact",
+        "shutdown",
+    ] {
+        assert!(
+            stdout.contains(&format!("PASS {check}:")),
+            "{check}: {stdout}"
+        );
+    }
+    let (code, stdout, stderr) = run("store:00000000000000000000000000000000");
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("FAIL store-id:"), "{stderr}");
+    assert!(!stdout.contains("PASS records"), "{stdout}");
+}
+
 #[test]
 fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -6816,10 +7101,15 @@ async fn start(config: &Path, socket: &Path) -> Daemon {
 }
 
 async fn start_with_stderr(config: &Path, socket: &Path, stderr: Stdio) -> Daemon {
+    start_with(config, socket, stderr, &[]).await
+}
+
+async fn start_with(config: &Path, socket: &Path, stderr: Stdio, args: &[&str]) -> Daemon {
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_sparrowd"))
             .arg("--config")
             .arg(config)
+            .args(args)
             .stderr(stderr)
             .stdout(Stdio::null())
             .admitted_spawn()

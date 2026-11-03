@@ -57,6 +57,10 @@ pub struct ServerConfig {
     /// Archive-before-delete. A store that has archived requires this table thereafter.
     #[serde(default)]
     pub archive: Option<ArchiveConfig>,
+    /// Serve reads only: no intake, maintenance or write operation. `sparrowd --query-only`
+    /// sets it too. It refuses every intake and archive key.
+    #[serde(default)]
+    pub query_only: bool,
 }
 
 /// Archive-before-delete destination and segment policy; unknown fields are errors.
@@ -228,7 +232,35 @@ impl ServerConfig {
                 "rpc_tcp_address and rpc_tcp_secret_file must be configured together".into(),
             );
         }
+        config.check_query_only()?;
         Ok(config)
+    }
+
+    /// Select query-only mode, as `sparrowd --query-only` does, and check that nothing in the
+    /// configuration would ingest, listen publicly or archive.
+    pub fn into_query_only(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+        self.query_only = true;
+        self.check_query_only()?;
+        Ok(self)
+    }
+
+    fn check_query_only(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.query_only {
+            return Ok(());
+        }
+        let conflicting = [
+            ("consume", !self.consume.is_empty()),
+            ("syslog", !self.syslog.is_empty()),
+            ("rpc_tcp_address", self.rpc_tcp_address.is_some()),
+            ("archive", self.archive.is_some()),
+        ];
+        match conflicting.iter().find(|(_, set)| *set) {
+            Some((key, _)) => Err(format!(
+                "query_only refuses the configured `{key}`: a query-only daemon starts no intake, public listener or archive; remove `{key}` from this configuration"
+            )
+            .into()),
+            None => Ok(()),
+        }
     }
 
     /// Read the configured TCP CHAP secret; a configured but unusable file is an error.

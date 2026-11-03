@@ -173,9 +173,7 @@ impl sparrow::Server for AnonymousTcp {
     ) -> capnp::Result<()> {
         let out = results.get().init_result();
         match self.session(params.get()?.get_response()?) {
-            Ok(session) => out
-                .init_ok()
-                .set_session(capnp_rpc::new_client::<sparrow::Client, _>(session)),
+            Ok(session) => out.init_ok().set_session(session.into_client()),
             Err(error) => failure(out, error),
         }
         Ok(())

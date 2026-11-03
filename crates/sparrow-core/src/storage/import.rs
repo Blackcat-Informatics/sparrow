@@ -3,7 +3,7 @@
 
 //! Durable raw staging, separate from accepted evidence and derived indexes.
 
-use super::eviction::{EvictionLimits, RetirementShare};
+use super::eviction::RetirementShare;
 use super::{
     BYTE_READ_BYTES, CHUNK, Catalog, Error, RETRY_WINDOW, Store, Writer, blake3, hex, integer,
     json, parse, put, read_chunk_range, read_field, record_ends, validate_ingest_labels,
@@ -533,7 +533,7 @@ impl Store {
     #[cfg(feature = "test-support")]
     pub fn scale_retirement_for_tests(
         &self,
-        limits: EvictionLimits,
+        limits: super::eviction::EvictionLimits,
         record_reserve: usize,
     ) -> Result<super::eviction::RetirementBounds, Error> {
         limits.validate()?;
