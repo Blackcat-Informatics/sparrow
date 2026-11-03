@@ -64,7 +64,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "result_next",
-        "Resume the captured operation, scope and limits from an immutable cursor; reading never renews its lease or evidence retention.",
+        "Resume the captured operation, scope and limits from a cursor; reading never renews its lease or evidence retention. A live artifact listing reads its next receipt-ordered page under a new lease.",
     ),
     (
         "sources_list",
@@ -72,7 +72,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "artifacts_list",
-        "Page an immutable capture of eligible complete artifacts and surviving parent provenance; original receipt-time filters refuse reclaimed parents with unknown origin metadata.",
+        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads receipt-ordered pages that count delivered rows until the last page. Original receipt-time filters refuse reclaimed parents with unknown origin metadata.",
     ),
     (
         "diagnostic_define",

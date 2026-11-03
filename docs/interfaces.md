@@ -30,7 +30,8 @@ task teardown cancels those children at host scan/staging checkpoints. A worker
 retains its permit until exit; private files and reservations are dropped, and
 fresh captures abandoned before response rendering are released. Successfully
 rendered cursors retain their ordinary replayable lease, including after an
-abandoned continuation. Store identity validation does not wait for the catalogue
+abandoned continuation. A live artifact continuation releases its new handle if
+it is not delivered, and the handle it continued only after delivery (schema 66). Store identity validation does not wait for the catalogue
 writer. Cancellation does not
 establish non-delivery of a mutation, interrupt individual native calls or mutex
 waits, or qualify direct Cap'n Proto promise cancellation. MCP cancellation
@@ -289,6 +290,69 @@ step holds native rewriting off for pressure, the data allowance or the
 free-space floor. `Store::recompress_step(now, settle)` observes progress and
 turns RocksDB periodic compaction on or off without compacting anything
 itself. `Store::recompression_status` reads the last observation.
+
+### Live artifact pages (schema 66)
+
+Schema 66 changes the live artifact listing, the one with no explicit selection,
+from one immutable capture into pages read in receipt order. A page reads only
+the rows it selects, so the listing answers at any store size. Explicit
+selections keep one immutable capture, and the earlier statements still hold
+for them.
+
+How a page reads:
+
+- Without a source, a page reads the artifact and record receipt indexes
+  (`artifact-time:` and `time:`) from its position in the receipt interval.
+  With a source, it reads that source's record receipt index
+  (`source-context-v1:`) and the recordless-artifact index (`empty-time:`)
+  instead, so it never reads or charges another source's records.
+- A record shares its parent's receipt time, so the page folds one receipt
+  millisecond at a time and emits that millisecond's rows in artifact-ID order.
+  Rows are ordered by original receipt time, then artifact ID.
+- A page stops at its page size, at most 31 rows. It charges each catalog row
+  it reads against its own admission: the scan budget in entries and the
+  32 MiB conservative catalog charge. Artifact rows are decoded without owning
+  their record and chunk arrays.
+- A millisecond whose artifacts and records exceed one page's admission spans
+  pages, and the cursor resumes inside it. A page that exhausts its admission
+  after reading a row ends early with a cursor, possibly with no rows. Only a
+  page that cannot fit a single catalog row refuses with `RESOURCE_LIMIT`. The
+  message names the page size, both bounds, the artifact and its receipt time.
+
+What a page reports:
+
+- Each page is its own lease, with its own snapshot ID, `as_of` and scan
+  evidence. `ArtifactListPage.receiptWalk` marks such a page.
+- `total_items` counts the rows delivered through that page, and `page_start`
+  the rows before it. Diagnostic coverage covers the rows that page delivered or
+  excluded.
+- While a live listing continues, CLI and MCP render `matching_artifacts` as
+  null, `answer_certainty` as `incomplete` and `coverage.catalog_complete` as
+  false. Only the final page of one walk reports an exact count.
+- Evidence received or retired between pages can appear in or leave later
+  pages, but no row repeats.
+
+Continuation:
+
+- A cursor binds the selector and limits and continues after the page's last
+  row, through `artifacts_list` or `result_next`. Continuing reads the store as
+  it is then and publishes a new handle.
+- The daemon releases the continued page's handle only after it delivers the
+  new page. A cursor the client already holds therefore survives an abandoned
+  or failed continuation. After a delivered continuation it returns
+  `RESULT_EXPIRED`.
+- A retained record whose parent catalog was reclaimed appears at its receipt
+  time. Receipt filtering over it still refuses with `INDEX_NOT_READY`.
+
+For live listings only, this section supersedes four groups of statements. The
+first is the replay and "never creates another handle" statements under
+cursor-only continuation. The second is the schema 27 statements that page
+coverage is identical across continuation, that `total_items` counts captured
+proven rows, and that continuation serves the immutable capture. The third is
+the schema 24 receipt with a fixed store, snapshot and as-of. The fourth is
+the earlier MCP descriptions of `artifacts_list` and `result_next`. The
+`sources` inventory reads the same indexes over its whole interval and remains
+one immutable capture.
 
 ### Large artifacts (schema 65)
 
@@ -980,7 +1044,8 @@ output is identical to replay through the original operation with its cursor.
 No membership, ranking corpus, source watch inventory or pin name is re-resolved.
 The shared lease owner parses the cursor and validates the original variable
 page boundary. Reading never renews a handle or evidence retention and never
-creates another handle. Foreign stores refuse STORE_MISMATCH; malformed/non-page
+creates another handle, except that a live artifact listing reads and publishes
+its next page (schema 66). Foreign stores refuse STORE_MISMATCH; malformed/non-page
 positions refuse INVALID_ARGUMENT; expired, unknown and previous-owner handles
 refuse RESULT_EXPIRED. These are typed failures with no successful prefix.
 Schema discovery refuses older daemons before requesting continuation.
@@ -1818,17 +1883,21 @@ its exact `retained_records` within membership and carries shared typed coverage
 `eligible_records` is the matching-record count or unknown, accompanied by a
 `known_eligible_records` lower bound and matched/excluded/unknown evidence.
 Page coverage includes every source/receipt-eligible record, including parents
-without proven matches, and remains identical across continuation.
+without proven matches. For a selection it remains identical across
+continuation; a live page covers its own rows (schema 66).
 
-`total_items` and `known_matching_artifacts` count captured proven rows;
+`total_items` and `known_matching_artifacts` count captured proven rows, or on
+a continuing live page the rows delivered so far, with `matching_artifacts` null
+(schema 66);
 `matching_artifacts` is null and `answer_certainty` is incomplete when diagnostic
 membership is unknown. CLI `--require-complete-index` and MCP
 `require_complete_index=true` refuse with `INDEX_NOT_READY` on applicable unknown
 mappings. No prefix or handle is published on refusal. CLI and MCP share scope
 decoding, typed coverage encoding and rendering.
 
-Cursors bind the original membership, selector and limits. Continuation serves
-the immutable capture after pin release, collection changes or evidence retirement;
+Cursors bind the original membership, selector and limits. For a selection,
+continuation serves the immutable capture after pin release, collection changes
+or evidence retirement, while a live listing reads its next page (schema 66);
 fresh reads revalidate current evidence. No read renews protection. Current
 discovery schema 34 is required; old clients/daemons are explicitly refused.
 Storage formats and retained evidence encodings are unchanged.
@@ -2020,7 +2089,8 @@ required `store_id`. RPC requests declare the current discovered schema.
 Pages use the shared `CatalogReadReceipt` with fixed store/snapshot/as-of,
 absolute lease deadline, total items, page position, scan evidence and limits.
 Continuation must retain its original selector and limits. Reading later pages
-does not renew the lease or pin any evidence. Summaries carry original artifact
+does not renew the lease or pin any evidence. Schema 66 gives each live page its
+own lease instead. Summaries carry original artifact
 metadata in an explicit optional union, complete-byte availability at capture
 time and exact retained record count. Reclaimed parent catalogs return absent
 origin metadata while surviving records retain parent ID/source. Receipt-time
@@ -2033,26 +2103,6 @@ duration. Artifact and pin pages share both their receipt wire codec and agent
 renderer. Schema 27 supersedes this initial scope with membership and diagnostic
 filtering. Producer stream discovery now uses `producerStreamGet` and source
 summaries; corpus-scale operational selection remains unqualified.
-
-The live artifact listing, with no explicit selection, reads one page at a time
-in receipt order, so its cost follows the page and not the store. Each page
-seeks the artifact and record receipt indexes at its receipt interval and
-position, folds one receipt millisecond at a time and stops at its page size,
-at most 31 rows. It charges only the catalog rows it reads against its own
-admission: the scan budget in entries and the 32 MiB conservative catalog
-charge. A page that exhausts that admission after reading a row ends early with
-a cursor. A page that exhausts it before one row fits refuses with
-`RESOURCE_LIMIT`, and the message names the page size and both bounds. Rows are
-ordered by original receipt time, then artifact ID. The cursor continues after
-the page's last row and binds the selector and limits. Each page is a new lease
-with its own snapshot ID, `as_of` and scan evidence. Continuing releases the
-previous page's handle, so each continuation cursor serves one read.
-`total_items` counts the rows delivered through that page, and diagnostic
-coverage covers the records that page read. Evidence received or retired
-between pages can appear in or leave later pages, but no row repeats. A record
-shares its parent's receipt time, so a retained record whose parent catalog was
-reclaimed appears at that time; receipt filtering over it still refuses with
-`INDEX_NOT_READY`. Explicit selections keep one immutable capture.
 
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity

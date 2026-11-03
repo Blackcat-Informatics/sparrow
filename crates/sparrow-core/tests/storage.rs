@@ -1011,18 +1011,24 @@ fn cancelled_catalogue_reads_preserve_original_cursors_and_evidence() {
         assert!(store.result_next(&sources.store_id, cursor, 5).is_ok());
         assert!(store.result_release(&sources.store_id, id, 5).unwrap());
     }
-    // A live artifact continuation reads its next page and retires the handle it continued.
+    // A live artifact continuation reads its next page; the handle it continued
+    // stays until its owner releases it after delivery.
     let last = store
         .result_next(&parents.store_id, parents.next_cursor.as_ref().unwrap(), 5)
         .unwrap();
-    assert!(
-        matches!(last, sparrow_core::ResultPage::Artifacts(page) if page.next_cursor.is_none())
-    );
-    assert!(
-        !store
-            .result_release(&parents.store_id, &parents.snapshot_id, 5)
-            .unwrap()
-    );
+    let sparrow_core::ResultPage::Artifacts(last) = last else {
+        panic!("artifact continuation");
+    };
+    // A final page holds no handle of its own.
+    assert!(last.next_cursor.is_none());
+    for (snapshot_id, held) in [(&parents.snapshot_id, true), (&last.snapshot_id, false)] {
+        assert_eq!(
+            store
+                .result_release(&parents.store_id, snapshot_id, 5)
+                .unwrap(),
+            held
+        );
+    }
     let status = store.status(5).unwrap();
     for key in [
         "source_read_handles",
@@ -10159,7 +10165,15 @@ fn artifacts_listing_reads_only_its_page() {
     assert_eq!(ids(&second), narrow[2..]);
     assert_eq!((second.page_start, second.total_items), (2, 3));
     assert!(second.next_cursor.is_none());
-    // A continuation cursor serves one read, through either surface.
+    // The continued handle survives until its owner releases it, so a cursor
+    // whose continuation was not delivered reads the same next page again.
+    let again = store.artifact_read(&query, 602).unwrap();
+    assert_eq!(ids(&again), narrow[2..]);
+    assert!(
+        store
+            .result_release(&first.store_id, &first.snapshot_id, 602)
+            .unwrap()
+    );
     assert_eq!(
         store.artifact_read(&query, 602).unwrap_err().code,
         "RESULT_EXPIRED"
@@ -10195,34 +10209,73 @@ fn artifacts_listing_page_over_its_bound_is_refused_by_name() {
     use sparrow_core::ArtifactRead;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    store
-        .ingest("page-over-bound", "source", "jsonl", b"{}\n{}\n{}\n", 0)
+    let artifact = store
+        .ingest("page-over-bound", "source", "jsonl", b"{}\n", 0)
         .unwrap();
-    // One row costs the pin scan's terminal probe, the artifact and its three
-    // records: five catalog entries.
+    // The pin scan's terminal probe spends the only entry, so not even the
+    // artifact's own catalog row fits.
     let query = ArtifactRead {
-        page_size: 5,
-        scan_budget: 4,
+        page_size: 100,
+        scan_budget: 1,
         ..Default::default()
     };
     let error = store.artifact_read(&query, 1).unwrap_err();
     assert_eq!(error.code, "RESOURCE_LIMIT");
-    assert!(
-        error.message.contains("page_size 5") && error.message.contains("4 catalog entries"),
-        "{}",
-        error.message
-    );
+    for named in [
+        "page_size 100",
+        "1 catalog entries",
+        artifact.id.as_str(),
+        "1970-01-01T00:00:00",
+    ] {
+        assert!(error.message.contains(named), "{named}: {}", error.message);
+    }
     assert_eq!(
         store.status(1).unwrap()["artifact_read_handles"].as_str(),
         Some("0")
     );
-    let fits = ArtifactRead {
-        scan_budget: 5,
-        ..query
+}
+
+#[test]
+fn artifacts_listing_spans_an_artifact_larger_than_one_page() {
+    use sparrow_core::ArtifactRead;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let large = store
+        .ingest("page-span-large", "source", "jsonl", &b"{}\n".repeat(40), 0)
+        .unwrap();
+    let small = store
+        .ingest("page-span-small", "source", "jsonl", b"{}\n", 1)
+        .unwrap();
+    // Each page admits ten entries: the pin probe and nine catalog rows, far
+    // fewer than the large artifact's row and its forty records.
+    let mut query = ArtifactRead {
+        page_size: 5,
+        scan_budget: 10,
+        ..Default::default()
     };
+    let mut rows = Vec::new();
+    let mut pages = 0;
+    let mut held: Option<(String, String)> = None;
+    loop {
+        let page = store.artifact_read(&query, 2).unwrap();
+        pages += 1;
+        rows.extend(page.body.artifacts.iter().cloned());
+        // Release the predecessor once its successor is read, as the daemon
+        // does after delivery.
+        if let Some((store_id, snapshot_id)) = held.replace((page.store_id, page.snapshot_id)) {
+            assert!(store.result_release(&store_id, &snapshot_id, 2).unwrap());
+        }
+        match page.next_cursor {
+            Some(cursor) => query.cursor = Some(cursor),
+            None => break,
+        }
+    }
+    assert!(pages > 4, "{pages} pages");
     assert_eq!(
-        store.artifact_read(&fits, 1).unwrap().body.artifacts.len(),
-        1
+        rows.iter()
+            .map(|row| (row.id.as_str(), row.retained_records))
+            .collect::<Vec<_>>(),
+        [(large.id.as_str(), 40), (small.id.as_str(), 1)]
     );
 }
 

@@ -36,9 +36,21 @@ pub(super) struct CaptureAdmission<'a> {
 
 impl CaptureAdmission<'_> {
     pub(super) fn entry(&mut self, bytes: usize) -> Result<(), Error> {
+        if bytes > ENTRY_BYTES {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "catalog capture exhausted entry/scan/time admission; no result published",
+            ));
+        }
+        self.visit()?;
+        super::Writer::charge_catalog(self.remaining, bytes)
+    }
+
+    /// Count one catalog entry against the scan budget and lease time only; the
+    /// caller charges its bytes through a streaming decoder's own admission.
+    pub(super) fn visit(&mut self) -> Result<(), Error> {
         self.cancellation.checkpoint()?;
         if *self.scanned == self.scan_budget
-            || bytes > ENTRY_BYTES
             || self.started.elapsed() >= Duration::from_millis(LEASE_MS)
         {
             return Err(Error::new(
@@ -47,7 +59,7 @@ impl CaptureAdmission<'_> {
             ));
         }
         *self.scanned += 1;
-        super::Writer::charge_catalog(self.remaining, bytes)
+        Ok(())
     }
 }
 

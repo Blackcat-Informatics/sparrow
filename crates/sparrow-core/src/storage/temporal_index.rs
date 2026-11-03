@@ -18,22 +18,39 @@ pub(super) type Entry<'a> = (&'a [u8], &'a [u8]);
 
 pub(super) struct TemporalRows<'a> {
     cursor: DBRawIteratorWithThreadMode<'a, DB>,
-    prefix: &'static str,
+    prefix: &'a str,
     advance: bool,
     finished: bool,
 }
 
 impl<'a> TemporalRows<'a> {
     pub(super) fn new(
-        prefix: &'static str,
+        prefix: &'a str,
         from: u64,
+        before: u64,
+        scan: impl FnOnce(ReadOptions) -> DBRawIteratorWithThreadMode<'a, DB>,
+    ) -> Self {
+        Self::after(prefix, from, None, before, scan)
+    }
+
+    /// Start at `from`, or just past the entry for `after` received at `from`.
+    pub(super) fn after(
+        prefix: &'a str,
+        from: u64,
+        after: Option<&str>,
         before: u64,
         scan: impl FnOnce(ReadOptions) -> DBRawIteratorWithThreadMode<'a, DB>,
     ) -> Self {
         let mut options = ReadOptions::default();
         options.set_iterate_upper_bound(format!("{prefix}{before:020}:").into_bytes());
         let mut cursor = scan(options);
-        cursor.seek(format!("{prefix}{from:020}:").as_bytes());
+        let mut start = format!("{prefix}{from:020}:").into_bytes();
+        if let Some(after) = after {
+            // The least key greater than the entry itself.
+            start.extend_from_slice(after.as_bytes());
+            start.push(0);
+        }
+        cursor.seek(&start);
         Self {
             cursor,
             prefix,
