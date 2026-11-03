@@ -1003,7 +1003,6 @@ fn cancelled_catalogue_reads_preserve_original_cursors_and_evidence() {
     }
     for (id, cursor) in [
         (&sources.snapshot_id, sources.next_cursor.as_ref().unwrap()),
-        (&parents.snapshot_id, parents.next_cursor.as_ref().unwrap()),
         (
             &collections.snapshot_id,
             collections.next_cursor.as_ref().unwrap(),
@@ -1012,6 +1011,18 @@ fn cancelled_catalogue_reads_preserve_original_cursors_and_evidence() {
         assert!(store.result_next(&sources.store_id, cursor, 5).is_ok());
         assert!(store.result_release(&sources.store_id, id, 5).unwrap());
     }
+    // A live artifact continuation reads its next page and retires the handle it continued.
+    let last = store
+        .result_next(&parents.store_id, parents.next_cursor.as_ref().unwrap(), 5)
+        .unwrap();
+    assert!(
+        matches!(last, sparrow_core::ResultPage::Artifacts(page) if page.next_cursor.is_none())
+    );
+    assert!(
+        !store
+            .result_release(&parents.store_id, &parents.snapshot_id, 5)
+            .unwrap()
+    );
     let status = store.status(5).unwrap();
     for key in [
         "source_read_handles",
@@ -9881,7 +9892,7 @@ fn stored_rdf_snapshot_survives_concurrent_pin_release_retirement_and_ingestion(
 }
 
 #[test]
-fn artifact_pages_are_immutable_source_time_scoped_occurrence_discovery() {
+fn artifact_pages_are_receipt_ordered_source_time_scoped_occurrence_discovery() {
     use sparrow_core::{ArtifactRead, ArtifactSelector};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -9905,59 +9916,66 @@ fn artifact_pages_are_immutable_source_time_scoped_occurrence_discovery() {
         ..Default::default()
     };
     let first = store.artifact_read(&query, 10).unwrap();
-    assert_eq!(first.total_items, 2);
-    assert_eq!(first.body.artifacts.len(), 1);
+    assert_eq!((first.page_start, first.total_items), (0, 1));
     assert_eq!(first.as_of, 10);
     assert_eq!(first.lease_expires_at, 60_010);
+    assert_eq!(first.body.artifacts[0].id, a.id);
     assert!(first.body.artifacts[0].complete_bytes_available);
     assert_eq!(first.body.artifacts[0].retained_records, 2);
     assert_eq!(
         first.body.artifacts[0].origin.as_ref().unwrap().byte_length,
         6
     );
-    store
-        .ingest("artifact-list-later", "source-a", "jsonl", b"{}\n", 2)
-        .unwrap();
     query.cursor = first.next_cursor.clone();
-    let second = store.artifact_read(&query, 11).unwrap();
-    assert_eq!(first.snapshot_id, second.snapshot_id);
-    assert_eq!(second.total_items, 2);
-    assert!(second.next_cursor.is_none());
-    let mut ids = vec![
-        first.body.artifacts[0].id.clone(),
-        second.body.artifacts[0].id.clone(),
-    ];
-    let mut expected = vec![a.id, b.id];
-    ids.sort();
-    expected.sort();
-    assert_eq!(ids, expected);
     let mut changed = query.clone();
     changed.selector.received_before = 4;
     assert_eq!(
-        store.artifact_read(&changed, 12).unwrap_err().code,
+        store.artifact_read(&changed, 11).unwrap_err().code,
         "CONFLICT"
     );
     changed = query.clone();
     changed.page_size = 2;
     assert_eq!(
-        store.artifact_read(&changed, 12).unwrap_err().code,
+        store.artifact_read(&changed, 11).unwrap_err().code,
         "CONFLICT"
     );
     let other_dir = tempfile::tempdir().unwrap();
     let other = Store::open(other_dir.path(), config()).unwrap();
     assert_eq!(
-        other.artifact_read(&query, 12).unwrap_err().code,
+        other.artifact_read(&query, 11).unwrap_err().code,
         "RESULT_EXPIRED"
     );
+    // A later page reads the store as it is, in receipt order after the cursor.
+    let later = store
+        .ingest("artifact-list-later", "source-a", "jsonl", b"{}\n", 2)
+        .unwrap();
+    let second = store.artifact_read(&query, 11).unwrap();
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+    assert_eq!(second.page_start, 1);
+    query.cursor = second.next_cursor.clone();
+    let third = store.artifact_read(&query, 12).unwrap();
+    assert_eq!((third.page_start, third.total_items), (2, 3));
+    assert!(third.next_cursor.is_none());
+    let mut ids = vec![
+        second.body.artifacts[0].id.clone(),
+        third.body.artifacts[0].id.clone(),
+    ];
+    let mut expected = vec![b.id, later.id];
+    ids.sort();
+    expected.sort();
+    assert_eq!(ids, expected);
+    query.cursor = None;
+    let fresh = store.artifact_read(&query, 20).unwrap();
+    query.cursor = fresh.next_cursor.clone();
     assert_eq!(
         store
-            .artifact_read(&query, first.lease_expires_at)
+            .artifact_read(&query, fresh.lease_expires_at)
             .unwrap_err()
             .code,
         "RESULT_EXPIRED"
     );
     assert_eq!(
-        store.status(first.lease_expires_at).unwrap()["artifact_read_handles"].as_str(),
+        store.status(fresh.lease_expires_at).unwrap()["artifact_read_handles"].as_str(),
         Some("0")
     );
 }
@@ -9992,9 +10010,10 @@ fn artifact_discovery_keeps_reclaimed_parent_unknown_and_never_invents_complete_
         ..Default::default()
     };
     let first = store.artifact_read(&query, 31 * DAY).unwrap();
-    assert_eq!(first.total_items, 2);
     query.cursor = first.next_cursor.clone();
     let second = store.artifact_read(&query, 31 * DAY + 1).unwrap();
+    assert_eq!(second.total_items, 2);
+    assert!(second.next_cursor.is_none());
     let rows = [&first.body.artifacts[0], &second.body.artifacts[0]];
     let fragment = rows.iter().find(|row| row.id == artifact.id).unwrap();
     assert!(fragment.origin.is_none());
@@ -10036,7 +10055,6 @@ fn artifact_discovery_keeps_reclaimed_parent_unknown_and_never_invents_complete_
     store.release(&record_pin.id).unwrap();
     store.release(&whole_pin.id).unwrap();
     store.expire(31 * DAY + 2).unwrap();
-    assert_eq!(store.artifact_read(&query, 31 * DAY + 3).unwrap(), second);
     assert_eq!(
         store
             .artifact_read(&ArtifactRead::default(), 31 * DAY + 3)
@@ -10085,6 +10103,127 @@ fn artifact_capture_refuses_budget_and_corruption_without_publishing_prefixes() 
         );
         assert!(store.properties().is_ok());
     }
+}
+
+#[test]
+fn artifacts_listing_reads_only_its_page() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    // 600 artifacts and their records exceed the 512 KiB of catalog rows that one
+    // 32 MiB charge at 64 bytes per byte admits, which the listing once spent on
+    // a whole-store scan before filtering.
+    let mut narrow = Vec::new();
+    for time in 0..600 {
+        let source = if (300..303).contains(&time) {
+            "narrow"
+        } else {
+            "bulk"
+        };
+        let artifact = store
+            .ingest(
+                &format!("page-bound-{time}"),
+                source,
+                "jsonl",
+                b"{}\n",
+                time,
+            )
+            .unwrap();
+        if source == "narrow" {
+            narrow.push(artifact.id);
+        }
+    }
+    let mut query = ArtifactRead {
+        selector: ArtifactSelector {
+            source: Some("narrow".into()),
+            received_from: 300,
+            received_before: 303,
+            ..Default::default()
+        },
+        page_size: 2,
+        ..Default::default()
+    };
+    let first = store.artifact_read(&query, 600).unwrap();
+    let ids = |page: &sparrow_core::ArtifactReadPage| {
+        page.body
+            .artifacts
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&first), narrow[..2]);
+    // Two artifacts, their two records and the pin scan's terminal probe.
+    assert_eq!(first.scanned, 5, "page read {} entries", first.scanned);
+    query.cursor = first.next_cursor.clone();
+    let second = store.artifact_read(&query, 601).unwrap();
+    assert_eq!(ids(&second), narrow[2..]);
+    assert_eq!((second.page_start, second.total_items), (2, 3));
+    assert!(second.next_cursor.is_none());
+    // A continuation cursor serves one read, through either surface.
+    assert_eq!(
+        store.artifact_read(&query, 602).unwrap_err().code,
+        "RESULT_EXPIRED"
+    );
+    let unfiltered = ArtifactRead {
+        page_size: 1,
+        ..Default::default()
+    };
+    let oldest = store.artifact_read(&unfiltered, 600).unwrap();
+    assert_eq!(
+        oldest.body.artifacts[0]
+            .origin
+            .as_ref()
+            .unwrap()
+            .received_at,
+        0
+    );
+    let store_id = oldest.store_id.clone();
+    let Ok(sparrow_core::ResultPage::Artifacts(next)) =
+        store.result_next(&store_id, oldest.next_cursor.as_deref().unwrap(), 601)
+    else {
+        panic!("artifact continuation must read the next live page");
+    };
+    assert_eq!(
+        next.body.artifacts[0].origin.as_ref().unwrap().received_at,
+        1
+    );
+    assert_eq!(next.page_start, 1);
+}
+
+#[test]
+fn artifacts_listing_page_over_its_bound_is_refused_by_name() {
+    use sparrow_core::ArtifactRead;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("page-over-bound", "source", "jsonl", b"{}\n{}\n{}\n", 0)
+        .unwrap();
+    // One row costs the pin scan's terminal probe, the artifact and its three
+    // records: five catalog entries.
+    let query = ArtifactRead {
+        page_size: 5,
+        scan_budget: 4,
+        ..Default::default()
+    };
+    let error = store.artifact_read(&query, 1).unwrap_err();
+    assert_eq!(error.code, "RESOURCE_LIMIT");
+    assert!(
+        error.message.contains("page_size 5") && error.message.contains("4 catalog entries"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        store.status(1).unwrap()["artifact_read_handles"].as_str(),
+        Some("0")
+    );
+    let fits = ArtifactRead {
+        scan_budget: 5,
+        ..query
+    };
+    assert_eq!(
+        store.artifact_read(&fits, 1).unwrap().body.artifacts.len(),
+        1
+    );
 }
 
 #[test]
@@ -13500,7 +13639,7 @@ fn artifact_diagnostic_filters_preserve_unknown_counts_and_original_receipt_scop
 }
 
 #[test]
-fn artifact_filter_pages_freeze_coverage_and_bind_all_filters() {
+fn artifact_filter_pages_cover_their_rows_and_bind_all_filters() {
     use sparrow_core::{
         ArtifactRead, ArtifactSelector, DiagnosticDimension as D, QueryAlternatives,
     };
@@ -13538,11 +13677,13 @@ fn artifact_filter_pages_freeze_coverage_and_bind_all_filters() {
         .ingest("artifact-filter-page-new", "mapped", "jsonl", b"{}\n", 21)
         .unwrap();
     let second = store.artifact_read(&query, 22).unwrap();
+    // Each live page covers the records of the rows it read; both rows match alike.
     assert_eq!(
         second.body.diagnostic_coverage,
         first.body.diagnostic_coverage
     );
     assert_eq!(second.total_items, 2);
+    query.cursor = second.next_cursor.clone();
     query.selector.require_complete_index = true;
     assert_eq!(
         store.artifact_read(&query, 22).unwrap_err().code,
@@ -15792,7 +15933,9 @@ fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_o
     let pin = store
         .pin("next-pin-a", "first", &a.record_ids, 1, 2)
         .unwrap();
-    store.pin("next-pin-b", "second", &[b.id], 1, 2).unwrap();
+    store
+        .pin("next-pin-b", "second", std::slice::from_ref(&b.id), 1, 2)
+        .unwrap();
     let scope = record_page_scope("pages", 1);
     let id = store.properties().unwrap()["store_id"]
         .as_str()
@@ -15847,7 +15990,12 @@ fn result_next_reuses_all_captured_operation_pages_and_refuses_invalid_expired_o
             },
         ));
     }
+    // Explicit selections are captured; live listings read on (see artifacts_listing_*).
     let mut artifacts = ArtifactRead {
+        selector: sparrow_core::ArtifactSelector {
+            selection: QuerySelection::Evidence(vec![a.id.clone(), b.id.clone()]),
+            ..Default::default()
+        },
         page_size: 1,
         ..Default::default()
     };

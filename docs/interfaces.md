@@ -2034,6 +2034,26 @@ renderer. Schema 27 supersedes this initial scope with membership and diagnostic
 filtering. Producer stream discovery now uses `producerStreamGet` and source
 summaries; corpus-scale operational selection remains unqualified.
 
+The live artifact listing, with no explicit selection, reads one page at a time
+in receipt order, so its cost follows the page and not the store. Each page
+seeks the artifact and record receipt indexes at its receipt interval and
+position, folds one receipt millisecond at a time and stops at its page size,
+at most 31 rows. It charges only the catalog rows it reads against its own
+admission: the scan budget in entries and the 32 MiB conservative catalog
+charge. A page that exhausts that admission after reading a row ends early with
+a cursor. A page that exhausts it before one row fits refuses with
+`RESOURCE_LIMIT`, and the message names the page size and both bounds. Rows are
+ordered by original receipt time, then artifact ID. The cursor continues after
+the page's last row and binds the selector and limits. Each page is a new lease
+with its own snapshot ID, `as_of` and scan evidence. Continuing releases the
+previous page's handle, so each continuation cursor serves one read.
+`total_items` counts the rows delivered through that page, and diagnostic
+coverage covers the records that page read. Evidence received or retired
+between pages can appear in or leave later pages, but no row repeats. A record
+shares its parent's receipt time, so a retained record whose parent catalog was
+reclaimed appears at that time; receipt filtering over it still refuses with
+`INDEX_NOT_READY`. Explicit selections keep one immutable capture.
+
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
 `media_type`, `format`, labels, and requested `durability`. Omitted source identity
 uses the configured upload source. Format selects the interpretation profile;

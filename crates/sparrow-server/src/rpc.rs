@@ -3028,9 +3028,19 @@ impl wire::sparrow::Server for Rpc {
             page_size: input.get_page_size() as usize,
             scan_budget: input.get_scan_budget() as usize,
         };
+        // A live listing's continuation publishes a new handle that this reply owns.
         match self
-            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
-                store.artifact_read_cancellable(&query, now, &cancellation)
+            .read_work(move |store, now, cancellation| {
+                let page = store.artifact_read_cancellable(&query, now, &cancellation)?;
+                let owns_capture = query.cursor.as_deref().is_none_or(|cursor| {
+                    cursor.split_once('/').map(|(id, _)| id) != Some(page.snapshot_id.as_str())
+                });
+                Ok(QueryReply {
+                    page,
+                    store,
+                    delivered: false,
+                    owns_capture,
+                })
             })
             .await
         {
@@ -4026,13 +4036,27 @@ mod tests {
             },
         )
         .await;
+        // An explicit selection is one captured lease with replayable cursors;
+        // live listings continue by reading their next page instead.
+        let selection = sparrow_core::QuerySelection::Evidence(
+            rpc.store
+                .artifacts(instant)
+                .unwrap()
+                .into_iter()
+                .map(|artifact| artifact.id)
+                .collect(),
+        );
         capture_lifetime(
             &rpc,
             &admission,
             "artifact_read_handles",
-            |store, now, token, cursor| {
+            move |store, now, token, cursor| {
                 store.artifact_read_cancellable(
                     &sparrow_core::ArtifactRead {
+                        selector: sparrow_core::ArtifactSelector {
+                            selection: selection.clone(),
+                            ..Default::default()
+                        },
                         cursor,
                         page_size: 1,
                         ..Default::default()

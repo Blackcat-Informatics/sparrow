@@ -2702,7 +2702,7 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     "1",
                 ],
             );
-            assert_eq!(first["total_items"].as_str(), Some("2"));
+            assert_eq!(first["total_items"].as_str(), Some("1"));
             assert_eq!(first["rows"][0]["retained_records"].as_str(), Some("2"));
             assert_eq!(
                 first["rows"][0]["complete_bytes_available"].as_bool(),
@@ -2728,9 +2728,19 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 )
                 .await;
             assert!(!second["isError"].as_bool().unwrap());
-            let again = cli(
-                &socket,
-                &[
+            // A live continuation reads the next receipt-ordered page under a new
+            // handle, and the later artifact still lies ahead of it.
+            let second = &second["structuredContent"];
+            assert_ne!(second["snapshot_id"], first["snapshot_id"]);
+            assert_eq!(second["total_items"].as_str(), Some("2"));
+            assert_eq!(second["has_more"].as_bool(), Some(true));
+            assert_ne!(
+                second["rows"][0]["artifact_id"],
+                first["rows"][0]["artifact_id"]
+            );
+            let spent = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
                     "artifacts",
                     &store,
                     "--source",
@@ -2739,16 +2749,11 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     "1",
                     "--cursor",
                     cursor,
-                ],
-            );
-            assert_eq!(second["structuredContent"], again);
-            assert_eq!(again["snapshot_id"], first["snapshot_id"]);
-            assert_eq!(again["total_items"].as_str(), Some("2"));
-            assert_eq!(again["has_more"].as_bool(), Some(false));
-            assert_ne!(
-                again["rows"][0]["artifact_id"],
-                first["rows"][0]["artifact_id"]
-            );
+                ])
+                .admitted_output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&spent.stderr).contains("RESULT_EXPIRED"));
+            let cursor = second["next_cursor"].as_str().unwrap();
             let fragments = cli(
                 &socket,
                 &["artifacts", &store, "--source", "wire-fragments"],
@@ -11510,6 +11515,19 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 )])),
             )
             .unwrap();
+            // A pinned selection is one captured artifact page set; live listings read on.
+            let scope_file = dir.path().join("artifact-scope.json");
+            std::fs::write(
+                &scope_file,
+                purrdf_lex::json::write_compact(&Value::from(
+                    Object::new()
+                        .with("kind", "pin")
+                        .with("store_id", id)
+                        .with("pin_id", pin_id),
+                )),
+            )
+            .unwrap();
+            let artifact_scope = scope_file.to_str().unwrap();
             let commands = [
                 vec![
                     "records",
@@ -11538,7 +11556,14 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                     "--page-size",
                     "1",
                 ],
-                vec!["artifacts", id, "--page-size", "1"],
+                vec![
+                    "artifacts",
+                    id,
+                    "--scope-file",
+                    artifact_scope,
+                    "--page-size",
+                    "1",
+                ],
                 vec!["sources", id, "--page-size", "1"],
                 vec!["pins", id, "--page-size", "1"],
                 vec!["pin-get", id, "--id", pin_id, "--page-size", "1"],

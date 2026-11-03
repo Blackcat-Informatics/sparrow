@@ -215,7 +215,7 @@ names = ['^(recapture_pin_for_receipt|serialize_full_scope_for_receipt)$']
 id = "temporal-backend-candidates"
 summary = "Current and snapshot-bound readers use the same native half-open temporal iterator and catalog/index integrity checks; backends supply lookup only."
 home = "sparrow_core::storage::query_membership::temporal_candidates"
-entry_points = ["sparrow_core::storage::Writer::query_candidates", "sparrow_core::storage::temporal_index::TemporalRows::new", "sparrow_core::storage::temporal_index::TemporalRows::read_next", "sparrow_core::storage::temporal_index::row_bound", "sparrow_core::storage::temporal_index::check_width"]
+entry_points = ["sparrow_core::storage::Writer::query_candidates", "sparrow_core::storage::temporal_index::TemporalRows::new", "sparrow_core::storage::temporal_index::TemporalRows::read_next", "sparrow_core::storage::temporal_index::TemporalRows::peek", "sparrow_core::storage::temporal_index::row_bound", "sparrow_core::storage::temporal_index::check_width", "sparrow_core::storage::temporal_index::entry_time"]
 spec = "docs/query-streaming.md: native read foundation."
 vectors = ["crates/sparrow-core/src/storage/query_membership.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -224,6 +224,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(snapshot_time_candidates|stream_time_candidates)$']
+
+[[job]]
+id = "artifact-receipt-fold"
+summary = "One receipt-ordered fold reads the artifact and record receipt indexes one millisecond at a time; the live artifact listing stops it at its page and continues by cursor, and the source inventory runs it over the whole interval."
+home = "sparrow_core::storage::artifact_read::Receipts::fold"
+entry_points = ["sparrow_core::storage::artifact_read::Writer::artifact_capture", "sparrow_core::storage::artifact_read::Writer::artifact_receipt_page", "sparrow_core::storage::artifact_read::Store::artifact_next"]
+spec = "docs/interfaces.md: live artifact listing pages."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(scan_artifact_prefix|scan_record_prefix)$']
 
 [[job]]
 id = "backend-field-witnesses"
