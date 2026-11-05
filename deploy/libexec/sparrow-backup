@@ -78,8 +78,24 @@ def du(path):
     return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file())
 
 
+def no_copy_on_write(path):
+    flags = subprocess.run(["lsattr", "-d", "--", str(path)], check=True, capture_output=True,
+                           text=True).stdout.split(maxsplit=1)[0]
+    return "C" in flags
+
+
 def copy_tree(source, target):
-    subprocess.run(["cp", "-a", "--reflink=auto", "--", str(source), str(target)], check=True)
+    # btrfs refuses a reflink between a copy-on-write file and a no-copy-on-write one, and
+    # --reflink=auto then copies every byte. So the copy's directory takes its source's attribute
+    # before anything is created in it (deploy/lib.sh, match_copy_on_write). Copy-on-write is off
+    # for the store (Patrick, 2026-10-15).
+    target.mkdir()
+    fstype = subprocess.run(["findmnt", "-no", "FSTYPE", "-T", str(target)], check=True,
+                            capture_output=True, text=True).stdout.strip()
+    if fstype == "btrfs":
+        flag = "+C" if no_copy_on_write(source) else "-C"
+        subprocess.run(["chattr", flag, "--", str(target)], check=True)
+    subprocess.run(["cp", "-a", "--reflink=auto", "--", f"{source}/.", str(target)], check=True)
 
 
 def sync_tree(path):

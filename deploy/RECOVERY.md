@@ -280,7 +280,9 @@ sudo deploy/stop.sh
 sudo mv /SPARROW/store /SPARROW/store.damaged
 sudo mv /SPARROW/intake /SPARROW/intake.damaged
 sudo mv /SPARROW/ship /SPARROW/ship.damaged
-sudo cp -a --reflink=auto /SPARROW/backups/NAME/store /SPARROW/store
+sudo mkdir /SPARROW/store
+sudo deploy/copy-on-write.sh match /SPARROW/backups/NAME/store /SPARROW/store
+sudo cp -a --reflink=auto /SPARROW/backups/NAME/store/. /SPARROW/store/
 sudo cp -a --reflink=auto /SPARROW/backups/NAME/intake /SPARROW/intake
 sudo cp -a --reflink=auto /SPARROW/backups/NAME/config/ship /SPARROW/ship
 sudo systemd-tmpfiles --create sparrow.conf
@@ -288,6 +290,12 @@ sudo deploy/start.sh --restored-from /SPARROW/backups/NAME
 sudo deploy/check.sh --store-id STORE_ID
 sudo systemctl start sparrow-ship.timer sparrow-backup.timer
 ```
+
+The restored store takes the backup's copy-on-write attribute, because btrfs
+refuses a reflink between a copy-on-write file and a no-copy-on-write one and
+`--reflink=auto` would then copy every byte. A backup taken before copy-on-write
+was switched off restores a store that still has it, and the next
+`deploy/restart.sh` rewrites that store without it while it is closed.
 
 `start.sh --restored-from` starts exactly the image `SOURCE` names, taken from
 `/usr/local/libexec/sparrow`, `./bin` or the backup's `images/`, and fails
@@ -420,7 +428,9 @@ for part in store intake; do
     fi
     if [ ! -e "/SPARROW/$part" ]; then
         sudo rm -rf "/SPARROW/$part.restoring"
-        sudo cp -a --reflink=always "$B/$part" "/SPARROW/$part.restoring"
+        sudo mkdir "/SPARROW/$part.restoring"
+        sudo deploy/copy-on-write.sh match "$B/$part" "/SPARROW/$part.restoring"
+        sudo cp -a --reflink=always "$B/$part/." "/SPARROW/$part.restoring/"
         sudo mv -T "/SPARROW/$part.restoring" "/SPARROW/$part"
     fi
 done

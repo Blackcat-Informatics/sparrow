@@ -210,8 +210,12 @@ scratch=$(realpath -e -- "$SCRATCH") || exit 1
 guard "$SCRATCH" "$scratch"
 require_socket_length "$SOCKET"
 
-cp -a --reflink=always -- "$BACKUP/store" "$DATA" \
-    || die "cannot reflink $BACKUP/store below $VERIFY_ROOT; it must be on the backup's btrfs filesystem"
+# The copy's directory takes the backup store's copy-on-write attribute, since btrfs refuses a
+# reflink between a copy-on-write file and a no-copy-on-write one.
+mkdir -- "$DATA"
+match_copy_on_write "$BACKUP/store" "$DATA"
+cp -a --reflink=always -- "$BACKUP/store/." "$DATA/" \
+    || die "cannot reflink $BACKUP/store below $VERIFY_ROOT; it must be on the backup's btrfs filesystem, and every file in it must share the store directory's copy-on-write attribute (lsattr)"
 {
     printf 'query_only = true\n'
     printf 'socket_path = "%s"\ndata_dir = "%s"\ntext_lexicon_dir = "%s"\n' "$SOCKET" "$DATA" "$lexicons"

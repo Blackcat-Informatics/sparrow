@@ -382,3 +382,102 @@ print(v["store_id"], v["schema_version"], v["pressure"]["phase"], len(v["consume
     printf 'receipt: store_id=%s schema=%s pressure=%s durability_failure=%s watches=%s\n' \
         "$store" "$schema" "$pressure" "$durability" "$watches"
 }
+
+# Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"), by Katamari's
+# mechanism (katamari-io copy_on_write.rs). On btrfs, a file or directory created in a directory
+# that carries the no-copy-on-write attribute (chattr +C) inherits it. So the attribute is set on
+# a directory before anything is written there. A file that already holds data keeps
+# copy-on-write, so an existing store is rewritten by copy while it is closed
+# (convert_store_no_cow). btrfs refuses a reflink between a copy-on-write file and a
+# no-copy-on-write one, and cp --reflink=auto then copies every byte. So a copy's directory takes
+# its source's attribute (match_copy_on_write).
+
+on_btrfs() {
+    [[ $(findmnt -no FSTYPE -T "$1" 2>/dev/null) == btrfs ]]
+}
+
+no_copy_on_write() {
+    local flags
+    flags=$(lsattr -d -- "$1" 2>/dev/null) || return 1
+    [[ ${flags%% *} == *C* ]]
+}
+
+# The number of regular files under $1 that still have copy-on-write.
+copy_on_write_files() {
+    find "$1" -type f -exec lsattr -- {} + 2>/dev/null | awk '$1 !~ /C/' | wc -l
+}
+
+# Switch copy-on-write off for DIR where its filesystem has the attribute. It is never a failure
+# for the caller. A directory that already holds copy-on-write files is left as it is, because new
+# files would inherit the attribute and the store would be mixed, so no reflink copy of it would
+# work. Such a directory is converted with convert_store_no_cow.
+switch_off_copy_on_write() {
+    local dir=$1 output
+    on_btrfs "$dir" || return 0
+    no_copy_on_write "$dir" && return 0
+    if (($(copy_on_write_files "$dir"))); then
+        note "$dir holds copy-on-write files; convert it while closed (deploy/copy-on-write.sh convert $dir)"
+        return 0
+    fi
+    if [[ -n ${DEST:-} ]]; then
+        note "staged, not run: chattr +C $dir"
+        return 0
+    fi
+    output=$(chattr +C -- "$dir" 2>&1) || note "copy-on-write stays on for $dir: $output"
+}
+
+# Give the empty directory DIR the copy-on-write attribute of SOURCE's directory, so that a reflink
+# copy of SOURCE into DIR shares extents instead of copying every byte.
+match_copy_on_write() {
+    local source=$1 dir=$2 flag=-C output
+    on_btrfs "$dir" || return 0
+    no_copy_on_write "$source" && flag=+C
+    output=$(chattr "$flag" -- "$dir" 2>&1) || die "cannot chattr $flag $dir to match $source: $output"
+}
+
+# Rewrite the closed store DATA so that it and every file in it have copy-on-write off. The copy
+# is made in a no-copy-on-write sibling, its file list, sizes and bytes are compared with DATA, and
+# it then takes DATA's name. The original is kept, renamed DATA.cow-STAMP, for the operator to
+# remove once a backup of the converted store has verified.
+convert_store_no_cow() {
+    local data partial kept need free link files
+    data=$(realpath -e -- "$1") || die "$1 does not exist"
+    [[ -d $data ]] || die "$data is not a directory"
+    if ! on_btrfs "$data"; then
+        note "$data is not on btrfs; it has no copy-on-write to switch off"
+        return 0
+    fi
+    if no_copy_on_write "$data" && (($(copy_on_write_files "$data") == 0)); then
+        note "copy-on-write is already off for $data and every file in it"
+        return 0
+    fi
+    for link in /proc/[0-9]*/fd/*; do
+        [[ $(readlink -- "$link" 2>/dev/null) != "$data"/* ]] \
+            || die "process ${link#/proc/} still holds a file in $data open; stop the daemon first"
+    done
+    partial=$data.no-cow.partial
+    kept=$data.cow-$(date -u +%Y%m%dT%H%M%SZ)
+    [[ ! -e $partial ]] || die "$partial is left from an earlier attempt; inspect and remove it"
+    need=$(du -s -B1 -- "$data" | cut -f1)
+    free=$(df -B1 --output=avail -- "${data%/*}" | tail -n 1)
+    ((free > need + 10 * 1024 ** 3)) \
+        || die "only $free bytes free beside $data; converting it needs $need bytes plus 10 GiB"
+    mkdir -- "$partial"
+    chattr +C -- "$partial" || die "cannot switch copy-on-write off for $partial; $data is unchanged"
+    # cp -a copies DATA's mode, owner and ACLs onto PARTIAL; the files inherit PARTIAL's attribute.
+    cp -a --reflink=never -- "$data/." "$partial/" \
+        || die "copying $data failed; $data is unchanged and $partial is kept for inspection"
+    diff -q <(cd -- "$data" && find . -printf '%P %y %s %m\n' | sort) \
+        <(cd -- "$partial" && find . -printf '%P %y %s %m\n' | sort) >/dev/null \
+        || die "the copy's file list differs from $data; $data is unchanged and $partial is kept"
+    diff -r -q --no-dereference -- "$data" "$partial" >/dev/null \
+        || die "the copy's bytes differ from $data; $data is unchanged and $partial is kept"
+    if (($(copy_on_write_files "$partial"))) || ! no_copy_on_write "$partial"; then
+        die "$partial or files in it still have copy-on-write; $data is unchanged"
+    fi
+    files=$(find "$partial" -type f | wc -l)
+    mv -T -- "$data" "$kept"
+    mv -T -- "$partial" "$data"
+    sync -f -- "$data"
+    note "converted $data: $files files with copy-on-write off; the original is kept at $kept"
+}

@@ -6,7 +6,8 @@
 # installed and verified while the old daemon still runs; the stop goes through the drain; the
 # image the links named becomes the rollback (.previous). After the start the store identity must
 # be the one the old daemon reported. There is no automatic rollback: an image may upgrade the
-# store's format, and an older image cannot read it (RECOVERY.md, "Rollback").
+# store's format, and an older image cannot read it (RECOVERY.md, "Rollback"). A store that still
+# has copy-on-write files is rewritten without it while closed, and the original is kept beside it.
 set -euo pipefail
 umask 022
 
@@ -62,7 +63,10 @@ if unit_active; then
     store=$(status_json | status_field store_id)
     [[ $(readlink -- "$LIBEXEC/sparrowd") != "${daemon##*/}" ]] || note "already on ${daemon##*/}; restarting it"
 fi
+data=$(config_value data_dir)
 drain_stop
+# While the store is closed, rewrite it with copy-on-write off if any file still has it (lib.sh).
+convert_store_no_cow "$data"
 select_current "$daemon" "$cli"
 note "starting $SPARROW_UNIT on ${daemon##*/}"
 "${SYSTEMCTL[@]}" start "$SPARROW_UNIT"
