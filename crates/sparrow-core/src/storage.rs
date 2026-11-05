@@ -1380,8 +1380,9 @@ impl Store {
                 "RDF read control counters inconsistent",
             ));
         }
-        match db.get("rdf_profile")? {
-            Some(stored) if stored == rdf_fingerprint.as_bytes() => {}
+        let advance_rdf_profile = match db.get("rdf_profile")? {
+            Some(stored) if stored == rdf_fingerprint.as_bytes() => false,
+            Some(stored) if rdf_index::previous_profile_advances(&db, &stored)? => true,
             Some(_) => {
                 return Err(Error::new(
                     "UNSUPPORTED",
@@ -1394,7 +1395,7 @@ impl Store {
                     "store RDF profile identity missing",
                 ));
             }
-        }
+        };
         rdf_index::upgrade_reverse(&db)?;
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
@@ -1408,6 +1409,11 @@ impl Store {
                 "STORAGE_FAILURE",
                 "producer registry missing from fenced store",
             ));
+        }
+        if advance_rdf_profile {
+            // After the upgrades and fences, so their refusals leave the profile unchanged; the
+            // synchronization below makes it durable.
+            db.put("rdf_profile", &rdf_fingerprint)?;
         }
         // Recovered buffered writes are certified only after a real synchronization.
         db.flush_wal(true)?;

@@ -51,6 +51,41 @@ pub(super) fn profile_identity() -> Result<String, Error> {
     ))
 }
 
+/// The profile identity stored by images built on PurRDF a47940e. PurRDF fb02dd38b changed the
+/// native Markdown rules, and with them the Markdown contract id this identity hashes (#28).
+const PREVIOUS_PROFILE: &str = "1909d176e2b728f3041d0b2c665600aed5303e4b8525260bc1165850690ad0d5";
+
+/// Whether a store recorded under `PREVIOUS_PROFILE` may advance to the current profile. Only
+/// the Markdown contract changed between the two, so a store holding no Markdown projection has
+/// nothing stored under the old rules. A store that still holds one refuses, naming the count.
+/// The caller writes the current profile after the startup upgrades and fences have passed.
+pub(super) fn previous_profile_advances(db: &DB, stored: &[u8]) -> Result<bool, Error> {
+    if stored != PREVIOUS_PROFILE.as_bytes() {
+        return Ok(false);
+    }
+    const PREFIX: &[u8] = b"rdf:state:rdf-projection:markdown:";
+    let mut markdown = 0_u64;
+    for entry in db.iterator(rocksdb::IteratorMode::From(
+        PREFIX,
+        rocksdb::Direction::Forward,
+    )) {
+        let (key, _) = entry?;
+        if !key.starts_with(PREFIX) {
+            break;
+        }
+        markdown += 1;
+    }
+    if markdown > 0 {
+        return Err(Error::new(
+            "UNSUPPORTED",
+            format!(
+                "RDF profile changed and the store holds {markdown} Markdown projection(s) built under the previous Markdown rules; open it with its own image, or wait until those records retire"
+            ),
+        ));
+    }
+    Ok(true)
+}
+
 impl Store {
     /// Inspect a retained record's persisted RDF state and exact native stream counts.
     /// This operation does not rebuild a dataset or imply SPARQL/backend qualification.

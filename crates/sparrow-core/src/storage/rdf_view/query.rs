@@ -138,7 +138,7 @@ impl Store {
                 engine.explain_governed_fallible_view(
                     view,
                     read.request,
-                    QueryOptions::new().with_env(environment),
+                    &QueryOptions::new().with_env(environment),
                     governors,
                 )
             },
@@ -165,7 +165,7 @@ impl Store {
                 engine.query_governed_fallible_view(
                     view,
                     query.0.request,
-                    QueryOptions::new().with_env(environment),
+                    &QueryOptions::new().with_env(environment),
                     governors,
                 )
             },

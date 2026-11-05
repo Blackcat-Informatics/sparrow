@@ -122,6 +122,7 @@ every watch in `consume_watches` names a root that exists.
   `UNSUPPORTED: unsupported store format; migration required`,
   `UNSUPPORTED: text analyzer identity changed; explicit index migration required`,
   `UNSUPPORTED: RDF profile changed; explicit projection/index migration required`,
+  `UNSUPPORTED: RDF profile changed and the store holds N Markdown projection(s) ...`,
   or a refusal naming the archive table on a store that has been fenced for
   archiving.
 - Diagnose: which image runs (`readlink /usr/local/libexec/sparrow/sparrowd`),
@@ -130,7 +131,13 @@ every watch in `consume_watches` names a root that exists.
 - Recover: an unsupported format means an image older than the store; return
   to the image that last opened it (`sudo deploy/restart.sh --rev REV`). An
   analyzer change means the lexicon bundle differs from the one the store was
-  built with; point `text_lexicon_dir` back at that bundle. A store fenced for
+  built with; point `text_lexicon_dir` back at that bundle. A Markdown
+  count means the store still holds Markdown projections from before PurRDF
+  fb02dd38b: return to the previous image (`sudo deploy/restart.sh
+  --rollback`) until those records retire. The newer image advances the
+  profile itself once none remains (#28). The plain profile refusal on an
+  image built before fb02dd38b means a newer image has already advanced the
+  profile: see "Rollback". A store fenced for
   archiving needs its `[archive]` table restored. Never delete or rebuild the
   store to get past a refusal.
 - Reversible: yes; a refused open changes nothing.
@@ -152,6 +159,14 @@ every watch in `consume_watches` names a root that exists.
   ([evidence/lifecycle.md](evidence/lifecycle.md) shows a schema 62 image
   refusing a store a schema 63 image had opened, and the restore). Reverting `/etc/sparrow/server.toml` is a
   separate step, kept in its backup.
+- Limit without a schema change: the move to PurRDF fb02dd38b (#28) keeps
+  schema 67 but advances the store's RDF profile at the first open. An image
+  built before it then refuses with `RDF profile changed`, and the schema
+  check does not catch this, so `--rollback` stops the service. Run
+  `--rollback` again to swap forward, or restore the named pre-upgrade
+  backup. `restart.sh` does not require that backup when the schema stays
+  the same: take it by hand with `deploy/pre-upgrade-backup.sh` before that
+  restart.
 - Reversible: yes; `--rollback` again swaps forward.
 
 ## Watch root missing, replaced or unreadable
