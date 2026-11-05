@@ -10160,6 +10160,24 @@ fn artifacts_listing_reads_only_its_page() {
     assert_eq!(ids(&first), narrow[..2]);
     // Two artifacts, their two records and the pin scan's terminal probe.
     assert_eq!(first.scanned, 5, "page read {} entries", first.scanned);
+    // Without a receipt window, a source listing seeks its own rows. Filtering
+    // after a store-wide read would spend this budget on the bulk rows first.
+    let source_only = ArtifactRead {
+        selector: ArtifactSelector {
+            source: Some("narrow".into()),
+            ..Default::default()
+        },
+        page_size: 3,
+        scan_budget: 10,
+        ..Default::default()
+    };
+    let by_source = store.artifact_read(&source_only, 600).unwrap();
+    assert_eq!(ids(&by_source), narrow);
+    assert!(
+        by_source.scanned <= 10,
+        "read {} entries",
+        by_source.scanned
+    );
     query.cursor = first.next_cursor.clone();
     let second = store.artifact_read(&query, 601).unwrap();
     assert_eq!(ids(&second), narrow[2..]);

@@ -31,7 +31,7 @@ retains its permit until exit; private files and reservations are dropped, and
 fresh captures abandoned before response rendering are released. Successfully
 rendered cursors retain their ordinary replayable lease, including after an
 abandoned continuation. A live artifact continuation releases its new handle if
-it is not delivered, and the handle it continued only after delivery (schema 66). Store identity validation does not wait for the catalogue
+it is not rendered, and the handle it continued only after rendering (schema 66). Store identity validation does not wait for the catalogue
 writer. Cancellation does not
 establish non-delivery of a mutation, interrupt individual native calls or mutex
 waits, or qualify direct Cap'n Proto promise cancellation. MCP cancellation
@@ -337,10 +337,11 @@ Continuation:
 - A cursor binds the selector and limits and continues after the page's last
   row, through `artifacts_list` or `result_next`. Continuing reads the store as
   it is then and publishes a new handle.
-- The daemon releases the continued page's handle only after it delivers the
+- The daemon releases the continued page's handle only after it renders the
   new page. A cursor the client already holds therefore survives an abandoned
-  or failed continuation. After a delivered continuation it returns
-  `RESULT_EXPIRED`.
+  or failed continuation. After a rendered continuation it returns
+  `RESULT_EXPIRED`. A reply lost after rendering still spends the cursor the
+  client held, and the new page's handle lives out its lease.
 - A retained record whose parent catalog was reclaimed appears at its receipt
   time. Receipt filtering over it still refuses with `INDEX_NOT_READY`.
 
