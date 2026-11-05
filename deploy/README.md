@@ -64,6 +64,14 @@ Patrick's decisions for this deployment, 2026-11-01:
 
 ## Layout
 
+Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"). `install.sh`
+sets the btrfs no-copy-on-write attribute on `/SPARROW/store` and `/SPARROW/backups` while they
+are empty, so every file created in them inherits it. `restart.sh` rewrites a closed store that
+still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keeps the original
+beside it as `store.cow-STAMP`; remove that copy once a backup of the converted store has verified. Every backup, verification and restore copy takes its source's
+attribute, because btrfs refuses a reflink between the two kinds of file. The store gives up
+btrfs checksums and compression; its own digests and compression cover both.
+
 | Path | Owner, mode | Contents |
 | --- | --- | --- |
 | `/usr/local/libexec/sparrow/sparrowd-schemaN-REV` | root, 0755 | Daemon images, one per revision, never overwritten: `N` is the client schema version, `REV` the short Sparrow commit. |
@@ -78,10 +86,10 @@ Patrick's decisions for this deployment, 2026-11-01:
 | `/etc/sparrow/watches/` | root:sparrow, 0750 | The applied watch definitions, kept for a restore. |
 | `/etc/sparrow/tcp.secret` | root, 0600 | The CHAP secret (see [Secrets](#secrets)). |
 | `/SPARROW` | root:sparrow, 0750 | The service's tree. |
-| `/SPARROW/store` | sparrow, 0710 | The store and `rpc.sock` (0660). |
+| `/SPARROW/store` | sparrow, 0710, no copy-on-write (`C`) | The store and `rpc.sock` (0660). |
 | `/SPARROW/intake/NAME` | the operator who made it (plain `mkdir`; the cutover gives existing roots to `sparrow`), 0770, ACL `group:sparrow:rwx` | One consume root per watch. |
 | `/SPARROW/ship` | paudley:sparrow, 2700 | The shipper's queue, staging, ledgers and lock. |
-| `/SPARROW/backups` | root, 0700 | Closed-store backups: three daily `STAMP` copies, and the named `pre-upgrade-IMAGE` copies, which the rotation never prunes. |
+| `/SPARROW/backups` | root, 0700, no copy-on-write (`C`) | Closed-store backups: three daily `STAMP` copies, and the named `pre-upgrade-IMAGE` copies, which the rotation never prunes. |
 | `/etc/systemd/system/sparrow*.{service,timer}` | root, 0644 | The units, from `systemd/`. |
 | `/etc/apparmor.d/sparrow` | root, 0644 | The profile, from `apparmor/`. |
 | `/etc/sysusers.d/sparrow.conf`, `/etc/tmpfiles.d/sparrow.conf` | root, 0644 | The user, group and layout, from `config/`. |
