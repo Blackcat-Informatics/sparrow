@@ -1,0 +1,220 @@
+diff --git crates/sparrow-core/src/storage.rs crates/sparrow-core/src/storage.rs
+index 59f68e0..d8bb2f7 100644
+--- crates/sparrow-core/src/storage.rs
++++ crates/sparrow-core/src/storage.rs
+@@ -1380,8 +1380,9 @@ impl Store {
+                 "RDF read control counters inconsistent",
+             ));
+         }
+-        match db.get("rdf_profile")? {
+-            Some(stored) if stored == rdf_fingerprint.as_bytes() => {}
++        let advance_rdf_profile = match db.get("rdf_profile")? {
++            Some(stored) if stored == rdf_fingerprint.as_bytes() => false,
++            Some(stored) if rdf_index::previous_profile_advances(&db, &stored)? => true,
+             Some(_) => {
+                 return Err(Error::new(
+                     "UNSUPPORTED",
+@@ -1394,7 +1395,7 @@ impl Store {
+                     "store RDF profile identity missing",
+                 ));
+             }
+-        }
++        };
+         rdf_index::upgrade_reverse(&db)?;
+         recordless::upgrade(&db)?;
+         diagnostic::fence_format(&db)?;
+@@ -1409,6 +1410,11 @@ impl Store {
+                 "producer registry missing from fenced store",
+             ));
+         }
++        if advance_rdf_profile {
++            // After the upgrades and fences, so their refusals leave the profile unchanged; the
++            // synchronization below makes it durable.
++            db.put("rdf_profile", &rdf_fingerprint)?;
++        }
+         // Recovered buffered writes are certified only after a real synchronization.
+         db.flush_wal(true)?;
+         let durability = std::cell::RefCell::new(durability::State::new(
+diff --git crates/sparrow-core/src/storage/rdf_index.rs crates/sparrow-core/src/storage/rdf_index.rs
+index e8db1ce..eeeeb05 100644
+--- crates/sparrow-core/src/storage/rdf_index.rs
++++ crates/sparrow-core/src/storage/rdf_index.rs
+@@ -51,6 +51,41 @@ pub(super) fn profile_identity() -> Result<String, Error> {
+     ))
+ }
+ 
++/// The profile identity stored by images built on PurRDF a47940e. PurRDF fb02dd38b changed the
++/// native Markdown rules, and with them the Markdown contract id this identity hashes (#28).
++const PREVIOUS_PROFILE: &str = "1909d176e2b728f3041d0b2c665600aed5303e4b8525260bc1165850690ad0d5";
++
++/// Whether a store recorded under `PREVIOUS_PROFILE` may advance to the current profile. Only
++/// the Markdown contract changed between the two, so a store holding no Markdown projection has
++/// nothing stored under the old rules. A store that still holds one refuses, naming the count.
++/// The caller writes the current profile once every other startup check has passed.
++pub(super) fn previous_profile_advances(db: &DB, stored: &[u8]) -> Result<bool, Error> {
++    if stored != PREVIOUS_PROFILE.as_bytes() {
++        return Ok(false);
++    }
++    const PREFIX: &[u8] = b"rdf:state:rdf-projection:markdown:";
++    let mut markdown = 0_u64;
++    for entry in db.iterator(rocksdb::IteratorMode::From(
++        PREFIX,
++        rocksdb::Direction::Forward,
++    )) {
++        let (key, _) = entry?;
++        if !key.starts_with(PREFIX) {
++            break;
++        }
++        markdown += 1;
++    }
++    if markdown > 0 {
++        return Err(Error::new(
++            "UNSUPPORTED",
++            format!(
++                "RDF profile changed and the store holds {markdown} Markdown projection(s) built under the previous Markdown rules; open it with its own image, or wait until those records retire"
++            ),
++        ));
++    }
++    Ok(true)
++}
++
+ impl Store {
+     /// Inspect a retained record's persisted RDF state and exact native stream counts.
+     /// This operation does not rebuild a dataset or imply SPARQL/backend qualification.
+diff --git crates/sparrow-core/tests/storage.rs crates/sparrow-core/tests/storage.rs
+index 05968bc..36f2f59 100644
+--- crates/sparrow-core/tests/storage.rs
++++ crates/sparrow-core/tests/storage.rs
+@@ -11692,6 +11692,90 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
+     }
+ }
+ 
++/// A dependency move must not change a persisted identity unnoticed. Change these values only
++/// together with the migration that carries deployed stores across (#28).
++#[test]
++fn persisted_identities_are_pinned_and_the_markdown_contract_move_migrates() {
++    const PREVIOUS: &str = "1909d176e2b728f3041d0b2c665600aed5303e4b8525260bc1165850690ad0d5";
++    const CURRENT: &str = "eeb4f94510fa9301ca019c75ea1f4f02fa3a1539205c085fe24a401d17e63462";
++    let dir = tempfile::tempdir().unwrap();
++    let store = Store::open(dir.path(), config()).unwrap();
++    let status = store.status(0).unwrap();
++    assert_eq!(status["rdf_profile"].as_str(), Some(CURRENT));
++    assert_eq!(
++        status["text_analyzer"].as_str(),
++        Some("e5533b9df7c75ab405290d27872c6392515acb3d0d77d21d4433ec4c59904058")
++    );
++    store
++        .ingest("identity-json", "identity", "json", br#"{"a":1}"#, 1)
++        .unwrap();
++    drop(store);
++    let profile = |dir: &std::path::Path| {
++        let db = catalog_db(dir).unwrap();
++        db.get("rdf_profile").unwrap().unwrap()
++    };
++    // A store holding no Markdown projection advances to the current profile.
++    catalog_db(dir.path())
++        .unwrap()
++        .put("rdf_profile", PREVIOUS)
++        .unwrap();
++    let store = Store::open(dir.path(), config()).unwrap();
++    assert_eq!(
++        store.status(0).unwrap()["rdf_profile"].as_str(),
++        Some(CURRENT)
++    );
++    let markdown = store
++        .ingest(
++            "identity-markdown",
++            "identity",
++            "markdown",
++            b"# Title\n\nbody\n",
++            2,
++        )
++        .unwrap();
++    drop(store);
++    assert_eq!(profile(dir.path()), CURRENT.as_bytes());
++    // One holding a Markdown projection refuses, names the count, and writes nothing.
++    catalog_db(dir.path())
++        .unwrap()
++        .put("rdf_profile", PREVIOUS)
++        .unwrap();
++    match Store::open(dir.path(), config()) {
++        Ok(_) => panic!("a Markdown projection under the previous rules was admitted"),
++        Err(error) => {
++            assert_eq!(error.code, "UNSUPPORTED");
++            assert!(
++                error.message.contains("holds 1 Markdown projection"),
++                "{error}"
++            );
++        }
++    }
++    assert_eq!(profile(dir.path()), PREVIOUS.as_bytes());
++    // Once the Markdown record retires, the same store advances.
++    catalog_db(dir.path())
++        .unwrap()
++        .put("rdf_profile", CURRENT)
++        .unwrap();
++    let store = Store::open(dir.path(), config()).unwrap();
++    store.expire(31 * DAY + 2).unwrap();
++    store.expire(31 * DAY + 2).unwrap();
++    assert!(
++        store
++            .rdf_inspect(&markdown.record_ids[0], 31 * DAY + 3)
++            .is_err()
++    );
++    drop(store);
++    catalog_db(dir.path())
++        .unwrap()
++        .put("rdf_profile", PREVIOUS)
++        .unwrap();
++    let store = Store::open(dir.path(), config()).unwrap();
++    assert_eq!(
++        store.status(0).unwrap()["rdf_profile"].as_str(),
++        Some(CURRENT)
++    );
++}
++
+ #[test]
+ fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers() {
+     use sparrow_core::{ContextFrontier, QueryScope};
+diff --git deploy/RECOVERY.md deploy/RECOVERY.md
+index 2551757..2ac61be 100644
+--- deploy/RECOVERY.md
++++ deploy/RECOVERY.md
+@@ -122,6 +122,7 @@ every watch in `consume_watches` names a root that exists.
+   `UNSUPPORTED: unsupported store format; migration required`,
+   `UNSUPPORTED: text analyzer identity changed; explicit index migration required`,
+   `UNSUPPORTED: RDF profile changed; explicit projection/index migration required`,
++  `UNSUPPORTED: RDF profile changed and the store holds N Markdown projection(s) ...`,
+   or a refusal naming the archive table on a store that has been fenced for
+   archiving.
+ - Diagnose: which image runs (`readlink /usr/local/libexec/sparrow/sparrowd`),
+@@ -130,7 +131,13 @@ every watch in `consume_watches` names a root that exists.
+ - Recover: an unsupported format means an image older than the store; return
+   to the image that last opened it (`sudo deploy/restart.sh --rev REV`). An
+   analyzer change means the lexicon bundle differs from the one the store was
+-  built with; point `text_lexicon_dir` back at that bundle. A store fenced for
++  built with; point `text_lexicon_dir` back at that bundle. A Markdown
++  count means the store still holds Markdown projections from before PurRDF
++  fb02dd38b: return to the previous image (`sudo deploy/restart.sh
++  --rollback`) until those records retire. The newer image advances the
++  profile itself once none remains (#28). The plain profile refusal on an
++  image built before fb02dd38b means a newer image has already advanced the
++  profile: see "Rollback". A store fenced for
+   archiving needs its `[archive]` table restored. Never delete or rebuild the
+   store to get past a refusal.
+ - Reversible: yes; a refused open changes nothing.
+@@ -152,6 +159,14 @@ every watch in `consume_watches` names a root that exists.
+   ([evidence/lifecycle.md](evidence/lifecycle.md) shows a schema 62 image
+   refusing a store a schema 63 image had opened, and the restore). Reverting `/etc/sparrow/server.toml` is a
+   separate step, kept in its backup.
++- Limit without a schema change: the move to PurRDF fb02dd38b (#28) keeps
++  schema 67 but advances the store's RDF profile at the first open. An image
++  built before it then refuses with `RDF profile changed`, and the schema
++  check does not catch this, so `--rollback` stops the service. Run
++  `--rollback` again to swap forward, or restore the named pre-upgrade
++  backup. `restart.sh` does not require that backup when the schema stays
++  the same: take it by hand with `deploy/pre-upgrade-backup.sh` before that
++  restart.
+ - Reversible: yes; `--rollback` again swaps forward.
+ 
+ ## Watch root missing, replaced or unreadable
