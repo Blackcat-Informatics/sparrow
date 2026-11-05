@@ -13,24 +13,44 @@ pub(super) const fn row_bound(prefix: &str) -> u64 {
     (prefix.len() + 21 + 2 * ID_BYTES) as u64
 }
 
+/// A borrowed index key and its identity value.
+pub(super) type Entry<'a> = (&'a [u8], &'a [u8]);
+
 pub(super) struct TemporalRows<'a> {
     cursor: DBRawIteratorWithThreadMode<'a, DB>,
-    prefix: &'static str,
+    prefix: &'a str,
     advance: bool,
     finished: bool,
 }
 
 impl<'a> TemporalRows<'a> {
     pub(super) fn new(
-        prefix: &'static str,
+        prefix: &'a str,
         from: u64,
+        before: u64,
+        scan: impl FnOnce(ReadOptions) -> DBRawIteratorWithThreadMode<'a, DB>,
+    ) -> Self {
+        Self::after(prefix, from, None, before, scan)
+    }
+
+    /// Start at `from`, or just past the entry for `after` received at `from`.
+    pub(super) fn after(
+        prefix: &'a str,
+        from: u64,
+        after: Option<&str>,
         before: u64,
         scan: impl FnOnce(ReadOptions) -> DBRawIteratorWithThreadMode<'a, DB>,
     ) -> Self {
         let mut options = ReadOptions::default();
         options.set_iterate_upper_bound(format!("{prefix}{before:020}:").into_bytes());
         let mut cursor = scan(options);
-        cursor.seek(format!("{prefix}{from:020}:").as_bytes());
+        let mut start = format!("{prefix}{from:020}:").into_bytes();
+        if let Some(after) = after {
+            // The least key greater than the entry itself.
+            start.extend_from_slice(after.as_bytes());
+            start.push(0);
+        }
+        cursor.seek(&start);
         Self {
             cursor,
             prefix,
@@ -45,39 +65,68 @@ impl<'a> TemporalRows<'a> {
         &mut self,
         read: impl FnOnce(&[u8], &[u8]) -> Result<T, Error>,
     ) -> Option<Result<T, Error>> {
-        if self.finished {
-            return None;
-        }
-        if self.advance {
-            self.cursor.next();
-        }
-        self.advance = true;
-        if !self.cursor.valid() {
-            self.finished = true;
-            return self.cursor.status().err().map(|error| Err(error.into()));
-        }
-        let entry = self.cursor.key().zip(self.cursor.value());
-        let Some((key, value)) = entry else {
-            self.finished = true;
-            return Some(Err(Error::new(
-                "STORAGE_FAILURE",
-                "native temporal cursor lost its borrowed entry",
-            )));
+        let result = match self.peek()? {
+            Ok((key, value)) => read(key, value),
+            Err(error) => return Some(Err(error)),
         };
-        if !key.starts_with(self.prefix.as_bytes()) {
-            self.finished = true;
-            return None;
-        }
-        if let Err(error) = check_width(self.prefix, key, value) {
-            self.finished = true;
-            return Some(Err(error));
-        }
-        let result = read(key, value);
+        self.advance = true;
         if result.is_err() {
             self.finished = true;
         }
         Some(result)
     }
+
+    /// Borrow the width-checked head entry without consuming it.
+    pub(super) fn peek(&mut self) -> Option<Result<Entry<'_>, Error>> {
+        if self.finished {
+            return None;
+        }
+        if self.advance {
+            self.cursor.next();
+            self.advance = false;
+        }
+        if !self.cursor.valid() {
+            self.finished = true;
+            return self.cursor.status().err().map(|error| Err(error.into()));
+        }
+        let state = match self.cursor.key().zip(self.cursor.value()) {
+            None => Err(Error::new(
+                "STORAGE_FAILURE",
+                "native temporal cursor lost its borrowed entry",
+            )),
+            Some((key, _)) if !key.starts_with(self.prefix.as_bytes()) => Ok(false),
+            Some((key, value)) => check_width(self.prefix, key, value).map(|()| true),
+        };
+        match state {
+            Ok(true) => self.cursor.key().zip(self.cursor.value()).map(Ok),
+            Ok(false) => {
+                self.finished = true;
+                None
+            }
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+/// Receipt time of a width-checked entry whose key suffix names its identity.
+pub(super) fn entry_time(prefix: &str, key: &[u8], value: &[u8]) -> Result<u64, Error> {
+    let digits = prefix.len()..prefix.len() + 20;
+    key.get(digits)
+        .filter(|digits| {
+            digits.iter().all(u8::is_ascii_digit)
+                && key.get(prefix.len() + 20) == Some(&b':')
+                && key.get(prefix.len() + 21..) == Some(value)
+        })
+        .and_then(|digits| std::str::from_utf8(digits).ok()?.parse().ok())
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "temporal index key disagrees with its receipt time or identity",
+            )
+        })
 }
 
 pub(super) fn check_width(prefix: &str, key: &[u8], value: &[u8]) -> Result<(), Error> {

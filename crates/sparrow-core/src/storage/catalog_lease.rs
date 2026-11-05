@@ -36,9 +36,21 @@ pub(super) struct CaptureAdmission<'a> {
 
 impl CaptureAdmission<'_> {
     pub(super) fn entry(&mut self, bytes: usize) -> Result<(), Error> {
+        if bytes > ENTRY_BYTES {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "catalog capture exhausted entry/scan/time admission; no result published",
+            ));
+        }
+        self.visit()?;
+        super::Writer::charge_catalog(self.remaining, bytes)
+    }
+
+    /// Count one catalog entry against the scan budget and lease time only; the
+    /// caller charges its bytes through a streaming decoder's own admission.
+    pub(super) fn visit(&mut self) -> Result<(), Error> {
         self.cancellation.checkpoint()?;
         if *self.scanned == self.scan_budget
-            || bytes > ENTRY_BYTES
             || self.started.elapsed() >= Duration::from_millis(LEASE_MS)
         {
             return Err(Error::new(
@@ -47,7 +59,7 @@ impl CaptureAdmission<'_> {
             ));
         }
         *self.scanned += 1;
-        super::Writer::charge_catalog(self.remaining, bytes)
+        Ok(())
     }
 }
 
@@ -66,6 +78,14 @@ pub(super) trait PageBody: Sized {
     fn is_boundary(&self, start: usize, page_size: usize) -> Result<bool, Error> {
         Ok(start.is_multiple_of(page_size.min(Self::PAGE_ITEMS)))
     }
+    /// Rows delivered by earlier pages of a continued read.
+    fn offset(&self) -> usize {
+        0
+    }
+    /// Whether the reader continues past this body's last row.
+    fn continues(&self) -> bool {
+        false
+    }
 }
 
 /// Complete immutable metadata capture with bounded pagination.
@@ -79,7 +99,7 @@ pub struct CatalogReadPage<B> {
     pub as_of: u64,
     /// Absolute deadline, never renewed by reading pages.
     pub lease_expires_at: u64,
-    /// Full captured result size.
+    /// Full captured result size; for a continued read, rows delivered through this page.
     pub total_items: usize,
     /// Zero-based first returned position.
     pub page_start: usize,
@@ -139,6 +159,24 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
             + self.selector.capacity()
             + self.body.capacity()
     }
+    /// Refuse a cursor presented with another operation, selector or limits.
+    pub(super) fn bind(
+        &self,
+        selector: &S,
+        page_size: usize,
+        scan_budget: usize,
+    ) -> Result<(), Error> {
+        if &self.selector != selector
+            || self.page_size != page_size
+            || self.scan_budget != scan_budget
+        {
+            return Err(Error::new(
+                "CONFLICT",
+                "cursor requires its original operation, selector and limits",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn alive(&self, now: u64) -> bool {
         now < self.expires_at && self.started.elapsed() < Duration::from_millis(LEASE_MS)
     }
@@ -174,9 +212,10 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
             snapshot_id: self.id.clone(),
             as_of: self.as_of,
             lease_expires_at: self.expires_at,
-            total_items: self.body.len(),
-            page_start: start,
-            next_cursor: (end < self.body.len()).then(|| format!("{}/{end}", self.id)),
+            total_items: self.body.offset() + self.body.len(),
+            page_start: self.body.offset() + start,
+            next_cursor: (end < self.body.len() || self.body.continues())
+                .then(|| format!("{}/{end}", self.id)),
             page_size: self.page_size,
             scan_budget: self.scan_budget,
             scanned: self.scanned,
@@ -255,16 +294,29 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
     ) -> Result<CatalogReadPage<B>, Error> {
         let cursor = Cursor::parse(cursor)?;
         let snapshot = self.snapshot(&cursor)?;
-        if &snapshot.selector != selector
-            || snapshot.page_size != page_size
-            || snapshot.scan_budget != scan_budget
-        {
+        snapshot.bind(selector, page_size, scan_budget)?;
+        snapshot.resume(cursor.start, now)
+    }
+
+    /// The live handle a cursor continues past, when its reader reads further rows.
+    pub(super) fn continuation(
+        &self,
+        cursor: &Cursor<'_>,
+        now: u64,
+    ) -> Result<Option<&Snapshot<S, B>>, Error> {
+        let Some(snapshot) = self.snapshots.get(cursor.id) else {
+            return Ok(None);
+        };
+        if cursor.start != snapshot.body.len() || !snapshot.body.continues() {
+            return Ok(None);
+        }
+        if !snapshot.alive(now) {
             return Err(Error::new(
-                "CONFLICT",
-                "cursor requires its original operation, selector and limits",
+                "RESULT_EXPIRED",
+                "catalog read lease ended before its continuation",
             ));
         }
-        snapshot.resume(cursor.start, now)
+        Ok(Some(snapshot))
     }
     fn snapshot(&self, cursor: &Cursor<'_>) -> Result<&Snapshot<S, B>, Error> {
         self.snapshots.get(cursor.id).ok_or_else(|| {

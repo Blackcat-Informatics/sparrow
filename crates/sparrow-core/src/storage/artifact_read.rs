@@ -2,10 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 //! Pin-aware artifact discovery, including parents known only through retained records.
+//!
+//! The live listing reads the artifact and record receipt indexes in receipt
+//! order and stops at its page, so its charge follows the page rather than the
+//! store. Explicit selections remain one bounded immutable capture.
 
-use super::{Artifact, Catalog, Error, Record, Store, Writer, catalog_lease, random_id};
+use super::{
+    Catalog, Error, Record, Store, Writer, catalog_lease, random_id,
+    temporal_index::{TemporalRows, entry_time},
+};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
@@ -142,13 +149,66 @@ impl ArtifactSummary {
     }
 }
 
-/// Immutable artifact summaries in stable artifact-ID order.
+/// Artifact summaries: selections in artifact-ID order, live pages in receipt then ID order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactPageBody {
     /// Page rows. Missing parents retain identity/source and explicit unknown metadata.
     pub artifacts: Vec<ArtifactSummary>,
-    /// Coverage across all eligible records, including parents with no proven match.
+    /// Coverage across the eligible records of a capture's rows, or of the rows
+    /// a live page delivered or excluded, including parents with no proven match.
     pub diagnostic_coverage: crate::DiagnosticCoverage,
+    /// Whether this is a live receipt-ordered page, whose counts cover only the
+    /// rows delivered so far while the listing continues.
+    receipt_walk: bool,
+    /// Rows delivered by earlier pages of the same live listing.
+    offset: usize,
+    /// Receipt position after this page's rows, while the live listing continues.
+    resume: Option<Position>,
+}
+
+impl ArtifactPageBody {
+    /// A live receipt-ordered page rather than one immutable capture.
+    #[must_use]
+    pub fn receipt_walk(&self) -> bool {
+        self.receipt_walk
+    }
+}
+
+/// Live listing position: a receipt millisecond, the fold stage inside it, the last
+/// index identity that stage consumed, and the rows of that millisecond folded so far.
+/// A group larger than one page's admission therefore spans pages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Position {
+    received_at: u64,
+    stage: Stage,
+    after: Option<String>,
+    rows: BTreeMap<String, ArtifactSummary>,
+    capacity: usize,
+}
+
+impl Position {
+    fn new(received_at: u64, stage: Stage) -> Self {
+        Self {
+            received_at,
+            stage,
+            after: None,
+            rows: BTreeMap::new(),
+            capacity: 4096,
+        }
+    }
+}
+
+/// One receipt millisecond folds its index stages in order, then emits its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// Every artifact receipt row, for the unfiltered listing.
+    Artifacts,
+    /// Every record receipt row, or the selected source's record receipt rows.
+    Records,
+    /// Recordless artifacts, which a source's record index cannot reach.
+    Recordless,
+    /// Rows complete; emit them in artifact-ID order.
+    Emit,
 }
 
 impl catalog_lease::PageBody for ArtifactPageBody {
@@ -163,15 +223,26 @@ impl catalog_lease::PageBody for ArtifactPageBody {
                 .iter()
                 .map(ArtifactSummary::capacity)
                 .sum::<usize>()
+            + self.resume.as_ref().map_or(0, |position| {
+                position.capacity + position.after.as_ref().map_or(0, String::capacity)
+            })
     }
     fn page(&self, start: usize, end: usize) -> Result<Self, Error> {
         Ok(Self {
             artifacts: self.artifacts[start..end].to_vec(),
             diagnostic_coverage: self.diagnostic_coverage,
+            receipt_walk: self.receipt_walk,
+            offset: self.offset,
+            resume: self.resume.clone(),
         })
     }
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn continues(&self) -> bool {
+        self.resume.is_some()
+    }
 }
-
 /// Complete artifact capture receipt and bounded page; reads do not pin evidence.
 pub type ArtifactReadPage = catalog_lease::CatalogReadPage<ArtifactPageBody>;
 pub(super) type Reads = catalog_lease::Reads<ArtifactSelector, ArtifactPageBody>;
@@ -213,6 +284,13 @@ impl Store {
         reads.purge(now);
         cancellation.checkpoint()?;
         if let Some(cursor) = &query.cursor {
+            let parsed = catalog_lease::Cursor::parse(cursor)?;
+            let binding = (&query.selector, query.page_size, query.scan_budget);
+            if let Some(page) =
+                self.artifact_next(&mut reads, &parsed, Some(binding), now, cancellation)?
+            {
+                return Ok(page);
+            }
             return reads.resume(
                 &query.selector,
                 cursor,
@@ -220,6 +298,17 @@ impl Store {
                 query.scan_budget,
                 now,
             );
+        }
+        if query.selector.selection == crate::QuerySelection::Live {
+            let start = Position::new(query.selector.received_from, first_stage(&query.selector));
+            let page = Continued {
+                selector: &query.selector,
+                page_size: query.page_size,
+                scan_budget: query.scan_budget,
+                start,
+                offset: 0,
+            };
+            return self.artifact_page(&mut reads, page, now, cancellation);
         }
         let started = Instant::now();
         let expires_at = now
@@ -264,6 +353,105 @@ impl Store {
     }
 }
 
+/// One live listing page request, fresh or continuing a previous page's handle.
+struct Continued<'a> {
+    selector: &'a ArtifactSelector,
+    page_size: usize,
+    scan_budget: usize,
+    start: Position,
+    offset: usize,
+}
+
+impl Store {
+    /// Read the next live page when `cursor` continues past its handle's rows.
+    /// Other cursors are replayed by the shared lease owner, so this returns `None`.
+    /// The continued handle stays live: its owner retires it once the new page
+    /// has been delivered, so an abandoned or failed continuation keeps the cursor.
+    pub(super) fn artifact_next(
+        &self,
+        reads: &mut Reads,
+        cursor: &catalog_lease::Cursor<'_>,
+        binding: Option<(&ArtifactSelector, usize, usize)>,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<Option<ArtifactReadPage>, Error> {
+        let Some(snapshot) = reads.continuation(cursor, now)? else {
+            return Ok(None);
+        };
+        if let Some((selector, page_size, scan_budget)) = binding {
+            snapshot.bind(selector, page_size, scan_budget)?;
+        }
+        let selector = snapshot.selector.clone();
+        let start = snapshot.body.resume.clone().ok_or_else(|| {
+            Error::new("STORAGE_FAILURE", "artifact continuation lost its position")
+        })?;
+        let page = Continued {
+            selector: &selector,
+            page_size: snapshot.page_size,
+            scan_budget: snapshot.scan_budget,
+            start,
+            offset: snapshot.body.offset + snapshot.body.artifacts.len(),
+        };
+        self.artifact_page(reads, page, now, cancellation).map(Some)
+    }
+
+    /// Read and publish one live page under its own lease.
+    fn artifact_page(
+        &self,
+        reads: &mut Reads,
+        page: Continued<'_>,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<ArtifactReadPage, Error> {
+        let started = Instant::now();
+        let expires_at = now
+            .checked_add(catalog_lease::LEASE_MS)
+            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "artifact read deadline overflow"))?;
+        crate::format_instant(now)?;
+        crate::format_instant(expires_at)?;
+        let writer = self.lock()?;
+        cancellation.checkpoint()?;
+        let mut scanned = 0;
+        let mut remaining = SCAN_BYTES;
+        let mut admission = CaptureAdmission {
+            cancellation,
+            started,
+            scan_budget: page.scan_budget,
+            scanned: &mut scanned,
+            remaining: &mut remaining,
+        };
+        let mut body = writer.artifact_receipt_page(
+            page.selector,
+            page.start,
+            Some(page.page_size),
+            now,
+            &mut admission,
+        )?;
+        body.offset = page.offset;
+        let snapshot = catalog_lease::Snapshot {
+            bytes: 0,
+            id: random_id("artifact-read")?,
+            store_id: writer.id.clone(),
+            selector: page.selector.clone(),
+            as_of: now,
+            expires_at,
+            started,
+            page_size: page.page_size,
+            scan_budget: page.scan_budget,
+            scanned,
+            body,
+        };
+        drop(writer);
+        reads.publish(
+            snapshot,
+            now,
+            CAPTURE_BYTES,
+            HANDLE_BYTES,
+            MAX_HANDLES,
+            cancellation,
+        )
+    }
+}
 /// One collector owns live and selected artifact/record metadata folding.
 struct ArtifactCapture {
     rows: BTreeMap<String, ArtifactSummary>,
@@ -272,28 +460,47 @@ struct ArtifactCapture {
     diagnostic_coverage: crate::DiagnosticCoverage,
 }
 impl ArtifactCapture {
+    fn new(scope: crate::QueryScope) -> Self {
+        Self {
+            rows: BTreeMap::new(),
+            capacity: 4096,
+            scope,
+            diagnostic_coverage: crate::DiagnosticCoverage::default(),
+        }
+    }
+
     /// Fold one admitted native catalog entry without retaining its decoded body.
+    /// `receipt` is the index time it was reached through, which must agree.
+    #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
         writer: &Writer,
         key: &[u8],
         bytes: &[u8],
         now: u64,
-        protected: &std::collections::BTreeSet<String>,
+        protected: &BTreeSet<String>,
         admission: &mut CaptureAdmission<'_>,
+        receipt: Option<u64>,
     ) -> Result<(), Error> {
-        admission.entry(bytes.len())?;
-        let value = super::parse(bytes)?;
         let (summary, retained) = if key.starts_with(b"artifact:") {
-            let artifact = Artifact::decode(&value)?.stored(writer)?;
-            if artifact.id.as_bytes() != key {
+            // Validate the manifest arrays without owning them, so the charge
+            // follows the scalar metadata rather than the artifact's record count.
+            admission.visit()?;
+            let id = std::str::from_utf8(key)
+                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid artifact catalog key"))?;
+            let header = super::artifact_rdf::catalog(&writer.db, id, bytes, admission.remaining)?;
+            let original_records = usize::try_from(header.record_count)
+                .map_err(|_| Error::new("STORAGE_FAILURE", "artifact record count overflow"))?;
+            let artifact = header.artifact;
+            if let Some(time) = receipt.filter(|time| *time != artifact.received_at) {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
-                    "artifact discovery catalog identity mismatch",
+                    format!(
+                        "{id} is indexed at receipt {time} but its catalog was received at {}",
+                        artifact.received_at
+                    ),
                 ));
             }
-            super::validate_ingest_labels(&artifact.id, &artifact.source, &artifact.format)
-                .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
             let complete = writer.live_artifact(&artifact, now, protected);
             (
                 ArtifactSummary {
@@ -304,7 +511,7 @@ impl ArtifactCapture {
                         received_at: artifact.received_at,
                         expires_at: artifact.expires_at,
                         byte_length: artifact.byte_length,
-                        original_records: artifact.record_ids.len(),
+                        original_records,
                     }),
                     complete_bytes_available: complete,
                     retained_records: 0,
@@ -313,16 +520,41 @@ impl ArtifactCapture {
                 false,
             )
         } else {
-            let record = Record::decode(&value)?;
+            admission.entry(bytes.len())?;
+            let record = Record::decode(&super::parse(bytes)?)?;
             if record.id.as_bytes() != key {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
                     "artifact discovery record identity mismatch",
                 ));
             }
+            if let Some(time) = receipt.filter(|time| *time != record.received_at) {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    format!(
+                        "{} is indexed at receipt {time} but was received at {}; its parent is {}",
+                        record.id, record.received_at, record.artifact_id
+                    ),
+                ));
+            }
             writer.validate_event_record(&record)?;
             if !writer.live_record(&record, now, protected) {
                 return Ok(());
+            }
+            // A record shares its parent's receipt. A parent without a receipt
+            // index row (an evicted catalog) is folded here, before its records.
+            if !self.rows.contains_key(&record.artifact_id)
+                && let Some(parent) = writer.db.get_pinned(&record.artifact_id)?
+            {
+                self.push(
+                    writer,
+                    record.artifact_id.as_bytes(),
+                    &parent,
+                    now,
+                    protected,
+                    admission,
+                    Some(record.received_at),
+                )?;
             }
             let mut diagnostic_coverage = crate::DiagnosticCoverage::default();
             let parent = self.rows.get(&record.artifact_id);
@@ -400,14 +632,257 @@ impl Writer {
         now: u64,
         admission: &mut CaptureAdmission<'_>,
     ) -> Result<ArtifactPageBody, Error> {
+        let protected = self.artifact_protected(now, admission)?;
+        let selection =
+            self.query_selection_membership(&selector.selection, now, &protected, Some(admission))?;
+        let mut capture = ArtifactCapture::new(selector.scope());
+        if let Some(selection) = selection {
+            for id in &selection.parents {
+                if let Some(bytes) = self.db.get_pinned(id)? {
+                    capture.push(
+                        self,
+                        id.as_bytes(),
+                        &bytes,
+                        now,
+                        &protected,
+                        admission,
+                        None,
+                    )?;
+                } else if selection.artifacts.contains(id) {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "resolved complete artifact disappeared during capture",
+                    ));
+                }
+            }
+            for id in selection.records.keys() {
+                let bytes = self.db.get_pinned(id)?.ok_or_else(|| {
+                    Error::new(
+                        "STORAGE_FAILURE",
+                        "resolved selected record disappeared during capture",
+                    )
+                })?;
+                capture.push(
+                    self,
+                    id.as_bytes(),
+                    &bytes,
+                    now,
+                    &protected,
+                    admission,
+                    None,
+                )?;
+            }
+        } else {
+            // The whole receipt interval through the live page reader, all or nothing.
+            let start = Position::new(selector.received_from, first_stage(selector));
+            return self.artifact_receipt_page(selector, start, None, now, admission);
+        }
+        let mut artifacts = Vec::new();
+        for (_, summary) in capture.rows {
+            admission.cancellation.checkpoint()?;
+            if let Some(summary) = finish_row(&capture.scope, selector, summary)? {
+                artifacts.push(summary);
+            }
+        }
+        Ok(ArtifactPageBody {
+            artifacts,
+            diagnostic_coverage: capture.diagnostic_coverage,
+            receipt_walk: false,
+            offset: 0,
+            resume: None,
+        })
+    }
+
+    /// Read live rows in receipt order from `start`. With a page size, stop at it,
+    /// or when the page's own admission runs out after it consumed an index row,
+    /// and return the position to continue from. A page that cannot consume one
+    /// index row refuses by name. Without a page size, read the whole interval or
+    /// refuse, for an aggregate capture.
+    fn artifact_receipt_page(
+        &self,
+        selector: &ArtifactSelector,
+        start: Position,
+        page_size: Option<usize>,
+        now: u64,
+        admission: &mut CaptureAdmission<'_>,
+    ) -> Result<ArtifactPageBody, Error> {
+        let limit = page_size.map_or(usize::MAX, |size| {
+            size.min(<ArtifactPageBody as catalog_lease::PageBody>::PAGE_ITEMS)
+        });
+        let protected = self.artifact_protected(now, admission)?;
+        let scope = selector.scope();
+        let source_prefix = match &selector.source {
+            Some(source) => {
+                super::source_context::ready(self)?;
+                Some(super::source_context::prefix(source))
+            }
+            None => None,
+        };
+        let indexes = Indexes {
+            writer: self,
+            source: source_prefix.as_deref(),
+            before: selector.received_before,
+        };
+        let mut position = start;
+        let mut artifacts = Vec::new();
+        let mut diagnostic_coverage = crate::DiagnosticCoverage::default();
+        let mut progressed = false;
+        let resume = loop {
+            if position.stage == Stage::Emit {
+                if artifacts.len() == limit && !position.rows.is_empty() {
+                    break Some(position);
+                }
+                let Some((_, summary)) = position.rows.pop_first() else {
+                    match indexes.next_time(position.received_at.saturating_add(1))? {
+                        None => break None,
+                        Some(time) => {
+                            position = Position::new(time, first_stage(selector));
+                            if artifacts.len() == limit {
+                                break Some(position);
+                            }
+                            continue;
+                        }
+                    }
+                };
+                admission.cancellation.checkpoint()?;
+                progressed = true;
+                diagnostic_coverage.merge(summary.diagnostic_coverage);
+                if let Some(summary) = finish_row(&scope, selector, summary)? {
+                    artifacts.push(summary);
+                }
+                continue;
+            }
+            let Some((prefix, kind)) = indexes.stage(position.stage) else {
+                position.stage = next_stage(position.stage);
+                position.after = None;
+                continue;
+            };
+            let mut rows = TemporalRows::after(
+                prefix,
+                position.received_at,
+                position.after.as_deref(),
+                position.received_at.saturating_add(1),
+                |options| self.db.raw_iterator_opt(options),
+            );
+            let mut capture = ArtifactCapture {
+                rows: std::mem::take(&mut position.rows),
+                capacity: position.capacity,
+                scope: scope.clone(),
+                diagnostic_coverage: crate::DiagnosticCoverage::default(),
+            };
+            let mut stopped = None;
+            while let Some(entry) = rows.peek() {
+                let (key, value) = entry?;
+                entry_time(prefix, key, value)?;
+                let id = catalog_identity(value, kind)?.to_owned();
+                let folded = self.fold_indexed(
+                    &mut capture,
+                    position.stage,
+                    &id,
+                    position.received_at,
+                    now,
+                    &protected,
+                    admission,
+                );
+                match folded {
+                    Ok(()) => {
+                        progressed = true;
+                        position.after = Some(id);
+                        rows.read_next(|_, _| Ok(())).transpose()?;
+                    }
+                    Err(error) if error.code == "RESOURCE_LIMIT" && page_size.is_some() => {
+                        stopped = Some((id, error));
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            position.rows = capture.rows;
+            position.capacity = capture.capacity;
+            if let Some((id, error)) = stopped {
+                if progressed {
+                    break Some(position);
+                }
+                return Err(refuse_row(
+                    selector,
+                    page_size,
+                    admission.scan_budget,
+                    &position,
+                    &id,
+                    &error,
+                ));
+            }
+            position.stage = next_stage(position.stage);
+            position.after = None;
+        };
+        Ok(ArtifactPageBody {
+            artifacts,
+            diagnostic_coverage,
+            receipt_walk: true,
+            offset: 0,
+            resume,
+        })
+    }
+
+    /// Fold one index row of `stage` received at `time`. A source's records are
+    /// confirmed against the primary receipt index; recordless rows skip
+    /// artifacts already folded.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_indexed(
+        &self,
+        capture: &mut ArtifactCapture,
+        stage: Stage,
+        id: &str,
+        time: u64,
+        now: u64,
+        protected: &BTreeSet<String>,
+        admission: &mut CaptureAdmission<'_>,
+    ) -> Result<(), Error> {
+        if stage == Stage::Recordless && capture.rows.contains_key(id) {
+            return Ok(());
+        }
+        if stage == Stage::Records
+            && self
+                .db
+                .get_pinned(format!("time:{time:020}:{id}"))?
+                .as_deref()
+                != Some(id.as_bytes())
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                format!("{id} is in a receipt index at {time} without its primary receipt row"),
+            ));
+        }
+        let bytes = self.db.get_pinned(id)?.ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                format!("receipt index row at {time} references missing catalog entry {id}"),
+            )
+        })?;
+        capture.push(
+            self,
+            id.as_bytes(),
+            &bytes,
+            now,
+            protected,
+            admission,
+            Some(time),
+        )
+    }
+    /// Live pins protect evidence for every artifact capture, charged to its admission.
+    fn artifact_protected(
+        &self,
+        now: u64,
+        admission: &mut CaptureAdmission<'_>,
+    ) -> Result<BTreeSet<String>, Error> {
         let CaptureAdmission {
             cancellation,
             started,
             scan_budget,
             scanned,
             remaining,
-        } = &mut *admission;
-        let protected = self.protected_matching(
+        } = admission;
+        self.protected_matching(
             now,
             |_| true,
             || {
@@ -425,87 +900,147 @@ impl Writer {
             },
             Some(ENTRY_BYTES),
             Some(&mut **remaining),
-        )?;
-        let selection =
-            self.query_selection_membership(&selector.selection, now, &protected, Some(admission))?;
-        let mut capture = ArtifactCapture {
-            rows: BTreeMap::new(),
-            capacity: 4096,
-            scope: selector.scope(),
-            diagnostic_coverage: crate::DiagnosticCoverage::default(),
-        };
-        if let Some(selection) = selection {
-            for id in &selection.parents {
-                if let Some(bytes) = self.db.get_pinned(id)? {
-                    capture.push(self, id.as_bytes(), &bytes, now, &protected, admission)?;
-                } else if selection.artifacts.contains(id) {
-                    return Err(Error::new(
-                        "STORAGE_FAILURE",
-                        "resolved complete artifact disappeared during capture",
-                    ));
-                }
-            }
-            for id in selection.records.keys() {
-                let bytes = self.db.get_pinned(id)?.ok_or_else(|| {
-                    Error::new(
-                        "STORAGE_FAILURE",
-                        "resolved selected record disappeared during capture",
-                    )
-                })?;
-                capture.push(self, id.as_bytes(), &bytes, now, &protected, admission)?;
-            }
-        } else {
-            for prefix in [b"artifact:".as_slice(), b"record:".as_slice()] {
-                let mut iterator = self.db.raw_iterator();
-                iterator.seek(prefix);
-                while iterator.valid() {
-                    let key = iterator.key().ok_or_else(|| {
-                        Error::new("STORAGE_FAILURE", "artifact discovery iterator key missing")
-                    })?;
-                    if !key.starts_with(prefix) {
-                        break;
-                    }
-                    let bytes = iterator.value().ok_or_else(|| {
-                        Error::new(
-                            "STORAGE_FAILURE",
-                            "artifact discovery iterator value missing",
-                        )
-                    })?;
-                    capture.push(self, key, bytes, now, &protected, admission)?;
-                    iterator.next();
-                }
-                iterator.status()?;
-            }
-        }
-        let mut artifacts = Vec::new();
-        for (_, summary) in capture.rows {
-            admission.cancellation.checkpoint()?;
-            if !summary.complete_bytes_available && summary.retained_records == 0 {
-                continue;
-            }
-            if let Some(origin) = &summary.origin {
-                if summary.retained_records > origin.original_records {
-                    return Err(Error::new(
-                        "STORAGE_FAILURE",
-                        "retained record count exceeds original artifact membership",
-                    ));
-                }
-                crate::format_instant(origin.received_at)
-                    .and_then(|_| crate::format_instant(origin.expires_at))
-                    .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
-            }
-            if !artifact_eligible(&capture.scope, &summary.source, summary.origin.as_ref())?
-                || !selector.diagnostics.is_empty() && summary.diagnostic_coverage.matched == 0
-            {
-                continue;
-            }
-            artifacts.push(summary);
-        }
-        Ok(ArtifactPageBody {
-            artifacts,
-            diagnostic_coverage: capture.diagnostic_coverage,
-        })
+        )
     }
+}
+
+/// The receipt indexes one listing reads: every artifact and record for the
+/// unfiltered listing, or one source's records and every recordless artifact.
+/// Every record shares its parent's receipt, so one millisecond is one fold group.
+struct Indexes<'a> {
+    writer: &'a Writer,
+    source: Option<&'a str>,
+    before: u64,
+}
+
+impl<'a> Indexes<'a> {
+    /// The index prefix and catalog kind a stage reads, or `None` when it has none.
+    fn stage(&self, stage: Stage) -> Option<(&'a str, &'static str)> {
+        match (stage, self.source) {
+            (Stage::Artifacts, None) => Some((super::artifact_rdf::TIME, "artifact:")),
+            (Stage::Records, None) => Some(("time:", "record:")),
+            (Stage::Records, Some(prefix)) => Some((prefix, "record:")),
+            (Stage::Recordless, Some(_)) => Some((RECORDLESS, "artifact:")),
+            _ => None,
+        }
+    }
+
+    /// The earliest receipt time at or after `from` that any read index holds.
+    fn next_time(&self, from: u64) -> Result<Option<u64>, Error> {
+        if from >= self.before {
+            return Ok(None);
+        }
+        let mut next = None::<u64>;
+        for stage in [Stage::Artifacts, Stage::Records, Stage::Recordless] {
+            let Some((prefix, _)) = self.stage(stage) else {
+                continue;
+            };
+            let mut rows = TemporalRows::new(prefix, from, self.before, |options| {
+                self.writer.db.raw_iterator_opt(options)
+            });
+            if let Some(entry) = rows.peek() {
+                let (key, value) = entry?;
+                let time = entry_time(prefix, key, value)?;
+                next = Some(next.map_or(time, |next: u64| next.min(time)));
+            }
+        }
+        Ok(next)
+    }
+}
+
+/// The chronological recordless-artifact index (`recordless::key_parts`).
+const RECORDLESS: &str = "empty-time:";
+
+fn first_stage(selector: &ArtifactSelector) -> Stage {
+    if selector.source.is_some() {
+        Stage::Records
+    } else {
+        Stage::Artifacts
+    }
+}
+
+fn next_stage(stage: Stage) -> Stage {
+    match stage {
+        Stage::Artifacts => Stage::Records,
+        Stage::Records => Stage::Recordless,
+        Stage::Recordless | Stage::Emit => Stage::Emit,
+    }
+}
+
+/// A bounded identity of the expected catalog kind, from an index row's value.
+fn catalog_identity<'v>(value: &'v [u8], kind: &str) -> Result<&'v str, Error> {
+    std::str::from_utf8(value)
+        .ok()
+        .filter(|id| id.starts_with(kind) && id.len() > kind.len())
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "receipt index requires a bounded catalog identity",
+            )
+        })
+}
+
+/// Name the page bound and the row that cannot fit within one fresh page.
+fn refuse_row(
+    selector: &ArtifactSelector,
+    page_size: Option<usize>,
+    scan_budget: usize,
+    position: &Position,
+    id: &str,
+    error: &Error,
+) -> Error {
+    let received = crate::format_instant(position.received_at)
+        .unwrap_or_else(|_| position.received_at.to_string());
+    let artifact = if id.starts_with("artifact:") {
+        id.to_owned()
+    } else {
+        let folded = position.rows.keys().take(3).cloned().collect::<Vec<_>>();
+        if folded.is_empty() {
+            format!("unknown (the parent of {id})")
+        } else {
+            format!("{} (at {id})", folded.join(", "))
+        }
+    };
+    let source = selector
+        .source
+        .as_deref()
+        .map_or_else(String::new, |source| format!(" of source {source:?}"));
+    Error::new(
+        "RESOURCE_LIMIT",
+        format!(
+            "an artifact listing page of page_size {} cannot fit one catalog row of artifact {artifact}{source} received at {received} within its bound of {scan_budget} catalog entries (scan_budget) and {SCAN_BYTES} charged catalog bytes; raise scan_budget or start the receipt interval after it: {}",
+            page_size.unwrap_or(0),
+            error.message
+        ),
+    )
+}
+
+/// Keep a summary only when it is available and matches the outer filters.
+fn finish_row(
+    scope: &crate::QueryScope,
+    selector: &ArtifactSelector,
+    summary: ArtifactSummary,
+) -> Result<Option<ArtifactSummary>, Error> {
+    if !summary.complete_bytes_available && summary.retained_records == 0 {
+        return Ok(None);
+    }
+    if let Some(origin) = &summary.origin {
+        if summary.retained_records > origin.original_records {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "retained record count exceeds original artifact membership",
+            ));
+        }
+        crate::format_instant(origin.received_at)
+            .and_then(|_| crate::format_instant(origin.expires_at))
+            .map_err(|error| Error::new("STORAGE_FAILURE", error.message))?;
+    }
+    if !artifact_eligible(scope, &summary.source, summary.origin.as_ref())?
+        || !selector.diagnostics.is_empty() && summary.diagnostic_coverage.matched == 0
+    {
+        return Ok(None);
+    }
+    Ok(Some(summary))
 }
 
 // Original artifact receipt time is independent of record acceptance time.

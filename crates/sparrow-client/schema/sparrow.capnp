@@ -51,6 +51,8 @@ struct ArtifactListQuery {
 struct ArtifactListPage {
   receipt @0 :CatalogReadReceipt; rows @1 :List(ArtifactSummary);
   coverage @2 :DiagnosticCoverage; matchingRecords @3 :Count;
+  # Schema 66: a live receipt-ordered page; totalItems counts rows delivered so far.
+  receiptWalk @4 :Bool;
 }
 struct SourceWatchInfo { watchId @0 :Text; revision @1 :UInt64; enabled @2 :Bool; }
 struct SourceSummary {

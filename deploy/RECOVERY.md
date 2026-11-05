@@ -241,7 +241,7 @@ reads that line from the journal of the invocation it stopped, through
 when that daemon then exited 0; `N` is exactly what the copied store holds. Before
 the stop, it reads the running image for the line's text. An image that prints the
 line and then exits nonzero, or never logs it (a SIGKILL, for example), fails the
-backup, and nothing is published. An image that predates the line (schema 65 and
+backup, and nothing is published. An image that predates the line (schema 66 and
 older) still gets a published backup, which records
 `payload_chunks=unrecorded (image predates the closing count)` instead of a count.
 So a pre-upgrade backup of an older image, and nightly backups after a restore to
@@ -252,7 +252,7 @@ expired, and the script prints that both were skipped.
 
 A backup whose `SOURCE` has no `unique_payload_chunks` predates the count, or
 was taken from an image that predates it: the script skips that check, runs the others and still exits 1 as not verified. An
-image without query-only mode (schema 65 and older) is refused before it starts,
+image without query-only mode (schema 66 and older) is refused before it starts,
 because it would consume the live intake folders. Such a backup can be opened
 with a newer image instead, with `--image DAEMON`; the newer image may upgrade
 the disposable copy as it opens it.

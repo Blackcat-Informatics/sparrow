@@ -314,7 +314,7 @@ the store's `live_records` before the stop and the `unique_payload_chunks` the
 stopped daemon logged in its closing line, taken only when the daemon exited 0.
 The script reads the journal of the stopped invocation with
 `journalctl --invocation=`, which needs systemd 257 or newer. An image that
-predates the closing line (schema 65 and older) is recognised before the stop,
+predates the closing line (schema 66 and older) is recognised before the stop,
 from the line's text missing in the image. Its backup is still published, and
 records `payload_chunks=unrecorded (image predates the closing count)`. For an
 image that prints the line, a missing line or a nonzero exit fails the backup. It
