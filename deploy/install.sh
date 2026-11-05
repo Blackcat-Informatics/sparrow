@@ -132,6 +132,10 @@ host systemd-sysusers sparrow.conf
 # 2. /SPARROW, its modes and ACLs (re-asserted at every boot by systemd-tmpfiles).
 if put "$DEPLOY_DIR/config/tmpfiles-sparrow.conf" /etc/tmpfiles.d/sparrow.conf 0644; then :; fi
 host systemd-tmpfiles --create sparrow.conf
+# Copy-on-write off for the store and for the copies made of it (lib.sh, switch_off_copy_on_write).
+for dir in /SPARROW/store /SPARROW/backups; do
+    switch_off_copy_on_write "$dir"
+done
 
 # 3. /etc/sparrow: configuration templates, watch definitions, and the secret's location.
 if [[ -n $DEST ]]; then
