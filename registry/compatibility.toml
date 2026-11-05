@@ -4,12 +4,12 @@
 # The census reference tree, not a compiled Sparrow dependency lock.
 # Advance deliberately, record the reason, and run make check at the new revision.
 manifest_version = 1
-recorded = "2026-11-01"
+recorded = "2026-11-04"
 
 [[supplier]]
 name = "purrdf"
 version = "3.0.1"
-git_revision = "23a2b710e9801f5bcd051efe1e48147468db8afc"
+git_revision = "c6d670c762842541075bb28c424265ce074d4699"
 repository = "../purrdf"
 role = "Reference tree for structural helper discovery and PurRDF-owned ledger jobs."
 
@@ -42,3 +42,9 @@ date = "2026-11-01"
 supplier = "purrdf"
 revision = "23a2b710e9801f5bcd051efe1e48147468db8afc"
 reason = "Advance to PurRDF main with the fleet's coordinated move of PurRDF consumers to head. Adapt to QueryOptions passed by reference, rfc3339 FormatError without a String conversion, and fallible datasets_isomorphic with an explicit canonicalization control. A fresh store under this revision reports the same RDF profile and text analyzer identities as the deployed store."
+
+[[event]]
+date = "2026-11-04"
+supplier = "purrdf"
+revision = "c6d670c762842541075bb28c424265ce074d4699"
+reason = "Pin group A repin (D69, memetics #202): purrdf, gmeow-ontology, rust-agentic-foundations and purrassist move together to one common head, with PurRDF at main c6d670c (3.0.1). Sparrow depends on PurRDF alone, so it moves the runtime pins and this census reference to that head with no patch tables."

@@ -49,7 +49,7 @@ pub(super) async fn query(
     };
     // Keep the same worker, cancellation, captured-result and delivery owner.
     let reply = rpc
-        .query_work(true, move |store, now, cancellation| {
+        .query_work(None, move |store, now, cancellation| {
             store
                 .correlate_read(
                     &CorrelateRead {

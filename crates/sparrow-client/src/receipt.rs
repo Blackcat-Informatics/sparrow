@@ -43,8 +43,9 @@ pub struct Discovery {
     pub store_id: String,
     /// Generated wire contract version.
     pub schema_version: u32,
-    /// Maximum complete artifact accepted by the direct buffered-input operation.
-    pub max_artifact_bytes: u64,
+    /// Largest artifact carried in one inline ingest message. Larger artifacts
+    /// stream through the staged import, up to its fixed publication bound.
+    pub max_inline_artifact_bytes: u64,
     /// Maximum record membership in one artifact.
     pub max_records_per_artifact: u64,
     /// Native analyzer identity.
@@ -70,7 +71,7 @@ impl Discovery {
             flush_interval_ms: durability.get_flush_interval_ms(),
             store_id: value.get_store_id()?.to_str()?.to_owned(),
             schema_version: value.get_schema_version(),
-            max_artifact_bytes: value.get_max_artifact_bytes(),
+            max_inline_artifact_bytes: value.get_max_inline_artifact_bytes(),
             max_records_per_artifact: value.get_max_records_per_artifact(),
             text_analyzer: value.get_text_analyzer()?.to_str()?.to_owned(),
             text_profile: value.get_text_profile()?.to_str()?.to_owned(),
@@ -82,7 +83,7 @@ impl Discovery {
             || !discovery.store_id.starts_with("store:")
             || discovery.store_id.len() <= 6
             || discovery.store_id.len() > 128
-            || discovery.max_artifact_bytes == 0
+            || discovery.max_inline_artifact_bytes == 0
             || discovery.max_records_per_artifact == 0
             || discovery.text_analyzer.is_empty()
             || discovery.text_profile.is_empty()
@@ -451,7 +452,7 @@ mod tests {
             status.set_text_analyzer("analyzer");
             status.set_text_profile("text");
             status.set_rdf_profile(rdf);
-            status.set_max_artifact_bytes(1024);
+            status.set_max_inline_artifact_bytes(1024);
             status.set_max_records_per_artifact(100);
             status.set_max_event_batch_bytes(crate::MAX_EVENT_BATCH_BYTES as u32);
             status.set_max_event_batch_events(crate::MAX_EVENT_BATCH_EVENTS as u32);

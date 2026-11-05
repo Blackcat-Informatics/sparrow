@@ -3,6 +3,7 @@
 
 [Unit]
 Description=Ship finished producer files to Sparrow every 5 minutes
+Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
 
 [Timer]
 OnBootSec=5min

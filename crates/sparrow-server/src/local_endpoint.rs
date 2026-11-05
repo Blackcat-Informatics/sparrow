@@ -63,7 +63,8 @@ impl LocalEndpoint {
             Err(error) => return Err(error),
         };
         let identity = socket_identity(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        // Members of the daemon's group connect; data_dir (0710) admits no one else.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
         Ok(Self {
             listener,
             path: path.to_owned(),

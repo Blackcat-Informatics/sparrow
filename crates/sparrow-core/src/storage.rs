@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 use purrdf_hash::{blake3, hex};
 use purrdf_lex::json::record::{DecodeError, Record as JsonRecord};
 use purrdf_lex::json::{self, Object, Value};
-use rocksdb::{
-    ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions,
-};
+use rocksdb::{DB, IteratorMode, WriteBatch, WriteOptions};
 
 pub(crate) mod archive;
 mod artifact_rdf;
@@ -45,6 +43,7 @@ mod query_membership;
 mod rdf_index;
 pub(crate) mod rdf_view;
 pub(crate) mod receiver_stream;
+pub(crate) mod recompression;
 mod record_fields;
 pub(crate) mod record_read;
 mod record_spool;
@@ -60,6 +59,7 @@ mod source_context;
 pub(crate) mod source_read;
 pub(crate) mod source_time;
 pub(crate) mod syslog;
+mod table_options;
 pub(crate) mod tail;
 mod tail_ranges;
 mod temporal_index;
@@ -70,8 +70,13 @@ mod writer_format;
 const FORMAT: &[u8] = b"sparrow.store/33";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
+/// How long an accepted artifact and its records live, in milliseconds, unless pinned.
+pub const RETENTION_MS: u64 = 30 * DAY;
 const CHUNK: usize = 64 * 1024;
 const BYTE_READ_BYTES: usize = 1024 * 1024;
+/// Largest artifact accepted as one in-memory batch. Larger artifacts stream
+/// through the staged import, within the disk budget and `MAX_IMPORT_BYTES`.
+pub const INLINE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const CATALOG_STRING_BYTES: usize = 16 * 1024 * 1024;
 const CATALOG_LIMITS: json::Limits = json::Limits {
     max_depth: 128,
@@ -79,6 +84,108 @@ const CATALOG_LIMITS: json::Limits = json::Limits {
     max_string_bytes: CATALOG_STRING_BYTES,
     unique_members: true,
 };
+
+fn in_range(offset: u64, length: usize, size: u64) -> Result<(), Error> {
+    offset
+        .checked_add(length as u64)
+        .filter(|end| *end <= size)
+        .map(|_| ())
+        .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range is outside evidence"))
+}
+
+/// Read one record's bytes, or those of an artifact holding at most one record.
+/// A record is chunked from its own start in full CHUNK pieces, so the read seeks
+/// straight to the chunk holding `offset` and costs the requested range at any size.
+/// Only the visited chunks are checked to be full; the skipped ones are trusted.
+fn record_bytes(
+    writer: &Writer,
+    chunks: Vec<String>,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, Error> {
+    let skip = offset / CHUNK as u64;
+    let last = chunks.len().saturating_sub(1);
+    let chunks = chunks
+        .into_iter()
+        .enumerate()
+        .skip(skip as usize)
+        .map(|(index, digest)| {
+            let payload = writer.payload_chunk(&digest)?;
+            if index != last && payload.len() != CHUNK {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "record manifest holds a short chunk before its end",
+                ));
+            }
+            Ok(payload)
+        });
+    read_chunk_range(chunks, offset - skip * CHUNK as u64, length)
+}
+
+/// Read a multi-record artifact through its ordered, contiguous record rows. A
+/// binary search on `byte_start` finds the record holding `offset`; each record
+/// then seeks like `record_bytes`. Beyond the requested chunks, a read decodes the
+/// whole artifact row once and a logarithmic number of record rows.
+fn artifact_bytes(
+    writer: &Writer,
+    ids: &[String],
+    offset: u64,
+    length: usize,
+    now: u64,
+    protected: &BTreeSet<String>,
+) -> Result<Vec<u8>, Error> {
+    let record = |index: usize| -> Result<Record, Error> {
+        let record: Record = writer.get(&ids[index])?;
+        if !writer.live_record(&record, now, protected) || record.byte_end < record.byte_start {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "live artifact references an unreadable record",
+            ));
+        }
+        Ok(record)
+    };
+    let (mut low, mut high) = (0, ids.len());
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if record(middle)?.byte_start <= offset {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    let mut result = Vec::with_capacity(length);
+    let mut position = offset;
+    for index in low..ids.len() {
+        if result.len() == length {
+            break;
+        }
+        let record = record(index)?;
+        let gap = || {
+            Error::new(
+                "STORAGE_FAILURE",
+                "artifact records do not cover its bytes contiguously",
+            )
+        };
+        if index != low && record.byte_start != position {
+            return Err(gap());
+        }
+        let start = position.checked_sub(record.byte_start).ok_or_else(gap)?;
+        let rest = record.byte_end.checked_sub(position).ok_or_else(gap)?;
+        let take = rest.min((length - result.len()) as u64) as usize;
+        if take == 0 {
+            continue;
+        }
+        result.extend(record_bytes(writer, record.chunks, start, take)?);
+        position += take as u64;
+    }
+    if result.len() != length {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "artifact records do not cover the requested bytes",
+        ));
+    }
+    Ok(result)
+}
 
 fn read_chunk_range(
     chunks: impl IntoIterator<Item = Result<Vec<u8>, Error>>,
@@ -211,8 +318,6 @@ pub struct Config {
     pub maintenance_reserve: u64,
     /// Filesystem free space that must remain before any store write.
     pub min_free_bytes: u64,
-    /// Maximum bytes in a single bounded ingestion operation.
-    pub max_artifact_bytes: usize,
     /// Maximum records published by one ingestion operation.
     pub max_records: usize,
     /// Maximum direct members in one pin collection.
@@ -233,7 +338,6 @@ impl Config {
         }
         if self.maintenance_reserve < 1024 * 1024
             || self.disk_budget <= self.maintenance_reserve
-            || self.max_artifact_bytes == 0
             || self.max_records == 0
             || self.max_pin_members == 0
             || self.min_free_bytes == 0
@@ -244,7 +348,7 @@ impl Config {
             ));
         }
         if let Some(policy) = &self.archive {
-            policy.validate(self.max_artifact_bytes)?;
+            policy.validate()?;
         }
         Ok(())
     }
@@ -392,9 +496,16 @@ struct Writer {
     pressure: std::cell::RefCell<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
     expiry: std::cell::RefCell<expiry::Cursor>,
+    recompression: std::cell::RefCell<recompression::State>,
     /// Present exactly when the store archives before deleting.
     archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
+    /// Longest record an import layout keeps whole; `import::RAW_RECORD_BYTES`
+    /// except where the dev-only test hook lowers it for one open store.
+    raw_record_bytes: std::cell::Cell<u64>,
+    /// Retirement share the import bound and pin caps derive from: production
+    /// defaults except where the dev-only test hook scales them for one open store.
+    retirement: std::cell::Cell<eviction::RetirementShare>,
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -690,6 +801,7 @@ impl Writer {
             )
             .with("text_profile", crate::text::PROFILE)
             .with("retry_window_seconds", (RETRY_WINDOW / 1000).to_string())
+            .with("retention_seconds", (RETENTION_MS / 1000).to_string())
             .with(
                 "max_producer_streams",
                 producer_stream::MAX_PRODUCER_STREAMS.to_string(),
@@ -708,8 +820,8 @@ impl Writer {
             )
             .with("disk_budget", self.config.disk_budget.to_string())
             .with(
-                "max_artifact_bytes",
-                self.config.max_artifact_bytes.to_string(),
+                "max_inline_artifact_bytes",
+                INLINE_ARTIFACT_BYTES.to_string(),
             )
             .with(
                 "max_records_per_artifact",
@@ -763,6 +875,30 @@ impl Writer {
         }
         Ok(bytes)
     }
+    /// Refuse a pin creation or extension that would take the store past its pin
+    /// caps. Every expiry and eviction pass charges all pin rows, expired ones
+    /// included until expiry deletes them, against the pin capture budget, and the
+    /// caps keep that charge inside it. Release never passes through here.
+    fn admit_pins(
+        &self,
+        pins: usize,
+        members: usize,
+        current_pins: usize,
+        current_members: usize,
+    ) -> Result<(), Error> {
+        let share = self.retirement.get();
+        let (max_pins, max_members) = (share.max_pins(), share.max_pinned_members());
+        if pins > max_pins || members > max_members {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                format!(
+                    "pins are capped at {max_pins} rows and {max_members} members store-wide, and the store holds {current_pins} rows with {current_members} members, expired rows included until expiry deletes them; release pins or wait for expiry"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn commit_pin(&self, key: &str, arguments: Value, pin: &Pin, now: u64) -> Result<(), Error> {
         let receipt: Value = Object::new()
             .with("arguments", arguments)
@@ -998,9 +1134,23 @@ impl Writer {
         &self,
         now: u64,
         include: impl Fn(&str) -> bool,
+        admit: impl FnMut() -> Result<R, Error>,
+        maximum: Option<usize>,
+        remaining: Option<&mut usize>,
+    ) -> Result<BTreeSet<String>, Error> {
+        self.capture_pins(now, include, admit, maximum, remaining, None)
+    }
+
+    /// Capture live pin members, optionally collecting the keys of expired pin rows
+    /// so the caller can delete them.
+    fn capture_pins<R>(
+        &self,
+        now: u64,
+        include: impl Fn(&str) -> bool,
         mut admit: impl FnMut() -> Result<R, Error>,
         maximum: Option<usize>,
         mut remaining: Option<&mut usize>,
+        mut expired: Option<&mut Vec<Box<[u8]>>>,
     ) -> Result<BTreeSet<String>, Error> {
         let mut protected = BTreeSet::new();
         let mut iterator = self.db.prefix_iterator("pin:");
@@ -1025,6 +1175,8 @@ impl Writer {
             let pin: Pin = self.decode_evidence(&key, &bytes)?;
             if pin.expires_at > now {
                 protected.extend(pin.members.into_iter().filter(|member| include(member)));
+            } else if let Some(expired) = expired.as_deref_mut() {
+                expired.push(key);
             }
         }
         Ok(protected)
@@ -1141,34 +1293,10 @@ impl Store {
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         config.validate()?;
         let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
-        let mut options = Options::default();
-        options.create_if_missing(true);
-        options.create_missing_column_families(true);
-        options.set_max_background_jobs(2);
-        options.set_write_buffer_size(8 * 1024 * 1024);
-        options.set_compression_type(DBCompressionType::Lz4);
-        options.set_bottommost_compression_type(DBCompressionType::Zstd);
-        pressure::native_compaction_options(&mut options);
-        let mut payload = Options::default();
-        payload.set_compression_type(DBCompressionType::Lz4);
-        payload.set_bottommost_compression_type(DBCompressionType::Zstd);
-        payload.set_enable_blob_files(true);
-        payload.set_min_blob_size(CHUNK as u64);
-        payload.set_blob_compression_type(DBCompressionType::Zstd);
-        payload.set_enable_blob_gc(true);
-        payload.set_write_buffer_size(8 * 1024 * 1024);
-        pressure::native_compaction_options(&mut payload);
         let db = DB::open_cf_descriptors(
-            &options,
+            &table_options::database(),
             path,
-            [
-                ColumnFamilyDescriptor::new("default", options.clone()),
-                ColumnFamilyDescriptor::new("payload", payload),
-                ColumnFamilyDescriptor::new(
-                    rdf_index::REVERSE_FAMILY,
-                    rdf_index::reverse_family_options(&options),
-                ),
-            ],
+            table_options::descriptors(),
         )?;
         source_time::validate_log_fence(&db)?;
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
@@ -1217,6 +1345,8 @@ impl Store {
                 batch.put("store_id", &id);
                 batch.put("text_analyzer", &fingerprint);
                 batch.put("rdf_profile", &rdf_fingerprint);
+                // A new store writes every table under the current options.
+                batch.put(recompression::PROFILE_KEY, table_options::PROFILE);
                 batch.put("rdf:term-count", 0_u64.to_be_bytes());
                 batch.put("rdf:max-encoded", 0_u64.to_be_bytes());
                 batch.put("rdf:next", 0_u64.to_be_bytes());
@@ -1287,6 +1417,7 @@ impl Store {
         ));
         manifest_retire::features(&db)?;
         let pressure = pressure::State::load(&db)?;
+        let recompression = recompression::State::load(&db)?;
         source_context::rebuild(&db)?;
         let store = Self {
             id: Arc::from(id.as_str()),
@@ -1300,8 +1431,11 @@ impl Store {
                 pressure: std::cell::RefCell::new(pressure),
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
+                recompression: std::cell::RefCell::new(recompression),
                 archive: archive.map(std::cell::RefCell::new),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
+                retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
             })),
             pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
             rdf_read: Arc::new(Mutex::new(())),
@@ -1424,10 +1558,10 @@ impl Store {
             ));
         }
         let writer = self.lock()?;
-        if bytes.len() > writer.config.max_artifact_bytes {
+        if bytes.len() > INLINE_ARTIFACT_BYTES {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
-                "artifact exceeds the configured bounded ingestion size",
+                "inline ingestion carries at most 16 MiB; stage a larger artifact through import_begin",
             ));
         }
         if let Some(input) = origin.tail()
@@ -1460,7 +1594,7 @@ impl Store {
         }
         let source_time_profile = writer.time_profile(source)?;
         let diagnostic_profile = writer.diagnostic_profile(source)?;
-        let expires_at = now.checked_add(30 * DAY).ok_or_else(|| {
+        let expires_at = now.checked_add(RETENTION_MS).ok_or_else(|| {
             Error::new(
                 "INVALID_ARGUMENT",
                 "acceptance timestamp overflows retention deadline",
@@ -1900,7 +2034,7 @@ impl Store {
             return tail_ranges::bytes(&writer, id, offset, length, now);
         }
         let protected = writer.protected(now)?;
-        let (chunks, size) = if id.starts_with("artifact:") {
+        if id.starts_with("artifact:") {
             let artifact: Artifact = writer.get(id)?;
             if !writer.live_artifact(&artifact, now, &protected) {
                 return Err(Error::new(
@@ -1908,30 +2042,34 @@ impl Store {
                     "complete artifact expired or was evicted",
                 ));
             }
-            (artifact.chunks, artifact.byte_length)
-        } else if id.starts_with("record:") {
-            let record: Record = writer.get(id)?;
-            if !writer.live_record(&record, now, &protected) {
-                return Err(Error::new(
-                    "EVIDENCE_UNAVAILABLE",
-                    "record expired or was evicted",
-                ));
+            in_range(offset, length, artifact.byte_length)?;
+            if artifact.record_ids.len() <= 1 {
+                return record_bytes(&writer, artifact.chunks, offset, length);
             }
-            (record.chunks, record.byte_end - record.byte_start)
-        } else {
+            return artifact_bytes(
+                &writer,
+                &artifact.record_ids,
+                offset,
+                length,
+                now,
+                &protected,
+            );
+        }
+        if !id.starts_with("record:") {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "bytes target must be an artifact or record",
             ));
-        };
-        offset
-            .checked_add(length as u64)
-            .filter(|end| *end <= size)
-            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "byte range is outside evidence"))?;
-        let chunks = chunks
-            .into_iter()
-            .map(|digest| writer.payload_chunk(&digest));
-        read_chunk_range(chunks, offset, length)
+        }
+        let record: Record = writer.get(id)?;
+        if !writer.live_record(&record, now, &protected) {
+            return Err(Error::new(
+                "EVIDENCE_UNAVAILABLE",
+                "record expired or was evicted",
+            ));
+        }
+        in_range(offset, length, record.byte_end - record.byte_start)?;
+        record_bytes(&writer, record.chunks, offset, length)
     }
 
     /// Create or extend a collection atomically; every target must be live.
@@ -1999,19 +2137,28 @@ impl Store {
                 ));
             }
         }
-        let mut pin = writer
-            .catalog::<Pin>("pin:")
-            .try_fold(None, |found, pin| -> Result<_, Error> {
+        let (found, pins, members) = writer.catalog::<Pin>("pin:").try_fold(
+            (None, 0_usize, 0_usize),
+            |(found, pins, members), pin| -> Result<_, Error> {
                 let pin = pin?;
-                Ok(found.or_else(|| (pin.name == name && pin.expires_at > now).then_some(pin)))
-            })?
-            .unwrap_or(Pin {
+                let total = members + pin.members.len();
+                let found =
+                    found.or_else(|| (pin.name == name && pin.expires_at > now).then_some(pin));
+                Ok((found, pins + 1, total))
+            },
+        )?;
+        let extended = found.is_some();
+        let mut pin = match found {
+            Some(pin) => pin,
+            None => Pin {
                 id: random_id("pin")?,
                 name: name.to_owned(),
                 expires_at: deadline,
                 revision: 0,
                 members: BTreeSet::new(),
-            });
+            },
+        };
+        let before = pin.members.len();
         pin.members.extend(targets);
         if pin.members.len() > writer.config.max_pin_members {
             return Err(Error::new(
@@ -2019,6 +2166,12 @@ impl Store {
                 "pin exceeds direct membership limit",
             ));
         }
+        writer.admit_pins(
+            pins + usize::from(!extended),
+            members - before + pin.members.len(),
+            pins,
+            members,
+        )?;
         pin.extend(deadline)?;
         writer.commit_pin(&retry_key, arguments, &pin, now)?;
         Ok(pin)
@@ -2194,6 +2347,12 @@ impl Store {
                 "native query read registry poisoned",
             )?,
         })
+    }
+
+    /// Count stored payload chunks, the `unique_payload_chunks` of status, without the
+    /// record census. It changes only when evidence is ingested or retired.
+    pub fn unique_payload_chunks(&self) -> Result<u64, Error> {
+        self.lock()?.count_prefix("ref:")
     }
 
     /// Report measured database bytes and deduplicated live payload references.

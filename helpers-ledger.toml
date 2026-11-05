@@ -5,7 +5,7 @@
 id = "native-retirement-compaction-policy"
 summary = "Catalog and payload families share one native tombstone collector configuration. RocksDB owns table marking, compaction and blob GC; pressure retains its existing measured-recovery and pin-safe retirement owner."
 home = "sparrow_core::storage::pressure::native_compaction_options"
-entry_points = ["sparrow_core::storage::Store::open"]
+entry_points = ["sparrow_core::storage::table_options::family"]
 spec = "docs/native-reclamation.md: existing native controls and real-pressure qualification."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -215,7 +215,7 @@ names = ['^(recapture_pin_for_receipt|serialize_full_scope_for_receipt)$']
 id = "temporal-backend-candidates"
 summary = "Current and snapshot-bound readers use the same native half-open temporal iterator and catalog/index integrity checks; backends supply lookup only."
 home = "sparrow_core::storage::query_membership::temporal_candidates"
-entry_points = ["sparrow_core::storage::Writer::query_candidates", "sparrow_core::storage::temporal_index::TemporalRows::new", "sparrow_core::storage::temporal_index::TemporalRows::read_next", "sparrow_core::storage::temporal_index::row_bound", "sparrow_core::storage::temporal_index::check_width"]
+entry_points = ["sparrow_core::storage::Writer::query_candidates", "sparrow_core::storage::temporal_index::TemporalRows::new", "sparrow_core::storage::temporal_index::TemporalRows::after", "sparrow_core::storage::temporal_index::TemporalRows::read_next", "sparrow_core::storage::temporal_index::TemporalRows::peek", "sparrow_core::storage::temporal_index::row_bound", "sparrow_core::storage::temporal_index::check_width", "sparrow_core::storage::temporal_index::entry_time"]
 spec = "docs/query-streaming.md: native read foundation."
 vectors = ["crates/sparrow-core/src/storage/query_membership.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -224,6 +224,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(snapshot_time_candidates|stream_time_candidates)$']
+
+[[job]]
+id = "artifact-receipt-fold"
+summary = "One staged receipt-ordered reader walks the artifact and record receipt indexes, or one source's context and recordless indexes, one millisecond at a time; the live artifact listing stops it at its page bound and resumes by cursor inside a millisecond, and the source inventory runs it over the whole interval."
+home = "sparrow_core::storage::artifact_read::Writer::artifact_receipt_page"
+entry_points = ["sparrow_core::storage::artifact_read::Writer::artifact_capture", "sparrow_core::storage::artifact_read::Writer::fold_indexed", "sparrow_core::storage::artifact_read::Indexes::next_time", "sparrow_core::storage::artifact_read::Store::artifact_next"]
+spec = "docs/interfaces.md: live artifact listing pages."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(scan_artifact_prefix|scan_record_prefix)$']
 
 [[job]]
 id = "backend-field-witnesses"
@@ -814,6 +828,20 @@ fingerprints = []
 names = ['^(run_new_claim_worker|run_recovery_claim_worker)$']
 
 [[job]]
+id = "query-only-write-refusal"
+summary = "One gate classifies every typed operation as a read it forwards or a write it forwards or, on a query-only daemon, refuses with READ_ONLY. Unix connections, CHAP sessions and the anonymous TCP gate all forward through it, so no handler checks the mode itself."
+home = "sparrow_server::query_only::WriteGate"
+entry_points = ["sparrow_server::rpc::Rpc::into_gate", "sparrow_server::rpc::Rpc::into_client", "sparrow_server::rpc::Rpc::query_only", "sparrow_server::config::ServerConfig::into_query_only", "sparrow_server::watches::WatchRegistry::stored"]
+spec = "docs/interfaces.md: query-only daemon (schema 66)."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(require_writable|refuse_if_query_only|check_read_only)$']
+
+[[job]]
 id = "consume-status"
 summary = "One bounded snapshot owner exposes coverage, deferral, persistent pending counts and failures through generated RPC and shared CLI/MCP rendering."
 home = "sparrow_server::watches::WatchRegistry::update"
@@ -1064,6 +1092,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(check_claim_upload_stability|check_client_file_stability)$']
+
+[[job]]
+id = "staged-import-upload"
+summary = "One resumable staged uploader streams completed files and SDK in-memory inputs above the inline batch bound through one positional input seam; no second chunked ingest loop."
+home = "sparrow_client::imports::upload"
+entry_points = ["sparrow_client::imports::import_file", "sparrow_client::imports::import_open_file", "sparrow_client::Client::ingest_with_durability", "sparrow_client::Client::import_open_file"]
+spec = "docs/interfaces.md: large artifacts (schema 64)."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(upload_bytes|stage_in_memory_artifact|chunked_ingest)$']
 
 [[job]]
 id = "query-membership"
@@ -1992,6 +2034,48 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(reclaim_direct_pressure|reclaim_import_pressure)$']
+
+[[job]]
+id = "column-family-table-options"
+summary = "One owner builds the database options and every column family's table and compression options from the measured profile, including the reverse family's small blocks and Bloom filter and the payload dictionary."
+home = "sparrow_core::storage::table_options::family"
+entry_points = ["sparrow_core::storage::table_options::database", "sparrow_core::storage::table_options::descriptors", "sparrow_core::storage::Store::open"]
+spec = "docs/architecture.md: 4.2 deduplication and compression; docs/load-qualification.md: table options and dictionaries."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(reverse_family_options|payload_family_options|default_family_options)$']
+
+[[job]]
+id = "one-time-table-rewrite"
+summary = "One prompt step drives the one-time rewrite of table files written under an older options profile through RocksDB periodic compaction: it records a durable start, sets the rewritten families' periodic window to the time since it, and turns the window off for pressure, the data allowance or the free-space floor. It completes when no older file remains."
+home = "sparrow_core::storage::recompression::Store::recompress_step"
+entry_points = ["sparrow_core::storage::recompression::Store::recompression_status", "sparrow_core::storage::recompression::Writer::recompress", "sparrow_core::storage::recompression::Writer::rewrite_window", "sparrow_core::storage::recompression::Writer::rewrite_gate", "sparrowd::maintenance::Job::execute"]
+spec = "docs/architecture.md: 4.2 deduplication and compression; docs/interfaces.md: table rewrite status (schema 64)."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(compact_whole_store|rewrite_tables_elsewhere|recompress_slice)$']
+
+[[job]]
+id = "typed-recompression-status"
+summary = "Encode the table rewrite's profile, phase, family, rewritten bytes, waiting reason and failure into one typed status contract; the agent renders it for CLI and MCP."
+home = "sparrow_server::recompression::encode"
+entry_points = ["sparrow_server::agent::status::recompression"]
+spec = "docs/interfaces.md: table rewrite status (schema 64)."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(encode_cli_recompression|encode_mcp_recompression)$']
 
 [[job]]
 id = "typed-pressure-status"
@@ -3834,7 +3918,7 @@ names = ['^(lookup_receiver_window_elsewhere|lookup_producer_window_elsewhere)$'
 
 [[job]]
 id = "joined-daemon-maintenance"
-summary = "One joined serial worker schedules bounded expiry continuations, pressure and buffered synchronization fairly. Native jobs run one at a time under existing storage limits; stop prevents further work and joins the current job before final RPC drain and flush."
+summary = "One joined serial worker schedules bounded expiry continuations, pressure, buffered synchronization and table rewrite steps fairly. Native jobs run one at a time under existing storage limits; stop prevents further work and joins the current job before final RPC drain and flush."
 home = "sparrowd::maintenance::run"
 entry_points = ["sparrowd::maintenance::Worker::start", "sparrowd::maintenance::Worker::shutdown", "sparrowd::maintenance::Job::execute", "sparrowd::main", "sparrowd::shutdown::finish"]
 spec = "docs/interfaces.md: daemon maintenance scheduling."
@@ -4416,8 +4500,8 @@ reason = "The generated Sparrow server trait requires one method per schema ordi
 [[job]]
 id = "store-free-space-floor"
 summary = "One filesystem free-space floor refuses every store write before RocksDB can fail on a full disk, and tells daemon pause points a shortfall apart from a failed measurement."
-home = "sparrow_core::storage::space::SpaceFloor::shortfall"
-entry_points = ["sparrow_core::storage::space::SpaceFloor::check", "sparrow_core::storage::Writer::apply"]
+home = "sparrow_core::storage::space::SpaceFloor::shortfall_after"
+entry_points = ["sparrow_core::storage::space::SpaceFloor::shortfall", "sparrow_core::storage::space::SpaceFloor::check", "sparrow_core::storage::Writer::apply", "sparrow_core::storage::recompression::Writer::rewrite_gate"]
 spec = "docs/deployment.md: min_free_bytes."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/syslog_listener.rs"]
 bench = []

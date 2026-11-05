@@ -19,8 +19,8 @@ pub use query::{
     QueryAlternatives, QueryScope, QuerySelection, RecordQuery,
 };
 pub use storage::archive::{
-    ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES, ARCHIVE_SEGMENT_RECORDS,
-    ARCHIVE_START_FRACTION, ArchiveIntent, ArchivePolicy, ArchiveState,
+    ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_MIN_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES,
+    ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ArchiveIntent, ArchivePolicy, ArchiveState,
 };
 pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,
@@ -45,12 +45,16 @@ pub use storage::durability::{
     DEFAULT_FLUSH_INTERVAL_MS, Durability, DurabilityStatus, DurabilityWatermark,
     MAX_BUFFERED_BYTES, MAX_BUFFERED_WRITES,
 };
-pub use storage::eviction::{EvictionFrontier, EvictionLimits, EvictionReport};
+#[cfg(feature = "test-support")]
+pub use storage::eviction::RetirementBounds;
+pub use storage::eviction::{
+    EvictionFrontier, EvictionLimits, EvictionReport, MAX_PINNED_MEMBERS, MAX_PINS,
+};
 pub use storage::expiry::{ExpiryFrontier, ExpiryReport};
 pub use storage::handoff::ConsumptionHandoff;
 pub use storage::import::{
     IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,
-    ImportRecordSpan, ImportStart,
+    ImportRecordSpan, ImportStart, MAX_IMPORT_BYTES, RAW_RECORD_BYTES,
 };
 pub use storage::ingest_status::{
     IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus,
@@ -76,6 +80,9 @@ pub use storage::receiver_stream::{
     MAX_RECEIVER_REGISTRY_BYTES, MAX_RECEIVER_WINDOWS, ReceiverDiscard, ReceiverPosition,
     ReceiverWindow, SyslogReceiver,
 };
+pub use storage::recompression::{
+    RECOMPRESSION_SETTLE_SECONDS, RecompressionPhase, RecompressionStatus,
+};
 pub use storage::record_read::{
     JsonRead, QUERY_CAPTURE_PROFILE, QueryCancellation, RecordOperation, RecordPageBody,
     RecordRead, RecordReadPage,
@@ -100,6 +107,7 @@ pub use storage::tail::{
 };
 pub use storage::watch_registry::MAX_WATCH_REGISTRY_BYTES;
 pub use storage::{
-    Artifact, Config, Error, Pin, QUERY_SCOPE_PROFILE, QUERY_SCOPE_WORKSPACE_BYTES, Record, Store,
+    Artifact, Config, Error, INLINE_ARTIFACT_BYTES, Pin, QUERY_SCOPE_PROFILE,
+    QUERY_SCOPE_WORKSPACE_BYTES, RETENTION_MS, Record, Store,
 };
 pub use text::resolve_text_analyzer;

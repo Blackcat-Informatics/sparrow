@@ -146,7 +146,14 @@ pub(super) fn render(page: wire::artifact_list_page::Reader<'_>) -> Result<Value
         ));
     }
     let coverage = page.get_coverage()?;
-    let complete = coverage.get_membership_complete();
+    // A live listing is exact only on the final page of its walk; until then
+    // `total_items` counts the rows delivered so far.
+    let walking = page.get_receipt_walk()
+        && !matches!(
+            page.get_receipt()?.get_next_cursor()?.which()?,
+            wire::optional_text::Absent(())
+        );
+    let complete = coverage.get_membership_complete() && !walking;
     Ok(super::catalog::receipt(page.get_receipt()?)?
         .with(
             "answer_certainty",
@@ -168,7 +175,7 @@ pub(super) fn render(page: wire::artifact_list_page::Reader<'_>) -> Result<Value
             "coverage",
             Value::from(
                 super::render_membership_coverage(coverage, page.get_matching_records()?)?
-                    .with("catalog_complete", true)
+                    .with("catalog_complete", !walking)
                     .with("scanned", page.get_receipt()?.get_scanned().to_string()),
             ),
         )

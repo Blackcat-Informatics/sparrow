@@ -27,6 +27,14 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
             let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
             let _daemon = start(&config, &socket).await;
+            // INVARIANT: the daemon's group can reach the socket and nothing else in the store.
+            let mode = |path: &std::path::Path| {
+                std::os::unix::fs::PermissionsExt::mode(
+                    &std::fs::symlink_metadata(path).unwrap().permissions(),
+                ) & 0o7777
+            };
+            assert_eq!(mode(&data), 0o710);
+            assert_eq!(mode(&socket), 0o660);
             let baseline = cli(&socket, &["capabilities"]);
             assert_eq!(baseline["transport"].as_str(), Some("capnp"));
             assert_eq!(baseline["transports"], Value::array(["unix", "tcp"]));
@@ -875,10 +883,6 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
             let socket = data.join("rpc.sock");
             let config_path = write_server_config(dir.path(), &data, &socket);
             append_tail_config(&config_path, &root, "log");
-            let text = std::fs::read_to_string(&config_path)
-                .unwrap()
-                .replace("max_artifact_bytes = 8388608", "max_artifact_bytes = 1024");
-            std::fs::write(&config_path, text).unwrap();
             let config = sparrow_server::ServerConfig::read(&config_path).unwrap();
             let store = config.open_store().unwrap();
             let store_id = store.store_id().unwrap();
@@ -886,10 +890,12 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
             let mut intents = Vec::new();
             for name in ["resume.log", "changed.log", "missing.log", "empty.log"] {
                 let path = root.join(name);
+                // 300 lines of 4 KiB need two 1 MiB tail captures to drain.
+                let line = [b"accepted".as_slice(), &[b'a'; 4087], b"\n"].concat();
                 let bytes = if name == "empty.log" {
                     Vec::new()
                 } else {
-                    let mut bytes = b"accepted\n".repeat(300);
+                    let mut bytes = line.repeat(300);
                     bytes.extend_from_slice(b"final-without-newline");
                     bytes
                 };
@@ -922,7 +928,7 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
                         .tail_append(
                             &generation.id,
                             0,
-                            &bytes[..9],
+                            &bytes[..line.len()],
                             false,
                             sparrow_server::now().unwrap(),
                         )
@@ -985,7 +991,7 @@ async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_
             assert_eq!(receipts[1].gap.as_deref(), Some("identity_changed"));
             assert_eq!(receipts[2].gap.as_deref(), Some("read_gap"));
             for receipt in &receipts[1..3] {
-                assert_eq!(receipt.offset, 9);
+                assert_eq!(receipt.offset, 4096);
                 assert!(receipt.finished_at.is_none());
             }
             assert_eq!(receipts[3].offset, 0);
@@ -1020,16 +1026,12 @@ async fn tail_capture_refusal_preserves_bytes_and_missing_recovery_reports_a_dur
             std::fs::write(&outside, b"outside\n").unwrap();
             std::os::unix::fs::symlink(&outside, root.join("alias.log")).unwrap();
             let input = root.join("current.log");
-            let bytes = vec![b'x'; 1025];
+            let bytes = vec![b'x'; 1024 * 1024 + 1];
             std::fs::write(&input, &bytes).unwrap();
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
             append_tail_config(&config, &root, "log");
-            let text = std::fs::read_to_string(&config)
-                .unwrap()
-                .replace("max_artifact_bytes = 8388608", "max_artifact_bytes = 1024");
-            std::fs::write(&config, text).unwrap();
             let daemon = start(&config, &socket).await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();
             watch_until(client.capability(), |watch| {
@@ -1041,7 +1043,7 @@ async fn tail_capture_refusal_preserves_bytes_and_missing_recovery_reports_a_dur
             .await;
             let status = cli(&socket, &["status"]);
             let watch = &status["consume_watches"][0];
-            assert_eq!(watch["tail_read_bytes"].as_str(), Some("1024"));
+            assert_eq!(watch["tail_read_bytes"].as_str(), Some("1048576"));
             assert_eq!(watch["tail_descriptors"].as_u64(), Some(1));
             assert_eq!(watch["tail_checkpoint_records"].as_str(), Some("0"));
             let first_id = watch["tail_generation_ids"][0].as_str().unwrap().to_owned();
@@ -1995,7 +1997,6 @@ async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_pack
                 sparrow_server::Rpc::new(
                     store.clone(),
                     std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-                    1024 * 1024,
                     100,
                 )
                 .with_syslog(registry),
@@ -2701,7 +2702,13 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     "1",
                 ],
             );
-            assert_eq!(first["total_items"].as_str(), Some("2"));
+            assert_eq!(first["total_items"].as_str(), Some("1"));
+            // Until the walk's final page the count covers delivered rows only.
+            assert_eq!(first["has_more"].as_bool(), Some(true));
+            assert_eq!(first["matching_artifacts"], Value::Null);
+            assert_eq!(first["known_matching_artifacts"].as_str(), Some("1"));
+            assert_eq!(first["answer_certainty"].as_str(), Some("incomplete"));
+            assert_eq!(first["coverage"]["catalog_complete"].as_bool(), Some(false));
             assert_eq!(first["rows"][0]["retained_records"].as_str(), Some("2"));
             assert_eq!(
                 first["rows"][0]["complete_bytes_available"].as_bool(),
@@ -2727,9 +2734,21 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 )
                 .await;
             assert!(!second["isError"].as_bool().unwrap());
-            let again = cli(
-                &socket,
-                &[
+            // A live continuation reads the next receipt-ordered page under a new
+            // handle, and the later artifact still lies ahead of it.
+            let second = &second["structuredContent"];
+            assert_ne!(second["snapshot_id"], first["snapshot_id"]);
+            assert_eq!(second["total_items"].as_str(), Some("2"));
+            assert_eq!(second["has_more"].as_bool(), Some(true));
+            assert_eq!(second["matching_artifacts"], Value::Null);
+            assert_eq!(second["answer_certainty"].as_str(), Some("incomplete"));
+            assert_ne!(
+                second["rows"][0]["artifact_id"],
+                first["rows"][0]["artifact_id"]
+            );
+            let spent = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
                     "artifacts",
                     &store,
                     "--source",
@@ -2738,16 +2757,11 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     "1",
                     "--cursor",
                     cursor,
-                ],
-            );
-            assert_eq!(second["structuredContent"], again);
-            assert_eq!(again["snapshot_id"], first["snapshot_id"]);
-            assert_eq!(again["total_items"].as_str(), Some("2"));
-            assert_eq!(again["has_more"].as_bool(), Some(false));
-            assert_ne!(
-                again["rows"][0]["artifact_id"],
-                first["rows"][0]["artifact_id"]
-            );
+                ])
+                .admitted_output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&spent.stderr).contains("RESULT_EXPIRED"));
+            let cursor = second["next_cursor"].as_str().unwrap();
             let fragments = cli(
                 &socket,
                 &["artifacts", &store, "--source", "wire-fragments"],
@@ -2809,6 +2823,24 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     output
                 );
             }
+            // The final page of one uninterrupted walk states the exact count.
+            let last = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--source",
+                    "wire-catalog",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    cursor,
+                ],
+            );
+            assert_eq!(last["has_more"].as_bool(), Some(false));
+            assert_eq!(last["matching_artifacts"].as_str(), Some("3"));
+            assert_eq!(last["answer_certainty"].as_str(), Some("exact"));
+            assert_eq!(last["coverage"]["catalog_complete"].as_bool(), Some(true));
             for version in [0, 23] {
                 let mut request = client.capability().artifacts_list_request();
                 let mut query = request.get().init_query();
@@ -2832,7 +2864,8 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
             }
             let status = cli(&socket, &["status"]);
             assert_eq!(status["max_artifact_read_handles"].as_str(), Some("8"));
-            assert_eq!(status["artifact_read_handles"].as_str(), Some("1"));
+            // Delivering the final page retired the last continued handle.
+            assert_eq!(status["artifact_read_handles"].as_str(), Some("0"));
         })
         .await;
 }
@@ -3360,6 +3393,9 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
         assert_eq!(cli_status["pressure"]["evicted_recordless_artifacts"].as_str(), Some("1"));
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_recordless_artifacts"], cli_status["pressure"]["evicted_recordless_artifacts"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_records"], cli_status["pressure"]["evicted_records"]);
+        // A new store owes no table rewrite, and both adapters render the same status.
+        assert_eq!(cli_status["recompression"]["phase"].as_str(), Some("complete"));
+        assert_eq!(mcp_status["structuredContent"]["recompression"], cli_status["recompression"]);
         let retained = mcp.tool(4, "bytes_read", Object::new().with("store_id", &protected.store_id)
             .with("id", &protected.id).with("offset", "0").with("length", 7_u64).into()).await;
         assert_eq!(retained["isError"].as_bool(), Some(false));
@@ -3935,6 +3971,428 @@ async fn removed_watch_keeps_durable_claim_recovery_and_refuses_root_rebinding()
         .await;
 }
 
+/// The typed failure of one refused write: its code and message.
+fn rpc_failure<T: capnp::traits::Owned + 'static>(
+    result: wire::result::Reader<'_, T>,
+) -> (String, String) {
+    match result.which().unwrap() {
+        wire::result::Ok(_) => panic!("expected a typed RPC failure"),
+        wire::result::Error(error) => {
+            let error = error.unwrap();
+            (
+                error.get_code().unwrap().to_str().unwrap().to_owned(),
+                error.get_message().unwrap().to_str().unwrap().to_owned(),
+            )
+        }
+    }
+}
+
+/// INVARIANT: a query-only daemon on a copy of a store with a registered watch answers reads
+/// as a normal daemon does, opens and claims nothing in the stored watch root, and refuses
+/// writes with `READ_ONLY` before acting on them.
+#[tokio::test(flavor = "current_thread")]
+async fn query_only_daemon_serves_reads_and_refuses_writes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 0, 16, 16);
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let consumed = root.join("consumed.jsonl");
+            std::fs::write(&consumed, b"{\"copy\":1}\n").unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_completed_claims() == 1 && watch.get_pending_claims() == 0
+            })
+            .await;
+            assert!(!consumed.exists(), "the normal daemon owns the root");
+            drop(client);
+            drop(daemon);
+
+            let copy = dir.path().join("copy");
+            std::fs::create_dir(&copy).unwrap();
+            let copied = copy.join("store");
+            let status = Command::new("cp")
+                .args(["-a", "--reflink=auto", "--"])
+                .arg(&data)
+                .arg(&copied)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let copy_socket = copied.join("rpc.sock");
+            let copy_config = write_server_config(&copy, &copied, &copy_socket);
+            let _query = start_with(
+                &copy_config,
+                &copy_socket,
+                Stdio::inherit(),
+                &["--query-only"],
+            )
+            .await;
+            let waiting = root.join("waiting.jsonl");
+            std::fs::write(&waiting, b"{\"copy\":2}\n").unwrap();
+            let client = sparrow_client::Client::connect(&copy_socket).await.unwrap();
+            let store = client.discovery().store_id.clone();
+
+            let response = client
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            assert!(status.get_query_only());
+            let watches = status.get_consume_watches().unwrap();
+            assert_eq!(watches.len(), 1, "the stored watch is reported");
+            assert_eq!(
+                watches.get(0).get_id().unwrap().to_str().unwrap(),
+                "completed"
+            );
+            assert_eq!(
+                watches.get(0).get_directories(),
+                0,
+                "its root is never opened"
+            );
+            assert_eq!(
+                cli(&copy_socket, &["status"])["query_only"].as_bool(),
+                Some(true)
+            );
+            let rows =
+                cli(&copy_socket, &["records", "--source", "consume-acceptance"])["rows"].clone();
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                1,
+                "reads answer from the copy"
+            );
+            let record = rows[0]["record_id"].as_str().unwrap().to_owned();
+
+            let mut ingest = client.capability().ingest_request();
+            let mut input = ingest.get().init_request();
+            input.set_request_id("query-only-ingest");
+            input.set_source("query-only");
+            input.set_format(wire::Format::Jsonl);
+            input.set_bytes(b"{\"refused\":true}\n");
+            let response = ingest.send().promise.await.unwrap();
+            let (code, message) = rpc_failure(response.get().unwrap().get_result().unwrap());
+            assert_eq!(code, "READ_ONLY");
+            assert!(message.contains("query-only mode"), "{message}");
+
+            let response = client
+                .capability()
+                .watch_list_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let list = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let listed = list.get_watches().unwrap().get(0);
+            let mut put = client.capability().watch_put_request();
+            let mut input = put.get().init_request();
+            input.set_store_id(&store);
+            input.set_request_id("query-only-watch");
+            input.set_expected_revision(listed.get_revision());
+            input
+                .set_definition(listed.get_definition().unwrap())
+                .unwrap();
+            let response = put.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_failure(response.get().unwrap().get_result().unwrap()).0,
+                "READ_ONLY"
+            );
+
+            let mut pin = client.capability().pin_request();
+            let mut input = pin.get().init_request();
+            input.set_request_id("query-only-pin");
+            input.set_name("refused");
+            input.set_days(1);
+            let mut target = input.init_targets(1).get(0);
+            target.set_store_id(&store);
+            target.set_record(&record);
+            let response = pin.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_failure(response.get().unwrap().get_result().unwrap()).0,
+                "READ_ONLY"
+            );
+
+            // The normal daemon consumed a quiet_ms = 0 file within one poll; give the copy longer.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                std::fs::read(&waiting).unwrap(),
+                b"{\"copy\":2}\n",
+                "the copy claimed nothing"
+            );
+            assert_eq!(
+                cli(&copy_socket, &["status"])["live_records"].as_str(),
+                Some("1")
+            );
+        })
+        .await;
+}
+
+/// INVARIANT: query-only mode starts no intake, public listener or archive, so a
+/// configuration that names one refuses startup with the conflicting key, whether the flag
+/// or the `query_only` key selects the mode, before any store or socket is created.
+#[test]
+fn query_only_refuses_conflicting_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    let base = std::fs::read_to_string(&config).unwrap();
+    let refused = |extra: &str, flag: bool, key: &str| {
+        std::fs::write(&config, format!("{base}{extra}")).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sparrowd"));
+        command.arg("--config").arg(&config);
+        if flag {
+            command.arg("--query-only");
+        }
+        let output = command.admitted_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{extra}");
+        assert!(
+            stderr.contains(&format!("query_only refuses the configured `{key}`")),
+            "{stderr}"
+        );
+        assert!(!data.exists(), "refused before opening the store");
+    };
+    let root = dir.path().join("completed");
+    std::fs::create_dir(&root).unwrap();
+    let consume = toml::to_string(&watch_definition(&root, "completed", 0, 16, 16)).unwrap();
+    refused(&format!("\n[[consume]]\n{consume}"), true, "consume");
+    refused(
+        &format!("query_only = true\n\n[[consume]]\n{consume}"),
+        false,
+        "consume",
+    );
+    let secret = dir.path().join("tcp.secret");
+    std::fs::write(&secret, [7; 32]).unwrap();
+    let tcp = format!(
+        "rpc_tcp_address = \"127.0.0.1:9\"\nrpc_tcp_secret_file = \"{}\"\n",
+        secret.display()
+    );
+    refused(&tcp, true, "rpc_tcp_address");
+}
+
+/// Run deploy/verify-backup.sh with a scratch root and the given live configuration.
+fn verify_backup(
+    backup: &Path,
+    verify: &Path,
+    live: &Path,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let output = Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/verify-backup.sh"
+    ))
+    .args(args)
+    .arg(backup)
+    .env("SPARROW_VERIFY", verify)
+    .env("SPARROW_CONFIG", live)
+    .admitted_output()
+    .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A live configuration for verify-backup's guard, and a backup of a two-record store.
+/// Returns the live configuration, the live data_dir, the backup and its store identity.
+fn backup_fixture(
+    dir: &Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
+    let live_data = dir.join("live").join("store");
+    std::fs::create_dir_all(&live_data).unwrap();
+    let live = write_server_config(&dir.join("live"), &live_data, &live_data.join("rpc.sock"));
+    let backup = dir.join("backup");
+    let data = backup.join("store");
+    std::fs::create_dir_all(backup.join("config")).unwrap();
+    let config = write_server_config(&backup.join("config"), &data, &data.join("rpc.sock"));
+    let store = sparrow_server::ServerConfig::read(&config)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let now = sparrow_server::now().unwrap();
+    store
+        .ingest(
+            "verify-backup",
+            "verify",
+            "jsonl",
+            b"{\"backup\":1}\n{\"backup\":2}\n",
+            now,
+        )
+        .unwrap();
+    let identity = store.store_id().unwrap();
+    let chunks = store.status(now).unwrap()["unique_payload_chunks"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(store);
+    std::fs::write(
+        backup.join("SOURCE"),
+        format!(
+            "taken_utc={}\nimage=sparrowd-test\nstore_id={identity}\nunique_payload_chunks={chunks}\ntext_lexicon_dir={}\n",
+            sparrow_core::format_instant(now + 1000).unwrap(),
+            sparrow_test_support::text_lexicon_dir().display()
+        ),
+    )
+    .unwrap();
+    (live, live_data, backup, identity)
+}
+
+/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a reflinked copy,
+/// still passes on its clock-independent chunk count once the backup has aged out of
+/// retention, and fails, removing its scratch copy, when SOURCE names another store.
+#[test]
+fn verify_backup_fails_on_wrong_store_id() {
+    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, _, backup, identity) = backup_fixture(dir.path());
+    let verify = dir.path().join("verify");
+    let image = ["--image", env!("CARGO_BIN_EXE_sparrowd")];
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    for check in [
+        "query-only",
+        "store-id",
+        "status",
+        "payload-chunks",
+        "records",
+        "artifact",
+        "shutdown",
+    ] {
+        assert!(
+            stdout.contains(&format!("PASS {check}:")),
+            "{check}: {stdout}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+    // Once the backup's newest hour is older than retention, its records have expired by the
+    // reader's clock; the chunk count still holds, and the window checks are skipped.
+    let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
+    let taken = source.lines().next().unwrap().to_owned();
+    let aged =
+        sparrow_core::format_instant(sparrow_server::now().unwrap() - sparrow_core::RETENTION_MS)
+            .unwrap();
+    std::fs::write(
+        backup.join("SOURCE"),
+        source.replace(&taken, &format!("taken_utc={aged}")),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("PASS payload-chunks:"), "{stdout}");
+    assert!(stdout.contains("SKIP records:"), "{stdout}");
+    std::fs::write(
+        backup.join("SOURCE"),
+        source.replace(&identity, "store:00000000000000000000000000000000"),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("FAIL store-id:"), "{stderr}");
+    assert!(!stdout.contains("PASS records"), "{stdout}");
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+}
+
+/// INVARIANT: verify-backup.sh never starts a daemon that could reach the live store or the
+/// live intake: it refuses a backup whose store is or holds a link (here, to the live
+/// data_dir), and it refuses the backup's own image when that image has no query-only mode,
+/// without running it with a configuration.
+#[test]
+fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, live_data, backup, _) = backup_fixture(dir.path());
+    let verify = dir.path().join("verify");
+
+    let linked = dir.path().join("linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::copy(backup.join("SOURCE"), linked.join("SOURCE")).unwrap();
+    std::os::unix::fs::symlink(&live_data, linked.join("store")).unwrap();
+    let (code, stdout, stderr) = verify_backup(
+        &linked,
+        &verify,
+        &live,
+        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("store is a symbolic link"), "{stderr}");
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
+    assert_eq!(
+        std::fs::read_dir(&live_data).unwrap().count(),
+        0,
+        "the live store is untouched"
+    );
+
+    // A link inside the store is refused too, even one that stays inside the backup.
+    let inner = backup.join("store").join("inner-link");
+    std::os::unix::fs::symlink(backup.join("SOURCE"), &inner).unwrap();
+    let (code, stdout, stderr) = verify_backup(
+        &backup,
+        &verify,
+        &live,
+        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("holds the symbolic link"), "{stderr}");
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
+    std::fs::remove_file(&inner).unwrap();
+
+    // The backup's own pre-query-only image: it prints the old usage line, and marks any run
+    // that passes it arguments.
+    let images = backup.join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    let started = dir.path().join("old-image-started");
+    for name in ["sparrowd-test", "sparrow-test"] {
+        let stub = images.join(name);
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n[ $# -eq 0 ] || touch '{}'\necho 'usage: sparrowd --config FILE.toml' >&2\nexit 1\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("predates query-only mode"), "{stderr}");
+    assert!(
+        !started.exists(),
+        "the old image never ran with a configuration"
+    );
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
+}
+
 #[test]
 fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -4188,6 +4646,206 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             assert!(!socket.exists());
+        })
+        .await;
+}
+
+/// Run the packaged shipper once over `config`; it must only read the producer files.
+fn ship(config: &Path) -> std::process::Output {
+    Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/libexec/sparrow-ship"
+    ))
+    .arg(config)
+    .admitted_output()
+    .unwrap()
+}
+
+/// INVARIANT: the shipper never queues a whole file the store would refuse before
+/// upload, and its literal bound is the store's `MAX_IMPORT_BYTES`.
+#[test]
+fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/libexec/sparrow-ship"
+    ))
+    .unwrap();
+    assert!(
+        script.contains(&format!(
+            "\nMAX_IMPORT_BYTES = {}\n",
+            sparrow_core::MAX_IMPORT_BYTES
+        )),
+        "the shipper's MAX_IMPORT_BYTES must equal sparrow_core::MAX_IMPORT_BYTES"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let reports = dir.path().join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::create_dir_all(dir.path().join("intake/reports")).unwrap();
+    // A sparse file costs no blocks, so the bound is cheap to cross.
+    let original = reports.join("huge.json");
+    std::fs::File::create(&original)
+        .unwrap()
+        .set_len(sparrow_core::MAX_IMPORT_BYTES + 1)
+        .unwrap();
+    let config = dir.path().join("ship.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
+             max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+             max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+             [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
+             rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
+            dir.path().join("intake"),
+            dir.path().join("ship"),
+            reports,
+        ),
+    )
+    .unwrap();
+    let refused = ship(&config);
+    assert!(!refused.status.success());
+    let errors = String::from_utf8_lossy(&refused.stderr);
+    assert!(errors.contains("import bound"), "{errors}");
+    let report = String::from_utf8_lossy(&refused.stdout);
+    assert!(report.contains("reports: queued 0"), "{report}");
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("ship/queue/reports"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(&original).unwrap().len(),
+        sparrow_core::MAX_IMPORT_BYTES + 1
+    );
+}
+
+/// INVARIANT: an artifact above the removed 16 MiB per-artifact limit ingests whole and
+/// reads back byte-exact. The shipper ships one single-object JSON file of 20 MiB whole,
+/// the consume watch publishes it, and the SDK stages an in-memory copy in bounded
+/// appends while one inline message stays refused at the store's batch bound.
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_single_json_ships_whole_ingests_and_reads_back_exactly() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let reports = dir.path().join("reports");
+            let intake = dir.path().join("intake");
+            std::fs::create_dir_all(&reports).unwrap();
+            std::fs::create_dir_all(intake.join("reports")).unwrap();
+            let mut json = br#"{"refusal":""#.to_vec();
+            json.resize(20 * 1024 * 1024, b'r');
+            json.extend_from_slice(br#""}"#);
+            let original = reports.join("refusal-evidence.json");
+            std::fs::write(&original, &json).unwrap();
+            let ship_config = dir.path().join("ship.toml");
+            let settings = format!(
+                "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
+                 max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+                 max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+                 [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
+                 rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
+                intake,
+                dir.path().join("ship"),
+                reports,
+            );
+            // The removed knob refuses with its removal rather than shipping anything.
+            std::fs::write(
+                &ship_config,
+                format!("max_whole_bytes = 16777216\n{settings}"),
+            )
+            .unwrap();
+            let refused = ship(&ship_config);
+            assert!(!refused.status.success());
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("`max_whole_bytes` was removed")
+            );
+            std::fs::write(&ship_config, &settings).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let mut watch = watch_definition(&intake.join("reports"), "completed", 0, 16, 16);
+            watch.format = "json".into();
+            append_watch_config(&config, &watch);
+            let _daemon = start(&config, &socket).await;
+            let shipped = ship(&ship_config);
+            assert!(
+                shipped.status.success(),
+                "{}",
+                String::from_utf8_lossy(&shipped.stderr)
+            );
+            let report = String::from_utf8_lossy(&shipped.stdout);
+            assert!(report.contains("reports: queued 1"), "{report}");
+            assert!(report.contains("reports: fed 1"), "{report}");
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_completed_claims() == 1 && watch.get_pending_claims() == 0
+            })
+            .await;
+            assert_eq!(std::fs::read(&original).unwrap(), json);
+            let store = client.discovery().store_id.clone();
+            let listed = cli(
+                &socket,
+                &["artifacts", &store, "--source", "consume-acceptance"],
+            );
+            let row = &listed["rows"][0];
+            assert_eq!(listed["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(row["complete_bytes_available"].as_bool(), Some(true));
+            assert_eq!(
+                row["origin"]["byte_length"].as_str(),
+                Some(json.len().to_string().as_str())
+            );
+            let consumed = row["artifact_id"].as_str().unwrap().to_owned();
+            let window = 1024 * 1024;
+            let mut read = Vec::with_capacity(json.len());
+            while read.len() < json.len() {
+                let length = window.min(json.len() - read.len());
+                read.extend(
+                    client
+                        .bytes(&consumed, read.len() as u64, length as u32)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert!(read == json, "consumed artifact bytes differ");
+            // One inline message stays bounded; the SDK stages the same input instead.
+            let mut request = client.capability().ingest_request();
+            let mut input = request.get().init_request();
+            input.set_request_id("inline-oversized");
+            input.set_source("sdk-oversized");
+            input.set_format(wire::Format::Json);
+            input.set_bytes(&json);
+            let response = request.send().promise.await.unwrap();
+            match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                wire::result::Error(error) => {
+                    assert_eq!(
+                        error.unwrap().get_code().unwrap().to_str().unwrap(),
+                        "RESOURCE_LIMIT"
+                    );
+                }
+                wire::result::Ok(_) => panic!("an inline message above 16 MiB was accepted"),
+            }
+            let staged = client
+                .ingest("sdk-oversized", "sdk-oversized", wire::Format::Json, &json)
+                .await
+                .unwrap();
+            assert_eq!(staged.byte_length, json.len() as u64);
+            assert_eq!(staged.durability, wire::Durability::Durable);
+            let tail = json.len() - window;
+            assert_eq!(
+                client
+                    .bytes(&staged.id, tail as u64, window as u32)
+                    .await
+                    .unwrap(),
+                json[tail..]
+            );
         })
         .await;
 }
@@ -4648,7 +5306,6 @@ async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_re
             let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
                 store.clone(),
                 Arc::new(tokio::sync::Semaphore::new(4)),
-                config.max_artifact_bytes,
                 config.max_pin_members,
             ));
             let serving = tokio::task::spawn_local(async move {
@@ -6613,10 +7270,15 @@ async fn start(config: &Path, socket: &Path) -> Daemon {
 }
 
 async fn start_with_stderr(config: &Path, socket: &Path, stderr: Stdio) -> Daemon {
+    start_with(config, socket, stderr, &[]).await
+}
+
+async fn start_with(config: &Path, socket: &Path, stderr: Stdio, args: &[&str]) -> Daemon {
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_sparrowd"))
             .arg("--config")
             .arg(config)
+            .args(args)
             .stderr(stderr)
             .stdout(Stdio::null())
             .admitted_spawn()
@@ -11141,6 +11803,109 @@ async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
         .await;
 }
 
+/// A delivered live artifact continuation retires the handle it continued, so
+/// each surface continues its own first page and the spent cursor then expires.
+async fn live_artifact_continuations(
+    socket: &std::path::Path,
+    client: &sparrow_client::Client,
+    mcp: &mut Mcp,
+    args: &[&str],
+) {
+    use purrdf_lex::json::Object;
+    let id = args[1];
+    let mut continued = Vec::new();
+    for surface in 0_u64..4 {
+        let first = cli(socket, args);
+        let snapshot = first["snapshot_id"].as_str().unwrap().to_owned();
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let (rows, next_snapshot) = match surface {
+            0 | 1 => {
+                let next = if surface == 0 {
+                    let mut repeat = args.to_vec();
+                    repeat.extend(["--cursor", cursor.as_str()]);
+                    cli(socket, &repeat)
+                } else {
+                    let next = cli(socket, &["result-next", id, &cursor]);
+                    assert_eq!(next["operation"].as_str(), Some("artifacts_list"));
+                    next
+                };
+                (next["rows"].clone(), next["snapshot_id"].clone())
+            }
+            2 => {
+                let reply = mcp
+                    .tool(
+                        300 + surface,
+                        "result_next",
+                        Object::new()
+                            .with("store_id", id)
+                            .with("cursor", cursor.as_str())
+                            .into(),
+                    )
+                    .await;
+                assert!(!reply["isError"].as_bool().unwrap());
+                let next = &reply["structuredContent"];
+                (next["rows"].clone(), next["snapshot_id"].clone())
+            }
+            _ => {
+                let mut call = client.capability().result_next_request();
+                let mut query = call.get().init_query();
+                query.set_store_id(id);
+                query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                query.set_cursor(&cursor);
+                let response = call.send().promise.await.unwrap();
+                let page = match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
+                    wire::result::Ok(page) => page.unwrap(),
+                    wire::result::Error(error) => panic!("{:?}", error.unwrap().get_code()),
+                };
+                let wire::result_page::Artifacts(page) = page.which().unwrap() else {
+                    panic!("artifact continuation");
+                };
+                let page = page.unwrap();
+                let rows = page.get_rows().unwrap();
+                assert_eq!(rows.len(), 1);
+                let artifact = rows.get(0).get_id().unwrap().to_str().unwrap();
+                let snapshot = page
+                    .get_receipt()
+                    .unwrap()
+                    .get_snapshot_id()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                (
+                    purrdf_lex::json::Value::from(artifact),
+                    purrdf_lex::json::Value::from(snapshot),
+                )
+            }
+        };
+        assert_ne!(next_snapshot.as_str(), Some(snapshot.as_str()));
+        continued.push(rows);
+        let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            .arg(socket)
+            .args(["result-next", id, &cursor])
+            .admitted_output()
+            .unwrap();
+        assert!(!out.status.success() && out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("RESULT_EXPIRED"));
+        // The final continuation holds no handle, and delivery retired the first.
+        for snapshot in [snapshot.as_str(), next_snapshot.as_str().unwrap()] {
+            assert!(!client.release_result(snapshot).await.unwrap().released);
+        }
+    }
+    for rows in &continued[1..3] {
+        assert_eq!(rows, &continued[0]);
+    }
+    assert_eq!(
+        continued[3].as_str(),
+        continued[0][0]["artifact_id"].as_str()
+    );
+}
 #[tokio::test(flavor = "current_thread")]
 async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page() {
     use purrdf_lex::json::{Object, Value};
@@ -11341,6 +12106,10 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 vec!["pin-get", id, "--id", pin_id, "--page-size", "1"],
             ];
             for (index, args) in commands.into_iter().enumerate() {
+                if args[0] == "artifacts" {
+                    live_artifact_continuations(&socket, &client, &mut mcp, &args).await;
+                    continue;
+                }
                 let first = cli(&socket, &args);
                 let cursor = if index < 4 {
                     first["page"]["next_cursor"].as_str()

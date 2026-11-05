@@ -66,7 +66,7 @@ pub use logging::TracingLayer;
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 63;
+pub const SCHEMA_VERSION: u32 = 67;
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -223,7 +223,7 @@ impl Client {
         &self.connection.client
     }
 
-    /// Accept one bounded complete artifact with the caller's stable retry identity.
+    /// Accept one complete artifact with the caller's stable retry identity.
     /// Default acceptance is durable; use `ingest_with_durability` for a buffered fence.
     pub async fn ingest(
         &self,
@@ -237,6 +237,9 @@ impl Client {
     }
 
     /// Accept a complete artifact with explicit buffered or durable acknowledgment.
+    /// An input above the discovered inline bound is staged in 64 KiB appends and
+    /// acknowledged durably; the store refuses one above `MAX_IMPORT_BYTES` before
+    /// any byte is uploaded.
     pub async fn ingest_with_durability(
         &self,
         request_id: &str,
@@ -254,10 +257,19 @@ impl Client {
                 "require bounded nonempty request and source labels",
             ));
         }
-        if bytes.len() as u64 > self.discovery.max_artifact_bytes {
-            return Err(Error::InvalidArgument(
-                "input exceeds buffered artifact limit; use import_file",
-            ));
+        if bytes.len() as u64 > self.discovery.max_inline_artifact_bytes {
+            // One message cannot carry it: stream it through the resumable import,
+            // which acknowledges durably whatever durability was requested.
+            return imports::upload(
+                self.capability(),
+                &self.discovery,
+                request_id,
+                source,
+                format,
+                bytes,
+                &mut imports::Checkpoint::default(),
+            )
+            .await;
         }
         let expected = receipt::ExpectedArtifact::bytes(
             &self.discovery,
@@ -322,7 +334,7 @@ impl Client {
             request_id,
             source,
             format,
-            file,
+            &imports::CompletedInput::capture(file)?,
             &mut imports::Checkpoint::default(),
         )
         .await

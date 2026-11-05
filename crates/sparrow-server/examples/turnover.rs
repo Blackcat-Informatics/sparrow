@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || profile.log_rows == 0
         || profile.log_rows > config.max_records
         || profile.opaque_bytes == 0
-        || profile.opaque_bytes > config.max_artifact_bytes
+        || profile.opaque_bytes > sparrow_core::INLINE_ARTIFACT_BYTES
     {
         return Err(
             "fixture sizes must be positive and fit configured artifact/record admission".into(),

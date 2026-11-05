@@ -42,8 +42,10 @@ DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
 implemented and deployed in schema 62. See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
 
-The installed user service is `sparrow.service`, serving typed Cap'n Proto on
-`0.0.0.0:518` and a private Unix socket. Anonymous TCP peers may only discover,
+The production deployment is the system unit in [`deploy/`](deploy/README.md),
+serving typed Cap'n Proto on `0.0.0.0:518` and a private Unix socket at
+`/SPARROW/store/rpc.sock`; the live host runs the earlier user service until its
+cutover. Anonymous TCP peers may only discover,
 ingest and import; other TCP operations require `--secret-file` CHAP authentication. The client is `~/.local/bin/sparrow`.
 Graph queries use PurRDF's native semantics and governors over bounded stored
 views, with explicit admission refusals; see
@@ -132,8 +134,8 @@ make install-hooks  # run make check before every commit
 ```
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the gate, the PurRDF reuse rules
-and the helper ledger, and [Deployment](docs/deployment.md) for installing the
-user service.
+and the helper ledger, and [deploy/README.md](deploy/README.md) for installing
+the service.
 
 ## Architecture and interfaces
 
@@ -152,8 +154,8 @@ text analysis, scoring, and query governors.
 - [Helper census](docs/helper-census.md): PurRDF reuse and local duplication gates.
 - [Development runtime](docs/development-runtime.md): implemented surfaces,
   verification evidence and unfinished server acceptance.
-- [Deployment](docs/deployment.md): persistent Linux user-service installation,
-  runtime asset ownership and cutover verification.
+- [Deployment](docs/deployment.md): configuration, kept images, seeded builds,
+  shipping and backups behind the [`deploy/`](deploy/README.md) procedures.
 - [Performance baseline](docs/performance-baseline.md): copied-corpus disk
   measurements, explicit query-capacity refusals and remaining qualification.
 

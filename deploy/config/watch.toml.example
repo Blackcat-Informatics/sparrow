@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# One consume watch for one shipper source, applied with
+#   sparrow /SPARROW/store/rpc.sock watch put REQUEST_ID 0 NAME.toml
+# (REQUEST_ID fresh per mutation; 0 creates, the current revision replaces). Keep applied
+# definitions in /etc/sparrow/watches/ so a restore can reapply them. The root is
+# /SPARROW/intake/NAME, where NAME is the shipper source's name; create it first with
+#   mkdir /SPARROW/intake/NAME
+# as a member of the sparrow group. The parent's default ACL gives the group rwx on it.
+# Do not use `install -d` or `mkdir -m`: their explicit chmod resets the ACL mask and takes the
+# daemon's write access away (deploy/README.md, "Permissions").
+
+id = "app-events"
+root = "/SPARROW/intake/app-events"
+producer_contract = "finished_files"
+source = "app-events"
+format = "jsonl"
+quiet_ms = 30000
+max_directories = 1
+max_candidates = 1024

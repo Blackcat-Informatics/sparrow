@@ -49,7 +49,21 @@ pub(super) async fn finish(
     // Once joined, reserve all slots and retain them through the final WAL fence.
     let drained = drain(operations.clone(), slots).await;
     if drained.is_ok() {
-        record_failure(&mut errors, "store flush", store.flush());
+        let flushed = store.flush();
+        let closed = flushed.is_ok();
+        record_failure(&mut errors, "store flush", flushed);
+        if closed {
+            // Every worker has stopped and admission is closed, so nothing can change the count
+            // again; sparrow-backup records this line from the journal of the stop it performed.
+            match (store.store_id(), store.unique_payload_chunks()) {
+                (Ok(id), Ok(chunks)) => {
+                    eprintln!("sparrowd: closed store={id} unique_payload_chunks={chunks}");
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    errors.push(format!("closing count: {error}"));
+                }
+            }
+        }
     } else if let Err(error) = &drained {
         errors.push(error.clone());
         errors.push("store flush withheld because RPC admission could not be drained".into());

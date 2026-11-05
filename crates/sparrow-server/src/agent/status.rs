@@ -17,7 +17,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         || value.get_store_id()?.to_str()? != discovery.store_id
         || value.get_durability_status()?.get_session_id()?.to_str()?
             != discovery.durability_session
-        || value.get_max_artifact_bytes() != discovery.max_artifact_bytes
+        || value.get_max_inline_artifact_bytes() != discovery.max_inline_artifact_bytes
         || value.get_max_records_per_artifact() != discovery.max_records_per_artifact
         || value.get_text_analyzer()?.to_str()? != discovery.text_analyzer
         || value.get_text_profile()?.to_str()? != discovery.text_profile
@@ -126,6 +126,8 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,
         )
+        .with("recompression", recompression(value.get_recompression()?)?)
+        .with("query_only", value.get_query_only())
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -163,8 +165,12 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             value.get_retry_window_seconds().to_string(),
         )
         .with(
-            "max_artifact_bytes",
-            value.get_max_artifact_bytes().to_string(),
+            "retention_seconds",
+            value.get_retention_seconds().to_string(),
+        )
+        .with(
+            "max_inline_artifact_bytes",
+            value.get_max_inline_artifact_bytes().to_string(),
         )
         .with(
             "max_records_per_artifact",
@@ -299,4 +305,19 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             value.get_record_read_lease_ms().to_string(),
         );
     Ok(output.into())
+}
+
+fn recompression(value: wire::recompression_status::Reader<'_>) -> Result<Value> {
+    let phase = match value.get_phase()? {
+        wire::RecompressionPhase::Running => "running",
+        wire::RecompressionPhase::Paused => "paused",
+        wire::RecompressionPhase::Complete => "complete",
+    };
+    Ok(Object::new()
+        .with("profile", value.get_profile()?.to_str()?)
+        .with("phase", phase)
+        .with("remaining_bytes", value.get_remaining_bytes().to_string())
+        .with("waiting", super::optional_value(value.get_waiting()?)?)
+        .with("failure", super::optional_value(value.get_failure()?)?)
+        .into())
 }

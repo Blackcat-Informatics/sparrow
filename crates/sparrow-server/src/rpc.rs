@@ -76,10 +76,10 @@ pub struct Rpc {
     syslog: crate::syslog_listener::SyslogRegistry,
     store: Store,
     requests: Arc<Semaphore>,
-    max_artifact_bytes: usize,
     max_pin_members: usize,
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
+    query_only: bool,
 }
 
 /// The full typed service is already authorized; only an anonymous TCP gate runs CHAP.
@@ -98,44 +98,88 @@ impl Drop for CancelQuery {
 }
 
 /// A completed capture stays private until its response has been rendered.
+/// An undelivered page releases the handle it published; a delivered live
+/// continuation releases the handle it continued, which the client no longer needs.
 struct QueryReply<B> {
     page: sparrow_core::CatalogReadPage<B>,
     store: Store,
     delivered: bool,
     owns_capture: bool,
+    supersedes: Option<String>,
+}
+impl<B> QueryReply<B> {
+    /// Own the page's handle unless it is the handle `cursor` already names.
+    fn new(page: sparrow_core::CatalogReadPage<B>, store: Store, cursor: Option<&str>) -> Self {
+        let continued = cursor
+            .and_then(|cursor| cursor.split_once('/'))
+            .map(|(id, _)| id);
+        let owns_capture = continued != Some(page.snapshot_id.as_str());
+        let supersedes = continued.filter(|_| owns_capture).map(str::to_owned);
+        Self {
+            page,
+            store,
+            delivered: false,
+            owns_capture,
+            supersedes,
+        }
+    }
 }
 impl<B> Drop for QueryReply<B> {
     fn drop(&mut self) {
-        if self.owns_capture && !self.delivered {
+        let release = if self.delivered {
+            self.supersedes.as_deref()
+        } else {
+            self.owns_capture.then_some(self.page.snapshot_id.as_str())
+        };
+        if let Some(snapshot) = release {
             let released = now().and_then(|now| {
                 self.store
-                    .result_release(&self.page.store_id, &self.page.snapshot_id, now)
+                    .result_release(&self.page.store_id, snapshot, now)
             });
             if let Err(error) = released {
-                eprintln!("sparrowd: abandoned query release failed: {error}");
+                eprintln!("sparrowd: query handle release failed: {error}");
             }
         }
     }
 }
 
+/// A `result_next` page: a guarded live artifact continuation, or a replay.
+enum Next {
+    Artifacts(QueryReply<sparrow_core::ArtifactPageBody>),
+    Replay(sparrow_core::ResultPage),
+}
+
 impl Rpc {
     /// Construct the one typed adapter with explicit admission limits.
-    pub fn new(
-        store: Store,
-        requests: Arc<Semaphore>,
-        max_artifact_bytes: usize,
-        max_pin_members: usize,
-    ) -> Self {
+    pub fn new(store: Store, requests: Arc<Semaphore>, max_pin_members: usize) -> Self {
         Self {
             connection: Default::default(),
             syslog: crate::syslog_listener::SyslogRegistry::default(),
             store,
             requests,
-            max_artifact_bytes,
             max_pin_members,
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
+            query_only: false,
         }
+    }
+
+    /// Serve reads only: every connection's service refuses writes with `READ_ONLY`.
+    #[must_use]
+    pub fn query_only(mut self) -> Self {
+        self.query_only = true;
+        self
+    }
+
+    /// The write gate in front of this service; every connection's capability is one.
+    pub(crate) fn into_gate(self) -> crate::query_only::WriteGate {
+        let query_only = self.query_only;
+        crate::query_only::WriteGate::new(self, query_only)
+    }
+
+    /// The typed service a Unix connection or CHAP session receives, behind the write gate.
+    pub(crate) fn into_client(self) -> wire::sparrow::Client {
+        capnp_rpc::new_client(self.into_gate())
     }
 
     /// Persistent store identity bound into CHAP responses.
@@ -302,7 +346,7 @@ impl Rpc {
 
     async fn query_work<B: Send + 'static>(
         &self,
-        owns_capture: bool,
+        cursor: Option<String>,
         operation: impl FnOnce(
             Store,
             u64,
@@ -313,13 +357,7 @@ impl Rpc {
     ) -> Result<QueryReply<B>, Error> {
         self.read_work(move |store, now, cancellation| {
             let page = operation(store.clone(), now, cancellation.clone())?;
-            let reply = QueryReply {
-                page,
-                store,
-                delivered: false,
-                owns_capture,
-            };
-            Ok(reply)
+            Ok(QueryReply::new(page, store, cursor.as_deref()))
         })
         .await
     }
@@ -529,6 +567,7 @@ fn artifacts_page(
     page: &sparrow_core::ArtifactReadPage,
 ) -> capnp::Result<()> {
     catalog_receipt(out.reborrow().init_receipt(), page);
+    out.set_receipt_walk(page.body.receipt_walk());
     let encoded = page.body.diagnostic_coverage.encode(
         page.body.diagnostic_coverage.evaluated,
         page.body.diagnostic_coverage.matched,
@@ -1773,7 +1812,8 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        // Normalization is bounded independently of the configured storage admission.
+        // Batch validation bounds normalization by MAX_EVENT_BATCH_EVENTS and
+        // MAX_EVENT_BATCH_BYTES, well inside the store's inline ingest bound.
         let bytes = match input.source_bytes().map_err(invalid) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1781,16 +1821,6 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        if bytes.len() > self.max_artifact_bytes {
-            failure(
-                results.get().init_result(),
-                Error {
-                    code: "RESOURCE_LIMIT",
-                    message: "event batch exceeds configured artifact admission".into(),
-                },
-            );
-            return Ok(());
-        }
         match self
             .work(move |store, now| {
                 store.define_time_profile(
@@ -2526,7 +2556,7 @@ impl wire::sparrow::Server for Rpc {
         };
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.records_read_cancellable(
                         &sparrow_core::RecordRead {
@@ -2577,7 +2607,7 @@ impl wire::sparrow::Server for Rpc {
         let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.records_read_cancellable(
                         &sparrow_core::RecordRead {
@@ -2621,7 +2651,7 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
-                out.set_max_artifact_bytes(number(&value, "max_artifact_bytes")?);
+                out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
@@ -2656,14 +2686,16 @@ impl wire::sparrow::Server for Rpc {
                     store.status(now)?,
                     store.durability_status()?,
                     store.pressure_status()?,
+                    store.recompression_status()?,
                 ))
             })
             .await
         {
             Err(e) => failure(results.get().init_result(), e),
-            Ok((value, durability, pressure)) => {
+            Ok((value, durability, pressure, recompression)) => {
                 let mut out = results.get().init_result().init_ok();
                 crate::pressure::encode(out.reborrow().init_pressure_status(), &pressure)?;
+                crate::recompression::encode(out.reborrow().init_recompression(), &recompression);
                 let watches = self
                     .watches
                     .snapshot()
@@ -2712,6 +2744,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                out.set_query_only(self.query_only);
                 let mut syslog_rows = out.reborrow().init_syslog_listeners(syslog.len() as u32);
                 for (index, status) in syslog.iter().enumerate() {
                     status.encode(syslog_rows.reborrow().get(index as u32));
@@ -2730,7 +2763,8 @@ impl wire::sparrow::Server for Rpc {
                 out.set_active_pins(number(&value, "active_pins")?);
                 out.set_unique_json_projections(number(&value, "unique_json_projections")?);
                 out.set_retry_window_seconds(number(&value, "retry_window_seconds")?);
-                out.set_max_artifact_bytes(number(&value, "max_artifact_bytes")?);
+                out.set_retention_seconds(number(&value, "retention_seconds")?);
+                out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_pin_members(number(&value, "max_pin_members")?);
                 out.set_pin_read_handles(number(&value, "pin_read_handles")?);
@@ -2770,12 +2804,13 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let request = params.get()?.get_request()?;
         let bytes = request.get_bytes()?;
-        if bytes.len() > self.max_artifact_bytes {
+        // Refuse before copying; the store owns this bound and the staged import has none.
+        if bytes.len() > sparrow_core::INLINE_ARTIFACT_BYTES {
             failure(
                 results.get().init_result(),
                 Error {
                     code: "RESOURCE_LIMIT",
-                    message: "artifact exceeds configured ingestion bound".into(),
+                    message: "inline ingestion carries at most 16 MiB; stage a larger artifact through importBegin".into(),
                 },
             );
             return Ok(());
@@ -3042,7 +3077,7 @@ impl wire::sparrow::Server for Rpc {
             scan_budget: input.get_scan_budget() as usize,
         };
         match self
-            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+            .query_work(query.cursor.clone(), move |store, now, cancellation| {
                 store.artifact_read_cancellable(&query, now, &cancellation)
             })
             .await
@@ -3365,7 +3400,7 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+            .query_work(query.cursor.clone(), move |store, now, cancellation| {
                 store.source_read_with_syslog_cancellable(
                     &query,
                     now,
@@ -3433,7 +3468,7 @@ impl wire::sparrow::Server for Rpc {
             scan_budget: input.get_scan_budget() as usize,
         };
         match self
-            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+            .query_work(query.cursor.clone(), move |store, now, cancellation| {
                 store.pin_read_cancellable(&query, now, &cancellation)
             })
             .await
@@ -3590,12 +3625,28 @@ impl wire::sparrow::Server for Rpc {
         }
         let store_id = query.get_store_id()?.to_str()?.to_owned();
         let cursor = query.get_cursor()?.to_str()?.to_owned();
+        // A live artifact continuation publishes a page under the same delivery
+        // guard as `artifacts_list`; every other operation replays its capture.
         match self
-            .work(move |store, now| store.result_next(&store_id, &cursor, now))
+            .read_work(move |store, now, _| {
+                Ok(match store.result_next(&store_id, &cursor, now)? {
+                    sparrow_core::ResultPage::Artifacts(page) => {
+                        Next::Artifacts(QueryReply::new(page, store, Some(&cursor)))
+                    }
+                    page => Next::Replay(page),
+                })
+            })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
-            Ok(page) => {
+            Ok(Next::Artifacts(mut reply)) => {
+                artifacts_page(
+                    results.get().init_result().init_ok().init_artifacts(),
+                    &reply.page,
+                )?;
+                reply.delivered = true;
+            }
+            Ok(Next::Replay(page)) => {
                 let out = results.get().init_result().init_ok();
                 match page {
                     sparrow_core::ResultPage::Records(page) => records_page(
@@ -3704,7 +3755,7 @@ impl wire::sparrow::Server for Rpc {
         );
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.json_read_cancellable(
                         &sparrow_core::JsonRead {
@@ -3751,7 +3802,7 @@ impl wire::sparrow::Server for Rpc {
         let decoded = optional(input.get_decoded()?)?;
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.json_read_cancellable(
                         &sparrow_core::JsonRead {
@@ -3813,7 +3864,7 @@ mod tests {
             } else {
                 let action = capture.clone();
                 let mut reply = rpc
-                    .query_work(true, move |store, now, token| {
+                    .query_work(None, move |store, now, token| {
                         action(store, now, &token, None)
                     })
                     .await
@@ -3841,9 +3892,10 @@ mod tests {
                 let cursor = cursor.clone();
                 let (entered, running) = tokio::sync::oneshot::channel();
                 let (release, paused) = std::sync::mpsc::channel();
+                let held = cursor.clone();
                 let task = tokio::spawn(async move {
                     worker
-                        .query_work(owns_capture, move |store, now, cancellation| {
+                        .query_work(held, move |store, now, cancellation| {
                             let page = if after_capture {
                                 Some(action(store.clone(), now, &cancellation, cursor.clone())?)
                             } else {
@@ -3890,8 +3942,9 @@ mod tests {
                 );
             }
             let action = capture.clone();
+            let held = cursor.clone();
             let reply = rpc
-                .query_work(owns_capture, move |store, now, token| {
+                .query_work(held, move |store, now, token| {
                     action(store, now, &token, cursor)
                 })
                 .await
@@ -3902,11 +3955,18 @@ mod tests {
                 Some(expected)
             );
             if let Some((store_id, id, cursor)) = original {
-                assert!(
+                // A live artifact continuation publishes its own page; release it too.
+                let next = rpc
+                    .store
+                    .result_next(&store_id, &cursor, now().unwrap())
+                    .unwrap();
+                if let sparrow_core::ResultPage::Artifacts(page) = &next
+                    && page.snapshot_id != id
+                {
                     rpc.store
-                        .result_next(&store_id, &cursor, now().unwrap())
-                        .is_ok()
-                );
+                        .result_release(&store_id, &page.snapshot_id, now().unwrap())
+                        .unwrap();
+                }
                 assert!(
                     rpc.store
                         .result_release(&store_id, &id, now().unwrap())
@@ -3931,7 +3991,7 @@ mod tests {
             .open_store()
             .unwrap();
         let admission = Arc::new(Semaphore::new(1));
-        let rpc = Arc::new(Rpc::new(store, admission.clone(), 1024 * 1024, 100));
+        let rpc = Arc::new(Rpc::new(store, admission.clone(), 100));
         let (entered, running) = tokio::sync::oneshot::channel();
         let (release, paused) = std::sync::mpsc::channel();
         let worker = rpc.clone();
@@ -4039,6 +4099,7 @@ mod tests {
             },
         )
         .await;
+        // A live listing: an abandoned continuation keeps the delivered cursor.
         capture_lifetime(
             &rpc,
             &admission,

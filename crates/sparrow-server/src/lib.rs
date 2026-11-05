@@ -18,6 +18,8 @@ pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;
 mod pressure;
+mod query_only;
+mod recompression;
 mod tcp_gate;
 mod transport;
 mod watch_admin;

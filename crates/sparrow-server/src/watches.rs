@@ -110,6 +110,42 @@ impl WatchRegistry {
             .map_err(|_| Error::State("consume status registry poisoned"))
     }
 
+    /// The stored catalog's watches as a query-only daemon reports them: no root is opened or
+    /// watched, so each is `reconciling` with no directories, candidates or worker counters.
+    pub fn stored(store: &Store) -> Result<Self, Error> {
+        let catalog = Catalog::load(store, &[])?;
+        let pending = store.consumption_pending()?;
+        let states = catalog
+            .watches()
+            .iter()
+            .map(|watch| WatchStatus {
+                id: watch.definition.id.clone(),
+                root: watch.definition.root.to_string_lossy().into_owned(),
+                definition: watch.definition.clone(),
+                revision: watch.revision,
+                enabled: watch.enabled,
+                covered: false,
+                directories: 0,
+                candidates: 0,
+                deferred: false,
+                pending: pending
+                    .iter()
+                    .filter(|journal| journal.watch == watch.definition.id)
+                    .count() as u32,
+                completed: 0,
+                reconciliations: 0,
+                coverage_losses: 0,
+                failure: None,
+                tail_generation_ids: Vec::new(),
+                tail_read_bytes: 0,
+                tail_descriptors: 0,
+                tail_checkpoint_records: 0,
+                tail_admission_waiting: false,
+            })
+            .collect();
+        Ok(Self(Arc::new(Mutex::new(states))))
+    }
+
     fn update(
         &self,
         detectors: &[Detector],

@@ -3,6 +3,7 @@
 
 //! Durable raw staging, separate from accepted evidence and derived indexes.
 
+use super::eviction::RetirementShare;
 use super::{
     BYTE_READ_BYTES, CHUNK, Catalog, Error, RETRY_WINDOW, Store, Writer, blake3, hex, integer,
     json, parse, put, read_chunk_range, read_field, record_ends, validate_ingest_labels,
@@ -18,6 +19,67 @@ const RECLAIM_CHUNKS: u64 = 128;
 /// Maximum record spans in one immutable layout page.
 pub const IMPORT_LAYOUT_PAGE_RECORDS: usize = 128;
 const LAYOUT_BYTES: usize = 32 * 1024;
+/// Longest record a layout keeps whole: 2048 chunks (128 MiB). A longer record is
+/// laid out as consecutive raw records, so each chunk manifest fits one retirement
+/// pass and one catalog read while the artifact still reads back byte-exact.
+pub const RAW_RECORD_BYTES: u64 = 2048 * CHUNK as u64;
+/// Chunks one atomic publication batch carries. `import_publish` writes every
+/// chunk identity four times (record row, artifact row, saved receipt and ingest
+/// receipt) within 128 MiB, less 16 MiB for the fixed rows.
+const PUBLICATION_CHUNKS: usize = (super::publication::PUBLICATION_BYTES - 16 * 1024 * 1024)
+    / (4 * super::manifest_retire::ROW_CHUNK_BYTES);
+
+/// Chunks whose artifact row one retirement pass under `share` can read, counting
+/// a record identity for every chunk, as an artifact of one-chunk records has.
+pub(super) const fn envelope_chunks(share: RetirementShare) -> usize {
+    use super::manifest_retire::{ROW_CHUNK_BYTES, ROW_RECORD_BYTES, envelope_charge};
+    let budget = share.envelope_budget();
+    let fixed = envelope_charge(0, 0, share.limits.max_payload_refs);
+    if budget <= fixed {
+        0
+    } else {
+        (budget - fixed) / (2 * (ROW_CHUNK_BYTES + ROW_RECORD_BYTES))
+    }
+}
+
+/// Chunks an import may declare: the smaller of the publication batch and the
+/// retirement envelope under `share`.
+const fn admitted_chunks(share: RetirementShare) -> usize {
+    let envelope = envelope_chunks(share);
+    if envelope < PUBLICATION_CHUNKS {
+        envelope
+    } else {
+        PUBLICATION_CHUNKS
+    }
+}
+
+/// Largest input `import_begin` admits. Expiry and eviction read an artifact's
+/// whole catalog row in one pass, within the 32 MiB evidence budget less the 4 MiB
+/// record row reserve; pin capture has its own budget. That is the binding bound:
+/// 129,935 chunks, about 7.93 GiB. The four chunk copies of publication fit at this
+/// size. The v2 store format (#5) replaces both the whole-row read and the single
+/// publication batch.
+pub const MAX_IMPORT_BYTES: u64 = admitted_chunks(RetirementShare::DEFAULT) as u64 * CHUNK as u64;
+
+const _: () = {
+    use super::manifest_retire::envelope_charge;
+    let share = RetirementShare::DEFAULT;
+    let chunks = admitted_chunks(share);
+    let take = share.limits.max_payload_refs;
+    let budget = share.envelope_budget();
+    // The admitted artifact's row fits one pass, and one chunk more would not.
+    assert!(envelope_charge(chunks, chunks, take) <= budget);
+    assert!(chunks < PUBLICATION_CHUNKS || envelope_charge(chunks + 1, chunks + 1, take) > budget);
+    // The envelope and the record row reserve together fit the evidence budget.
+    assert!(budget + share.record_reserve <= share.limits.max_catalog_bytes);
+    // Its four copies fit the publication batch.
+    assert!(chunks <= PUBLICATION_CHUNKS);
+    assert!(
+        16 * 1024 * 1024 + chunks * 4 * super::manifest_retire::ROW_CHUNK_BYTES
+            <= super::publication::PUBLICATION_BYTES
+    );
+    assert!(RAW_RECORD_BYTES == 2048 * CHUNK as u64);
+};
 
 /// Starting an upload either resumes private staging or returns accepted evidence.
 /// An accepted retry never allocates another staging journal or occurrence.
@@ -147,8 +209,15 @@ impl Catalog for ImportManifest {
             || (manifest.layout_complete
                 && lines
                 && (manifest.layout_records == 0) != (manifest.byte_length == 0))
-            || (!lines && manifest.layout_records > 1)
-            || (manifest.layout_complete && !lines && manifest.layout_records != 1)
+            // A document is one record unless layout split it into raw records,
+            // each longer than the 16 MiB projected record bound.
+            || (!lines
+                && manifest.layout_records
+                    > manifest
+                        .byte_length
+                        .div_ceil(crate::projection::RECORD_BYTES)
+                        .max(1))
+            || (manifest.layout_complete && !lines && manifest.layout_records == 0)
             || (manifest.published_artifact.is_some() && !manifest.layout_complete)
         {
             return Err(Error::new(
@@ -311,6 +380,28 @@ impl Writer {
         self.admit_data_write(super::pressure::data_batch_estimate(batch))
     }
 
+    /// Largest declared input: `MAX_IMPORT_BYTES` under production retirement limits.
+    fn import_bytes_bound(&self) -> u64 {
+        admitted_chunks(self.retirement.get()) as u64 * CHUNK as u64
+    }
+
+    /// Refuse an artifact whose catalog row one retirement pass could not read. The
+    /// declared-size bound covers documents; this covers many-record artifacts.
+    pub(super) fn require_retirable(&self, chunks: usize, records: usize) -> Result<(), Error> {
+        let share = self.retirement.get();
+        if super::manifest_retire::envelope_charge(chunks, records, share.limits.max_payload_refs)
+            > share.envelope_budget()
+        {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                format!(
+                    "an artifact of {chunks} chunks and {records} records exceeds what one retirement pass can read; split the input and import the parts"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn commit_layout_page(
         &self,
         manifest: &mut ImportManifest,
@@ -416,6 +507,53 @@ impl Store {
     ) -> Result<ImportManifest, Error> {
         self.lock()?
             .begin_import(request_id, source, format, byte_length, payload_id, now)
+    }
+
+    /// Lower this open store's whole-record ceiling for import layouts so a test can
+    /// split a document without a 128 MiB input. Pieces must stay raw, so the ceiling
+    /// is a whole number of chunks above twice the projected record bound.
+    /// This entry point is absent unless the dev-only test-support feature is selected.
+    #[cfg(feature = "test-support")]
+    pub fn split_raw_records_above(&self, bytes: u64) -> Result<(), Error> {
+        let floor = 2 * crate::projection::RECORD_BYTES + CHUNK as u64;
+        if !bytes.is_multiple_of(CHUNK as u64) || !(floor..=RAW_RECORD_BYTES).contains(&bytes) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "raw record ceiling must be whole chunks above twice the projected record bound",
+            ));
+        }
+        self.lock()?.raw_record_bytes.set(bytes);
+        Ok(())
+    }
+
+    /// Size this open store's import bound and pin caps from scaled retirement
+    /// `limits` and record row reserve, so a test can reach both ceilings without
+    /// multi-GiB inputs. Expiry and eviction must then run with the same limits.
+    /// This entry point is absent unless the dev-only test-support feature is selected.
+    #[cfg(feature = "test-support")]
+    pub fn scale_retirement_for_tests(
+        &self,
+        limits: super::eviction::EvictionLimits,
+        record_reserve: usize,
+    ) -> Result<super::eviction::RetirementBounds, Error> {
+        limits.validate()?;
+        if record_reserve >= limits.max_catalog_bytes {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "record row reserve must leave part of the evidence budget",
+            ));
+        }
+        let writer = self.lock()?;
+        let share = RetirementShare {
+            limits,
+            record_reserve,
+        };
+        writer.retirement.set(share);
+        Ok(super::eviction::RetirementBounds {
+            import_bytes: writer.import_bytes_bound(),
+            pins: share.max_pins(),
+            pinned_members: share.max_pinned_members(),
+        })
     }
 
     /// Atomically recover a shared ingestion receipt or create/resume private staging.
@@ -646,11 +784,19 @@ impl Store {
         if manifest.layout_complete {
             return Ok(manifest);
         }
-        let mut rows = Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS);
-        let mut record_hash = blake3::Hasher::new();
+        let split = writer.raw_record_bytes.get();
+        let mut layout = Layout {
+            writer: &writer,
+            rows: Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS),
+            next_index: 0,
+            record_start: 0,
+            record_hash: blake3::Hasher::new(),
+            pending: None,
+            split,
+            piece: split - crate::projection::RECORD_BYTES,
+            chunks: 0,
+        };
         let mut input_hash = blake3::Hasher::new();
-        let mut record_start = 0;
-        let mut next_index = 0;
         let count = manifest.chunk_count().max(1);
         for chunk in 0..count {
             let bytes = if manifest.byte_length == 0 {
@@ -659,36 +805,22 @@ impl Store {
                 writer.import_chunk(&manifest, chunk * CHUNK as u64)?
             };
             input_hash.update(&bytes);
+            let base = chunk * CHUNK as u64;
             let mut cursor = 0;
             for end in record_ends(&manifest.format, &bytes, chunk + 1 == count) {
-                if next_index >= writer.config.max_records as u64 {
-                    return Err(Error::new(
-                        "RESOURCE_LIMIT",
-                        "import layout exceeds configured record count; raw staging remains available for cancellation",
-                    ));
-                }
-                record_hash.update(&bytes[cursor..end]);
-                let byte_end = chunk * CHUNK as u64 + end as u64;
-                rows.push(ImportRecordSpan {
-                    index: next_index,
-                    byte_start: record_start,
-                    byte_end,
-                    payload_id: format!(
-                        "blake3:{}",
-                        hex::encode(record_hash.finalize().as_bytes())
-                    ),
-                });
-                record_hash = blake3::Hasher::new();
-                record_start = byte_end;
+                layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..end])?;
+                layout.finish_record(&mut manifest, base + end as u64)?;
                 cursor = end;
-                next_index += 1;
-                if rows.len() == IMPORT_LAYOUT_PAGE_RECORDS {
-                    writer.commit_layout_page(&mut manifest, &rows, false)?;
-                    rows.clear();
-                }
             }
-            record_hash.update(&bytes[cursor..]);
+            layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..])?;
         }
+        let Layout {
+            rows,
+            next_index,
+            record_start,
+            chunks,
+            ..
+        } = layout;
         if next_index < manifest.layout_records
             || record_start != manifest.byte_length
             || format!("blake3:{}", hex::encode(input_hash.finalize().as_bytes()))
@@ -699,6 +831,12 @@ impl Store {
                 "prepared record layout does not match the complete sealed input",
             ));
         }
+        // Refuse a many-record artifact here, before publication work, rather than
+        // only when it is published; the publish-time check remains for layouts that
+        // completed earlier.
+        let records = usize::try_from(next_index)
+            .map_err(|_| Error::new("RESOURCE_LIMIT", "import layout record count overflow"))?;
+        writer.require_retirable(chunks, records)?;
         writer.commit_layout_page(&mut manifest, &rows, true)?;
         Ok(manifest)
     }
@@ -898,6 +1036,16 @@ impl Writer {
             previous.require_live(now)?;
             return Ok(previous);
         }
+        let admitted = writer.import_bytes_bound();
+        if byte_length > admitted {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                format!(
+                    "declared input of {byte_length} bytes exceeds {admitted} bytes (about {:.2} GiB), the most one retirement pass can read back as an artifact; split the input and import the parts",
+                    admitted as f64 / (1u64 << 30) as f64
+                ),
+            ));
+        }
         if byte_length > writer.config.disk_budget - writer.config.maintenance_reserve {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -937,6 +1085,105 @@ impl Writer {
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
         Ok(manifest)
+    }
+}
+
+/// Streaming record layout. A record longer than `split` bytes is emitted as
+/// consecutive raw records: each full piece is `piece` bytes, a whole number of
+/// chunks, and the remainder keeps more than `RECORD_BYTES`, so every piece stays
+/// raw and none exceeds `split`.
+struct Layout<'a> {
+    writer: &'a Writer,
+    rows: Vec<ImportRecordSpan>,
+    next_index: u64,
+    record_start: u64,
+    /// Digest of the bytes since `record_start`.
+    record_hash: blake3::Hasher,
+    /// Candidate cut at `record_start + piece`, the digest of the bytes before it,
+    /// and the digest of the bytes after it.
+    pending: Option<(u64, String, blake3::Hasher)>,
+    split: u64,
+    piece: u64,
+    /// Payload chunks of the records emitted so far, as publication will store them.
+    chunks: usize,
+}
+
+fn payload_id(hash: &blake3::Hasher) -> String {
+    format!("blake3:{}", hex::encode(hash.finalize().as_bytes()))
+}
+
+impl Layout<'_> {
+    /// Hash the bytes at artifact offset `at`, all inside the current record.
+    fn feed(&mut self, manifest: &mut ImportManifest, at: u64, bytes: &[u8]) -> Result<(), Error> {
+        let end = at + bytes.len() as u64;
+        let cut = self.record_start + self.piece;
+        match &mut self.pending {
+            None if at <= cut && cut < end => {
+                let (before, after) = bytes.split_at((cut - at) as usize);
+                self.record_hash.update(before);
+                let id = payload_id(&self.record_hash);
+                self.record_hash.update(after);
+                let mut tail = blake3::Hasher::new();
+                tail.update(after);
+                self.pending = Some((cut, id, tail));
+            }
+            None => {
+                self.record_hash.update(bytes);
+            }
+            Some((_, _, tail)) => {
+                self.record_hash.update(bytes);
+                tail.update(bytes);
+            }
+        }
+        if end - self.record_start > self.split {
+            let (cut, id, tail) = self
+                .pending
+                .take()
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "raw record split lost its cut"))?;
+            self.emit(manifest, cut, id)?;
+            self.record_hash = tail;
+        }
+        Ok(())
+    }
+
+    /// Close the current record, which `feed` has kept within `split` bytes.
+    fn finish_record(&mut self, manifest: &mut ImportManifest, byte_end: u64) -> Result<(), Error> {
+        self.pending = None;
+        let id = payload_id(&self.record_hash);
+        self.emit(manifest, byte_end, id)?;
+        self.record_hash = blake3::Hasher::new();
+        Ok(())
+    }
+
+    fn emit(
+        &mut self,
+        manifest: &mut ImportManifest,
+        byte_end: u64,
+        payload_id: String,
+    ) -> Result<(), Error> {
+        if self.next_index >= self.writer.config.max_records as u64 {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "import layout exceeds configured record count; raw staging remains available for cancellation",
+            ));
+        }
+        let length = usize::try_from(byte_end - self.record_start)
+            .map_err(|_| Error::new("RESOURCE_LIMIT", "import record length overflow"))?;
+        self.chunks += length.div_ceil(CHUNK);
+        self.rows.push(ImportRecordSpan {
+            index: self.next_index,
+            byte_start: self.record_start,
+            byte_end,
+            payload_id,
+        });
+        self.record_start = byte_end;
+        self.next_index += 1;
+        if self.rows.len() == IMPORT_LAYOUT_PAGE_RECORDS {
+            self.writer
+                .commit_layout_page(manifest, &self.rows, false)?;
+            self.rows.clear();
+        }
+        Ok(())
     }
 }
 

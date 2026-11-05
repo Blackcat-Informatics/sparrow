@@ -162,10 +162,38 @@ reuse an incompatible projection.
 
 Use LZ4 for hot table levels and Zstd for colder levels; use Zstd for payload
 blobs. This is recompression during storage transitions, not an extra compression
-wrapper around already compressed bytes. Test trained dictionaries on repetitive
-inputs after the baseline is measured. Startup must verify that requested codecs
-are available rather than accept a silent uncompressed fallback. [Compression
-configuration](https://github.com/facebook/rocksdb/wiki/Compression).
+wrapper around already compressed bytes. The default and payload families use
+32 KiB table blocks and Zstd level 6 at the bottommost level; payload also trains
+a 112 KiB dictionary there. The reverse lookup family keeps 4 KiB blocks and its
+Bloom filter, because its point reads usually miss. The measured ratios are in
+[load qualification](load-qualification.md#table-options-and-dictionaries-issue-19).
+Startup must verify that requested codecs are available rather than accept a
+silent uncompressed fallback: RocksDB refuses to open when LZ4 or the payload
+blob codec is not linked, and a linked Zstd always supports dictionary training.
+[Compression configuration](https://github.com/facebook/rocksdb/wiki/Compression).
+
+New options apply only to new table files. The catalog key
+`table-options-profile` names the profile whose files are all written. When it
+differs from the running binary's profile, the default and payload families
+are rewritten once by RocksDB's periodic compaction. Manual range compaction
+does not fit this store: a range starts at the first level with keys in it,
+so a level-0 file or memtable flush, which spans every catalog prefix, merges
+the whole base level into every slice. A periodic job rewrites one marked file,
+into its own level at the bottom or into its overlap one level down. The native
+scheduler runs it below size-triggered compaction and aborts it when the store
+closes.
+
+The first step durably records the next table file number and a start second.
+Every five seconds a serial maintenance step sets the two families' periodic
+window to the seconds since the start, so only files created before it are
+marked. The window starts after 60 seconds and moves only after drifting by a
+minute or an eighth, which keeps native option writes rare. Files written in roughly the first eighth of the rewrite can be marked again and rewritten more than once; that adds work but does not delay completion. The step turns the
+window off while pressure maintenance is outstanding. It also turns it off
+while a job's 1 GiB of headroom would exceed the data allowance or leave less
+than the free-space floor. When no file numbered below the recorded boundary
+remains in those families, the profile key is written and the window is
+turned off. A restart resumes from the recorded start. RocksDB reads files
+written under either profile, so no store format fence is needed.
 
 Reference counts cover manifest children, live occurrences, shared projections,
 and pin-protected evidence. Term references include nested RDF terms. Garbage

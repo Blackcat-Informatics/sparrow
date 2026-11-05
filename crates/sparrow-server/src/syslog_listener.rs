@@ -665,7 +665,7 @@ mod tests {
                     .is_err()
                 );
                 let client: crate::sparrow_capnp::sparrow::Client = capnp_rpc::new_client(
-                    crate::Rpc::new(store.clone(), Arc::new(Semaphore::new(4)), 8388608, 100)
+                    crate::Rpc::new(store.clone(), Arc::new(Semaphore::new(4)), 100)
                         .with_syslog(registry),
                 );
                 let mut request = client.sources_list_request();

@@ -159,7 +159,7 @@ pub(super) async fn query(
     match operation {
         Operation::Query => {
             let reply = rpc
-                .query_work(true, move |store, now, cancellation| {
+                .query_work(None, move |store, now, cancellation| {
                     store
                         .sparql_read(&input.read(), now, &cancellation)
                         .map_err(|e| Error::new(e.code, e.message.clone()))
@@ -169,7 +169,7 @@ pub(super) async fn query(
         }
         Operation::Explain => {
             let reply = rpc
-                .query_work(true, move |store, now, cancellation| {
+                .query_work(None, move |store, now, cancellation| {
                     store
                         .sparql_explanation_read(&input.read(), now, &cancellation)
                         .map_err(|e| Error::new(e.code, e.message.clone()))
