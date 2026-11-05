@@ -11692,6 +11692,90 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     }
 }
 
+/// A dependency move must not change a persisted identity unnoticed. Change these values only
+/// together with the migration that carries deployed stores across (#28).
+#[test]
+fn persisted_identities_are_pinned_and_the_markdown_contract_move_migrates() {
+    const PREVIOUS: &str = "1909d176e2b728f3041d0b2c665600aed5303e4b8525260bc1165850690ad0d5";
+    const CURRENT: &str = "eeb4f94510fa9301ca019c75ea1f4f02fa3a1539205c085fe24a401d17e63462";
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let status = store.status(0).unwrap();
+    assert_eq!(status["rdf_profile"].as_str(), Some(CURRENT));
+    assert_eq!(
+        status["text_analyzer"].as_str(),
+        Some("e5533b9df7c75ab405290d27872c6392515acb3d0d77d21d4433ec4c59904058")
+    );
+    store
+        .ingest("identity-json", "identity", "json", br#"{"a":1}"#, 1)
+        .unwrap();
+    drop(store);
+    let profile = |dir: &std::path::Path| {
+        let db = catalog_db(dir).unwrap();
+        db.get("rdf_profile").unwrap().unwrap()
+    };
+    // A store holding no Markdown projection advances to the current profile.
+    catalog_db(dir.path())
+        .unwrap()
+        .put("rdf_profile", PREVIOUS)
+        .unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["rdf_profile"].as_str(),
+        Some(CURRENT)
+    );
+    let markdown = store
+        .ingest(
+            "identity-markdown",
+            "identity",
+            "markdown",
+            b"# Title\n\nbody\n",
+            2,
+        )
+        .unwrap();
+    drop(store);
+    assert_eq!(profile(dir.path()), CURRENT.as_bytes());
+    // One holding a Markdown projection refuses, names the count, and writes nothing.
+    catalog_db(dir.path())
+        .unwrap()
+        .put("rdf_profile", PREVIOUS)
+        .unwrap();
+    match Store::open(dir.path(), config()) {
+        Ok(_) => panic!("a Markdown projection under the previous rules was admitted"),
+        Err(error) => {
+            assert_eq!(error.code, "UNSUPPORTED");
+            assert!(
+                error.message.contains("holds 1 Markdown projection"),
+                "{error}"
+            );
+        }
+    }
+    assert_eq!(profile(dir.path()), PREVIOUS.as_bytes());
+    // Once the Markdown record retires, the same store advances.
+    catalog_db(dir.path())
+        .unwrap()
+        .put("rdf_profile", CURRENT)
+        .unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.expire(31 * DAY + 2).unwrap();
+    store.expire(31 * DAY + 2).unwrap();
+    assert!(
+        store
+            .rdf_inspect(&markdown.record_ids[0], 31 * DAY + 3)
+            .is_err()
+    );
+    drop(store);
+    catalog_db(dir.path())
+        .unwrap()
+        .put("rdf_profile", PREVIOUS)
+        .unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.status(0).unwrap()["rdf_profile"].as_str(),
+        Some(CURRENT)
+    );
+}
+
 #[test]
 fn record_context_matches_retained_acceptance_order_and_reports_scan_frontiers() {
     use sparrow_core::{ContextFrontier, QueryScope};
