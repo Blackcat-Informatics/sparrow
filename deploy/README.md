@@ -68,7 +68,7 @@ Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"). 
 sets the btrfs no-copy-on-write attribute on `/SPARROW/store` and `/SPARROW/backups` while they
 are empty, so every file created in them inherits it. `restart.sh` rewrites a closed store that
 still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keeps the original
-beside it as `store.cow-STAMP`. Every backup, verification and restore copy takes its source's
+beside it as `store.cow-STAMP`; remove that copy once a backup of the converted store has verified. Every backup, verification and restore copy takes its source's
 attribute, because btrfs refuses a reflink between the two kinds of file. The store gives up
 btrfs checksums and compression; its own digests and compression cover both.
 

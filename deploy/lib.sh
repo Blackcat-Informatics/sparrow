@@ -465,17 +465,24 @@ convert_store_no_cow() {
     mkdir -- "$partial"
     chattr +C -- "$partial" || die "cannot switch copy-on-write off for $partial; $data is unchanged"
     # cp -a copies DATA's mode, owner and ACLs onto PARTIAL; the files inherit PARTIAL's attribute.
+    # A socket is not data: one is left only by an unclean exit, and the daemon creates its socket
+    # at start. So sockets are neither kept nor compared.
     cp -a --reflink=never -- "$data/." "$partial/" \
         || die "copying $data failed; $data is unchanged and $partial is kept for inspection"
-    diff -q <(cd -- "$data" && find . -printf '%P %y %s %m\n' | sort) \
-        <(cd -- "$partial" && find . -printf '%P %y %s %m\n' | sort) >/dev/null \
+    find "$partial" -type s -delete
+    # A directory's size counts its entry names, so it is not compared.
+    diff -q <(cd -- "$data" && find . ! -type s \( -type d -printf '%P %y %m\n' -o -printf '%P %y %s %m %l\n' \) | sort) \
+        <(cd -- "$partial" && find . \( -type d -printf '%P %y %m\n' -o -printf '%P %y %s %m %l\n' \) | sort) >/dev/null \
         || die "the copy's file list differs from $data; $data is unchanged and $partial is kept"
-    diff -r -q --no-dereference -- "$data" "$partial" >/dev/null \
-        || die "the copy's bytes differ from $data; $data is unchanged and $partial is kept"
+    while IFS= read -r -d '' file; do
+        cmp -s -- "$data/$file" "$partial/$file" \
+            || die "the copy of $file differs from $data; $data is unchanged and $partial is kept"
+    done < <(cd -- "$data" && find . -type f -printf '%P\0')
     if (($(copy_on_write_files "$partial"))) || ! no_copy_on_write "$partial"; then
         die "$partial or files in it still have copy-on-write; $data is unchanged"
     fi
     files=$(find "$partial" -type f | wc -l)
+    sync -f -- "$partial"
     mv -T -- "$data" "$kept"
     mv -T -- "$partial" "$data"
     sync -f -- "$data"
