@@ -79,6 +79,7 @@ pub struct Rpc {
     max_pin_members: usize,
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
+    query_only: bool,
 }
 
 /// The full typed service is already authorized; only an anonymous TCP gate runs CHAP.
@@ -159,7 +160,26 @@ impl Rpc {
             max_pin_members,
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
+            query_only: false,
         }
+    }
+
+    /// Serve reads only: every connection's service refuses writes with `READ_ONLY`.
+    #[must_use]
+    pub fn query_only(mut self) -> Self {
+        self.query_only = true;
+        self
+    }
+
+    /// The write gate in front of this service; every connection's capability is one.
+    pub(crate) fn into_gate(self) -> crate::query_only::WriteGate {
+        let query_only = self.query_only;
+        crate::query_only::WriteGate::new(self, query_only)
+    }
+
+    /// The typed service a Unix connection or CHAP session receives, behind the write gate.
+    pub(crate) fn into_client(self) -> wire::sparrow::Client {
+        capnp_rpc::new_client(self.into_gate())
     }
 
     /// Persistent store identity bound into CHAP responses.
@@ -2724,6 +2744,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                out.set_query_only(self.query_only);
                 let mut syslog_rows = out.reborrow().init_syslog_listeners(syslog.len() as u32);
                 for (index, status) in syslog.iter().enumerate() {
                     status.encode(syslog_rows.reborrow().get(index as u32));
@@ -2742,6 +2763,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_active_pins(number(&value, "active_pins")?);
                 out.set_unique_json_projections(number(&value, "unique_json_projections")?);
                 out.set_retry_window_seconds(number(&value, "retry_window_seconds")?);
+                out.set_retention_seconds(number(&value, "retention_seconds")?);
                 out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_pin_members(number(&value, "max_pin_members")?);

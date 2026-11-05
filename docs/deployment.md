@@ -194,6 +194,8 @@ evidence when qualifying a restore. Opening a store can perform required format
 upgrades; always work on a disposable restored copy. A live store is protected
 by the existing single-owner database lock. The example never activates its
 saved source paths, even when the copied watch catalog names original roots.
+To check a whole backup rather than selected evidence, use
+`deploy/verify-backup.sh` (`deploy/RECOVERY.md`, "Verify a backup").
 
 ## Unit behavior
 
@@ -307,7 +309,15 @@ it. The copy is synchronized after the
 service answers again, so the sync is outside the closed window. Only then is
 the backup renamed into place and the oldest beyond `KEEP` removed. The script refuses to
 run unless free space covers twice the store plus 10 GiB, in case extents are
-not shared. Each backup lists its sources in `SOURCE`, with the image the link names. It
+not shared. Each backup lists its sources in `SOURCE`, with the image the link names and
+the store's `live_records` before the stop and the `unique_payload_chunks` the
+stopped daemon logged in its closing line, taken only when the daemon exited 0.
+The script reads the journal of the stopped invocation with
+`journalctl --invocation=`, which needs systemd 257 or newer. An image that
+predates the closing line (schema 66 and older) is recognised before the stop,
+from the line's text missing in the image. Its backup is still published, and
+records `payload_chunks=unrecorded (image predates the closing count)`. For an
+image that prints the line, a missing line or a nonzero exit fails the backup. It
 refuses when that image's schema number differs from the running daemon's
 `schema_version`, because then the link does not name the running image. The journal records the measured
 downtime and each phase's time: the drain wait, the copy before the stop, the
@@ -354,8 +364,11 @@ original still exists. Records that producers sent directly after the backup
 are lost unless they resend them. This whole-service procedure has not been
 exercised; the drill covers only reading a restored store. `deploy/RECOVERY.md`,
 "Restore from a backup", gives the commands. Before replacing a live store,
-qualify the backup on a disposable copy with the recovery probe above. Never start `sparrowd` on such a copy: its
-watch catalog names the live consume roots.
+verify the backup with `deploy/verify-backup.sh BACKUP` (`deploy/RECOVERY.md`,
+"Verify a backup"). It opens a reflinked copy with `sparrowd --query-only`,
+which opens no watch root and refuses every write, and checks the store
+identity, status, the stored payload chunk count, and, within the retention
+window, a records window and one artifact's bytes. A backup counts as verified only after the script passes on it.
 
 This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live

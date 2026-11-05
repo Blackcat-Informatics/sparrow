@@ -127,6 +127,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             crate::pressure::decode(value.get_pressure_status()?)?,
         )
         .with("recompression", recompression(value.get_recompression()?)?)
+        .with("query_only", value.get_query_only())
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -162,6 +163,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with(
             "retry_window_seconds",
             value.get_retry_window_seconds().to_string(),
+        )
+        .with(
+            "retention_seconds",
+            value.get_retention_seconds().to_string(),
         )
         .with(
             "max_inline_artifact_bytes",

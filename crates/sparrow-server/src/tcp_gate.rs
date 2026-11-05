@@ -6,7 +6,8 @@
 //! An anonymous peer may discover the store, ingest and import. Every other listed
 //! operation returns a typed `UNAUTHENTICATED` failure; an operation added to the
 //! schema without a decision here falls back to the generated `unimplemented` error.
-//! A successful CHAP exchange returns the connection's ungated typed service.
+//! A successful CHAP exchange returns the connection's complete typed service. Every
+//! forward, and the session, passes through the one write gate in `query_only`.
 
 use crate::{rpc::failure, sparrow_capnp::sparrow};
 use sparrow_client::{CHAP_BYTES, TcpSecret};
@@ -15,7 +16,7 @@ use std::{cell::Cell, rc::Rc};
 
 /// One public TCP connection's anonymous capability and single CHAP attempt.
 pub(crate) struct AnonymousTcp {
-    rpc: Rc<crate::Rpc>,
+    gate: Rc<crate::query_only::WriteGate>,
     secret: TcpSecret,
     nonce: Cell<Option<[u8; CHAP_BYTES]>>,
     finished: Cell<bool>,
@@ -24,7 +25,7 @@ pub(crate) struct AnonymousTcp {
 impl AnonymousTcp {
     pub(crate) fn new(rpc: crate::Rpc, secret: TcpSecret) -> Self {
         Self {
-            rpc: Rc::new(rpc),
+            gate: Rc::new(rpc.into_gate()),
             secret,
             nonce: Cell::new(None),
             finished: Cell::new(false),
@@ -57,10 +58,13 @@ impl AnonymousTcp {
             .nonce
             .take()
             .ok_or_else(|| unauthenticated("authenticate requires an outstanding authChallenge"))?;
-        if !self.secret.verify(&self.rpc.store_id()?, &nonce, response) {
+        if !self
+            .secret
+            .verify(&self.gate.rpc().store_id()?, &nonce, response)
+        {
             return Err(unauthenticated("CHAP response refused; reconnect to retry"));
         }
-        Ok((*self.rpc).clone())
+        Ok(self.gate.rpc().clone())
     }
 }
 
@@ -75,7 +79,7 @@ macro_rules! forward {
             params: sparrow::$params,
             results: sparrow::$results,
         ) -> capnp::Result<()> {
-            <crate::Rpc as sparrow::Server>::$method(self.rpc.clone(), params, results).await
+            <crate::query_only::WriteGate as sparrow::Server>::$method(self.gate.clone(), params, results).await
         }
     )*};
 }
@@ -173,11 +177,66 @@ impl sparrow::Server for AnonymousTcp {
     ) -> capnp::Result<()> {
         let out = results.get().init_result();
         match self.session(params.get()?.get_response()?) {
-            Ok(session) => out
-                .init_ok()
-                .set_session(capnp_rpc::new_client::<sparrow::Client, _>(session)),
+            Ok(session) => out.init_ok().set_session(session.into_client()),
             Err(error) => failure(out, error),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// INVARIANT: an anonymous TCP peer of a query-only service reaches the same write gate
+    /// as a Unix connection, so the writes it may otherwise call are refused with READ_ONLY.
+    #[tokio::test(flavor = "current_thread")]
+    async fn anonymous_tcp_writes_pass_through_the_query_only_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = crate::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let rpc = crate::Rpc::new(
+            store,
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            100,
+        )
+        .query_only();
+        let secret = dir.path().join("tcp.secret");
+        std::fs::write(&secret, [9; 32]).unwrap();
+        std::fs::set_permissions(
+            &secret,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        let client: sparrow::Client =
+            capnp_rpc::new_client(AnonymousTcp::new(rpc, TcpSecret::read(&secret).unwrap()));
+        let mut request = client.ingest_request();
+        let mut input = request.get().init_request();
+        input.set_request_id("anonymous-query-only");
+        input.set_source("tcp");
+        input.set_format(crate::sparrow_capnp::Format::Jsonl);
+        input.set_bytes(b"{\"refused\":true}\n");
+        let response = request.send().promise.await.unwrap();
+        match response
+            .get()
+            .unwrap()
+            .get_result()
+            .unwrap()
+            .which()
+            .unwrap()
+        {
+            crate::sparrow_capnp::result::Error(error) => {
+                assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "READ_ONLY"
+                );
+            }
+            crate::sparrow_capnp::result::Ok(_) => panic!("query-only TCP ingest was admitted"),
+        }
     }
 }

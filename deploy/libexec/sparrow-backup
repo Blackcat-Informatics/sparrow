@@ -19,7 +19,9 @@ every watch reports no pending claims. Files are never moved under the running
 daemon, whose reserved claims bind each file's identity.
 
 Each backup records in SOURCE the image that last opened the store, with the
-store's identity, schema and format, and keeps that image pair under images/
+store's identity, schema, format and live records, and the stored payload chunks
+the daemon logged once it had stopped and exited 0 (an image that predates that line records
+payload_chunks=unrecorded instead), and keeps that image pair under images/
 and the lexicon bundle it reads under lexicons/, so `deploy/start.sh --restored-from BACKUP` can start exactly that image. Only
 timestamp-named backups are pruned; a copy under another name (README.md,
 "Upgrades and rollback": pre-upgrade-IMAGE) is kept until removed by hand.
@@ -32,6 +34,7 @@ failure exits nonzero so the systemd unit records it.
 
 import fcntl
 import json
+import mmap
 import os
 import re
 import shutil
@@ -107,6 +110,64 @@ def pending_claims(socket):
     return sum(watch["pending_claims"] for watch in daemon_status(socket)["consume_watches"])
 
 
+def invocation_id():
+    """The running unit's invocation, whose journal the stop will write."""
+    shown = subprocess.run([*systemctl_command(), "show", "-p", "InvocationID", "--value", UNIT],
+                           check=True, capture_output=True, text=True).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", shown):
+        raise RuntimeError(f"{UNIT} reports no invocation ID ({shown!r})")
+    return shown
+
+
+CLOSING_PREFIX = "sparrowd: closed store="
+CLOSED = re.compile(re.escape(CLOSING_PREFIX) + r"(\S+) unique_payload_chunks=([0-9]+)")
+
+
+def logs_closing_count(daemon):
+    """Whether the daemon image prints the closing count, read from the image itself: an image
+    that prints the line carries its text, and an older one never prints it, so for that image a
+    missing line is expected rather than a sign of an unclean stop."""
+    with open(daemon, "rb") as handle, \
+            mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as image:
+        return image.find(CLOSING_PREFIX.encode()) != -1
+
+
+def stop_result():
+    """The stopped unit's Result, read after the stop and before the restart resets it. It is
+    success only when the main process exited 0; a nonzero exit reads exit-code and a death by
+    signal, including a SIGKILL stop, reads signal. (ExecMainStatus is cleared once the unit is
+    inactive, so it cannot be used here.)"""
+    return subprocess.run([*systemctl_command(), "show", "-p", "Result", "--value", UNIT],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def closing_chunks(invocation, store_id):
+    """The unique_payload_chunks the stopped daemon logged after its final flush. journald can
+    lag the stop briefly, so the read is retried for a bounded time."""
+    journal = ["journalctl"] + (["--user"] if SCOPE == "user" else [])
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            lines = subprocess.run([*journal, "-u", UNIT, f"--invocation={invocation}", "-o",
+                                    "cat", "--no-pager"], check=True, capture_output=True,
+                                   text=True).stdout
+        except (OSError, subprocess.CalledProcessError) as error:
+            detail = getattr(error, "stderr", None) or str(error)
+            fail(f"journalctl could not read the journal of {UNIT} invocation {invocation} "
+                 f"({detail.strip()}); the lookup needs systemd 257 or newer")
+        found = [CLOSED.fullmatch(line.strip()) for line in lines.splitlines()]
+        found = [match for match in found if match]
+        if found:
+            closed_store, chunks = found[-1].groups()
+            if closed_store != store_id:
+                fail(f"the stopped daemon closed {closed_store}, not {store_id}")
+            return int(chunks)
+        if time.monotonic() > deadline:
+            fail(f"the journal of {UNIT} invocation {invocation} has no closing count; the "
+                 "daemon did not stop cleanly")
+        time.sleep(1)
+
+
 def selected_image():
     """The daemon image the unit runs: start.sh and restart.sh point this link at the image they
     start, and refuse to leave it naming any other while the unit runs."""
@@ -169,6 +230,8 @@ def main(server_config, backup_root, keep, intake, extra):
         # runs between the drain check and the stop.
         prepared = time.monotonic()
         image = selected_image()
+        # Whether this image prints the closing count: only then is a missing line a failure.
+        counted = logs_closing_count(LIBEXEC / image)
         # The image pair that last opened the store, so a restore needs nothing from ./bin.
         images = partial / "images"
         images.mkdir()
@@ -204,19 +267,23 @@ def main(server_config, backup_root, keep, intake, extra):
         if named is None or int(named.group(1)) != status["schema_version"]:
             raise RuntimeError(f"the image link names {image}, but the running daemon reports "
                                f"schema {status['schema_version']}; the link does not name it")
-        (partial / "SOURCE").write_text(
+        source = (
             f"data_dir={data_dir}\nserver_config={server_config}\nintake={intake}\n"
             f"taken_utc={stamp}\ndrain_seconds={waited:.0f}\n"
             "waiting_files=0\npending_claims=0\n"
             f"image={image}\nstore_id={status['store_id']}\n"
             f"schema_version={status['schema_version']}\nstore_format={status['store_format']}\n"
+            f"live_records={int(status['live_records'])}\n"
             + "".join(f"extra={path}\n" for path in extra)
         )
+        # The stopped daemon logs its closing count; this invocation's journal holds it.
+        invocation = invocation_id()
         marker.write_text(f"{os.getpid()}\n")
         started = time.monotonic()
         stopped = True
         systemctl("stop", UNIT)
         stop_seconds = time.monotonic() - started
+        result = stop_result()
         copy_tree(data_dir, partial / "store")
         copy_tree(intake, partial / "intake")
         copy_seconds = time.monotonic() - started - stop_seconds
@@ -235,6 +302,17 @@ def main(server_config, backup_root, keep, intake, extra):
                 fail(f"{UNIT} restarted but did not answer status within 120s")
             time.sleep(1)
     downtime = time.monotonic() - started
+    # Read after the restart, so it adds no downtime. The count was taken once every worker
+    # had stopped and the final flush had succeeded, so it is exactly what the copied store
+    # holds; it counts only when the daemon then exited 0.
+    if not counted:
+        recorded = "payload_chunks=unrecorded (image predates the closing count)\n"
+    elif result != "success":
+        fail(f"{UNIT} invocation {invocation} did not exit 0 when stopped (Result={result}); "
+             "its closing count is not recorded")
+    else:
+        recorded = f"unique_payload_chunks={closing_chunks(invocation, status['store_id'])}\n"
+    (partial / "SOURCE").write_text(source + recorded)
     ready_seconds = downtime - stop_seconds - copy_seconds
     # The copy becomes durable after the daemon is back, and before the rename publishes it.
     synced = time.monotonic()

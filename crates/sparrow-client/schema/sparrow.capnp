@@ -234,6 +234,7 @@ struct Status {
   maxSparqlReadHandles @46 :UInt64; maxSparqlReadBytes @47 :UInt64;
   sparqlReadLeaseMs @48 :UInt64;
   recompression @49 :RecompressionStatus;
+  queryOnly @50 :Bool; retentionSeconds @51 :UInt64;
 }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.

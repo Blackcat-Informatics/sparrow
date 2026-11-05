@@ -438,6 +438,65 @@ fixed 1 MiB window. The archive's `max_segment_bytes` is a closing target from
 1 MiB to 192 MiB, and an entry larger than the target is archived in a segment
 of its own; see [the archive format](archive-format.md).
 
+### Query-only daemon (schema 67)
+
+`sparrowd --config FILE --query-only`, or `query_only = true` in the server
+configuration, opens a store to serve reads only. It exists so that a copy of a
+store, such as a backup, can be opened and queried. A copy's watch catalog names
+the live intake folders, and a normal daemon on the copy would consume them.
+
+A query-only daemon starts no consume or tail worker, syslog listener, TCP
+listener or maintenance worker. No periodic buffered flush, expiry, pressure
+eviction, import reclamation or table rewrite runs, so retention and eviction
+never change the store. The shutdown flush still runs. A configuration that also sets `consume`, `syslog`,
+`rpc_tcp_address` or `archive` refuses to start before the store is opened, and
+the error names the conflicting key. A store fenced for archiving requires the
+`[archive]` table to open, so it cannot be opened query-only.
+
+The daemon serves the Unix socket. Every read answers exactly as a normal
+daemon's does. `watchList` and `Status.consumeWatches` report the stored watch
+catalog, but no root is opened. Each watch reports coverage `reconciling`, no
+directories or candidates, its pending claims from the stored journals, and no
+worker counters.
+
+One gate, `sparrow_server::query_only::WriteGate`, wraps the service of every
+connection: Unix connections, CHAP sessions and the anonymous TCP gate's
+forwards. It classifies every operation once. It forwards each read, and on a
+query-only daemon it refuses each write before decoding its request. The writes are `ingest`, `eventsIngest`, `importBegin` through
+`importCancel` (except `importGet`), `flush`, `pin`, `pinRenew`, `pinRelease`,
+`watchPut`, `watchRemove`, `watchHandoff`, `tailFinish`, `sourceTimeDefine` and
+`diagnosticDefine`. Each returns the typed error `READ_ONLY`, whose message says
+the daemon is in query-only mode. `resultRelease` stays a read: it releases a
+query capture held in memory and writes nothing to the store. An operation added
+to the schema without a decision in the gate returns Cap'n Proto
+`unimplemented`.
+
+A query-only daemon still modifies the store directory, so open only a
+disposable copy, never the only one. Every open, including one of a current
+store, deletes and rebuilds the source-context catalog rows and their job
+checkpoint in synchronous batches. Opening also applies any catalog upgrade that
+a store written by an older image still needs, and RocksDB writes its own files
+in `data_dir` (the write-ahead log, `MANIFEST`, `OPTIONS` and `LOG`). It replays
+a write-ahead log left by an unclean stop and may compact the files that replay
+flushes. At shutdown the daemon synchronizes and flushes every column family into
+new table files. None of this adds or removes evidence: record, artifact and
+payload chunk rows are unchanged, so `Status.uniquePayloadChunks` reads the same
+as when the store was closed. Opening a store last written by the schema 62
+image left its format, `sparrow.store/92`, unchanged. A store that still owes the
+table rewrite reports `recompression` as `running`, but the rewrite never runs.
+The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
+at shutdown. Every daemon, query-only or not, logs
+`sparrowd: closed store=ID unique_payload_chunks=N` once its workers have stopped
+and its final flush has succeeded. A later shutdown error can still follow it, so
+`sparrow-backup` records that count only when the daemon then exited 0. Query captures use anonymous temporary files that leave no name
+behind.
+
+Schema 67 adds `Status.queryOnly`, true in this mode, and
+`Status.retentionSeconds`, how long an unpinned record is retained after it is
+received (`sparrow_core::RETENTION_MS`, 30 days). CLI and MCP status render them
+as `query_only` and `retention_seconds`, the latter as a decimal string. `deploy/verify-backup.sh` relies on the mode to verify a
+backup; see `deploy/RECOVERY.md`, "Verify a backup".
+
 ## 1. Common types and defaults
 
 | Type | Contract |
@@ -2672,6 +2731,7 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
 | `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
 | `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface. Raw artifact preservation can still succeed independently of projection support. |
+| `READ_ONLY` | A write sent to a query-only daemon (schema 67). Not retryable against that daemon. |
 
 `STORAGE_FAILURE` also covers a publication at or behind the archive watermark,
 which signals a clock regression, and retirement reaching unarchived evidence.

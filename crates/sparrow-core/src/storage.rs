@@ -70,6 +70,8 @@ mod writer_format;
 const FORMAT: &[u8] = b"sparrow.store/33";
 const DAY: u64 = 86_400_000;
 const RETRY_WINDOW: u64 = 2 * DAY;
+/// How long an accepted artifact and its records live, in milliseconds, unless pinned.
+pub const RETENTION_MS: u64 = 30 * DAY;
 const CHUNK: usize = 64 * 1024;
 const BYTE_READ_BYTES: usize = 1024 * 1024;
 /// Largest artifact accepted as one in-memory batch. Larger artifacts stream
@@ -799,6 +801,7 @@ impl Writer {
             )
             .with("text_profile", crate::text::PROFILE)
             .with("retry_window_seconds", (RETRY_WINDOW / 1000).to_string())
+            .with("retention_seconds", (RETENTION_MS / 1000).to_string())
             .with(
                 "max_producer_streams",
                 producer_stream::MAX_PRODUCER_STREAMS.to_string(),
@@ -1591,7 +1594,7 @@ impl Store {
         }
         let source_time_profile = writer.time_profile(source)?;
         let diagnostic_profile = writer.diagnostic_profile(source)?;
-        let expires_at = now.checked_add(30 * DAY).ok_or_else(|| {
+        let expires_at = now.checked_add(RETENTION_MS).ok_or_else(|| {
             Error::new(
                 "INVALID_ARGUMENT",
                 "acceptance timestamp overflows retention deadline",
@@ -2344,6 +2347,12 @@ impl Store {
                 "native query read registry poisoned",
             )?,
         })
+    }
+
+    /// Count stored payload chunks, the `unique_payload_chunks` of status, without the
+    /// record census. It changes only when evidence is ingested or retired.
+    pub fn unique_payload_chunks(&self) -> Result<u64, Error> {
+        self.lock()?.count_prefix("ref:")
     }
 
     /// Report measured database bytes and deduplicated live payload references.

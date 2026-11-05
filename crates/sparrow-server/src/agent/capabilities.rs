@@ -34,7 +34,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         )
         .with("transport", "capnp")
         .with("transports", Value::array(["unix", "tcp"]))
-        .with("retention_days", 30_u64)
+        .with("retention_days", sparrow_core::RETENTION_MS / 86_400_000)
         .with("time_basis", "received_at")
         .with(
             "records_time_bases",

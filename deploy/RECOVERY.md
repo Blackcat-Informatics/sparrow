@@ -188,15 +188,91 @@ every watch in `consume_watches` names a root that exists.
   nor the profile names the NAS, so a NAS outage does not affect the service.
   Sparrow issues #15 to #17 add the archive and this entry's procedure.
 
+## Verify a backup
+
+A backup counts as verified only after `deploy/verify-backup.sh` passes on it.
+Run it as the operator, who must be able to read the backup and the live server
+configuration:
+
+```bash
+deploy/verify-backup.sh /SPARROW/backups/NAME; echo "exit=$?"
+```
+
+The script reads the live `data_dir` and `socket_path` from `SPARROW_CONFIG`
+(default `/etc/sparrow/server.toml`) and refuses to run when it cannot read
+them, since those are the paths a copy must never touch. It refuses a
+`BACKUP/store` that is a symbolic link or holds one: `sparrow-backup` copies no
+links, and a copied absolute link would lead the daemon out of the copy. It reflinks `BACKUP/store` into a scratch directory below
+`/SPARROW/verify/` (`SPARROW_VERIFY` overrides it), so the backup itself is
+never opened. Before it creates that directory, and again on the copy, it
+refuses any path that resolves under the live store, the live socket, the intake
+(`SPARROW_INTAKE`), the backup, or the `data_dir` and `intake` the backup itself
+records in `SOURCE` and its configuration copy. It writes a configuration for the copy with its own socket and
+the lexicon bundle the backup keeps, and starts the image in `BACKUP/images/`
+that `SOURCE` names with `--query-only`. In that mode the daemon opens no watch
+root, claims no file, runs no retention or eviction and refuses every write
+(docs/interfaces.md, "Query-only daemon"). Opening still rewrites some catalog
+rows and table files in the copy, which is why it works only on a disposable
+copy. The script then prints one line per check:
+
+| Check | Passes when |
+| --- | --- |
+| `query-only` | Status and the startup line report `query_only`, and no stored watch root is open |
+| `store-id` | The copy's store identity equals `store_id` in `SOURCE` |
+| `status` | `pressure.phase` is `ready` and `durability.failure` is `null` |
+| `payload-chunks` | The copy's `unique_payload_chunks` equals the count `SOURCE` recorded |
+| `records` | A `records` window over the hour before `taken_utc` returns rows |
+| `artifact` | The first row's artifact reads back to the BLAKE3 digest its catalog row records |
+| `shutdown` | The daemon exits 0 after SIGINT and logs its closing payload chunk count |
+
+It exits 1 at the first failed check, and always stops the daemon and removes
+the scratch copy.
+
+The count check uses stored payload chunks rather than live records. A record is
+live only until its retention deadline, measured by the reader's clock, so a
+copy verified later reports fewer live records than the backup recorded, even
+when it is intact. Payload chunks change only when evidence is retired, which a
+query-only daemon never does. `sparrow-backup` does not read the count while
+the service runs, when ingestion, expiry and eviction could still change it.
+After every worker has stopped and the final flush has succeeded, `sparrowd`
+logs `sparrowd: closed store=ID unique_payload_chunks=N`. `sparrow-backup`
+reads that line from the journal of the invocation it stopped, through
+`journalctl --invocation=`, which needs systemd 257 or newer. It records `N` only
+when that daemon then exited 0; `N` is exactly what the copied store holds. Before
+the stop, it reads the running image for the line's text. An image that prints the
+line and then exits nonzero, or never logs it (a SIGKILL, for example), fails the
+backup, and nothing is published. An image that predates the line (schema 66 and
+older) still gets a published backup, which records
+`payload_chunks=unrecorded (image predates the closing count)` instead of a count.
+So a pre-upgrade backup of an older image, and nightly backups after a restore to
+one, keep working. For the clock reason above, the `records` and
+`artifact` checks run only while the window is younger than the retention window
+the daemon reports (`retention_seconds`, 30 days). After that its records have
+expired, and the script prints that both were skipped.
+
+A backup whose `SOURCE` has no `unique_payload_chunks` predates the count, or
+was taken from an image that predates it: the script skips that check, runs the others and still exits 1 as not verified. An
+image without query-only mode (schema 66 and older) is refused before it starts,
+because it would consume the live intake folders. Such a backup can be opened
+with a newer image instead, with `--image DAEMON`; the newer image may upgrade
+the disposable copy as it opens it.
+
+`--time-records` prints, after the checks, five elapsed times of the same
+`records` window, for comparing read latency on an older store format with the
+live service. `--window FROM BEFORE` selects that window (RFC 3339 instants), so
+it can be an hour held by both the backup and the live store. The window must be
+younger than the retention window, or the timing fails. The script prints the
+exact command, so the live times can be taken the same way.
+
 ## Restore from a backup
 
 A backup `/SPARROW/backups/NAME` (a `STAMP`, or a named `pre-upgrade-IMAGE`)
 holds `store`, `intake` and `config` (the server configuration, `/etc/sparrow`
 with the secret, and `/SPARROW/ship`) from one moment, `images/` with the
 image pair that last opened the store, `lexicons/` with the bundle it read, and `SOURCE`, which names that image
-(`image=`) and the store's identity, schema and format. Qualify it on a disposable copy first with the recovery probe
-(docs/deployment.md, "Recovery qualification"), and never start `sparrowd` on
-such a copy: its watch catalog names the live consume roots.
+(`image=`) and the store's identity, schema, format and live record count.
+Restore only a backup that `deploy/verify-backup.sh` has passed ("Verify a
+backup").
 
 ```bash
 sudo systemctl stop sparrow-backup.timer sparrow-ship.timer

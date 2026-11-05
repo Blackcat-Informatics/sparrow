@@ -13,14 +13,21 @@ mod shutdown;
 
 /// How often the daemon compares filesystem free space with its floor.
 const SPACE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Also the contract `deploy/verify-backup.sh` reads to tell an image with query-only mode.
+const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only]";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 2 || args[0] != "--config" {
-        return Err("usage: sparrowd --config FILE.toml".into());
+    let (path, query_only) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--config", path] => (path, false),
+        ["--config", path, "--query-only"] | ["--query-only", "--config", path] => (path, true),
+        _ => return Err(USAGE.into()),
+    };
+    let mut config = ServerConfig::read(Path::new(path))?;
+    if query_only {
+        config = config.into_query_only()?;
     }
-    let config = ServerConfig::read(Path::new(&args[1]))?;
     let tcp_secret = config.tcp_secret()?;
     // Keep the subscription alive through startup and awaited maintenance work.
     // Recreating ctrl_c() inside select drops its listener when another branch wins.
@@ -57,14 +64,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let operation_slots = u32::try_from(config.max_concurrent_requests)?;
-    let watches = sparrow_server::watches::WatchRegistry::default();
-    let mut consumer = Some(sparrow_server::watches::ConsumeWorker::start(
-        store.clone(),
-        &config.consume,
-        config.socket_path.clone(),
-        watches.clone(),
-        operations.clone(),
-    )?);
+    // A query-only daemon owns no watch root: it reports the stored catalog and claims nothing.
+    let (watches, mut consumer) = if config.query_only {
+        (
+            sparrow_server::watches::WatchRegistry::stored(&store)?,
+            None,
+        )
+    } else {
+        let watches = sparrow_server::watches::WatchRegistry::default();
+        let consumer = sparrow_server::watches::ConsumeWorker::start(
+            store.clone(),
+            &config.consume,
+            config.socket_path.clone(),
+            watches.clone(),
+            operations.clone(),
+        )?;
+        (watches, Some(consumer))
+    };
     // Validate the catalog first; recover only a refused socket under exclusive store ownership.
     let endpoint = match local_endpoint::LocalEndpoint::bind(&config.socket_path, &store).await {
         Ok(endpoint) => endpoint,
@@ -116,7 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpc = Rpc::new(store.clone(), operations.clone(), config.max_pin_members)
         .with_watches(watches)
         .with_syslog(syslog_registry);
-    if config.max_concurrent_requests >= 2 {
+    if config.query_only {
+        rpc = rpc.query_only();
+    } else if config.max_concurrent_requests >= 2 {
         rpc = rpc.with_watch_controller(
             consumer
                 .as_ref()
@@ -125,16 +143,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     eprintln!(
-        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={}",
+        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={}",
         store_id,
         config.socket_path.display(),
         config.data_dir.display(),
         config.max_rpc_connections,
-        config.max_concurrent_requests
+        config.max_concurrent_requests,
+        config.query_only
     );
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
-        let mut maintenance = Some(maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms))));
+        // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
+        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms))));
         let serving = async {
         let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
         let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);

@@ -29,7 +29,7 @@ where
 
 /// Who reached the daemon, which selects the bootstrap capability.
 pub enum Access {
-    /// The private Unix socket: the complete typed service.
+    /// The private Unix socket: the complete typed service, or its query-only gate.
     Local,
     /// Public TCP: the anonymous gate, upgraded by CHAP with this secret.
     PublicTcp(sparrow_client::TcpSecret),
@@ -54,7 +54,7 @@ pub fn admit_connection<S>(
         let _permit = permit;
         let (rpc, _lifetime) = rpc.for_connection();
         let client = match access {
-            Access::Local => capnp_rpc::new_client(rpc),
+            Access::Local => rpc.into_client(),
             Access::PublicTcp(secret) => {
                 capnp_rpc::new_client(crate::tcp_gate::AnonymousTcp::new(rpc, secret))
             }

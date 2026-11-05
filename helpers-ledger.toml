@@ -828,6 +828,20 @@ fingerprints = []
 names = ['^(run_new_claim_worker|run_recovery_claim_worker)$']
 
 [[job]]
+id = "query-only-write-refusal"
+summary = "One gate classifies every typed operation as a read it forwards or a write it forwards or, on a query-only daemon, refuses with READ_ONLY. Unix connections, CHAP sessions and the anonymous TCP gate all forward through it, so no handler checks the mode itself."
+home = "sparrow_server::query_only::WriteGate"
+entry_points = ["sparrow_server::rpc::Rpc::into_gate", "sparrow_server::rpc::Rpc::into_client", "sparrow_server::rpc::Rpc::query_only", "sparrow_server::config::ServerConfig::into_query_only", "sparrow_server::watches::WatchRegistry::stored"]
+spec = "docs/interfaces.md: query-only daemon (schema 66)."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(require_writable|refuse_if_query_only|check_read_only)$']
+
+[[job]]
 id = "consume-status"
 summary = "One bounded snapshot owner exposes coverage, deferral, persistent pending counts and failures through generated RPC and shared CLI/MCP rendering."
 home = "sparrow_server::watches::WatchRegistry::update"
