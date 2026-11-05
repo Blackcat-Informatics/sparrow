@@ -97,24 +97,55 @@ impl Drop for CancelQuery {
 }
 
 /// A completed capture stays private until its response has been rendered.
+/// An undelivered page releases the handle it published; a delivered live
+/// continuation releases the handle it continued, which the client no longer needs.
 struct QueryReply<B> {
     page: sparrow_core::CatalogReadPage<B>,
     store: Store,
     delivered: bool,
     owns_capture: bool,
+    supersedes: Option<String>,
+}
+impl<B> QueryReply<B> {
+    /// Own the page's handle unless it is the handle `cursor` already names.
+    fn new(page: sparrow_core::CatalogReadPage<B>, store: Store, cursor: Option<&str>) -> Self {
+        let continued = cursor
+            .and_then(|cursor| cursor.split_once('/'))
+            .map(|(id, _)| id);
+        let owns_capture = continued != Some(page.snapshot_id.as_str());
+        let supersedes = continued.filter(|_| owns_capture).map(str::to_owned);
+        Self {
+            page,
+            store,
+            delivered: false,
+            owns_capture,
+            supersedes,
+        }
+    }
 }
 impl<B> Drop for QueryReply<B> {
     fn drop(&mut self) {
-        if self.owns_capture && !self.delivered {
+        let release = if self.delivered {
+            self.supersedes.as_deref()
+        } else {
+            self.owns_capture.then_some(self.page.snapshot_id.as_str())
+        };
+        if let Some(snapshot) = release {
             let released = now().and_then(|now| {
                 self.store
-                    .result_release(&self.page.store_id, &self.page.snapshot_id, now)
+                    .result_release(&self.page.store_id, snapshot, now)
             });
             if let Err(error) = released {
-                eprintln!("sparrowd: abandoned query release failed: {error}");
+                eprintln!("sparrowd: query handle release failed: {error}");
             }
         }
     }
+}
+
+/// A `result_next` page: a guarded live artifact continuation, or a replay.
+enum Next {
+    Artifacts(QueryReply<sparrow_core::ArtifactPageBody>),
+    Replay(sparrow_core::ResultPage),
 }
 
 impl Rpc {
@@ -295,7 +326,7 @@ impl Rpc {
 
     async fn query_work<B: Send + 'static>(
         &self,
-        owns_capture: bool,
+        cursor: Option<String>,
         operation: impl FnOnce(
             Store,
             u64,
@@ -306,13 +337,7 @@ impl Rpc {
     ) -> Result<QueryReply<B>, Error> {
         self.read_work(move |store, now, cancellation| {
             let page = operation(store.clone(), now, cancellation.clone())?;
-            let reply = QueryReply {
-                page,
-                store,
-                delivered: false,
-                owns_capture,
-            };
-            Ok(reply)
+            Ok(QueryReply::new(page, store, cursor.as_deref()))
         })
         .await
     }
@@ -522,6 +547,7 @@ fn artifacts_page(
     page: &sparrow_core::ArtifactReadPage,
 ) -> capnp::Result<()> {
     catalog_receipt(out.reborrow().init_receipt(), page);
+    out.set_receipt_walk(page.body.receipt_walk());
     let encoded = page.body.diagnostic_coverage.encode(
         page.body.diagnostic_coverage.evaluated,
         page.body.diagnostic_coverage.matched,
@@ -2510,7 +2536,7 @@ impl wire::sparrow::Server for Rpc {
         };
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.records_read_cancellable(
                         &sparrow_core::RecordRead {
@@ -2561,7 +2587,7 @@ impl wire::sparrow::Server for Rpc {
         let cursor = query_text(input.get_cursor()?, 160, "query cursor exceeds 160 bytes");
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.records_read_cancellable(
                         &sparrow_core::RecordRead {
@@ -3029,7 +3055,7 @@ impl wire::sparrow::Server for Rpc {
             scan_budget: input.get_scan_budget() as usize,
         };
         match self
-            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+            .query_work(query.cursor.clone(), move |store, now, cancellation| {
                 store.artifact_read_cancellable(&query, now, &cancellation)
             })
             .await
@@ -3352,7 +3378,7 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+            .query_work(query.cursor.clone(), move |store, now, cancellation| {
                 store.source_read_with_syslog_cancellable(
                     &query,
                     now,
@@ -3420,7 +3446,7 @@ impl wire::sparrow::Server for Rpc {
             scan_budget: input.get_scan_budget() as usize,
         };
         match self
-            .query_work(query.cursor.is_none(), move |store, now, cancellation| {
+            .query_work(query.cursor.clone(), move |store, now, cancellation| {
                 store.pin_read_cancellable(&query, now, &cancellation)
             })
             .await
@@ -3577,12 +3603,28 @@ impl wire::sparrow::Server for Rpc {
         }
         let store_id = query.get_store_id()?.to_str()?.to_owned();
         let cursor = query.get_cursor()?.to_str()?.to_owned();
+        // A live artifact continuation publishes a page under the same delivery
+        // guard as `artifacts_list`; every other operation replays its capture.
         match self
-            .work(move |store, now| store.result_next(&store_id, &cursor, now))
+            .read_work(move |store, now, _| {
+                Ok(match store.result_next(&store_id, &cursor, now)? {
+                    sparrow_core::ResultPage::Artifacts(page) => {
+                        Next::Artifacts(QueryReply::new(page, store, Some(&cursor)))
+                    }
+                    page => Next::Replay(page),
+                })
+            })
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
-            Ok(page) => {
+            Ok(Next::Artifacts(mut reply)) => {
+                artifacts_page(
+                    results.get().init_result().init_ok().init_artifacts(),
+                    &reply.page,
+                )?;
+                reply.delivered = true;
+            }
+            Ok(Next::Replay(page)) => {
                 let out = results.get().init_result().init_ok();
                 match page {
                     sparrow_core::ResultPage::Records(page) => records_page(
@@ -3691,7 +3733,7 @@ impl wire::sparrow::Server for Rpc {
         );
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.json_read_cancellable(
                         &sparrow_core::JsonRead {
@@ -3738,7 +3780,7 @@ impl wire::sparrow::Server for Rpc {
         let decoded = optional(input.get_decoded()?)?;
         match self
             .query_work(
-                cursor.as_ref().is_ok_and(Option::is_none),
+                cursor.as_ref().ok().cloned().flatten(),
                 move |store, now, cancellation| {
                     store.json_read_cancellable(
                         &sparrow_core::JsonRead {
@@ -3800,7 +3842,7 @@ mod tests {
             } else {
                 let action = capture.clone();
                 let mut reply = rpc
-                    .query_work(true, move |store, now, token| {
+                    .query_work(None, move |store, now, token| {
                         action(store, now, &token, None)
                     })
                     .await
@@ -3828,9 +3870,10 @@ mod tests {
                 let cursor = cursor.clone();
                 let (entered, running) = tokio::sync::oneshot::channel();
                 let (release, paused) = std::sync::mpsc::channel();
+                let held = cursor.clone();
                 let task = tokio::spawn(async move {
                     worker
-                        .query_work(owns_capture, move |store, now, cancellation| {
+                        .query_work(held, move |store, now, cancellation| {
                             let page = if after_capture {
                                 Some(action(store.clone(), now, &cancellation, cursor.clone())?)
                             } else {
@@ -3877,8 +3920,9 @@ mod tests {
                 );
             }
             let action = capture.clone();
+            let held = cursor.clone();
             let reply = rpc
-                .query_work(owns_capture, move |store, now, token| {
+                .query_work(held, move |store, now, token| {
                     action(store, now, &token, cursor)
                 })
                 .await
@@ -3889,11 +3933,18 @@ mod tests {
                 Some(expected)
             );
             if let Some((store_id, id, cursor)) = original {
-                assert!(
+                // A live artifact continuation publishes its own page; release it too.
+                let next = rpc
+                    .store
+                    .result_next(&store_id, &cursor, now().unwrap())
+                    .unwrap();
+                if let sparrow_core::ResultPage::Artifacts(page) = &next
+                    && page.snapshot_id != id
+                {
                     rpc.store
-                        .result_next(&store_id, &cursor, now().unwrap())
-                        .is_ok()
-                );
+                        .result_release(&store_id, &page.snapshot_id, now().unwrap())
+                        .unwrap();
+                }
                 assert!(
                     rpc.store
                         .result_release(&store_id, &id, now().unwrap())
@@ -4026,6 +4077,7 @@ mod tests {
             },
         )
         .await;
+        // A live listing: an abandoned continuation keeps the delivered cursor.
         capture_lifetime(
             &rpc,
             &admission,

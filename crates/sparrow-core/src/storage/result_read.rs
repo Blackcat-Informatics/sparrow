@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! Cursor-only continuation of already captured results; no membership re-evaluation.
+//! Cursor-only continuation of captured results. Live artifact listings read
+//! their next receipt-ordered page; every other operation replays its capture.
 
 use super::{Error, Store, catalog_lease, record_read};
 use crate::{ArtifactReadPage, PinReadPage, RecordReadPage, SourceReadPage};
@@ -115,6 +116,10 @@ impl Store {
                 .lock()
                 .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
             reads.purge(now);
+            let cancellation = crate::QueryCancellation::default();
+            if let Some(page) = self.artifact_next(&mut reads, &cursor, None, now, &cancellation)? {
+                return Ok(ResultPage::Artifacts(page));
+            }
             if let Some((_, page)) = reads.resume_captured(&cursor, now)? {
                 return Ok(ResultPage::Artifacts(page));
             }

@@ -2702,7 +2702,13 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     "1",
                 ],
             );
-            assert_eq!(first["total_items"].as_str(), Some("2"));
+            assert_eq!(first["total_items"].as_str(), Some("1"));
+            // Until the walk's final page the count covers delivered rows only.
+            assert_eq!(first["has_more"].as_bool(), Some(true));
+            assert_eq!(first["matching_artifacts"], Value::Null);
+            assert_eq!(first["known_matching_artifacts"].as_str(), Some("1"));
+            assert_eq!(first["answer_certainty"].as_str(), Some("incomplete"));
+            assert_eq!(first["coverage"]["catalog_complete"].as_bool(), Some(false));
             assert_eq!(first["rows"][0]["retained_records"].as_str(), Some("2"));
             assert_eq!(
                 first["rows"][0]["complete_bytes_available"].as_bool(),
@@ -2728,9 +2734,21 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 )
                 .await;
             assert!(!second["isError"].as_bool().unwrap());
-            let again = cli(
-                &socket,
-                &[
+            // A live continuation reads the next receipt-ordered page under a new
+            // handle, and the later artifact still lies ahead of it.
+            let second = &second["structuredContent"];
+            assert_ne!(second["snapshot_id"], first["snapshot_id"]);
+            assert_eq!(second["total_items"].as_str(), Some("2"));
+            assert_eq!(second["has_more"].as_bool(), Some(true));
+            assert_eq!(second["matching_artifacts"], Value::Null);
+            assert_eq!(second["answer_certainty"].as_str(), Some("incomplete"));
+            assert_ne!(
+                second["rows"][0]["artifact_id"],
+                first["rows"][0]["artifact_id"]
+            );
+            let spent = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                .arg(&socket)
+                .args([
                     "artifacts",
                     &store,
                     "--source",
@@ -2739,16 +2757,11 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     "1",
                     "--cursor",
                     cursor,
-                ],
-            );
-            assert_eq!(second["structuredContent"], again);
-            assert_eq!(again["snapshot_id"], first["snapshot_id"]);
-            assert_eq!(again["total_items"].as_str(), Some("2"));
-            assert_eq!(again["has_more"].as_bool(), Some(false));
-            assert_ne!(
-                again["rows"][0]["artifact_id"],
-                first["rows"][0]["artifact_id"]
-            );
+                ])
+                .admitted_output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&spent.stderr).contains("RESULT_EXPIRED"));
+            let cursor = second["next_cursor"].as_str().unwrap();
             let fragments = cli(
                 &socket,
                 &["artifacts", &store, "--source", "wire-fragments"],
@@ -2810,6 +2823,24 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     output
                 );
             }
+            // The final page of one uninterrupted walk states the exact count.
+            let last = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--source",
+                    "wire-catalog",
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    cursor,
+                ],
+            );
+            assert_eq!(last["has_more"].as_bool(), Some(false));
+            assert_eq!(last["matching_artifacts"].as_str(), Some("3"));
+            assert_eq!(last["answer_certainty"].as_str(), Some("exact"));
+            assert_eq!(last["coverage"]["catalog_complete"].as_bool(), Some(true));
             for version in [0, 23] {
                 let mut request = client.capability().artifacts_list_request();
                 let mut query = request.get().init_query();
@@ -2833,7 +2864,8 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
             }
             let status = cli(&socket, &["status"]);
             assert_eq!(status["max_artifact_read_handles"].as_str(), Some("8"));
-            assert_eq!(status["artifact_read_handles"].as_str(), Some("1"));
+            // Delivering the final page retired the last continued handle.
+            assert_eq!(status["artifact_read_handles"].as_str(), Some("0"));
         })
         .await;
 }
@@ -11344,6 +11376,109 @@ async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
         .await;
 }
 
+/// A delivered live artifact continuation retires the handle it continued, so
+/// each surface continues its own first page and the spent cursor then expires.
+async fn live_artifact_continuations(
+    socket: &std::path::Path,
+    client: &sparrow_client::Client,
+    mcp: &mut Mcp,
+    args: &[&str],
+) {
+    use purrdf_lex::json::Object;
+    let id = args[1];
+    let mut continued = Vec::new();
+    for surface in 0_u64..4 {
+        let first = cli(socket, args);
+        let snapshot = first["snapshot_id"].as_str().unwrap().to_owned();
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let (rows, next_snapshot) = match surface {
+            0 | 1 => {
+                let next = if surface == 0 {
+                    let mut repeat = args.to_vec();
+                    repeat.extend(["--cursor", cursor.as_str()]);
+                    cli(socket, &repeat)
+                } else {
+                    let next = cli(socket, &["result-next", id, &cursor]);
+                    assert_eq!(next["operation"].as_str(), Some("artifacts_list"));
+                    next
+                };
+                (next["rows"].clone(), next["snapshot_id"].clone())
+            }
+            2 => {
+                let reply = mcp
+                    .tool(
+                        300 + surface,
+                        "result_next",
+                        Object::new()
+                            .with("store_id", id)
+                            .with("cursor", cursor.as_str())
+                            .into(),
+                    )
+                    .await;
+                assert!(!reply["isError"].as_bool().unwrap());
+                let next = &reply["structuredContent"];
+                (next["rows"].clone(), next["snapshot_id"].clone())
+            }
+            _ => {
+                let mut call = client.capability().result_next_request();
+                let mut query = call.get().init_query();
+                query.set_store_id(id);
+                query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                query.set_cursor(&cursor);
+                let response = call.send().promise.await.unwrap();
+                let page = match response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                {
+                    wire::result::Ok(page) => page.unwrap(),
+                    wire::result::Error(error) => panic!("{:?}", error.unwrap().get_code()),
+                };
+                let wire::result_page::Artifacts(page) = page.which().unwrap() else {
+                    panic!("artifact continuation");
+                };
+                let page = page.unwrap();
+                let rows = page.get_rows().unwrap();
+                assert_eq!(rows.len(), 1);
+                let artifact = rows.get(0).get_id().unwrap().to_str().unwrap();
+                let snapshot = page
+                    .get_receipt()
+                    .unwrap()
+                    .get_snapshot_id()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                (
+                    purrdf_lex::json::Value::from(artifact),
+                    purrdf_lex::json::Value::from(snapshot),
+                )
+            }
+        };
+        assert_ne!(next_snapshot.as_str(), Some(snapshot.as_str()));
+        continued.push(rows);
+        let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            .arg(socket)
+            .args(["result-next", id, &cursor])
+            .admitted_output()
+            .unwrap();
+        assert!(!out.status.success() && out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("RESULT_EXPIRED"));
+        // The final continuation holds no handle, and delivery retired the first.
+        for snapshot in [snapshot.as_str(), next_snapshot.as_str().unwrap()] {
+            assert!(!client.release_result(snapshot).await.unwrap().released);
+        }
+    }
+    for rows in &continued[1..3] {
+        assert_eq!(rows, &continued[0]);
+    }
+    assert_eq!(
+        continued[3].as_str(),
+        continued[0][0]["artifact_id"].as_str()
+    );
+}
 #[tokio::test(flavor = "current_thread")]
 async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page() {
     use purrdf_lex::json::{Object, Value};
@@ -11544,6 +11679,10 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 vec!["pin-get", id, "--id", pin_id, "--page-size", "1"],
             ];
             for (index, args) in commands.into_iter().enumerate() {
+                if args[0] == "artifacts" {
+                    live_artifact_continuations(&socket, &client, &mut mcp, &args).await;
+                    continue;
+                }
                 let first = cli(&socket, &args);
                 let cursor = if index < 4 {
                     first["page"]["next_cursor"].as_str()
