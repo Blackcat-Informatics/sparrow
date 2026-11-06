@@ -1,0 +1,8 @@
+Back up the interim production user unit with the repository helper (#31)
+
+Nightlies under the user unit ran an older hand-installed helper whose SOURCE
+lacks store_id and unique_payload_chunks, so verify-backup refused them. The
+repository helper now accepts the user-scope sparrow.service only when its
+backup unit sets SPARROW_INTERIM_USER_PRODUCTION=1, and refuses it otherwise.
+deploy/MANUAL.md describes the interim backup unit. #22 removes the variable
+with the user unit.

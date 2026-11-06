@@ -1,0 +1,113 @@
+{
+  "issue": 31,
+  "pr_number": 32,
+  "branch": "paudley/31-record-verifiable-source-in-nightlies",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/31-record-verifiable-source-in-nightlies/.stage/record-verifiable-source-in-nightlies",
+  "observed_at": "2026-11-06T14:06:34.004892+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews",
+    "merge_candidate"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/31-record-verifiable-source-in-nightlies/.stage/record-verifiable-source-in-nightlies/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/31-record-verifiable-source-in-nightlies/.stage/record-verifiable-source-in-nightlies/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/31-record-verifiable-source-in-nightlies/.stage/record-verifiable-source-in-nightlies/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/31-record-verifiable-source-in-nightlies/.stage/record-verifiable-source-in-nightlies/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/31-record-verifiable-source-in-nightlies/.stage/record-verifiable-source-in-nightlies/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict.",
+    "Preflight does not sign, fetch, push or mutate forge state. API permission and read access do not prove Git push authorization or protected-branch admission."
+  ],
+  "pr": {
+    "number": 32,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Back up the interim production user unit with the repository helper (#31)",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/32",
+    "baseRefName": "main",
+    "baseRefOid": "13af50d80d33586a200417e653eb0b382227dfae",
+    "headRefName": "paudley/31-record-verifiable-source-in-nightlies",
+    "headRefOid": "c8bdca35f6b9897108a25c633e2d34cbb0ccb3b4",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/15/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "c8bdca35f6b9897108a25c633e2d34cbb0ccb3b4",
+    "branch": "paudley/31-record-verifiable-source-in-nightlies",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 32,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #32 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "missing_artifacts": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  },
+  "preflight": {
+    "git": "/usr/bin/git",
+    "python3": "/home/paudley/stage/root/bin/python3",
+    "stagectl": "/home/paudley/stage/root/bin/stagectl",
+    "bash": "/usr/bin/bash",
+    "readlink": "/home/paudley/stage/root/bin/readlink",
+    "sed": "/usr/bin/sed",
+    "awk": "/usr/bin/awk",
+    "ghprsq": "/home/paudley/stage/agents/bin/ghprsq",
+    "archive": {
+      "files": 17,
+      "bytes": 32414,
+      "errors": [],
+      "limits": "Read-only selected-evidence admission; full newly reachable Git object closure is checked by ghprsq before push."
+    },
+    "signing": {
+      "format": "openpgp",
+      "key_configured": true,
+      "limits": "Configuration inspected; no signing operation was performed."
+    },
+    "forge_permissions": {
+      "admin": true,
+      "push": true,
+      "pull": true
+    },
+    "merge_candidate": {
+      "base": "13af50d80d33586a200417e653eb0b382227dfae",
+      "head": "c8bdca35f6b9897108a25c633e2d34cbb0ccb3b4",
+      "status": "clean"
+    }
+  }
+}

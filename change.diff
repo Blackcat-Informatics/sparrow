@@ -1,0 +1,84 @@
+diff --git deploy/MANUAL.md deploy/MANUAL.md
+index 64f6297..d6a2906 100644
+--- deploy/MANUAL.md
++++ deploy/MANUAL.md
+@@ -110,6 +110,13 @@ sudo env RUNTIME_DIRECTORY=/run/sparrow-backup sh -c 'install -d -m 0700 /run/sp
+ The backup stops and starts `sparrow.service` through `systemctl`, so it
+ needs systemd. The shipper needs only the daemon to be consuming.
+ 
++Until #22 moves production to the system unit, production runs as the user
++unit `sparrow.service`. Its backup unit runs the same helper with
++`SPARROW_SCOPE=user`, `SPARROW_PREFIX=$HOME/.local` and
++`SPARROW_INTERIM_USER_PRODUCTION=1` (#31). Without that last variable the
++helper refuses a user-scope `sparrow.service`, so a test-instance run never
++stops production. #22 removes the variable with the user unit.
++
+ ## The recovery probe
+ 
+ The kept image `bin/sparrow-recovery-schemaN-REV` reads a restored store
+diff --git deploy/libexec/sparrow-backup deploy/libexec/sparrow-backup
+index c0296a9..2174b10 100755
+--- deploy/libexec/sparrow-backup
++++ deploy/libexec/sparrow-backup
+@@ -51,6 +51,9 @@ from pathlib import Path
+ UNIT = os.environ.get("SPARROW_UNIT", "sparrow.service")
+ SCOPE = os.environ.get("SPARROW_SCOPE", "system")
+ LIBEXEC = Path(os.environ.get("SPARROW_PREFIX", "/usr/local")) / "libexec" / "sparrow"
++# Until the system unit replaces it (#22), production runs as the user unit sparrow.service, and
++# only its own backup unit sets this, to back it up (#31). #22 removes it with the user unit.
++INTERIM_USER_PRODUCTION = os.environ.get("SPARROW_INTERIM_USER_PRODUCTION") == "1"
+ STAMP = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+ QUIESCE_SECONDS = 30 * 60
+ # The unit's RuntimeDirectory=; its ExecStopPost reads the same name.
+@@ -65,7 +68,8 @@ def systemctl_command():
+     if SCOPE not in ("system", "user"):
+         fail(f"SPARROW_SCOPE must be system or user, not {SCOPE}")
+     # systemctl reads "sparrow" as "sparrow.service", so both spellings are refused.
+-    if SCOPE == "user" and UNIT.removesuffix(".service") == "sparrow":
++    if SCOPE == "user" and UNIT.removesuffix(".service") == "sparrow" \
++            and not INTERIM_USER_PRODUCTION:
+         fail("SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit, never sparrow.service")
+     return ["systemctl"] + (["--user"] if SCOPE == "user" else [])
+ 
+diff --git deploy/MANUAL.md deploy/MANUAL.md
+index 64f6297..d6a2906 100644
+--- deploy/MANUAL.md
++++ deploy/MANUAL.md
+@@ -110,6 +110,13 @@ sudo env RUNTIME_DIRECTORY=/run/sparrow-backup sh -c 'install -d -m 0700 /run/sp
+ The backup stops and starts `sparrow.service` through `systemctl`, so it
+ needs systemd. The shipper needs only the daemon to be consuming.
+ 
++Until #22 moves production to the system unit, production runs as the user
++unit `sparrow.service`. Its backup unit runs the same helper with
++`SPARROW_SCOPE=user`, `SPARROW_PREFIX=$HOME/.local` and
++`SPARROW_INTERIM_USER_PRODUCTION=1` (#31). Without that last variable the
++helper refuses a user-scope `sparrow.service`, so a test-instance run never
++stops production. #22 removes the variable with the user unit.
++
+ ## The recovery probe
+ 
+ The kept image `bin/sparrow-recovery-schemaN-REV` reads a restored store
+diff --git deploy/libexec/sparrow-backup deploy/libexec/sparrow-backup
+index c0296a9..2174b10 100755
+--- deploy/libexec/sparrow-backup
++++ deploy/libexec/sparrow-backup
+@@ -51,6 +51,9 @@ from pathlib import Path
+ UNIT = os.environ.get("SPARROW_UNIT", "sparrow.service")
+ SCOPE = os.environ.get("SPARROW_SCOPE", "system")
+ LIBEXEC = Path(os.environ.get("SPARROW_PREFIX", "/usr/local")) / "libexec" / "sparrow"
++# Until the system unit replaces it (#22), production runs as the user unit sparrow.service, and
++# only its own backup unit sets this, to back it up (#31). #22 removes it with the user unit.
++INTERIM_USER_PRODUCTION = os.environ.get("SPARROW_INTERIM_USER_PRODUCTION") == "1"
+ STAMP = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+ QUIESCE_SECONDS = 30 * 60
+ # The unit's RuntimeDirectory=; its ExecStopPost reads the same name.
+@@ -65,7 +68,8 @@ def systemctl_command():
+     if SCOPE not in ("system", "user"):
+         fail(f"SPARROW_SCOPE must be system or user, not {SCOPE}")
+     # systemctl reads "sparrow" as "sparrow.service", so both spellings are refused.
+-    if SCOPE == "user" and UNIT.removesuffix(".service") == "sparrow":
++    if SCOPE == "user" and UNIT.removesuffix(".service") == "sparrow" \
++            and not INTERIM_USER_PRODUCTION:
+         fail("SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit, never sparrow.service")
+     return ["systemctl"] + (["--user"] if SCOPE == "user" else [])
+ 
