@@ -113,7 +113,10 @@ needs systemd. The shipper needs only the daemon to be consuming.
 Until #22 moves production to the system unit, production runs as the user
 unit `sparrow.service`. Its backup unit runs the same helper with
 `SPARROW_SCOPE=user`, `SPARROW_PREFIX=$HOME/.local` and
-`SPARROW_INTERIM_USER_PRODUCTION=1` (#31). Without that last variable the
+`SPARROW_INTERIM_USER_PRODUCTION=1` (#31). It also sets
+`RuntimeDirectory=sparrow-backup`, and its `ExecStopPost` checks the marker
+`%t/sparrow-backup/stopped`, so a killed backup still restarts production.
+Without `SPARROW_INTERIM_USER_PRODUCTION=1` the
 helper refuses a user-scope `sparrow.service`, so a test-instance run never
 stops production. #22 removes the variable with the user unit.
 

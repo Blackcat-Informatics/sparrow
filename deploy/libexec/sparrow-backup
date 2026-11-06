@@ -67,7 +67,8 @@ def fail(message):
 def systemctl_command():
     if SCOPE not in ("system", "user"):
         fail(f"SPARROW_SCOPE must be system or user, not {SCOPE}")
-    # systemctl reads "sparrow" as "sparrow.service", so both spellings are refused.
+    # systemctl reads "sparrow" as "sparrow.service", so both spellings are refused unless the
+    # interim production backup unit opts in.
     if SCOPE == "user" and UNIT.removesuffix(".service") == "sparrow" \
             and not INTERIM_USER_PRODUCTION:
         fail("SPARROW_SCOPE=user needs SPARROW_UNIT naming a test unit, never sparrow.service")
