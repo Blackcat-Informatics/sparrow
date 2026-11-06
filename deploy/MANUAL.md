@@ -110,6 +110,16 @@ sudo env RUNTIME_DIRECTORY=/run/sparrow-backup sh -c 'install -d -m 0700 /run/sp
 The backup stops and starts `sparrow.service` through `systemctl`, so it
 needs systemd. The shipper needs only the daemon to be consuming.
 
+Until #22 moves production to the system unit, production runs as the user
+unit `sparrow.service`. Its backup unit runs the same helper with
+`SPARROW_SCOPE=user`, `SPARROW_PREFIX=$HOME/.local` and
+`SPARROW_INTERIM_USER_PRODUCTION=1` (#31). It also sets
+`RuntimeDirectory=sparrow-backup`, and its `ExecStopPost` checks the marker
+`%t/sparrow-backup/stopped`, so a killed backup still restarts production.
+Without `SPARROW_INTERIM_USER_PRODUCTION=1` the
+helper refuses a user-scope `sparrow.service`, so a test-instance run never
+stops production. #22 removes the variable with the user unit.
+
 ## The recovery probe
 
 The kept image `bin/sparrow-recovery-schemaN-REV` reads a restored store
