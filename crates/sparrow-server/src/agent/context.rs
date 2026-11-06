@@ -78,11 +78,27 @@ pub(super) fn render_record(value: wire::record::Reader<'_>) -> Result<Value> {
                 .into()
         }
     };
+    let intake = match value.get_intake()?.which()? {
+        wire::optional_intake::Absent(()) => Value::Null,
+        wire::optional_intake::Value(intake) => {
+            let intake = intake?;
+            let endpoint = match intake.get_endpoint()? {
+                wire::IntakeEndpoint::IngestSocket => sparrow_core::INGEST_SOCKET,
+            };
+            Object::new()
+                .with("endpoint", endpoint)
+                .with("uid", intake.get_uid().to_string())
+                .with("gid", intake.get_gid().to_string())
+                .with("pid", intake.get_pid().to_string())
+                .into()
+        }
+    };
     Ok(Object::new()
         .with(
             "tail",
             crate::tail_wire::render_position(value.get_tail()?)?,
         )
+        .with("intake", intake)
         .with("syslog", crate::syslog_wire::render(value.get_syslog()?)?)
         .with("producer", producer)
         .with("receiver", receiver)

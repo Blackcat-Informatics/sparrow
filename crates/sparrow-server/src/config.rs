@@ -52,6 +52,18 @@ pub struct ServerConfig {
     /// Independent bound on admitted Unix and TCP RPC connections.
     #[serde(default = "default_rpc_connections")]
     pub max_rpc_connections: usize,
+    /// Optional group-accessible ingest-only Unix socket. Its parent directory is outside
+    /// `data_dir`; startup requires it to be owned by the daemon, group
+    /// `ingest_socket_gid` and mode 2750.
+    #[serde(default)]
+    pub ingest_socket_path: Option<PathBuf>,
+    /// Numeric group whose members may connect, required exactly when the socket is set.
+    #[serde(default)]
+    pub ingest_socket_gid: Option<u32>,
+    /// Ingest-socket connection ceiling, separate from `max_rpc_connections` so producers
+    /// cannot starve CLI and MCP connections.
+    #[serde(default = "default_ingest_connections")]
+    pub max_ingest_connections: usize,
     /// Required native analyzer artifact directory.
     pub text_lexicon_dir: PathBuf,
     /// Archive-before-delete. A store that has archived requires this table thereafter.
@@ -195,6 +207,10 @@ fn default_rpc_connections() -> usize {
     16
 }
 
+fn default_ingest_connections() -> usize {
+    16
+}
+
 impl ServerConfig {
     /// Read and validate the same typed configuration used by the production daemon.
     pub fn read(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -219,6 +235,7 @@ impl ServerConfig {
         if config.socket_path.parent() != Some(config.data_dir.as_path()) {
             return Err("socket_path must be directly inside the private data_dir".into());
         }
+        config.validate_ingest_socket()?;
         if !config.consume.is_empty() && config.max_concurrent_requests < 2 {
             return Err("consume requires at least two concurrent storage operations".into());
         }
@@ -252,6 +269,7 @@ impl ServerConfig {
             ("consume", !self.consume.is_empty()),
             ("syslog", !self.syslog.is_empty()),
             ("rpc_tcp_address", self.rpc_tcp_address.is_some()),
+            ("ingest_socket_path", self.ingest_socket_path.is_some()),
             ("archive", self.archive.is_some()),
         ];
         match conflicting.iter().find(|(_, set)| *set) {
@@ -261,6 +279,41 @@ impl ServerConfig {
             .into()),
             None => Ok(()),
         }
+    }
+
+    /// Lexical checks; startup checks the directory's owner, group and mode.
+    fn validate_ingest_socket(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if !(1..=256).contains(&self.max_ingest_connections) {
+            return Err("max_ingest_connections must be 1..256".into());
+        }
+        if self.ingest_socket_path.is_some() != self.ingest_socket_gid.is_some() {
+            return Err(
+                "ingest_socket_path and ingest_socket_gid must be configured together".into(),
+            );
+        }
+        let Some(path) = &self.ingest_socket_path else {
+            return Ok(());
+        };
+        let parent = path.parent().filter(|_| {
+            path.is_absolute()
+                && path.file_name().is_some()
+                && path
+                    .components()
+                    .all(|part| !matches!(part, std::path::Component::ParentDir))
+        });
+        let Some(parent) = parent else {
+            return Err(
+                "ingest_socket_path must be an absolute socket path without '..' inside a directory"
+                    .into(),
+            );
+        };
+        if parent.starts_with(&self.data_dir) || self.data_dir.starts_with(parent) {
+            return Err(
+                "ingest_socket_path must be in a directory outside data_dir that does not contain it"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// Read the configured TCP CHAP secret; a configured but unusable file is an error.

@@ -92,13 +92,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 },
                 &store,
-                None,
+                &[],
                 &operations,
                 operation_slots,
             )
             .await;
         }
     };
+    let ingest = match (&config.ingest_socket_path, config.ingest_socket_gid) {
+        (Some(path), Some(gid)) => {
+            match local_endpoint::LocalEndpoint::bind_ingest(path, gid).await {
+                Ok(endpoint) => Some((
+                    endpoint,
+                    sparrow_server::ingest_socket::IngestSocket::new(
+                        path.clone(),
+                        gid,
+                        config.max_ingest_connections,
+                    ),
+                )),
+                Err(error) => {
+                    return shutdown::finish(
+                        Err(error.into()),
+                        shutdown::Workers {
+                            consumer: consumer.take(),
+                            ..Default::default()
+                        },
+                        &store,
+                        &[&endpoint],
+                        &operations,
+                        operation_slots,
+                    )
+                    .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let endpoints: Vec<&local_endpoint::LocalEndpoint> = std::iter::once(&endpoint)
+        .chain(ingest.as_ref().map(|(endpoint, _)| endpoint))
+        .collect();
     let connections = Arc::new(Semaphore::new(config.max_rpc_connections));
     let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
     let mut syslog = if config.syslog.is_empty() {
@@ -121,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ..Default::default()
                     },
                     &store,
-                    Some(&endpoint),
+                    &endpoints,
                     &operations,
                     operation_slots,
                 )
@@ -132,6 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpc = Rpc::new(store.clone(), operations.clone(), config.max_pin_members)
         .with_watches(watches)
         .with_syslog(syslog_registry);
+    if let Some((_, socket)) = &ingest {
+        rpc = rpc.with_ingest_socket(socket.clone());
+    }
     if config.query_only {
         rpc = rpc.query_only();
     } else if config.max_concurrent_requests >= 2 {
@@ -151,6 +186,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_concurrent_requests,
         config.query_only
     );
+    if let (Some(path), Some(gid)) = (&config.ingest_socket_path, config.ingest_socket_gid) {
+        eprintln!(
+            "sparrowd: ingest_socket={} gid={gid} max_ingest_connections={}",
+            path.display(),
+            config.max_ingest_connections
+        );
+    }
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
@@ -192,18 +234,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 accepted = endpoint.listener.accept(), if space_ok => {
                     let (stream, _) = accepted?;
-                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::Local);
+                    let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::Local);
+                }
+                accepted = async { ingest.as_ref().expect("enabled ingest branch").0.listener.accept().await }, if space_ok && ingest.is_some() => {
+                    let (stream, _) = accepted?;
+                    let _ = ingest.as_ref().expect("enabled ingest branch").1.admit(stream, rpc.clone());
                 }
                 accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if space_ok && tcp_listener.is_some() => {
                     let (stream, _) = accepted?;
                     stream.set_nodelay(true)?;
                     let secret = tcp_secret.clone().expect("configuration pairs TCP with its secret");
-                    sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::PublicTcp(secret));
+                    let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::PublicTcp(secret));
                 }
             }
         }
         Ok::<(), Box<dyn std::error::Error>>(())
         }.await;
-        shutdown::finish(serving, shutdown::Workers { consumer: consumer.take(), syslog: syslog.take(), maintenance: maintenance.take() }, &store, Some(&endpoint), &operations, operation_slots).await
+        shutdown::finish(serving, shutdown::Workers { consumer: consumer.take(), syslog: syslog.take(), maintenance: maintenance.take() }, &store, &endpoints, &operations, operation_slots).await
     }).await
 }

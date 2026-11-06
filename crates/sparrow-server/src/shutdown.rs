@@ -30,7 +30,7 @@ pub(super) async fn finish(
     initial: Result<(), Box<dyn std::error::Error>>,
     workers: Workers,
     store: &sparrow_core::Store,
-    endpoint: Option<&LocalEndpoint>,
+    endpoints: &[&LocalEndpoint],
     operations: &Arc<Semaphore>,
     slots: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -68,7 +68,7 @@ pub(super) async fn finish(
         errors.push(error.clone());
         errors.push("store flush withheld because RPC admission could not be drained".into());
     }
-    if let Some(endpoint) = endpoint {
+    for endpoint in endpoints {
         record_failure(
             &mut errors,
             "local endpoint cleanup",
@@ -158,7 +158,7 @@ mod tests {
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         {
-            let teardown = finish(Ok(()), Workers::default(), &store, None, &operations, 2);
+            let teardown = finish(Ok(()), Workers::default(), &store, &[], &operations, 2);
             tokio::pin!(teardown);
             tokio::select! {
                 biased;

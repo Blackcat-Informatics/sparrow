@@ -33,22 +33,27 @@ pub enum Access {
     Local,
     /// Public TCP: the anonymous gate, upgraded by CHAP with this secret.
     PublicTcp(sparrow_client::TcpSecret),
+    /// The group-accessible ingest socket: producer operations only, each recording this
+    /// kernel-reported caller in the provenance of the evidence it creates.
+    IngestSocket(sparrow_core::PeerCredential),
 }
 
 /// Every Unix or TCP connection closes this long after admission.
 pub(crate) const CONNECTION_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Apply the same connection ceiling and lease to Unix and public TCP streams.
+/// Apply a connection ceiling and the lease to one accepted stream. Returns false, having
+/// dropped the stream unanswered, when the ceiling is reached.
 pub fn admit_connection<S>(
     stream: S,
     rpc: crate::Rpc,
     connections: std::sync::Arc<tokio::sync::Semaphore>,
     access: Access,
-) where
+) -> bool
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
 {
     let Ok(permit) = connections.try_acquire_owned() else {
-        return;
+        return false;
     };
     tokio::task::spawn_local(async move {
         let _permit = permit;
@@ -56,7 +61,16 @@ pub fn admit_connection<S>(
         let client = match access {
             Access::Local => rpc.into_client(),
             Access::PublicTcp(secret) => {
-                capnp_rpc::new_client(crate::tcp_gate::AnonymousTcp::new(rpc, secret))
+                capnp_rpc::new_client(crate::ingest_gate::IngestGate::new(
+                    rpc,
+                    crate::tcp_gate::AnonymousTcp::new(secret),
+                ))
+            }
+            Access::IngestSocket(credential) => {
+                capnp_rpc::new_client(crate::ingest_gate::IngestGate::new(
+                    rpc.with_peer(credential),
+                    crate::ingest_gate::IngestSocketPolicy,
+                ))
             }
         };
         match tokio::time::timeout(CONNECTION_LEASE, serve_connection(stream, client)).await {
@@ -65,4 +79,5 @@ pub fn admit_connection<S>(
             Err(_) => eprintln!("sparrowd: RPC connection lease expired"),
         }
     });
+    true
 }

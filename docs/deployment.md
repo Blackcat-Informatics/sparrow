@@ -139,7 +139,59 @@ sets `data_dir` to mode 0710 and the socket to 0660 each time it starts, so
 members of the daemon's group can connect and cannot list or read the store;
 store files stay owner-only under the unit's `UMask=0077`. Only the operator
 belongs to that group, for the CLI and administration. Fleet producers ingest
-through the ingest-only group socket of Sparrow issue #10, not this socket.
+through the ingest-only group socket below, not this socket.
+
+### Ingest-only group socket
+
+Daemons that run as other accounts, such as `katamari-stored`, log into Sparrow
+through a second Unix socket. It admits only producer operations (`discover`,
+`ingest`, the import operations, `eventsIngest` and `flush`) and refuses every
+other operation with `PERMISSION_DENIED`. Each artifact and record it accepts
+records the caller's uid, gid and pid, which the kernel reports for the
+connection (`SO_PEERCRED`).
+
+1. Create the group and add each producer account to it:
+
+   ```bash
+   sudo groupadd --system sparrow-ingest
+   sudo usermod -aG sparrow-ingest katamari
+   ```
+
+2. Install the tmpfiles entry, which creates `/run/sparrow-ingest` owned by the
+   daemon's account, group `sparrow-ingest`, mode 2750, at every boot:
+
+   ```bash
+   sudo install -m 0644 packaging/tmpfiles/sparrow-ingest.conf /etc/tmpfiles.d/
+   sudo systemd-tmpfiles --create /etc/tmpfiles.d/sparrow-ingest.conf
+   ```
+
+   Edit the owner in the entry if the daemon runs as another account.
+
+3. Set the three keys above the first table in `server.toml` and restart:
+
+   ```toml
+   ingest_socket_path = "/run/sparrow-ingest/ingest.sock"
+   ingest_socket_gid = 948          # getent group sparrow-ingest | cut -d: -f3
+   max_ingest_connections = 16      # optional; 1..256, default 16
+   ```
+
+The socket's directory must be outside `data_dir`. At startup the daemon
+refuses to start unless that directory is a real directory, not a symbolic
+link, owned by the daemon's uid, with group `ingest_socket_gid` and mode exactly
+2750. After binding, the socket must have that group, inherited from the setgid
+directory, and the daemon sets mode 0660; a mismatch also stops startup. The
+daemon's own account does not need to be in the group: it owns the directory,
+and the setgid bit, not its membership, gives the socket the group.
+
+`max_ingest_connections` is a ceiling separate from `max_rpc_connections`, so
+producers cannot use up the connections the CLI and MCP need. Over it, a
+producer connection is dropped unanswered. A connection whose credentials the
+kernel cannot report is refused and logged. `status` lists the socket's path,
+group, ceiling, active connections and refused connections. An import is bound
+to the account that began it; another account's attempt to continue it is
+refused with `PERMISSION_DENIED`. A query-only daemon refuses
+`ingest_socket_path`.
+
 Validate the unit files, and their security exposure, without loading them.
 Before `install.sh` has run, `verify` reports that
 `/usr/local/libexec/sparrow/sparrowd` is missing; that line is expected, and

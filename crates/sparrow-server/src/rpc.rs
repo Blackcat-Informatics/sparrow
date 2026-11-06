@@ -80,10 +80,14 @@ pub struct Rpc {
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
     query_only: bool,
+    /// Present only on an ingest-socket connection: the caller its evidence records.
+    intake: Option<sparrow_core::Intake>,
+    /// The configured ingest socket's counters, reported by `status`.
+    ingest_socket: Option<crate::ingest_socket::IngestSocket>,
 }
 
-/// The full typed service is already authorized; only an anonymous TCP gate runs CHAP.
-fn chap_unsupported() -> Error {
+/// The full typed service and the ingest socket run no CHAP; only anonymous TCP does.
+pub(crate) fn chap_unsupported() -> Error {
     Error::new(
         "UNSUPPORTED",
         "CHAP applies only to an anonymous public TCP connection".to_owned(),
@@ -161,6 +165,8 @@ impl Rpc {
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
             query_only: false,
+            intake: None,
+            ingest_socket: None,
         }
     }
 
@@ -203,6 +209,33 @@ impl Rpc {
     pub fn with_syslog(mut self, registry: crate::syslog_listener::SyslogRegistry) -> Self {
         self.syslog = registry;
         self
+    }
+
+    /// Report this configured ingest socket in `status`.
+    #[must_use]
+    pub fn with_ingest_socket(mut self, socket: crate::ingest_socket::IngestSocket) -> Self {
+        self.ingest_socket = Some(socket);
+        self
+    }
+
+    /// Record this ingest-socket caller on every artifact, record and import it creates.
+    pub(crate) fn with_peer(mut self, credential: sparrow_core::PeerCredential) -> Self {
+        self.intake = Some(sparrow_core::Intake::IngestSocket(credential));
+        self
+    }
+
+    /// Run one import operation only for the caller its importBegin bound.
+    async fn import_work<T: Send + 'static>(
+        &self,
+        id: String,
+        operation: impl FnOnce(&Store, &str, u64) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let caller = self.intake;
+        self.work(move |store, now| {
+            store.import_admit(&id, caller.as_ref(), now)?;
+            operation(&store, &id, now)
+        })
+        .await
     }
 
     /// Attach the one bounded administration worker; requires two connection slots.
@@ -856,6 +889,7 @@ fn artifact(
         .set_unix_millis(value.expires_at);
     out.set_byte_length(value.byte_length);
     out.set_payload_id(&value.payload_id);
+    intake(out.reborrow().init_intake(), value.intake.as_ref());
     let mut records = out.init_record_ids(
         value
             .record_ids
@@ -867,6 +901,20 @@ fn artifact(
         records.set(index as u32, id);
     }
     Ok(())
+}
+
+/// The typed form of an artifact's or record's ingest-socket provenance.
+fn intake(mut out: wire::optional_intake::Builder<'_>, value: Option<&sparrow_core::Intake>) {
+    match value {
+        Some(sparrow_core::Intake::IngestSocket(credential)) => {
+            let mut out = out.init_value();
+            out.set_endpoint(wire::IntakeEndpoint::IngestSocket);
+            out.set_uid(credential.uid);
+            out.set_gid(credential.gid);
+            out.set_pid(credential.pid);
+        }
+        None => out.set_absent(()),
+    }
 }
 
 fn durability_watermark(
@@ -980,6 +1028,7 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> cap
     crate::diagnostics::snapshot(out.reborrow().init_diagnostics(), &value.diagnostics);
     crate::syslog_wire::snapshot(out.reborrow().init_syslog(), value.syslog.as_ref())?;
     crate::tail_wire::position(out.reborrow().init_tail(), value.tail.as_ref())?;
+    intake(out.reborrow().init_intake(), value.intake.as_ref());
     match value.receiver {
         Some(position) => {
             let mut receiver = out.reborrow().init_receiver().init_value();
@@ -1821,6 +1870,7 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
+        let intake = self.intake;
         match self
             .work(move |store, now| {
                 store.define_time_profile(
@@ -1828,7 +1878,7 @@ impl wire::sparrow::Server for Rpc {
                     "/event_time",
                     sparrow_core::TimeRepresentation::UnixMillis,
                 )?;
-                store.ingest_producer(
+                store.ingest_producer_with_intake(
                     &input.request_id,
                     &input.source,
                     &bytes,
@@ -1836,6 +1886,7 @@ impl wire::sparrow::Server for Rpc {
                         instance: input.client_instance,
                         sequences: input.events.iter().map(|event| event.sequence).collect(),
                     },
+                    intake,
                     now,
                     mode,
                 )
@@ -1875,10 +1926,13 @@ impl wire::sparrow::Server for Rpc {
         let payload = payload.to_owned();
         let kind = format(input.get_format()?);
         let length = input.get_byte_length();
+        let intake = self.intake;
         match self
             .work(move |store, now| {
                 Ok((
-                    store.import_start(&request, &source, kind, length, &payload, now)?,
+                    store.import_start_with_intake(
+                        &request, &source, kind, length, &payload, intake, now,
+                    )?,
                     store.store_id()?,
                 ))
             })
@@ -1923,9 +1977,9 @@ impl wire::sparrow::Server for Rpc {
         let bytes = bytes.to_vec();
         let offset = input.get_offset();
         match self
-            .work(move |store, now| {
+            .import_work(id, move |store, id, now| {
                 Ok((
-                    store.import_append(&id, offset, &bytes, now)?,
+                    store.import_append(id, offset, &bytes, now)?,
                     store.store_id()?,
                 ))
             })
@@ -2074,7 +2128,9 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| Ok((store.import_get(&id, now)?, store.store_id()?)))
+            .import_work(id, |store, id, now| {
+                Ok((store.import_get(id, now)?, store.store_id()?))
+            })
             .await
         {
             Ok((value, store)) => {
@@ -2098,7 +2154,9 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| Ok((store.import_seal(&id, now)?, store.store_id()?)))
+            .import_work(id, |store, id, now| {
+                Ok((store.import_seal(id, now)?, store.store_id()?))
+            })
             .await
         {
             Ok((value, store)) => {
@@ -2122,7 +2180,9 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| Ok((store.import_prepare_layout(&id, now)?, store.store_id()?)))
+            .import_work(id, |store, id, now| {
+                Ok((store.import_prepare_layout(id, now)?, store.store_id()?))
+            })
             .await
         {
             Ok((value, store)) => {
@@ -2148,9 +2208,9 @@ impl wire::sparrow::Server for Rpc {
         };
         let expected = input.get_expected_record();
         match self
-            .work(move |store, now| {
+            .import_work(id, move |store, id, now| {
                 Ok((
-                    store.import_prepare_record(&id, expected, now)?,
+                    store.import_prepare_record(id, expected, now)?,
                     store.store_id()?,
                 ))
             })
@@ -2177,7 +2237,9 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| Ok((store.import_publish(&id, now)?, store.store_id()?)))
+            .import_work(id, |store, id, now| {
+                Ok((store.import_publish(id, now)?, store.store_id()?))
+            })
             .await
         {
             Ok((value, store)) => artifact(results.get().init_result().init_ok(), value, &store)?,
@@ -2745,6 +2807,10 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_query_only(self.query_only);
+                match &self.ingest_socket {
+                    Some(socket) => socket.encode(out.reborrow().init_ingest_socket().init_value()),
+                    None => out.reborrow().init_ingest_socket().set_absent(()),
+                }
                 let mut syslog_rows = out.reborrow().init_syslog_listeners(syslog.len() as u32);
                 for (index, status) in syslog.iter().enumerate() {
                     status.encode(syslog_rows.reborrow().get(index as u32));
@@ -2820,9 +2886,10 @@ impl wire::sparrow::Server for Rpc {
         let source = request.get_source()?.to_str()?.to_owned();
         let format = format(request.get_format()?);
         let mode = durability_mode(request.get_durability()?);
+        let intake = self.intake;
         match self
             .work(move |store, now| {
-                store.ingest_with_durability(&request_id, &source, format, &bytes, now, mode)
+                store.ingest_with_intake(&request_id, &source, format, &bytes, intake, now, mode)
             })
             .await
         {

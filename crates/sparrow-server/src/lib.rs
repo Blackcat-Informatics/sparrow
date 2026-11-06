@@ -17,6 +17,8 @@ mod time_wire;
 pub use config::{ConsumeWatch, ProducerContract, ServerConfig};
 pub mod consumption;
 mod handoff;
+mod ingest_gate;
+pub mod ingest_socket;
 mod pressure;
 mod query_only;
 mod recompression;

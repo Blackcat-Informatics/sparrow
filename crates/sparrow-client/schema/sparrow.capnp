@@ -26,7 +26,13 @@ struct Artifact {
   payloadId @7 :Text; recordIds @8 :List(Text);
   durability @9 :Durability = durable;
   bufferedThrough @10 :OptionalDurabilityWatermark;
+  # Schema 68: endpoint and caller identity, present only for ingest-socket evidence.
+  intake @11 :OptionalIntake;
 }
+enum IntakeEndpoint { ingestSocket @0; }
+# The SO_PEERCRED identity the ingest socket read when it accepted the connection.
+struct Intake { endpoint @0 :IntakeEndpoint; uid @1 :UInt32; gid @2 :UInt32; pid @3 :UInt32; }
+struct OptionalIntake { union { absent @0 :Void; value @1 :Intake; } }
 struct ArtifactRef { storeId @0 :Text; id @1 :Text; }
 struct ArtifactOrigin {
   format @0 :Format; receivedAt @1 :Instant; expiresAt @2 :Instant;
@@ -81,6 +87,7 @@ struct Record {
   syslog @11 :OptionalSyslogSnapshot;
   tail @12 :OptionalTailPosition;
   receiver @13 :OptionalReceiverPosition;
+  intake @14 :OptionalIntake;
 }
 struct TailDeclaration {
   requestId @0 :Text; watch @1 :Text; watchRevision @2 :UInt64;
@@ -235,7 +242,14 @@ struct Status {
   sparqlReadLeaseMs @48 :UInt64;
   recompression @49 :RecompressionStatus;
   queryOnly @50 :Bool; retentionSeconds @51 :UInt64;
+  # Schema 68: the group-accessible ingest-only Unix socket, when configured.
+  ingestSocket @52 :OptionalIngestSocketStatus;
 }
+struct IngestSocketStatus {
+  path @0 :Text; gid @1 :UInt32; maxConnections @2 :UInt32;
+  activeConnections @3 :UInt32; refusedConnections @4 :UInt64;
+}
+struct OptionalIngestSocketStatus { union { absent @0 :Void; value @1 :IngestSocketStatus; } }
 
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
 struct Discovery {

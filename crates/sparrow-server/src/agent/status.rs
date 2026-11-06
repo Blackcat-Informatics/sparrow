@@ -121,7 +121,27 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             );
         watches.push(Value::from(status));
     }
+    let ingest_socket = match value.get_ingest_socket()?.which()? {
+        wire::optional_ingest_socket_status::Absent(()) => Value::Null,
+        wire::optional_ingest_socket_status::Value(socket) => {
+            let socket = socket?;
+            Object::new()
+                .with("path", socket.get_path()?.to_str()?)
+                .with("gid", u64::from(socket.get_gid()))
+                .with("max_connections", u64::from(socket.get_max_connections()))
+                .with(
+                    "active_connections",
+                    u64::from(socket.get_active_connections()),
+                )
+                .with(
+                    "refused_connections",
+                    socket.get_refused_connections().to_string(),
+                )
+                .into()
+        }
+    };
     let output = Object::new()
+        .with("ingest_socket", ingest_socket)
         .with(
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,

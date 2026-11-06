@@ -782,6 +782,35 @@ pub(super) fn stream_metadata(
     Ok(())
 }
 
+/// Ingest-socket provenance: the endpoint and the kernel-reported caller identity.
+fn intake_metadata(
+    builder: &mut purrdf::RdfDatasetBuilder,
+    subject: purrdf::ir::TermId,
+    intake: Option<&super::intake::Intake>,
+) -> Result<(), Error> {
+    use purrdf::RdfLiteral;
+    let Some(intake) = intake else {
+        return Ok(());
+    };
+    let predicate = builder.intern_iri("urn:sparrow:vocab:intakeEndpoint")?;
+    let object = builder.intern_literal(RdfLiteral::simple(intake.endpoint()))?;
+    builder.push_quad(subject, predicate, object, None)?;
+    let credential = intake.credential();
+    for (name, value) in [
+        ("peerUid", credential.uid),
+        ("peerGid", credential.gid),
+        ("peerPid", credential.pid),
+    ] {
+        let predicate = builder.intern_iri(&format!("urn:sparrow:vocab:{name}"))?;
+        let object = builder.intern_literal(RdfLiteral::typed(
+            value.to_string(),
+            "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+        ))?;
+        builder.push_quad(subject, predicate, object, None)?;
+    }
+    Ok(())
+}
+
 pub(super) fn artifact_metadata(
     artifact: &super::Artifact,
 ) -> Result<std::sync::Arc<RdfDataset>, Error> {
@@ -816,6 +845,7 @@ pub(super) fn artifact_metadata(
         let predicate = builder.intern_iri(&format!("urn:sparrow:vocab:{name}"))?;
         builder.push_quad(subject, predicate, object, None)?;
     }
+    intake_metadata(&mut builder, subject, artifact.intake.as_ref())?;
     metadata_dataset(builder)
 }
 
@@ -978,6 +1008,7 @@ pub(super) fn metadata(
         let object = builder.intern_iri(&graph_iri(&record.rdf_projection_id))?;
         builder.push_quad(subject, predicate, object, None)?;
     }
+    intake_metadata(&mut builder, subject, record.intake.as_ref())?;
     super::tracing_rdf::append(&mut builder, record, subject, facts)?;
     metadata_dataset(builder)
 }

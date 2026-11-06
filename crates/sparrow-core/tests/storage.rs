@@ -18049,7 +18049,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
     // The log time law is removed so the format identity alone decides the refusal.
     let db = catalog_db(dir.path()).unwrap();
     db.put("archive:through", through).unwrap();
-    db.put("store_format", b"sparrow.store/110").unwrap();
+    db.put("store_format", b"sparrow.store/132").unwrap();
     db.delete("log-time-profile-law").unwrap();
     drop(db);
     assert_eq!(

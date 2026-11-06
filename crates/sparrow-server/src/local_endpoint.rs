@@ -23,6 +23,38 @@ impl LocalEndpoint {
                 "local endpoint must be inside the owned private store",
             ));
         }
+        let endpoint = Self::bind_recovering(path).await?;
+        // Members of the daemon's group connect; data_dir (0710) admits no one else.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+        Ok(endpoint)
+    }
+
+    /// The ingest socket: a checked setgid directory outside the store, and a socket that
+    /// inherited its group and carries mode 0660. A mismatch fails startup.
+    pub(super) async fn bind_ingest(path: &Path, gid: u32) -> io::Result<Self> {
+        let directory = path
+            .parent()
+            .ok_or_else(|| io::Error::other("ingest socket path has no directory"))?;
+        sparrow_server::ingest_socket::check_directory(
+            directory,
+            rustix::process::geteuid().as_raw(),
+            gid,
+        )?;
+        let endpoint = Self::bind_recovering(path).await?;
+        let checked = std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(sparrow_server::ingest_socket::SOCKET_MODE),
+        )
+        .and_then(|()| sparrow_server::ingest_socket::check_socket(path, gid));
+        if let Err(error) = checked {
+            endpoint.remove_name()?;
+            return Err(error);
+        }
+        Ok(endpoint)
+    }
+
+    /// Bind `path`, replacing a stale name only after a refused connection proves it dead.
+    async fn bind_recovering(path: &Path) -> io::Result<Self> {
         let listener = match tokio::net::UnixListener::bind(path) {
             Ok(listener) => listener,
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
@@ -63,8 +95,6 @@ impl LocalEndpoint {
             Err(error) => return Err(error),
         };
         let identity = socket_identity(path)?;
-        // Members of the daemon's group connect; data_dir (0710) admits no one else.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
         Ok(Self {
             listener,
             path: path.to_owned(),

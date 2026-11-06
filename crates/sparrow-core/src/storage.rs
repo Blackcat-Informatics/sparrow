@@ -33,6 +33,7 @@ pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
 pub(crate) mod ingest_status;
+pub(crate) mod intake;
 pub(crate) mod log_time;
 mod manifest_retire;
 pub(crate) mod pin_read;
@@ -376,6 +377,8 @@ pub struct Artifact {
     pub payload_id: String,
     /// Addressable records in source order.
     pub record_ids: Vec<String>,
+    /// Endpoint and caller identity, present only for evidence accepted on the ingest socket.
+    pub intake: Option<intake::Intake>,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -413,6 +416,8 @@ pub struct Record {
     pub syslog: Option<syslog::SyslogSnapshot>,
     /// Immutable original file-generation byte position, when tailed.
     pub tail: Option<tail::TailPosition>,
+    /// Endpoint and caller identity, present only for evidence accepted on the ingest socket.
+    pub intake: Option<intake::Intake>,
     chunks: Vec<String>,
     evicted: bool,
 }
@@ -608,7 +613,7 @@ impl purrdf_lex::json::record::ToJson for Pin {
 
 impl Catalog for Artifact {
     fn encode(&self) -> Value {
-        Object::new()
+        let object = Object::new()
             .with("id", self.id.clone())
             .with("source", self.source.clone())
             .with("format", self.format.clone())
@@ -618,8 +623,12 @@ impl Catalog for Artifact {
             .with("payload_id", self.payload_id.clone())
             .with("record_ids", self.record_ids.clone())
             .with("chunks", self.chunks.clone())
-            .with("evicted", self.evicted)
-            .into()
+            .with("evicted", self.evicted);
+        // Absent intake keeps the catalog row of evidence from every other endpoint unchanged.
+        match &self.intake {
+            Some(intake) => object.with("intake", intake.encode()).into(),
+            None => object.into(),
+        }
     }
 
     fn decode(v: &Value) -> Result<Self, Error> {
@@ -633,6 +642,7 @@ impl Catalog for Artifact {
             byte_length: integer(v, "byte_length")?,
             payload_id: read_field::<String>(v, "payload_id")?,
             record_ids: read_field::<Vec<String>>(v, "record_ids")?,
+            intake: intake::decode_member(v)?,
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             evicted: read_field(v, "evicted")?,
         })
@@ -645,7 +655,7 @@ impl Catalog for Artifact {
 
 impl Catalog for Record {
     fn encode(&self) -> Value {
-        Object::new()
+        let object = Object::new()
             .with("id", self.id.clone())
             .with("artifact_id", self.artifact_id.clone())
             .with("source", self.source.clone())
@@ -662,8 +672,11 @@ impl Catalog for Record {
             .with("syslog", self.syslog.as_ref().map(Catalog::encode))
             .with("tail", self.tail.as_ref().map(Catalog::encode))
             .with("chunks", self.chunks.clone())
-            .with("evicted", self.evicted)
-            .into()
+            .with("evicted", self.evicted);
+        match &self.intake {
+            Some(intake) => object.with("intake", intake.encode()).into(),
+            None => object.into(),
+        }
     }
 
     fn decode(v: &Value) -> Result<Self, Error> {
@@ -708,6 +721,7 @@ impl Catalog for Record {
                 .filter(|value| !value.is_null())
                 .map(tail::TailPosition::decode)
                 .transpose()?,
+            intake: intake::decode_member(v)?,
             chunks: read_field::<Vec<String>>(v, "chunks")?,
             syslog: v
                 .get("syslog")
@@ -1509,12 +1523,31 @@ impl Store {
         now: u64,
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
+        self.ingest_with_intake(request_id, source, format, bytes, None, now, mode)
+    }
+
+    /// Accept a complete atomic artifact, recording the endpoint and caller that sent it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the ingest request, its intake provenance and its WAL boundary"
+    )]
+    pub fn ingest_with_intake(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        bytes: &[u8],
+        intake: Option<intake::Intake>,
+        now: u64,
+        mode: durability::Durability,
+    ) -> Result<Artifact, Error> {
         self.ingest_input(
             request_id,
             source,
             format,
             bytes,
             ingest::Origin::Ordinary,
+            intake,
             now,
             mode,
         )
@@ -1530,6 +1563,24 @@ impl Store {
         now: u64,
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
+        self.ingest_producer_with_intake(request_id, source, bytes, producer, None, now, mode)
+    }
+
+    /// Accept typed events, recording the endpoint and caller that sent them.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the event batch, its intake provenance and its WAL boundary"
+    )]
+    pub fn ingest_producer_with_intake(
+        &self,
+        request_id: &str,
+        source: &str,
+        bytes: &[u8],
+        producer: &producer_stream::ProducerBatch,
+        intake: Option<intake::Intake>,
+        now: u64,
+        mode: durability::Durability,
+    ) -> Result<Artifact, Error> {
         producer.validate()?;
         self.ingest_input(
             request_id,
@@ -1537,6 +1588,7 @@ impl Store {
             "jsonl",
             bytes,
             ingest::Origin::Producer(producer),
+            intake,
             now,
             mode,
         )
@@ -1553,6 +1605,7 @@ impl Store {
         format: &str,
         bytes: &[u8],
         origin: ingest::Origin<'_>,
+        intake: Option<intake::Intake>,
         now: u64,
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
@@ -1588,6 +1641,7 @@ impl Store {
             bytes.len() as u64,
             &payload_id,
             origin,
+            intake.as_ref(),
             now,
         )? {
             return writer.receipt(receipt, mode);
@@ -1597,6 +1651,9 @@ impl Store {
                 "CONFLICT",
                 "request has a staged import; resume it through import_start",
             ));
+        }
+        if intake.is_some() {
+            intake::fence(&writer)?;
         }
         let source_time_profile = writer.time_profile(source)?;
         let diagnostic_profile = writer.diagnostic_profile(source)?;
@@ -1673,6 +1730,7 @@ impl Store {
                         source_start: checkpoint.offset + start as u64,
                         source_end: checkpoint.offset + end as u64,
                     }),
+                intake,
             })?;
             put(&mut prepared.batch, &record.id, &record);
             prepared.batch.put(
@@ -1692,6 +1750,7 @@ impl Store {
             byte_length: bytes.len() as u64,
             payload_id,
             record_ids: records,
+            intake,
             chunks: Vec::new(),
             evicted: false,
         };

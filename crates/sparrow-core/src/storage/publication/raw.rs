@@ -215,6 +215,7 @@ pub(super) fn advance(
         producer: None,
         receiver: None,
         tail: None,
+        intake: manifest.intake,
         id: raw.record_id,
         artifact_id: &progress.artifact_id,
         source: &manifest.source,

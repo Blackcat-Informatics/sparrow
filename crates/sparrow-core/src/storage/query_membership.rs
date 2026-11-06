@@ -335,6 +335,7 @@ mod tests {
             receiver: None,
             syslog: None,
             tail: None,
+            intake: None,
             chunks: Vec::new(),
             evicted: false,
         };

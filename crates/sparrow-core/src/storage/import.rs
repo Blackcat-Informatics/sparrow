@@ -121,13 +121,15 @@ pub struct ImportManifest {
     pub published_artifact: Option<String>,
     /// Source ownership persists until its consumption journal is resolved.
     pub consumption: bool,
+    /// Endpoint and caller of the connection that began the import; it binds the import.
+    pub intake: Option<super::intake::Intake>,
     reclaimed_chunks: u64,
     reclaimed_layout_pages: u64,
 }
 
 impl Catalog for ImportManifest {
     fn encode(&self) -> Value {
-        Object::new()
+        let object = Object::new()
             .with("id", self.id.clone())
             .with("request_id", self.request_id.clone())
             .with("source", self.source.clone())
@@ -145,8 +147,11 @@ impl Catalog for ImportManifest {
             .with(
                 "reclaimed_layout_pages",
                 self.reclaimed_layout_pages.to_string(),
-            )
-            .into()
+            );
+        match &self.intake {
+            Some(intake) => object.with("intake", intake.encode()).into(),
+            None => object.into(),
+        }
     }
 
     fn decode(value: &Value) -> Result<Self, Error> {
@@ -186,12 +191,14 @@ impl Catalog for ImportManifest {
                 .map(|_| integer(value, "reclaimed_layout_pages"))
                 .transpose()?
                 .unwrap_or(0),
+            intake: super::intake::decode_member(value)?,
         };
         validate_ingest_labels(&manifest.request_id, &manifest.source, &manifest.format)
             .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
         let lines = ["jsonl", "log"].contains(&manifest.format.as_str());
         if manifest.id != import_id(&manifest.request_id)
             || manifest.consumption != manifest.request_id.starts_with("consume:")
+            || (manifest.consumption && manifest.intake.is_some())
             || !valid_payload_id(&manifest.payload_id)
             || manifest.received_bytes > manifest.byte_length
             || (manifest.received_bytes != manifest.byte_length
@@ -505,8 +512,15 @@ impl Store {
         payload_id: &str,
         now: u64,
     ) -> Result<ImportManifest, Error> {
-        self.lock()?
-            .begin_import(request_id, source, format, byte_length, payload_id, now)
+        self.lock()?.begin_import(
+            request_id,
+            source,
+            format,
+            byte_length,
+            payload_id,
+            None,
+            now,
+        )
     }
 
     /// Lower this open store's whole-record ceiling for import layouts so a test can
@@ -566,6 +580,33 @@ impl Store {
         payload_id: &str,
         now: u64,
     ) -> Result<ImportStart, Error> {
+        self.import_start_with_intake(
+            request_id,
+            source,
+            format,
+            byte_length,
+            payload_id,
+            None,
+            now,
+        )
+    }
+
+    /// Start or resume an import bound to the endpoint and caller that began it. Its
+    /// published artifact and records carry that intake; see [`Store::import_admit`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the declared import, its intake binding and the acceptance clock"
+    )]
+    pub fn import_start_with_intake(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        byte_length: u64,
+        payload_id: &str,
+        intake: Option<super::intake::Intake>,
+        now: u64,
+    ) -> Result<ImportStart, Error> {
         validate_ingest_labels(request_id, source, format)?;
         if !valid_payload_id(payload_id) {
             return Err(Error::new(
@@ -582,6 +623,7 @@ impl Store {
             byte_length,
             payload_id,
             super::ingest::Origin::Ordinary,
+            intake.as_ref(),
             now,
         )? {
             return Ok(ImportStart::Accepted(
@@ -589,8 +631,38 @@ impl Store {
             ));
         }
         writer
-            .begin_import(request_id, source, format, byte_length, payload_id, now)
+            .begin_import(
+                request_id,
+                source,
+                format,
+                byte_length,
+                payload_id,
+                intake,
+                now,
+            )
             .map(ImportStart::Staging)
+    }
+
+    /// Refuse a caller other than the one that began this import. A missing or
+    /// malformed import is left for the operation itself to report.
+    pub fn import_admit(
+        &self,
+        id: &str,
+        caller: Option<&super::intake::Intake>,
+        now: u64,
+    ) -> Result<(), Error> {
+        if !id.starts_with("import:") {
+            return Ok(());
+        }
+        let writer = self.lock()?;
+        let bound = match super::publication::published(&writer, id, now)? {
+            Some((manifest, _)) => manifest.intake,
+            None => match writer.db.get(id)? {
+                Some(bytes) => ImportManifest::decode(&parse(&bytes)?)?.intake,
+                None => return Ok(()),
+            },
+        };
+        super::intake::admit_import(bound.as_ref(), caller)
     }
 
     /// Recover the committed offset and fixed lease after a client/daemon restart.
@@ -969,6 +1041,10 @@ impl Store {
 }
 
 impl Writer {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the declared import, its intake binding and the acceptance clock"
+    )]
     fn begin_import(
         &self,
         request_id: &str,
@@ -976,6 +1052,7 @@ impl Writer {
         format: &str,
         byte_length: u64,
         payload_id: &str,
+        intake: Option<super::intake::Intake>,
         now: u64,
     ) -> Result<ImportManifest, Error> {
         validate_ingest_labels(request_id, source, format)?;
@@ -987,6 +1064,12 @@ impl Writer {
         }
         let writer = self;
         let consumption = writer.require_consumption(request_id, source, format, byte_length)?;
+        if consumption && intake.is_some() {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "consumption imports belong to the daemon's watches, not to an ingest-socket caller",
+            ));
+        }
         let id = import_id(request_id);
         if let Some(previous) = super::publication::published(writer, &id, now)? {
             let saved = previous.0;
@@ -1001,6 +1084,7 @@ impl Writer {
                     "published import request has different declared input",
                 ));
             }
+            super::intake::admit_import(saved.intake.as_ref(), intake.as_ref())?;
             return Ok(saved);
         }
         if writer
@@ -1011,6 +1095,7 @@ impl Writer {
                 byte_length,
                 payload_id,
                 super::ingest::Origin::Ordinary,
+                intake.as_ref(),
                 now,
             )?
             .is_some()
@@ -1033,6 +1118,7 @@ impl Writer {
                     "import request identity has different declared input",
                 ));
             }
+            super::intake::admit_import(previous.intake.as_ref(), intake.as_ref())?;
             previous.require_live(now)?;
             return Ok(previous);
         }
@@ -1078,11 +1164,15 @@ impl Writer {
             layout_complete: false,
             published_artifact: None,
             consumption,
+            intake,
             reclaimed_layout_pages: 0,
         };
         let mut batch = WriteBatch::default();
         put(&mut batch, &manifest.id, &manifest);
         writer.admit_import_batch(&batch)?;
+        if intake.is_some() {
+            super::intake::fence(writer)?;
+        }
         writer.commit(batch)?;
         Ok(manifest)
     }

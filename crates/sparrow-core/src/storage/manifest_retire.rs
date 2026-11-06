@@ -238,6 +238,15 @@ pub(super) fn header(
                 chunks = Some(strings(&mut reader, remaining, skip, take, None)?);
                 json::Value::array(Vec::<String>::new())
             }
+            // The one bounded object member; the artifact codec checks its shape.
+            "intake" => {
+                let slice = &bytes[reader.skip_value()?];
+                reserve(
+                    remaining,
+                    slice.len().saturating_mul(64).saturating_add(1024),
+                )?;
+                json::read_slice(slice, CATALOG_LIMITS)?
+            }
             _ => {
                 let start = match reader.next_event()? {
                     json::Event::String(raw) => raw.span().start - 1,
