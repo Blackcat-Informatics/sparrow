@@ -86,6 +86,20 @@ fingerprints = []
 names = ['^(compile_log_time_elsewhere|match_log_time_elsewhere|guess_log_timezone)$']
 
 [[job]]
+id = "event-time-receipt-fallback"
+summary = "One read-time law places a record on the event timeline: its source instant with basis source, or its receipt time with basis receipt. Records reads, RPC rendering and RDF metadata use it; stored records keep their unknown reason. Correlation expresses the same law in its native SPARQL recipe."
+home = "sparrow_core::storage::source_time::EventTime::placement"
+entry_points = ["sparrow_core::storage::text_index::Store::records_query_stage", "sparrow_core::storage::rdf_index::event_time_metadata", "sparrow_core::storage::rdf_index::fallback_metadata", "sparrow_core::storage::source_time::EventPlacement::receipt", "sparrow_server::rpc::event_time", "sparrow_server::agent::source_time::event"]
+spec = "docs/interfaces.md: receipt-time event fallback (schema 69)."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(fallback_event_time|receipt_fallback_millis|event_or_receipt_time)$']
+
+[[job]]
 id = "log-time-control-wire"
 summary = "Definitions and returned profiles share bounded capture wire encoding/decoding; CLI and MCP source time definitions share one closed native JSON input codec."
 home = "sparrow_server::time_wire::capture"
@@ -126,6 +140,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(copy_tracing_upgrade_pager|append_unowned_tracing_graph)$']
+
+[[job]]
+id = "event-fallback-rdf-backfill"
+summary = "One startup migration fences older writers into the fallback families and adds eventTimeFallback/eventTimeBasis to every retained record metadata graph without eventTime, published or privately prepared, deriving the receipt placement from the graph's own receivedAt. It reuses the shared catalog pager, the shared stored-metadata loader and the one fallback metadata builder; stored records are not read."
+home = "sparrow_core::storage::event_fallback_rdf::upgrade"
+entry_points = ["sparrow_core::storage::event_fallback_rdf::publish", "sparrow_core::storage::rdf_index::stored_metadata", "sparrow_core::storage::rdf_index::fallback_metadata", "sparrow_core::storage::writer_format::enable_event_fallback"]
+spec = "docs/interfaces.md: receipt-time event fallback (schema 69)."
+vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(copy_fallback_upgrade_pager|decode_metadata_graph_elsewhere|append_fallback_triples_elsewhere)$']
 
 [[job]]
 id = "native-correlation-recipes"
@@ -4396,7 +4424,7 @@ names = ['^(copy_rdf_retirement_into_test_fixture|remove_artifact_rdf_upgrade_el
 id = "owned-provenance-rdf-upgrade"
 summary = "One bounded startup migration augments actual metadata graph owners, including private preparation, using native term codecs and builders; replacement reuses the existing dictionary and reference writer."
 home = "sparrow_core::storage::provenance_rdf::upgrade"
-entry_points = ["sparrow_core::storage::provenance_rdf::publish", "sparrow_core::storage::catalog_upgrade::json_charge", "sparrow_core::storage::provenance_rdf::failure", "sparrow_core::storage::rdf_index::RdfWrite::replace_metadata", "sparrow_core::storage::rdf_index::manifest_rows"]
+entry_points = ["sparrow_core::storage::provenance_rdf::publish", "sparrow_core::storage::catalog_upgrade::json_charge", "sparrow_core::storage::provenance_rdf::failure", "sparrow_core::storage::rdf_index::RdfWrite::replace_metadata", "sparrow_core::storage::rdf_index::manifest_rows", "sparrow_core::storage::rdf_index::stored_metadata"]
 spec = "docs/interfaces.md: Source and Stream provenance ownership."
 vectors = ["crates/sparrow-core/src/storage/rdf_index.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []

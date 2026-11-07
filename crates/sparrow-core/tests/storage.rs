@@ -32,7 +32,7 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/88")
+        Some("sparrow.store/143")
     );
     assert_eq!(
         store
@@ -146,7 +146,64 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         300,
         &sparrow_core::QueryCancellation::default(),
     );
-    assert_eq!(correlated.unwrap_err().code, "INDEX_NOT_READY");
+    // Unknown clocks are placed at receipt time, so strict event correlation is complete;
+    // the fallback records (received at 200 and 201) lie outside this interval.
+    let correlated = correlated.unwrap();
+    assert!(
+        correlated.body.captured().outcome.is_ok(),
+        "{:?}",
+        correlated.body.captured().outcome
+    );
+    assert_eq!(correlated.total_items, 1);
+    // A source time that depends on a failed JSON projection is not ready evidence: strict
+    // event-clock correlation refuses it, as a strict records read does, while the receipt
+    // clock does not depend on it.
+    store
+        .define_time_profile("log-clock-json", "/t", TimeRepresentation::UnixMillis)
+        .unwrap();
+    let failed = store
+        .ingest(
+            "log-clock-json-failed",
+            "log-clock-json",
+            "json",
+            b"{invalid}",
+            202,
+        )
+        .unwrap();
+    assert!(matches!(
+        &store.record(&failed.record_ids[0]).unwrap().event_time,
+        EventTime::Unknown { reason, .. } if reason == "projection_failed"
+    ));
+    let mut failed_scope = record_page_scope("log-clock-json", 1000);
+    failed_scope.require_complete_index = true;
+    let correlate_failed = |clock| {
+        store.correlate_read(
+            &sparrow_core::CorrelateRead {
+                scope: &failed_scope,
+                selector: &sparrow_core::CorrelationSelector::Evidence(vec![
+                    failed.record_ids[0].clone(),
+                ]),
+                relation: sparrow_core::CorrelationRelation::Time(
+                    sparrow_core::CorrelationInterval {
+                        clock,
+                        from: 0,
+                        before: 1000,
+                    },
+                ),
+                governors: &purrdf::sparql::QueryGovernors::METERED,
+                limits: sparrow_core::RdfReadLimits::default(),
+            },
+            300,
+            &sparrow_core::QueryCancellation::default(),
+        )
+    };
+    assert_eq!(
+        correlate_failed(sparrow_core::CorrelationClock::Event)
+            .unwrap_err()
+            .code,
+        "INDEX_NOT_READY"
+    );
+    assert!(correlate_failed(sparrow_core::CorrelationClock::Received).is_ok());
     let pin = store
         .pin(
             "log-time-pin",
@@ -161,16 +218,16 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/88")
+        Some("sparrow.store/143")
     );
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/90")
+        Some("sparrow.store/145")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
-    db.put("store_format", b"sparrow.store/79").unwrap();
+    db.put("store_format", b"sparrow.store/134").unwrap();
     drop(db);
     assert!(
         Store::open(dir.path(), config())
@@ -180,7 +237,7 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
             .contains("log time")
     );
     let db = catalog_db(dir.path()).unwrap();
-    db.put("store_format", b"sparrow.store/90").unwrap();
+    db.put("store_format", b"sparrow.store/145").unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(store.time_profile("log-clock").unwrap(), Some(profile));
@@ -230,7 +287,7 @@ fn native_log_time_refusals_do_not_publish_records_or_guess_optional_captures() 
         assert!(store.time_profile("invalid-log-map").unwrap().is_none());
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some("sparrow.store/77")
+            Some("sparrow.store/132")
         );
     }
     store
@@ -376,6 +433,44 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
             Durability::Durable,
         )
         .unwrap();
+    // A plain record with an unknown source time, whose graph the tracing backfill leaves alone.
+    let plain = store
+        .ingest(
+            "fallback-backfill",
+            "fallback-backfill",
+            "log",
+            b"no time\n",
+            3,
+        )
+        .unwrap();
+    let plain_id = plain.record_ids[0].clone();
+    // A staged import prepared but not published: its record graph exists before any
+    // public catalog row, survives the restart, and publication later reuses it.
+    let staged = stage_fixture(&store, "fallback-staged", "log", b"staged\n");
+    let prepared = store.import_prepare_record(&staged.id, 0, 4).unwrap();
+    assert_eq!(prepared.prepared_records, staged.layout_records);
+    let private_rows = |db: &rocksdb::DB| {
+        db.prefix_iterator(b"rdf:graph:record:")
+            .map(Result::unwrap)
+            .take_while(|(key, _)| key.starts_with(b"rdf:graph:record:"))
+            .filter(|(key, _)| db.get(&key[b"rdf:graph:".len()..]).unwrap().is_none())
+            .map(|(_, bytes)| {
+                purrdf_lex::json::read_slice(&bytes, purrdf_lex::json::Limits::DEFAULT).unwrap()
+                    ["rows"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .collect::<Vec<_>>()
+    };
+    let plain_rows = |db: &rocksdb::DB| {
+        let manifest = purrdf_lex::json::read_slice(
+            &db.get(format!("rdf:graph:{plain_id}")).unwrap().unwrap(),
+            purrdf_lex::json::Limits::DEFAULT,
+        )
+        .unwrap();
+        manifest["rows"].as_array().unwrap().len()
+    };
     let pin = store
         .pin("tracing-pin", "tracing", &[a.record_ids[0].clone()], 40, 4)
         .unwrap();
@@ -463,6 +558,14 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     db.put("store_format", b"sparrow.store/66").unwrap();
     db.delete("tracing-rdf-upgrade").unwrap();
     db.delete("tracing-rdf:profile").unwrap();
+    db.delete("event-fallback-rdf-upgrade").unwrap();
+    // Recreate the graphs a writer before schema 69 published, without fallback facts.
+    let current_rows = plain_rows(&db);
+    let current_private = private_rows(&db);
+    assert_eq!(current_private.len(), 1);
+    sparrow_core::remove_event_fallback_rdf_for_legacy_fixture(&db).unwrap();
+    assert_eq!(plain_rows(&db), current_rows - 2);
+    assert_eq!(private_rows(&db), [current_private[0] - 2]);
     let projection = purrdf_lex::json::read_slice(
         &db.get(&a.record_ids[0]).unwrap().unwrap(),
         purrdf_lex::json::Limits::DEFAULT,
@@ -485,8 +588,33 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/77")
+        Some("sparrow.store/132")
     );
+    // The fallback backfill restored the receipt-time facts and wrote no source eventTime.
+    let fallback_times = store
+        .with_rdf_records(std::slice::from_ref(&plain_id), 6, RdfReadLimits::default(), |view| {
+            purrdf::sparql::NativeSparqlEngine::new()
+                .query_governed_fallible_view(
+                    view,
+                    SparqlRequest {
+                        query: "PREFIX s: <urn:sparrow:vocab:> SELECT ?p ?o WHERE { ?r ?p ?o FILTER(?p IN (s:eventTime, s:eventTimeFallback, s:eventTimeBasis)) }",
+                        base_iri: None,
+                        substitutions: &[],
+                    },
+                    &purrdf::sparql::QueryOptions::default(),
+                    &governors,
+                )
+                .map_err(Box::new)
+        })
+        .unwrap()
+        .unwrap();
+    let (_, facts) = fallback_times.result.solutions().unwrap();
+    let facts = format!("{facts:?}");
+    assert!(facts.contains("eventTimeFallback"), "{facts}");
+    assert!(facts.contains("1970-01-01T00:00:00.003Z"), "{facts}");
+    assert!(facts.contains("receipt"), "{facts}");
+    assert!(!facts.contains("vocab:eventTime\""), "{facts}");
+    drop(fallback_times);
     let after = store
         .sparql_query(&read, 6, &QueryCancellation::default())
         .unwrap();
@@ -502,6 +630,32 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
         original
     );
     drop(after);
+    // The privately prepared graph was backfilled too, so publication reuses current facts.
+    let published = store.import_publish(&staged.id, 6).unwrap();
+    let staged_times = store
+        .with_rdf_records(&published.record_ids, 6, RdfReadLimits::default(), |view| {
+            purrdf::sparql::NativeSparqlEngine::new()
+                .query_governed_fallible_view(
+                    view,
+                    SparqlRequest {
+                        query: "PREFIX s: <urn:sparrow:vocab:> SELECT ?p ?o WHERE { ?r ?p ?o FILTER(?p IN (s:eventTime, s:eventTimeFallback, s:eventTimeBasis)) }",
+                        base_iri: None,
+                        substitutions: &[],
+                    },
+                    &purrdf::sparql::QueryOptions::default(),
+                    &governors,
+                )
+                .map_err(Box::new)
+        })
+        .unwrap()
+        .unwrap();
+    let (_, facts) = staged_times.result.solutions().unwrap();
+    let facts = format!("{facts:?}");
+    assert!(facts.contains("eventTimeFallback"), "{facts}");
+    assert!(facts.contains("1970-01-01T00:00:00.004Z"), "{facts}");
+    assert!(facts.contains("receipt"), "{facts}");
+    assert!(!facts.contains("vocab:eventTime\""), "{facts}");
+    drop(staged_times);
     store.expire(31 * DAY).unwrap();
     let after = store
         .sparql_query(&read, 31 * DAY, &QueryCancellation::default())
@@ -1118,7 +1272,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(12).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/85")
+        Some("sparrow.store/140")
     );
     assert_eq!(
         store.watch_registry().unwrap().as_deref(),
@@ -1299,7 +1453,7 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     let intact = db.get("syslog-receiver-registry").unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/84".as_slice())
+        Some(b"sparrow.store/139".as_slice())
     );
     db.delete("syslog-receiver-registry").unwrap();
     drop(db);
@@ -1309,14 +1463,14 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     );
     let db = catalog_db(dir.path()).unwrap();
     db.put("syslog-receiver-registry", &intact).unwrap();
-    db.put("store_format", b"sparrow.store/80").unwrap();
+    db.put("store_format", b"sparrow.store/135").unwrap();
     drop(db);
     assert_eq!(
         Store::open(dir.path(), config()).err().unwrap().code,
         "STORAGE_FAILURE"
     );
     let db = catalog_db(dir.path()).unwrap();
-    db.put("store_format", b"sparrow.store/84").unwrap();
+    db.put("store_format", b"sparrow.store/139").unwrap();
     let value = purrdf_lex::json::read_slice(&intact, purrdf_lex::json::Limits::DEFAULT).unwrap();
     let mut rows = value.as_array().unwrap().clone();
     rows[1] = rows[0].clone();
@@ -1585,7 +1739,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
                     };
                     object.remove("tail_published").unwrap();
                 }
-                _ => db.put("store_format", b"sparrow.store/80").unwrap(),
+                _ => db.put("store_format", b"sparrow.store/135").unwrap(),
             }
             db.put(&key, json::write_compact(&value)).unwrap();
         }
@@ -1597,12 +1751,12 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         drop(store);
         let db = catalog_db(dir.path()).unwrap();
         db.put(&key, &saved).unwrap();
-        db.put("store_format", b"sparrow.store/81").unwrap();
+        db.put("store_format", b"sparrow.store/136").unwrap();
     }
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/81")
+        Some("sparrow.store/136")
     );
     assert_eq!(
         store
@@ -1729,7 +1883,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/81")
+        Some("sparrow.store/136")
     );
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -2268,7 +2422,7 @@ fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfe
         let store = Store::open(dir.path(), config()).unwrap();
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", legacy + 52).as_str())
+            Some(format!("sparrow.store/{}", legacy + 107).as_str())
         );
         assert_eq!(store.tail_generation(&generation.id).unwrap(), original);
         assert_eq!(store.bytes(&first.record_ids[0], 0, 2, 3).unwrap(), b"n\n");
@@ -2768,7 +2922,7 @@ fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() 
         }
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 44).as_str())
+            Some(format!("sparrow.store/{}", current + 99).as_str())
         );
         let state = store.producer_stream(&id, 2).unwrap();
         assert_eq!(state.accepted_events, 2);
@@ -3111,7 +3265,7 @@ fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_anno
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 44).as_str())
+            Some(format!("sparrow.store/{}", current + 99).as_str())
         );
         let record = store.record(&a.record_ids[0]).unwrap();
         assert!(record.producer.is_none());
@@ -3755,7 +3909,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 68).as_str())
+            Some(format!("sparrow.store/{}", version + 123).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -4274,7 +4428,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(3).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 44).as_str())
+            Some(format!("sparrow.store/{}", current + 99).as_str())
         );
         assert_eq!(
             store.bytes(&populated.id, 0, 10, 3).unwrap(),
@@ -4559,7 +4713,7 @@ fn manifest_retirement_survives_reopen_without_rewriting_original_catalog_or_rec
     let root = db.get(&original.id).unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/86".as_slice())
+        Some(b"sparrow.store/141".as_slice())
     );
     let position = db
         .get(format!("artifact-retirement:{}", original.id))
@@ -4637,7 +4791,7 @@ fn manifest_retirement_fences_later_writers_and_rejects_corrupt_state() {
         .unwrap();
     assert_eq!(
         store.status(3).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/87")
+        Some("sparrow.store/142")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -5216,7 +5370,7 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     // Force a strictly larger linked footprint: this is no native recovery observation.
     assert_eq!(
         store.status(4).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/86")
+        Some("sparrow.store/141")
     );
     file.set_len(15 * 1024 * 1024).unwrap();
     drop(file);
@@ -5254,21 +5408,21 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/86".as_slice())
+        Some(b"sparrow.store/141".as_slice())
     );
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/87")
+        Some("sparrow.store/142")
     );
     store
         .watch_registry_replace(Some(b"registered"), b"updated")
         .unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/87")
+        Some("sparrow.store/142")
     );
 }
 
@@ -5283,7 +5437,7 @@ fn invalid_pressure_recovery_markers_refuse_open() {
         drop(Store::open(dir.path(), config()).unwrap());
         let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
         db.put("pressure-reclamation-wait", bytes).unwrap();
-        db.put("store_format", b"sparrow.store/82").unwrap();
+        db.put("store_format", b"sparrow.store/137").unwrap();
         drop(db);
         match Store::open(dir.path(), config()) {
             Ok(_) => panic!("invalid pressure marker admitted"),
@@ -5819,7 +5973,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/79")
+        Some("sparrow.store/134")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -5834,7 +5988,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/79")
+        Some("sparrow.store/134")
     );
 }
 
@@ -5882,7 +6036,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/77")
+        Some("sparrow.store/132")
     );
     let digest = format!(
         "blake3:{}",
@@ -5907,7 +6061,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/78")
+        Some("sparrow.store/133")
     );
     assert_eq!(
         store
@@ -5942,7 +6096,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/80")
+        Some("sparrow.store/135")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     let selector = IngestSelector::Handoff(handoff.request_id.clone());
@@ -5959,7 +6113,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/80")
+        Some("sparrow.store/135")
     );
     assert_eq!(
         store
@@ -6237,7 +6391,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/79")
+        Some("sparrow.store/134")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -11665,7 +11819,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/77")
+        Some("sparrow.store/132")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]
@@ -13386,7 +13540,7 @@ fn source_time_profiles_are_durable_immutable_and_do_not_reinterpret_old_records
 }
 
 #[test]
-fn event_intervals_exclude_unknowns_sort_source_time_and_keep_retention_on_acceptance() {
+fn event_intervals_place_unknowns_at_receipt_sort_source_time_and_keep_retention_on_acceptance() {
     use sparrow_core::{EventInterval, EventTime, QueryScope, RecordQuery, TimeRepresentation};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -13484,10 +13638,13 @@ fn event_intervals_exclude_unknowns_sort_source_time_and_keep_retention_on_accep
         result["rows"][0]["record_id"].as_str(),
         Some(early.record_ids[0].as_str())
     );
+    // The later source time and the seven receipt-time fallbacks (received at 30) lie
+    // outside the event interval.
     assert_eq!(
         result["event_coverage"]["outside_interval"].as_str(),
-        Some("1")
+        Some("8")
     );
+    assert_eq!(result["event_time_fallback"].as_str(), Some("0"));
     let receipt_only = RecordQuery::default();
     assert_eq!(
         store.records_query(&scope, &receipt_only, 100).unwrap()["rows"][0]["record_id"].as_str(),
@@ -13511,6 +13668,232 @@ fn event_intervals_exclude_unknowns_sort_source_time_and_keep_retention_on_accep
             .unwrap()
             .is_empty()
     );
+}
+
+/// One store with a receipt-time fallback record (plain log, no profile) received at 5000
+/// and a source-time record whose source instant (1000) differs from its receipt (5000).
+fn fallback_fixture() -> (tempfile::TempDir, Store, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_time_profile(
+            "fallback-sourced",
+            "/t",
+            sparrow_core::TimeRepresentation::UnixMillis,
+        )
+        .unwrap();
+    let fallback = store
+        .ingest(
+            "fallback-plain",
+            "fallback-plain",
+            "log",
+            b"no timestamp here\n",
+            5000,
+        )
+        .unwrap();
+    let sourced = store
+        .ingest(
+            "fallback-sourced",
+            "fallback-sourced",
+            "json",
+            br#"{"t":1000}"#,
+            5000,
+        )
+        .unwrap();
+    (
+        dir,
+        store,
+        fallback.record_ids[0].clone(),
+        sourced.record_ids[0].clone(),
+    )
+}
+
+fn event_query(from: u64, before: u64) -> sparrow_core::RecordQuery {
+    sparrow_core::RecordQuery {
+        event_interval: Some(sparrow_core::EventInterval { from, before }),
+        ..Default::default()
+    }
+}
+
+/// INVARIANT: a record without a source instant is placed on the event timeline at its
+/// receipt time, marked `receipt`, counted as a fallback, and keeps its stored reason.
+#[test]
+fn event_interval_includes_receipt_fallback() {
+    use sparrow_core::{EventTime, EventTimeBasis};
+    let (_dir, store, fallback, _) = fallback_fixture();
+    let record = store.record(&fallback).unwrap();
+    assert!(matches!(
+        &record.event_time,
+        EventTime::Unknown { reason, profile_id: None } if reason == "no_profile"
+    ));
+    let placement = record.event_time.placement(record.received_at);
+    assert_eq!(placement.millis, 5000);
+    assert_eq!(placement.basis, EventTimeBasis::Receipt);
+    let result = store
+        .records_query(
+            &record_page_scope("fallback-plain", 10),
+            &event_query(4000, 6000),
+            6000,
+        )
+        .unwrap();
+    let rows = result["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["record_id"].as_str(), Some(fallback.as_str()));
+    assert_eq!(rows[0]["event_time"]["state"].as_str(), Some("unknown"));
+    assert_eq!(rows[0]["event_time"]["reason"].as_str(), Some("no_profile"));
+    assert_eq!(result["time_basis"].as_str(), Some("event_time"));
+    assert_eq!(result["event_time_fallback"].as_str(), Some("1"));
+    assert_eq!(result["event_coverage"]["unknown"].as_str(), Some("1"));
+    let excluded = store
+        .records_query(
+            &record_page_scope("fallback-plain", 10),
+            &event_query(0, 5000),
+            6000,
+        )
+        .unwrap();
+    assert!(excluded["rows"].as_array().unwrap().is_empty());
+    assert_eq!(excluded["event_time_fallback"].as_str(), Some("0"));
+    assert_eq!(
+        excluded["event_coverage"]["outside_interval"].as_str(),
+        Some("1")
+    );
+}
+
+/// INVARIANT: a known source instant is never replaced by receipt time, even when the
+/// receipt instant lies in the requested event interval.
+#[test]
+fn source_event_time_is_never_marked_fallback() {
+    use sparrow_core::EventTimeBasis;
+    let (_dir, store, _, sourced) = fallback_fixture();
+    let record = store.record(&sourced).unwrap();
+    assert_eq!(record.received_at, 5000);
+    let placement = record.event_time.placement(record.received_at);
+    assert_eq!(placement.millis, 1000);
+    assert_eq!(placement.basis, EventTimeBasis::Source);
+    let scope = record_page_scope("fallback-sourced", 10);
+    let at_receipt = store
+        .records_query(&scope, &event_query(4000, 6000), 6000)
+        .unwrap();
+    assert!(at_receipt["rows"].as_array().unwrap().is_empty());
+    let at_source = store
+        .records_query(&scope, &event_query(1000, 1001), 6000)
+        .unwrap();
+    assert_eq!(
+        at_source["rows"][0]["record_id"].as_str(),
+        Some(sourced.as_str())
+    );
+    assert_eq!(
+        at_source["rows"][0]["event_time"]["state"].as_str(),
+        Some("known")
+    );
+    assert_eq!(at_source["event_time_fallback"].as_str(), Some("0"));
+}
+
+/// INVARIANT: event-clock correlation places a record without a source instant at its
+/// receipt time and labels that endpoint `receipt`, and a source endpoint `source`.
+#[test]
+fn correlation_event_clock_uses_fallback_marked() {
+    use purrdf::{TermValue, sparql::QueryGovernors};
+    use sparrow_core::{
+        CorrelateRead, CorrelationClock, CorrelationInterval, CorrelationRelation,
+        CorrelationSelector, QueryCancellation, RdfReadLimits, SparqlItem,
+    };
+    let (_dir, store, fallback, sourced) = fallback_fixture();
+    let mut scope = record_page_scope("unused", 100);
+    scope.source = None;
+    scope.require_complete_index = true;
+    let page = store
+        .correlate_read(
+            &CorrelateRead {
+                scope: &scope,
+                selector: &CorrelationSelector::Evidence(vec![sourced.clone()]),
+                relation: CorrelationRelation::Time(CorrelationInterval {
+                    clock: CorrelationClock::Event,
+                    from: 1000,
+                    before: 5001,
+                }),
+                governors: &QueryGovernors::METERED.with_fuel(1_000_000),
+                limits: RdfReadLimits::default(),
+            },
+            6000,
+            &QueryCancellation::default(),
+        )
+        .unwrap();
+    assert!(
+        page.body.captured().outcome.is_ok(),
+        "{:?}",
+        page.body.captured().outcome
+    );
+    assert_eq!(page.total_items, 1);
+    let Some(SparqlItem::Solution(row)) = page.body.items().next() else {
+        panic!("native correlation solution expected")
+    };
+    assert_eq!(row[0], Some(TermValue::simple_literal(sourced)));
+    assert_eq!(row[1], Some(TermValue::simple_literal(fallback)));
+    let instant = |text: &str| {
+        Some(TermValue::typed_literal(
+            text,
+            "http://www.w3.org/2001/XMLSchema#dateTime",
+        ))
+    };
+    assert_eq!(row[17], instant("1970-01-01T00:00:01Z"));
+    assert_eq!(row[18], instant("1970-01-01T00:00:05Z"));
+    assert_eq!(row[19], Some(TermValue::simple_literal("source")));
+    assert_eq!(row[20], Some(TermValue::simple_literal("receipt")));
+}
+
+/// INVARIANT: `sparrow:eventTime` carries only source instants; a receipt fallback is a
+/// distinct `eventTimeFallback` with basis `receipt`, so SPARQL cannot confuse the two.
+#[test]
+fn sparql_distinguishes_fallback_time() {
+    let (_dir, store, fallback, sourced) = fallback_fixture();
+    let select = |query: &str| {
+        let native = store
+            .with_rdf_records(
+                &[fallback.clone(), sourced.clone()],
+                6000,
+                sparrow_core::RdfReadLimits::default(),
+                |view| {
+                    purrdf::sparql::NativeSparqlEngine::new()
+                        .query_governed_fallible_view(
+                            view,
+                            purrdf::SparqlRequest {
+                                query,
+                                base_iri: None,
+                                substitutions: &[],
+                            },
+                            &purrdf::sparql::QueryOptions::default(),
+                            &purrdf::sparql::QueryGovernors::METERED
+                                .with_fuel(1_000_000)
+                                .with_max_answers(100)
+                                .with_max_intermediate_cells(10_000)
+                                .with_max_scratch_bytes(1024 * 1024)
+                                .with_max_remote_requests(0),
+                        )
+                        .map_err(Box::new)
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let (_, rows) = native.result.solutions().expect("native SELECT result");
+        format!("{rows:?}")
+    };
+    let fallback_iri = format!("urn:sparrow:{fallback}");
+    let sourced_iri = format!("urn:sparrow:{sourced}");
+    let source_times = select("SELECT ?r ?t WHERE { ?r <urn:sparrow:vocab:eventTime> ?t }");
+    assert!(!source_times.contains(&fallback_iri), "{source_times}");
+    assert!(source_times.contains(&sourced_iri), "{source_times}");
+    assert!(
+        source_times.contains("1970-01-01T00:00:01Z"),
+        "{source_times}"
+    );
+    let fallbacks = select(
+        "SELECT ?r ?t ?b WHERE { ?r <urn:sparrow:vocab:eventTimeFallback> ?t ; <urn:sparrow:vocab:eventTimeBasis> ?b }",
+    );
+    assert!(fallbacks.contains(&fallback_iri), "{fallbacks}");
+    assert!(!fallbacks.contains(&sourced_iri), "{fallbacks}");
+    assert!(fallbacks.contains("1970-01-01T00:00:05Z"), "{fallbacks}");
+    assert!(fallbacks.contains("receipt"), "{fallbacks}");
 }
 
 #[test]
@@ -18005,8 +18388,8 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
             .parse::<u32>()
             .unwrap()
     };
-    assert!((99..=109).contains(&number(&fenced)), "{fenced}");
-    assert_eq!(number(&fenced) - 99, (number(&unfenced) - 33) % 11);
+    assert!((154..=164).contains(&number(&fenced)), "{fenced}");
+    assert_eq!(number(&fenced) - 154, (number(&unfenced) - 33) % 11);
     assert_eq!(
         store.archive_state().unwrap(),
         Some(sparrow_core::ArchiveState::default())
@@ -18017,7 +18400,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!((99..=109).contains(&number(&watched)), "{watched}");
+    assert!((154..=164).contains(&number(&watched)), "{watched}");
     drop(store);
     let refused = Store::open(dir.path(), config()).err().unwrap();
     assert_eq!(refused.code, "INVALID_ARGUMENT");
@@ -18049,7 +18432,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
     // The log time law is removed so the format identity alone decides the refusal.
     let db = catalog_db(dir.path()).unwrap();
     db.put("archive:through", through).unwrap();
-    db.put("store_format", b"sparrow.store/132").unwrap();
+    db.put("store_format", b"sparrow.store/187").unwrap();
     db.delete("log-time-profile-law").unwrap();
     drop(db);
     assert_eq!(

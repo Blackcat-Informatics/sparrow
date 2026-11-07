@@ -205,7 +205,7 @@ impl Store {
             cancellation,
             |view, coverage| {
                 if read.scope.require_complete_index && correlation.is_some_and(|capture| !capture.complete(coverage)) {
-                    return Err(view.budget.fail(Error::new("INDEX_NOT_READY", "correlation requires known diagnostic/event-time interpretations throughout its selected scope")));
+                    return Err(view.budget.fail(Error::new("INDEX_NOT_READY", "correlation requires known diagnostic interpretations and ready event-time projections throughout its selected scope")));
                 }
                 let scope_admission = view
                     .budget

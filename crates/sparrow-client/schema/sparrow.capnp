@@ -188,7 +188,12 @@ struct KnownEventTime {
   instant @0 :Instant; profileId @1 :Text; occurrence @2 :UInt64;
   sourceStart @3 :UInt64; sourceEnd @4 :UInt64;
 }
-struct UnknownEventTime { reason @0 :UnknownTimeReason; profileId @1 :OptionalText; }
+# Schema 69: an unknown source time is placed on the event timeline at the record's
+# receipt instant, marked as a receipt-basis fallback. The stored reason is unchanged.
+struct UnknownEventTime {
+  reason @0 :UnknownTimeReason; profileId @1 :OptionalText;
+  fallback @2 :Instant;
+}
 struct EventTime { union { unknown @0 :UnknownEventTime; known @1 :KnownEventTime; } }
 struct SourceTimeProfile {
   storeId @0 :Text; id @1 :Text; source @2 :Text; path @3 :Text;
@@ -557,6 +562,9 @@ struct RecordsResults {
   knownQualifiedRecords @7 :UInt64;
   page @8 :CatalogReadReceipt;
   artifactGroups @9 :OptionalArtifactMatchGroups;
+  # Schema 69: qualified records placed on the event timeline by receipt time; zero for
+  # a receipt-time read.
+  eventTimeFallback @10 :UInt64;
 }
 struct ArtifactMatchGroup { artifactId @0 :Text; capturedMatches @1 :UInt64; pageIndices @2 :List(UInt32); }
 struct OptionalArtifactMatchGroups { union { absent @0 :Void; value @1 :List(ArtifactMatchGroup); } }

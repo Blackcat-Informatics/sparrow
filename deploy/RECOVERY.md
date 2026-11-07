@@ -123,13 +123,18 @@ every watch in `consume_watches` names a root that exists.
   `UNSUPPORTED: text analyzer identity changed; explicit index migration required`,
   `UNSUPPORTED: RDF profile changed; explicit projection/index migration required`,
   `UNSUPPORTED: RDF profile changed and the store holds N Markdown projection(s) ...`,
-  or a refusal naming the archive table on a store that has been fenced for
-  archiving.
+  a refusal naming the archive table on a store that has been fenced for
+  archiving, or
+  `STORAGE_FAILURE: log time interpretation law and writer fence disagree`
+  on a store with a log time profile.
 - Diagnose: which image runs (`readlink /usr/local/libexec/sparrow/sparrowd`),
   which image last opened the store (the receipts and the journal), and
   whether `text_lexicon_dir` changed (`grep text_lexicon_dir /etc/sparrow/server.toml`).
 - Recover: an unsupported format means an image older than the store; return
-  to the image that last opened it (`sudo deploy/restart.sh --rev REV`). An
+  to the image that last opened it (`sudo deploy/restart.sh --rev REV`). On a
+  log time store an older image reports the law and fence disagreement
+  instead, because it does not know the newer fence identity: recover it the
+  same way. An
   analyzer change means the lexicon bundle differs from the one the store was
   built with; point `text_lexicon_dir` back at that bundle. A Markdown
   count means the store still holds Markdown projections from before PurRDF

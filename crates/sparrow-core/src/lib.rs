@@ -88,6 +88,8 @@ pub use storage::record_read::{
     JsonRead, QUERY_CAPTURE_PROFILE, QueryCancellation, RecordOperation, RecordPageBody,
     RecordRead, RecordReadPage,
 };
+#[cfg(feature = "test-support")]
+pub use storage::remove_event_fallback_rdf_for_legacy_fixture;
 pub use storage::result_read::ResultPage;
 pub use storage::retention_metrics::{RetentionMetrics, RetentionReadLimits};
 #[cfg(feature = "test-support")]
@@ -96,7 +98,9 @@ pub use storage::source_read::{
     SourcePageBody, SourceRead, SourceReadPage, SourceSelector, SourceSummary, SourceSyslogBinding,
     SourceWatchBinding, SourceWatchInfo,
 };
-pub use storage::source_time::{EventTime, SourceTimeProfile, TimeRepresentation};
+pub use storage::source_time::{
+    EventPlacement, EventTime, EventTimeBasis, SourceTimeProfile, TimeRepresentation,
+};
 pub use storage::space::SpaceFloor;
 pub use storage::syslog::{
     SYSLOG_ELEMENTS, SYSLOG_MESSAGE_BYTES, SYSLOG_PARAMETERS, SyslogDialect, SyslogElement,

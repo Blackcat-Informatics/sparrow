@@ -507,6 +507,7 @@ impl Store {
         let mut event_unknown = 0_u64;
         let mut event_evaluated = 0_u64;
         let mut event_outside = 0_u64;
+        let mut event_fallback = 0_u64;
         let time_basis = if query.event_interval.is_some() {
             "event_time"
         } else {
@@ -566,9 +567,7 @@ impl Store {
                         "selected source-time profile depends on a failed JSON projection",
                     ));
                 }
-                let Some(millis) = record.event_time.millis() else {
-                    continue;
-                };
+                let millis = record.event_time.placement(record.received_at).millis;
                 if millis < interval.from || millis >= interval.before {
                     event_outside += 1;
                     continue;
@@ -586,6 +585,12 @@ impl Store {
                 continue;
             };
             qualified += 1;
+            if query.event_interval.is_some()
+                && record.event_time.placement(record.received_at).basis
+                    == crate::EventTimeBasis::Receipt
+            {
+                event_fallback += 1;
+            }
             if capture && query.text.is_none() && qualified > row_limit {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
@@ -596,9 +601,7 @@ impl Store {
                 if let Some(stage) = stage.as_deref_mut() {
                     let order = if query.event_interval.is_some() {
                         Some((
-                            record.event_time.millis().ok_or_else(|| {
-                                Error::new("STORAGE_FAILURE", "qualified event time disappeared")
-                            })?,
+                            record.event_time.placement(record.received_at).millis,
                             record.id.clone(),
                         ))
                     } else {
@@ -627,9 +630,7 @@ impl Store {
                     }
                     chronological.push((
                         if query.event_interval.is_some() {
-                            record.event_time.millis().ok_or_else(|| {
-                                Error::new("STORAGE_FAILURE", "qualified event time disappeared")
-                            })?
+                            record.event_time.placement(record.received_at).millis
                         } else {
                             record.received_at
                         },
@@ -734,6 +735,7 @@ impl Store {
                     ),
                 )
                 .with("known_qualified_records", qualified.to_string())
+                .with("event_time_fallback", event_fallback.to_string())
                 .with("event_coverage", event_coverage)
                 .with("rows", Value::array(selected_rows))
                 .into());
@@ -923,6 +925,7 @@ impl Store {
                 ),
             )
             .with("known_qualified_records", qualified.to_string())
+            .with("event_time_fallback", event_fallback.to_string())
             .with("event_coverage", event_coverage)
             .with("rows", Value::array(rows))
             .into())

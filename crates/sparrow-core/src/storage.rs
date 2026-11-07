@@ -15,10 +15,13 @@ use rocksdb::{DB, IteratorMode, WriteBatch, WriteOptions};
 
 pub(crate) mod archive;
 mod artifact_rdf;
+mod event_fallback_rdf;
 mod provenance_rdf;
 mod tracing_rdf;
 #[cfg(feature = "test-support")]
 pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
+#[cfg(feature = "test-support")]
+pub use event_fallback_rdf::remove_event_fallback_rdf_for_legacy_fixture;
 pub(crate) mod artifact_read;
 pub(crate) mod catalog_lease;
 mod catalog_upgrade;
@@ -1417,6 +1420,7 @@ impl Store {
         artifact_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         provenance_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         tracing_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
+        event_fallback_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         let archive = archive::open(&db, config.archive.as_ref())?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(

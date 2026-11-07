@@ -273,7 +273,7 @@ async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture
             assert_eq!(artifact["record_ids"].as_array().unwrap().len(), 3);
             assert_eq!(
                 cli(&endpoint, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/90")
+                Some("sparrow.store/145")
             );
             let first = cli(
                 &endpoint,
@@ -625,7 +625,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/81"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/136"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -3866,7 +3866,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/80");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/135");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -4083,7 +4083,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/79")
+                Some("sparrow.store/134")
             );
         })
         .await;
@@ -4869,7 +4869,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/79"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/134"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -9313,15 +9313,49 @@ async fn mcp_exercise(
     assert_eq!(event_mcp["rows"], event_cli["rows"]);
     assert_eq!(event_mcp["text"]["rows"], event_cli["text"]["rows"]);
     assert_eq!(event_cli["event_coverage"]["unknown"].as_str(), Some("2"));
+    // The later source time and both receipt-time fallbacks (received now) lie outside.
     assert_eq!(
         event_cli["event_coverage"]["outside_interval"].as_str(),
-        Some("1")
+        Some("3")
     );
     assert_eq!(event_cli["time_basis"].as_str(), Some("event_time"));
+    assert_eq!(event_cli["event_time_fallback"].as_str(), Some("0"));
     assert_eq!(
         event_cli["rows"][0]["event_time"]["instant"].as_str(),
         Some("1970-01-01T00:00:01Z")
     );
+    assert_eq!(
+        event_cli["rows"][0]["event_time"]["basis"].as_str(),
+        Some("source")
+    );
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let fallback_cli = cli(
+        socket,
+        &[
+            "records",
+            "--source",
+            "rpc-events",
+            "--event-from",
+            &sparrow_core::format_instant(now - 3_600_000).unwrap(),
+            "--event-before",
+            &sparrow_core::format_instant(now + 3_600_000).unwrap(),
+        ],
+    );
+    assert_eq!(fallback_cli["event_time_fallback"].as_str(), Some("2"));
+    for row in fallback_cli["rows"].as_array().unwrap() {
+        let event = &row["event_time"];
+        assert_eq!(event["basis"].as_str(), Some("receipt"));
+        assert_eq!(event["state"].as_str(), Some("unknown"));
+        assert_eq!(event["fallback_instant"], row["received_at"]);
+        assert!(event["instant"].is_null());
+        assert!(event["reason"].as_str().is_some());
+    }
     assert_eq!(
         event_cli["text"]["ranking"]["documents"].as_str(),
         Some("1")

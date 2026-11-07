@@ -265,6 +265,10 @@ pub(super) fn render(found: wire::records_results::Reader<'_>) -> Result<Value> 
             "known_qualified_records",
             found.get_known_qualified_records().to_string(),
         )
+        .with(
+            "event_time_fallback",
+            found.get_event_time_fallback().to_string(),
+        )
         .with("rows", Value::array(rows))
         .with("text", text)
         .into())

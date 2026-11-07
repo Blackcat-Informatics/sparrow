@@ -488,6 +488,7 @@ fn records_page(
         "qualified_records",
     )?;
     out.set_known_qualified_records(number(value, "known_qualified_records")?);
+    out.set_event_time_fallback(number(value, "event_time_fallback")?);
     out.set_time_basis(match field::<String>(value, "time_basis")?.as_str() {
         "received_at" => wire::TimeBasis::ReceivedAt,
         "event_time" => wire::TimeBasis::EventTime,
@@ -539,10 +540,12 @@ fn records_page(
         target.set_record_id(field::<String>(row, "record_id")?);
         target.set_artifact_id(field::<String>(row, "artifact_id")?);
         target.set_source(field::<String>(row, "source")?);
-        target.reborrow().init_received_at().set_unix_millis(
-            sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?,
-        );
+        let received_at = sparrow_core::parse_instant(&field::<String>(row, "received_at")?)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        target
+            .reborrow()
+            .init_received_at()
+            .set_unix_millis(received_at);
         target.set_byte_start(number(row, "byte_start")?);
         target.set_byte_end(number(row, "byte_end")?);
         let event = row
@@ -551,7 +554,7 @@ fn records_page(
         let event =
             <sparrow_core::EventTime as purrdf_lex::json::record::FromJson>::from_json(event)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        event_time(target.reborrow().init_event_time(), &event)?;
+        event_time(target.reborrow().init_event_time(), &event, received_at)?;
         crate::diagnostics::snapshot(
             target.reborrow().init_diagnostics(),
             &field::<sparrow_core::DiagnosticSnapshot>(row, "diagnostics")?,
@@ -1024,7 +1027,11 @@ fn record(mut out: wire::record::Builder<'_>, value: Record, store: &str) -> cap
         .set_unix_millis(value.expires_at);
     out.set_byte_start(value.byte_start);
     out.set_byte_end(value.byte_end);
-    event_time(out.reborrow().init_event_time(), &value.event_time)?;
+    event_time(
+        out.reborrow().init_event_time(),
+        &value.event_time,
+        value.received_at,
+    )?;
     crate::diagnostics::snapshot(out.reborrow().init_diagnostics(), &value.diagnostics);
     crate::syslog_wire::snapshot(out.reborrow().init_syslog(), value.syslog.as_ref())?;
     crate::tail_wire::position(out.reborrow().init_tail(), value.tail.as_ref())?;
@@ -1078,9 +1085,12 @@ fn source_time_profile(
     });
 }
 
+/// Render stored source evidence with its read-time placement; an unknown source time
+/// carries the receipt instant that places it on the event timeline.
 fn event_time(
     out: wire::event_time::Builder<'_>,
     value: &sparrow_core::EventTime,
+    received_at: u64,
 ) -> capnp::Result<()> {
     match value {
         sparrow_core::EventTime::Known {
@@ -1099,6 +1109,9 @@ fn event_time(
         }
         sparrow_core::EventTime::Unknown { reason, profile_id } => {
             let mut out = out.init_unknown();
+            out.reborrow()
+                .init_fallback()
+                .set_unix_millis(value.placement(received_at).millis);
             out.set_reason(match reason.as_str() {
                 "no_profile" => wire::UnknownTimeReason::NoProfile,
                 "not_json" => wire::UnknownTimeReason::NotJson,
