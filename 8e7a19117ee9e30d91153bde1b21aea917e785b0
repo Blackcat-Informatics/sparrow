@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 6442d32cad392fcc9414f5364659f17749aad999
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 34
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/34
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 2aa56a9b33f974b2ddd320815f8a4ecdc032deb6
+GhpRsq-Head-Ref: paudley/20-fall-back-to-receipt-time-marked-as
+GhpRsq-Head-OID: 6442d32cad392fcc9414f5364659f17749aad999
+GhpRsq-Result-Tree: 12437b8b04d17eb5cbc5a11d62e33961552c1d97
+GhpRsq-Result-Commit: 8e7a19117ee9e30d91153bde1b21aea917e785b0
+GhpRsq-Parent-Hashes: 6442d32cad392fcc9414f5364659f17749aad999
+GhpRsq-Squash-Notes-SHA256: 8046cadd054020abda20cc68153d1636c9200ba62c9a454e28ab0944a3db0f09
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: dc49bf818920294a570e1da83a0da7f41b86db55
+GhpRsq-Stage-Commit: a643a065a8dca74fb8b4247866f1ce6263634adb
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/a643a065a8dca74fb8b4247866f1ce6263634adb
+GhpRsq-Stage-Ref: refs/ghprsq/pr/34/stage
+GhpRsq-Stage-Files: 17
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/a643a065a8dca74fb8b4247866f1ce6263634adb
