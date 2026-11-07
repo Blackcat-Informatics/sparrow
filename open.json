@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 20,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/20-fall-back-to-receipt-time-marked-as",
+  "branch": "paudley/20-fall-back-to-receipt-time-marked-as",
+  "slug": "fall-back-to-receipt-time-marked-as",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/20-fall-back-to-receipt-time-marked-as/.stage/fall-back-to-receipt-time-marked-as",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "2aa56a9b33f974b2ddd320815f8a4ecdc032deb6",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/20-fall-back-to-receipt-time-marked-as",
+    "branch:paudley/20-fall-back-to-receipt-time-marked-as",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow caches into /home/paudley/Active/sparrow/.worktrees/20-fall-back-to-receipt-time-marked-as plus 0 dependency units from 0 other checkouts in 4.2s; 271 unchanged files keep their built mtimes; 2 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/20-fall-back-to-receipt-time-marked-as/.stage/fall-back-to-receipt-time-marked-as",
+    "issue:/home/paudley/Active/sparrow/.worktrees/20-fall-back-to-receipt-time-marked-as/.stage/fall-back-to-receipt-time-marked-as/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-06T18:41:28-0600",
+  "seed_error": ""
+}
