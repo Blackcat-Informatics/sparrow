@@ -1,0 +1,80 @@
+{
+  "issue": 36,
+  "pr_number": 138,
+  "branch": "paudley/36-bound-the-schema-69-first-open",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/36-bound-the-schema-69-first-open/.stage/bound-the-schema-69-first-open",
+  "observed_at": "2026-11-07T20:43:05.159098+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/36-bound-the-schema-69-first-open/.stage/bound-the-schema-69-first-open/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/36-bound-the-schema-69-first-open/.stage/bound-the-schema-69-first-open/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/36-bound-the-schema-69-first-open/.stage/bound-the-schema-69-first-open/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/36-bound-the-schema-69-first-open/.stage/bound-the-schema-69-first-open/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/36-bound-the-schema-69-first-open/.stage/bound-the-schema-69-first-open/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 138,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Serve at once and run the schema 69 backfills as a maintenance duty (#36)",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/138",
+    "baseRefName": "main",
+    "baseRefOid": "03052cf895108f5d367a19d0e0c92d5a036a3989",
+    "headRefName": "paudley/36-bound-the-schema-69-first-open",
+    "headRefOid": "4b108a95d096f51b64d1174545383ecf26fda55c",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/27/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "4b108a95d096f51b64d1174545383ecf26fda55c",
+    "branch": "paudley/36-bound-the-schema-69-first-open",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 138,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #138 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "missing_artifacts": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
