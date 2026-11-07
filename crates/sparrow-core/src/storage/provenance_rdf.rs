@@ -3,12 +3,10 @@
 
 //! Minimal Source/Stream facts share their retained occurrence's RDF ownership.
 
-use super::{
-    Error, artifact_rdf, catalog_upgrade, integer, parse, rdf_index, read_field, writer_format,
-};
-use purrdf::{RdfDatasetBuilder, TermFactory, TermValue, projections::ProjectionTerm};
+use super::{Error, artifact_rdf, catalog_upgrade, rdf_index, writer_format};
+use purrdf::{TermFactory, TermValue};
 use rocksdb::{DB, WriteBatch};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 const PAGE_BYTES: usize = 32 * 1024 * 1024;
 const RECORDS: catalog_upgrade::Job = catalog_upgrade::Job {
@@ -63,73 +61,15 @@ fn publish(
     let id = key
         .strip_prefix("rdf:graph:")
         .ok_or_else(|| failure("invalid metadata owner"))?;
-    let manifest = parse(bytes)?;
-    let owner = integer(&manifest, "owner")?;
-    let rows = rdf_index::manifest_rows(&manifest)?;
-    let primary: BTreeSet<_> = rows
-        .iter()
-        .filter(|(s, _)| *s == 0)
-        .map(|(_, r)| *r)
-        .collect();
-    if rows.iter().any(|(s, r)| *s != 0 || r[3] != owner) {
-        return Err(failure(
-            "metadata stream or graph slots contradict native plain-quad ownership",
-        ));
-    }
-    let mut remaining = PAGE_BYTES - charge;
-    let limits = rdf_index::term_limits()?;
-    let mut values = BTreeMap::new();
-    let mut native = BTreeMap::new();
-    let mut builder = RdfDatasetBuilder::new();
-    for term in rows
-        .iter()
-        .flat_map(|(_, row)| row)
-        .copied()
-        .collect::<BTreeSet<_>>()
-    {
-        let bytes = db
-            .get_pinned(rdf_index::term_key(term))?
-            .ok_or_else(|| failure("metadata term missing"))?;
-        if bytes.len() > 65536 {
-            return Err(failure("metadata term exceeds encoded bound"));
-        }
-        remaining = remaining
-            .checked_sub(bytes.len().saturating_mul(256).saturating_add(4096))
-            .ok_or_else(|| {
-                Error::new(
-                    "RESOURCE_LIMIT",
-                    "provenance term decoding exceeds migration admission",
-                )
-            })?;
-        let value = ProjectionTerm::from_canonical_json(&bytes, limits)
-            .and_then(|v| v.to_term_value(limits))
-            .map_err(|e| failure(&e.to_string()))?;
-        native.insert(term, builder.intern_value(&value)?);
-        values.insert(term, value);
-    }
-    if values.get(&owner) != Some(&TermValue::iri(rdf_index::graph_iri(id))) {
-        return Err(failure("owner dictionary identity mismatch"));
-    }
-    if read_field::<Vec<String>>(&manifest, "graphs")? != [owner.to_string()] {
-        return Err(failure("metadata graph declarations disagree with owner"));
-    }
-    let mut rdf = rdf_index::RdfWrite::new(db)?;
-    let mut closure = BTreeSet::new();
-    for (id, value) in &values {
-        if rdf.closure(value, &mut closure)? != *id {
-            return Err(failure("metadata dictionary identity is inconsistent"));
-        }
-    }
-    let declared = read_field::<Vec<String>>(&manifest, "terms")?;
-    if declared != closure.iter().map(u64::to_string).collect::<Vec<_>>() {
-        return Err(failure(
-            "metadata term ownership disagrees with native closure",
-        ));
-    }
+    let rdf_index::StoredMetadata {
+        mut builder,
+        values,
+        primary,
+        mut rdf,
+    } = rdf_index::stored_metadata(db, id, bytes, PAGE_BYTES - charge, &failure)?;
     let subject_value = TermValue::iri(super::rdf_index::entity_iri(id));
     let mut fields = BTreeMap::new();
     for row in primary {
-        builder.push_quad(native[&row[0]], native[&row[1]], native[&row[2]], None)?;
         if values[&row[0]] == subject_value
             && let TermValue::Iri(predicate) = &values[&row[1]]
             && let Some(name) = predicate.strip_prefix("urn:sparrow:vocab:")

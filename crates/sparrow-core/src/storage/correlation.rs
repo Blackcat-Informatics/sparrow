@@ -12,21 +12,22 @@ use purrdf::{TermValue, sparql::QueryGovernors};
 use purrdf_lex::json::{Object, Value};
 
 /// Identity of the declared-equality and explicit-interval correlation law.
-pub const CORRELATION_PROFILE: &str = "sparrow-correlation/1";
+pub const CORRELATION_PROFILE: &str = "sparrow-correlation/2";
 
 /// Which recorded clock supplies an explicit temporal relationship.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorrelationClock {
-    /// Server acceptance time, never substituted for event time.
+    /// Server acceptance time only.
     Received,
-    /// Known source event time; missing interpretations remain incomplete coverage.
+    /// Event-timeline placement: the source instant, or receipt time marked `receipt`
+    /// when a record has no source instant. Every endpoint carries its basis.
     Event,
 }
 
 /// Both endpoints must fall in this explicit half-open interval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorrelationInterval {
-    /// Receipt or known event time.
+    /// Receipt time or event-timeline placement.
     pub clock: CorrelationClock,
     /// Inclusive UTC Unix millisecond bound.
     pub from: u64,
@@ -43,7 +44,7 @@ pub enum CorrelationSelector {
     Diagnostic(DiagnosticDimension, String),
     /// Exact source label.
     Source(String),
-    /// Known record time in an explicit half-open interval.
+    /// Record time in an explicit half-open interval.
     Time(CorrelationInterval),
 }
 
@@ -56,7 +57,7 @@ pub enum CorrelationRelation {
     SpanId,
     /// The same recorded Source entity.
     Source,
-    /// Both known times lie in the explicitly requested interval.
+    /// Both endpoint times lie in the explicitly requested interval.
     Time(CorrelationInterval),
 }
 
@@ -87,6 +88,9 @@ pub struct CorrelationCapture {
 
 impl CorrelationCapture {
     /// Whether all required interpretations and selected graph coverage are known.
+    /// Every record has an event-timeline placement (a receipt fallback when its source
+    /// time is unknown). An event clock is still incomplete while any selected record's
+    /// source-time profile depends on a failed JSON projection, as in a strict records read.
     pub fn complete(&self, coverage: &RdfScopeCoverage) -> bool {
         let known = |dimension| {
             coverage
@@ -98,7 +102,7 @@ impl CorrelationCapture {
         };
         let clock = |interval: CorrelationInterval| {
             interval.clock == CorrelationClock::Received
-                || coverage.event_time_known == coverage.selected_records
+                || coverage.event_time_projection_failed == 0
         };
         coverage.complete()
             && match &self.selector {
@@ -202,10 +206,6 @@ fn time_clause(
             "correlation interval must be increasing and half-open",
         ));
     }
-    let predicate = match interval.clock {
-        CorrelationClock::Received => "receivedAt",
-        CorrelationClock::Event => "eventTime",
-    };
     for (name, time) in [("from", interval.from), ("before", interval.before)] {
         bindings.push((
             format!("{prefix}_{name}"),
@@ -215,8 +215,18 @@ fn time_clause(
             ),
         ));
     }
+    let time = match interval.clock {
+        CorrelationClock::Received => {
+            format!("?{subject} <urn:sparrow:vocab:receivedAt> ?{prefix}_time . ")
+        }
+        // Read-time fallback, the same law as `EventTime::placement`: a record without a
+        // source instant is placed at its receipt time and labelled `receipt`.
+        CorrelationClock::Event => format!(
+            "OPTIONAL {{ ?{subject} <urn:sparrow:vocab:eventTime> ?{prefix}_source }} BIND(COALESCE(?{prefix}_source, ?{subject}_received) AS ?{prefix}_time) BIND(IF(BOUND(?{prefix}_source), \"source\", \"receipt\") AS ?{prefix}_basis) "
+        ),
+    };
     Ok(format!(
-        "?{subject} <urn:sparrow:vocab:{predicate}> ?{prefix}_time . FILTER(?{prefix}_time >= ?{prefix}_from && ?{prefix}_time < ?{prefix}_before) "
+        "{time}FILTER(?{prefix}_time >= ?{prefix}_from && ?{prefix}_time < ?{prefix}_before) "
     ))
 }
 
@@ -323,7 +333,8 @@ SELECT (STRAFTER(STR(?seed), "urn:sparrow:") AS ?seed_id)
        ?seed ?related ?seed_artifact ?related_artifact ?seed_source ?related_source
        ?seed_source_name ?related_source_name ?seed_received ?related_received
        ?seed_start ?seed_end ?related_start ?related_end ?relationship_value
-       ?seed_window_time ?related_window_time
+       ?seed_window_time ?related_window_time ?seed_window_basis ?related_window_basis
+       ?selected_basis
 WHERE {{
  ?seed a s:Record ; s:artifact ?seed_artifact ; s:source ?seed_source ; s:sourceName ?seed_source_name ; s:receivedAt ?seed_received ; s:sourceByteStart ?seed_start ; s:sourceByteEnd ?seed_end .
  ?related a s:Record ; s:artifact ?related_artifact ; s:source ?related_source ; s:sourceName ?related_source_name ; s:receivedAt ?related_received ; s:sourceByteStart ?related_start ; s:sourceByteEnd ?related_end .

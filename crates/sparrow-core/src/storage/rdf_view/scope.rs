@@ -108,6 +108,9 @@ pub struct RdfScopeCoverage {
     pub catalog_entries: usize,
     /// Known source-event times among selected occurrences, independently of RDF readiness.
     pub event_time_known: u64,
+    /// Selected occurrences whose source-time profile depends on a failed JSON projection.
+    /// Their receipt-time placement is not ready evidence for a strict event-clock read.
+    pub event_time_projection_failed: u64,
     /// Known declared diagnostic values among selected occurrences, by dimension.
     pub diagnostic_known: std::collections::BTreeMap<crate::DiagnosticDimension, u64>,
 }
@@ -215,8 +218,12 @@ impl StoredRdfView<'_> {
         strict: bool,
         coverage: &mut RdfScopeCoverage,
     ) -> Result<(), ReadError> {
-        if matches!(record.event_time, crate::EventTime::Known { .. }) {
-            coverage.event_time_known += 1;
+        match &record.event_time {
+            crate::EventTime::Known { .. } => coverage.event_time_known += 1,
+            crate::EventTime::Unknown { reason, .. } if reason == "projection_failed" => {
+                coverage.event_time_projection_failed += 1;
+            }
+            crate::EventTime::Unknown { .. } => {}
         }
         for (dimension, value) in &record.diagnostics.fields {
             if matches!(value, crate::DiagnosticValue::Known { .. }) {

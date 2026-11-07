@@ -755,7 +755,9 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
             "event_time",
             Object::new()
                 .with("known", c.get_event_time_known().to_string())
-                .with("unknown", unknown(c.get_event_time_known())?.to_string()),
+                .with("unknown", unknown(c.get_event_time_known())?.to_string())
+                // Every unknown source time is placed on the event timeline at receipt time.
+                .with("fallback", unknown(c.get_event_time_known())?.to_string()),
         )
         .with("diagnostics", diagnostic_known);
     let correlation = match value.get_correlation()?.which()? {

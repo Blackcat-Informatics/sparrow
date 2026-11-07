@@ -684,6 +684,153 @@ pub(super) fn manifest_rows(manifest: &Value) -> Result<Vec<(u8, [u64; 4])>, Err
         .collect()
 }
 
+/// One stored occurrence metadata graph replayed into a native builder for a rebuild.
+pub(super) struct StoredMetadata<'a> {
+    /// Every primary quad of the stored graph, re-interned.
+    pub builder: purrdf::RdfDatasetBuilder,
+    /// Decoded dictionary values by stored term ID.
+    pub values: BTreeMap<u64, TermValue>,
+    /// Primary-stream rows: subject, predicate, object and owner IDs.
+    pub primary: BTreeSet<[u64; 4]>,
+    /// Writer that verified the graph's dictionary closure.
+    pub rdf: RdfWrite<'a>,
+}
+
+/// Decode `rdf:graph:<id>`, verify its plain-quad ownership and dictionary identity, and
+/// replay its primary quads. `remaining` bounds term decoding within a migration page.
+pub(super) fn stored_metadata<'a>(
+    db: &'a DB,
+    id: &str,
+    bytes: &[u8],
+    mut remaining: usize,
+    failure: &dyn Fn(&str) -> Error,
+) -> Result<StoredMetadata<'a>, Error> {
+    let manifest = parse(bytes)?;
+    let owner = integer(&manifest, "owner")?;
+    let rows = manifest_rows(&manifest)?;
+    let primary: BTreeSet<_> = rows
+        .iter()
+        .filter(|(s, _)| *s == 0)
+        .map(|(_, r)| *r)
+        .collect();
+    if rows.iter().any(|(s, r)| *s != 0 || r[3] != owner) {
+        return Err(failure(
+            "metadata stream or graph slots contradict native plain-quad ownership",
+        ));
+    }
+    let limits = term_limits()?;
+    let mut values = BTreeMap::new();
+    let mut native = BTreeMap::new();
+    let mut builder = purrdf::RdfDatasetBuilder::new();
+    use purrdf::TermFactory;
+    for term in rows
+        .iter()
+        .flat_map(|(_, row)| row)
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let bytes = db
+            .get_pinned(term_key(term))?
+            .ok_or_else(|| failure("metadata term missing"))?;
+        if bytes.len() > 65536 {
+            return Err(failure("metadata term exceeds encoded bound"));
+        }
+        remaining = remaining
+            .checked_sub(bytes.len().saturating_mul(256).saturating_add(4096))
+            .ok_or_else(|| {
+                Error::new(
+                    "RESOURCE_LIMIT",
+                    "metadata term decoding exceeds migration admission",
+                )
+            })?;
+        let value = ProjectionTerm::from_canonical_json(&bytes, limits)
+            .and_then(|v| v.to_term_value(limits))
+            .map_err(|e| failure(&e.to_string()))?;
+        native.insert(term, builder.intern_value(&value)?);
+        values.insert(term, value);
+    }
+    if values.get(&owner) != Some(&TermValue::iri(graph_iri(id))) {
+        return Err(failure("owner dictionary identity mismatch"));
+    }
+    if read_field::<Vec<String>>(&manifest, "graphs")? != [owner.to_string()] {
+        return Err(failure("metadata graph declarations disagree with owner"));
+    }
+    let mut rdf = RdfWrite::new(db)?;
+    let mut closure = BTreeSet::new();
+    for (id, value) in &values {
+        if rdf.closure(value, &mut closure)? != *id {
+            return Err(failure("metadata dictionary identity is inconsistent"));
+        }
+    }
+    let declared = read_field::<Vec<String>>(&manifest, "terms")?;
+    if declared != closure.iter().map(u64::to_string).collect::<Vec<_>>() {
+        return Err(failure(
+            "metadata term ownership disagrees with native closure",
+        ));
+    }
+    for row in &primary {
+        builder.push_quad(native[&row[0]], native[&row[1]], native[&row[2]], None)?;
+    }
+    Ok(StoredMetadata {
+        builder,
+        values,
+        primary,
+        rdf,
+    })
+}
+
+/// Event-time facts of one record: `eventTime` and its profile for a source instant, or
+/// the distinct receipt-time fallback facts.
+pub(super) fn event_time_metadata(
+    builder: &mut purrdf::RdfDatasetBuilder,
+    subject: purrdf::ir::TermId,
+    record: &Record,
+) -> Result<(), Error> {
+    use crate::RDF_VOCABULARY_NAMESPACE as NS;
+    // `eventTime` carries only a source instant. A receipt-time fallback uses its own
+    // predicate and basis so a query can never mistake one for the other.
+    let placement = record.event_time.placement(record.received_at);
+    let crate::EventTime::Known { profile_id, .. } = &record.event_time else {
+        return fallback_metadata(builder, subject, placement);
+    };
+    let predicate = builder.intern_iri(&format!("{NS}eventTime"))?;
+    let object = builder.intern_literal(date_time(placement.millis)?)?;
+    builder.push_quad(subject, predicate, object, None)?;
+    let predicate = builder.intern_iri(&format!("{NS}sourceTimeProfile"))?;
+    let object = builder.intern_iri(&format!("urn:sparrow:{profile_id}"))?;
+    builder.push_quad(subject, predicate, object, None)?;
+    Ok(())
+}
+
+/// `eventTimeFallback` and `eventTimeBasis` of a receipt-time placement.
+pub(super) fn fallback_metadata(
+    builder: &mut purrdf::RdfDatasetBuilder,
+    subject: purrdf::ir::TermId,
+    placement: crate::EventPlacement,
+) -> Result<(), Error> {
+    use crate::RDF_VOCABULARY_NAMESPACE as NS;
+    if placement.basis != crate::EventTimeBasis::Receipt {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "a source instant is not a receipt-time fallback",
+        ));
+    }
+    let predicate = builder.intern_iri(&format!("{NS}eventTimeFallback"))?;
+    let object = builder.intern_literal(date_time(placement.millis)?)?;
+    builder.push_quad(subject, predicate, object, None)?;
+    let predicate = builder.intern_iri(&format!("{NS}eventTimeBasis"))?;
+    let object = builder.intern_literal(purrdf::RdfLiteral::simple(placement.basis.name()))?;
+    builder.push_quad(subject, predicate, object, None)?;
+    Ok(())
+}
+
+fn date_time(millis: u64) -> Result<purrdf::RdfLiteral, Error> {
+    Ok(purrdf::RdfLiteral::typed(
+        crate::format_instant(millis)?,
+        "http://www.w3.org/2001/XMLSchema#dateTime",
+    ))
+}
+
 pub(super) fn metadata_dataset(
     builder: purrdf::RdfDatasetBuilder,
 ) -> Result<std::sync::Arc<RdfDataset>, Error> {
@@ -728,17 +875,11 @@ fn occurrence_metadata(
         ),
         (
             format!("{NS}receivedAt"),
-            builder.intern_literal(RdfLiteral::typed(
-                crate::format_instant(received_at)?,
-                "http://www.w3.org/2001/XMLSchema#dateTime",
-            ))?,
+            builder.intern_literal(date_time(received_at)?)?,
         ),
         (
             format!("{NS}expiresAt"),
-            builder.intern_literal(RdfLiteral::typed(
-                crate::format_instant(expires_at)?,
-                "http://www.w3.org/2001/XMLSchema#dateTime",
-            ))?,
+            builder.intern_literal(date_time(expires_at)?)?,
         ),
     ] {
         let predicate = builder.intern_iri(&predicate)?;
@@ -989,20 +1130,7 @@ pub(super) fn metadata(
         ))?;
         builder.push_quad(subject, predicate, object, None)?;
     }
-    if let crate::EventTime::Known {
-        millis, profile_id, ..
-    } = &record.event_time
-    {
-        let predicate = builder.intern_iri(&format!("{NS}eventTime"))?;
-        let object = builder.intern_literal(RdfLiteral::typed(
-            crate::format_instant(*millis)?,
-            "http://www.w3.org/2001/XMLSchema#dateTime",
-        ))?;
-        builder.push_quad(subject, predicate, object, None)?;
-        let predicate = builder.intern_iri(&format!("{NS}sourceTimeProfile"))?;
-        let object = builder.intern_iri(&format!("urn:sparrow:{profile_id}"))?;
-        builder.push_quad(subject, predicate, object, None)?;
-    }
+    event_time_metadata(&mut builder, subject, record)?;
     if state.and_then(|s| s.get("state")).and_then(Value::as_str) == Some("complete") {
         let predicate = builder.intern_iri(&format!("{NS}projection"))?;
         let object = builder.intern_iri(&graph_iri(&record.rdf_projection_id))?;

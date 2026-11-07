@@ -207,6 +207,45 @@ pub enum EventTime {
         profile_id: Option<String>,
     },
 }
+/// Which clock placed a record on the event timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventTimeBasis {
+    /// The source profile supplied the instant.
+    Source,
+    /// No source instant exists; the record's receipt time is the marked fallback.
+    Receipt,
+}
+
+impl EventTimeBasis {
+    /// Stable agent and RDF spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Receipt => "receipt",
+        }
+    }
+}
+
+/// An event-timeline instant and the clock that supplied it, derived at read time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventPlacement {
+    /// UTC Unix milliseconds on the event timeline.
+    pub millis: u64,
+    /// Source instant or receipt-time fallback.
+    pub basis: EventTimeBasis,
+}
+
+impl EventPlacement {
+    /// The marked receipt-time fallback of a record without a source instant.
+    pub(crate) const fn receipt(received_at: u64) -> Self {
+        Self {
+            millis: received_at,
+            basis: EventTimeBasis::Receipt,
+        }
+    }
+}
+
 impl EventTime {
     pub(crate) fn unknown(reason: &str, profile: Option<&SourceTimeProfile>) -> Self {
         Self::Unknown {
@@ -219,6 +258,18 @@ impl EventTime {
         match self {
             Self::Known { millis, .. } => Some(*millis),
             Self::Unknown { .. } => None,
+        }
+    }
+    /// Read-time event-timeline placement: the source instant, or the record's receipt
+    /// time marked as a fallback. Stored evidence, including the unknown reason, is unchanged.
+    #[must_use]
+    pub fn placement(&self, received_at: u64) -> EventPlacement {
+        match self {
+            Self::Known { millis, .. } => EventPlacement {
+                millis: *millis,
+                basis: EventTimeBasis::Source,
+            },
+            Self::Unknown { .. } => EventPlacement::receipt(received_at),
         }
     }
     pub(crate) fn encode(&self) -> Value {

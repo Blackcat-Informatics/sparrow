@@ -133,6 +133,129 @@ const INTAKE_ARCHIVE: [&[u8]; 11] = [
     b"sparrow.store/131",
 ];
 
+// Receipt-time event fallback RDF: older binaries cannot publish a record metadata graph
+// without its `eventTimeFallback`. Each family lifts one family that existed before it,
+// keeping that family's log time, archive and intake switches.
+const FALLBACK_TRACING: [&[u8]; 11] = [
+    b"sparrow.store/132",
+    b"sparrow.store/133",
+    b"sparrow.store/134",
+    b"sparrow.store/135",
+    b"sparrow.store/136",
+    b"sparrow.store/137",
+    b"sparrow.store/138",
+    b"sparrow.store/139",
+    b"sparrow.store/140",
+    b"sparrow.store/141",
+    b"sparrow.store/142",
+];
+const FALLBACK_LOG_TIME: [&[u8]; 11] = [
+    b"sparrow.store/143",
+    b"sparrow.store/144",
+    b"sparrow.store/145",
+    b"sparrow.store/146",
+    b"sparrow.store/147",
+    b"sparrow.store/148",
+    b"sparrow.store/149",
+    b"sparrow.store/150",
+    b"sparrow.store/151",
+    b"sparrow.store/152",
+    b"sparrow.store/153",
+];
+const FALLBACK_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/154",
+    b"sparrow.store/155",
+    b"sparrow.store/156",
+    b"sparrow.store/157",
+    b"sparrow.store/158",
+    b"sparrow.store/159",
+    b"sparrow.store/160",
+    b"sparrow.store/161",
+    b"sparrow.store/162",
+    b"sparrow.store/163",
+    b"sparrow.store/164",
+];
+const FALLBACK_INTAKE: [&[u8]; 11] = [
+    b"sparrow.store/165",
+    b"sparrow.store/166",
+    b"sparrow.store/167",
+    b"sparrow.store/168",
+    b"sparrow.store/169",
+    b"sparrow.store/170",
+    b"sparrow.store/171",
+    b"sparrow.store/172",
+    b"sparrow.store/173",
+    b"sparrow.store/174",
+    b"sparrow.store/175",
+];
+const FALLBACK_INTAKE_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/176",
+    b"sparrow.store/177",
+    b"sparrow.store/178",
+    b"sparrow.store/179",
+    b"sparrow.store/180",
+    b"sparrow.store/181",
+    b"sparrow.store/182",
+    b"sparrow.store/183",
+    b"sparrow.store/184",
+    b"sparrow.store/185",
+    b"sparrow.store/186",
+];
+
+/// Families the event fallback fence lifts, in the order of their lifted counterparts.
+const LIFTED: [[&[u8]; 11]; 5] = [TRACING, LOG_TIME, ARCHIVE, INTAKE, INTAKE_ARCHIVE];
+const FALLBACK: [[&[u8]; 11]; 5] = [
+    FALLBACK_TRACING,
+    FALLBACK_LOG_TIME,
+    FALLBACK_ARCHIVE,
+    FALLBACK_INTAKE,
+    FALLBACK_INTAKE_ARCHIVE,
+];
+
+fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize, usize)> {
+    families
+        .iter()
+        .enumerate()
+        .find_map(|(family, identities)| {
+            identities
+                .iter()
+                .position(|identity| *identity == format)
+                .map(|index| (family, index))
+        })
+}
+
+/// The pre-fallback identity a fallback-fenced format lifts; other formats are unchanged.
+fn lower(format: &[u8]) -> &[u8] {
+    position(&FALLBACK, format).map_or(format, |(family, index)| LIFTED[family][index])
+}
+
+/// Re-apply the fallback fence to a transition computed on the lowered identity.
+fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
+    if !has_event_fallback(current) {
+        return Ok(next);
+    }
+    enable_event_fallback(next)
+}
+
+pub(super) fn has_event_fallback(format: &[u8]) -> bool {
+    position(&FALLBACK, format).is_some()
+}
+
+/// Fence a current tracing-or-later family for receipt-time fallback RDF; idempotent.
+pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&FALLBACK, format) {
+        return Ok(FALLBACK[family][index]);
+    }
+    position(&LIFTED, format)
+        .map(|(family, index)| FALLBACK[family][index])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "event fallback RDF requires a tracing or later authority family",
+            )
+        })
+}
+
 /// Every family in order; a position modulo `BASE.len()` names the original authority.
 fn families() -> impl Iterator<Item = &'static &'static [u8]> {
     BASE.iter()
@@ -144,6 +267,7 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(ARCHIVE.iter())
         .chain(INTAKE.iter())
         .chain(INTAKE_ARCHIVE.iter())
+        .chain(FALLBACK.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -159,38 +283,51 @@ fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
 }
 
 pub(super) fn has_intake(format: &[u8]) -> bool {
+    let format = lower(format);
     INTAKE.contains(&format) || INTAKE_ARCHIVE.contains(&format)
 }
 
 /// Fence any current authority family for intake provenance, keeping its archive switch.
 pub(super) fn enable_intake(format: &[u8]) -> Result<&'static [u8], Error> {
     let index = base_index(format, "intake provenance fence")?;
-    Ok(if has_archive(format) {
-        INTAKE_ARCHIVE[index]
-    } else {
-        INTAKE[index]
-    })
+    relift(
+        format,
+        if has_archive(format) {
+            INTAKE_ARCHIVE[index]
+        } else {
+            INTAKE[index]
+        },
+    )
 }
 
 pub(super) fn has_archive(format: &[u8]) -> bool {
+    let format = lower(format);
     ARCHIVE.contains(&format) || INTAKE_ARCHIVE.contains(&format)
 }
 
 /// Fence any current authority family for archive-before-delete; idempotent.
 pub(super) fn enable_archive(format: &[u8]) -> Result<&'static [u8], Error> {
     let index = base_index(format, "archive fence")?;
-    Ok(if has_intake(format) {
-        INTAKE_ARCHIVE[index]
-    } else {
-        ARCHIVE[index]
-    })
+    relift(
+        format,
+        if has_intake(format) {
+            INTAKE_ARCHIVE[index]
+        } else {
+            ARCHIVE[index]
+        },
+    )
 }
 
 pub(super) fn has_log_time(format: &[u8]) -> bool {
+    let format = lower(format);
     LOG_TIME.contains(&format) || has_archive(format) || has_intake(format)
 }
 
 pub(super) fn enable_log_time(format: &[u8]) -> Result<&'static [u8], Error> {
+    relift(format, enable_log_time_lowered(lower(format))?)
+}
+
+fn enable_log_time_lowered(format: &[u8]) -> Result<&'static [u8], Error> {
     // The archive and intake families already include the log time law; never lower them.
     if let Some(identity) = ARCHIVE
         .iter()
@@ -217,6 +354,7 @@ pub(super) fn enable_log_time(format: &[u8]) -> Result<&'static [u8], Error> {
 }
 
 pub(super) fn has_tracing(format: &[u8]) -> bool {
+    let format = lower(format);
     TRACING.contains(&format) || has_log_time(format)
 }
 
@@ -274,6 +412,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
             .chain(ARCHIVE.iter())
             .chain(INTAKE.iter())
             .chain(INTAKE_ARCHIVE.iter())
+            .chain(FALLBACK.iter().flatten())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -310,31 +449,29 @@ pub(super) fn stage(db: &DB, batch: &mut WriteBatch, base: &[u8]) -> Result<(), 
     let current = db
         .get("store_format")?
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
-    batch.put(
-        "store_format",
-        if has_intake(&current) {
-            let index = base_index(base, "intake provenance fence")?;
-            if has_archive(&current) {
-                INTAKE_ARCHIVE[index]
-            } else {
-                INTAKE[index]
-            }
-        } else if has_archive(&current) {
-            enable_archive(base)?
-        } else if has_log_time(&current) {
-            enable_log_time(base)?
-        } else if has_tracing(&current) {
-            enable_tracing(base)?
-        } else if has_provenance(&current) {
-            enable_provenance(base)?
-        } else if has_all_artifact_rdf(&current) {
-            enable_all(base)?
-        } else if has_artifact_rdf(&current) {
-            enable(base)?
+    let staged = if has_intake(&current) {
+        let index = base_index(base, "intake provenance fence")?;
+        if has_archive(&current) {
+            INTAKE_ARCHIVE[index]
         } else {
-            base
-        },
-    );
+            INTAKE[index]
+        }
+    } else if has_archive(&current) {
+        enable_archive(base)?
+    } else if has_log_time(&current) {
+        enable_log_time(base)?
+    } else if has_tracing(&current) {
+        enable_tracing(base)?
+    } else if has_provenance(&current) {
+        enable_provenance(base)?
+    } else if has_all_artifact_rdf(&current) {
+        enable_all(base)?
+    } else if has_artifact_rdf(&current) {
+        enable(base)?
+    } else {
+        base
+    };
+    batch.put("store_format", relift(&current, staged)?);
     Ok(())
 }
 
@@ -354,6 +491,11 @@ mod tests {
             ARCHIVE,
             INTAKE,
             INTAKE_ARCHIVE,
+            FALLBACK_TRACING,
+            FALLBACK_LOG_TIME,
+            FALLBACK_ARCHIVE,
+            FALLBACK_INTAKE,
+            FALLBACK_INTAKE_ARCHIVE,
         ] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
@@ -414,6 +556,61 @@ mod tests {
                 [BASE, RDF, ALL_RDF, PROVENANCE, TRACING, LOG_TIME]
                     .iter()
                     .all(|family| !family.contains(&identity))
+            );
+        }
+        // The event fallback fence lifts every tracing-or-later family and keeps its switches.
+        for (index, base) in BASE.into_iter().enumerate() {
+            for (lifted, fallback) in LIFTED.iter().zip(FALLBACK.iter()) {
+                assert_eq!(
+                    enable_event_fallback(lifted[index]).unwrap(),
+                    fallback[index]
+                );
+                assert_eq!(
+                    enable_event_fallback(fallback[index]).unwrap(),
+                    fallback[index]
+                );
+                assert!(has_event_fallback(fallback[index]));
+                assert!(!has_event_fallback(lifted[index]));
+                assert!(has_tracing(fallback[index]) && has_provenance(fallback[index]));
+            }
+            assert!(enable_event_fallback(base).is_err());
+            assert_eq!(
+                enable_log_time(FALLBACK_TRACING[index]).unwrap(),
+                FALLBACK_LOG_TIME[index]
+            );
+            assert_eq!(
+                enable_archive(FALLBACK_LOG_TIME[index]).unwrap(),
+                FALLBACK_ARCHIVE[index]
+            );
+            assert_eq!(
+                enable_intake(FALLBACK_LOG_TIME[index]).unwrap(),
+                FALLBACK_INTAKE[index]
+            );
+            assert_eq!(
+                enable_intake(FALLBACK_ARCHIVE[index]).unwrap(),
+                FALLBACK_INTAKE_ARCHIVE[index]
+            );
+            assert_eq!(
+                enable_archive(FALLBACK_INTAKE[index]).unwrap(),
+                FALLBACK_INTAKE_ARCHIVE[index]
+            );
+        }
+        // Older binaries know none of the fallback identities, so they refuse a fenced store.
+        for identity in FALLBACK.iter().flatten() {
+            assert!(
+                [
+                    BASE,
+                    RDF,
+                    ALL_RDF,
+                    PROVENANCE,
+                    TRACING,
+                    LOG_TIME,
+                    ARCHIVE,
+                    INTAKE,
+                    INTAKE_ARCHIVE
+                ]
+                .iter()
+                .all(|family| !family.contains(identity))
             );
         }
         assert!(enable(b"sparrow.store/5").is_err());

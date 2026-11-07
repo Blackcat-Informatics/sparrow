@@ -482,7 +482,9 @@ flushes. At shutdown the daemon synchronizes and flushes every column family int
 new table files. None of this adds or removes evidence: record, artifact and
 payload chunk rows are unchanged, so `Status.uniquePayloadChunks` reads the same
 as when the store was closed. Opening a store last written by the schema 62
-image left its format, `sparrow.store/92`, unchanged. A store that still owes the
+image left its format, `sparrow.store/92`, unchanged under schema 68. Since
+schema 69, any open, query-only included, lifts it to `/147` and runs the
+receipt-time fallback backfill (see "Receipt-time event fallback"). A store that still owes the
 table rewrite reports `recompression` as `running`, but the rewrite never runs.
 The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
 at shutdown. Every daemon, query-only or not, logs
@@ -496,6 +498,43 @@ Schema 67 adds `Status.queryOnly`, true in this mode, and
 received (`sparrow_core::RETENTION_MS`, 30 days). CLI and MCP status render them
 as `query_only` and `retention_seconds`, the latter as a decimal string. `deploy/verify-backup.sh` relies on the mode to verify a
 backup; see `deploy/RECOVERY.md`, "Verify a backup".
+
+### Receipt-time event fallback (schema 69)
+
+A record whose source profile yields no event time is placed on the event
+timeline at its receipt time, and every such placement is marked as a fallback.
+The basis is `source` when the source profile supplied the instant and `receipt`
+otherwise. The fallback is derived at read time from the record's `received_at`.
+Stored records and source profiles are unchanged, and the stored unknown reason
+stays inspectable.
+
+The Cap'n Proto shape is unchanged in structure: the `EventTime` union variant is
+the basis (`known` is `source`, `unknown` is `receipt`). Schema 69 adds
+`UnknownEventTime.fallback`, the receipt instant that places the record, and
+`RecordsResults.eventTimeFallback`, the count of qualified records an event-time
+read placed by receipt time (0 for a receipt-time read). Older endpoints fail the
+exact schema discovery check.
+
+The CLI and MCP JSON shape for record output (`records`, `record`, `context`)
+renders the basis explicitly as `event_time.basis`. A `source` basis keeps
+`instant` and its source evidence. A `receipt` basis adds `fallback_instant`
+beside the original `state`, `reason` and `profile_id`, and never sets `instant`.
+An event-time records read reports top-level `event_time_fallback` as a decimal
+string. Correlation profile `sparrow-correlation/2` and the RDF vocabulary below
+carry the same law.
+
+The RDF fallback triples are written with each new record metadata graph. Opening
+a store last written before schema 69 backfills them: a resumable startup job
+(`event-fallback-rdf-upgrade`, through the shared catalog upgrade pager) rebuilds
+every retained record metadata graph that has no `eventTime`, adding
+`eventTimeFallback` (the graph's own `receivedAt`) and `eventTimeBasis` and
+nothing else. It reads only the graph, so a graph prepared by an unfinished
+staged import, which has no public record yet, is covered too, and its later
+publication carries the facts. Stored records are not read or changed. Before the job starts, the store format moves to a fallback writer
+family, `sparrow.store/132` to `/186`, which lifts each tracing, log time,
+archive and intake family by 55 and keeps its switches, so older binaries refuse
+the store rather than publish graphs without the fallback facts. The service
+stays unavailable until the backfill finishes.
 
 ## 1. Common types and defaults
 
@@ -551,7 +590,7 @@ generation identity for as long as recovery can still require it.
 Artifact/record summaries expose:
 
 - Store and occurrence ID, occurrence IRI and graph IRIs, source/stream ID, receipt time, ordinary deadline,
-  event time when known, media/format, and source name.
+  event time with its `source` or `receipt` basis, media/format, and source name.
 - Payload identity, byte length, source byte range when applicable, and whether
   the complete artifact remains available.
 - Projection state and codec/profile identifiers, parsed diagnostic fields,
@@ -609,10 +648,13 @@ IDs, service, host, severity, receipt time, event time, and trace/span IDs; more
 expressive conditions use SPARQL.
 
 Temporal reads select receipt time (`received_at`) or source event time
-(`event_time`) explicitly. An event-time interval excludes unknown event times
-and reports their count when known; it never substitutes receipt time. A source
-profile states which field and representation supplies event time. Chronological
-sorting uses the selected timestamp and occurrence ID as a stable tiebreaker.
+(`event_time`) explicitly. An event-time interval places a record whose source
+time is unknown at its receipt time, marks it with basis `receipt`, and reports
+both the unknown count and `event_time_fallback`, the count of selected records
+placed by receipt time (schema 69). A known source instant is never replaced by
+receipt time. A source profile states which field and representation supplies
+event time. Chronological sorting uses the selected placement and occurrence ID
+as a stable tiebreaker.
 Timestamp mappings, lexical/logical field matching, and text interpretation are
 advertised profiles rather than guesses based on names or file extensions.
 
@@ -649,9 +691,11 @@ materialized input and incompatible non-syslog format retain explicit unknown
 reasons: `log_no_match`, `log_capture_missing`, `log_invalid_utf8`,
 `invalid_instant`, `log_input_unavailable` and `log_wrong_format`. Raw bytes remain
 authoritative. Syslog retains its protocol timestamp interpretation. Event-time
-queries exclude unknown clocks and report their count without substituting receipt
-time. Strict index readiness does not promise every clock is known; event-time
-correlation separately enforces its interpretation-completeness contract.
+queries place unknown clocks at receipt time, marked with basis `receipt`, and
+report their count. Strict index readiness does not promise every clock is known;
+a source time that depends on a failed JSON projection is not ready, so strict
+event-time reads and strict event-clock correlation refuse it with
+`INDEX_NOT_READY`.
 
 Patterns admit at most 4096 UTF-8 bytes. Compilation has finite native ceilings
 of 100,000 steps, 16,384 nodes and 65,536 construction slots. Each match has
@@ -670,6 +714,8 @@ an `extraction` descriptor; the legacy `path` is empty for a log capture.
 
 The first log definition atomically publishes its interpretation marker and
 writer fence 88..98, preserving the corresponding prior authority family 77..87.
+On a schema 69 store, already lifted by +55, the same definition moves 132..142
+to 143..153.
 Other stores keep their format. Later watch/receiver/pressure/retirement
 transitions preserve the fence; marker/format disagreement fails on open. Older
 writers refuse the new family. Source time definition/lookup RPCs require schema
@@ -1279,9 +1325,13 @@ relationship; a missing/unavailable reference fails before native evaluation.
 Relations are `shared_trace_id`, `shared_span_id`, `shared_source`, or
 `cooccurs_in_interval`. The first two compare known declared strings exactly;
 they do not establish a global trace/span identity or causal link. Shared source
-means the same recorded Source entity. Co-occurrence requires both known times
+means the same recorded Source entity. Co-occurrence requires both endpoint times
 in the explicit half-open interval; it is not a guessed relative window or a
-producer-order claim. Event-time unknowns never use receipt time as a fallback.
+producer-order claim. On the event clock an endpoint without a source instant is
+placed at its receipt time, derived at read time from `receivedAt`. Profile
+`sparrow-correlation/2` (schema 69) returns `seed_window_basis`,
+`related_window_basis` and, for an event-clock time selector, `selected_basis`,
+each `source` or `receipt`; they are unbound on the receipt clock.
 
 Native rows are directed `(seed, related)` pairs, exclude self-edges, and preserve
 distinct occurrences with equal payloads. Reverse pairs may both appear when
@@ -1294,7 +1344,7 @@ support original-byte inspection; a result lease does not retain those bytes.
 
 The native result envelope, governor certificate and all partial/failure laws are
 the same as raw SPARQL. `operation=correlate` and a frozen `correlation` descriptor
-survive `result_next`. Its `sparrow-correlation/1` profile and
+survive `result_next`. Its `sparrow-correlation/2` profile and
 `correlation-query:<BLAKE3>` key cover recipe text and normalized typed parameters;
 scope and snapshot identities remain separate. A descriptor is validated through
 the same recipe owner before rendering. Source, scope, page and governor controls
@@ -1304,8 +1354,14 @@ Content projection is not needed: correlation reads metadata and diagnostics.
 All native graph replies additionally expose `interpretations`: known/unknown
 event-time and per-dimension diagnostic counts among known selected occurrences.
 Outer diagnostic-membership unknowns remain separate in the existing coverage.
-For correlation, `coverage.complete` also requires known interpretations for all
-selector/relation fields throughout that selected scope, not only matching rows.
+Agent output adds `interpretations.event_time.fallback`, equal to the unknown
+count, because every unknown is placed by receipt time.
+For correlation, `coverage.complete` also requires known diagnostic interpretations
+for all selector/relation fields throughout that selected scope, not only matching
+rows. Every record has an event-clock placement, so an unknown source time alone
+does not leave it incomplete. An event clock does require that no selected
+record's source time depends on a failed JSON projection, the same readiness law
+as a strict records read.
 Strict `require_complete_index=true` refuses an incomplete interpretation with
 `INDEX_NOT_READY`. In permissive mode, available relationships retain their native
 certainty while incomplete coverage prevents an empty result proving absence.
@@ -1528,7 +1584,8 @@ Sparrow's vocabulary is `urn:sparrow:vocab:`. Metadata uses `Artifact`, `Record`
 
 | Predicate | Value |
 | --- | --- |
-| `receivedAt`, `expiresAt`, `eventTime` | Typed UTC `xsd:dateTime`; an unknown event time is absent. `expiresAt` is the ordinary retention deadline, not an implicit pin renewal. |
+| `receivedAt`, `expiresAt`, `eventTime` | Typed UTC `xsd:dateTime`. `eventTime` is a source instant only and is absent when the source time is unknown. `expiresAt` is the ordinary retention deadline, not an implicit pin renewal. |
+| `eventTimeFallback`, `eventTimeBasis` | On a record without a source instant: its receipt instant as a typed `xsd:dateTime`, and the simple literal `receipt`. Absent on a record with `eventTime`, so a query cannot confuse the two (schema 69). |
 | `source`, `stream`, `artifact` | Entity IRIs linking an occurrence to its origin, generation, or parent. |
 | `payload` | Content IRI corresponding to the occurrence's exact payload identity. |
 | `projection` | Named graph IRI for a content projection under its recorded profile. |

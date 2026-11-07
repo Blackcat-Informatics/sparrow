@@ -168,11 +168,14 @@ impl Input {
     }
 }
 
+/// Source evidence plus its event-timeline basis: `source` for a known instant, or
+/// `receipt` with the fallback instant and the original unknown reason.
 pub(super) fn event(value: wire::event_time::Reader<'_>) -> Result<Value> {
     match value.which()? {
         wire::event_time::Known(value) => {
             let value = value?;
             Ok(Object::new()
+                .with("basis", sparrow_core::EventTimeBasis::Source.name())
                 .with("state", "known")
                 .with("instant", instant(value.get_instant()?)?)
                 .with("profile_id", value.get_profile_id()?.to_str()?)
@@ -184,6 +187,8 @@ pub(super) fn event(value: wire::event_time::Reader<'_>) -> Result<Value> {
         wire::event_time::Unknown(value) => {
             let value = value?;
             Ok(Object::new()
+                .with("basis", sparrow_core::EventTimeBasis::Receipt.name())
+                .with("fallback_instant", instant(value.get_fallback()?)?)
                 .with("state", "unknown")
                 .with("profile_id", optional_value(value.get_profile_id()?)?)
                 .with(

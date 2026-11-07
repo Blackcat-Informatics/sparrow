@@ -217,8 +217,9 @@ evidence, temporal query paths and retention. Native work/storage refusals fail
 ingestion rather than publishing a prefix; ordinary absent/invalid source times
 remain unknown. See [the contract and limits](interfaces.md#plain-log-timestamp-captures-source-schema-60).
 
-An event-time interval excludes records with unknown event time and reports that
-excluded count separately when known. It never substitutes acceptance time.
+An event-time interval places records with unknown event time at their receipt
+time, marks each with basis `receipt`, and reports their count as
+`event_time_fallback` (schema 69). A known source instant is never replaced.
 Chronological pages use the selected timestamp and a stable occurrence-ID
 tiebreaker within the captured snapshot. Relevance sorting is an explicit option;
 scores identify their ranking corpus and profile.

@@ -101,6 +101,10 @@ that view's identity space.
 Completed-file records inherit the artifact's acceptance time. Tailed records
 receive their own acceptance time as they are committed. A completed file's
 source modification time and a record's event time are independent metadata.
+A record whose source profile yields no event time keeps its stored unknown
+reason. Event-time reads place it at its receipt time, derived when read and
+marked with basis `receipt`; a source instant has basis `source` and is never
+replaced. Retention and expiry always use receipt time.
 
 Large files use ordered manifests covering every original byte, including blank
 lines, delimiters, CRLF, and a final unterminated record. JSONL/log boundaries
@@ -495,7 +499,9 @@ lexical scalar values are not silently converted into typed numeric literals.
 Sparrow owns the vocabulary `urn:sparrow:vocab:` for occurrence metadata,
 diagnostic facts, and relationships. Shared content graphs and occurrence graphs
 are distinct. A record links to its content projection rather than duplicating
-every content triple. Source, service, severity, event time, and trace/span
+every content triple. The `eventTime` predicate carries only a source instant; a
+receipt-time fallback uses the distinct `eventTimeFallback` and `eventTimeBasis`
+predicates. Source, service, severity, event time, and trace/span
 identifiers are normalized into a separate diagnostic view when available;
 conflicting or ambiguous mappings produce diagnostics and preserve source
 spelling.

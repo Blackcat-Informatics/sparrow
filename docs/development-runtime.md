@@ -6308,13 +6308,15 @@ target/release/sparrow SOCKET records --source copied-events \
 
 `records_search` accepts paired `event_from` and `event_before` bounds, plus its
 existing text/field and acceptance-time filters. CLI uses paired `--event-from`
-and `--event-before`. Bounds are UTC half-open intervals. Unknown source times
-are excluded, with `event_coverage.unknown` counted among live source/acceptance
-scope records. `outside_interval` counts known source times outside the interval;
-`evaluated` is their shared population. `membership_complete:false` identifies
-an incomplete bounded catalog scan, so these counts must not be treated as exact
-store-wide totals. Chronological event queries sort by source instant and stable
-record ID before applying the row limit. Optional text ranking runs only over
+and `--event-before`. Bounds are UTC half-open intervals. Since schema 69, an
+unknown source time is placed at its receipt time with basis `receipt`, and
+`event_time_fallback` counts the qualified records placed that way;
+`event_coverage.unknown` still counts unknown source times among live
+source/acceptance scope records. `outside_interval` counts placements outside the
+interval; `evaluated` is their shared population. `membership_complete:false`
+identifies an incomplete bounded catalog scan, so these counts must not be
+treated as exact store-wide totals. Chronological event queries sort by placement
+and stable record ID before applying the row limit. Optional text ranking runs only over
 qualified event-time members, with the existing native corpus receipts.
 
 The response explicitly reports `time_basis:event_time`, each row's known time
