@@ -439,30 +439,42 @@ impl<'a> RdfWrite<'a> {
         })
     }
 
+    /// The identity of a term this batch staged or the dictionary holds, without staging it.
+    pub(super) fn known(&mut self, value: &TermValue) -> Result<Option<u64>, Error> {
+        self.lookup(&encoded(value)?)
+    }
+
+    fn lookup(&mut self, bytes: &[u8]) -> Result<Option<u64>, Error> {
+        if let Some(id) = self.terms.get(bytes).or_else(|| self.stored.get(bytes)) {
+            return Ok(Some(*id));
+        }
+        let reverse = reverse_key(bytes);
+        let Some(stored) = self.db.get_cf(reverse_family(self.db)?, reverse)? else {
+            return Ok(None);
+        };
+        let id = u64::from_be_bytes(
+            stored
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid RDF reverse identity"))?,
+        );
+        if self.db.get(term_key(id))?.as_deref() != Some(bytes) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "RDF forward/reverse identity mismatch",
+            ));
+        }
+        // Memory stays bounded; beyond the bound repeats read again.
+        if self.stored_bytes.saturating_add(bytes.len()) <= MAX_STAGING {
+            self.stored_bytes += bytes.len();
+            self.stored.insert(bytes.to_vec(), id);
+        }
+        Ok(Some(id))
+    }
+
     fn intern(&mut self, value: &TermValue) -> Result<u64, Error> {
         let bytes = encoded(value)?;
-        if let Some(id) = self.terms.get(&bytes).or_else(|| self.stored.get(&bytes)) {
-            return Ok(*id);
-        }
-        let reverse = reverse_key(&bytes);
-        if let Some(stored) = self.db.get_cf(reverse_family(self.db)?, reverse)? {
-            let id = u64::from_be_bytes(
-                stored
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::new("STORAGE_FAILURE", "invalid RDF reverse identity"))?,
-            );
-            if self.db.get(term_key(id))?.as_deref() != Some(bytes.as_slice()) {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "RDF forward/reverse identity mismatch",
-                ));
-            }
-            // Memory stays bounded; beyond the bound repeats read again.
-            if self.stored_bytes.saturating_add(bytes.len()) <= MAX_STAGING {
-                self.stored_bytes += bytes.len();
-                self.stored.insert(bytes, id);
-            }
+        if let Some(id) = self.lookup(&bytes)? {
             return Ok(id);
         }
         self.staged_bytes = self.staged_bytes.saturating_add(bytes.len());
@@ -797,26 +809,26 @@ pub(super) fn manifest_rows(manifest: &Value) -> Result<Vec<(u8, [u64; 4])>, Err
 }
 
 /// One stored occurrence metadata graph replayed into a native builder for a rebuild.
-pub(super) struct StoredMetadata<'a> {
+pub(super) struct StoredMetadata {
     /// Every primary quad of the stored graph, re-interned.
     pub builder: purrdf::RdfDatasetBuilder,
     /// Decoded dictionary values by stored term ID.
     pub values: BTreeMap<u64, TermValue>,
     /// Primary-stream rows: subject, predicate, object and owner IDs.
     pub primary: BTreeSet<[u64; 4]>,
-    /// Writer that verified the graph's dictionary closure.
-    pub rdf: RdfWrite<'a>,
 }
 
-/// Decode `rdf:graph:<id>`, verify its plain-quad ownership and dictionary identity, and
-/// replay its primary quads. `remaining` bounds term decoding within a migration page.
-pub(super) fn stored_metadata<'a>(
-    db: &'a DB,
+/// Decode `rdf:graph:<id>`, verify its plain-quad ownership and dictionary identity through
+/// `rdf`, the writer that will replace it, and replay its primary quads. `remaining` bounds
+/// term decoding for this graph.
+pub(super) fn stored_metadata(
+    db: &DB,
+    rdf: &mut RdfWrite<'_>,
     id: &str,
     bytes: &[u8],
     mut remaining: usize,
     failure: &dyn Fn(&str) -> Error,
-) -> Result<StoredMetadata<'a>, Error> {
+) -> Result<StoredMetadata, Error> {
     let manifest = parse(bytes)?;
     let owner = integer(&manifest, "owner")?;
     let rows = manifest_rows(&manifest)?;
@@ -867,7 +879,6 @@ pub(super) fn stored_metadata<'a>(
     if read_field::<Vec<String>>(&manifest, "graphs")? != [owner.to_string()] {
         return Err(failure("metadata graph declarations disagree with owner"));
     }
-    let mut rdf = RdfWrite::new(db)?;
     let mut closure = BTreeSet::new();
     for (id, value) in &values {
         if rdf.closure(value, &mut closure)? != *id {
@@ -887,7 +898,6 @@ pub(super) fn stored_metadata<'a>(
         builder,
         values,
         primary,
-        rdf,
     })
 }
 
@@ -936,7 +946,7 @@ pub(super) fn fallback_metadata(
     Ok(())
 }
 
-fn date_time(millis: u64) -> Result<purrdf::RdfLiteral, Error> {
+pub(super) fn date_time(millis: u64) -> Result<purrdf::RdfLiteral, Error> {
     Ok(purrdf::RdfLiteral::typed(
         crate::format_instant(millis)?,
         "http://www.w3.org/2001/XMLSchema#dateTime",

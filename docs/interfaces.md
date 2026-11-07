@@ -530,7 +530,13 @@ every retained record metadata graph that has no `eventTime`, adding
 `eventTimeFallback` (the graph's own `receivedAt`) and `eventTimeBasis` and
 nothing else. It reads only the graph, so a graph prepared by an unfinished
 staged import, which has no public record yet, is covered too, and its later
-publication carries the facts. Stored records are not read or changed. Before the job starts, the store format moves to a fallback writer
+publication carries the facts. Stored records are not read or changed. Each page
+examines up to 4,096 graphs, rebuilding those that need facts through one RDF writer, and commits them with its
+checkpoint in one synchronized write, ending sooner at 16 MiB of stored graph
+manifests or of page batch, so an interrupted open resumes after its last
+committed page. A graph whose manifest rows already give its record `eventTime`
+or `eventTimeFallback` is skipped from those rows and the dictionary identities,
+without decoding its terms. Before the job starts, the store format moves to a fallback writer
 family, `sparrow.store/132` to `/186`, which lifts each tracing, log time,
 archive and intake family by 55 and keeps its switches, so older binaries refuse
 the store rather than publish graphs without the fallback facts. The service

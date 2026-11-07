@@ -21,14 +21,57 @@ pub(super) fn json_charge(bytes: &[u8], maximum: usize) -> Result<usize, Error> 
     Ok(charge)
 }
 
-pub(super) struct Job {
+pub(super) struct Job<P = Publish> {
     pub checkpoint: &'static str,
     pub source: &'static str,
     pub target: &'static [u8],
     pub page_bytes: usize,
     pub page_entries: usize,
     pub charge: fn(&[u8]) -> Result<usize, Error>,
-    pub publish: Publish,
+    pub publish: P,
+}
+
+/// How a job publishes the entries of one page. A page opens its state before its first
+/// entry and finishes it into the page's batch before the checkpoint, so the entries of
+/// one atomic page can share staged state, such as an RDF writer whose counters resolve
+/// from the committed database.
+pub(super) trait Publication {
+    type Page<'a>;
+    fn open<'a>(&self, db: &'a DB) -> Result<Self::Page<'a>, Error>;
+    fn publish(
+        &self,
+        page: &mut Self::Page<'_>,
+        identity: &str,
+        bytes: &[u8],
+        charge: usize,
+        batch: &mut WriteBatch,
+    ) -> Result<(), Error>;
+    /// Whether the page must end before another entry; asked once it holds an entry.
+    fn full(&self, _page: &Self::Page<'_>, _batch: &WriteBatch) -> bool {
+        false
+    }
+    fn finish(&self, page: Self::Page<'_>, batch: &mut WriteBatch) -> Result<(), Error>;
+}
+
+/// An entry publisher with no page state.
+impl Publication for Publish {
+    type Page<'a> = &'a DB;
+    fn open<'a>(&self, db: &'a DB) -> Result<&'a DB, Error> {
+        Ok(db)
+    }
+    fn publish(
+        &self,
+        db: &mut &DB,
+        identity: &str,
+        bytes: &[u8],
+        charge: usize,
+        batch: &mut WriteBatch,
+    ) -> Result<(), Error> {
+        self(db, identity, bytes, charge, batch)
+    }
+    fn finish(&self, _: &DB, _: &mut WriteBatch) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -71,7 +114,11 @@ impl Catalog for Progress {
     }
 }
 
-pub(super) fn run(db: &DB, job: &Job, admit: PageAdmission<'_>) -> Result<(), Error> {
+pub(super) fn run<P: Publication>(
+    db: &DB,
+    job: &Job<P>,
+    admit: PageAdmission<'_>,
+) -> Result<(), Error> {
     loop {
         let bytes = db.get(job.checkpoint)?.ok_or_else(|| {
             Error::new(
@@ -96,7 +143,7 @@ pub(super) fn run(db: &DB, job: &Job, admit: PageAdmission<'_>) -> Result<(), Er
     }
 }
 
-pub(super) fn seed(db: &DB, job: &Job, batch: &mut WriteBatch) -> Result<(), Error> {
+pub(super) fn seed<P>(db: &DB, job: &Job<P>, batch: &mut WriteBatch) -> Result<(), Error> {
     let present = match db.prefix_iterator(job.target).next() {
         Some(row) => row?.0.starts_with(job.target),
         None => false,
@@ -119,9 +166,9 @@ pub(super) fn commit(db: &DB, batch: WriteBatch) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn step(
+pub(super) fn step<P: Publication>(
     db: &DB,
-    job: &Job,
+    job: &Job<P>,
     mut progress: Progress,
     maximum: usize,
     admit: PageAdmission<'_>,
@@ -139,6 +186,7 @@ pub(super) fn step(
     let start = progress.after.clone();
     let key = start.as_deref().unwrap_or(job.source);
     let mut batch = WriteBatch::default();
+    let mut page = job.publish.open(db)?;
     let mut remaining = job.page_bytes;
     let mut visited = 0;
     progress.complete = true;
@@ -153,7 +201,7 @@ pub(super) fn step(
         {
             continue;
         }
-        if visited == maximum {
+        if visited == maximum || (visited > 0 && job.publish.full(&page, &batch)) {
             progress.complete = false;
             break;
         }
@@ -187,10 +235,12 @@ pub(super) fn step(
             break;
         }
         remaining -= charge;
-        (job.publish)(db, identity, &bytes, charge, &mut batch)?;
+        job.publish
+            .publish(&mut page, identity, &bytes, charge, &mut batch)?;
         progress.after = Some(identity.to_owned());
         visited += 1;
     }
+    job.publish.finish(page, &mut batch)?;
     if progress.complete {
         progress.after = None;
     }
