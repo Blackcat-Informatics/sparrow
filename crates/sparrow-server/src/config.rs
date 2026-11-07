@@ -265,6 +265,22 @@ impl ServerConfig {
         if !self.query_only {
             return Ok(());
         }
+        self.refuse_intake("query_only", "a query-only daemon")
+    }
+
+    /// Check the configuration for `sparrowd --no-intake`: a writable daemon with its
+    /// maintenance duty that starts no intake, public listener or archive, so that a disposable
+    /// copy of a store can run its online migrations without consuming the live intake that
+    /// its stored watch catalog names.
+    pub fn check_no_intake(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.query_only {
+            return Err("--no-intake and query-only mode exclude each other".into());
+        }
+        self.refuse_intake("--no-intake", "a no-intake daemon")
+    }
+
+    /// Refuse the first configured intake, public listener or archive key for `mode`.
+    fn refuse_intake(&self, mode: &str, daemon: &str) -> Result<(), Box<dyn std::error::Error>> {
         let conflicting = [
             ("consume", !self.consume.is_empty()),
             ("syslog", !self.syslog.is_empty()),
@@ -274,7 +290,7 @@ impl ServerConfig {
         ];
         match conflicting.iter().find(|(_, set)| *set) {
             Some((key, _)) => Err(format!(
-                "query_only refuses the configured `{key}`: a query-only daemon starts no intake, public listener or archive; remove `{key}` from this configuration"
+                "{mode} refuses the configured `{key}`: {daemon} starts no intake, public listener or archive; remove `{key}` from this configuration"
             )
             .into()),
             None => Ok(()),

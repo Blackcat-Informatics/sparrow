@@ -539,8 +539,22 @@ enumeration use the same owner walk. Requests and row visits are charged as on
 the store-wide plan, but only rows of in-scope graphs are read, so a scoped
 read's cost follows its scope. A read over the whole live store keeps the
 store-wide plan, whose cost is the store's. Opening a store written before the
-mirror builds it from the existing declarations in resumable pages after
-fencing older writers.
+mirror fences older writers and serves at once; the maintenance worker builds
+the mirror from the existing declarations in resumable pages. Until the build
+completes, every scope keeps the store-wide plan filtered to its owners, which
+returns the same rows, and new declarations get their mirror rows as they are
+written.
+
+Online store migrations rebuild derived rows while the daemon serves. The open
+applies the writer-format fence and seeds each migration's checkpoint durably,
+then serves. The joined maintenance worker runs one bounded page per admission,
+fairly with its other duties, and each page commits its rows and checkpoint
+atomically through the ordinary write path, so a restart resumes after the last
+committed page and a failed page is retried, never skipped. Readers take an
+explicit pending path until a migration completes and say so where the answer
+could differ: the schema 69 receipt-time fallback backfill is reported in
+SPARQL coverage. `status` reports each migration's progress. A query-only
+daemon runs no maintenance worker, so it serves on the pending paths.
 
 Use PurRDF's governed prepared queries and fail-aware execution boundary.
 Storage faults refuse publication of an apparently successful prefix. Governor

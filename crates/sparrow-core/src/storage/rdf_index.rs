@@ -293,8 +293,7 @@ const GRAPH_PREFIX: &[u8] = b"rdf:g:";
 /// read enumerates its owners' graphs without visiting the store's other declarations.
 /// `RdfWrite` writes and deletes both rows in the same batch.
 pub(super) const OWNER_GRAPH_PREFIX: &[u8] = b"rdf:o:";
-const OWNER_GRAPH_UPGRADE: &str = "owner-graph-index-upgrade";
-const OWNER_GRAPH_PAGE: usize = 65536;
+pub(super) const OWNER_GRAPH_UPGRADE: &str = "owner-graph-index-upgrade";
 
 pub(super) fn owner_graph_key(owner: u64, graph: u64) -> Vec<u8> {
     let mut key = OWNER_GRAPH_PREFIX.to_vec();
@@ -307,51 +306,65 @@ fn owner_graph_failure(message: &str) -> Error {
     Error::new("STORAGE_FAILURE", format!("owner graph index: {message}"))
 }
 
-/// Fence older writers, then build `rdf:o:` from the existing graph declarations. The job
+/// Fence older writers into `batch` and seed the `rdf:o:` build from the existing graph
+/// declarations; the build itself runs online, one page per maintenance admission. It
 /// reads only `rdf:g:` keys, so graphs prepared by an unfinished staged import, which have
-/// no catalog record yet, are covered too. Each page commits its rows with the frontier,
-/// so an interrupted open resumes after the last committed declaration.
-pub(super) fn upgrade_owner_graphs(
+/// no catalog record yet, are covered too.
+pub(super) fn fence_owner_graphs(
     db: &DB,
-    admit: &dyn Fn(&WriteBatch) -> Result<(), Error>,
+    format: &[u8],
+    batch: &mut WriteBatch,
 ) -> Result<(), Error> {
-    let format = db
-        .get("store_format")?
-        .ok_or_else(|| owner_graph_failure("writer format missing"))?;
-    if !super::writer_format::has_owner_graphs(&format) {
-        let mut batch = WriteBatch::default();
-        batch.put(OWNER_GRAPH_UPGRADE, [1]);
-        batch.put(
-            "store_format",
-            super::writer_format::enable_owner_graphs(&format)?,
-        );
-        super::catalog_upgrade::commit(db, batch)?;
-    }
-    while !owner_graph_step(db, OWNER_GRAPH_PAGE, admit)? {}
+    // With no declaration to copy the build is complete as it starts.
+    batch.put(
+        OWNER_GRAPH_UPGRADE,
+        [u8::from(super::any_key(db, GRAPH_PREFIX)?)],
+    );
+    batch.put(
+        "store_format",
+        super::writer_format::enable_owner_graphs(format)?,
+    );
     Ok(())
 }
 
-/// One durable page of the owner graph build; `true` once the build is complete. The
-/// checkpoint is `[0]` when complete, `[1]` before the first declaration, and `[1]`
-/// followed by the last copied declaration's graph and owner otherwise.
-fn owner_graph_step(
-    db: &DB,
-    page: usize,
-    admit: &dyn Fn(&WriteBatch) -> Result<(), Error>,
-) -> Result<bool, Error> {
-    let state = db.get(OWNER_GRAPH_UPGRADE)?.ok_or_else(|| {
+/// Committed progress of the owner graph build: `None` once complete, otherwise the
+/// last copied declaration's graph and owner, if any.
+pub(super) fn owner_graph_progress(
+    read: impl FnOnce(&str) -> Result<Option<Vec<u8>>, Error>,
+) -> Result<Option<Option<(u64, u64)>>, Error> {
+    let state = read(OWNER_GRAPH_UPGRADE)?.ok_or_else(|| {
         owner_graph_failure("required upgrade state missing; restore the original catalog")
     })?;
-    let after = match state.as_slice() {
-        [0] => return Ok(true),
-        [1] => None,
-        [1, after @ ..] if after.len() == 16 => {
-            let mut key = GRAPH_PREFIX.to_vec();
-            key.extend_from_slice(after);
-            Some(key)
-        }
-        _ => return Err(owner_graph_failure("invalid upgrade checkpoint")),
+    match state.as_slice() {
+        [0] => Ok(None),
+        [1] => Ok(Some(None)),
+        [1, after @ ..] => match after.as_chunks::<8>() {
+            ([graph, owner], []) => Ok(Some(Some((
+                u64::from_be_bytes(*graph),
+                u64::from_be_bytes(*owner),
+            )))),
+            _ => Err(owner_graph_failure("invalid upgrade checkpoint")),
+        },
+        _ => Err(owner_graph_failure("invalid upgrade checkpoint")),
+    }
+}
+
+/// Graph declarations at or before an owner graph build frontier, and all of them.
+pub(super) fn owner_graph_counts(db: &DB, after: Option<(u64, u64)>) -> Result<(u64, u64), Error> {
+    let frontier = after.map(|(graph, owner)| graph_key(graph, owner));
+    super::count_prefix(db, GRAPH_PREFIX, frontier.as_deref())
+}
+
+/// Stage one page of the owner graph build: up to `page` copied declarations and the
+/// advanced checkpoint in one batch, and whether the build is complete after it. `None`
+/// when the build was already complete. The checkpoint is `[0]` when complete, `[1]`
+/// before the first declaration, and `[1]` followed by the last copied declaration's
+/// graph and owner otherwise.
+pub(super) fn owner_graph_page(db: &DB, page: usize) -> Result<Option<(WriteBatch, bool)>, Error> {
+    let Some(after) = owner_graph_progress(|key| Ok(db.get(key)?))? else {
+        return Ok(None);
     };
+    let after = after.map(|(graph, owner)| graph_key(graph, owner));
     let start = after.as_deref().unwrap_or(GRAPH_PREFIX);
     let mut batch = WriteBatch::default();
     let mut frontier = None;
@@ -393,9 +406,7 @@ fn owner_graph_step(
         (false, None) => return Err(owner_graph_failure("empty upgrade page")),
     };
     batch.put(OWNER_GRAPH_UPGRADE, checkpoint);
-    admit(&batch)?;
-    super::catalog_upgrade::commit(db, batch)?;
-    Ok(complete)
+    Ok(Some((batch, complete)))
 }
 
 fn index_key(owner: u64, stream: u8, name: &str, order: [usize; 4], row: &[u64; 4]) -> Vec<u8> {
@@ -1263,6 +1274,17 @@ pub(super) fn metadata(
     metadata_dataset(builder)
 }
 
+/// Mark both online migrations complete in a bare test database, as on a current store.
+#[cfg(test)]
+pub(super) fn complete_test_migrations(db: &DB) {
+    db.put(OWNER_GRAPH_UPGRADE, [0]).unwrap();
+    db.put(
+        super::event_fallback_rdf::CHECKPOINT,
+        br#"{"after":null,"complete":true}"#,
+    )
+    .unwrap();
+}
+
 /// Bare test database with the column families RDF writes require.
 #[cfg(test)]
 pub(super) fn open_test_db(path: &std::path::Path) -> DB {
@@ -1299,8 +1321,12 @@ mod tests {
             db.put(graph_key(graph, owner), []).unwrap();
         }
         db.put(OWNER_GRAPH_UPGRADE, [1]).unwrap();
-        let admit = |_: &WriteBatch| Ok(());
-        assert!(!owner_graph_step(&db, 3, &admit).unwrap());
+        let owner_graph_step = |db: &DB, page| {
+            let (batch, complete) = owner_graph_page(db, page)?.expect("build pending");
+            super::super::catalog_upgrade::commit(db, batch)?;
+            Ok::<_, Error>(complete)
+        };
+        assert!(!owner_graph_step(&db, 3).unwrap());
         let built = |db: &DB| {
             db.prefix_iterator(OWNER_GRAPH_PREFIX)
                 .map(Result::unwrap)
@@ -1311,7 +1337,7 @@ mod tests {
         assert_eq!(built(&db).len(), 3);
         drop(db);
         let db = DB::open_default(dir.path()).unwrap();
-        while !owner_graph_step(&db, 1, &admit).unwrap() {}
+        while !owner_graph_step(&db, 1).unwrap() {}
         let mut expected = declarations
             .map(|(graph, owner)| owner_graph_key(owner, graph))
             .to_vec();
@@ -1322,7 +1348,7 @@ mod tests {
         db.put(graph_key(0, 5), []).unwrap();
         db.delete(owner_graph_key(1, 3)).unwrap();
         assert_eq!(
-            owner_graph_step(&db, 64, &admit).unwrap_err().code,
+            owner_graph_step(&db, 64).unwrap_err().code,
             "STORAGE_FAILURE"
         );
         assert!(db.get(owner_graph_key(1, 3)).unwrap().is_none());
@@ -1495,6 +1521,7 @@ mod tests {
         use purrdf::{DatasetView, FallibleDatasetView, GraphMatch};
         let dir = tempfile::tempdir().unwrap();
         let db = open_test_db(dir.path());
+        complete_test_migrations(&db);
         empty_dictionary(&db);
         let mut selected = purrdf::RdfDatasetBuilder::new();
         let s = selected.intern_iri("urn:selected").unwrap();
@@ -1635,6 +1662,7 @@ mod tests {
         use purrdf::{BlankScope, RdfDatasetBuilder, RdfLiteral, RdfTextDirection};
         let dir = tempfile::tempdir().unwrap();
         let db = open_test_db(dir.path());
+        complete_test_migrations(&db);
         empty_dictionary(&db);
         let mut builder = RdfDatasetBuilder::new();
         let s = builder.intern_iri("urn:fixture:subject").unwrap();

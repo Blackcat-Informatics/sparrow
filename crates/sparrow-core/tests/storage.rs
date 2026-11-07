@@ -590,6 +590,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
         store.properties().unwrap()["store_format"].as_str(),
         Some("sparrow.store/187")
     );
+    assert!(migrate(&store) > 0);
     // The fallback backfill restored the receipt-time facts and wrote no source eventTime.
     let fallback_times = store
         .with_rdf_records(std::slice::from_ref(&plain_id), 6, RdfReadLimits::default(), |view| {
@@ -18690,6 +18691,22 @@ fn scoped_rows(
     query: &str,
     now: u64,
 ) -> (Vec<Vec<Option<purrdf::TermValue>>>, u64) {
+    let (rows, requests, _) = scoped_answer(store, scope, layers, query, now);
+    (rows, requests)
+}
+
+/// [`scoped_rows`] together with the capture's coverage.
+fn scoped_answer(
+    store: &Store,
+    scope: &QueryScope,
+    layers: sparrow_core::RdfGraphLayers,
+    query: &str,
+    now: u64,
+) -> (
+    Vec<Vec<Option<purrdf::TermValue>>>,
+    u64,
+    sparrow_core::RdfScopeCoverage,
+) {
     use sparrow_core::{QueryCancellation, RdfReadLimits, SparqlRead};
     let governors = purrdf::sparql::QueryGovernors::METERED.with_fuel(10_000_000);
     let read = SparqlRead {
@@ -18710,7 +18727,16 @@ fn scoped_rows(
     // A complete result is the exact-answer certificate; partial answers are errors.
     let complete = result.outcome.unwrap_or_else(|e| panic!("{query}: {e:?}"));
     let rows = complete.result.solutions().unwrap().1.to_vec();
-    (rows, complete.evidence.view.requests)
+    (rows, complete.evidence.view.requests, result.coverage)
+}
+
+/// Run every online migration page to completion, returning the pages committed.
+fn migrate(store: &Store) -> usize {
+    let mut pages = 0;
+    while store.migrate_step().unwrap().is_some() {
+        pages += 1;
+    }
+    pages
 }
 
 /// Records whose layers exercise metadata, diagnostic and content graphs, shared content
@@ -18930,77 +18956,195 @@ fn scoped_sparql_cost_is_independent_of_store_size() {
     );
 }
 
-/// INVARIANT: opening a store written before the owner-to-graph index fences older writers
-/// first, then builds one `rdf:o:` row per graph declaration, including graphs a staged
-/// import prepared before publication; a fenced build interrupted by a restart resumes.
+/// INVARIANT: the first schema 69 open fences older writers and serves at once, before
+/// either online migration runs: status reports both pending, scoped SPARQL answers equal
+/// the store-wide plan's, and coverage names the record graphs still awaiting their
+/// fallback facts. An ingest during the migration writes its index rows and facts at once.
+/// Direct `Store::migrate_step` pages (the maintenance worker's unit of work, driven here
+/// one at a time) then finish both jobs, a restart between them resumes, and the answers
+/// equal the fully migrated store's, now through the owner index.
 #[test]
-fn owner_graph_index_migration_builds_the_index_and_fences_older_writers() {
-    use sparrow_core::RdfGraphLayers;
+fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_them() {
+    use sparrow_core::{QuerySelection, RdfGraphLayers};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    owner_graph_fixture(&store);
+    let records = owner_graph_fixture(&store);
     // A prepared but unpublished import: its graph is declared before any catalog record.
     let staged = stage_fixture(&store, "graphs-staged", "log", b"staged\n");
     store.import_prepare_record(&staged.id, 0, 5).unwrap();
-    let query = "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g";
-    let scope = record_page_scope("graphs", 1000);
-    let before = scoped_rows(&store, &scope, RdfGraphLayers::ALL, query, 6);
+    let fallback = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?b WHERE { ?r sp:eventTimeBasis ?b }";
+    let queries = [
+        "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
+        "SELECT * WHERE { ?s ?p ?o }",
+        fallback,
+    ];
+    let wide = record_page_scope("graphs", 1000);
+    let mut one = wide.clone();
+    one.source = None;
+    // The plain log record, which has no source event time.
+    one.selection = QuerySelection::Evidence(vec![records.last().unwrap().clone()]);
+    let scopes = [&wide, &one];
+    let answers = |store: &Store| {
+        scopes
+            .iter()
+            .flat_map(|scope| {
+                queries
+                    .iter()
+                    .map(|query| scoped_answer(store, scope, RdfGraphLayers::ALL, query, 6))
+            })
+            .collect::<Vec<_>>()
+    };
+    let migrated = answers(&store);
+    assert!(!migrated[2].0.is_empty(), "fallback facts are queryable");
     assert_eq!(
-        store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/187")
+        store
+            .migrations()
+            .unwrap()
+            .iter()
+            .filter(|m| m.complete())
+            .count(),
+        2
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
     let (declared, _) = owner_graph_rows(&db);
-    let clear = |db: &rocksdb::DB| {
-        for (key, _) in db
-            .prefix_iterator(b"rdf:o:")
-            .map(Result::unwrap)
-            .take_while(|(key, _)| key.starts_with(b"rdf:o:"))
-        {
-            db.delete(key).unwrap();
-        }
-    };
-    // The store a writer before the index left: its event fallback family, and no index.
-    clear(&db);
-    db.delete("owner-graph-index-upgrade").unwrap();
-    db.put("store_format", b"sparrow.store/132").unwrap();
+    sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
     drop(db);
+
     let store = Store::open(dir.path(), config()).unwrap();
-    // Older writers know identities up to `/186` only, so they refuse the fenced store.
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
         Some("sparrow.store/187")
     );
+    let pending = store.migrations().unwrap();
     assert_eq!(
-        scoped_rows(&store, &scope, RdfGraphLayers::ALL, query, 6),
-        before
+        pending.iter().map(|m| m.name).collect::<Vec<_>>(),
+        ["owner-graph-index", "event-fallback-rdf"]
     );
+    for migration in &pending {
+        assert!(!migration.complete(), "{migration:?}");
+        assert_eq!(migration.done, 0, "{migration:?}");
+        assert!(migration.total > 0, "{migration:?}");
+        assert_eq!(migration.watermark.as_deref(), Some("start"));
+        assert_eq!(migration.failure, None);
+    }
+    // A scoped read keeps the whole-store plan and equals the whole live store's answer.
+    let during = answers(&store);
+    let mut whole = wide.clone();
+    whole.source = None;
+    for (query, (rows, _, coverage)) in queries.iter().zip(&during) {
+        let (expected, _, _) = scoped_answer(&store, &whole, RdfGraphLayers::ALL, query, 6);
+        assert_eq!(rows, &expected, "{query}");
+        // Every unmigrated record graph lacks its facts, and the answer says so.
+        assert!(coverage.event_fallback_pending > 0, "{coverage:?}");
+    }
+    assert!(during[2].0.len() < migrated[2].0.len());
+    assert!(during[5].0.is_empty() && during[5].2.event_fallback_pending == 1);
+    // A strict read refuses rather than answering without the pending facts.
+    let mut strict = one.clone();
+    strict.require_complete_index = true;
+    let refused = store
+        .sparql_query(
+            &sparrow_core::SparqlRead {
+                text_relations: None,
+                scope: &strict,
+                layers: RdfGraphLayers::ALL,
+                request: purrdf::SparqlRequest {
+                    query: fallback,
+                    base_iri: None,
+                    substitutions: &[],
+                },
+                governors: &purrdf::sparql::QueryGovernors::METERED.with_fuel(10_000_000),
+                limits: sparrow_core::RdfReadLimits::default(),
+            },
+            6,
+            &sparrow_core::QueryCancellation::default(),
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "INDEX_NOT_READY");
+    // An ingest during the migration writes its index rows and fallback facts at once.
+    let late = store
+        .ingest("graphs-late", "graphs", "log", b"late line\n", 5)
+        .unwrap();
+    let mut late_scope = one.clone();
+    late_scope.selection = QuerySelection::Evidence(late.record_ids.clone());
+    let (late_rows, _, late_coverage) =
+        scoped_answer(&store, &late_scope, RdfGraphLayers::ALL, fallback, 6);
+    assert_eq!(late_rows.len(), 1, "{late_rows:?}");
+    assert_eq!(late_coverage.event_fallback_pending, 0);
+    let late_answers = |store: &Store| {
+        queries
+            .iter()
+            .map(|query| scoped_rows(store, &late_scope, RdfGraphLayers::ALL, query, 6).0)
+            .collect::<Vec<_>>()
+    };
+    let late_during = late_answers(&store);
+    let pending_cost = scoped_rows(&store, &one, RdfGraphLayers::ALL, queries[0], 6).1;
+
+    // One page builds the whole index; a restart then resumes with the backfill.
+    let page = store.migrate_step().unwrap().unwrap();
+    assert_eq!(page.migration, sparrow_core::Migration::OwnerGraphIndex);
+    assert!(page.complete);
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
-    assert_eq!(owner_graph_rows(&db), (declared.clone(), declared.clone()));
-    // A restart after the fence but before the first page resumes the build.
-    clear(&db);
-    db.put("owner-graph-index-upgrade", [1]).unwrap();
+    let (now_declared, mirrored) = owner_graph_rows(&db);
+    assert_eq!(now_declared, mirrored);
+    assert!(declared.iter().all(|row| now_declared.contains(row)));
     drop(db);
-    drop(Store::open(dir.path(), config()).unwrap());
+    let store = Store::open(dir.path(), config()).unwrap();
+    let resumed = store.migrations().unwrap();
+    assert!(resumed[0].complete(), "{resumed:?}");
+    assert!(!resumed[1].complete(), "{resumed:?}");
+    assert!(migrate(&store) > 0);
+    let done = store.migrations().unwrap();
+    assert!(done.iter().all(|m| m.complete() && m.total > 0), "{done:?}");
+    // Every answer equals the fully migrated store's, with the late record's own too.
+    let after = answers(&store);
+    for ((rows, _, coverage), (expected, _, _)) in after.iter().zip(&migrated) {
+        assert_eq!(coverage.event_fallback_pending, 0);
+        // The late record joined the wide scope; its rows are compared on their own.
+        assert!(
+            expected.iter().all(|row| rows.contains(row)),
+            "{rows:?} {expected:?}"
+        );
+    }
+    // Rebuilt graphs take new dictionary identities, so unordered rows compare as sets.
+    let set = |rows: &[Vec<Option<purrdf::TermValue>>]| {
+        let mut rows = rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    for (rows, (expected, _, _)) in after[queries.len()..]
+        .iter()
+        .zip(&migrated[queries.len()..])
+    {
+        assert_eq!(set(&rows.0), set(expected));
+    }
+    for (rows, expected) in late_answers(&store).iter().zip(&late_during) {
+        assert_eq!(set(rows), set(expected));
+    }
+    // The completed index bounds the one-record scope by its own graphs.
+    let indexed_cost = scoped_rows(&store, &one, RdfGraphLayers::ALL, queries[0], 6).1;
+    assert!(indexed_cost < pending_cost, "{indexed_cost} {pending_cost}");
+    // Publication reuses the prepared graph, which the backfill already rebuilt.
+    let published = store.import_publish(&staged.id, 6).unwrap();
+    let mut staged_scope = one.clone();
+    staged_scope.selection = QuerySelection::Evidence(published.record_ids.clone());
+    let (rows, _, coverage) =
+        scoped_answer(&store, &staged_scope, RdfGraphLayers::ALL, fallback, 6);
+    assert_eq!((rows.len(), coverage.event_fallback_pending), (1, 0));
+    drop(store);
     let db = catalog_db(dir.path()).unwrap();
-    assert_eq!(owner_graph_rows(&db), (declared.clone(), declared));
-    // A fenced store without its build state refuses rather than reading a partial index.
+    let (declared, mirrored) = owner_graph_rows(&db);
+    assert_eq!(declared, mirrored);
+    // A fenced store without its migration state refuses rather than serving a partial one.
     db.delete("owner-graph-index-upgrade").unwrap();
     drop(db);
     assert_eq!(
         Store::open(dir.path(), config()).err().unwrap().code,
         "STORAGE_FAILURE"
     );
-    let db = catalog_db(dir.path()).unwrap();
-    db.put("owner-graph-index-upgrade", [0]).unwrap();
-    drop(db);
-    // Publication reuses the prepared graph, whose index row the build already wrote.
-    let store = Store::open(dir.path(), config()).unwrap();
-    store.import_publish(&staged.id, 6).unwrap();
-    drop(store);
-    let db = catalog_db(dir.path()).unwrap();
-    let (declared, mirrored) = owner_graph_rows(&db);
-    assert_eq!(declared, mirrored);
 }

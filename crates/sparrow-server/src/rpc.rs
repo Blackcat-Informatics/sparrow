@@ -2762,15 +2762,20 @@ impl wire::sparrow::Server for Rpc {
                     store.durability_status()?,
                     store.pressure_status()?,
                     store.recompression_status()?,
+                    store.migrations()?,
                 ))
             })
             .await
         {
             Err(e) => failure(results.get().init_result(), e),
-            Ok((value, durability, pressure, recompression)) => {
+            Ok((value, durability, pressure, recompression, migrations)) => {
                 let mut out = results.get().init_result().init_ok();
                 crate::pressure::encode(out.reborrow().init_pressure_status(), &pressure)?;
                 crate::recompression::encode(out.reborrow().init_recompression(), &recompression);
+                crate::recompression::encode_migrations(
+                    out.reborrow().init_migrations(migrations.len() as u32),
+                    &migrations,
+                );
                 let watches = self
                     .watches
                     .snapshot()

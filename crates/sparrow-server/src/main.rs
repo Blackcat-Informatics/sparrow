@@ -13,20 +13,70 @@ mod shutdown;
 
 /// How often the daemon compares filesystem free space with its floor.
 const SPACE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-/// Also the contract `deploy/verify-backup.sh` reads to tell an image with query-only mode.
-const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only]";
+/// Also the contract `deploy/verify-backup.sh` reads to tell an image with query-only mode
+/// and, for its migration measurement, an image with `--no-intake`.
+const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only | --no-intake]";
+
+/// How often the serving loop checks that every worker it started is still running.
+const WORKER_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Watch the workers the daemon started and return the failure of the first that ends.
+/// Every worker runs until shutdown, so any end before it is a failure the daemon exits
+/// on. Every mode is covered: a normal daemon has all three workers, a no-intake daemon only
+/// maintenance, a query-only one none, so this never returns there.
+async fn worker_health(
+    consumer: &mut Option<sparrow_server::watches::ConsumeWorker>,
+    syslog: &mut Option<sparrow_server::syslog_listener::SyslogWorker>,
+    maintenance: Option<&maintenance::Worker>,
+) -> Box<dyn std::error::Error> {
+    let mut tick = tokio::time::interval(WORKER_HEALTH_INTERVAL);
+    loop {
+        tick.tick().await;
+        if consumer
+            .as_ref()
+            .is_some_and(sparrow_server::watches::ConsumeWorker::is_finished)
+        {
+            if let Some(worker) = consumer.take()
+                && let Err(error) = worker.shutdown().await
+            {
+                return error;
+            }
+            return "completed-consumption worker terminated unexpectedly".into();
+        }
+        if syslog
+            .as_ref()
+            .is_some_and(sparrow_server::syslog_listener::SyslogWorker::is_finished)
+        {
+            if let Some(worker) = syslog.take()
+                && let Err(error) = worker.shutdown().await
+            {
+                return error.into();
+            }
+            return "syslog intake worker terminated unexpectedly".into();
+        }
+        if maintenance.is_some_and(maintenance::Worker::is_finished) {
+            return "maintenance worker terminated unexpectedly".into();
+        }
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (path, query_only) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["--config", path] => (path, false),
-        ["--config", path, "--query-only"] | ["--query-only", "--config", path] => (path, true),
+    let (path, mode) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--config", path] => (path, None),
+        ["--config", path, mode @ ("--query-only" | "--no-intake")]
+        | [mode @ ("--query-only" | "--no-intake"), "--config", path] => (path, Some(mode)),
         _ => return Err(USAGE.into()),
     };
     let mut config = ServerConfig::read(Path::new(path))?;
-    if query_only {
-        config = config.into_query_only()?;
+    // A no-intake daemon writes and runs maintenance but, like a query-only one, opens no
+    // stored watch root, so a copy of a store never consumes the intake its catalog names.
+    let intake = mode != Some("--no-intake");
+    match mode {
+        Some("--query-only") => config = config.into_query_only()?,
+        Some(_) => config.check_no_intake()?,
+        None => {}
     }
     let tcp_secret = config.tcp_secret()?;
     // Keep the subscription alive through startup and awaited maintenance work.
@@ -64,8 +114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let operation_slots = u32::try_from(config.max_concurrent_requests)?;
-    // A query-only daemon owns no watch root: it reports the stored catalog and claims nothing.
-    let (watches, mut consumer) = if config.query_only {
+    // A query-only or no-intake daemon owns no watch root: it reports the stored catalog and
+    // claims nothing.
+    let (watches, mut consumer) = if config.query_only || !intake {
         (
             sparrow_server::watches::WatchRegistry::stored(&store)?,
             None,
@@ -169,22 +220,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if config.query_only {
         rpc = rpc.query_only();
-    } else if config.max_concurrent_requests >= 2 {
-        rpc = rpc.with_watch_controller(
-            consumer
-                .as_ref()
-                .expect("worker started above")
-                .controller(),
-        );
+    } else if let Some(consumer) = consumer.as_ref()
+        && config.max_concurrent_requests >= 2
+    {
+        rpc = rpc.with_watch_controller(consumer.controller());
     }
     eprintln!(
-        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={}",
+        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={} intake={}",
         store_id,
         config.socket_path.display(),
         config.data_dir.display(),
         config.max_rpc_connections,
         config.max_concurrent_requests,
-        config.query_only
+        config.query_only,
+        intake && !config.query_only
     );
     if let (Some(path), Some(gid)) = (&config.ingest_socket_path, config.ingest_socket_gid) {
         eprintln!(
@@ -198,7 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
         let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms))));
         let serving = async {
-        let mut consumer_health = tokio::time::interval(std::time::Duration::from_millis(200));
+        // Pinned once, so its interval and any worker shutdown it starts survive every turn.
+        let health = worker_health(&mut consumer, &mut syslog, maintenance.as_ref());
+        tokio::pin!(health);
         let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
         // Below the floor every write is refused, so admit no new connections.
         let mut space_ok = true;
@@ -208,19 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     signal.ok_or("daemon interrupt subscription terminated unexpectedly")?;
                     break;
                 }
-                _ = consumer_health.tick(), if consumer.is_some() || syslog.is_some() => {
-                    if consumer.as_ref().is_some_and(sparrow_server::watches::ConsumeWorker::is_finished) {
-                        consumer.take().expect("worker checked above").shutdown().await?;
-                        return Err("completed-consumption worker terminated unexpectedly".into());
-                    }
-                    if syslog.as_ref().is_some_and(sparrow_server::syslog_listener::SyslogWorker::is_finished) {
-                        syslog.take().expect("worker checked above").shutdown().await?;
-                        return Err("syslog intake worker terminated unexpectedly".into());
-                    }
-                    if maintenance.as_ref().is_some_and(maintenance::Worker::is_finished) {
-                        return Err("maintenance worker terminated unexpectedly".into());
-                    }
-                }
+                failure = &mut health => return Err(failure),
                 _ = space.tick() => match (store.space_floor().shortfall()?, space_ok) {
                     (None, false) => {
                         eprintln!("sparrowd: free space restored; accepting connections and writes");

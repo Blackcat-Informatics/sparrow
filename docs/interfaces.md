@@ -483,8 +483,11 @@ new table files. None of this adds or removes evidence: record, artifact and
 payload chunk rows are unchanged, so `Status.uniquePayloadChunks` reads the same
 as when the store was closed. Opening a store last written by the schema 62
 image left its format, `sparrow.store/92`, unchanged under schema 68. Since
-schema 69, any open, query-only included, lifts it to `/147` and runs the
-receipt-time fallback backfill (see "Receipt-time event fallback"). A store that still owes the
+schema 69, any open, query-only included, fences the store for the online
+migrations (see "Online store migrations") in one synchronized batch, lifting
+that format to `/202`. A query-only daemon runs no migration page: it answers
+through the pending read paths and its `status` reports each migration's
+progress where the copy left it. A store that still owes the
 table rewrite reports `recompression` as `running`, but the rewrite never runs.
 The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
 at shutdown. Every daemon, query-only or not, logs
@@ -498,6 +501,20 @@ Schema 67 adds `Status.queryOnly`, true in this mode, and
 received (`sparrow_core::RETENTION_MS`, 30 days). CLI and MCP status render them
 as `query_only` and `retention_seconds`, the latter as a decimal string. `deploy/verify-backup.sh` relies on the mode to verify a
 backup; see `deploy/RECOVERY.md`, "Verify a backup".
+
+`sparrowd --config FILE --no-intake` opens a store writable with its
+maintenance worker, so a disposable copy can run its online migrations, but
+starts no intake. Like a query-only daemon, it starts no consume worker and
+reports the stored watch catalog without opening any root, and its
+configuration may not set `consume`, `syslog`, `rpc_tcp_address`,
+`ingest_socket_path` or `archive`. The refusal names the key. The mode has no
+configuration key and cannot be combined with query-only mode. Reads and
+writes on its Unix socket are served as by a normal daemon, and
+`Status.queryOnly` is false. If its maintenance worker ends, the daemon exits
+with an error, as a normal daemon does. The startup line ends
+`query_only=false intake=false`. `deploy/verify-backup.sh --measure-migration`
+uses the mode; see [the deployment guide](deployment.md), "Measure the online
+migration".
 
 ### Receipt-time event fallback (schema 69)
 
@@ -523,24 +540,26 @@ An event-time records read reports top-level `event_time_fallback` as a decimal
 string. Correlation profile `sparrow-correlation/2` and the RDF vocabulary below
 carry the same law.
 
-The RDF fallback triples are written with each new record metadata graph. Opening
-a store last written before schema 69 backfills them: a resumable startup job
-(`event-fallback-rdf-upgrade`, through the shared catalog upgrade pager) rebuilds
+The RDF fallback triples are written with each new record metadata graph. A store
+last written before schema 69 backfills them online (see "Online store
+migrations"): a resumable job (`event-fallback-rdf-upgrade`, through the shared
+catalog upgrade pager) rebuilds
 every retained record metadata graph that has no `eventTime`, adding
 `eventTimeFallback` (the graph's own `receivedAt`) and `eventTimeBasis` and
 nothing else. It reads only the graph, so a graph prepared by an unfinished
 staged import, which has no public record yet, is covered too, and its later
-publication carries the facts. Stored records are not read or changed. Each page
-examines up to 4,096 graphs, rebuilding those that need facts through one RDF writer, and commits them with its
-checkpoint in one synchronized write, ending sooner at 16 MiB of stored graph
-manifests or of page batch, so an interrupted open resumes after its last
+publication carries the facts. Stored records are not read or changed. Each
+maintenance page examines up to 64 graphs, rebuilding those that need facts
+through one RDF writer, and commits them with its checkpoint in one synchronized
+write, ending sooner at 16 MiB of stored graph manifests or of page batch, so it
+holds the writer briefly and an interrupted backfill resumes after its last
 committed page. A graph whose manifest rows already give its record `eventTime`
 or `eventTimeFallback` is skipped from those rows and the dictionary identities,
 without decoding its terms. Before the job starts, the store format moves to a fallback writer
 family, `sparrow.store/132` to `/186`, which lifts each tracing, log time,
 archive and intake family by 55 and keeps its switches, so older binaries refuse
-the store rather than publish graphs without the fallback facts. The service
-stays unavailable until the backfill finishes.
+the store rather than publish graphs without the fallback facts. The fence moves
+when the store opens, and the service answers at once while the backfill runs.
 
 ### Owner-to-graph index (store format)
 
@@ -549,13 +568,62 @@ which scoped SPARQL reads use to find their graphs (see the cost rule under
 SPARQL below). Opening a store written before this index first moves the store
 format to an owner-graph writer family, `sparrow.store/187` to `/241`, which lifts
 each event fallback family by 55 and keeps its log time, archive and intake
-switches, so older binaries refuse the store. A resumable startup job
-(`owner-graph-index-upgrade`) then copies every existing declaration in durable
-pages of 65,536, each committed with its frontier, so a restart resumes after the
-last committed page. It reads only declaration keys, so a graph prepared by an
-unfinished staged import is covered before its publication. The first open reads
-each declaration once and writes one small row for it; the service stays
-unavailable until the build finishes. No wire schema changes.
+switches, so older binaries refuse the store. A resumable online job
+(`owner-graph-index-upgrade`, see "Online store migrations") then copies every
+existing declaration in durable pages of 65,536, each committed with its
+frontier, so a restart resumes after the last committed page. It reads only
+declaration keys, so a graph prepared by an unfinished staged import is covered
+before its publication. The build reads each declaration once and writes one
+small row for it. Until it completes, scoped SPARQL keeps the whole-store plan.
+
+### Online store migrations (schema 69)
+
+Opening a store that owes the schema 69 migrations applies both writer fences
+and seeds both checkpoints in one synchronized batch, then serves; the open
+does not wait for either job. The joined maintenance worker runs them as one
+duty, `owner-graph-index` first and then `event-fallback-rdf`, one page per
+admission. It is selected fairly with buffered synchronization, pressure
+maintenance, import reclamation, retention and the table rewrite. Below the
+free-space floor it is skipped, as pressure maintenance, import reclamation and
+retention are; buffered synchronization and the table rewrite still run there.
+Each page commits its rows and its checkpoint in one synchronized batch through
+the ordinary write path, so it is admitted against the data allowance and a
+failed write latches durability uncertainty as any write does; a restart
+resumes after the last committed page.
+While pages succeed the next one follows at once; a failed page commits
+nothing, sets that migration's `failure` and is retried every 60 seconds until
+it succeeds. Nothing is skipped. The daemon logs
+`sparrowd: migration NAME progress pages=P done=D total=T watermark=W` every 64
+pages and `sparrowd: migration NAME complete pages=P` when a migration finishes.
+
+`Status.migrations` (CLI and MCP `migrations`) lists both migrations with
+`name`, `done` and `total` (decimal strings), `watermark` and `failure`. `total`
+counts the migration's source entries now in the store: graph declarations for
+`owner-graph-index`, record metadata graphs (counted by their provenance
+markers) for `event-fallback-rdf`. `done` counts those at or before the
+watermark, so it moves with ingest and retirement as well as with pages. The
+watermark is an opaque position, `start` before the first page and null once
+complete, when `done` equals `total`. A store that never owed a migration
+reports it complete.
+
+Readers are explicit while a migration is pending:
+
+| Reader | Pending | Complete |
+| --- | --- | --- |
+| Scoped SPARQL (selection, pin, or a source, time or diagnostic filter) | The whole-store plan over every graph declaration, filtered to the scope's owners; the same rows | The owner-to-graph index, at the cost of the scope |
+| Whole-live-store SPARQL | The whole-store plan | The whole-store plan |
+| Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph is beyond the backfill watermark and lacks `eventTimeFallback` is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`); the answer's `complete` is false, and a request with `require_complete_index` refuses with `INDEX_NOT_READY`. A correlation reads only `eventTime` and `receivedAt`, so it neither counts nor refuses | Zero; no refusal |
+| New graphs written during the migration | Owner-to-graph rows and fallback facts in the same batch | The same |
+| Catalog event time (intervals, sorting, correlation clocks, `event_time_fallback`) | Derived from each record's `received_at`; independent of the RDF rewrite | The same |
+
+While the backfill is pending, each candidate record (a selected record without
+a source event time whose graph is beyond the backfill watermark) costs an
+extra manifest point read and a subject lookup, both charged to the request
+budget; a record at or before the watermark costs nothing extra. A large metadata scope can therefore refuse
+with `RESOURCE_LIMIT` during the migration and succeed after it.
+
+The wire schema stays 69: no schema 69 endpoint was deployed before these fields
+were added.
 
 ## 1. Common types and defaults
 

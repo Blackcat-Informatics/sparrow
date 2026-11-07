@@ -85,7 +85,7 @@ impl<Outcome> ScopedSparqlResult<Outcome> {
     /// Independent requested-index coverage; this never changes native answer certainty.
     pub fn index_coverage_complete(&self) -> bool {
         self.correlation.as_ref().map_or_else(
-            || self.coverage.complete(),
+            || self.coverage.complete() && self.coverage.event_fallback_pending == 0,
             |capture| capture.complete(&self.coverage),
         ) && self
             .text

@@ -8,7 +8,7 @@
 //! A record graph carries `eventTime` exactly when its record has a source instant;
 //! without one, the graph's own `receivedAt` is the receipt-time placement.
 
-use super::{Error, artifact_rdf, catalog_upgrade, parse, rdf_index, writer_format};
+use super::{Error, catalog_upgrade, parse, rdf_index, writer_format};
 use purrdf::{TermFactory, TermValue};
 use rocksdb::{DB, WriteBatch};
 
@@ -20,8 +20,10 @@ const GRAPH_BYTES: usize = 32 * 1024 * 1024;
 const PAGE_ENTRIES: usize = 4096;
 const PAGE_INPUT: usize = 16 * 1024 * 1024;
 const PAGE_BATCH: usize = 16 * 1024 * 1024;
+/// The backfill's durable checkpoint, also read by SPARQL scope capture.
+pub(super) const CHECKPOINT: &str = "event-fallback-rdf-upgrade";
 const JOB: catalog_upgrade::Job<Fallback> = catalog_upgrade::Job {
-    checkpoint: "event-fallback-rdf-upgrade",
+    checkpoint: CHECKPOINT,
     source: "rdf:graph:record:",
     target: b"event-fallback-rdf:",
     page_bytes: PAGE_INPUT,
@@ -30,26 +32,85 @@ const JOB: catalog_upgrade::Job<Fallback> = catalog_upgrade::Job {
     publish: Fallback,
 };
 
-/// Fence older writers, then add `eventTimeFallback` and `eventTimeBasis` to every retained
-/// record graph whose source time is unknown. Stored records are only read.
-pub(super) fn upgrade(db: &DB, disk_budget: u64, reserve: u64) -> Result<(), Error> {
-    let format = db
-        .get("store_format")?
-        .ok_or_else(|| failure("writer format missing"))?;
-    if !writer_format::has_event_fallback(&format) {
-        let mut batch = WriteBatch::default();
-        catalog_upgrade::seed(db, &JOB, &mut batch)?;
-        batch.put(
-            "store_format",
-            writer_format::enable_event_fallback(&format)?,
-        );
-        catalog_upgrade::commit(db, batch)?;
+/// Fence older writers into `batch` and seed the backfill that adds `eventTimeFallback` and
+/// `eventTimeBasis` to every retained record graph whose source time is unknown. The
+/// backfill runs online, one page per maintenance admission; stored records are only read.
+pub(super) fn fence(db: &DB, format: &[u8], batch: &mut WriteBatch) -> Result<Vec<u8>, Error> {
+    catalog_upgrade::seed(db, &JOB, batch)?;
+    if !super::any_key(db, JOB.source.as_bytes())? {
+        // No record graph to rebuild: the backfill is complete as it starts.
+        let complete = catalog_upgrade::Progress {
+            after: None,
+            complete: true,
+        };
+        super::put(batch, JOB.checkpoint, &complete);
     }
-    catalog_upgrade::run(
+    let format = writer_format::enable_event_fallback(format)?;
+    batch.put("store_format", format);
+    Ok(format.to_vec())
+}
+
+/// The committed backfill frontier: `None` once complete, otherwise the last examined
+/// record graph's owner identity, if any.
+pub(super) fn frontier(db: &DB) -> Result<Option<Option<String>>, Error> {
+    decode_frontier(db.get(CHECKPOINT)?.as_deref())
+}
+
+/// Decode the committed checkpoint as [`frontier`] does, from any snapshot.
+pub(super) fn decode_frontier(bytes: Option<&[u8]>) -> Result<Option<Option<String>>, Error> {
+    use super::Catalog;
+    let bytes = bytes.ok_or_else(|| failure("backfill state missing"))?;
+    if bytes.len() > 1024 {
+        return Err(failure("backfill checkpoint exceeds its bound"));
+    }
+    let progress = catalog_upgrade::Progress::decode(&parse(bytes)?)?;
+    Ok((!progress.complete).then(|| owner(progress.after)))
+}
+
+fn owner(after: Option<String>) -> Option<String> {
+    after.and_then(|key| key.strip_prefix("rdf:graph:").map(str::to_owned))
+}
+
+/// Stage one backfill page of at most `maximum` graphs with its checkpoint, and whether
+/// the backfill is complete after it; `None` when it was already complete.
+pub(super) fn page(db: &DB, maximum: usize) -> Result<Option<(WriteBatch, bool)>, Error> {
+    let progress = catalog_upgrade::progress(db, &JOB)?;
+    if progress.complete {
+        return Ok(None);
+    }
+    catalog_upgrade::page(db, &JOB, progress, maximum.min(JOB.page_entries)).map(Some)
+}
+
+/// Record graphs at or before the frontier `after` (an owner identity), and all of them,
+/// counted from their empty provenance markers, one per record graph.
+pub(super) fn counts(db: &DB, after: Option<&str>) -> Result<(u64, u64), Error> {
+    let frontier = after.map(|id| format!("provenance-rdf:{id}"));
+    super::count_prefix(
         db,
-        &JOB,
-        Some(&|batch| artifact_rdf::admit(db, disk_budget, reserve, batch)),
+        b"provenance-rdf:record:",
+        frontier.as_deref().map(str::as_bytes),
     )
+}
+
+/// Whether a record graph's stored rows already give its subject `eventTime` or
+/// `eventTimeFallback`: the facts are current and the graph needs no backfill. The
+/// dictionary identities come from the caller's view of the dictionary.
+pub(super) fn carries_event_time(
+    rows: &[(u8, [u64; 4])],
+    subject: Option<u64>,
+    predicates: [Option<u64>; 2],
+) -> bool {
+    subject.is_some_and(|subject| {
+        rows.iter().any(|(stream, row)| {
+            *stream == 0 && row[0] == subject && predicates.contains(&Some(row[1]))
+        })
+    })
+}
+
+/// The predicates [`carries_event_time`] looks for.
+pub(super) fn event_time_predicates() -> [TermValue; 2] {
+    use crate::RDF_VOCABULARY_NAMESPACE as NS;
+    ["eventTime", "eventTimeFallback"].map(|name| TermValue::iri(format!("{NS}{name}")))
 }
 
 fn failure(message: &str) -> Error {
@@ -103,18 +164,12 @@ fn publish(
     // A source instant, or facts already current: nothing to add. The stored manifest's
     // rows and the dictionary decide that without decoding the graph's terms.
     let rows = rdf_index::manifest_rows(&parse(bytes)?)?;
-    let mut current = [None; 2];
-    for (slot, name) in current.iter_mut().zip(["eventTime", "eventTimeFallback"]) {
-        *slot = rdf.known(&TermValue::iri(format!("{NS}{name}")))?;
+    let mut predicates = [None; 2];
+    for (slot, predicate) in predicates.iter_mut().zip(event_time_predicates()) {
+        *slot = rdf.known(&predicate)?;
     }
-    let current = |row: &[u64; 4]| current.contains(&Some(row[1]));
-    if rows
-        .iter()
-        .any(|(stream, row)| *stream == 0 && current(row))
-        && rdf.known(&subject_value)?.is_some_and(|subject| {
-            rows.iter()
-                .any(|(stream, row)| *stream == 0 && row[0] == subject && current(row))
-        })
+    if predicates.iter().any(Option::is_some)
+        && carries_event_time(&rows, rdf.known(&subject_value)?, predicates)
     {
         return Ok(());
     }
@@ -279,24 +334,20 @@ mod tests {
         db.write(batch).unwrap();
         let before = ids.map(|id| db.get(format!("rdf:graph:{id}")).unwrap().unwrap());
         let mut batch = WriteBatch::default();
-        catalog_upgrade::seed(&db, &JOB, &mut batch).unwrap();
-        batch.put(
-            "store_format",
-            writer_format::enable_event_fallback(b"sparrow.store/77").unwrap(),
-        );
+        fence(&db, b"sparrow.store/77", &mut batch).unwrap();
         catalog_upgrade::commit(&db, batch).unwrap();
         catalog_upgrade::step(&db, &JOB, checkpoint(&db), 3, None).unwrap();
         assert_eq!(checkpoint(&db).after.as_deref(), Some("rdf:graph:record:c"));
         assert_eq!([rows(&db, "record:b"), rows(&db, "record:c")], [4, 4]);
         // The next page would rebuild record:e before refusing record:f.
         db.put("rdf:graph:record:f", b"{}").unwrap();
-        assert!(upgrade(&db, 1 << 40, 0).is_err());
+        assert!(catalog_upgrade::run(&db, &JOB, None).is_err());
         assert_eq!(db.get("rdf:graph:record:e").unwrap().unwrap(), before[4]);
         assert_eq!(checkpoint(&db).after.as_deref(), Some("rdf:graph:record:c"));
         db.put("rdf:graph:record:f", &before[5]).unwrap();
         drop(db);
         let db = rdf_index::open_test_db(dir.path());
-        upgrade(&db, 1 << 40, 0).unwrap();
+        catalog_upgrade::run(&db, &JOB, None).unwrap();
         assert!(checkpoint(&db).complete);
         for (id, stored) in ids.iter().zip(&before) {
             let current = db.get(format!("rdf:graph:{id}")).unwrap().unwrap();

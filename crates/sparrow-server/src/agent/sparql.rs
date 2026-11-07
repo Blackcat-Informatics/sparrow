@@ -798,6 +798,10 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
         )
         .with("complete", c.get_complete())
         .with(
+            "event_fallback_pending",
+            c.get_event_fallback_pending().to_string(),
+        )
+        .with(
             "diagnostic_scope",
             Object::new()
                 .with("evaluated", d.get_evaluated().to_string())

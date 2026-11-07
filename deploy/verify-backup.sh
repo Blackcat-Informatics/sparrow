@@ -13,12 +13,21 @@
 # socket_path come from SPARROW_CONFIG, and it refuses without them, refuses a backup store that is
 # or holds a symlink leading outside the backup, and refuses any scratch path that resolves under
 # the live store, socket, intake or the backup.
+#
+# With --measure-migration it instead measures the online schema 69 migrations on a writable copy
+# (docs/deployment.md, "Measure the online migration"): the image opens the copy with
+# `sparrowd --no-intake` (maintenance runs; no watch root, ingest socket, TCP listener or archive
+# is opened) under a systemd user scope with the service unit's CPU, IO and memory limits, and the
+# script logs machine-greppable `MEASURE` lines until status reports every migration complete. A
+# disk guard refuses to start below 50 GB free and aborts below 40 GB, and the copy is removed
+# however the run ends.
 set -euo pipefail
 umask 077
 
 usage() {
     cat <<'USAGE'
 Usage: deploy/verify-backup.sh [--time-records] [--window FROM BEFORE] [--image DAEMON] BACKUP
+       deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP
 
 Copy BACKUP/store into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), open
 the copy query-only with the image BACKUP/SOURCE records, and check it. A backup counts as
@@ -31,14 +40,30 @@ readable: its data_dir and socket_path are the live paths the copy must never to
                 taken_utc); it must be younger than the retention window
 --image DAEMON  open the copy with DAEMON instead (its CLI is the sibling sparrow or
                 sparrow-SUFFIX); a newer image may upgrade the disposable copy as it opens it
+--measure-migration
+                instead of verifying, open a writable copy with `sparrowd --no-intake` under
+                `systemd-run --user --scope` (CPUQuota=100%, IOWeight=20, MemoryHigh=2G,
+                MemoryMax=4G) and measure the online migrations until status reports them
+                all complete. The filesystem holding SPARROW_VERIFY must have 50 GB free to
+                start (SPARROW_MEASURE_MIN_FREE_GB may raise it); the run aborts below 40 GB
+                (SPARROW_MEASURE_ABORT_FREE_GB may raise it). Output lines starting
+                "verify-backup: MEASURE" carry the image and its sha256, the scope's applied
+                limits, the start and end clock times, the seconds to the first status
+                answer, done/total progress and the free space every minute, the total
+                backfill seconds and live_records. The run fails on a migration failure
+                (FAIL migrate), a durability failure (FAIL durability), or done/total
+                unchanged for 600s after the first status (FAIL stall). The daemon's own
+                migration lines are printed as "verify-backup: daemon:". The copy is
+                removed however the run ends.
 USAGE
 }
 
-TIME_RECORDS=0 IMAGE_OVERRIDE='' WINDOW_FROM='' WINDOW_BEFORE=''
+TIME_RECORDS=0 MEASURE_MIGRATION=0 IMAGE_OVERRIDE='' WINDOW_FROM='' WINDOW_BEFORE=''
 while (($#)); do
     case $1 in
         -h | --help) usage; exit 0 ;;
         --time-records) TIME_RECORDS=1; shift ;;
+        --measure-migration) MEASURE_MIGRATION=1; shift ;;
         --image) IMAGE_OVERRIDE=${2:?--image needs a daemon image}; shift 2 ;;
         --window)
             WINDOW_FROM=${2:?--window needs FROM and BEFORE}
@@ -54,6 +79,29 @@ done
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 VERIFY_ROOT=${SPARROW_VERIFY:-/SPARROW/verify}
+# The migration measurement's disk guard, in GB of 10^9 bytes. An override may only raise them.
+GB=1000000000
+MIN_FREE_GB=${SPARROW_MEASURE_MIN_FREE_GB:-50} ABORT_FREE_GB=${SPARROW_MEASURE_ABORT_FREE_GB:-40}
+# Seconds between status polls while measuring; progress and free space are logged every minute.
+POLL_SECONDS=15
+# Seconds the migrations' done/total may stay unchanged after the first status before the run
+# fails as stalled. A failing page already ends the run as FAIL migrate, so this catches stops
+# that set no failure, such as the daemon pausing writes below its free-space floor. The worker
+# retries a failed page every 60 seconds, and the live step-1 open averaged about 0.9 s per
+# 64-graph page (34 minutes over 2,360 pages), so a healthy backfill moves every poll; ten retry
+# intervals without movement is a stopped migration, and also the switch gate's whole budget.
+STALL_SECONDS=600
+# The scope limits as systemd reports them once applied (deploy/systemd/sparrow.service).
+SCOPE_LIMITS='CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=2147483648 MemoryMax=4294967296'
+if ((MEASURE_MIGRATION)); then
+    ((TIME_RECORDS == 0)) && [[ -z $WINDOW_FROM ]] \
+        || die "--measure-migration measures the migrations only; it takes no --time-records or --window"
+    if [[ ! $MIN_FREE_GB =~ ^[0-9]+$ || ! $ABORT_FREE_GB =~ ^[0-9]+$ ]] \
+        || ((MIN_FREE_GB < 50 || ABORT_FREE_GB < 40 || ABORT_FREE_GB >= MIN_FREE_GB)); then
+        die "the disk guard needs SPARROW_MEASURE_MIN_FREE_GB >= 50 and SPARROW_MEASURE_ABORT_FREE_GB >= 40, below it"
+    fi
+    command -v systemd-run >/dev/null || die "--measure-migration needs systemd-run for the user scope that limits the daemon"
+fi
 BACKUP=$(realpath -e -- "$1") || die "backup $1 does not exist"
 [[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup"
 [[ ! -L $BACKUP/store ]] || die "$BACKUP/store is a symbolic link; a backup holds its store itself"
@@ -156,6 +204,10 @@ daemon_usage=$("$daemon" 2>&1 || true)
 [[ $daemon_usage == *"--query-only"* ]] || die "$daemon predates query-only mode \
 (it reports: $daemon_usage), so it cannot open a copy without claiming its watch roots. \
 Verify with an image that has the mode (--image); a newer image may upgrade the disposable copy"
+# The writable measurement needs the mode that runs maintenance but opens no watch root.
+((MEASURE_MIGRATION == 0)) || [[ $daemon_usage == *"--no-intake"* ]] || die "$daemon has no \
+--no-intake mode (it reports: $daemon_usage), so a writable copy would claim its watch roots; \
+measure with an image that has the mode (--image)"
 
 shopt -s nullglob
 bundles=("$BACKUP"/lexicons/*/artifacts)
@@ -185,6 +237,27 @@ done
 
 verify_root=$(realpath -m -- "$VERIFY_ROOT") || exit 1
 guard "$VERIFY_ROOT" "$verify_root"
+# The free space the measurement guards is that of the filesystem holding SPARROW_VERIFY.
+free_root=$verify_root
+while [[ ! -e $free_root ]]; do
+    free_root=$(dirname -- "$free_root")
+done
+# Log the free space for PHASE; with FLOOR (GB), also return 1 when it is below the floor.
+# Return 2 when the free space cannot be read.
+report_free() {
+    local free
+    free=$(free_bytes "$free_root") || return 2
+    printf 'verify-backup: MEASURE free_space phase=%s path=%s bytes=%s gb=%s\n' \
+        "$1" "$free_root" "$free" $((free / GB))
+    ((${2:-0} == 0 || free >= $2 * GB))
+}
+if ((MEASURE_MIGRATION)); then
+    report_free start "$MIN_FREE_GB" || {
+        (($? == 1)) || die "cannot read the free space of $free_root; nothing was copied or started"
+        die "$free_root has under the ${MIN_FREE_GB} GB free a writable copy needs to start; \
+nothing was copied or started"
+    }
+fi
 mkdir -p -- "$VERIFY_ROOT"
 SCRATCH=$(mktemp -d -- "$VERIFY_ROOT/verify-XXXXXX") || exit 1
 DATA=$SCRATCH/store SOCKET=$SCRATCH/store/verify.sock CONFIG=$SCRATCH/server.toml LOG=$SCRATCH/daemon.log
@@ -199,7 +272,13 @@ cleanup() {
         printf 'verify-backup: daemon log:\n' >&2
         tail -n 20 -- "$LOG" >&2 || true
     fi
+    # The daemon's own migration lines (page counts, progress, failed pages) are evidence too, and
+    # the log goes with the copy, so keep them in the run's output however it ended.
+    if ((MEASURE_MIGRATION)) && [[ -s $LOG ]]; then
+        sed -n 's/^sparrowd: \(migration \|online migration failed\)/verify-backup: daemon: &/p' -- "$LOG" || true
+    fi
     rm -rf -- "$SCRATCH"
+    ((MEASURE_MIGRATION == 0)) || report_free end || true
     exit "$status"
 }
 trap cleanup EXIT
@@ -217,7 +296,7 @@ match_copy_on_write "$BACKUP/store" "$DATA"
 cp -a --reflink=always -- "$BACKUP/store/." "$DATA/" \
     || die "cannot reflink $BACKUP/store below $VERIFY_ROOT; it must be on the backup's btrfs filesystem, and every file in it must share the store directory's copy-on-write attribute (lsattr)"
 {
-    printf 'query_only = true\n'
+    ((MEASURE_MIGRATION)) || printf 'query_only = true\n'
     printf 'socket_path = "%s"\ndata_dir = "%s"\ntext_lexicon_dir = "%s"\n' "$SOCKET" "$DATA" "$lexicons"
     printf 'max_concurrent_requests = 4\nmax_rpc_connections = 16\n'
     printf '%s\n' "${limits[@]}"
@@ -229,6 +308,110 @@ done
 socket_dir=$(realpath -e -- "${SOCKET%/*}") || exit 1
 guard "$SOCKET" "$socket_dir/${SOCKET##*/}"
 [[ ! -L $DATA && ! -e $SOCKET ]] || die "the scratch copy $DATA is a link or already holds $SOCKET"
+
+# Seconds elapsed since START (date +%s%N), to the millisecond.
+elapsed() {
+    local now
+    now=$(date +%s%N) || return 1
+    printf '%d.%03d' $(((now - $1) / 1000000000)) $(((now - $1) / 1000000 % 1000))
+}
+# The number of stored watch roots a status document on stdin reports open.
+open_watches() {
+    json_field consume_watches | python3 -I -c 'import json,sys; print(sum(w["directories"] != "0" and w["directories"] != 0 for w in json.load(sys.stdin)))'
+}
+
+if ((MEASURE_MIGRATION)); then
+    image_sha=$(sha256sum -- "$daemon") || exit 1
+    printf 'verify-backup: MEASURE image=%s sha256=%s\n' "$daemon" "${image_sha%% *}"
+    started=$(date +%s%N) || exit 1
+    printf 'verify-backup: MEASURE start_utc=%s\n' "$(date -u -d "@$((started / 1000000000))" +%Y-%m-%dT%H:%M:%SZ)"
+    # A scope runs the daemon as this process (systemd-run execs it), so PID is the daemon's.
+    systemd-run --user --scope --quiet --collect --unit="sparrow-${SCRATCH##*/}" \
+        -p CPUQuota=100% -p IOWeight=20 -p MemoryHigh=2G -p MemoryMax=4G \
+        -- "$daemon" --config "$CONFIG" --no-intake 2>"$LOG" >/dev/null &
+    PID=$!
+    # No readiness ceiling: how long the first open takes is what this mode measures.
+    first='' next_minute=$((SECONDS + 60)) failures=0 progress='status=unanswered' moved=0
+    while :; do
+        kill -0 "$PID" 2>/dev/null || fail open "the daemon exited (see its log below)"
+        if ((SECONDS >= next_minute)); then
+            next_minute=$((next_minute + 60))
+            printf 'verify-backup: MEASURE progress elapsed_seconds=%s %s\n' "$(elapsed "$started")" "$progress"
+            report_free minute "$ABORT_FREE_GB" || {
+                (($? == 1)) || fail disk "cannot read the free space of $free_root; stopping the \
+daemon and removing $SCRATCH"
+                fail disk "$free_root fell under the ${ABORT_FREE_GB} GB abort floor; stopping the \
+daemon and removing $SCRATCH"
+            }
+        fi
+        if ! grep -q '^sparrowd: store=' -- "$LOG"; then
+            sleep 1
+            continue
+        fi
+        if ! status=$("$cli" "$SOCKET" status 2>"$SCRATCH/status.err"); then
+            # Before the first answer each attempt warms the copy's cache; after it, three
+            # failures running end the run.
+            if [[ -n $first ]]; then
+                failures=$((failures + 1))
+                ((failures < 3)) || fail status "status did not answer three times running: $(cat -- "$SCRATCH/status.err")"
+            fi
+            printf 'verify-backup: status did not answer (%s); retrying\n' "$(cat -- "$SCRATCH/status.err")"
+            sleep 1
+            continue
+        fi
+        failures=0
+        if [[ -z $first ]]; then
+            first=$(elapsed "$started") || exit 1
+            printf 'verify-backup: MEASURE first_status_seconds=%s\n' "$first"
+            store=$(json_field store_id <<<"$status") || exit 1
+            [[ $store == "$expected_store" ]] || fail store-id "the copy is $store, but SOURCE records $expected_store"
+            mode=$(json_field query_only <<<"$status") || exit 1
+            opened=$(open_watches <<<"$status") || exit 1
+            if [[ $mode != false ]] || ! grep -q 'query_only=false intake=false' -- "$LOG" || ((opened)); then
+                fail no-intake "the daemon does not report no-intake mode, or $opened stored watch roots are open"
+            fi
+            pass no-intake "$store is writable with no intake; no stored watch root is open"
+            scope="sparrow-${SCRATCH##*/}.scope"
+            applied=$(systemctl --user show "$scope" -p CPUQuotaPerSecUSec -p IOWeight -p MemoryHigh \
+                -p MemoryMax | sort | paste -sd ' ') || fail scope "systemctl cannot show $scope"
+            printf 'verify-backup: MEASURE scope=%s %s\n' "$scope" "$applied"
+            [[ $applied == "$SCOPE_LIMITS" ]] || fail scope "$scope runs with $applied, not $SCOPE_LIMITS"
+        fi
+        durability=$(json_field durability failure <<<"$status") || exit 1
+        [[ $durability == null ]] || fail durability "the copy reports durability failure $durability"
+        mapfile -t state < <(python3 -I -c 'import json,sys
+rows=json.load(sys.stdin)["migrations"]
+failed=[r for r in rows if r["failure"] is not None]
+print("failed" if failed else "complete" if all(r["watermark"] is None for r in rows) else "pending")
+print(" ".join("%s=%s/%s" % (r["name"], r["done"], r["total"]) for r in rows))
+print("; ".join("%s: %s" % (r["name"], r["failure"]) for r in failed))' <<<"$status")
+        ((${#state[@]} == 3)) || fail status "status reports no readable migrations"
+        if [[ ${state[1]} != "$progress" ]]; then
+            moved=$SECONDS
+        elif ((SECONDS - moved >= STALL_SECONDS)); then
+            fail stall "the migrations have not moved from ${state[1]} in ${STALL_SECONDS}s"
+        fi
+        progress=${state[1]}
+        [[ ${state[0]} != failed ]] || fail migrate "${state[2]}"
+        [[ ${state[0]} != complete ]] || break
+        sleep "$POLL_SECONDS"
+    done
+    printf 'verify-backup: MEASURE backfill_seconds=%s\n' "$(elapsed "$started")"
+    printf 'verify-backup: MEASURE end_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'verify-backup: MEASURE live_records=%s\n' "$(json_field live_records <<<"$status")"
+    pass migrate "every migration is complete with no failure: $progress"
+    kill -INT "$PID"
+    stopped=0
+    wait "$PID" || stopped=$?
+    PID=''
+    ((stopped == 0)) || fail shutdown "the daemon exited with status $stopped after SIGINT"
+    # Retention runs in a writable copy, so its closing count need not equal SOURCE's.
+    grep -Eq "^sparrowd: closed store=$store unique_payload_chunks=[0-9]+\$" -- "$LOG" \
+        || fail shutdown "the daemon did not log its closing count"
+    pass shutdown "the daemon stopped cleanly; removing $SCRATCH"
+    printf 'verify-backup: migration of %s measured\n' "$BACKUP"
+    exit 0
+fi
 
 "$daemon" --config "$CONFIG" --query-only 2>"$LOG" >/dev/null &
 PID=$!
@@ -252,8 +435,7 @@ mode=$(json_field query_only <<<"$status") || exit 1
 if [[ $mode != true ]] || ! grep -q 'query_only=true' -- "$LOG"; then
     fail query-only "the daemon does not report query-only mode; its watch roots could be opened"
 fi
-watches=$(json_field consume_watches <<<"$status") || exit 1
-opened=$(python3 -I -c 'import json,sys; print(sum(w["directories"] != "0" and w["directories"] != 0 for w in json.load(sys.stdin)))' <<<"$watches") || exit 1
+opened=$(open_watches <<<"$status") || exit 1
 ((opened == 0)) || fail query-only "$opened stored watch roots are open"
 pass query-only "status and startup report query_only; no stored watch root is open"
 
@@ -328,9 +510,8 @@ if ((TIME_RECORDS)); then
     for run in 1 2 3 4 5; do
         started=$(date +%s%N) || exit 1
         "$cli" "$SOCKET" "${window[@]}" >/dev/null || fail time-records "run $run failed"
-        finished=$(date +%s%N) || exit 1
-        elapsed=$((finished - started))
-        printf 'verify-backup: time-records run %d: %d.%03d s\n' "$run" $((elapsed / 1000000000)) $((elapsed / 1000000 % 1000))
+        took=$(elapsed "$started") || exit 1
+        printf 'verify-backup: time-records run %d: %s s\n' "$run" "$took"
     done
 fi
 

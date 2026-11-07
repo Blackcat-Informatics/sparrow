@@ -3,7 +3,9 @@
 
 //! One joined, serial maintenance owner; RPC retains its own request budget.
 
-use sparrow_core::{Error, EvictionLimits, RECOMPRESSION_SETTLE_SECONDS, Store};
+use sparrow_core::{
+    Error, EvictionLimits, Migration, MigrationPage, RECOMPRESSION_SETTLE_SECONDS, Store,
+};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -14,6 +16,11 @@ const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Pause between table rewrite steps. A step only observes progress and turns
 /// native periodic compaction on or off, so it never holds the loop for long.
 const RECOMPRESSION_INTERVAL: Duration = Duration::from_secs(5);
+/// Retry interval of an online migration whose last page failed. While pages succeed the
+/// next one is admitted as a continuation, fairly with the other duties.
+const MIGRATION_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+/// Pages between journal progress lines of one online migration.
+const MIGRATION_PROGRESS_PAGES: u64 = 64;
 
 pub(super) struct Worker {
     stop: watch::Sender<bool>,
@@ -59,6 +66,7 @@ enum Job {
     Reclaim,
     Expiry,
     Recompress,
+    Migrate,
 }
 
 impl Job {
@@ -69,24 +77,71 @@ impl Job {
             Self::Reclaim => "import journal reclamation",
             Self::Expiry => "retention maintenance",
             Self::Recompress => "table rewrite",
+            Self::Migrate => "online migration",
         }
     }
 
-    /// Only expiry changes its continuation. Other duties cannot lose that work.
-    fn execute(self, store: &Store) -> Result<Option<bool>, Error> {
+    /// Only expiry and online migration change their continuation; a migration reports
+    /// its page. Other duties cannot lose that work.
+    fn execute(self, store: &Store) -> Result<Outcome, Error> {
+        let done = Outcome::Continue(None);
         match self {
-            Self::Flush => store.flush_buffered().map(|_| None),
+            Self::Flush => store.flush_buffered().map(|_| done),
             Self::Pressure => store
                 .pressure_maintain(sparrow_server::now()?, EvictionLimits::default())
-                .map(|_| None),
+                .map(|_| done),
             // Published journals hold one of 16 import slots until reclaimed.
-            Self::Reclaim => store.import_reclaim(sparrow_server::now()?).map(|_| None),
+            Self::Reclaim => store.import_reclaim(sparrow_server::now()?).map(|_| done),
             Self::Expiry => store
                 .expire_bounded(sparrow_server::now()?, EvictionLimits::default())
-                .map(|report| Some(report.continuation)),
+                .map(|report| Outcome::Continue(Some(report.continuation))),
             Self::Recompress => store
                 .recompress_step(sparrow_server::now()?, RECOMPRESSION_SETTLE_SECONDS)
-                .map(|_| None),
+                .map(|_| done),
+            Self::Migrate => store.migrate_step().map(Outcome::Migrated),
+        }
+    }
+}
+
+enum Outcome {
+    Continue(Option<bool>),
+    Migrated(Option<MigrationPage>),
+}
+
+/// Journal lines of the online migrations: progress every few pages, and completion.
+#[derive(Default)]
+struct MigrationJournal {
+    pages: [u64; Migration::ALL.len()],
+}
+
+impl MigrationJournal {
+    async fn page(&mut self, store: &Store, page: MigrationPage) {
+        let pages = &mut self.pages[page.migration.index()];
+        *pages += 1;
+        let pages = *pages;
+        let name = page.migration.name();
+        if page.complete {
+            eprintln!("sparrowd: migration {name} complete pages={pages}");
+        } else if pages.is_multiple_of(MIGRATION_PROGRESS_PAGES) {
+            // Counting takes the writer and scans the source keys: keep it off the loop.
+            let owner = store.clone();
+            let statuses = tokio::task::spawn_blocking(move || owner.migrations())
+                .await
+                .map_err(|error| Error::new("STORAGE_FAILURE", error.to_string()))
+                .and_then(|statuses| statuses);
+            match statuses {
+                Ok(statuses) => {
+                    for status in statuses.iter().filter(|status| status.name == name) {
+                        eprintln!(
+                            "sparrowd: migration {name} progress pages={pages} done={} total={} watermark={}",
+                            status.done,
+                            status.total,
+                            status.watermark.as_deref().unwrap_or("none")
+                        );
+                    }
+                }
+                Err(error) => eprintln!("sparrowd: migration {name} progress failed: {error}"),
+            }
         }
     }
 }
@@ -101,18 +156,24 @@ async fn run(
     let mut reclaim = tokio::time::interval(Duration::from_secs(1));
     let mut expiry = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
     let mut recompress = tokio::time::interval(RECOMPRESSION_INTERVAL);
+    let mut migrate = tokio::time::interval(MIGRATION_RETRY_INTERVAL);
     for interval in [
         &mut flush,
         &mut pressure,
         &mut reclaim,
         &mut expiry,
         &mut recompress,
+        &mut migrate,
     ] {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     }
     // Buffered synchronization retains its configured initial delay.
     flush.tick().await;
     let mut continuation = false;
+    // Pages continue back to back once the first succeeds, until every migration is
+    // complete; a failed page waits for the retry tick, never a busy loop.
+    let mut migrating = false;
+    let mut journal = MigrationJournal::default();
     loop {
         let job = tokio::select! {
             biased;
@@ -127,6 +188,8 @@ async fn run(
                     _ = recompress.tick() => Job::Recompress,
                     _ = expiry.tick(), if !continuation => Job::Expiry,
                     _ = tokio::task::yield_now(), if continuation => Job::Expiry,
+                    _ = migrate.tick(), if !migrating => Job::Migrate,
+                    _ = tokio::task::yield_now(), if migrating => Job::Migrate,
                 }
             } => job,
         };
@@ -141,6 +204,7 @@ async fn run(
                 .is_some()
         {
             continuation = false;
+            migrating = false;
             continue;
         }
         let owner = store.clone();
@@ -165,19 +229,30 @@ async fn run(
             ));
         }
         match result {
-            Ok(Some(more)) => {
+            Ok(Outcome::Continue(Some(more))) => {
                 // The pause runs from the end of a traversal, however long it took.
                 if !more {
                     expiry.reset();
                 }
                 continuation = more;
             }
-            Ok(None) => {}
+            Ok(Outcome::Continue(None)) => {}
+            Ok(Outcome::Migrated(page)) => {
+                migrating = page.is_some();
+                if let Some(page) = page {
+                    journal.page(&store, page).await;
+                }
+            }
             Err(error) => {
                 eprintln!("sparrowd: {} failed: {error}", job.name());
-                if matches!(job, Job::Expiry) {
-                    // Retry a refused pass on the ordinary tick, never a busy loop.
-                    continuation = false;
+                // Retry a refused pass or page on the ordinary tick, never a busy loop.
+                match job {
+                    Job::Expiry => continuation = false,
+                    Job::Migrate => {
+                        migrating = false;
+                        migrate.reset();
+                    }
+                    _ => {}
                 }
             }
         }
@@ -301,6 +376,130 @@ mod tests {
             "NOT_FOUND"
         );
         worker.shutdown().await.unwrap();
+    }
+
+    /// INVARIANT: a store opened with both schema 69 migrations pending serves reads while
+    /// the backfill is part done, and those reads report the record graphs still pending;
+    /// the joined worker's pages then finish both migrations, after which the same read
+    /// reports nothing pending.
+    #[tokio::test]
+    async fn reads_report_pending_mid_migration_and_the_worker_finishes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let config = sparrow_server::ServerConfig::read(&path).unwrap();
+        let store = config.open_store().unwrap();
+        let now = sparrow_server::now().unwrap();
+        let input = (0..300).map(|i| format!("line {i}\n")).collect::<String>();
+        store
+            .ingest("migrate", "source", "log", input.as_bytes(), now)
+            .unwrap();
+        drop(store);
+        let db = sparrow_test_support::catalog_db(&data).unwrap();
+        sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+        drop(db);
+        let store = config.open_store().unwrap();
+        let pending = store.migrations().unwrap();
+        assert!(
+            pending.iter().all(|m| !m.complete() && m.total > 0),
+            "{pending:?}"
+        );
+        // Commit the worker's first two pages (the owner index, then one backfill page) so
+        // the read below lands part-way through the backfill, not before or after it.
+        for _ in 0..2 {
+            store.migrate_step().unwrap().unwrap();
+        }
+        let part = store.migrations().unwrap();
+        assert!(part[0].complete() && !part[1].complete(), "{part:?}");
+        assert!(part[1].done > 0, "{part:?}");
+        use sparrow_core::QueryScope;
+        let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1000);
+        let read = |store: &sparrow_core::Store| {
+            let governors = purrdf::sparql::QueryGovernors::METERED.with_fuel(10_000_000);
+            let result = store
+                .sparql_query(
+                    &sparrow_core::SparqlRead {
+                        text_relations: None,
+                        scope: &scope,
+                        layers: sparrow_core::RdfGraphLayers::ALL,
+                        request: purrdf::SparqlRequest {
+                            query: "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+                            base_iri: None,
+                            substitutions: &[],
+                        },
+                        governors: &governors,
+                        limits: sparrow_core::RdfReadLimits::default(),
+                    },
+                    sparrow_server::now().unwrap(),
+                    &sparrow_core::QueryCancellation::default(),
+                )
+                .unwrap();
+            assert!(result.outcome.is_ok(), "the read is served");
+            result.coverage.event_fallback_pending
+        };
+        let waiting = read(&store);
+        assert_eq!(waiting, part[1].total - part[1].done, "{part:?}");
+        let worker = Worker::start(store.clone(), Duration::from_millis(1));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !store
+                .migrations()
+                .unwrap()
+                .iter()
+                .all(sparrow_core::MigrationStatus::complete)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.shutdown().await.unwrap();
+        let done = store.migrations().unwrap();
+        assert!(
+            done.iter()
+                .all(|m| m.failure.is_none() && m.done == m.total),
+            "{done:?}"
+        );
+        assert_eq!(read(&store), 0);
+    }
+
+    /// INVARIANT: in the no-intake shape (maintenance, but no consume or syslog worker) the
+    /// daemon's health loop, the branch its serving loop exits on, keeps waiting while the
+    /// maintenance worker runs and returns the maintenance failure once that loop has ended,
+    /// so the daemon exits with an error instead of serving on without maintenance.
+    #[tokio::test]
+    async fn the_health_loop_fails_a_no_intake_daemon_whose_maintenance_worker_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let worker = Worker::start(store, Duration::from_millis(1));
+        let (mut consumer, mut syslog) = (None, None);
+        // A running worker: several health intervals pass without a failure.
+        assert!(
+            tokio::time::timeout(
+                crate::WORKER_HEALTH_INTERVAL * 5,
+                crate::worker_health(&mut consumer, &mut syslog, Some(&worker)),
+            )
+            .await
+            .is_err()
+        );
+        // End the loop without consuming the worker, as any unexpected end would.
+        worker.stop.send_replace(true);
+        let failure = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::worker_health(&mut consumer, &mut syslog, Some(&worker)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failure.to_string(),
+            "maintenance worker terminated unexpectedly"
+        );
     }
 
     #[tokio::test]

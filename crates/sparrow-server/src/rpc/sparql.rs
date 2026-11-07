@@ -529,6 +529,7 @@ fn receipt<Body, Outcome>(
     coverage.set_catalog_entries(c.catalog_entries as u64);
     coverage.set_complete(run.index_coverage_complete());
     coverage.set_event_time_known(c.event_time_known);
+    coverage.set_event_fallback_pending(c.event_fallback_pending);
     let mut known = coverage
         .reborrow()
         .init_diagnostic_known(sparrow_core::DiagnosticDimension::ALL.len() as u32);

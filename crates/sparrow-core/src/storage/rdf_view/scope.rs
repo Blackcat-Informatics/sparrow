@@ -113,6 +113,11 @@ pub struct RdfScopeCoverage {
     pub event_time_projection_failed: u64,
     /// Known declared diagnostic values among selected occurrences, by dimension.
     pub diagnostic_known: std::collections::BTreeMap<crate::DiagnosticDimension, u64>,
+    /// Selected record metadata graphs the online event fallback backfill has not yet
+    /// rebuilt: they lack `eventTimeFallback` and `eventTimeBasis` until it does. Raw
+    /// SPARQL counts them; a correlation, whose recipe reads only `eventTime` and
+    /// `receivedAt`, does not.
+    pub event_fallback_pending: u64,
 }
 
 impl RdfScopeCoverage {
@@ -232,6 +237,17 @@ impl StoredRdfView<'_> {
         }
         if layers.metadata {
             self.include_owner(&record.id)?;
+            if !matches!(record.event_time, crate::EventTime::Known { .. })
+                && self.fallback_pending(&record.id)?
+            {
+                coverage.event_fallback_pending += 1;
+                if strict {
+                    return Err(self.budget.fail(Error::new(
+                        "INDEX_NOT_READY",
+                        "the event fallback migration is pending for a selected record graph; retry after it completes or omit the complete-index requirement",
+                    )));
+                }
+            }
         }
         if layers.diagnostic
             && let Some(owner) = diagnostic::graph_owner(record)
@@ -339,7 +355,11 @@ impl Store {
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new_cancellable(&db, limits, &[], cancellation.clone())?;
-        view.scoped = scope.restricts_membership();
+        view.scoped = scope.restricts_membership() && view.owner_index;
+        if correlation.is_some() {
+            // The correlation recipe never reads the backfilled facts.
+            view.fallback = None;
+        }
         if text {
             Arc::get_mut(&mut view._scope)
                 .expect("text setup precedes native owned-query admission")
