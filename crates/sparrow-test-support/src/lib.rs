@@ -172,6 +172,29 @@ pub fn catalog_db(path: &std::path::Path) -> Result<rocksdb::DB, rocksdb::Error>
     rocksdb::DB::open_cf(&options, path, columns)
 }
 
+/// Return a closed current store to the state its first schema 69 open leaves before any
+/// online migration page: writers fenced, the owner-to-graph index empty with its build at
+/// the start, and every record metadata graph without its receipt-time fallback facts, with
+/// the backfill at the start. Graph declarations and records are unchanged.
+pub fn pending_schema_69_migrations(db: &rocksdb::DB) -> Result<(), Box<dyn std::error::Error>> {
+    sparrow_core::remove_event_fallback_rdf_for_legacy_fixture(db)?;
+    let mut batch = rocksdb::WriteBatch::default();
+    for row in db.prefix_iterator(b"rdf:o:") {
+        let (key, _) = row?;
+        if !key.starts_with(b"rdf:o:") {
+            break;
+        }
+        batch.delete(key);
+    }
+    batch.put("owner-graph-index-upgrade", [1]);
+    batch.put(
+        "event-fallback-rdf-upgrade",
+        br#"{"after":null,"complete":false}"#,
+    );
+    db.write(batch)?;
+    Ok(())
+}
+
 /// Remove the range index explicitly when constructing a historical writer fixture.
 /// This does not alter record bytes, generation authority, or their acceptance clocks.
 pub fn remove_tail_range_index(db: &rocksdb::DB) -> Result<(), rocksdb::Error> {

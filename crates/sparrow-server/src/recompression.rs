@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! Daemon encoding of the table-rewrite status; the agent renders it for CLI and MCP.
+//! Daemon encoding of the table-rewrite and online migration status; the agent renders
+//! them for CLI and MCP.
 
+use crate::agent::optional;
 use crate::sparrow_capnp as wire;
-use sparrow_core::{RecompressionPhase, RecompressionStatus};
+use sparrow_core::{MigrationStatus, RecompressionPhase, RecompressionStatus};
 
 pub(crate) fn encode(
     mut out: wire::recompression_status::Builder<'_>,
@@ -17,14 +19,20 @@ pub(crate) fn encode(
         RecompressionPhase::Complete => wire::RecompressionPhase::Complete,
     });
     out.set_remaining_bytes(status.remaining_bytes);
-    let text = |field: wire::optional_text::Builder<'_>, value: Option<&str>| {
-        sparrow_client::encode_optional(
-            field,
-            value,
-            |mut field, value| field.set_value(value),
-            |mut field| field.set_absent(()),
-        );
-    };
-    text(out.reborrow().init_waiting(), status.waiting.as_deref());
-    text(out.init_failure(), status.failure.as_deref());
+    optional(out.reborrow().init_waiting(), &status.waiting);
+    optional(out.init_failure(), &status.failure);
+}
+
+pub(crate) fn encode_migrations(
+    mut out: capnp::struct_list::Builder<'_, wire::migration_status::Owned>,
+    migrations: &[MigrationStatus],
+) {
+    for (index, migration) in migrations.iter().enumerate() {
+        let mut target = out.reborrow().get(index as u32);
+        target.set_name(migration.name);
+        target.set_done(migration.done);
+        target.set_total(migration.total);
+        optional(target.reborrow().init_watermark(), &migration.watermark);
+        optional(target.init_failure(), &migration.failure);
+    }
 }

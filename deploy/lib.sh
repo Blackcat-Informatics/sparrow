@@ -435,6 +435,16 @@ match_copy_on_write() {
     output=$(chattr "$flag" -- "$dir" 2>&1) || die "cannot chattr $flag $dir to match $source: $output"
 }
 
+# Bytes available to an unprivileged writer on the filesystem holding PATH. Run it in a command
+# substitution followed by "|| exit 1", since die there ends only the subshell.
+free_bytes() {
+    local free
+    free=$(df -B1 --output=avail -- "$1" | tail -n 1) || die "cannot read the free space of $1"
+    free=${free//[[:space:]]/}
+    [[ $free =~ ^[0-9]+$ ]] || die "df reports no free space for $1"
+    printf '%s\n' "$free"
+}
+
 # Rewrite the closed store DATA so that it and every file in it have copy-on-write off. The copy
 # is made in a no-copy-on-write sibling, its file list, sizes and bytes are compared with DATA, and
 # it then takes DATA's name. The original is kept, renamed DATA.cow-STAMP, for the operator to
@@ -459,7 +469,7 @@ convert_store_no_cow() {
     kept=$data.cow-$(date -u +%Y%m%dT%H%M%SZ)
     [[ ! -e $partial ]] || die "$partial is left from an earlier attempt; inspect and remove it"
     need=$(du -s -B1 -- "$data" | cut -f1)
-    free=$(df -B1 --output=avail -- "${data%/*}" | tail -n 1)
+    free=$(free_bytes "${data%/*}") || exit 1
     ((free > need + 10 * 1024 ** 3)) \
         || die "only $free bytes free beside $data; converting it needs $need bytes plus 10 GiB"
     mkdir -- "$partial"

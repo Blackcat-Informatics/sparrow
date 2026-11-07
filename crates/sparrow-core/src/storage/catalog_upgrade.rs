@@ -120,22 +120,7 @@ pub(super) fn run<P: Publication>(
     admit: PageAdmission<'_>,
 ) -> Result<(), Error> {
     loop {
-        let bytes = db.get(job.checkpoint)?.ok_or_else(|| {
-            Error::new(
-                "STORAGE_FAILURE",
-                format!(
-                    "required {} state missing; restore the original catalog",
-                    job.checkpoint
-                ),
-            )
-        })?;
-        if bytes.len() > 1024 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "catalog upgrade checkpoint exceeds its bound",
-            ));
-        }
-        let progress = Progress::decode(&parse(&bytes)?)?;
+        let progress = progress(db, job)?;
         if progress.complete {
             return Ok(());
         }
@@ -144,11 +129,7 @@ pub(super) fn run<P: Publication>(
 }
 
 pub(super) fn seed<P>(db: &DB, job: &Job<P>, batch: &mut WriteBatch) -> Result<(), Error> {
-    let present = match db.prefix_iterator(job.target).next() {
-        Some(row) => row?.0.starts_with(job.target),
-        None => false,
-    };
-    if db.get(job.checkpoint)?.is_some() || present {
+    if db.get(job.checkpoint)?.is_some() || super::any_key(db, job.target)? {
         return Err(Error::new(
             "STORAGE_FAILURE",
             format!("legacy store contains unfenced {} state", job.checkpoint),
@@ -169,10 +150,45 @@ pub(super) fn commit(db: &DB, batch: WriteBatch) -> Result<(), Error> {
 pub(super) fn step<P: Publication>(
     db: &DB,
     job: &Job<P>,
-    mut progress: Progress,
+    progress: Progress,
     maximum: usize,
     admit: PageAdmission<'_>,
 ) -> Result<(), Error> {
+    let (batch, _) = page(db, job, progress, maximum)?;
+    if let Some(admit) = admit {
+        admit(&batch)?;
+    }
+    commit(db, batch)
+}
+
+/// Read a job's committed checkpoint.
+pub(super) fn progress<P>(db: &DB, job: &Job<P>) -> Result<Progress, Error> {
+    let bytes = db.get(job.checkpoint)?.ok_or_else(|| {
+        Error::new(
+            "STORAGE_FAILURE",
+            format!(
+                "required {} state missing; restore the original catalog",
+                job.checkpoint
+            ),
+        )
+    })?;
+    if bytes.len() > 1024 {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "catalog upgrade checkpoint exceeds its bound",
+        ));
+    }
+    Progress::decode(&parse(&bytes)?)
+}
+
+/// Stage one page: its published entries and the advanced checkpoint in one batch, and
+/// whether the page completes the job. The caller admits and commits the batch whole.
+pub(super) fn page<P: Publication>(
+    db: &DB,
+    job: &Job<P>,
+    mut progress: Progress,
+    maximum: usize,
+) -> Result<(WriteBatch, bool), Error> {
     if progress
         .after
         .as_ref()
@@ -245,10 +261,7 @@ pub(super) fn step<P: Publication>(
         progress.after = None;
     }
     super::put(&mut batch, job.checkpoint, &progress);
-    if let Some(admit) = admit {
-        admit(&batch)?;
-    }
-    commit(db, batch)
+    Ok((batch, progress.complete))
 }
 
 #[cfg(test)]

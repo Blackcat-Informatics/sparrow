@@ -115,12 +115,25 @@ pub struct StoredRdfView<'a> {
     /// Membership narrower than the whole live store: patterns are evaluated per graph
     /// of `owners`, enumerated from the owner-to-graph index, so cost follows the scope.
     scoped: bool,
+    /// The owner-to-graph index build is complete in this snapshot. Until it is, every
+    /// scope keeps the whole-store plan, which reads only declarations every writer kept.
+    owner_index: bool,
+    /// Present while the event fallback backfill is incomplete in this snapshot.
+    fallback: Option<FallbackPending>,
     budget: Arc<Budget>,
     _scope: Arc<Reservation>,
     terms: u64,
     max_encoded: u64,
     scope_receipt: Option<super::Value>,
     text_scope: Option<text_relations::TextScope>,
+}
+
+/// An incomplete event fallback backfill as one snapshot sees it.
+struct FallbackPending {
+    /// Last examined record graph owner; graphs at or before it are migrated.
+    after: Option<String>,
+    /// Dictionary identities of `eventTime` and `eventTimeFallback`, when interned.
+    predicates: [Option<u64>; 2],
 }
 
 /// Owned native term carrier whose strings live through this admitted guard.
@@ -238,6 +251,8 @@ impl<'a> StoredRdfView<'a> {
             reverse: rdf_index::reverse_family(db).map_err(|e| budget.fail(e))?,
             owners: BTreeSet::new(),
             scoped: false,
+            owner_index: false,
+            fallback: None,
             budget,
             _scope: scope,
             terms: 0,
@@ -273,6 +288,7 @@ impl<'a> StoredRdfView<'a> {
                 "invalid RDF term allocation bound",
             )));
         }
+        view.migration_state()?;
         for id in graph_ids {
             let term = TermValue::iri(rdf_index::graph_iri(id));
             let owner = view.term_id_by_value(&term)?.ok_or_else(|| {
@@ -282,6 +298,67 @@ impl<'a> StoredRdfView<'a> {
             view.owners.insert(ordinal(owner));
         }
         Ok(view)
+    }
+
+    /// Read both online migration checkpoints from this view's snapshot.
+    fn migration_state(&mut self) -> Result<(), ReadError> {
+        let read = |key: &str| {
+            self.budget.request(key.len() as u64 + 1024, false)?;
+            self.snapshot
+                .get(key)
+                .map_err(|error| self.budget.fail(error.into()))
+        };
+        let owner = read(rdf_index::OWNER_GRAPH_UPGRADE)?;
+        let checkpoint = read(super::event_fallback_rdf::CHECKPOINT)?;
+        self.owner_index = rdf_index::owner_graph_progress(|_| Ok(owner))
+            .map_err(|error| self.budget.fail(error))?
+            .is_none();
+        let Some(after) = super::event_fallback_rdf::decode_frontier(checkpoint.as_deref())
+            .map_err(|error| self.budget.fail(error))?
+        else {
+            return Ok(());
+        };
+        let mut predicates = [None; 2];
+        for (slot, predicate) in predicates
+            .iter_mut()
+            .zip(super::event_fallback_rdf::event_time_predicates())
+        {
+            *slot = self.term_id_by_value(&predicate)?.map(ordinal);
+        }
+        self.fallback = Some(FallbackPending { after, predicates });
+        Ok(())
+    }
+
+    /// Whether a record's metadata graph still lacks the fallback facts the event fallback
+    /// backfill adds. Graphs at or before its frontier are migrated; one beyond it was
+    /// either published after the fence, with its facts, or still waits for a page.
+    fn fallback_pending(&self, id: &str) -> Result<bool, ReadError> {
+        let Some(pending) = &self.fallback else {
+            return Ok(false);
+        };
+        if pending.after.as_deref().is_some_and(|after| id <= after) {
+            return Ok(false);
+        }
+        let key = format!("rdf:graph:{id}");
+        let bytes = self.catalog_point(key.as_bytes())?.ok_or_else(|| {
+            self.budget
+                .fail(Error::new("STORAGE_FAILURE", "record RDF graph missing"))
+        })?;
+        let _decode = self
+            .budget
+            .reserve((bytes.len() as u64).saturating_mul(64))?;
+        let rows = super::parse(&bytes)
+            .and_then(|manifest| rdf_index::manifest_rows(&manifest))
+            .map_err(|error| self.budget.fail(error))?;
+        drop(bytes);
+        let subject = self
+            .term_id_by_value(&TermValue::iri(rdf_index::entity_iri(id)))?
+            .map(ordinal);
+        Ok(!super::event_fallback_rdf::carries_event_time(
+            &rows,
+            subject,
+            pending.predicates,
+        ))
     }
 
     /// Native sequence at which evidence membership and indexed values were captured.
@@ -931,7 +1008,7 @@ impl Store {
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new(&db, limits, &[])?;
-        view.scoped = true;
+        view.scoped = view.owner_index;
         let mut scope_bytes = 4096 + ids.len() as u64 * 2048;
         Arc::get_mut(&mut view._scope)
             .expect("scope capture precedes owned query admission")

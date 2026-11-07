@@ -39,6 +39,7 @@ pub(crate) mod ingest_status;
 pub(crate) mod intake;
 pub(crate) mod log_time;
 mod manifest_retire;
+pub(crate) mod migration;
 pub(crate) mod pin_read;
 pub(crate) mod pressure;
 pub(crate) mod producer_stream;
@@ -505,6 +506,7 @@ struct Writer {
     eviction: std::cell::RefCell<eviction::Cursor>,
     expiry: std::cell::RefCell<expiry::Cursor>,
     recompression: std::cell::RefCell<recompression::State>,
+    migrations: std::cell::RefCell<migration::State>,
     /// Present exactly when the store archives before deleting.
     archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
@@ -1132,15 +1134,7 @@ impl Writer {
     }
 
     fn count_prefix(&self, prefix: &str) -> Result<u64, Error> {
-        let mut count = 0_u64;
-        for entry in self.db.prefix_iterator(prefix) {
-            let (key, _) = entry?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            count += 1;
-        }
-        Ok(count)
+        count_prefix(&self.db, prefix.as_bytes(), None).map(|(_, total)| total)
     }
 
     fn protected(&self, now: u64) -> Result<BTreeSet<String>, Error> {
@@ -1296,6 +1290,30 @@ pub(super) fn family_handles(db: &DB) -> Result<Vec<&rocksdb::ColumnFamily>, Err
         .collect()
 }
 
+/// Whether any key starts with `prefix`.
+fn any_key(db: &DB, prefix: &[u8]) -> Result<bool, Error> {
+    match db.prefix_iterator(prefix).next() {
+        Some(row) => Ok(row?.0.starts_with(prefix)),
+        None => Ok(false),
+    }
+}
+
+/// Keys under `prefix` at or before `frontier`, and all keys under `prefix`.
+fn count_prefix(db: &DB, prefix: &[u8], frontier: Option<&[u8]>) -> Result<(u64, u64), Error> {
+    let (mut done, mut total) = (0, 0);
+    for row in db.prefix_iterator(prefix) {
+        let (key, _) = row?;
+        if !key.starts_with(prefix) {
+            break;
+        }
+        total += 1;
+        if frontier.is_some_and(|frontier| *key <= *frontier) {
+            done += 1;
+        }
+    }
+    Ok((done, total))
+}
+
 fn put<T: Catalog>(batch: &mut WriteBatch, key: &str, value: &T) {
     batch.put(key, json::write_compact(&value.encode()));
 }
@@ -1420,10 +1438,8 @@ impl Store {
         artifact_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         provenance_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         tracing_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
-        event_fallback_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
-        rdf_index::upgrade_owner_graphs(&db, &|batch| {
-            artifact_rdf::admit(&db, config.disk_budget, config.maintenance_reserve, batch)
-        })?;
+        // Schema 69's backfills run online, one page per maintenance admission.
+        migration::fence(&db)?;
         let archive = archive::open(&db, config.archive.as_ref())?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(
@@ -1459,6 +1475,7 @@ impl Store {
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
                 recompression: std::cell::RefCell::new(recompression),
+                migrations: std::cell::RefCell::new(migration::State::default()),
                 archive: archive.map(std::cell::RefCell::new),
                 query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),

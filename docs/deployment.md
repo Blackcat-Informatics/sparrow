@@ -283,6 +283,13 @@ is outstanding or a job's 1 GiB of headroom would not fit the data allowance
 or the free-space floor. The rewrite resumes after a restart, and a running
 job is aborted when the store closes, so shutdown does not wait for it.
 
+The first open of a store written before schema 69 serves at once and runs the
+owner-to-graph index build and the receipt-time fallback backfill in the
+background (see "Online store migrations" in the interfaces). `status` reports
+them under `migrations` with `done`, `total`, `watermark` and any `failure`, and
+the journal logs a progress line every 64 pages and a completion line per
+migration. A restart resumes after the last committed page.
+
 ## Shipping finished files from producers that keep them
 
 A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
@@ -421,6 +428,82 @@ verify the backup with `deploy/verify-backup.sh BACKUP` (`deploy/RECOVERY.md`,
 which opens no watch root and refuses every write, and checks the store
 identity, status, the stored payload chunk count, and, within the retention
 window, a records window and one artifact's bytes. A backup counts as verified only after the script passes on it.
+
+### Measure the online migration
+
+`deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP` measures
+the online schema 69 migrations ("Online store migrations" in the interfaces)
+on a writable reflinked copy of the backup's store below `SPARROW_VERIFY`
+(default `/SPARROW/verify`). The switch gate is a first open under 10 minutes
+measured this way. The copy has its own socket, and its scratch configuration
+takes the backup's budgets and lexicons as the verify mode's does, with no
+ingest socket, TCP listener, syslog listener, watch or archive. The image opens
+it with `sparrowd --no-intake`: the maintenance worker runs the migration pages,
+and, as in query-only mode, the stored watch catalog is reported but no root is
+opened, so the live intake folders it names are never consumed. An image
+without `--no-intake` in its usage line is refused. The daemon runs under
+`systemd-run --user --scope` with `CPUQuota=100%`, `IOWeight=20`,
+`MemoryHigh=2G` and `MemoryMax=4G`, the limits of the service unit.
+
+The disk guard reads the free space of the filesystem holding
+`SPARROW_VERIFY`. The run refuses to start under 50 GB free, before anything
+is copied, and aborts under 40 GB, stopping the daemon and removing the copy.
+A `df` that cannot be read ends the run with its own message.
+`SPARROW_MEASURE_MIN_FREE_GB` and `SPARROW_MEASURE_ABORT_FREE_GB` may raise
+either floor, never lower it. On the first status answer the script reads the
+scope's limits back from `systemctl --user show` and fails unless they are the
+ones requested. The run polls status every 15 seconds until every entry in
+`migrations` is complete with no failure, then stops the daemon with SIGINT and
+removes the copy.
+
+The run fails, removing the copy, with one `verify-backup: FAIL CHECK:` line
+on standard error. These are every failure of the mode:
+
+- `FAIL open`: the daemon exited. A `--no-intake` daemon also exits when its
+  maintenance worker ends.
+- `FAIL store-id`: the copy's store identity is not the one SOURCE records.
+- `FAIL no-intake`: status or the startup line does not report no-intake
+  mode, or a stored watch root is open.
+- `FAIL scope`: `systemctl --user show` cannot read the scope, or its limits
+  are not the ones requested.
+- `FAIL durability`: status reports a `durability.failure`.
+- `FAIL status`: status failed to answer three times running after its first
+  answer, or it reports no readable migrations.
+- `FAIL migrate`: a migration reports a failure; the line carries its text.
+- `FAIL stall`: the migrations' done/total has not moved for 600 seconds
+  after the first status. A failing page already ends the run as
+  `FAIL migrate`, so this catches stops that set no failure, such as the
+  daemon pausing writes below its own free-space floor. The worker retries a
+  failed page every 60 seconds. The live step-1 open averaged about 0.9 s per
+  64-graph page (34 minutes over 2,360 pages, an average not measured page by
+  page), so a healthy backfill moves at every poll. Ten retry intervals
+  without movement mean the migration has stopped, and 600 seconds is also
+  the switch gate's whole 10-minute budget.
+- `FAIL disk`: free space fell under the abort floor, or `df` could not read
+  it during the run.
+- `FAIL shutdown`: the daemon exited non-zero after SIGINT, or did not log its
+  closing count.
+
+There is no ceiling before the first status answer, because the length of the
+first open is the measured quantity. Interrupt the script to stop early; the
+copy is still removed. However the run ends, the daemon's own migration lines
+(`sparrowd: migration ...` progress and completion, and
+`sparrowd: online migration failed: ...`) are printed prefixed with
+`verify-backup: daemon:` before the copy and its log are removed.
+
+Each measurement is one `verify-backup: MEASURE` line on standard output:
+
+| Line | Meaning |
+| --- | --- |
+| `image=PATH sha256=HEX` | The daemon image and its digest |
+| `start_utc=TIME` | Clock time when the daemon was started |
+| `first_status_seconds=S` | Seconds from start to the first status answer |
+| `progress elapsed_seconds=S NAME=DONE/TOTAL ...` | Each migration's progress, every minute |
+| `free_space phase=start\|minute\|end path=P bytes=N gb=N` | Free space at start, every minute and at the end |
+| `scope=UNIT CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=N MemoryMax=N` | The scope's limits as systemd applied them |
+| `backfill_seconds=S` | Seconds from start until every migration was complete |
+| `end_utc=TIME` | Clock time when every migration was complete |
+| `live_records=N` | `live_records` from the final status |
 
 This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live

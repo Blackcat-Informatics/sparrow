@@ -249,6 +249,15 @@ struct Status {
   queryOnly @50 :Bool; retentionSeconds @51 :UInt64;
   # Schema 68: the group-accessible ingest-only Unix socket, when configured.
   ingestSocket @52 :OptionalIngestSocketStatus;
+  # Schema 69: the online store migrations and their progress.
+  migrations @53 :List(MigrationStatus);
+}
+# One online store migration. `done` of `total` source entries are migrated; `watermark` is
+# the opaque last committed position, `start` before the first page and absent only once
+# complete; `failure` is the latched error of the last page, cleared when a page succeeds.
+struct MigrationStatus {
+  name @0 :Text; done @1 :UInt64; total @2 :UInt64;
+  watermark @3 :OptionalText; failure @4 :OptionalText;
 }
 struct IngestSocketStatus {
   path @0 :Text; gid @1 :UInt32; maxConnections @2 :UInt32;
@@ -781,6 +790,8 @@ struct SparqlCoverage {
   artifactDiagnosticUnknown @11 :UInt64;
   eventTimeKnown @12 :UInt64;
   diagnosticKnown @13 :List(DiagnosticKnownCount);
+  # Schema 69: selected record graphs still awaiting the event fallback migration.
+  eventFallbackPending @14 :UInt64;
 }
 struct DiagnosticKnownCount { dimension @0 :DiagnosticDimension; known @1 :UInt64; }
 enum CorrelationClock { received @0; event @1; }

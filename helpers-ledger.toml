@@ -143,8 +143,8 @@ names = ['^(copy_tracing_upgrade_pager|append_unowned_tracing_graph)$']
 
 [[job]]
 id = "event-fallback-rdf-backfill"
-summary = "One startup migration fences older writers into the fallback families and adds eventTimeFallback/eventTimeBasis to every retained record metadata graph without eventTime, published or privately prepared, deriving the receipt placement from the graph's own receivedAt. It reuses the shared catalog pager, the shared stored-metadata loader and the one fallback metadata builder; stored records are not read."
-home = "sparrow_core::storage::event_fallback_rdf::upgrade"
+summary = "One online migration, fenced and seeded at open and paged by the maintenance worker, moves older writers out with the fallback families and adds eventTimeFallback/eventTimeBasis to every retained record metadata graph without eventTime, published or privately prepared, deriving the receipt placement from the graph's own receivedAt. It reuses the shared catalog pager, the shared stored-metadata loader and the one fallback metadata builder; stored records are not read."
+home = "sparrow_core::storage::event_fallback_rdf::page"
 entry_points = ["sparrow_core::storage::event_fallback_rdf::publish", "sparrow_core::storage::rdf_index::stored_metadata", "sparrow_core::storage::rdf_index::fallback_metadata", "sparrow_core::storage::writer_format::enable_event_fallback"]
 spec = "docs/interfaces.md: receipt-time event fallback (schema 69)."
 vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
@@ -157,9 +157,9 @@ names = ['^(copy_fallback_upgrade_pager|decode_metadata_graph_elsewhere|append_f
 
 [[job]]
 id = "owner-graph-index"
-summary = "One RDF writer puts and deletes every rdf:g graph declaration together with its rdf:o owner-to-graph mirror in the same batch. One startup job fences older writers into the owner-graph families and builds the mirror from existing declaration keys in resumable pages, covering privately prepared graphs. Scoped views enumerate graphs from the mirror and merge graph-leading twins of the store-wide plan through the one ScopedRows heap."
+summary = "One RDF writer puts and deletes every rdf:g graph declaration together with its rdf:o owner-to-graph mirror in the same batch. One online migration, fenced and seeded at open and paged by the maintenance worker, builds the mirror from existing declaration keys in resumable pages behind the owner-graph writer families, covering privately prepared graphs. Scoped views enumerate graphs from the mirror and merge graph-leading twins of the store-wide plan through the one ScopedRows heap."
 home = "sparrow_core::storage::rdf_index::owner_graph_key"
-entry_points = ["sparrow_core::storage::rdf_index::upgrade_owner_graphs", "sparrow_core::storage::rdf_index::owner_graph_step", "sparrow_core::storage::writer_format::enable_owner_graphs", "sparrow_core::storage::rdf_view::StoredRdfView::owner_graphs", "sparrow_core::storage::rdf_view::sparse::ScopedRows::new", "sparrow_core::query::QueryScope::restricts_membership"]
+entry_points = ["sparrow_core::storage::rdf_index::fence_owner_graphs", "sparrow_core::storage::rdf_index::owner_graph_page", "sparrow_core::storage::writer_format::enable_owner_graphs", "sparrow_core::storage::rdf_view::StoredRdfView::owner_graphs", "sparrow_core::storage::rdf_view::sparse::ScopedRows::new", "sparrow_core::query::QueryScope::restricts_membership"]
 spec = "docs/interfaces.md: owner-to-graph index (store format); docs/architecture.md section 7."
 vectors = ["crates/sparrow-core/src/storage/rdf_index.rs", "crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []

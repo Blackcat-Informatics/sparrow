@@ -4227,9 +4227,10 @@ fn rpc_failure<T: capnp::traits::Owned + 'static>(
 
 /// INVARIANT: a query-only daemon on a copy of a store with a registered watch answers reads
 /// as a normal daemon does, opens and claims nothing in the stored watch root, and refuses
-/// writes with `READ_ONLY` before acting on them.
+/// writes with `READ_ONLY` before acting on them. A `--no-intake` daemon on the same copy
+/// also opens and claims nothing there, yet its maintenance worker finishes the migrations.
 #[tokio::test(flavor = "current_thread")]
-async fn query_only_daemon_serves_reads_and_refuses_writes() {
+async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migrates() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
@@ -4261,9 +4262,13 @@ async fn query_only_daemon_serves_reads_and_refuses_writes() {
                 .status()
                 .unwrap();
             assert!(status.success());
+            // The copy owes both schema 69 migrations, which only a maintenance worker runs.
+            let db = sparrow_test_support::catalog_db(&copied).unwrap();
+            sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+            drop(db);
             let copy_socket = copied.join("rpc.sock");
             let copy_config = write_server_config(&copy, &copied, &copy_socket);
-            let _query = start_with(
+            let query = start_with(
                 &copy_config,
                 &copy_socket,
                 Stdio::inherit(),
@@ -4363,36 +4368,115 @@ async fn query_only_daemon_serves_reads_and_refuses_writes() {
                 b"{\"copy\":2}\n",
                 "the copy claimed nothing"
             );
+            let status = cli(&copy_socket, &["status"]);
+            assert_eq!(status["live_records"].as_str(), Some("1"));
+            // A query-only open fences and serves, but never runs a migration page.
+            let migrations = status["migrations"].as_array().unwrap();
+            assert_eq!(migrations.len(), 2, "{migrations:?}");
+            for migration in migrations {
+                assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
+                assert_ne!(migration["total"].as_str(), Some("0"), "{migration:?}");
+                assert_eq!(migration["watermark"].as_str(), Some("start"));
+                assert!(migration["failure"].is_null());
+            }
+            // A SPARQL answer over the unmigrated record graph says the backfill is pending.
+            let request = purrdf_lex::json::Object::new()
+                .with("store_id", store.as_str())
+                .with("query", "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1")
+                .with(
+                    "layers",
+                    purrdf_lex::json::Object::new()
+                        .with("metadata", true)
+                        .with("content", false)
+                        .with("diagnostic", false),
+                );
+            let request_file = copy.join("pending.json");
+            std::fs::write(
+                &request_file,
+                purrdf_lex::json::write_compact(&request.into()),
+            )
+            .unwrap();
+            let answer = cli(&copy_socket, &["sparql", request_file.to_str().unwrap()]);
+            assert_eq!(answer["execution_status"].as_str(), Some("complete"));
+            let coverage = &answer["coverage"];
             assert_eq!(
-                cli(&copy_socket, &["status"])["live_records"].as_str(),
-                Some("1")
+                coverage["event_fallback_pending"].as_str(),
+                Some("1"),
+                "{coverage:?}"
+            );
+            assert_eq!(coverage["complete"].as_bool(), Some(false), "{coverage:?}");
+            drop(client);
+            drop(query);
+
+            // A no-intake daemon writes and runs maintenance, but opens no stored watch root.
+            let _migrating = start_with(
+                &copy_config,
+                &copy_socket,
+                Stdio::inherit(),
+                &["--no-intake"],
+            )
+            .await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                let status = cli(&copy_socket, &["status"]);
+                let migrations = status["migrations"].as_array().unwrap();
+                assert!(
+                    migrations.iter().all(|m| m["failure"].is_null()),
+                    "{migrations:?}"
+                );
+                if migrations.iter().all(|m| m["watermark"].is_null()) {
+                    break status;
+                }
+                assert!(std::time::Instant::now() < deadline, "{migrations:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert_eq!(status["query_only"].as_bool(), Some(false));
+            for migration in status["migrations"].as_array().unwrap() {
+                assert_eq!(migration["done"], migration["total"], "{migration:?}");
+            }
+            let watches = status["consume_watches"].as_array().unwrap();
+            assert_eq!(watches.len(), 1, "the stored watch is reported");
+            assert_eq!(watches[0]["directories"].as_u64(), Some(0), "{watches:?}");
+            let answer = cli(&copy_socket, &["sparql", request_file.to_str().unwrap()]);
+            assert_eq!(
+                answer["coverage"]["event_fallback_pending"].as_str(),
+                Some("0")
+            );
+            assert_eq!(
+                std::fs::read(&waiting).unwrap(),
+                b"{\"copy\":2}\n",
+                "the no-intake copy claimed nothing"
             );
         })
         .await;
 }
 
-/// INVARIANT: query-only mode starts no intake, public listener or archive, so a
-/// configuration that names one refuses startup with the conflicting key, whether the flag
-/// or the `query_only` key selects the mode, before any store or socket is created.
+/// INVARIANT: query-only and no-intake modes start no intake, public listener or archive, so
+/// a configuration that names one refuses startup with the conflicting key, whether a flag or
+/// the `query_only` key selects the mode, before any store or socket is created.
 #[test]
-fn query_only_refuses_conflicting_configuration() {
+fn query_only_and_no_intake_refuse_conflicting_configuration() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("store");
     let socket = data.join("rpc.sock");
     let config = write_server_config(dir.path(), &data, &socket);
     let base = std::fs::read_to_string(&config).unwrap();
-    let refused = |extra: &str, flag: bool, key: &str| {
+    // `flag` selects the mode on the command line; without one the `query_only` key does.
+    let refused = |extra: &str, flag: Option<&str>, key: &str| {
         std::fs::write(&config, format!("{base}{extra}")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_sparrowd"));
         command.arg("--config").arg(&config);
-        if flag {
-            command.arg("--query-only");
-        }
+        command.args(flag);
         let output = command.admitted_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{extra}");
+        let mode = if flag == Some("--no-intake") {
+            "--no-intake"
+        } else {
+            "query_only"
+        };
         assert!(
-            stderr.contains(&format!("query_only refuses the configured `{key}`")),
+            stderr.contains(&format!("{mode} refuses the configured `{key}`")),
             "{stderr}"
         );
         assert!(!data.exists(), "refused before opening the store");
@@ -4400,10 +4484,19 @@ fn query_only_refuses_conflicting_configuration() {
     let root = dir.path().join("completed");
     std::fs::create_dir(&root).unwrap();
     let consume = toml::to_string(&watch_definition(&root, "completed", 0, 16, 16)).unwrap();
-    refused(&format!("\n[[consume]]\n{consume}"), true, "consume");
+    refused(
+        &format!("\n[[consume]]\n{consume}"),
+        Some("--query-only"),
+        "consume",
+    );
     refused(
         &format!("query_only = true\n\n[[consume]]\n{consume}"),
-        false,
+        None,
+        "consume",
+    );
+    refused(
+        &format!("\n[[consume]]\n{consume}"),
+        Some("--no-intake"),
         "consume",
     );
     let secret = dir.path().join("tcp.secret");
@@ -4412,7 +4505,8 @@ fn query_only_refuses_conflicting_configuration() {
         "rpc_tcp_address = \"127.0.0.1:9\"\nrpc_tcp_secret_file = \"{}\"\n",
         secret.display()
     );
-    refused(&tcp, true, "rpc_tcp_address");
+    refused(&tcp, Some("--query-only"), "rpc_tcp_address");
+    refused(&tcp, Some("--no-intake"), "rpc_tcp_address");
 }
 
 /// Run deploy/verify-backup.sh with a scratch root and the given live configuration.
@@ -4422,6 +4516,17 @@ fn verify_backup(
     live: &Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
+    verify_backup_with(backup, verify, live, args, &[])
+}
+
+/// Run deploy/verify-backup.sh as [`verify_backup`] does, with extra environment.
+fn verify_backup_with(
+    backup: &Path,
+    verify: &Path,
+    live: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
     let output = Command::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/verify-backup.sh"
@@ -4430,6 +4535,7 @@ fn verify_backup(
     .arg(backup)
     .env("SPARROW_VERIFY", verify)
     .env("SPARROW_CONFIG", live)
+    .envs(env.iter().copied())
     .admitted_output()
     .unwrap();
     (
@@ -4625,6 +4731,55 @@ fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
         !started.exists(),
         "the old image never ran with a configuration"
     );
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
+}
+
+/// INVARIANT: the migration measurement's disk guard refuses to start below its free-space
+/// floor, and refuses an override that would lower a floor, before any scratch copy exists or
+/// any daemon starts.
+#[test]
+fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, _, backup, _) = backup_fixture(dir.path());
+    let verify = dir.path().join("verify");
+    let args = [
+        "--measure-migration",
+        "--image",
+        env!("CARGO_BIN_EXE_sparrowd"),
+    ];
+    // No filesystem has an exabyte free, so raising the start floor that far always refuses.
+    let (code, stdout, stderr) = verify_backup_with(
+        &backup,
+        &verify,
+        &live,
+        &args,
+        &[("SPARROW_MEASURE_MIN_FREE_GB", "1000000000")],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("verify-backup: MEASURE free_space phase=start "),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("GB free a writable copy needs to start"),
+        "{stderr}"
+    );
+    assert!(
+        !verify.exists(),
+        "refused before any scratch directory exists"
+    );
+    let (code, stdout, stderr) = verify_backup_with(
+        &backup,
+        &verify,
+        &live,
+        &args,
+        &[("SPARROW_MEASURE_MIN_FREE_GB", "1")],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("the disk guard needs"), "{stderr}");
     assert!(
         !verify.exists(),
         "refused before any scratch directory exists"

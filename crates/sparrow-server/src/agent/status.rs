@@ -147,6 +147,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             crate::pressure::decode(value.get_pressure_status()?)?,
         )
         .with("recompression", recompression(value.get_recompression()?)?)
+        .with("migrations", migrations(value.get_migrations()?)?)
         .with("query_only", value.get_query_only())
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
@@ -340,4 +341,24 @@ fn recompression(value: wire::recompression_status::Reader<'_>) -> Result<Value>
         .with("waiting", super::optional_value(value.get_waiting()?)?)
         .with("failure", super::optional_value(value.get_failure()?)?)
         .into())
+}
+
+fn migrations(
+    value: capnp::struct_list::Reader<'_, wire::migration_status::Owned>,
+) -> Result<Value> {
+    let mut rows = Vec::with_capacity(value.len() as usize);
+    for migration in value {
+        rows.push(Value::from(
+            Object::new()
+                .with("name", migration.get_name()?.to_str()?)
+                .with("done", migration.get_done().to_string())
+                .with("total", migration.get_total().to_string())
+                .with(
+                    "watermark",
+                    super::optional_value(migration.get_watermark()?)?,
+                )
+                .with("failure", super::optional_value(migration.get_failure()?)?),
+        ));
+    }
+    Ok(Value::from(rows))
 }
