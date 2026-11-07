@@ -61,12 +61,12 @@ fn publish(
     let id = key
         .strip_prefix("rdf:graph:")
         .ok_or_else(|| failure("invalid metadata owner"))?;
+    let mut rdf = rdf_index::RdfWrite::new(db)?;
     let rdf_index::StoredMetadata {
         mut builder,
         values,
         primary,
-        mut rdf,
-    } = rdf_index::stored_metadata(db, id, bytes, PAGE_BYTES - charge, &failure)?;
+    } = rdf_index::stored_metadata(db, &mut rdf, id, bytes, PAGE_BYTES - charge, &failure)?;
     let subject_value = TermValue::iri(super::rdf_index::entity_iri(id));
     let mut fields = BTreeMap::new();
     for row in primary {
