@@ -282,10 +282,120 @@ pub(super) fn upgrade_reverse(db: &DB) -> Result<(), Error> {
 }
 
 pub(super) fn graph_key(graph: u64, owner: u64) -> Vec<u8> {
-    let mut key = b"rdf:g:".to_vec();
+    let mut key = GRAPH_PREFIX.to_vec();
     key.extend_from_slice(&graph.to_be_bytes());
     key.extend_from_slice(&owner.to_be_bytes());
     key
+}
+
+const GRAPH_PREFIX: &[u8] = b"rdf:g:";
+/// `rdf:o:<owner><graph>` mirrors every `rdf:g:<graph><owner>` declaration, so a scoped
+/// read enumerates its owners' graphs without visiting the store's other declarations.
+/// `RdfWrite` writes and deletes both rows in the same batch.
+pub(super) const OWNER_GRAPH_PREFIX: &[u8] = b"rdf:o:";
+const OWNER_GRAPH_UPGRADE: &str = "owner-graph-index-upgrade";
+const OWNER_GRAPH_PAGE: usize = 65536;
+
+pub(super) fn owner_graph_key(owner: u64, graph: u64) -> Vec<u8> {
+    let mut key = OWNER_GRAPH_PREFIX.to_vec();
+    key.extend_from_slice(&owner.to_be_bytes());
+    key.extend_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn owner_graph_failure(message: &str) -> Error {
+    Error::new("STORAGE_FAILURE", format!("owner graph index: {message}"))
+}
+
+/// Fence older writers, then build `rdf:o:` from the existing graph declarations. The job
+/// reads only `rdf:g:` keys, so graphs prepared by an unfinished staged import, which have
+/// no catalog record yet, are covered too. Each page commits its rows with the frontier,
+/// so an interrupted open resumes after the last committed declaration.
+pub(super) fn upgrade_owner_graphs(
+    db: &DB,
+    admit: &dyn Fn(&WriteBatch) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let format = db
+        .get("store_format")?
+        .ok_or_else(|| owner_graph_failure("writer format missing"))?;
+    if !super::writer_format::has_owner_graphs(&format) {
+        let mut batch = WriteBatch::default();
+        batch.put(OWNER_GRAPH_UPGRADE, [1]);
+        batch.put(
+            "store_format",
+            super::writer_format::enable_owner_graphs(&format)?,
+        );
+        super::catalog_upgrade::commit(db, batch)?;
+    }
+    while !owner_graph_step(db, OWNER_GRAPH_PAGE, admit)? {}
+    Ok(())
+}
+
+/// One durable page of the owner graph build; `true` once the build is complete. The
+/// checkpoint is `[0]` when complete, `[1]` before the first declaration, and `[1]`
+/// followed by the last copied declaration's graph and owner otherwise.
+fn owner_graph_step(
+    db: &DB,
+    page: usize,
+    admit: &dyn Fn(&WriteBatch) -> Result<(), Error>,
+) -> Result<bool, Error> {
+    let state = db.get(OWNER_GRAPH_UPGRADE)?.ok_or_else(|| {
+        owner_graph_failure("required upgrade state missing; restore the original catalog")
+    })?;
+    let after = match state.as_slice() {
+        [0] => return Ok(true),
+        [1] => None,
+        [1, after @ ..] if after.len() == 16 => {
+            let mut key = GRAPH_PREFIX.to_vec();
+            key.extend_from_slice(after);
+            Some(key)
+        }
+        _ => return Err(owner_graph_failure("invalid upgrade checkpoint")),
+    };
+    let start = after.as_deref().unwrap_or(GRAPH_PREFIX);
+    let mut batch = WriteBatch::default();
+    let mut frontier = None;
+    let mut copied = 0;
+    for row in db.iterator(rocksdb::IteratorMode::From(
+        start,
+        rocksdb::Direction::Forward,
+    )) {
+        let (key, value) = row?;
+        if !key.starts_with(GRAPH_PREFIX) {
+            break;
+        }
+        if after.as_deref() == Some(&*key) {
+            continue;
+        }
+        if copied == page {
+            break;
+        }
+        let suffix = &key[GRAPH_PREFIX.len()..];
+        let [graph, owner] = suffix
+            .as_chunks::<8>()
+            .0
+            .try_into()
+            .ok()
+            .filter(|_| suffix.len() == 16 && value.is_empty())
+            .ok_or_else(|| owner_graph_failure("invalid graph declaration"))?;
+        let (graph, owner) = (u64::from_be_bytes(graph), u64::from_be_bytes(owner));
+        if graph == 0 || owner == 0 {
+            return Err(owner_graph_failure("zero graph declaration identity"));
+        }
+        batch.put(owner_graph_key(owner, graph), []);
+        frontier = Some(suffix.to_vec());
+        copied += 1;
+    }
+    let complete = copied < page;
+    let checkpoint = match (complete, frontier) {
+        (true, _) => vec![0],
+        (false, Some(frontier)) => [&[1][..], &frontier].concat(),
+        (false, None) => return Err(owner_graph_failure("empty upgrade page")),
+    };
+    batch.put(OWNER_GRAPH_UPGRADE, checkpoint);
+    admit(&batch)?;
+    super::catalog_upgrade::commit(db, batch)?;
+    Ok(complete)
 }
 
 fn index_key(owner: u64, stream: u8, name: &str, order: [usize; 4], row: &[u64; 4]) -> Vec<u8> {
@@ -527,6 +637,7 @@ impl<'a> RdfWrite<'a> {
         }
         for graph in graphs {
             batch.put(graph_key(graph, owner), []);
+            batch.put(owner_graph_key(owner, graph), []);
         }
         self.owners.insert(id.to_owned());
         Ok(())
@@ -598,6 +709,7 @@ impl<'a> RdfWrite<'a> {
                 .filter(|id| *id > 0)
                 .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid named graph ID"))?;
             batch.delete(graph_key(graph, owner));
+            batch.delete(owner_graph_key(owner, graph));
         }
         batch.delete(key);
         batch.delete(format!("provenance-rdf:{id}"));
@@ -1165,6 +1277,47 @@ pub(super) fn open_test_db(path: &std::path::Path) -> DB {
 mod tests {
     use super::*;
 
+    /// INVARIANT: the owner graph build commits each page with its frontier, so an
+    /// interrupted open resumes where it stopped and ends with one `rdf:o:` row per
+    /// declaration; a malformed declaration refuses without publishing its page.
+    #[test]
+    fn owner_graph_build_resumes_after_reopen_and_refuses_malformed_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let declarations = [(3, 1), (3, 2), (4, 2), (9, 7)];
+        for (graph, owner) in declarations {
+            db.put(graph_key(graph, owner), []).unwrap();
+        }
+        db.put(OWNER_GRAPH_UPGRADE, [1]).unwrap();
+        let admit = |_: &WriteBatch| Ok(());
+        assert!(!owner_graph_step(&db, 3, &admit).unwrap());
+        let built = |db: &DB| {
+            db.prefix_iterator(OWNER_GRAPH_PREFIX)
+                .map(Result::unwrap)
+                .take_while(|(key, _)| key.starts_with(OWNER_GRAPH_PREFIX))
+                .map(|(key, _)| key.to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(built(&db).len(), 3);
+        drop(db);
+        let db = DB::open_default(dir.path()).unwrap();
+        while !owner_graph_step(&db, 1, &admit).unwrap() {}
+        let mut expected = declarations
+            .map(|(graph, owner)| owner_graph_key(owner, graph))
+            .to_vec();
+        expected.sort();
+        assert_eq!(built(&db), expected);
+        assert_eq!(db.get(OWNER_GRAPH_UPGRADE).unwrap().unwrap(), [0]);
+        db.put(OWNER_GRAPH_UPGRADE, [1]).unwrap();
+        db.put(graph_key(0, 5), []).unwrap();
+        db.delete(owner_graph_key(1, 3)).unwrap();
+        assert_eq!(
+            owner_graph_step(&db, 64, &admit).unwrap_err().code,
+            "STORAGE_FAILURE"
+        );
+        assert!(db.get(owner_graph_key(1, 3)).unwrap().is_none());
+    }
+
     fn reverse_id(db: &DB, bytes: &[u8]) -> u64 {
         let stored = db
             .get_cf(reverse_family(db).unwrap(), reverse_key(bytes))
@@ -1701,7 +1854,14 @@ mod tests {
                 .next()
                 .is_none()
         );
-        for prefix in ["rdf:term:", "rdf:ref:", "rdf:q:", "rdf:g:", "rdf:graph:"] {
+        for prefix in [
+            "rdf:term:",
+            "rdf:ref:",
+            "rdf:q:",
+            "rdf:g:",
+            "rdf:o:",
+            "rdf:graph:",
+        ] {
             assert!(
                 !db.prefix_iterator(prefix)
                     .any(|e| e.unwrap().0.starts_with(prefix.as_bytes()))

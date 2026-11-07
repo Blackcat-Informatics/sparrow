@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 //! Merge physical graph-prefixed cursors without scanning unrelated statement rows.
-//! Keys use the existing persisted SPOG order; native quad IDs retain identity.
+//! A store-wide plan `P` among SPOG, POSG and OSPG maps to the graph-leading order
+//! `P + 3` (GSPO, GPOS, GOSP), whose tail after the graph is `P`'s order. Each graph's
+//! cursor is therefore sorted by `P`, and the heap keeps `P`'s one global order.
 
 use super::*;
 use std::{cmp::Reverse, collections::BinaryHeap, iter::Peekable};
@@ -16,8 +18,14 @@ pub(super) enum RowCursor<'a> {
 }
 
 impl<'a> RowCursor<'a> {
-    pub(super) fn scoped(view: &'a StoredRdfView<'a>, stream: u8, union_default: bool) -> Self {
-        match ScopedRows::new(view, stream, union_default) {
+    pub(super) fn scoped(
+        view: &'a StoredRdfView<'a>,
+        stream: u8,
+        plan: usize,
+        pattern: [Option<GlobalTermId>; 3],
+        union_default: bool,
+    ) -> Self {
+        match ScopedRows::new(view, stream, plan, pattern, union_default) {
             Ok(rows) => Self::Scoped(rows),
             Err(error) => Self::Refused { _cause: error },
         }
@@ -40,7 +48,9 @@ pub(super) struct ScopedRows<'a> {
     cursors: Vec<Peekable<QuadIter<'a>>>,
     heads: BinaryHeap<Reverse<([u64; 4], usize)>>,
     previous: Option<QuadIds<GlobalTermId>>,
-    initial: Option<(u8, bool)>,
+    initial: Option<(u8, [Option<GlobalTermId>; 3], bool)>,
+    /// Store-wide order whose axes key the heap; its graph-leading twin is `plan + 3`.
+    plan: usize,
     admission: Reservation,
 }
 
@@ -48,20 +58,27 @@ impl<'a> ScopedRows<'a> {
     fn new(
         view: &'a StoredRdfView<'a>,
         stream: u8,
+        plan: usize,
+        pattern: [Option<GlobalTermId>; 3],
         union_default: bool,
     ) -> Result<Self, ReadError> {
+        debug_assert!(
+            plan < 3,
+            "store-wide plans precede their graph-leading twins"
+        );
         Ok(Self {
             view,
             cursors: Vec::new(),
             heads: BinaryHeap::new(),
             previous: None,
-            initial: Some((stream, union_default)),
+            initial: Some((stream, pattern, union_default)),
+            plan,
             admission: view.budget.reserve(512)?,
         })
     }
 
     fn initialize(&mut self) -> Result<(), ReadError> {
-        let Some((stream, union_default)) = self.initial.take() else {
+        let Some((stream, pattern, union_default)) = self.initial.take() else {
             return Ok(());
         };
         let view = self.view;
@@ -69,13 +86,13 @@ impl<'a> ScopedRows<'a> {
             return Ok(());
         }
         for graph in view.graph_rows() {
-            // GSPO is the existing graph-leading index. Its tail is SPO order,
-            // so a heap can retain the original global order in O(graphs) space.
+            // The graph-leading twin seeks the graph, then the bound terms in the plan's
+            // order, so a heap retains the global order in O(graphs) space.
             let mut cursor = view
                 .physical_rows(
                     stream,
-                    3,
-                    [None; 3],
+                    self.plan + 3,
+                    pattern,
                     GraphMatch::Named(graph),
                     union_default,
                 )
@@ -140,12 +157,13 @@ impl<'a> ScopedRows<'a> {
 
     fn push_head(&mut self, index: usize) {
         if let Some(row) = self.cursors[index].peek() {
-            let key = [
+            let fields = [
                 ordinal(row.s),
                 ordinal(row.p),
                 ordinal(row.o),
                 row.g.map_or(0, ordinal),
             ];
+            let key = rdf_index::ORDERS[self.plan].1.map(|axis| fields[axis]);
             self.heads.push(Reverse((key, index)));
         }
     }

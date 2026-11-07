@@ -156,6 +156,20 @@ fingerprints = []
 names = ['^(copy_fallback_upgrade_pager|decode_metadata_graph_elsewhere|append_fallback_triples_elsewhere)$']
 
 [[job]]
+id = "owner-graph-index"
+summary = "One RDF writer puts and deletes every rdf:g graph declaration together with its rdf:o owner-to-graph mirror in the same batch. One startup job fences older writers into the owner-graph families and builds the mirror from existing declaration keys in resumable pages, covering privately prepared graphs. Scoped views enumerate graphs from the mirror and merge graph-leading twins of the store-wide plan through the one ScopedRows heap."
+home = "sparrow_core::storage::rdf_index::owner_graph_key"
+entry_points = ["sparrow_core::storage::rdf_index::upgrade_owner_graphs", "sparrow_core::storage::rdf_index::owner_graph_step", "sparrow_core::storage::writer_format::enable_owner_graphs", "sparrow_core::storage::rdf_view::StoredRdfView::owner_graphs", "sparrow_core::storage::rdf_view::sparse::ScopedRows::new", "sparrow_core::query::QueryScope::restricts_membership"]
+spec = "docs/interfaces.md: owner-to-graph index (store format); docs/architecture.md section 7."
+vectors = ["crates/sparrow-core/src/storage/rdf_index.rs", "crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(owner_graph_rows_elsewhere|scan_graph_declarations_for_scope|copy_owner_graph_pager)$']
+
+[[job]]
 id = "native-correlation-recipes"
 summary = "One fixed recipe owner normalizes selector parameters, fingerprints the recipe and supplies typed substitutions to native governed SPARQL; the original snapshot, result leases and interpretation coverage remain shared. No local relationship evaluator or interpolated user query text."
 home = "sparrow_core::storage::correlation::prepare"

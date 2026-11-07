@@ -133,6 +133,17 @@ impl QueryScope {
             + usize::from(!self.diagnostics.is_empty()) * 1024
     }
 
+    /// Whether membership is narrower than every retained occurrence: a selection, a pin,
+    /// or a live scope with any source, receipt-time or diagnostic filter.
+    pub(crate) fn restricts_membership(&self) -> bool {
+        !matches!(self.selection, QuerySelection::Live)
+            || self.source.is_some()
+            || self.sources.is_some()
+            || !self.diagnostics.is_empty()
+            || self.received_from != 0
+            || self.received_before != u64::MAX
+    }
+
     pub(crate) fn matches_source(&self, source: &str) -> bool {
         self.source.as_deref().is_none_or(|id| id == source)
             && self

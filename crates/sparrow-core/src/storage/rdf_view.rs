@@ -112,6 +112,9 @@ pub struct StoredRdfView<'a> {
     snapshot: Snapshot<'a>,
     reverse: &'a rocksdb::ColumnFamily,
     owners: BTreeSet<u64>,
+    /// Membership narrower than the whole live store: patterns are evaluated per graph
+    /// of `owners`, enumerated from the owner-to-graph index, so cost follows the scope.
+    scoped: bool,
     budget: Arc<Budget>,
     _scope: Arc<Reservation>,
     terms: u64,
@@ -234,6 +237,7 @@ impl<'a> StoredRdfView<'a> {
             snapshot: db.snapshot(),
             reverse: rdf_index::reverse_family(db).map_err(|e| budget.fail(e))?,
             owners: BTreeSet::new(),
+            scoped: false,
             budget,
             _scope: scope,
             terms: 0,
@@ -397,11 +401,15 @@ impl<'a> StoredRdfView<'a> {
         pattern: [Option<GlobalTermId>; 3],
         graph: GraphMatch<GlobalTermId>,
     ) -> impl Iterator<Item = QuadIds<GlobalTermId>> + '_ {
-        let cursor = |plan, graph, union_default| {
-            if pattern.iter().all(Option::is_none) && !matches!(graph, GraphMatch::Named(_)) {
-                RowCursor::scoped(self, stream, union_default)
-            } else {
+        let cursor = |plan: usize, graph, union_default| {
+            let unbound = pattern.iter().all(Option::is_none);
+            if matches!(graph, GraphMatch::Named(_)) || !(unbound || (self.scoped && plan < 3)) {
                 RowCursor::Indexed(self.physical_rows(stream, plan, pattern, graph, union_default))
+            } else {
+                // Every unbound pattern, and in a scoped view every bound one, merges one
+                // graph-leading cursor per in-scope graph in the store-wide plan's order.
+                let plan = if unbound { 0 } else { plan };
+                RowCursor::scoped(self, stream, plan, pattern, union_default)
             }
         };
         let first = cursor(plan, graph, matches!(graph, GraphMatch::Default));
@@ -457,18 +465,64 @@ impl<'a> StoredRdfView<'a> {
         }
     }
 
+    /// A scoped view walks its owners' `rdf:o:` rows; the whole live store walks every
+    /// `rdf:g:` declaration. Both charge one request and row visit per row read.
     fn graph_rows(&self) -> GraphIter<'_> {
         let reservation = self.budget.reserve(4096);
-        let iterator = reservation.as_ref().ok().map(|_| {
+        let iterator = (reservation.is_ok() && !self.scoped).then(|| {
             self.snapshot
                 .iterator(IteratorMode::From(b"rdf:g:", Direction::Forward))
         });
         GraphIter {
             view: self,
             iterator,
+            owned: self.scoped.then_some(OwnedGraphs::Pending),
             previous: None,
             _reservation: reservation.ok(),
         }
+    }
+
+    /// Distinct graphs declared by this view's owners, in global graph order.
+    fn owner_graphs(&self) -> Result<(BTreeSet<u64>, Reservation), ReadError> {
+        let mut reservation = self.budget.reserve(4096)?;
+        let mut graphs = BTreeSet::new();
+        for owner in &self.owners {
+            let mut prefix = rdf_index::OWNER_GRAPH_PREFIX.to_vec();
+            prefix.extend_from_slice(&owner.to_be_bytes());
+            let mut rows = self
+                .snapshot
+                .iterator(IteratorMode::From(&prefix, Direction::Forward));
+            // Charge each advance, including the terminal probe, before it reads.
+            loop {
+                self.budget.request(64, true)?;
+                let Some(row) = rows.next() else {
+                    break;
+                };
+                let (key, value) = row.map_err(|e| self.budget.fail(e.into()))?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let graph = <[u8; 8]>::try_from(&key[prefix.len()..])
+                    .ok()
+                    .filter(|_| value.is_empty())
+                    .map(u64::from_be_bytes)
+                    .ok_or_else(|| {
+                        self.budget.fail(Error::new(
+                            "STORAGE_FAILURE",
+                            "invalid RDF owner graph declaration",
+                        ))
+                    })?;
+                if graph == 0 {
+                    return Err(self
+                        .budget
+                        .fail(Error::new("STORAGE_FAILURE", "zero RDF graph identity")));
+                }
+                if graphs.insert(graph) {
+                    reservation.grow(64)?;
+                }
+            }
+        }
+        Ok((graphs, reservation))
     }
 }
 
@@ -559,13 +613,51 @@ impl Iterator for QuadIter<'_> {
 struct GraphIter<'a> {
     view: &'a StoredRdfView<'a>,
     iterator: Option<DBIteratorWithThreadMode<'a, DB>>,
+    owned: Option<OwnedGraphs>,
     previous: Option<GlobalTermId>,
     _reservation: Option<Reservation>,
+}
+
+/// A scoped view's graphs, enumerated on first use so an unused iterator reads nothing.
+enum OwnedGraphs {
+    Pending,
+    Ready {
+        graphs: std::collections::btree_set::IntoIter<u64>,
+        _reservation: Reservation,
+    },
+}
+
+impl GraphIter<'_> {
+    fn next_owned(&mut self) -> Option<GlobalTermId> {
+        let owned = self.owned.as_mut()?;
+        if matches!(owned, OwnedGraphs::Pending) {
+            let (graphs, reservation) = self.view.owner_graphs().ok()?;
+            *owned = OwnedGraphs::Ready {
+                graphs: graphs.into_iter(),
+                _reservation: reservation,
+            };
+        }
+        let OwnedGraphs::Ready { graphs, .. } = owned else {
+            unreachable!("owner graphs were enumerated above")
+        };
+        let graph = match global(graphs.next()?) {
+            Ok(id) => id,
+            Err(e) => {
+                self.view.budget.fail(e);
+                return None;
+            }
+        };
+        self.view.verified_forward(graph).ok()?;
+        Some(graph)
+    }
 }
 
 impl Iterator for GraphIter<'_> {
     type Item = GlobalTermId;
     fn next(&mut self) -> Option<Self::Item> {
+        if self.owned.is_some() {
+            return self.next_owned();
+        }
         loop {
             self.view.budget.request(64, true).ok()?;
             let (key, value) = match self.iterator.as_mut()?.next()? {
@@ -839,6 +931,7 @@ impl Store {
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new(&db, limits, &[])?;
+        view.scoped = true;
         let mut scope_bytes = 4096 + ids.len() as u64 * 2048;
         Arc::get_mut(&mut view._scope)
             .expect("scope capture precedes owned query admission")

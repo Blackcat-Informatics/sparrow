@@ -536,6 +536,21 @@ archive and intake family by 55 and keeps its switches, so older binaries refuse
 the store rather than publish graphs without the fallback facts. The service
 stays unavailable until the backfill finishes.
 
+### Owner-to-graph index (store format)
+
+Every graph declaration has an owner-to-graph row, written and deleted with it,
+which scoped SPARQL reads use to find their graphs (see the cost rule under
+SPARQL below). Opening a store written before this index first moves the store
+format to an owner-graph writer family, `sparrow.store/187` to `/241`, which lifts
+each event fallback family by 55 and keeps its log time, archive and intake
+switches, so older binaries refuse the store. A resumable startup job
+(`owner-graph-index-upgrade`) then copies every existing declaration in durable
+pages of 65,536, each committed with its frontier, so a restart resumes after the
+last committed page. It reads only declaration keys, so a graph prepared by an
+unfinished staged import is covered before its publication. The first open reads
+each declaration once and writes one small row for it; the service stays
+unavailable until the build finishes. No wire schema changes.
+
 ## 1. Common types and defaults
 
 | Type | Contract |
@@ -921,6 +936,16 @@ All source and native governor ceilings remain unchanged. Terminal iterator
 advances are admitted too; these counters describe admitted work, not physical
 RocksDB block reads or process RSS. Unknown/missing source profiles refuse at the
 agent boundary instead of claiming the current law.
+
+A SPARQL, SPARQL-explain or correlation request's cost follows its scope's graphs
+and rows, not the store's size. When the scope is narrower than the whole live
+store (a `selection` or `pin` scope, or a `live` scope with any source,
+receipt-time or diagnostic filter), the read enumerates the graphs of the captured
+owners from the owner-to-graph index and reads only those graphs' rows, in the
+same global order and with the same union-default deduplication as the
+store-wide plan, so answers and certainty do not change. Requests and row visits
+are charged under the same law. A request over the whole live store reads the
+store's rows by definition. The host ceilings are unchanged.
 
 Record and empty-artifact timelines share one native borrowed iterator. It
 checks key/identity widths before copying or loading a catalog and preserves

@@ -212,6 +212,84 @@ const FALLBACK: [[&[u8]; 11]; 5] = [
     FALLBACK_INTAKE_ARCHIVE,
 ];
 
+// Owner-to-graph index: older binaries cannot publish or retire a graph declaration
+// without its `rdf:o:` mirror. Each family lifts one event fallback family by 55,
+// keeping its log time, archive and intake switches.
+const OWNER_GRAPH_TRACING: [&[u8]; 11] = [
+    b"sparrow.store/187",
+    b"sparrow.store/188",
+    b"sparrow.store/189",
+    b"sparrow.store/190",
+    b"sparrow.store/191",
+    b"sparrow.store/192",
+    b"sparrow.store/193",
+    b"sparrow.store/194",
+    b"sparrow.store/195",
+    b"sparrow.store/196",
+    b"sparrow.store/197",
+];
+const OWNER_GRAPH_LOG_TIME: [&[u8]; 11] = [
+    b"sparrow.store/198",
+    b"sparrow.store/199",
+    b"sparrow.store/200",
+    b"sparrow.store/201",
+    b"sparrow.store/202",
+    b"sparrow.store/203",
+    b"sparrow.store/204",
+    b"sparrow.store/205",
+    b"sparrow.store/206",
+    b"sparrow.store/207",
+    b"sparrow.store/208",
+];
+const OWNER_GRAPH_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/209",
+    b"sparrow.store/210",
+    b"sparrow.store/211",
+    b"sparrow.store/212",
+    b"sparrow.store/213",
+    b"sparrow.store/214",
+    b"sparrow.store/215",
+    b"sparrow.store/216",
+    b"sparrow.store/217",
+    b"sparrow.store/218",
+    b"sparrow.store/219",
+];
+const OWNER_GRAPH_INTAKE: [&[u8]; 11] = [
+    b"sparrow.store/220",
+    b"sparrow.store/221",
+    b"sparrow.store/222",
+    b"sparrow.store/223",
+    b"sparrow.store/224",
+    b"sparrow.store/225",
+    b"sparrow.store/226",
+    b"sparrow.store/227",
+    b"sparrow.store/228",
+    b"sparrow.store/229",
+    b"sparrow.store/230",
+];
+const OWNER_GRAPH_INTAKE_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/231",
+    b"sparrow.store/232",
+    b"sparrow.store/233",
+    b"sparrow.store/234",
+    b"sparrow.store/235",
+    b"sparrow.store/236",
+    b"sparrow.store/237",
+    b"sparrow.store/238",
+    b"sparrow.store/239",
+    b"sparrow.store/240",
+    b"sparrow.store/241",
+];
+
+/// Families the owner graph fence lifts, in the order of their lifted counterparts.
+const OWNER_GRAPH: [[&[u8]; 11]; 5] = [
+    OWNER_GRAPH_TRACING,
+    OWNER_GRAPH_LOG_TIME,
+    OWNER_GRAPH_ARCHIVE,
+    OWNER_GRAPH_INTAKE,
+    OWNER_GRAPH_INTAKE_ARCHIVE,
+];
+
 fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize, usize)> {
     families
         .iter()
@@ -224,25 +302,55 @@ fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize
         })
 }
 
-/// The pre-fallback identity a fallback-fenced format lifts; other formats are unchanged.
+/// The pre-fallback identity an owner-graph or fallback-fenced format lifts; other formats
+/// are unchanged.
 fn lower(format: &[u8]) -> &[u8] {
+    let format =
+        position(&OWNER_GRAPH, format).map_or(format, |(family, index)| FALLBACK[family][index]);
     position(&FALLBACK, format).map_or(format, |(family, index)| LIFTED[family][index])
 }
 
-/// Re-apply the fallback fence to a transition computed on the lowered identity.
+/// Re-apply the fallback and owner graph fences to a transition computed on the lowered
+/// identity.
 fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
-    if !has_event_fallback(current) {
-        return Ok(next);
+    let next = if has_event_fallback(current) {
+        enable_event_fallback(next)?
+    } else {
+        next
+    };
+    if has_owner_graphs(current) {
+        enable_owner_graphs(next)
+    } else {
+        Ok(next)
     }
-    enable_event_fallback(next)
 }
 
 pub(super) fn has_event_fallback(format: &[u8]) -> bool {
-    position(&FALLBACK, format).is_some()
+    position(&FALLBACK, format).is_some() || has_owner_graphs(format)
+}
+
+pub(super) fn has_owner_graphs(format: &[u8]) -> bool {
+    position(&OWNER_GRAPH, format).is_some()
+}
+
+/// Fence a current event fallback family for the owner-to-graph index; idempotent.
+pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error> {
+    position(&OWNER_GRAPH, format)
+        .or_else(|| position(&FALLBACK, format))
+        .map(|(family, index)| OWNER_GRAPH[family][index])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "owner graph index requires an event fallback authority family",
+            )
+        })
 }
 
 /// Fence a current tracing-or-later family for receipt-time fallback RDF; idempotent.
 pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&OWNER_GRAPH, format) {
+        return Ok(OWNER_GRAPH[family][index]);
+    }
     if let Some((family, index)) = position(&FALLBACK, format) {
         return Ok(FALLBACK[family][index]);
     }
@@ -268,6 +376,7 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(INTAKE.iter())
         .chain(INTAKE_ARCHIVE.iter())
         .chain(FALLBACK.iter().flatten())
+        .chain(OWNER_GRAPH.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -413,6 +522,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
             .chain(INTAKE.iter())
             .chain(INTAKE_ARCHIVE.iter())
             .chain(FALLBACK.iter().flatten())
+            .chain(OWNER_GRAPH.iter().flatten())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -496,6 +606,11 @@ mod tests {
             FALLBACK_ARCHIVE,
             FALLBACK_INTAKE,
             FALLBACK_INTAKE_ARCHIVE,
+            OWNER_GRAPH_TRACING,
+            OWNER_GRAPH_LOG_TIME,
+            OWNER_GRAPH_ARCHIVE,
+            OWNER_GRAPH_INTAKE,
+            OWNER_GRAPH_INTAKE_ARCHIVE,
         ] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
@@ -610,6 +725,41 @@ mod tests {
                     INTAKE_ARCHIVE
                 ]
                 .iter()
+                .all(|family| !family.contains(identity))
+            );
+        }
+        // The owner graph fence lifts every fallback family, keeps its switches and the
+        // fallback fence, and no older binary knows its identities.
+        for index in 0..BASE.len() {
+            for (fallback, owner) in FALLBACK.iter().zip(OWNER_GRAPH.iter()) {
+                assert_eq!(enable_owner_graphs(fallback[index]).unwrap(), owner[index]);
+                assert_eq!(enable_owner_graphs(owner[index]).unwrap(), owner[index]);
+                assert_eq!(enable_event_fallback(owner[index]).unwrap(), owner[index]);
+                assert!(has_owner_graphs(owner[index]) && has_event_fallback(owner[index]));
+                assert!(!has_owner_graphs(fallback[index]));
+            }
+            assert!(enable_owner_graphs(TRACING[index]).is_err());
+            assert_eq!(
+                enable_log_time(OWNER_GRAPH_TRACING[index]).unwrap(),
+                OWNER_GRAPH_LOG_TIME[index]
+            );
+            assert_eq!(
+                enable_archive(OWNER_GRAPH_LOG_TIME[index]).unwrap(),
+                OWNER_GRAPH_ARCHIVE[index]
+            );
+            assert_eq!(
+                enable_intake(OWNER_GRAPH_ARCHIVE[index]).unwrap(),
+                OWNER_GRAPH_INTAKE_ARCHIVE[index]
+            );
+        }
+        for identity in OWNER_GRAPH.iter().flatten() {
+            assert!(
+                [
+                    BASE, RDF, ALL_RDF, PROVENANCE, TRACING, LOG_TIME, ARCHIVE, INTAKE
+                ]
+                .iter()
+                .chain(LIFTED.iter())
+                .chain(FALLBACK.iter())
                 .all(|family| !family.contains(identity))
             );
         }

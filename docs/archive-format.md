@@ -256,7 +256,7 @@ in-flight intent's end is refused with `STORAGE_FAILURE`. The message names
 both positions and says to correct the clock. Without this guard, a backwards
 clock step could publish evidence the archive would never cover.
 
-Archiving fences the store format with the `sparrow.store/99` to `/109` family, or `/121` to `/131` once the store is also fenced for intake provenance. A store fenced for receipt-time event fallback RDF (schema 69) uses `/154` to `/164` and `/176` to `/186` respectively.
+Archiving fences the store format with the `sparrow.store/99` to `/109` family, or `/121` to `/131` once the store is also fenced for intake provenance. A store fenced for receipt-time event fallback RDF (schema 69) uses `/154` to `/164` and `/176` to `/186` respectively. A store that also carries the owner-to-graph index uses `/209` to `/219` and `/231` to `/241` respectively.
 It sits above every earlier authority family and keeps the underlying authority
 through later transitions. It includes the log time law, so stores in this
 family always carry that law marker. Binaries without the gate do not know these
