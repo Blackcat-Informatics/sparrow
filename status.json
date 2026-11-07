@@ -1,0 +1,80 @@
+{
+  "issue": 10,
+  "pr_number": 33,
+  "branch": "paudley/10-add-a-group-accessible-ingest-only-unix",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/10-add-a-group-accessible-ingest-only-unix/.stage/add-a-group-accessible-ingest-only-unix",
+  "observed_at": "2026-11-07T00:38:26.143569+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/10-add-a-group-accessible-ingest-only-unix/.stage/add-a-group-accessible-ingest-only-unix/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/10-add-a-group-accessible-ingest-only-unix/.stage/add-a-group-accessible-ingest-only-unix/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/10-add-a-group-accessible-ingest-only-unix/.stage/add-a-group-accessible-ingest-only-unix/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/10-add-a-group-accessible-ingest-only-unix/.stage/add-a-group-accessible-ingest-only-unix/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/10-add-a-group-accessible-ingest-only-unix/.stage/add-a-group-accessible-ingest-only-unix/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 33,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Add a group-accessible ingest-only Unix socket with peer-credential provenance",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/33",
+    "baseRefName": "main",
+    "baseRefOid": "c11b747e2d3e23aad13ffb396b4a30b04b63f74c",
+    "headRefName": "paudley/10-add-a-group-accessible-ingest-only-unix",
+    "headRefOid": "6c50ff24f218a1ef0c80d14fb8be3a647f2b308c",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/17/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "6c50ff24f218a1ef0c80d14fb8be3a647f2b308c",
+    "branch": "paudley/10-add-a-group-accessible-ingest-only-unix",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 33,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #33 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "missing_artifacts": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
