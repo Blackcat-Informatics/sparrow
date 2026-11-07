@@ -1,0 +1,80 @@
+{
+  "issue": 13,
+  "pr_number": 35,
+  "branch": "paudley/13-bound-sparql-work-by-the-request-s",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/13-bound-sparql-work-by-the-request-s/.stage/bound-sparql-work-by-the-request-s",
+  "observed_at": "2026-11-07T05:54:50.252252+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/13-bound-sparql-work-by-the-request-s/.stage/bound-sparql-work-by-the-request-s/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/13-bound-sparql-work-by-the-request-s/.stage/bound-sparql-work-by-the-request-s/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/13-bound-sparql-work-by-the-request-s/.stage/bound-sparql-work-by-the-request-s/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/13-bound-sparql-work-by-the-request-s/.stage/bound-sparql-work-by-the-request-s/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/13-bound-sparql-work-by-the-request-s/.stage/bound-sparql-work-by-the-request-s/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 35,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Bound scoped SPARQL work by the request's scope, not the store (#13)",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/35",
+    "baseRefName": "main",
+    "baseRefOid": "8e7a19117ee9e30d91153bde1b21aea917e785b0",
+    "headRefName": "paudley/13-bound-sparql-work-by-the-request-s",
+    "headRefOid": "9e71b6308bfc2b9cd215e5f83c856c9cbbb7f80d",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/21/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "9e71b6308bfc2b9cd215e5f83c856c9cbbb7f80d",
+    "branch": "paudley/13-bound-sparql-work-by-the-request-s",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 35,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #35 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "missing_artifacts": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
