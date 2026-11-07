@@ -1421,6 +1421,9 @@ impl Store {
         provenance_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         tracing_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         event_fallback_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
+        rdf_index::upgrade_owner_graphs(&db, &|batch| {
+            artifact_rdf::admit(&db, config.disk_budget, config.maintenance_reserve, batch)
+        })?;
         let archive = archive::open(&db, config.archive.as_ref())?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(

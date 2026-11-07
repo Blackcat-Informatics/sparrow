@@ -339,6 +339,7 @@ impl Store {
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new_cancellable(&db, limits, &[], cancellation.clone())?;
+        view.scoped = scope.restricts_membership();
         if text {
             Arc::get_mut(&mut view._scope)
                 .expect("text setup precedes native owned-query admission")

@@ -525,6 +525,23 @@ annotation rows. These are storage encodings, not changes to RDF semantics.
 Measure their write and space costs; subsequent physical changes must preserve
 the view contract and qualify against the same corpus.
 
+Each graph declaration `rdf:g:<graph><owner>` has an owner-to-graph mirror
+`rdf:o:<owner><graph>`. The same writer puts and deletes both rows in one batch,
+so ingest, retirement and pin expiry keep them equal. A read whose scope is
+narrower than the whole live store (a selection, a pin, or a live scope with a
+source, receipt-time or diagnostic filter) evaluates every pattern per in-scope
+graph. It enumerates the graphs from `rdf:o:` for each captured owner, then seeks
+each graph in the graph-leading twin of the store-wide plan: `GSPO` for `SPOG`,
+`GPOS` for `POSG` and `GOSP` for `OSPG`. The twin's tail after the graph is the
+store-wide order, so a heap merges the per-graph cursors into that one global
+order and keeps union-default deduplication. Unbound patterns and named-graph
+enumeration use the same owner walk. Requests and row visits are charged as on
+the store-wide plan, but only rows of in-scope graphs are read, so a scoped
+read's cost follows its scope. A read over the whole live store keeps the
+store-wide plan, whose cost is the store's. Opening a store written before the
+mirror builds it from the existing declarations in resumable pages after
+fencing older writers.
+
 Use PurRDF's governed prepared queries and fail-aware execution boundary.
 Storage faults refuse publication of an apparently successful prefix. Governor
 outcomes preserve the engine's certainty certificate: certain answers,
