@@ -360,6 +360,7 @@ mod tests {
                 super::super::hex::encode(super::super::blake3::hash(b"").as_bytes())
             ),
             record_ids: Vec::new(),
+            intake: None,
             chunks: Vec::new(),
             evicted: false,
         }

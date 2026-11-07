@@ -1691,6 +1691,244 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
         .await;
 }
 
+/// Create a setgid 2750 ingest directory with the test user's own group and add the
+/// ingest socket keys to `config`. Returns the socket path and its group.
+fn configure_ingest_socket(
+    root: &Path,
+    config: &Path,
+    max_connections: usize,
+) -> (std::path::PathBuf, u32) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let directory = root.join("ingest");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o2750)).unwrap();
+    let gid = std::fs::metadata(&directory).unwrap().gid();
+    let socket = directory.join("ingest.sock");
+    let base = std::fs::read_to_string(config).unwrap();
+    std::fs::write(
+        config,
+        format!(
+            "ingest_socket_path = \"{}\"\ningest_socket_gid = {gid}\nmax_ingest_connections = {max_connections}\n{base}",
+            socket.display()
+        ),
+    )
+    .unwrap();
+    (socket, gid)
+}
+
+/// INVARIANT: evidence accepted on the ingest socket carries the caller's kernel-reported
+/// uid, gid and pid in its typed intake, its CLI rendering and its metadata graphs, and
+/// the socket inherits the configured group with mode 0660.
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_socket_records_peer_credentials_in_provenance() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (ingest, gid) = configure_ingest_socket(dir.path(), &config, 4);
+            let daemon = start(&config, &socket).await;
+            let metadata = std::fs::metadata(&ingest).unwrap();
+            assert_eq!((metadata.gid(), metadata.permissions().mode() & 0o7777), (gid, 0o660));
+
+            let producer = sparrow_client::Client::connect(&ingest).await.unwrap();
+            let artifact = producer
+                .ingest("peer-ingest", "peer.ingest", wire::Format::Log, b"from a peer\n")
+                .await
+                .unwrap();
+            let mut event = delivery_event("from a peer");
+            event.sequence = 1;
+            let events = producer
+                .events(&sparrow_client::EventBatch {
+                    request_id: "peer-events".into(),
+                    source: "peer.events".into(),
+                    client_instance: [5; 16],
+                    events: vec![event],
+                })
+                .await
+                .unwrap();
+            let unidentified = sparrow_client::Client::connect(&socket)
+                .await
+                .unwrap()
+                .ingest("private-ingest", "private", wire::Format::Log, b"owner\n")
+                .await
+                .unwrap();
+            let expected = (
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+                std::process::id(),
+            );
+            let store = artifact.store_id.clone();
+            let private = connect(&socket).await.unwrap();
+            let typed = |id: String| {
+                let mut request = private.client.record_get_request();
+                let mut reference = request.get().init_record();
+                reference.set_store_id(&store);
+                reference.set_id(&id);
+                async move {
+                    let response = request.send().promise.await.unwrap();
+                    let record = rpc_ok(response.get().unwrap().get_result().unwrap());
+                    match record.get_intake().unwrap().which().unwrap() {
+                        wire::optional_intake::Absent(()) => None,
+                        wire::optional_intake::Value(intake) => {
+                            let intake = intake.unwrap();
+                            assert_eq!(
+                                intake.get_endpoint().unwrap(),
+                                wire::IntakeEndpoint::IngestSocket
+                            );
+                            Some((intake.get_uid(), intake.get_gid(), intake.get_pid()))
+                        }
+                    }
+                }
+            };
+            assert_eq!(typed(unidentified.record_ids[0].clone()).await, None);
+            let (uid, gid, pid) = (
+                expected.0.to_string(),
+                expected.1.to_string(),
+                expected.2.to_string(),
+            );
+            for (index, receipt) in [&artifact, &events].into_iter().enumerate() {
+                let record = receipt.record_ids[0].clone();
+                assert_eq!(typed(record.clone()).await, Some(expected));
+                let context = cli(
+                    &socket,
+                    &["context", &store, &record, "--before", "0", "--after", "0"],
+                );
+                let intake = &context["anchor"]["intake"];
+                assert_eq!(intake["endpoint"].as_str(), Some("ingest-socket"));
+                assert_eq!(
+                    [&intake["uid"], &intake["gid"], &intake["pid"]].map(|value| value.as_str()),
+                    [Some(uid.as_str()), Some(gid.as_str()), Some(pid.as_str())]
+                );
+                // Selecting the artifact expands to its record: the artifact graph and the
+                // record's metadata graph each carry the caller, once.
+                let request = purrdf_lex::json::Object::new()
+                    .with("store_id", store.clone())
+                    .with(
+                        "scope",
+                        purrdf_lex::json::Object::new()
+                            .with("kind", "selection")
+                            .with("store_id", store.clone())
+                            .with("artifact_ids", vec![receipt.id.clone()]),
+                    )
+                    .with(
+                        "layers",
+                        purrdf_lex::json::Object::new()
+                            .with("metadata", true)
+                            .with("diagnostic", false)
+                            .with("content", false),
+                    )
+                    .with(
+                        "query",
+                        "PREFIX sp: <urn:sparrow:vocab:> SELECT ?e ?endpoint ?uid ?gid ?pid WHERE { ?e sp:intakeEndpoint ?endpoint ; sp:peerUid ?uid ; sp:peerGid ?gid ; sp:peerPid ?pid }",
+                    );
+                let path = dir.path().join(format!("peer-{index}.json"));
+                std::fs::write(&path, purrdf_lex::json::write_compact(&request.into())).unwrap();
+                let result = cli(&socket, &["sparql", path.to_str().unwrap()]);
+                let rows = result["rows"]["native_result"]["results"]["bindings"]
+                    .as_array()
+                    .unwrap();
+                let mut subjects: Vec<_> = rows
+                    .iter()
+                    .map(|row| row["e"]["value"].as_str().unwrap().to_owned())
+                    .collect();
+                subjects.sort();
+                let mut expected_subjects =
+                    vec![format!("urn:sparrow:{}", receipt.id), format!("urn:sparrow:{record}")];
+                expected_subjects.sort();
+                assert_eq!(subjects, expected_subjects, "{result:?}");
+                for row in rows {
+                    assert_eq!(row["endpoint"]["value"].as_str(), Some("ingest-socket"));
+                    for (name, value) in [("uid", &uid), ("gid", &gid), ("pid", &pid)] {
+                        assert_eq!(row[name]["value"].as_str(), Some(value.as_str()));
+                        assert_eq!(
+                            row[name]["datatype"].as_str(),
+                            Some("http://www.w3.org/2001/XMLSchema#nonNegativeInteger")
+                        );
+                    }
+                }
+            }
+            drop(daemon);
+        })
+        .await;
+}
+
+/// INVARIANT: the ingest socket admits producer operations only. Reads and administration
+/// return PERMISSION_DENIED, and it offers no CHAP session (UNSUPPORTED).
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_socket_refuses_reads_and_administration() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (ingest, _) = configure_ingest_socket(dir.path(), &config, 4);
+            let daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&ingest).await.unwrap();
+            let gate = producer.capability();
+            let status = gate.status_request().send().promise.await.unwrap();
+            let search = gate.records_search_request().send().promise.await.unwrap();
+            let pin = gate.pin_request().send().promise.await.unwrap();
+            let put = gate.watch_put_request().send().promise.await.unwrap();
+            let read = gate.bytes_read_request().send().promise.await.unwrap();
+            for code in [
+                rpc_error_code(status.get().unwrap().get_result().unwrap()),
+                rpc_error_code(search.get().unwrap().get_result().unwrap()),
+                rpc_error_code(pin.get().unwrap().get_result().unwrap()),
+                rpc_error_code(put.get().unwrap().get_result().unwrap()),
+                rpc_error_code(read.get().unwrap().get_result().unwrap()),
+            ] {
+                assert_eq!(code, "PERMISSION_DENIED");
+            }
+            let mut authenticate = gate.authenticate_request();
+            authenticate.get().set_response(&[0; 32]);
+            let authenticate = authenticate.send().promise.await.unwrap();
+            assert_eq!(
+                rpc_error_code(authenticate.get().unwrap().get_result().unwrap()),
+                "UNSUPPORTED"
+            );
+            assert_eq!(
+                sparrow_server::run_cli(&producer, &["status".into()])
+                    .await
+                    .unwrap_err()
+                    .code,
+                "PERMISSION_DENIED"
+            );
+            drop(daemon);
+        })
+        .await;
+}
+
+/// INVARIANT: ingest connections have their own ceiling: over it a producer connection is
+/// dropped and counted, while a private-socket CLI connection still succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_connections_have_their_own_ceiling() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (ingest, gid) = configure_ingest_socket(dir.path(), &config, 1);
+            let daemon = start(&config, &socket).await;
+            let held = sparrow_client::Client::connect(&ingest).await.unwrap();
+            assert!(sparrow_client::Client::connect(&ingest).await.is_err());
+            let status = cli(&socket, &["status"]);
+            let reported = &status["ingest_socket"];
+            assert_eq!(reported["path"].as_str(), ingest.to_str());
+            assert_eq!(reported["gid"].as_u64(), Some(u64::from(gid)));
+            assert_eq!(reported["max_connections"].as_u64(), Some(1));
+            assert_eq!(reported["active_connections"].as_u64(), Some(1));
+            assert_eq!(reported["refused_connections"].as_str(), Some("1"));
+            drop(held);
+            drop(daemon);
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix() {
     tokio::task::LocalSet::new()

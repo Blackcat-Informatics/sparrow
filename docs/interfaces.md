@@ -523,7 +523,7 @@ they do not specify their generated wire grammar.
 | Completed-file quiet interval | 30 seconds, configurable per watch; observed reopen/write activity postpones consumption. |
 | Pin duration | Required on every create/add/renew operation; no permanent or implicit pin. |
 | Disk capacity | An explicit deployment budget and maintenance reserve are required. |
-| RPC binding | Private Unix-domain socket for the daemon's group: store directory mode 0710, socket mode 0660, so a group member can connect but not list or read the store (2026-11-01); public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08. Anonymous TCP peers may only discover, ingest and import; every other operation requires a shared-secret CHAP session (2026-10-27). |
+| RPC binding | Private Unix-domain socket for the daemon's group: store directory mode 0710, socket mode 0660, so a group member can connect but not list or read the store (2026-11-01); public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08. Anonymous TCP peers may only discover, ingest and import; every other operation requires a shared-secret CHAP session (2026-10-27). An optional group-accessible ingest-only Unix socket (`ingest_socket_path`, schema 68, issue #10) admits members of `ingest_socket_gid` to the same producer operations and records each caller's `SO_PEERCRED` uid, gid and pid in provenance. |
 | Pagination | Default 200 items, maximum 1,000, additionally limited by serialized response bytes. |
 | Structured response budget | Default 256 KiB, configurable under a server maximum. |
 | Byte-read chunk | Default 64 KiB; maximum 1 MiB per call. |
@@ -1536,6 +1536,8 @@ Sparrow's vocabulary is `urn:sparrow:vocab:`. Metadata uses `Artifact`, `Record`
 | `service`, `host`, `severity`, `traceId`, `spanId` | Normalized diagnostic strings when available; source spelling remains in the original evidence. |
 | `sourceName` | Exact logical source label on each occurrence and its `Source` entity. |
 | `streamKind` | `producer`, `file-generation`, or `receiver-window`, identifying the native origin represented by a `Stream`. |
+| `intakeEndpoint` | `ingest-socket` on an artifact or record accepted on the ingest socket; absent otherwise (schema 68). |
+| `peerUid`, `peerGid`, `peerPid` | The ingest-socket caller's `SO_PEERCRED` user, group and process IDs as `xsd:nonNegativeInteger` literals, on the artifact graph and each record's metadata graph. |
 
 Schema 55 makes minimal `Source` and `Stream` provenance queryable in the
 metadata layer. The Source IRI is the same identity exposed by `sources_list`.
@@ -1562,6 +1564,13 @@ reference and index writer, then checkpoints atomically. Missing terms, conflict
 origin identities, unsupported metadata stream shapes or insufficient admission
 fail explicitly. The store is served only after both jobs complete. New graph
 publication and retirement maintain an atomic per-owner provenance marker.
+
+Store formats 110–120 (and 121–131 for an archiving store) fence a store for
+intake provenance before it first accepts ingest-socket evidence or begins an
+ingest-socket import, so an older writer refuses the store rather than
+publishing or rewriting evidence without its `intake`, `peerUid`, `peerGid` and
+`peerPid` facts. A store that never served the ingest socket keeps its earlier
+family. Like the archive family, the fence includes the log time law.
 
 Archive manifests and link quads use the same namespace: `ArchiveStore`,
 `ArchiveSegment`, `ArchiveTable` and `QuarantineEntry` classes, and
@@ -1813,6 +1822,25 @@ may call `discover`, `ingest`, `eventsIngest`, `flush` and the import operations
 `status`, returns a typed `UNAUTHENTICATED` failure. An operation added to the
 schema without an explicit admission decision returns Cap'n Proto `unimplemented`.
 The Unix socket serves the complete capability unchanged (rulings 2026-10-27).
+
+The ingest socket (`ingest_socket_path` and `ingest_socket_gid`, schema 68)
+shares this one producer list: anonymous TCP and the ingest socket forward the
+same operations, and an operation added later needs one admission decision.
+The ingest socket refuses every other operation with `PERMISSION_DENIED` and
+refuses `authChallenge` and `authenticate` with `UNSUPPORTED`; it offers no
+CHAP session. On accept the daemon reads the peer's uid, gid and pid; a
+connection without them is refused and logged. Every artifact and record
+accepted on that connection carries `intake`: endpoint `ingest-socket` and
+those three identities, in the typed `Artifact` and `Record`, in the CLI
+`context` and MCP `records_context` rendering (`null`, or
+`{"endpoint":"ingest-socket","uid":"N","gid":"N","pid":"N"}` with decimal
+strings), and in the metadata graphs. An import keeps the intake of the
+connection that ran `importBegin`; `importAppend` through `importPublish` from
+another uid return `PERMISSION_DENIED`, and an inline retry of a request
+committed by another caller returns `CONFLICT`. Its connections have their own
+ceiling, `max_ingest_connections` (1..256, default 16), and the same 60-second
+lease. The private socket records no caller identity. `status.ingestSocket`
+reports the path, group, ceiling, active connections and refused connections.
 
 Shared-secret CHAP upgrades a connection. `authChallenge` returns a fresh 32-byte
 nonce. `authenticate(response)` consumes it and checks the BLAKE3 keyed hash of
@@ -2732,6 +2760,7 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 | `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
 | `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface. Raw artifact preservation can still succeed independently of projection support. |
 | `READ_ONLY` | A write sent to a query-only daemon (schema 67). Not retryable against that daemon. |
+| `PERMISSION_DENIED` | A non-producer operation on the ingest socket, or an import continued by an account other than the one that began it (schema 68). Not retryable on that connection. |
 
 `STORAGE_FAILURE` also covers a publication at or behind the archive watermark,
 which signals a clock regression, and retirement reaching unarchived evidence.

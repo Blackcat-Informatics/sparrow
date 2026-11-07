@@ -3763,10 +3763,38 @@ fingerprints = []
 names = ['^(retire_cancelled_mcp_call_elsewhere|release_mcp_slot_before_job_drop)$']
 
 [[job]]
+id = "producer-only-ingest-gate"
+summary = "One producer-only admission list decides every schema operation for anonymous public TCP and the ingest socket. Endpoint policies supply only the refusal code and the CHAP answers; every forward passes through the query-only write gate."
+home = "sparrow_server::ingest_gate::IngestGate"
+entry_points = ["sparrow_server::ingest_gate::Policy", "sparrow_server::ingest_gate::IngestSocketPolicy", "sparrow_server::tcp_gate::AnonymousTcp", "sparrow_server::transport::admit_connection"]
+spec = "docs/interfaces.md: public TCP and syslog packet interpretation (ingest socket)."
+vectors = ["crates/sparrow-server/src/ingest_gate.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(tcp_forward_list|ingest_socket_forward_list|ingest_socket_refuse_list)$']
+
+[[job]]
+id = "ingest-socket-intake-provenance"
+summary = "One intake owner: the ingest socket reads SO_PEERCRED on accept under its own ceiling, the connection's Rpc carries the credential into every ingest and import call, imports bind the importBegin uid, and the store records intake in catalogs and as sp:intakeEndpoint and sp:peerUid/Gid/Pid metadata facts behind one writer fence."
+home = "sparrow_core::storage::intake::Intake"
+entry_points = ["sparrow_core::storage::intake::admit_import", "sparrow_core::storage::intake::fence", "sparrow_core::storage::rdf_index::intake_metadata", "sparrow_core::storage::writer_format::enable_intake", "sparrow_server::ingest_socket::IngestSocket::admit", "sparrow_server::ingest_socket::check_directory", "sparrow_server::ingest_socket::check_socket", "sparrow_server::rpc::Rpc::with_peer", "sparrow_server::rpc::Rpc::import_work"]
+spec = "docs/interfaces.md: ingest socket and core graph vocabulary; docs/deployment.md: ingest-only group socket."
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/ingest_gate.rs", "crates/sparrow-server/src/ingest_socket.rs", "crates/sparrow-core/src/storage/writer_format.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(peer_credentials_elsewhere|record_caller_identity_elsewhere)$']
+
+[[job]]
 id = "owned-local-endpoint"
 summary = "Under exclusive store ownership, recover only a refused socket with unchanged device/inode, preserve live or unproven endpoints and non-sockets, and remove only the original owned name on shutdown."
 home = "sparrowd::local_endpoint::LocalEndpoint::bind"
-entry_points = ["sparrowd::local_endpoint::LocalEndpoint::remove_name", "sparrowd::local_endpoint::remove_socket", "sparrowd::local_endpoint::socket_identity"]
+entry_points = ["sparrowd::local_endpoint::LocalEndpoint::bind_ingest", "sparrowd::local_endpoint::LocalEndpoint::bind_recovering", "sparrowd::local_endpoint::LocalEndpoint::remove_name", "sparrowd::local_endpoint::remove_socket", "sparrowd::local_endpoint::socket_identity"]
 spec = "docs/interfaces.md: local endpoint recovery."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []

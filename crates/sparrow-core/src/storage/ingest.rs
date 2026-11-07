@@ -60,6 +60,7 @@ pub(super) struct RecordInput<'a> {
     pub producer: Option<super::producer_stream::ProducerPosition>,
     pub receiver: Option<super::receiver_stream::ReceiverPosition>,
     pub tail: Option<super::tail::TailPosition>,
+    pub intake: Option<super::intake::Intake>,
 }
 
 pub(super) struct RecordBatch<'a> {
@@ -266,6 +267,7 @@ impl<'a> RecordBatch<'a> {
         let record = Record {
             receiver: input.receiver,
             tail: input.tail,
+            intake: input.intake,
             syslog,
             producer: input.producer,
             id: input.id,
@@ -496,6 +498,7 @@ impl Writer {
         byte_length: u64,
         payload_id: &str,
         origin: Origin<'_>,
+        intake: Option<&super::intake::Intake>,
         now: u64,
     ) -> Result<Option<super::Artifact>, Error> {
         let artifact = match self.retry(&format!("request:ingest:{request_id}"), now)? {
@@ -545,6 +548,13 @@ impl Writer {
             return Err(Error::new(
                 "CONFLICT",
                 "request_id was committed with different input",
+            ));
+        }
+        // A retry from another caller never returns, or re-attributes, the original receipt.
+        if super::intake::admit_import(artifact.intake.as_ref(), intake).is_err() {
+            return Err(Error::new(
+                "CONFLICT",
+                "request_id was committed with different intake provenance",
             ));
         }
         Ok(Some(artifact))

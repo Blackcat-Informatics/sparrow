@@ -423,6 +423,7 @@ impl Store {
             "syslog",
             bytes,
             super::ingest::Origin::Receiver(receiver),
+            None,
             now,
             super::durability::Durability::Durable,
         )

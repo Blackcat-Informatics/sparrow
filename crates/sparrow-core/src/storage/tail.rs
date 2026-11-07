@@ -746,6 +746,7 @@ impl Store {
                 &generation.declaration.format,
                 &input[..length],
                 super::ingest::Origin::Tail(append),
+                None,
                 now,
                 super::durability::Durability::Durable,
             )?)

@@ -59,6 +59,7 @@ pub use storage::import::{
 pub use storage::ingest_status::{
     IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus,
 };
+pub use storage::intake::{INGEST_SOCKET, Intake, PeerCredential, admit_import};
 pub use storage::log_time::LogTimeCapture;
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};

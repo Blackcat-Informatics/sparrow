@@ -401,6 +401,7 @@ impl Store {
                 producer: None,
                 receiver: None,
                 tail: None,
+                intake: manifest.intake,
                 id: random_id("record")?,
                 artifact_id: &progress.artifact_id,
                 source: &manifest.source,
@@ -571,6 +572,7 @@ impl Store {
             byte_length: manifest.byte_length,
             payload_id: manifest.payload_id.clone(),
             record_ids,
+            intake: manifest.intake,
             chunks,
             evicted: false,
         };
