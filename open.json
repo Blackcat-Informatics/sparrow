@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 146,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/146-keep-status-and-ingest-responsive-while",
+  "branch": "paudley/146-keep-status-and-ingest-responsive-while",
+  "slug": "keep-status-and-ingest-responsive-while",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/146-keep-status-and-ingest-responsive-while/.stage/keep-status-and-ingest-responsive-while",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "d9129222b53f023fd4eae01a992778b6d035b554",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/146-keep-status-and-ingest-responsive-while",
+    "branch:paudley/146-keep-status-and-ingest-responsive-while",
+    "ignored:2 files (2 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow caches into /home/paudley/Active/sparrow/.worktrees/146-keep-status-and-ingest-responsive-while plus 0 dependency units from 0 other checkouts in 5.0s; 276 unchanged files keep their built mtimes; 4 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/146-keep-status-and-ingest-responsive-while/.stage/keep-status-and-ingest-responsive-while",
+    "issue:/home/paudley/Active/sparrow/.worktrees/146-keep-status-and-ingest-responsive-while/.stage/keep-status-and-ingest-responsive-while/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-08T01:14:51-0600",
+  "seed_error": ""
+}
