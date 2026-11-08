@@ -991,8 +991,13 @@ impl Store {
             } else {
                 RECLAIM_CHUNKS
             };
+            // An unpublished consumption import is kept while its claim may still publish.
+            // Once an administrator retires the claim, the retirement record is the durable
+            // mark that releases it, through this same path, as an expired lease (D118).
             if (!published && manifest.expires_at > now)
-                || (manifest.consumption && manifest.published_artifact.is_none())
+                || (manifest.consumption
+                    && !published
+                    && !super::consumption::retired(&writer, &manifest.id)?)
             {
                 continue;
             }
@@ -1041,6 +1046,30 @@ impl Store {
 }
 
 impl Writer {
+    /// End the staging lease of a retired claim's unpublished consumption import, if one
+    /// began, in the retirement's own batch. [`Store::import_reclaim`] then frees its staged
+    /// chunks, private preparation and journal slot as for any expired lease.
+    pub(super) fn end_retired_consumption_import(
+        &self,
+        batch: &mut WriteBatch,
+        id: &str,
+        now: u64,
+    ) -> Result<(), Error> {
+        if self.db.get(id)?.is_none() {
+            return Ok(());
+        }
+        let mut manifest: ImportManifest = self.get(id)?;
+        if !manifest.consumption || manifest.published_artifact.is_some() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "a retired claim's import is not its unpublished consumption staging",
+            ));
+        }
+        manifest.expires_at = manifest.expires_at.min(now);
+        put(batch, id, &manifest);
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the declared import, its intake binding and the acceptance clock"

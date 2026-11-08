@@ -81,17 +81,6 @@ pub(super) fn page(db: &DB, maximum: usize) -> Result<Option<(WriteBatch, bool)>
     catalog_upgrade::page(db, &JOB, progress, maximum.min(JOB.page_entries)).map(Some)
 }
 
-/// Record graphs at or before the frontier `after` (an owner identity), and all of them,
-/// counted from their empty provenance markers, one per record graph.
-pub(super) fn counts(db: &DB, after: Option<&str>) -> Result<(u64, u64), Error> {
-    let frontier = after.map(|id| format!("provenance-rdf:{id}"));
-    super::count_prefix(
-        db,
-        b"provenance-rdf:record:",
-        frontier.as_deref().map(str::as_bytes),
-    )
-}
-
 /// Whether a record graph's stored rows already give its subject `eventTime` or
 /// `eventTimeFallback`: the facts are current and the graph needs no backfill. The
 /// dictionary identities come from the caller's view of the dictionary.

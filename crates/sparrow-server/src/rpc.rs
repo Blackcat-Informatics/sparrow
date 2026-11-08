@@ -84,6 +84,10 @@ pub struct Rpc {
     intake: Option<sparrow_core::Intake>,
     /// The configured ingest socket's counters, reported by `status`.
     ingest_socket: Option<crate::ingest_socket::IngestSocket>,
+    /// The administrator an admin operation records: the private socket's kernel-reported
+    /// peer, or a CHAP-authenticated TCP peer. Absent, an admin operation that records its
+    /// caller is refused.
+    admin: Option<String>,
 }
 
 /// The full typed service and the ingest socket run no CHAP; only anonymous TCP does.
@@ -167,6 +171,7 @@ impl Rpc {
             query_only: false,
             intake: None,
             ingest_socket: None,
+            admin: None,
         }
     }
 
@@ -215,6 +220,13 @@ impl Rpc {
     #[must_use]
     pub fn with_ingest_socket(mut self, socket: crate::ingest_socket::IngestSocket) -> Self {
         self.ingest_socket = Some(socket);
+        self
+    }
+
+    /// Identify this connection's administrator, recorded by admin operations that name
+    /// their caller.
+    pub(crate) fn with_admin(mut self, caller: String) -> Self {
+        self.admin = Some(caller);
         self
     }
 
@@ -1680,16 +1692,17 @@ fn text_results(
 
 fn watch_mutation_result(
     mut out: wire::result::Builder<'_, wire::watch_mutation::Owned>,
+    owner: &Store,
     store: &str,
     request: &str,
     result: Result<crate::watch_admin::ManagedWatch, Error>,
 ) -> capnp::Result<()> {
-    match result {
-        Ok(watch) => {
+    match result.and_then(|watch| Ok((watch, owner.consumption_retired()?))) {
+        Ok((watch, retired)) => {
             let mut receipt = out.reborrow().init_ok();
             receipt.set_request_id(request);
             receipt.set_durability(wire::Durability::Durable);
-            crate::watch_admin::encode_info(receipt.init_watch(), store, &watch)?;
+            crate::watch_admin::encode_info(receipt.init_watch(), store, &watch, &retired)?;
         }
         Err(error) => failure(out, error),
     }
@@ -1780,6 +1793,13 @@ impl wire::sparrow::Server for Rpc {
             .watches
             .snapshot()
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        let retired = match self.store.consumption_retired() {
+            Ok(retired) => retired,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
         let mut out = results.get().init_result().init_ok();
         out.set_store_id(&store);
         let mut rows = out.init_watches(watches.len() as u32);
@@ -1792,7 +1812,49 @@ impl wire::sparrow::Server for Rpc {
                     revision: watch.revision,
                     enabled: watch.enabled,
                 },
+                &retired,
             )?;
+        }
+        Ok(())
+    }
+
+    async fn watch_claim_retire(
+        self: Rc<Self>,
+        params: wire::sparrow::WatchClaimRetireParams,
+        mut results: wire::sparrow::WatchClaimRetireResults,
+    ) -> capnp::Result<()> {
+        let request = params.get()?.get_request()?;
+        let store = request.get_store_id()?.to_str()?;
+        let watch = request.get_watch()?.to_str()?;
+        let claim = request.get_claim_id()?.to_str()?;
+        let reason = request.get_reason()?.to_str()?;
+        let result = async {
+            self.check_store(store)?;
+            if watch.is_empty() || watch.len() > 128 || claim.is_empty() || claim.len() > 128 {
+                return Err(invalid("watch and claim identities require 1..128 bytes"));
+            }
+            let caller = self.admin.clone().ok_or_else(|| {
+                Error::new(
+                    "PERMISSION_DENIED",
+                    "claim retirement records its caller; this connection has no identified administrator",
+                )
+            })?;
+            self.controller()?
+                .retire_claim(crate::watch_admin::ClaimRetirement {
+                    watch: watch.into(),
+                    claim: claim.into(),
+                    caller,
+                    reason: reason.into(),
+                })
+                .await
+        }
+        .await;
+        match result {
+            Ok(retired) => crate::watch_admin::encode_retired_claim(
+                results.get().init_result().init_ok(),
+                &retired,
+            ),
+            Err(error) => failure(results.get().init_result(), error),
         }
         Ok(())
     }
@@ -1829,7 +1891,13 @@ impl wire::sparrow::Server for Rpc {
                 },
             )
             .await;
-        watch_mutation_result(results.get().init_result(), store, request_id, result)
+        watch_mutation_result(
+            results.get().init_result(),
+            &self.store,
+            store,
+            request_id,
+            result,
+        )
     }
 
     async fn watch_remove(
@@ -1858,7 +1926,13 @@ impl wire::sparrow::Server for Rpc {
                 },
             )
             .await;
-        watch_mutation_result(results.get().init_result(), store, request_id, result)
+        watch_mutation_result(
+            results.get().init_result(),
+            &self.store,
+            store,
+            request_id,
+            result,
+        )
     }
 
     async fn events_ingest(
@@ -2757,18 +2831,20 @@ impl wire::sparrow::Server for Rpc {
         };
         match self
             .work(|store, now| {
+                let (status, migrations) = store.status_report(now)?;
                 Ok((
-                    store.status(now)?,
+                    status,
                     store.durability_status()?,
                     store.pressure_status()?,
                     store.recompression_status()?,
-                    store.migrations()?,
+                    migrations,
+                    store.consumption_retired()?,
                 ))
             })
             .await
         {
             Err(e) => failure(results.get().init_result(), e),
-            Ok((value, durability, pressure, recompression, migrations)) => {
+            Ok((value, durability, pressure, recompression, migrations, retired)) => {
                 let mut out = results.get().init_result().init_ok();
                 crate::pressure::encode(out.reborrow().init_pressure_status(), &pressure)?;
                 crate::recompression::encode(out.reborrow().init_recompression(), &recompression);
@@ -2810,6 +2886,11 @@ impl wire::sparrow::Server for Rpc {
                     state.set_candidates(watch.candidates);
                     state.set_deferred(watch.deferred);
                     state.set_pending_claims(watch.pending);
+                    crate::watch_admin::encode_retired(
+                        |count| state.reborrow().init_retired_claims(count),
+                        &watch.id,
+                        &retired,
+                    );
                     state.set_completed_claims(watch.completed);
                     state.set_reconciliations(watch.reconciliations);
                     state.set_coverage_losses(watch.coverage_losses);
@@ -2842,6 +2923,15 @@ impl wire::sparrow::Server for Rpc {
                 out.set_physical_bytes(number(&value, "physical_bytes")?);
                 out.set_disk_budget(number(&value, "disk_budget")?);
                 out.set_maintenance_reserve(number(&value, "maintenance_reserve")?);
+                out.set_counts_pending(match field::<String>(&value, "counts")?.as_str() {
+                    "pending" => true,
+                    "exact" => false,
+                    _ => {
+                        return Err(capnp::Error::failed(
+                            "status counts state is neither pending nor exact".into(),
+                        ));
+                    }
+                });
                 out.set_live_records(number(&value, "live_records")?);
                 out.set_unique_payload_chunks(number(&value, "unique_payload_chunks")?);
                 out.set_active_pins(number(&value, "active_pins")?);

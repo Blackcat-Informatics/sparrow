@@ -28,7 +28,8 @@ pub use storage::artifact_read::{
 };
 pub use storage::catalog_lease::CatalogReadPage;
 pub use storage::consumption::{
-    ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, MAX_CONSUMPTION_JOURNALS,
+    ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, ConsumptionRetirement,
+    MAX_CONSUMPTION_JOURNALS, MAX_RETIRED_CONSUMPTION_CLAIMS, RetiredConsumption,
     validate_consumption_path,
 };
 pub use storage::context::{
@@ -117,5 +118,8 @@ pub use storage::{
     QUERY_SCOPE_WORKSPACE_BYTES, RETENTION_MS, Record, Store,
 };
 #[cfg(feature = "test-support")]
-pub use storage::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
+pub use storage::{
+    SourceCountAudit, StoreCounterAudit, remove_source_summary_for_legacy_fixture,
+    remove_store_counters_for_legacy_fixture,
+};
 pub use text::resolve_text_analyzer;

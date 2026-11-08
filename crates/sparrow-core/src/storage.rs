@@ -24,6 +24,8 @@ pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
 pub use event_fallback_rdf::remove_event_fallback_rdf_for_legacy_fixture;
 #[cfg(feature = "test-support")]
 pub use source_summary::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
+#[cfg(feature = "test-support")]
+pub use store_counters::{StoreCounterAudit, remove_store_counters_for_legacy_fixture};
 pub(crate) mod artifact_read;
 pub(crate) mod catalog_lease;
 mod catalog_upgrade;
@@ -66,6 +68,7 @@ mod source_context;
 pub(crate) mod source_read;
 mod source_summary;
 pub(crate) mod source_time;
+mod store_counters;
 pub(crate) mod syslog;
 mod table_options;
 pub(crate) mod tail;
@@ -74,6 +77,7 @@ mod temporal_index;
 mod text_index;
 pub(crate) mod watch_registry;
 mod writer_format;
+mod writer_queue;
 
 const FORMAT: &[u8] = b"sparrow.store/33";
 const DAY: u64 = 86_400_000;
@@ -427,6 +431,9 @@ pub struct Record {
     pub intake: Option<intake::Intake>,
     chunks: Vec<String>,
     evicted: bool,
+    /// Expiry retired the record's evidence (#146). The entry stays until a day past the
+    /// deadline; status `live_records` stops counting it here, in expiry's own batch.
+    retired: bool,
 }
 
 /// A named, durably committed collection of concrete evidence identities.
@@ -477,12 +484,31 @@ fn pin_deadline(days: u64, now: u64) -> Result<u64, Error> {
     Ok(deadline)
 }
 
+/// What a [`Store`] reads or coordinates without the writer lock (#146), shared by its
+/// clones behind one `Arc`.
+struct Unlocked {
+    /// The writer's database, for reads that take no writer lock: `status`, migration
+    /// progress and constant properties read counter rows from a snapshot of it.
+    db: Arc<DB>,
+    config: Config,
+    query_staging: Arc<std::sync::atomic::AtomicU64>,
+    /// Writers waiting for the writer lock, ahead of migration pages.
+    writers: writer_queue::WriterQueue,
+    migration_failures: migration::Failures,
+    /// The writer's durability, pressure and table rewrite state, which status reads
+    /// without the writer lock.
+    durability: writer_queue::Published<durability::View>,
+    pressure: writer_queue::Published<pressure::PressureStatus>,
+    recompression: writer_queue::Published<recompression::RecompressionStatus>,
+}
+
 /// One database owner. Clones share a serialized catalog writer.
 #[derive(Clone)]
 pub struct Store {
     id: Arc<str>,
     space: space::SpaceFloor,
     inner: Arc<Mutex<Writer>>,
+    unlocked: Arc<Unlocked>,
     pin_reads: Arc<Mutex<pin_read::Reads>>,
     rdf_read: Arc<Mutex<()>>,
     artifact_reads: Arc<Mutex<artifact_read::Reads>>,
@@ -507,12 +533,14 @@ struct Writer {
     id: String,
     config: Config,
     space: space::SpaceFloor,
-    durability: std::cell::RefCell<durability::State>,
-    pressure: std::cell::RefCell<pressure::State>,
+    durability: writer_queue::Observed<durability::State>,
+    pressure: writer_queue::Observed<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
     expiry: std::cell::RefCell<expiry::Cursor>,
-    recompression: std::cell::RefCell<recompression::State>,
-    migrations: std::cell::RefCell<migration::State>,
+    recompression: writer_queue::Observed<recompression::State>,
+    /// Dev-only: how long each migration page holds the writer before it commits.
+    #[cfg(feature = "test-support")]
+    page_hold: std::cell::Cell<Option<std::time::Duration>>,
     /// Present exactly when the store archives before deleting.
     archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
@@ -522,6 +550,14 @@ struct Writer {
     /// Retirement share the import bound and pin caps derive from: production
     /// defaults except where the dev-only test hook scales them for one open store.
     retirement: std::cell::Cell<eviction::RetirementShare>,
+}
+
+/// The refusal every operation reports once a writer panicked while holding the writer lock.
+fn writer_poisoned() -> Error {
+    Error::new(
+        "STORAGE_FAILURE",
+        "catalog writer poisoned; reopen and inspect the store",
+    )
 }
 
 fn random_id(kind: &str) -> Result<String, Error> {
@@ -584,6 +620,20 @@ trait Catalog: Sized {
 
 trait EvidenceCatalog: Catalog {
     fn identity(&self) -> &str;
+}
+
+/// Decode one evidence catalog entry and check its identity against its key. Needs no
+/// writer, so `status` decodes pin rows from a snapshot with it (#146); the writer's
+/// [`Writer::decode_evidence`] adds the stored form.
+fn decode_evidence_entry<T: EvidenceCatalog>(key: &[u8], bytes: &[u8]) -> Result<T, Error> {
+    let row = T::decode(&parse(bytes)?)?;
+    if row.identity().as_bytes() != key {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "evidence catalog identity disagrees with its key",
+        ));
+    }
+    Ok(row)
 }
 
 impl EvidenceCatalog for Artifact {
@@ -684,6 +734,12 @@ impl Catalog for Record {
             .with("tail", self.tail.as_ref().map(Catalog::encode))
             .with("chunks", self.chunks.clone())
             .with("evicted", self.evicted);
+        // Written only once set, so an entry expiry has not retired keeps its encoding.
+        let object = if self.retired {
+            object.with("retired", true)
+        } else {
+            object
+        };
         match &self.intake {
             Some(intake) => object.with("intake", intake.encode()).into(),
             None => object.into(),
@@ -740,6 +796,10 @@ impl Catalog for Record {
                 .map(syslog::SyslogSnapshot::decode)
                 .transpose()?,
             evicted: read_field(v, "evicted")?,
+            retired: match v.get("retired") {
+                None => false,
+                Some(_) => read_field(v, "retired")?,
+            },
         };
         if let source_time::EventTime::Known {
             source_start,
@@ -806,58 +866,51 @@ impl Catalog for Pin {
     }
 }
 
-impl Writer {
-    fn properties(&self) -> Result<Object, Error> {
-        let format = self
-            .db
-            .get("store_format")?
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "store format missing"))?;
-        Ok(Object::new()
-            .with("store_id", self.id.clone())
-            .with(
-                "store_format",
-                std::str::from_utf8(&format)
-                    .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?,
-            )
-            .with("rdf_profile", rdf_index::profile_identity()?)
-            .with(
-                "text_analyzer",
-                hex::encode(&self.config.text_analyzer.fingerprint()),
-            )
-            .with("text_profile", crate::text::PROFILE)
-            .with("retry_window_seconds", (RETRY_WINDOW / 1000).to_string())
-            .with("retention_seconds", (RETENTION_MS / 1000).to_string())
-            .with(
-                "max_producer_streams",
-                producer_stream::MAX_PRODUCER_STREAMS.to_string(),
-            )
-            .with(
-                "max_producer_gap_intervals",
-                producer_stream::MAX_PRODUCER_GAPS.to_string(),
-            )
-            .with(
-                "max_producer_registry_bytes",
-                producer_stream::MAX_PRODUCER_REGISTRY_BYTES.to_string(),
-            )
-            .with(
-                "producer_metadata_retention_seconds",
-                (30 * DAY / 1000).to_string(),
-            )
-            .with("disk_budget", self.config.disk_budget.to_string())
-            .with(
-                "max_inline_artifact_bytes",
-                INLINE_ARTIFACT_BYTES.to_string(),
-            )
-            .with(
-                "max_records_per_artifact",
-                self.config.max_records.to_string(),
-            )
-            .with("max_pin_members", self.config.max_pin_members.to_string())
-            .with(
-                "maintenance_reserve",
-                self.config.maintenance_reserve.to_string(),
-            ))
-    }
+/// Constant-size store and admission properties from the stored `store_format`.
+fn store_properties(format: Option<Vec<u8>>, id: &str, config: &Config) -> Result<Object, Error> {
+    let format = format.ok_or_else(|| Error::new("STORAGE_FAILURE", "store format missing"))?;
+    Ok(Object::new()
+        .with("store_id", id.to_owned())
+        .with(
+            "store_format",
+            std::str::from_utf8(&format)
+                .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?,
+        )
+        .with("rdf_profile", rdf_index::profile_identity()?)
+        .with(
+            "text_analyzer",
+            hex::encode(&config.text_analyzer.fingerprint()),
+        )
+        .with("text_profile", crate::text::PROFILE)
+        .with("retry_window_seconds", (RETRY_WINDOW / 1000).to_string())
+        .with("retention_seconds", (RETENTION_MS / 1000).to_string())
+        .with(
+            "max_producer_streams",
+            producer_stream::MAX_PRODUCER_STREAMS.to_string(),
+        )
+        .with(
+            "max_producer_gap_intervals",
+            producer_stream::MAX_PRODUCER_GAPS.to_string(),
+        )
+        .with(
+            "max_producer_registry_bytes",
+            producer_stream::MAX_PRODUCER_REGISTRY_BYTES.to_string(),
+        )
+        .with(
+            "producer_metadata_retention_seconds",
+            (30 * DAY / 1000).to_string(),
+        )
+        .with("disk_budget", config.disk_budget.to_string())
+        .with(
+            "max_inline_artifact_bytes",
+            INLINE_ARTIFACT_BYTES.to_string(),
+        )
+        .with("max_records_per_artifact", config.max_records.to_string())
+        .with("max_pin_members", config.max_pin_members.to_string())
+        .with(
+            "maintenance_reserve",
+            config.maintenance_reserve.to_string(),
+        ))
 }
 
 impl Writer {
@@ -1117,30 +1170,18 @@ impl Writer {
     }
 
     fn decode_evidence<T: EvidenceCatalog>(&self, key: &[u8], bytes: &[u8]) -> Result<T, Error> {
-        let row = T::decode(&parse(bytes)?)?.stored(self)?;
-        if row.identity().as_bytes() != key {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "evidence catalog identity disagrees with its key",
-            ));
-        }
-        Ok(row)
-    }
-
-    fn count_catalog<T: EvidenceCatalog>(
-        &self,
-        prefix: &str,
-        include: impl Fn(&T) -> bool,
-    ) -> Result<u64, Error> {
-        self.catalog::<T>(prefix).try_fold(0_u64, |count, row| {
-            count
-                .checked_add(u64::from(include(&row?)))
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "evidence catalog counter overflow"))
-        })
+        decode_evidence_entry::<T>(key, bytes)?.stored(self)
     }
 
     fn count_prefix(&self, prefix: &str) -> Result<u64, Error> {
-        count_prefix(&self.db, prefix.as_bytes(), None).map(|(_, total)| total)
+        let mut total = 0;
+        for row in self.db.prefix_iterator(prefix) {
+            if !row?.0.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            total += 1;
+        }
+        Ok(total)
     }
 
     fn protected(&self, now: u64) -> Result<BTreeSet<String>, Error> {
@@ -1302,22 +1343,6 @@ fn any_key(db: &DB, prefix: &[u8]) -> Result<bool, Error> {
     }
 }
 
-/// Keys under `prefix` at or before `frontier`, and all keys under `prefix`.
-fn count_prefix(db: &DB, prefix: &[u8], frontier: Option<&[u8]>) -> Result<(u64, u64), Error> {
-    let (mut done, mut total) = (0, 0);
-    for row in db.prefix_iterator(prefix) {
-        let (key, _) = row?;
-        if !key.starts_with(prefix) {
-            break;
-        }
-        total += 1;
-        if frontier.is_some_and(|frontier| *key <= *frontier) {
-            done += 1;
-        }
-    }
-    Ok((done, total))
-}
-
 fn put<T: Catalog>(batch: &mut WriteBatch, key: &str, value: &T) {
     batch.put(key, json::write_compact(&value.encode()));
 }
@@ -1458,30 +1483,43 @@ impl Store {
         }
         // Recovered buffered writes are certified only after a real synchronization.
         db.flush_wal(true)?;
-        let durability = std::cell::RefCell::new(durability::State::new(
+        let durability = writer_queue::Observed::new(durability::State::new(
             random_id("session")?,
             db.latest_sequence_number(),
         ));
         manifest_retire::features(&db)?;
-        let pressure = pressure::State::load(&db)?;
-        let recompression = recompression::State::load(&db)?;
+        let pressure = writer_queue::Observed::new(pressure::State::load(&db)?);
+        let recompression = writer_queue::Observed::new(recompression::State::load(&db)?);
         source_context::rebuild(&db)?;
+        let db = Arc::new(db);
+        let query_staging = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let store = Self {
             id: Arc::from(id.as_str()),
             space: space.clone(),
+            unlocked: Arc::new(Unlocked {
+                db: Arc::clone(&db),
+                config: config.clone(),
+                query_staging: Arc::clone(&query_staging),
+                writers: writer_queue::WriterQueue::default(),
+                migration_failures: migration::Failures::default(),
+                durability: durability.published(),
+                pressure: pressure.published(),
+                recompression: recompression.published(),
+            }),
             inner: Arc::new(Mutex::new(Writer {
-                db: Arc::new(db),
+                db,
                 id,
                 config,
                 space,
                 durability,
-                pressure: std::cell::RefCell::new(pressure),
+                pressure,
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
                 expiry: std::cell::RefCell::new(expiry::Cursor::default()),
-                recompression: std::cell::RefCell::new(recompression),
-                migrations: std::cell::RefCell::new(migration::State::default()),
+                recompression,
+                #[cfg(feature = "test-support")]
+                page_hold: std::cell::Cell::new(None),
                 archive: archive.map(std::cell::RefCell::new),
-                query_staging: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                query_staging,
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
                 retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
             })),
@@ -1513,13 +1551,28 @@ impl Store {
         &self.space
     }
 
+    /// Take the writer lock as a writer: while it waits, migration pages defer to it.
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Writer>, Error> {
-        self.inner.lock().map_err(|_| {
-            Error::new(
-                "STORAGE_FAILURE",
-                "catalog writer poisoned; reopen and inspect the store",
-            )
-        })
+        let arrival = self.unlocked.writers.arrive()?;
+        let writer = self.lock_uncounted();
+        drop(arrival);
+        writer
+    }
+
+    /// Take the writer lock without registering as a waiting writer: migration pages,
+    /// which defer to registered writers before they ask.
+    fn lock_uncounted(&self) -> Result<std::sync::MutexGuard<'_, Writer>, Error> {
+        self.inner.lock().map_err(|_| writer_poisoned())
+    }
+
+    /// Refuse, without waiting for the writer lock, once a writer panicked while holding it.
+    /// Reads that never take the lock (status and the observed states) call this so they
+    /// report the poisoned writer as every locked operation does, rather than stale state.
+    pub(crate) fn refuse_poisoned(&self) -> Result<(), Error> {
+        if self.inner.is_poisoned() {
+            return Err(writer_poisoned());
+        }
+        Ok(())
     }
 
     /// Durably ingest one bounded complete artifact, preserving every original byte.
@@ -2412,10 +2465,16 @@ impl Store {
         Ok(())
     }
 
-    /// Read constant-size store and admission properties without scanning evidence.
-    /// Does not measure physical bytes or count records, pins, references or projections.
+    /// Read constant-size store and admission properties without scanning evidence or
+    /// taking the writer lock. Does not measure physical bytes or count records, pins,
+    /// references or projections.
     pub fn properties(&self) -> Result<Value, Error> {
-        Ok(self.lock()?.properties()?.into())
+        Ok(store_properties(
+            self.unlocked.db.get("store_format")?,
+            &self.id,
+            &self.unlocked.config,
+        )?
+        .into())
     }
 
     fn read_lease_stats(&self, now: u64) -> Result<ReadLeaseStats, Error> {
@@ -2444,14 +2503,50 @@ impl Store {
         })
     }
 
-    /// Count stored payload chunks, the `unique_payload_chunks` of status, without the
-    /// record census. It changes only when evidence is ingested or retired.
-    pub fn unique_payload_chunks(&self) -> Result<u64, Error> {
-        self.lock()?.count_prefix("ref:")
+    /// Count stored payload chunks, the `unique_payload_chunks` of status, from its counter
+    /// row without the writer lock. It changes only when evidence is ingested or retired.
+    /// `None` while the store counters seed (status `counts` is `pending`): the counter row
+    /// then holds only the chunks below the seeding watermark, which is not the total.
+    pub fn unique_payload_chunks(&self) -> Result<Option<u64>, Error> {
+        self.refuse_poisoned()?;
+        let snapshot = self.unlocked.db.snapshot();
+        let reader = store_counters::Reader::snapshot(&snapshot);
+        let positions = store_counters::Positions::read(|key| reader.get(key.as_bytes()))?;
+        if !positions.seeded() {
+            return Ok(None);
+        }
+        Ok(Some(
+            store_counters::values(&reader)?[&store_counters::Counter::PayloadChunks],
+        ))
     }
 
-    /// Report measured database bytes and deduplicated live payload references.
+    /// Report measured database bytes, the store counters and active pins. It never takes
+    /// the writer lock: every count comes from one snapshot, so a migration page or a write
+    /// in progress does not delay it, and it refuses once that lock is poisoned. `counts` is
+    /// `pending` while the store counters seed;
+    /// `live_records`, `unique_payload_chunks` and `unique_json_projections` are then exact
+    /// only through the seeding watermark, not totals.
     pub fn status(&self, now: u64) -> Result<Value, Error> {
+        self.status_report(now).map(|(status, _)| status)
+    }
+
+    /// [`Store::status`] and [`Store::migrations`] from one snapshot, as the status RPC
+    /// reports them.
+    pub fn status_report(
+        &self,
+        now: u64,
+    ) -> Result<(Value, Vec<migration::MigrationStatus>), Error> {
+        self.status_counted(now).map(|(report, _)| report)
+    }
+
+    /// [`Store::status_report`] and the number of keys it read from its snapshot: a fixed
+    /// number plus one per pin row, which the pin caps bound, whether or not the counters
+    /// are seeded.
+    fn status_counted(
+        &self,
+        now: u64,
+    ) -> Result<((Value, Vec<migration::MigrationStatus>), u64), Error> {
+        self.refuse_poisoned()?;
         let ReadLeaseStats {
             pin: (pin_handles, pin_bytes),
             artifact: (artifact_handles, artifact_bytes),
@@ -2459,80 +2554,148 @@ impl Store {
             record: (record_handles, record_bytes),
             sparql: (sparql_handles, sparql_bytes),
         } = self.read_lease_stats(now)?;
-        let writer = self.lock()?;
-        let protected = writer.protected(now)?;
-        let live = writer.count_catalog::<Record>("record:", |record| {
-            writer.live_record(record, now, &protected)
+        let snapshot = self.unlocked.db.snapshot();
+        let reader = store_counters::Reader::snapshot(&snapshot);
+        let positions = store_counters::Positions::read(|key| reader.get(key.as_bytes()))?;
+        let counters = store_counters::values(&reader)?;
+        let failures = self.failures()?.clone();
+        let migrations = migration::report(&reader, &positions, &counters, &failures)?;
+        let mut active_pins = 0_u64;
+        reader.scan(b"pin:", None, |key, bytes| {
+            let pin = decode_evidence_entry::<Pin>(key, bytes)?;
+            active_pins += u64::from(pin.expires_at > now);
+            Ok(true)
         })?;
-        let unique_chunks = writer.count_prefix("ref:")?;
-        Ok(writer
-            .properties()?
-            .with("source_read_handles", source_handles.to_string())
-            .with("source_read_bytes", source_bytes.to_string())
-            .with(
-                "max_source_read_handles",
-                catalog_lease::MAX_HANDLES.to_string(),
-            )
-            .with(
-                "max_source_read_bytes",
-                catalog_lease::HANDLE_BYTES.to_string(),
-            )
-            .with("source_read_lease_ms", catalog_lease::LEASE_MS.to_string())
-            .with("sparql_read_handles", sparql_handles.to_string())
-            .with("sparql_read_bytes", sparql_bytes.to_string())
-            .with(
-                "max_sparql_read_handles",
-                catalog_lease::MAX_HANDLES.to_string(),
-            )
-            .with(
-                "max_sparql_read_bytes",
-                catalog_lease::HANDLE_BYTES.to_string(),
-            )
-            .with("sparql_read_lease_ms", catalog_lease::LEASE_MS.to_string())
-            .with("record_read_handles", record_handles.to_string())
-            .with("record_read_bytes", record_bytes.to_string())
-            .with(
-                "max_record_read_handles",
-                catalog_lease::MAX_HANDLES.to_string(),
-            )
-            .with(
-                "max_record_read_bytes",
-                catalog_lease::HANDLE_BYTES.to_string(),
-            )
-            .with("record_read_lease_ms", catalog_lease::LEASE_MS.to_string())
-            .with("pin_read_handles", pin_handles.to_string())
-            .with("pin_read_bytes", pin_bytes.to_string())
-            .with("max_pin_read_handles", pin_read::MAX_HANDLES.to_string())
-            .with("max_pin_read_bytes", pin_read::HANDLE_BYTES.to_string())
-            .with("pin_read_lease_ms", pin_read::LEASE_MS.to_string())
-            .with("artifact_read_handles", artifact_handles.to_string())
-            .with("artifact_read_bytes", artifact_bytes.to_string())
-            .with(
-                "max_artifact_read_handles",
-                artifact_read::MAX_HANDLES.to_string(),
-            )
-            .with(
-                "max_artifact_read_bytes",
-                artifact_read::HANDLE_BYTES.to_string(),
-            )
-            .with(
-                "artifact_read_lease_ms",
-                catalog_lease::LEASE_MS.to_string(),
-            )
-            .with(
-                "unique_json_projections",
-                writer.count_prefix("projection-ref:")?.to_string(),
-            )
-            .with("physical_bytes", writer.physical_bytes()?.to_string())
-            .with("live_records", live.to_string())
-            .with("unique_payload_chunks", unique_chunks.to_string())
-            .with(
-                "active_pins",
-                writer
-                    .count_catalog::<Pin>("pin:", |pin| pin.expires_at > now)?
-                    .to_string(),
-            )
-            .into())
+        let physical_bytes = linked_physical_bytes(&self.unlocked.db)?.saturating_add(
+            self.unlocked
+                .query_staging
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let status = store_properties(
+            reader.get(b"store_format")?,
+            &self.id,
+            &self.unlocked.config,
+        )?
+        .with("source_read_handles", source_handles.to_string())
+        .with("source_read_bytes", source_bytes.to_string())
+        .with(
+            "max_source_read_handles",
+            catalog_lease::MAX_HANDLES.to_string(),
+        )
+        .with(
+            "max_source_read_bytes",
+            catalog_lease::HANDLE_BYTES.to_string(),
+        )
+        .with("source_read_lease_ms", catalog_lease::LEASE_MS.to_string())
+        .with("sparql_read_handles", sparql_handles.to_string())
+        .with("sparql_read_bytes", sparql_bytes.to_string())
+        .with(
+            "max_sparql_read_handles",
+            catalog_lease::MAX_HANDLES.to_string(),
+        )
+        .with(
+            "max_sparql_read_bytes",
+            catalog_lease::HANDLE_BYTES.to_string(),
+        )
+        .with("sparql_read_lease_ms", catalog_lease::LEASE_MS.to_string())
+        .with("record_read_handles", record_handles.to_string())
+        .with("record_read_bytes", record_bytes.to_string())
+        .with(
+            "max_record_read_handles",
+            catalog_lease::MAX_HANDLES.to_string(),
+        )
+        .with(
+            "max_record_read_bytes",
+            catalog_lease::HANDLE_BYTES.to_string(),
+        )
+        .with("record_read_lease_ms", catalog_lease::LEASE_MS.to_string())
+        .with("pin_read_handles", pin_handles.to_string())
+        .with("pin_read_bytes", pin_bytes.to_string())
+        .with("max_pin_read_handles", pin_read::MAX_HANDLES.to_string())
+        .with("max_pin_read_bytes", pin_read::HANDLE_BYTES.to_string())
+        .with("pin_read_lease_ms", pin_read::LEASE_MS.to_string())
+        .with("artifact_read_handles", artifact_handles.to_string())
+        .with("artifact_read_bytes", artifact_bytes.to_string())
+        .with(
+            "max_artifact_read_handles",
+            artifact_read::MAX_HANDLES.to_string(),
+        )
+        .with(
+            "max_artifact_read_bytes",
+            artifact_read::HANDLE_BYTES.to_string(),
+        )
+        .with(
+            "artifact_read_lease_ms",
+            catalog_lease::LEASE_MS.to_string(),
+        )
+        .with(
+            "unique_json_projections",
+            counters[&store_counters::Counter::JsonProjections].to_string(),
+        )
+        .with("physical_bytes", physical_bytes.to_string())
+        .with(
+            "live_records",
+            counters[&store_counters::Counter::RetainedRecords].to_string(),
+        )
+        .with(
+            "unique_payload_chunks",
+            counters[&store_counters::Counter::PayloadChunks].to_string(),
+        )
+        .with("active_pins", active_pins.to_string())
+        .with(
+            "counts",
+            if positions.seeded() {
+                "exact"
+            } else {
+                "pending"
+            },
+        )
+        .into();
+        Ok(((status, migrations), reader.keys()))
+    }
+
+    /// Dev-only: what the status RPC reads, [`Store::status_report`], with the number of
+    /// keys it read, so tests can show its cost is fixed.
+    #[cfg(feature = "test-support")]
+    pub fn status_with_key_reads_for_tests(
+        &self,
+        now: u64,
+    ) -> Result<(Value, Vec<migration::MigrationStatus>, u64), Error> {
+        let ((status, migrations), keys) = self.status_counted(now)?;
+        Ok((status, migrations, keys))
+    }
+
+    /// Dev-only: whether some thread holds the writer lock now.
+    #[cfg(feature = "test-support")]
+    pub fn writer_busy_for_tests(&self) -> bool {
+        matches!(
+            self.inner.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
+    /// Dev-only: poison the writer lock, as a writer that panicked while holding it does.
+    #[cfg(feature = "test-support")]
+    pub fn poison_writer_for_tests(&self) {
+        let joined = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _writer = self.inner.lock();
+                    panic!("a writer panics while it holds the catalog writer");
+                })
+                .join()
+        });
+        assert!(joined.is_err() && self.inner.is_poisoned());
+    }
+
+    /// Dev-only: make every migration page hold the writer this long before it commits.
+    #[cfg(feature = "test-support")]
+    pub fn hold_migration_pages_for_tests(
+        &self,
+        hold: Option<std::time::Duration>,
+    ) -> Result<(), Error> {
+        self.lock()?.page_hold.set(hold);
+        Ok(())
     }
 }
 

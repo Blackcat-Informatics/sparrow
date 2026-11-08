@@ -227,6 +227,7 @@ impl Input {
                     wire::IngestDeletion::Claimed => "claimed",
                     wire::IngestDeletion::Published => "published",
                     wire::IngestDeletion::Removed => "removed",
+                    wire::IngestDeletion::Retired => "retired_unrecoverable",
                 },
             )
             .with("removed_at", removed)

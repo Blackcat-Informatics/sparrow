@@ -473,8 +473,8 @@ connection: Unix connections, CHAP sessions and the anonymous TCP gate's
 forwards. It classifies every operation once. It forwards each read, and on a
 query-only daemon it refuses each write before decoding its request. The writes are `ingest`, `eventsIngest`, `importBegin` through
 `importCancel` (except `importGet`), `flush`, `pin`, `pinRenew`, `pinRelease`,
-`watchPut`, `watchRemove`, `watchHandoff`, `tailFinish`, `sourceTimeDefine` and
-`diagnosticDefine`. Each returns the typed error `READ_ONLY`, whose message says
+`watchPut`, `watchRemove`, `watchClaimRetire`, `watchHandoff`, `tailFinish`,
+`sourceTimeDefine` and `diagnosticDefine`. Each returns the typed error `READ_ONLY`, whose message says
 the daemon is in query-only mode. `resultRelease` stays a read: it releases a
 query capture held in memory and writes nothing to the store. An operation added
 to the schema without a decision in the gate returns Cap'n Proto
@@ -590,9 +590,9 @@ small row for it. Until it completes, scoped SPARQL keeps the whole-store plan.
 Opening a store that owes the schema 69 migrations applies both writer fences
 and seeds both checkpoints in one synchronized batch, then serves; the open
 does not wait for either job. The joined maintenance worker runs them as one
-duty, `owner-graph-index` first, then `event-fallback-rdf`, then
-`source-summary` (see "Per-source counters and artifact index"), one page per
-admission. It is selected fairly with buffered synchronization, pressure
+duty, `store-counters` first (see "Store counters"), then `owner-graph-index`,
+`event-fallback-rdf` and `source-summary` (see "Per-source counters and
+artifact index"), one page per admission. It is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as pressure maintenance, import reclamation and
 retention are; buffered synchronization and the table rewrite still run there.
@@ -600,28 +600,47 @@ Each page commits its rows and its checkpoint in one synchronized batch through
 the ordinary write path, so it is admitted against the data allowance and a
 failed write latches durability uncertainty as any write does; a restart
 resumes after the last committed page.
-While pages succeed the next one follows at once; a failed page commits
+While pages succeed the next one follows at once, except that writers come
+first: an ingest, a consume publication or an RPC write that is waiting for the
+writer lock takes it before the next page does. Before a page the worker waits
+while any writer is waiting, for at most the longer of 100 ms and the time the
+previous page held the writer, so the migration still progresses under a
+continuous stream of writers. The wait blocks on a condition the last waiting
+writer signals; nothing polls. It runs apart from the worker's other duties,
+which keep their own schedule, so it delays only the page. When that wait ended
+while another duty ran, or the page is the first after a retry, writers may
+have arrived since, so the worker waits again immediately before the page,
+inline. A failed page commits
 nothing, sets that migration's `failure` and is retried every 60 seconds until
 it succeeds. Nothing is skipped. The daemon logs
 `sparrowd: migration NAME progress pages=P done=D total=T watermark=W` every 64
-pages and `sparrowd: migration NAME complete pages=P` when a migration finishes.
+pages and `sparrowd: migration NAME complete pages=P done=D` when a migration
+finishes. Each line reports the counters the page's own batch updated and reads
+nothing else; `total` is `counting` while `store-counters` seeds.
+
+Schema 70 adds two flags. `Status.countsPending` (CLI and MCP `counts`,
+`pending` or `exact`) is true while the `store-counters` migration seeds;
+`MigrationStatus.totalPending` is true for every migration then. While pending,
+`live_records`, `unique_payload_chunks` and `unique_json_projections` count
+exactly the keys through the `store-counters` watermark, and each migration's
+`done` counts its entries through both its own and the seeding watermark; none
+of them is a total. A pending `total` is 0 on the wire and `counting` in CLI and
+MCP. A query-only daemon never runs a page, so its counts stay pending until a
+writable daemon seeds them.
 
 `Status.migrations` (CLI and MCP `migrations`) lists every migration with
 `name`, `done` and `total` (decimal strings), `watermark` and `failure`. `total`
-counts the migration's source entries in the store, frozen when it completes: graph declarations for
-`owner-graph-index`, record metadata graphs (counted by their provenance
-markers) for `event-fallback-rdf`, `artifact:` and `record:` entries for
-`source-summary`. `done` counts those at or before the
-watermark, so it moves with ingest and retirement as well as with pages. The
-watermark is an opaque position, `start` before the first page and null once
-complete, when `done` equals `total`. A store that never owed a migration
-reports it complete. Only a running migration counts its entries on a status
-read. The page that completes a migration records its total in the same
-batch (`migration-total:NAME`), and a complete migration reports that recorded
-total as both `done` and `total`, so `status` never walks a finished
-migration's keys. A migration that completed before totals were recorded is
-counted once per daemon session. Fencing a migration again clears its recorded
-total.
+counts the migration's source entries now in the store: every counted key for
+`store-counters`, graph declarations for `owner-graph-index`, record metadata
+graphs (counted by their provenance markers) for `event-fallback-rdf`,
+`artifact:` and `record:` entries for `source-summary`. `done` counts those at
+or before the watermark, so it moves with ingest and retirement as well as with
+pages. The watermark is an opaque position, `start` before the first page and
+null once complete, when `done` equals `total` (or `total` is still counting). A
+store that never owed a migration reports it complete. Both numbers come from
+the store counters, read from the same snapshot as the rest of the status reply
+without the writer lock; no status read walks a migration's keys. The `migration-total:NAME` rows schema 69 images recorded are discarded
+when the counters are fenced.
 
 Readers are explicit while a migration is pending:
 
@@ -639,8 +658,75 @@ extra manifest point read and a subject lookup, both charged to the request
 budget; a record at or before the watermark costs nothing extra. A large metadata scope can therefore refuse
 with `RESOURCE_LIMIT` during the migration and succeed after it.
 
-The wire schema stays 69: no schema 69 endpoint was deployed before these fields
-were added.
+These fields were added within schema 69, before its first deployment. The
+schema 70 flags below were added after it.
+
+### Store counters (store format)
+
+`status` and the migration report take no writer lock and walk no store-sized
+key range. They read fixed counter rows, `store-counter:NAME`, each a
+big-endian 64-bit count, from one RocksDB snapshot:
+
+| Row | Counts |
+| --- | --- |
+| `records`, `retained-records` | `record:` entries; those neither evicted nor marked `retired` by expiry |
+| `artifacts` | `artifact:` entries |
+| `graph-declarations` | `rdf:g:` graph declarations |
+| `record-graphs` | `provenance-rdf:record:` markers, one per record metadata graph |
+| `payload-chunks`, `json-projections` | `ref:` and `projection-ref:` rows |
+| `done:owner-graph-index`, `done:event-fallback-rdf`, `done:source-summary` | The migration's source entries at or before its checkpoint |
+
+Status `live_records` is `retained-records` and keeps its deadline meaning:
+records neither evicted nor retired by expiry. Expiry marks a record `retired`
+in the batch that retires its evidence, when the record's deadline has passed
+and no active pin covers it, so the count drops in that batch rather than when
+the entry is deleted a day later. The count equals the deadline rule
+(`retention_metrics` `live_records`) once expiry has run at the same instant;
+between a deadline or pin release and the next expiry pass, and while the
+archive gate holds an expired record, the record still counts. An entry expiry
+retired before this marker existed is marked at expiry's next visit to it, so it
+stops counting at the next expiry pass. This differs from the per-source `retained_records`, which count entries
+until they are deleted. `unique_payload_chunks` and `unique_json_projections` are the two row
+counts. `active_pins` reads the pin rows, which the pin caps bound, and
+`physical_bytes` measures the database directory, as before. A status read
+therefore reads a fixed number of keys plus one per pin row, whatever the size
+of the store, seeding or not. The durability, pressure and table rewrite state
+the same reply carries is kept by the writer to itself, which may hold it
+across commits; when a change ends the writer publishes a small copy, and status
+reads only that copy. A status reply therefore waits for no migration page,
+write, pressure pass or rewrite step, at most for one short copy. It still
+checks, without waiting, whether a writer panicked while holding the writer
+lock, and then refuses with `STORAGE_FAILURE` ("catalog writer poisoned") as
+every locked operation does, as do the three observed-status reads.
+
+One owner, `store_counters::apply`, runs on every write batch after the
+per-source counters and adds its row changes to the same batch. A key the batch
+creates, deletes, evicts or restores changes each counter whose position covers
+it after the batch. A batch that moves a migration checkpoint adds the keys
+between the old and new position, read from the store before the batch. The two
+together are exact whichever a batch contains, and a crash keeps or loses the
+rows with the change they follow. A count a write would take below zero, a
+missing row, a merge on a counted key or checkpoint, or a batch that writes the
+rows itself refuses the whole write with `STORAGE_FAILURE` naming the row.
+Nothing is clamped. A write batch holding a range delete is refused with
+`STORAGE_FAILURE` before any counter follows it, because the batch iterator the
+owners read never reports a range; only the open-time fences, which rewrite
+these rows themselves, delete ranges.
+
+Opening a store written before the rows moves its format to a store counter
+writer family, `sparrow.store/297` to `/351`, which lifts each source summary
+family by 55 and keeps its log time, archive and intake switches, so older
+binaries refuse the store. The same synchronized batch writes every row as zero
+and seeds the first online migration, `store-counters`
+(`store-counters-upgrade`); a store with no counted key is complete at once.
+The open walks no key range. Each page advances the checkpoint across up to
+16,384 keys of one counted prefix, and the owner counts the keys it passes in
+the same batch; every row's position is also capped at that checkpoint, so a
+write during seeding keeps each row exact for the keys it covers. While the
+counters seed, `status` and the migration report read the same fixed rows and
+report them as pending (`counts` and each `total`, above), exact through the
+seeding watermark; nothing recounts. The migration journal reports
+`total=counting`.
 
 ### Per-source counters and artifact index (store format)
 
@@ -677,7 +763,8 @@ naming the source or the key. Nothing is clamped.
 
 The counts follow retirement, not the retention deadline. A record past its
 deadline that has not been retired, for example while the archive gate holds
-it, still counts. Status `live_records` keeps its deadline meaning.
+it, still counts. Status `live_records` keeps its deadline meaning (see "Store
+counters").
 
 Opening a store written before these rows moves its format to a source summary
 writer family, `sparrow.store/242` to `/296`, which lifts each owner-graph
@@ -1191,7 +1278,8 @@ absent and present-list states. CLI scope files and MCP use the same native JSON
 decoder and typed encoder. Before sending a filtered read, these adapters require
 current discovery through the native client; an older daemon is refused with
 `UNSUPPORTED` rather than silently ignoring the added wire field. This discovery
-check uses bounded `discover`; explicit operational `status` remains a catalog scan.
+check uses bounded `discover`; explicit operational `status` reads fixed
+counter rows and the pin rows (see "Store counters").
 
 Membership expansion permits at most 100,000 direct pin members and 100,000
 record visits, including overlaps, and retains only bounded IDs/timestamps.
@@ -2165,6 +2253,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `pinRead` | Typed active-list/name/ID selector, finite catalog capture and store-scoped continuation pages. |
 | `keysList`, `valuesSearch`, `recordsSearch`, `recordsContext`, `sparqlQuery` | Shared native semantics, typed results, scope and query coverage; stored-text SPARQL relations remain required. |
 | `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume/tail administration; removal preserves existing claims and active tail generations guard definition changes/removal. |
+| `watchClaimRetire` | Administration (schema 70): retire one claim that can never complete, recording the authenticated caller, time and reason; see "Retiring an unrecoverable claim". |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Schema 23 adds `discover`: store identity, schema version, native text/RDF profile
@@ -2254,8 +2343,8 @@ retained record occurrences have separate exact counts. Identical content does
 not collapse occurrences. The counts come from the per-source counter rows (see
 "Per-source counters and artifact index") and follow retirement, not the
 retention deadline: a record past its deadline that has not been retired, for
-example while the archive gate holds it, still counts, while status
-`live_records` keeps its deadline meaning. A listing reads a snapshot taken
+example while the archive gate holds it, still counts. Status `live_records`
+keeps its deadline meaning. A listing reads a snapshot taken
 under the writer lock, which it releases before reading, so a listing never
 holds up ingest. It costs one entry against `scan_budget`, and that row's
 encoded size against the byte budget, per counter row it reads: one point read
@@ -2666,11 +2755,45 @@ establishes the total. Failed native projection is distinct from missing or corr
 catalog state, which refuses the whole read. Retired evidence is unavailable while
 the original managed publication receipt remains recoverable; recovery is no pin.
 
-Deletion is `not_managed`, `reserved`, `claimed`, `published` or `removed`.
+Deletion is `not_managed`, `reserved`, `claimed`, `published`, `removed` or
+`retired_unrecoverable`, the last for a claim an administrator retired with
+`watchClaimRetire`.
 Acceptance alone never proves source removal; only the original synchronized
 ownership journal supplies `removed_at`. Completed handoff lookup follows its
 existing finite retry lifetime. `watch_handoff_get` continues to certify the exact
 saved producer intent when that authority is needed.
+
+### Retiring an unrecoverable claim
+
+A consume claim whose source moved into the private `.sparrow-inflight/`
+directory and then vanished before publication can never complete: recovery
+needs that exact claimed generation and never republishes a replacement. It
+stays in `pending_claims`, its watch's `failure` names the claim and reads
+"unpublished claimed source is missing", and `sparrow-backup`, which waits for zero pending claims,
+fails every night. `watchClaimRetire` (CLI `watch retire-claim WATCH_ID
+CLAIM_ID REASON`, MCP `watch_claim_retire`) lets an administrator retire such a
+claim. It is an admin operation: anonymous TCP and the ingest socket refuse it,
+and a query-only daemon refuses it as a write. The watch's own claim owner
+checks, holding its private claim directory, that the private source is
+missing, and the store refuses unless the claim is active, belongs to that
+watch, was claimed and has no recorded publication. A claim whose private
+source exists, whose source never moved, or whose publication is recorded is
+refused with `CONFLICT`, as is a second retirement of the same claim. One write
+batch moves the claim out of the active journal set into a retired record that
+keeps the journal with the time, the caller and the reason. If the claim's
+staged import had begun, the same batch ends its staging lease; the next import
+reclaim pass then frees its staged chunks, private preparation and import slot
+through the ordinary expired-lease removal, so a retired claim never holds one
+of the 16 import slots. Retiring a claim clears the watch failure only when
+that claim's recovery set it; a failure another claim or discovery caused
+stays. The caller is the
+connection's administrator as the daemon identified it: `unix uid=U pid=P` on
+the private socket, `tcp-chap peer=ADDRESS` on a CHAP session. The claim leaves
+`pending_claims`; `status` and `watch list` list it under `retired_claims` with
+state `retired-unrecoverable`, and `ingest_get` reports its deletion as
+`retired_unrecoverable`. The daemon logs one line,
+`sparrowd: watch=W claim=ID retired-unrecoverable caller=… reason=… path=…`.
+A store keeps at most 64 retired claims, which are never removed.
 
 The default scan budget is 10,000 (maximum 100,000) records and pin collections;
 aggregate native catalog construction defaults to and is capped at 32 MiB.
@@ -2798,6 +2921,7 @@ sparrow $ENDPOINT watch remove REQUEST_ID WATCH_ID CURRENT_REVISION
 sparrow $ENDPOINT watch handoff-prepare REQUEST_ID WATCH_ID CURRENT_REVISION RELATIVE_PATH INTENT.capnp
 sparrow $ENDPOINT watch handoff INTENT.capnp
 sparrow $ENDPOINT watch handoff-status INTENT.capnp
+sparrow $ENDPOINT watch retire-claim WATCH_ID CLAIM_ID "REASON"
 # Save intents outside consumption roots; retry the same intent after uncertain delivery.
 # For a producer-finished tail, append TAIL_GENERATION_ID to handoff-prepare.
 

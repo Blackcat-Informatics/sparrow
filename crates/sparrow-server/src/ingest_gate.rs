@@ -177,6 +177,7 @@ decide! {
         sparql_query: SparqlQueryParams, SparqlQueryResults;
         correlate: CorrelateParams, CorrelateResults;
         sparql_explain: SparqlExplainParams, SparqlExplainResults;
+        watch_claim_retire: WatchClaimRetireParams, WatchClaimRetireResults;
     }
 }
 

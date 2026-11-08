@@ -55,9 +55,13 @@ pub(super) async fn finish(
         if closed {
             // Every worker has stopped and admission is closed, so nothing can change the count
             // again; sparrow-backup records this line from the journal of the stop it performed.
+            // While the store counters seed the count is not a total, so the line says pending.
             match (store.store_id(), store.unique_payload_chunks()) {
-                (Ok(id), Ok(chunks)) => {
+                (Ok(id), Ok(Some(chunks))) => {
                     eprintln!("sparrowd: closed store={id} unique_payload_chunks={chunks}");
+                }
+                (Ok(id), Ok(None)) => {
+                    eprintln!("sparrowd: closed store={id} unique_payload_chunks=pending");
                 }
                 (Err(error), _) | (_, Err(error)) => {
                     errors.push(format!("closing count: {error}"));

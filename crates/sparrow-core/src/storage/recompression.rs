@@ -127,6 +127,13 @@ pub(super) struct State {
     window: u64,
 }
 
+impl super::writer_queue::Observe for State {
+    type View = RecompressionStatus;
+    fn view(&self) -> RecompressionStatus {
+        self.status()
+    }
+}
+
 impl State {
     pub(super) fn load(db: &DB) -> Result<Self, Error> {
         let profile = db.get_pinned(PROFILE_KEY)?;
@@ -308,8 +315,10 @@ impl Writer {
 
 impl Store {
     /// Rewrite progress for the running binary's table options profile.
+    /// Reads the observed state without the writer lock, and refuses once it is poisoned.
     pub fn recompression_status(&self) -> Result<RecompressionStatus, Error> {
-        Ok(self.lock()?.recompression.borrow().status())
+        self.refuse_poisoned()?;
+        Ok(self.unlocked.recompression.read())
     }
 
     /// Observe the rewrite at `now` (Unix milliseconds) and turn native

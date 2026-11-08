@@ -58,6 +58,17 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
   setcap cap_net_bind_service=ep, run by a human with root); move the store aside and restore
   BACKUPS/pre-upgrade-FROM/store (cp -a --reflink=always into a chattr +C directory), which
   drops everything TO accepted; then start sparrow.service and both timers.
+- Claims after a rollback or restore. An intake root's .sparrow-inflight/ can hold a private
+  claim entry the restored store does not journal; the daemon then refuses to start with
+  "unrecognized private claim entry" (or "private claim directory exceeds its bounded journal
+  registry"). Move each such entry out of the intake root, keeping its bytes, never delete it,
+  and start again. A claim the store journals whose private source is missing never completes:
+  status shows it in pending_claims, the watch failure reads "unpublished claimed source is
+  missing", and every nightly backup waits for it. On a schema 70 image retire it, once its
+  bytes are confirmed lost: sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON". It
+  leaves pending_claims, status and watch list show it as retired-unrecoverable, and the
+  daemon logs one line. A claim whose private source exists or whose publication is recorded
+  is refused. Older images lack the command; go forward to TO first.
 USAGE
 }
 
@@ -242,9 +253,11 @@ T1=$EPOCHREALTIME
 log "status answers; downtime $(awk -v a="$T1" -v b="$T0" 'BEGIN{printf "%.1f", a-b}') s"
 python3 -I -c 'import json, sys
 v = json.load(sys.stdin)
-print("store_id=%s schema=%s format=%s live_records=%s pressure=%s pressure_failure=%s durability_failure=%s query_only=%s"
-      % (v["store_id"], v["schema_version"], v["store_format"], v["live_records"], v["pressure"]["phase"],
-         v["pressure"]["failure"], v["durability"]["failure"], v["query_only"]))' <<<"$out"
+# counts=pending (schema 70 and newer, while the store counters seed): live_records is exact
+# only through the seeding watermark, not a total. An older image reports no counts; exact.
+print("store_id=%s schema=%s format=%s live_records=%s counts=%s pressure=%s pressure_failure=%s durability_failure=%s query_only=%s"
+      % (v["store_id"], v["schema_version"], v["store_format"], v["live_records"], v.get("counts", "exact"),
+         v["pressure"]["phase"], v["pressure"]["failure"], v["durability"]["failure"], v["query_only"]))' <<<"$out"
 now=$(status_field store_id <<<"$out")
 [[ $now == "$STORE_ID" ]] || die "STORE ID CHANGED from $STORE_ID to $now; stop and read the recovery note"
 schema=$(status_field schema_version <<<"$out")

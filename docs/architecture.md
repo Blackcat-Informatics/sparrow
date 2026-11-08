@@ -554,7 +554,28 @@ committed page and a failed page is retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
 could differ: the schema 69 receipt-time fallback backfill is reported in
 SPARQL coverage, and the source listings refuse while their counters are seeded. `status` reports each migration's progress. A query-only
-daemon runs no maintenance worker, so it serves on the pending paths.
+daemon runs no maintenance worker, so it serves on the pending paths. Writers
+come before pages: before a page the maintenance worker waits while an ingest,
+publication or RPC write is waiting for the writer lock, for at most the longer
+of 100 ms and the previous page's hold, so the migration keeps progressing
+without holding writers behind a run of pages. The worker polls that wait with
+its other duties, so it delays only the page.
+
+`status` and the migration report never take the writer lock. They read fixed
+`store-counter:` rows from a RocksDB snapshot: the record, retained-record,
+artifact, graph-declaration, record-graph, payload-chunk and JSON-projection
+counts, and each migration's done count. One owner observes every write batch
+and adds the row changes to it, counting created, deleted and evicted keys and
+the keys a checkpoint move passes, so the rows are exact and crash-consistent
+with the writes they follow; a count that would go negative or a missing row
+refuses the write. Live records keep their deadline meaning: expiry marks a
+record retired in the batch that retires its evidence, so a record past its
+deadline counts only until that expiry pass, or while the archive gate holds it. The first online migration,
+`store-counters`, seeds the rows of an older store in pages that only advance
+its checkpoint; until it completes, those readers report the counts as pending,
+exact through its watermark, and recount nothing. Pressure, rewrite and
+durability state reach status as a small copy the writer publishes when a change
+ends, so status never waits for a pass that holds that state across commits.
 
 Source and artifact discovery read three derived catalog row families instead of
 the record catalog:

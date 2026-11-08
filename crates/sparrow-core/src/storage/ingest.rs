@@ -283,6 +283,7 @@ impl<'a> RecordBatch<'a> {
             diagnostics,
             chunks: record_chunks,
             evicted: false,
+            retired: false,
         };
         let json = self
             .projections

@@ -320,3 +320,81 @@ fn periodic_rescan_keeps_quiet_clocks_and_finds_missed_files() {
         Some(PathBuf::from("finished.bin"))
     );
 }
+
+#[test]
+fn retiring_a_claim_clears_only_the_failure_that_claim_caused() {
+    // INVARIANT (review 3, O12): `retire_claim` clears the watch failure only when the retired
+    // claim's own recovery set it. A failure from another claim or from discovery stays.
+    let directory = tempfile::tempdir().unwrap();
+    let producer = directory.path().join("producer");
+    std::fs::create_dir(&producer).unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut detectors = [Detector::open(
+        store,
+        ManagedWatch {
+            definition: ConsumeWatch {
+                id: "retire".into(),
+                root: producer.clone(),
+                producer_contract: crate::ProducerContract::FinishedFiles,
+                source: "retire".into(),
+                format: "opaque".into(),
+                quiet_ms: 30_000,
+                max_directories: 2,
+                max_candidates: 4,
+            },
+            revision: 1,
+            enabled: true,
+        },
+    )
+    .unwrap()];
+    // Three claimed sources whose private copies are gone, so each may be retired.
+    let [cause, other, discovered] = ["cause.bin", "other.bin", "discovered.bin"].map(|name| {
+        let path = producer.join(name);
+        std::fs::write(&path, name.as_bytes()).unwrap();
+        let identity = CompletedFileIdentity::capture(&path.metadata().unwrap());
+        let owner = detectors[0].owner.claim().unwrap();
+        let journal = owner
+            .reserve(Path::new(name), identity, "retire", "opaque")
+            .unwrap();
+        owner
+            .recover(&journal.import_id, crate::now().unwrap())
+            .unwrap();
+        std::fs::remove_file(producer.join(".sparrow-inflight").join(&journal.import_id)).unwrap();
+        journal.import_id
+    });
+    let retire = |detectors: &mut [Detector], claim: &str| {
+        let retirement = watch_admin::ClaimRetirement {
+            watch: "retire".into(),
+            claim: claim.into(),
+            caller: "test".into(),
+            reason: "source deleted".into(),
+        };
+        assert!(retire_claim(detectors, &retirement).is_ok());
+    };
+
+    // A failure another claim's recovery set survives retiring this claim.
+    detectors[0].failure = Some(format!("claim {cause}: missing"));
+    detectors[0].failed_claim = Some(cause.clone());
+    retire(&mut detectors, &other);
+    assert_eq!(
+        detectors[0].failure.as_deref(),
+        Some(format!("claim {cause}: missing").as_str())
+    );
+    assert_eq!(detectors[0].failed_claim.as_deref(), Some(cause.as_str()));
+
+    // Retiring the claim that set the failure clears it.
+    retire(&mut detectors, &cause);
+    assert_eq!(detectors[0].failure, None);
+    assert_eq!(detectors[0].failed_claim, None);
+
+    // A discovery failure names no claim, so no retirement clears it.
+    detectors[0].failure = Some("discovery refused".into());
+    retire(&mut detectors, &discovered);
+    assert_eq!(detectors[0].failure.as_deref(), Some("discovery refused"));
+}

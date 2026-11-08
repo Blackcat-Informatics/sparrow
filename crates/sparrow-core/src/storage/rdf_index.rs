@@ -347,12 +347,6 @@ pub(super) fn owner_graph_progress(
     }
 }
 
-/// Graph declarations at or before an owner graph build frontier, and all of them.
-pub(super) fn owner_graph_counts(db: &DB, after: Option<(u64, u64)>) -> Result<(u64, u64), Error> {
-    let frontier = after.map(|(graph, owner)| graph_key(graph, owner));
-    super::count_prefix(db, GRAPH_PREFIX, frontier.as_deref())
-}
-
 /// Stage one page of the owner graph build: up to `page` copied declarations and the
 /// advanced checkpoint in one batch, and whether the build is complete after it. `None`
 /// when the build was already complete. The checkpoint is `[0]` when complete, `[1]`

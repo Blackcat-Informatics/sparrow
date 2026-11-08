@@ -74,6 +74,18 @@ pub(crate) enum Command {
         intent: sparrow_core::TailFinishIntent,
         reply: oneshot::Sender<Result<sparrow_core::TailGeneration, sparrow_core::Error>>,
     },
+    RetireClaim {
+        retirement: ClaimRetirement,
+        reply: oneshot::Sender<Result<sparrow_core::RetiredConsumption, sparrow_core::Error>>,
+    },
+}
+
+/// An administrator's request to retire one unrecoverable claim of one watch.
+pub(crate) struct ClaimRetirement {
+    pub(crate) watch: String,
+    pub(crate) claim: String,
+    pub(crate) caller: String,
+    pub(crate) reason: String,
 }
 
 /// Bounded typed control path to the one worker owning durable watch mutations.
@@ -170,11 +182,50 @@ pub(crate) fn encode_info(
     mut out: crate::sparrow_capnp::watch_info::Builder<'_>,
     store: &str,
     watch: &ManagedWatch,
+    retired: &[sparrow_core::RetiredConsumption],
 ) -> capnp::Result<()> {
     out.set_store_id(store);
     out.set_revision(watch.revision);
     out.set_enabled(watch.enabled);
+    encode_retired(
+        |count| out.reborrow().init_retired_claims(count),
+        &watch.definition.id,
+        retired,
+    );
     encode_definition(out.init_definition(), &watch.definition)
+}
+
+/// The claims of `watch` retired unrecoverable, in a list `init` sizes.
+pub(crate) fn encode_retired<'a>(
+    init: impl FnOnce(
+        u32,
+    )
+        -> capnp::struct_list::Builder<'a, crate::sparrow_capnp::retired_claim::Owned>,
+    watch: &str,
+    retired: &[sparrow_core::RetiredConsumption],
+) {
+    let claims = retired
+        .iter()
+        .filter(|claim| claim.journal.watch == watch)
+        .collect::<Vec<_>>();
+    let mut out = init(claims.len() as u32);
+    for (index, claim) in claims.into_iter().enumerate() {
+        encode_retired_claim(out.reborrow().get(index as u32), claim);
+    }
+}
+
+/// One retired unrecoverable claim on the wire.
+pub(crate) fn encode_retired_claim(
+    mut out: crate::sparrow_capnp::retired_claim::Builder<'_>,
+    claim: &sparrow_core::RetiredConsumption,
+) {
+    out.set_claim_id(&claim.journal.import_id);
+    out.set_relative_path(&claim.journal.relative_path);
+    out.reborrow()
+        .init_retired_at()
+        .set_unix_millis(claim.retirement.retired_at);
+    out.set_caller(&claim.retirement.caller);
+    out.set_reason(&claim.retirement.reason);
 }
 
 impl WatchController {
@@ -187,6 +238,14 @@ impl WatchController {
     }
     pub(crate) async fn submit(&self, action: Action) -> Result<ManagedWatch, sparrow_core::Error> {
         self.enqueue(|reply| Command::Mutation { action, reply })
+            .await
+    }
+
+    pub(crate) async fn retire_claim(
+        &self,
+        retirement: ClaimRetirement,
+    ) -> Result<sparrow_core::RetiredConsumption, sparrow_core::Error> {
+        self.enqueue(|reply| Command::RetireClaim { retirement, reply })
             .await
     }
 

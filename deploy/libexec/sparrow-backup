@@ -21,7 +21,9 @@ daemon, whose reserved claims bind each file's identity.
 Each backup records in SOURCE the image that last opened the store, with the
 store's identity, schema, format and live records, and the stored payload chunks
 the daemon logged once it had stopped and exited 0 (an image that predates that line records
-payload_chunks=unrecorded instead), and keeps that image pair under images/
+payload_chunks=unrecorded instead). A count taken while the store counters seed is exact only
+through the seeding watermark, so SOURCE records it as pending rather than a number
+(live_records=pending, unique_payload_chunks=pending). It keeps that image pair under images/
 and the lexicon bundle it reads under lexicons/, so `deploy/start.sh --restored-from BACKUP` can start exactly that image. Only
 timestamp-named backups are pruned; a copy under another name (README.md,
 "Upgrades and rollback": pre-upgrade-IMAGE) is kept until removed by hand.
@@ -141,7 +143,8 @@ def invocation_id():
 
 
 CLOSING_PREFIX = "sparrowd: closed store="
-CLOSED = re.compile(re.escape(CLOSING_PREFIX) + r"(\S+) unique_payload_chunks=([0-9]+)")
+# The count is a number, or pending while a schema 70 or newer store's counters still seed.
+CLOSED = re.compile(re.escape(CLOSING_PREFIX) + r"(\S+) unique_payload_chunks=([0-9]+|pending)")
 
 
 def logs_closing_count(daemon):
@@ -163,8 +166,9 @@ def stop_result():
 
 
 def closing_chunks(invocation, store_id):
-    """The unique_payload_chunks the stopped daemon logged after its final flush. journald can
-    lag the stop briefly, so the read is retried for a bounded time."""
+    """The unique_payload_chunks the stopped daemon logged after its final flush: a number, or
+    pending when the store counters had not finished seeding, so the logged count was not a
+    total. journald can lag the stop briefly, so the read is retried for a bounded time."""
     journal = ["journalctl"] + (["--user"] if SCOPE == "user" else [])
     deadline = time.monotonic() + 30
     while True:
@@ -182,11 +186,23 @@ def closing_chunks(invocation, store_id):
             closed_store, chunks = found[-1].groups()
             if closed_store != store_id:
                 fail(f"the stopped daemon closed {closed_store}, not {store_id}")
-            return int(chunks)
+            return chunks if chunks == "pending" else int(chunks)
         if time.monotonic() > deadline:
             fail(f"the journal of {UNIT} invocation {invocation} has no closing count; the "
                  "daemon did not stop cleanly")
         time.sleep(1)
+
+
+def recorded_count(status, field):
+    """A counted status field as SOURCE records it: the number, or pending while the store
+    counters seed (status counts=pending), when the field is exact only through the seeding
+    watermark. A daemon older than schema 70 reports no counts field; its counts are exact."""
+    counts = status.get("counts", "exact")
+    if counts == "pending":
+        return "pending"
+    if counts != "exact":
+        raise RuntimeError(f"status reports counts={counts!r}, neither exact nor pending")
+    return int(status[field])
 
 
 def selected_image():
@@ -294,7 +310,7 @@ def main(server_config, backup_root, keep, intake, extra):
             "waiting_files=0\npending_claims=0\n"
             f"image={image}\nstore_id={status['store_id']}\n"
             f"schema_version={status['schema_version']}\nstore_format={status['store_format']}\n"
-            f"live_records={int(status['live_records'])}\n"
+            f"live_records={recorded_count(status, 'live_records')}\n"
             + "".join(f"extra={path}\n" for path in extra)
         )
         # The stopped daemon logs its closing count; this invocation's journal holds it.

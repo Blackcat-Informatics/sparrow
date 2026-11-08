@@ -76,6 +76,13 @@ pub(super) struct State {
     awaiting_physical: Option<u64>,
 }
 
+impl super::writer_queue::Observe for State {
+    type View = PressureStatus;
+    fn view(&self) -> PressureStatus {
+        self.status.clone()
+    }
+}
+
 impl State {
     pub(super) fn load(db: &rocksdb::DB) -> Result<Self, Error> {
         let Some(bytes) = db.get_pinned(WAIT_KEY)? else {
@@ -296,8 +303,10 @@ impl Writer {
 
 impl Store {
     /// Session-local pressure observations; reads do not request retirement.
+    /// Reads the observed state without the writer lock, and refuses once it is poisoned.
     pub fn pressure_status(&self) -> Result<PressureStatus, Error> {
-        Ok(self.lock()?.pressure.borrow().status.clone())
+        self.refuse_poisoned()?;
+        Ok(self.unlocked.pressure.read())
     }
 
     /// One bounded pressure pass, serialized with pins and all ingestion writers.

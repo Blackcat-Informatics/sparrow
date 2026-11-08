@@ -35,6 +35,10 @@ const TOOLS: &[(&str, &str)] = &[
         "Admit an immutable completed source for durable claim and deletion; a tail target acknowledges its original producer-finished checkpoint without reimporting records.",
     ),
     (
+        "watch_claim_retire",
+        "Administration: retire one consume claim that can never complete, recording the authenticated caller, the time and the reason. Refused unless the claim is pending, its claimed private source is missing and it never published. The claim leaves pending_claims and status and watch listings keep it as retired-unrecoverable. Irreversible; the source bytes it names are already gone.",
+    ),
+    (
         "watch_handoff_get",
         "Read original source retirement progress using the exact saved handoff intent; only removed confirms synchronized deletion.",
     ),
@@ -112,7 +116,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "status",
-        "Read current storage identity, limits and counters.",
+        "Read current storage identity, limits, counters and online migrations. While counts is pending, live_records, unique_payload_chunks and unique_json_projections are not totals, and a migration total reads counting.",
     ),
     (
         "keys_list",
@@ -278,6 +282,14 @@ pub(crate) fn definitions() -> Value {
                 .with("scan_budget", integer(100000))
                 .with("catalog_bytes", integer(33554432));
             required.push("store_id");
+        }
+        if *name == "watch_claim_retire" {
+            properties = properties
+                .with("store_id", string())
+                .with("watch", string())
+                .with("claim_id", string())
+                .with("reason", string());
+            required.extend(["store_id", "watch", "claim_id", "reason"]);
         }
         if *name == "file_generation_get" {
             properties = properties
@@ -670,14 +682,22 @@ pub(crate) fn definitions() -> Value {
                             "flush",
                             "file_finish",
                             "watch_handoff",
+                            "watch_claim_retire",
                         ]
                         .contains(name),
                     )
                     .with(
                         "destructiveHint",
-                        ["pin_release", "watch_handoff", "result_release"].contains(name),
+                        [
+                            "pin_release",
+                            "watch_handoff",
+                            "result_release",
+                            "watch_claim_retire",
+                        ]
+                        .contains(name),
                     )
-                    .with("idempotentHint", true)
+                    // A second retirement of the same claim is refused, not repeated.
+                    .with("idempotentHint", *name != "watch_claim_retire")
                     .with("openWorldHint", false),
             )
             .into()

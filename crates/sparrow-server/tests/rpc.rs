@@ -273,7 +273,7 @@ async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture
             assert_eq!(artifact["record_ids"].as_array().unwrap().len(), 3);
             assert_eq!(
                 cli(&endpoint, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/255")
+                Some("sparrow.store/310")
             );
             let first = cli(
                 &endpoint,
@@ -625,7 +625,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/246"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/301"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -1611,6 +1611,16 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
             ]
             .map(String::from);
             unauthenticated(sparrow_server::run_cli(&anonymous, &put).await);
+            // Claim retirement is administration: refused before CHAP (D118).
+            let retire = [
+                "watch",
+                "retire-claim",
+                "completed",
+                "import:0000000000000000000000000000000000000000000000000000000000000000",
+                "anonymous",
+            ]
+            .map(String::from);
+            unauthenticated(sparrow_server::run_cli(&anonymous, &retire).await);
             assert!(
                 cli(&socket, &["watch", "list"])["watches"]
                     .as_array()
@@ -1855,8 +1865,8 @@ async fn ingest_socket_records_peer_credentials_in_provenance() {
         .await;
 }
 
-/// INVARIANT: the ingest socket admits producer operations only. Reads and administration
-/// return PERMISSION_DENIED, and it offers no CHAP session (UNSUPPORTED).
+/// INVARIANT: the ingest socket admits producer operations only. Reads and administration,
+/// including claim retirement, return PERMISSION_DENIED, and it offers no CHAP session (UNSUPPORTED).
 #[tokio::test(flavor = "current_thread")]
 async fn ingest_socket_refuses_reads_and_administration() {
     tokio::task::LocalSet::new()
@@ -1874,12 +1884,19 @@ async fn ingest_socket_refuses_reads_and_administration() {
             let pin = gate.pin_request().send().promise.await.unwrap();
             let put = gate.watch_put_request().send().promise.await.unwrap();
             let read = gate.bytes_read_request().send().promise.await.unwrap();
+            let retire = gate
+                .watch_claim_retire_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
             for code in [
                 rpc_error_code(status.get().unwrap().get_result().unwrap()),
                 rpc_error_code(search.get().unwrap().get_result().unwrap()),
                 rpc_error_code(pin.get().unwrap().get_result().unwrap()),
                 rpc_error_code(put.get().unwrap().get_result().unwrap()),
                 rpc_error_code(read.get().unwrap().get_result().unwrap()),
+                rpc_error_code(retire.get().unwrap().get_result().unwrap()),
             ] {
                 assert_eq!(code, "PERMISSION_DENIED");
             }
@@ -3115,8 +3132,11 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
         .await;
 }
 
+/// Discovery and status read no record row (#146: status reads fixed counter keys), so a
+/// corrupt record leaves both answering with the counted totals; a read of the record
+/// itself still refuses it with `STORAGE_FAILURE` rather than concealing it.
 #[tokio::test(flavor = "current_thread")]
-async fn bounded_discovery_does_not_read_corrupt_evidence_or_disguise_status_failure() {
+async fn bounded_discovery_and_status_do_not_read_corrupt_evidence_and_keys_refuses_it() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
@@ -3156,20 +3176,10 @@ async fn bounded_discovery_does_not_read_corrupt_evidence_or_disguise_status_fai
                 .promise
                 .await
                 .unwrap();
-            match response
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                wire::result::Error(error) => assert_eq!(
-                    error.unwrap().get_code().unwrap().to_str().unwrap(),
-                    "STORAGE_FAILURE"
-                ),
-                wire::result::Ok(_) => panic!("status concealed a corrupt evidence row"),
-            }
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
+                1
+            );
             let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                 .arg(&socket)
                 .args(["keys"])
@@ -3873,7 +3883,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/245");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/300");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -4090,7 +4100,203 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/244")
+                Some("sparrow.store/299")
+            );
+        })
+        .await;
+}
+
+/// INVARIANT (D118): `watch retire-claim` retires only a claim that can never complete. A
+/// claim whose private source still exists is refused; one whose private source is missing
+/// leaves pending_claims, is listed as retired-unrecoverable in status and the watch listing
+/// with its caller and reason, and writes one journal line. A file that arrives while a claim
+/// is stuck keeps the drain sparrow-backup waits for (waiting files plus pending claims) above
+/// zero; once every claim is retired and the file is consumed it reaches zero.
+#[tokio::test(flavor = "current_thread")]
+async fn retire_claim_clears_only_an_unrecoverable_claim_and_lets_the_drain_reach_zero() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::{ServerConfig, consumption::ClaimRoot};
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 1_000, 16, 16);
+            // Two claims whose sources moved into the private claim directory.
+            let [lost, replaced] = {
+                let store = ServerConfig::read(&config).unwrap().open_store().unwrap();
+                let owner = ClaimRoot::open(store, "completed", &root).unwrap();
+                ["lost.jsonl", "replaced.jsonl"].map(|name| {
+                    let path = root.join(name);
+                    std::fs::write(&path, format!("{{\"name\":\"{name}\"}}\n")).unwrap();
+                    let identity =
+                        sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap());
+                    let journal = owner
+                        .reserve(Path::new(name), identity, "consume-acceptance", "jsonl")
+                        .unwrap();
+                    owner
+                        .recover(&journal.import_id, sparrow_server::now().unwrap())
+                        .unwrap();
+                    journal.import_id
+                })
+            };
+            let inflight = root.join(".sparrow-inflight");
+            // One private source is gone; the other is a different file, so neither recovers.
+            std::fs::remove_file(inflight.join(&lost)).unwrap();
+            std::fs::remove_file(inflight.join(&replaced)).unwrap();
+            std::fs::write(inflight.join(&replaced), b"not the claimed generation\n").unwrap();
+            let log = dir.path().join("daemon.log");
+            let daemon = start_with_stderr(
+                &config,
+                &socket,
+                Stdio::from(std::fs::File::create(&log).unwrap()),
+            )
+            .await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(producer.capability(), |watch| {
+                watch.get_pending_claims() == 2
+                    && matches!(
+                        watch.get_failure().unwrap().which().unwrap(),
+                        wire::optional_text::Value(_)
+                    )
+            })
+            .await;
+            let retire = |claim: &str| {
+                Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .arg(&socket)
+                    .args([
+                        "watch",
+                        "retire-claim",
+                        "completed",
+                        claim,
+                        "source deleted",
+                    ])
+                    .admitted_output()
+                    .unwrap()
+            };
+
+            // A private source that exists is recoverable or needs reconciliation, never retiring.
+            let refused = retire(&replaced);
+            assert!(!refused.status.success());
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains("CONFLICT") && stderr.contains("still exists"),
+                "{stderr}"
+            );
+            // MCP reaches the same operation and refusal.
+            let mut mcp = Mcp::start(&socket);
+            mcp.initialize(1).await;
+            let store_id = cli(&socket, &["status"])["store_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let refused = mcp
+                .tool(
+                    2,
+                    "watch_claim_retire",
+                    purrdf_lex::json::Object::new()
+                        .with("store_id", store_id.as_str())
+                        .with("watch", "completed")
+                        .with("claim_id", replaced.as_str())
+                        .with("reason", "source deleted")
+                        .into(),
+                )
+                .await;
+            assert_eq!(refused["isError"].as_bool(), Some(true), "{refused:?}");
+            assert_eq!(
+                refused["structuredContent"]["error"]["code"].as_str(),
+                Some("CONFLICT"),
+                "{refused:?}"
+            );
+            drop(mcp);
+
+            // Reconcile the replaced private entry (set its bytes aside): both claims are now
+            // unrecoverable. Which claim's failure the watch shows depends on retry timing, so
+            // the keep-another-claim's-failure rule is tested in the watch worker's unit tests.
+            std::fs::rename(inflight.join(&replaced), dir.path().join("set-aside")).unwrap();
+            let retired = cli(
+                &socket,
+                &[
+                    "watch",
+                    "retire-claim",
+                    "completed",
+                    &lost,
+                    "source deleted",
+                ],
+            );
+            let claim = &retired["retired_claim"];
+            assert_eq!(claim["claim_id"].as_str(), Some(lost.as_str()));
+            assert_eq!(claim["state"].as_str(), Some("retired-unrecoverable"));
+            assert_eq!(claim["reason"].as_str(), Some("source deleted"));
+            assert!(
+                claim["caller"].as_str().unwrap().starts_with("unix uid="),
+                "{claim:?}"
+            );
+            let status = cli(&socket, &["status"]);
+            let watch = &status["consume_watches"][0];
+            assert_eq!(watch["pending_claims"].as_u64(), Some(1), "{watch:?}");
+            assert_eq!(
+                watch["retired_claims"][0]["claim_id"].as_str(),
+                Some(lost.as_str())
+            );
+            let listed = cli(&socket, &["watch", "list"]);
+            assert_eq!(
+                listed["watches"][0]["retired_claims"][0]["claim_id"].as_str(),
+                Some(lost.as_str())
+            );
+            // A second retirement of the same claim is refused, not recorded again.
+            assert!(!retire(&lost).status.success());
+
+            // A file arrives while a claim is stuck: the drain sparrow-backup waits for
+            // (waiting files plus pending claims) is not zero, because the unrecoverable
+            // claim stays pending however the new file fares.
+            std::fs::write(root.join("waiting.jsonl"), b"{\"waiting\":1}\n").unwrap();
+            assert!(root.join("waiting.jsonl").exists());
+            assert!(
+                cli(&socket, &["status"])["consume_watches"][0]["pending_claims"]
+                    .as_u64()
+                    .unwrap()
+                    >= 1
+            );
+
+            // Retiring the last stuck claim lets the waiting file drain and the drain reach
+            // zero. Only retired claims ever failed, so no failure remains.
+            cli(
+                &socket,
+                &[
+                    "watch",
+                    "retire-claim",
+                    "completed",
+                    &replaced,
+                    "source deleted",
+                ],
+            );
+            watch_until(producer.capability(), |watch| {
+                watch.get_pending_claims() == 0 && watch.get_completed_claims() >= 1
+            })
+            .await;
+            let status = cli(&socket, &["status"]);
+            let watch = &status["consume_watches"][0];
+            assert_eq!(watch["pending_claims"].as_u64(), Some(0), "{watch:?}");
+            assert_eq!(watch["retired_claims"].as_array().unwrap().len(), 2);
+            assert!(watch["failure"].is_null(), "{watch:?}");
+            let waiting = std::fs::read_dir(&root)
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name() != ".sparrow-inflight")
+                .count();
+            assert_eq!(waiting, 0, "no file waits in the root");
+            drop(producer);
+            drop(daemon);
+            let journal = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(
+                journal
+                    .lines()
+                    .filter(|line| line.contains("retired-unrecoverable"))
+                    .count(),
+                2,
+                "one journal line per retirement: {journal}"
             );
         })
         .await;
@@ -4378,13 +4584,19 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 "the copy claimed nothing"
             );
             let status = cli(&copy_socket, &["status"]);
-            assert_eq!(status["live_records"].as_str(), Some("1"));
-            // A query-only open fences and serves, but never runs a migration page.
+            // A query-only open fences and serves, but never runs a migration page, so the
+            // store counters stay pending: counted through the seeding start, not totals.
+            assert_eq!(status["counts"].as_str(), Some("pending"));
+            assert_eq!(status["live_records"].as_str(), Some("0"));
             let migrations = status["migrations"].as_array().unwrap();
-            assert_eq!(migrations.len(), 3, "{migrations:?}");
+            assert_eq!(migrations.len(), 4, "{migrations:?}");
             for migration in migrations {
                 assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
-                assert_ne!(migration["total"].as_str(), Some("0"), "{migration:?}");
+                assert_eq!(
+                    migration["total"].as_str(),
+                    Some("counting"),
+                    "{migration:?}"
+                );
                 assert_eq!(migration["watermark"].as_str(), Some("start"));
                 assert!(migration["failure"].is_null());
             }
@@ -4440,6 +4652,8 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };
             assert_eq!(status["query_only"].as_bool(), Some(false));
+            assert_eq!(status["counts"].as_str(), Some("exact"));
+            assert_eq!(status["live_records"].as_str(), Some("1"));
             for migration in status["migrations"].as_array().unwrap() {
                 assert_eq!(migration["done"], migration["total"], "{migration:?}");
             }
@@ -4659,6 +4873,82 @@ fn verify_backup_fails_on_wrong_store_id() {
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("FAIL store-id:"), "{stderr}");
     assert!(!stdout.contains("PASS records"), "{stdout}");
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+}
+
+/// INVARIANT: verify-backup.sh never compares a pending count. When SOURCE recorded
+/// `unique_payload_chunks=pending`, or the copy's store counters are still seeding (a store
+/// written before #146 that the image upgrades), it reports the payload-chunks check as not
+/// verifiable rather than passing or failing it, still runs and passes every other check,
+/// expects the closing line to say pending for a pending copy, and exits 3, not 0.
+#[test]
+fn verify_backup_reports_pending_counts_as_not_verifiable() {
+    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, _, backup, _) = backup_fixture(dir.path());
+    let verify = dir.path().join("verify");
+    let image = ["--image", env!("CARGO_BIN_EXE_sparrowd")];
+    let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
+    let recorded = source
+        .lines()
+        .find(|line| line.starts_with("unique_payload_chunks="))
+        .unwrap()
+        .to_owned();
+    let others = ["query-only", "store-id", "status", "records", "artifact"];
+    let unverifiable = "NOT VERIFIABLE payload-chunks: not verifiable (counts pending)";
+    let summary = "verified except payload-chunks: not verifiable (counts pending)";
+
+    // SOURCE pending, copy exact: the live daemon logged no total, so nothing is compared.
+    std::fs::write(
+        backup.join("SOURCE"),
+        source.replace(&recorded, "unique_payload_chunks=pending"),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
+    assert_eq!(code, Some(3), "not verified: {stdout}{stderr}");
+    assert!(stdout.contains(unverifiable), "{stdout}");
+    assert!(!stdout.contains("PASS payload-chunks"), "{stdout}");
+    assert!(stdout.contains(summary), "{stdout}");
+    for check in others {
+        assert!(
+            stdout.contains(&format!("PASS {check}:")),
+            "{check}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains(&format!(
+            "PASS shutdown: the daemon stopped cleanly and logged {recorded};"
+        )),
+        "an exact copy still logs its count: {stdout}"
+    );
+
+    // SOURCE numeric, copy pending: the copy's count covers only the seeded keys.
+    std::fs::write(backup.join("SOURCE"), &source).unwrap();
+    let db = sparrow_test_support::catalog_db(&backup.join("store")).unwrap();
+    sparrow_core::remove_store_counters_for_legacy_fixture(&db).unwrap();
+    drop(db);
+    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
+    assert_eq!(code, Some(3), "not verified: {stdout}{stderr}");
+    assert!(stdout.contains(unverifiable), "{stdout}");
+    assert!(!stdout.contains("PASS payload-chunks"), "{stdout}");
+    assert!(!stderr.contains("FAIL"), "{stderr}");
+    assert!(stdout.contains(summary), "{stdout}");
+    for check in others {
+        assert!(
+            stdout.contains(&format!("PASS {check}:")),
+            "{check}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains(
+            "PASS shutdown: the daemon stopped cleanly and logged unique_payload_chunks=pending"
+        ),
+        "{stdout}"
+    );
     assert_eq!(
         std::fs::read_dir(&verify).unwrap().count(),
         0,
@@ -5123,7 +5413,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/244"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/299"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -9031,7 +9321,7 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 38);
+    assert_eq!(definitions.len(), 39);
     for (name, read_only) in [
         ("sparql_explain", true),
         ("correlate", true),
@@ -9041,6 +9331,7 @@ async fn mcp_exercise(
         ("file_finish_get", true),
         ("watch_handoff", false),
         ("watch_handoff_get", true),
+        ("watch_claim_retire", false),
         ("result_release", false),
         ("syslog_listener_get", true),
         ("receiver_window_get", true),

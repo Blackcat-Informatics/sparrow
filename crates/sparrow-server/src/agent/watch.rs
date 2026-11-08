@@ -30,6 +30,14 @@ pub(crate) enum Input {
         intent: sparrow_client::CompletedHandoff,
         read_only: bool,
     },
+    /// Retire one unrecoverable claim of one watch; `store` is the caller's expected store,
+    /// or the discovered one from the CLI.
+    RetireClaim {
+        store: Option<String>,
+        watch: String,
+        claim: String,
+        reason: String,
+    },
 }
 
 impl Input {
@@ -84,8 +92,16 @@ impl Input {
                 expected: decimal_u64(&Value::from(expected.clone()))
                     .map_err(|error| invalid(error.to_string()))?,
             }),
+            [operation, watch, claim, reason] if operation == "retire-claim" => {
+                Ok(Self::RetireClaim {
+                    store: None,
+                    watch: watch.clone(),
+                    claim: claim.clone(),
+                    reason: reason.clone(),
+                })
+            }
             _ => Err(invalid(
-                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp; zero revision creates a watch",
+                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp | watch retire-claim WATCH_ID CLAIM_ID REASON; zero revision creates a watch",
             )),
         }
     }
@@ -244,6 +260,29 @@ impl Input {
                 let response = call.send().promise.await?;
                 mutation(response.get()?.get_result()?)
             }
+            Self::RetireClaim {
+                store,
+                watch,
+                claim,
+                reason,
+            } => {
+                let mut call = client.watch_claim_retire_request();
+                let mut input = call.get().init_request();
+                input.set_store_id(store.as_deref().unwrap_or(&discovery.store_id));
+                input.set_watch(watch);
+                input.set_claim_id(claim);
+                input.set_reason(reason);
+                let response = call.send().promise.await?;
+                let claim = match response.get()?.get_result()?.which()? {
+                    wire::result::Ok(value) => value?,
+                    wire::result::Error(error) => return Err(failure(error?)),
+                };
+                Ok(Object::new()
+                    .with("store_id", discovery.store_id.as_str())
+                    .with("watch", watch.as_str())
+                    .with("retired_claim", retired_claim(claim)?)
+                    .into())
+            }
             Self::Remove {
                 request,
                 id,
@@ -279,11 +318,42 @@ fn mutation(result: wire::result::Reader<'_, wire::watch_mutation::Owned>) -> Re
         .into())
 }
 
+/// One retired unrecoverable claim as JSON, shared by watch listings and status.
+pub(super) fn retired_claim(value: wire::retired_claim::Reader<'_>) -> Result<Value> {
+    Ok(Object::new()
+        .with("claim_id", value.get_claim_id()?.to_str()?)
+        .with("state", "retired-unrecoverable")
+        .with(
+            "relative_path_hex",
+            purrdf_hash::hex::encode(value.get_relative_path()?),
+        )
+        .with("retired_at", super::instant(value.get_retired_at()?)?)
+        .with("caller", value.get_caller()?.to_str()?)
+        .with("reason", value.get_reason()?.to_str()?)
+        .into())
+}
+
+/// The retired unrecoverable claims of one watch as a JSON list.
+pub(super) fn retired_claims(
+    claims: capnp::struct_list::Reader<'_, wire::retired_claim::Owned>,
+) -> Result<Value> {
+    Ok(Value::from(
+        claims
+            .iter()
+            .map(retired_claim)
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
 fn info(value: wire::watch_info::Reader<'_>) -> Result<Value> {
     Ok(Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("revision", value.get_revision().to_string())
         .with("enabled", value.get_enabled())
+        .with(
+            "retired_claims",
+            retired_claims(value.get_retired_claims()?)?,
+        )
         .with("definition", definition(value.get_definition()?)?)
         .into())
 }
