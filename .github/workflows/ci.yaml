@@ -59,7 +59,7 @@ jobs:
       - name: Install capnp and libclang
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends capnproto libclang-dev clang
+          sudo apt-get install -y --no-install-recommends capnproto libclang-dev clang libcap2-bin
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1

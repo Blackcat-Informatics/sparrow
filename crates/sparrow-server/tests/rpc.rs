@@ -4786,6 +4786,96 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
     );
 }
 
+/// INVARIANT: deploy/user-unit-upgrade.sh refuses a trailing --to without a value, a daemon
+/// link that does not name --from, and a --to daemon without cap_net_bind_service before it
+/// changes anything: no backup is started and the links are untouched. Every path is a scratch
+/// override, and each refusal precedes the script's first systemctl call, so no unit is ever
+/// addressed.
+#[test]
+fn user_unit_upgrade_refuses_before_changing_anything() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (from, to) = ("sparrowd-schema68-aaaaaaa", "sparrowd-schema69-bbbbbbb");
+    let prefix = dir.path().join("prefix");
+    let libexec = prefix.join("libexec").join("sparrow");
+    let bin = dir.path().join("bin");
+    let backups = dir.path().join("backups");
+    for path in [&libexec, &bin, &prefix.join("bin"), &backups] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    // Never executed: the preconditions only test that the images exist and match ./bin.
+    let image = b"#!/bin/sh\nexit 1\n";
+    for name in [
+        from,
+        to,
+        "sparrow-schema68-aaaaaaa",
+        "sparrow-schema69-bbbbbbb",
+    ] {
+        for parent in [&libexec, &bin] {
+            let path = parent.join(name);
+            std::fs::write(&path, image).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let link = libexec.join("sparrowd");
+    let run = |args: &[&str]| {
+        let output = Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/user-unit-upgrade.sh"
+        ))
+        .args(args)
+        .env("HOME", dir.path())
+        .env("SPARROW_SCOPE", "system")
+        .env_remove("SPARROW_UNIT")
+        .env("SPARROW_PREFIX", &prefix)
+        .env(
+            "SPARROW_CONFIG",
+            dir.path().join("config").join("server.toml"),
+        )
+        .env("SPARROW_BACKUPS", &backups)
+        .env("SPARROW_BIN", &bin)
+        .admitted_output()
+        .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let unchanged = |expected: &str| {
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(expected));
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 0);
+    };
+    let switch = ["--from", from, "--to", to];
+
+    symlink(from, &link).unwrap();
+    let (code, stdout, stderr) = run(&["--from", from, "--to"]);
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("--to needs a daemon image name"),
+        "{stderr}"
+    );
+    unchanged(from);
+
+    std::fs::remove_file(&link).unwrap();
+    symlink("sparrowd-schema67-ccccccc", &link).unwrap();
+    let (code, stdout, stderr) = run(&switch);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("unexpected daemon link")
+            && stderr.contains("not sparrowd-schema68-aaaaaaa"),
+        "{stderr}"
+    );
+    unchanged("sparrowd-schema67-ccccccc");
+
+    std::fs::remove_file(&link).unwrap();
+    symlink(from, &link).unwrap();
+    let (code, stdout, stderr) = run(&switch);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("lacks cap_net_bind_service"), "{stderr}");
+    unchanged(from);
+}
+
 #[test]
 fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
     let dir = tempfile::tempdir().unwrap();

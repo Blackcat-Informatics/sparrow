@@ -508,3 +508,66 @@ Each measurement is one `verify-backup: MEASURE` line on standard output:
 This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live
 acceptance evidence are recorded in [Development runtime](development-runtime.md).
+
+## Switching the user unit's image
+
+Until Sparrow issue #22 moves the live store to the system unit, it runs under
+the operator's old user unit, `sparrow.service` under `systemctl --user`. The
+system unit's scripts refuse that unit. `deploy/user-unit-upgrade.sh` switches
+it from one kept image pair to another and takes the named pre-upgrade backup
+in the stopped window:
+
+```bash
+deploy/user-unit-upgrade.sh --from sparrowd-schema68-2aa56a9 --to sparrowd-schema69-3a64e08
+```
+
+Both arguments name daemon images under `~/.local/libexec/sparrow`. Each CLI
+image is the daemon's name with `sparrowd-` replaced by `sparrow-`, and the
+schema numbers come from the names. Run it as the operator, only on the
+coordination session's go. `SPARROW_PREFIX` (default `~/.local`),
+`SPARROW_CONFIG` (default `~/.config/sparrow/server.toml`, which names the store
+and its sockets), `SPARROW_BACKUPS` and `SPARROW_BIN` override the layout;
+`--help` lists them.
+
+Before anything changes it refuses unless all of these hold:
+
+- `pre-upgrade-FROM` is absent from the backup directory.
+- The daemon link names `--from`.
+- All four images are executable.
+- The `--to` pair matches `./bin` byte for byte.
+- The `--to` daemon carries `cap_net_bind_service`.
+- `server.toml` sets the ingest keys.
+- The store has copy-on-write off.
+- The backup directory is on the store's filesystem, which the reflink copy needs.
+- The store's filesystem has the store's size plus 10 GiB free.
+- No nightly backup is running.
+- The running daemon reports the `--from` schema.
+
+The capability is a prerequisite done by a human with root,
+`sudo setcap cap_net_bind_service=ep ~/.local/libexec/sparrow/IMAGE`; the
+script checks it with `getcap` and never runs `setcap`.
+
+It then stops both timers and waits for the shipper, stops the unit and checks
+that no `sparrowd` remains. Next it copies the closed store by reflink into a
+no-copy-on-write `pre-upgrade-FROM` and compares the file lists. The backup
+also keeps the old image pair, `server.toml`, `ship.toml` and a `SOURCE` file.
+Last, it switches the links and starts the unit.
+
+It waits up to 10 minutes, the switch gate, for the first status answer. The
+measured first open of schema 69 on a copy of the live store under the unit's
+limits answered in 117.2 seconds (`verify-backup.sh --measure-migration`,
+2026-11-07). It does not wait for pressure to report `ready`: that phase tracks
+disk-budget maintenance, not the migrations. After the first answer it fails
+unless the store identity is unchanged and the schema is the `--to` schema. It
+prints each migration's `done`, `total` and `failure`, the watches and the
+ingest socket, starts the timers, and exits 0. The backfill continues online
+in the running daemon. Watch it with `sparrow /SPARROW/store/rpc.sock status`
+(`migrations`) and with `journalctl --user -u sparrow.service`, which logs a
+`sparrowd: migration` progress line every 64 pages and a completion line per
+migration.
+
+`--help` gives the recovery for each failure point. A failure after the start
+leaves the `--to` daemon running with both timers stopped, and it may already
+have accepted ingest. The recovery goes forward first: wait for status, confirm
+the store identity and schema, then start the timers. A rollback restores the
+pre-upgrade backup and drops everything `--to` accepted.
