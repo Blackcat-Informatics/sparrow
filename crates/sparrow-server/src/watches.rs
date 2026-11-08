@@ -260,6 +260,9 @@ struct Detector {
     reconciliations: u64,
     coverage_losses: u64,
     failure: Option<String>,
+    /// The claim whose recovery set `failure`, if a claim's recovery did; any other
+    /// failure clears it. Retiring that claim clears the failure, and nothing else does.
+    failed_claim: Option<String>,
     tail_admission_waiting: bool,
 }
 
@@ -293,6 +296,7 @@ impl Detector {
             reconciliations: 0,
             coverage_losses: 0,
             failure: None,
+            failed_claim: None,
             tail_admission_waiting: false,
         };
         detector.reconcile("startup")?;
@@ -399,10 +403,12 @@ impl Detector {
                 }
                 Err(Error::FinishedGeneration(message)) => {
                     self.failure = Some(message.into());
+                    self.failed_claim = None;
                     Ok(())
                 }
                 Err(error) => {
                     self.failure = Some(error.to_string().chars().take(1024).collect());
+                    self.failed_claim = None;
                     self.deferred = true;
                     Ok(())
                 }
@@ -816,6 +822,56 @@ fn storage_admission(error: sparrow_core::Error) -> AdminFailure {
     }
 }
 
+/// Retire one unrecoverable claim through the watch's own claim owner, which holds its
+/// private claim directory, and write the one journal line that records it.
+fn retire_claim(
+    detectors: &mut [Detector],
+    retirement: &watch_admin::ClaimRetirement,
+) -> Result<sparrow_core::RetiredConsumption, AdminFailure> {
+    let now = crate::now().map_err(AdminFailure::Refused)?;
+    let detector = detectors
+        .iter_mut()
+        .find(|detector| detector.config.id == retirement.watch)
+        .ok_or_else(|| {
+            AdminFailure::Refused(watch_admin::failure(
+                "NOT_FOUND",
+                "claim retirement names no configured watch",
+            ))
+        })?;
+    let retired = detector
+        .owner
+        .claim()
+        .map_err(|error| AdminFailure::Refused(watch_admin::failure("UNSUPPORTED", error)))?
+        .retire(
+            &retirement.claim,
+            &retirement.caller,
+            &retirement.reason,
+            now,
+        )
+        .map_err(|error| match error {
+            Error::Storage(error) => storage_admission(error),
+            Error::State(message) => {
+                AdminFailure::Refused(watch_admin::failure("CONFLICT", message))
+            }
+            error => AdminFailure::Refused(watch_admin::failure("STORAGE_FAILURE", error)),
+        })?;
+    // Clear the watch failure only when it is this claim's recovery refusal; a failure from
+    // another claim or from discovery stays until its own cause resolves.
+    if detector.failed_claim.as_deref() == Some(retirement.claim.as_str()) {
+        detector.failure = None;
+        detector.failed_claim = None;
+    }
+    eprintln!(
+        "sparrowd: watch={} claim={} retired-unrecoverable caller={:?} reason={:?} path={:?}",
+        retirement.watch,
+        retirement.claim,
+        retired.retirement.caller,
+        retired.retirement.reason,
+        String::from_utf8_lossy(&retired.journal.relative_path),
+    );
+    Ok(retired)
+}
+
 fn admit_tail_finish(
     store: &Store,
     detectors: &mut [Detector],
@@ -1037,6 +1093,13 @@ async fn run(
                     let result = admit_tail_finish(&store, &mut detectors, &intent);
                     acknowledge(reply, result, &store, &registry, &detectors)?;
                 }
+                watch_admin::Command::RetireClaim { retirement, reply } => {
+                    let result = retire_claim(&mut detectors, &retirement);
+                    if result.is_ok() {
+                        retry.remove(&retirement.claim);
+                    }
+                    acknowledge(reply, result, &store, &registry, &detectors)?;
+                }
             }
         }
         for detector in &mut detectors {
@@ -1076,7 +1139,8 @@ async fn run(
                         return Err(Error::Storage(error));
                     }
                     Err(error) => {
-                        detector.failure = Some(error.to_string().chars().take(1024).collect())
+                        detector.failure = Some(error.to_string().chars().take(1024).collect());
+                        detector.failed_claim = None;
                     }
                 }
             }
@@ -1132,6 +1196,7 @@ async fn run(
                         }
                         Err(error) => {
                             detector.failure = Some(error.to_string().chars().take(1024).collect());
+                            detector.failed_claim = None;
                             eprintln!(
                                 "sparrowd: watch={} reservation refused for {:?}: {error}",
                                 detector.config.id, path
@@ -1230,7 +1295,10 @@ async fn run(
                 result = tokio::time::timeout(PUBLICATION_DEADLINE, operation) => result.unwrap_or(Err(Error::State("consume publication deadline expired; retain the original journal and retry"))),
             };
             if let Err(error) = result {
-                detector.failure = Some(error.to_string().chars().take(1024).collect());
+                // Name the claim, so an operator can act on it (retire-claim takes its ID).
+                detector.failure =
+                    Some(format!("claim {id}: {error}").chars().take(1024).collect());
+                detector.failed_claim = Some(id.clone());
                 eprintln!("sparrowd: watch={watch} claim={id} pending: {error}");
                 let failures = retry
                     .get(&id)
@@ -1242,6 +1310,7 @@ async fn run(
                 }
             } else {
                 detector.failure = None;
+                detector.failed_claim = None;
                 detector.completed = detector.completed.saturating_add(1);
             }
             if let Some(index) = detectors

@@ -76,6 +76,7 @@ pub(super) fn encode(
     }
     out.set_deletion(match value.deletion {
         sparrow_core::IngestDeletion::NotManaged => wire::IngestDeletion::NotManaged,
+        sparrow_core::IngestDeletion::Retired => wire::IngestDeletion::Retired,
         sparrow_core::IngestDeletion::Reserved => wire::IngestDeletion::Reserved,
         sparrow_core::IngestDeletion::Claimed => wire::IngestDeletion::Claimed,
         sparrow_core::IngestDeletion::Published => wire::IngestDeletion::Published,

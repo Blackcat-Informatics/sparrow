@@ -170,6 +170,48 @@ fingerprints = []
 names = ['^(source_counter_delta|update_source_summary|clamp_source_count|copy_source_summary_pager|source_sha256|fold_catalog_batch)$']
 
 [[job]]
+id = "store-counters"
+summary = "One WriteBatch observer, called in Writer::apply after the per-source counters for every write, keeps the store-counter rows (records, retained records, artifacts, graph declarations, record graphs, payload chunks, JSON projections and each migration's done count) exact in the same batch: key existence and eviction changes within each row's bound, plus the keys a checkpoint move passes, read before the batch. Underflow or a missing row refuses with STORAGE_FAILURE, never clamped. status, unique_payload_chunks and the migration report read the rows from one snapshot without the writer lock; while the first online migration seeds them they report the rows as pending, exact through its watermark, and nothing recounts at run time (the recount is a test-support audit). Batches fold through the one durability::observe_batch, which refuses a batch holding a range delete."
+home = "sparrow_core::storage::store_counters::apply"
+entry_points = ["sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::store_counters::page", "sparrow_core::storage::store_counters::fence", "sparrow_core::storage::store_counters::values", "sparrow_core::storage::migration::report", "sparrow_core::storage::Store::status_report", "sparrow_core::storage::writer_format::enable_store_counters"]
+spec = "docs/interfaces.md: store counters (store format) and online store migrations; docs/architecture.md section 7."
+vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/src/maintenance.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(count_records_under_lock|recount_status_catalog|migration_counts|owner_graph_counts|clamp_store_counter|pending_path_recount)$']
+
+[[job]]
+id = "writer-priority-over-migration-pages"
+summary = "Every ordinary writer registers in the one writer queue while it waits for the catalog writer lock; before a migration page the maintenance worker waits on that queue's condition variable until no writer waits, bounded by the longer of 100 ms and the previous page's hold, in a blocking task it polls with its other duties so only the page waits. No polling of the queue and no second scheduler."
+home = "sparrow_core::storage::writer_queue::WriterQueue::defer_page"
+entry_points = ["sparrow_core::storage::writer_queue::WriterQueue::arrive", "sparrow_core::storage::Store::defer_migration_page", "sparrow_core::storage::Store::migrate_step"]
+spec = "docs/interfaces.md: online store migrations; docs/architecture.md section 7."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/src/maintenance.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(yield_to_writers_by_polling|fair_writer_mutex|spin_until_writers_drain)$']
+
+[[job]]
+id = "observed-writer-state"
+summary = "Durability, pressure and table rewrite state stay writer-local and may be held across commits; a mutable borrow publishes a small Observe::View copy when it ends, and status reads only that copy, so status never waits for a pressure pass, rewrite step or commit."
+home = "sparrow_core::storage::writer_queue::Observed::borrow_mut"
+entry_points = ["sparrow_core::storage::writer_queue::Published::read", "sparrow_core::storage::Store::durability_status", "sparrow_core::storage::Store::pressure_status", "sparrow_core::storage::Store::recompression_status"]
+spec = "docs/interfaces.md: store counters (store format); docs/architecture.md section 7."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(status_reads_writer_state_under_lock|clone_whole_durability_ledger)$']
+
+[[job]]
 id = "owner-graph-index"
 summary = "One RDF writer puts and deletes every rdf:g graph declaration together with its rdf:o owner-to-graph mirror in the same batch. One online migration, fenced and seeded at open and paged by the maintenance worker, builds the mirror from existing declaration keys in resumable pages behind the owner-graph writer families, covering privately prepared graphs. Scoped views enumerate graphs from the mirror and merge graph-leading twins of the store-wide plan through the one ScopedRows heap."
 home = "sparrow_core::storage::rdf_index::owner_graph_key"
@@ -2666,8 +2708,8 @@ names = ['^(collect_eviction_candidates|sort_recordless_artifacts)$']
 [[job]]
 id = "streaming-evidence-catalog"
 summary = "Decode and identity-check one native evidence catalog entry at a time for status, listings, pin mutation and protection capture."
-home = "sparrow_core::storage::Writer::decode_evidence"
-entry_points = ["sparrow_core::storage::Writer::catalog", "sparrow_core::storage::Writer::count_catalog", "sparrow_core::storage::Writer::protected_matching"]
+home = "sparrow_core::storage::decode_evidence_entry"
+entry_points = ["sparrow_core::storage::Writer::decode_evidence", "sparrow_core::storage::Writer::catalog", "sparrow_core::storage::Writer::protected_matching", "sparrow_core::storage::Store::status"]
 spec = "docs/development-runtime.md: streaming evidence catalog reads."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2877,8 +2919,8 @@ names = ['^(open_corrupt_time_db|open_corrupt_diagnostic_db|open_test_catalog_ag
 [[job]]
 id = "bounded-store-properties"
 summary = "One property owner serves compatibility discovery and full status without duplicating profile identities or admission limits."
-home = "sparrow_core::storage::Writer::properties"
-entry_points = ["sparrow_core::storage::Store::properties"]
+home = "sparrow_core::storage::store_properties"
+entry_points = ["sparrow_core::storage::Store::properties", "sparrow_core::storage::Store::status"]
 spec = "docs/interfaces.md: schema 23 bounded discovery."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []

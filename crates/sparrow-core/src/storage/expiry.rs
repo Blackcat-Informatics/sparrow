@@ -292,8 +292,14 @@ impl Writer {
                                 break 'phases;
                             }
                             report.payload_refs += record.chunks.len();
-                            if retirement.record(&mut record, 1)? {
+                            let retired = retirement.record(&mut record, 1)?;
+                            if retired {
                                 report.records += 1;
+                            }
+                            // The marker drops the record from status `live_records` in this
+                            // batch, a day before the entry itself is deleted (#146).
+                            if retired || !record.retired {
+                                record.retired = true;
                                 put(&mut retirement.batch, &record.id, &record);
                             }
                             if record.expires_at.saturating_add(DAY) <= now {

@@ -251,13 +251,20 @@ struct Status {
   ingestSocket @52 :OptionalIngestSocketStatus;
   # Schema 69: the online store migrations and their progress.
   migrations @53 :List(MigrationStatus);
+  # Schema 70: true while the store counters seed. liveRecords, uniquePayloadChunks and
+  # uniqueJsonProjections then count only the keys through the `store-counters` watermark;
+  # they are not totals until this is false.
+  countsPending @54 :Bool;
 }
 # One online store migration. `done` of `total` source entries are migrated; `watermark` is
 # the opaque last committed position, `start` before the first page and absent only once
 # complete; `failure` is the latched error of the last page, cleared when a page succeeds.
+# Schema 70: `totalPending` is true while the store counters seed; `total` is then 0 and
+# `done` is exact through the seeding watermark.
 struct MigrationStatus {
   name @0 :Text; done @1 :UInt64; total @2 :UInt64;
   watermark @3 :OptionalText; failure @4 :OptionalText;
+  totalPending @5 :Bool;
 }
 struct IngestSocketStatus {
   path @0 :Text; gid @1 :UInt32; maxConnections @2 :UInt32;
@@ -307,6 +314,14 @@ struct ConsumeWatchStatus {
   failure @10 :OptionalText;
   definition @11 :WatchDefinition; revision @12 :UInt64; enabled @13 :Bool;
   tailGenerationIds @14 :List(Text); tailReadBytes @15 :UInt64; tailDescriptors @16 :UInt32; tailCheckpointRecords @17 :UInt64; tailAdmissionWaiting @18 :Bool;
+  # Schema 70: claims an administrator retired as unrecoverable; never counted as pending.
+  retiredClaims @19 :List(RetiredClaim);
+}
+
+# A claim retired unrecoverable by watchClaimRetire: claimed, its private source missing and
+# never published. It leaves pendingClaims and is kept as this audit record.
+struct RetiredClaim {
+  claimId @0 :Text; relativePath @1 :Data; retiredAt @2 :Instant; caller @3 :Text; reason @4 :Text;
 }
 
 enum WatchMode { consume @0; tail @1; }
@@ -322,12 +337,15 @@ struct WatchDefinition {
 }
 struct WatchInfo {
   storeId @0 :Text; definition @1 :WatchDefinition; revision @2 :UInt64; enabled @3 :Bool;
+  retiredClaims @4 :List(RetiredClaim);
 }
 struct WatchList { storeId @0 :Text; watches @1 :List(WatchInfo); }
 struct WatchPut {
   storeId @0 :Text; requestId @1 :Text; expectedRevision @2 :UInt64; definition @3 :WatchDefinition;
 }
 struct WatchRemove { storeId @0 :Text; requestId @1 :Text; id @2 :Text; expectedRevision @3 :UInt64; }
+# Retire one unrecoverable claim of one watch; the daemon records the authenticated caller.
+struct WatchClaimRetire { storeId @0 :Text; watch @1 :Text; claimId @2 :Text; reason @3 :Text; }
 struct WatchMutation {
   requestId @0 :Text; watch @1 :WatchInfo; durability @2 :Durability = durable;
 }
@@ -617,7 +635,7 @@ struct IngestIndexCounts {
   complete @0 :UInt64; failed @1 :UInt64; incomplete @2 :UInt64;
   notApplicable @3 :UInt64; unavailable @4 :UInt64; pending @5 :UInt64;
 }
-enum IngestDeletion { notManaged @0; reserved @1; claimed @2; published @3; removed @4; }
+enum IngestDeletion { notManaged @0; reserved @1; claimed @2; published @3; removed @4; retired @5; }
 struct IngestAcceptance {
   artifactId @0 :Text; source @1 :Text; format @2 :Format;
   receivedAt @3 :Instant; expiresAt @4 :Instant; byteLength @5 :UInt64;
@@ -733,6 +751,9 @@ interface Sparrow {
   authChallenge @50 () -> (result :Result(TcpChallenge));
   # Public TCP only: consume the challenge; success grants an ungated session capability.
   authenticate @51 (response :Data) -> (result :Result(TcpSession));
+  # Administration: retire a claim that can never complete (claimed, private source missing,
+  # never published). Refused for a recoverable or published claim.
+  watchClaimRetire @52 (request :WatchClaimRetire) -> (result :Result(RetiredClaim));
 }
 
 struct TcpChallenge { nonce @0 :Data; }

@@ -68,6 +68,32 @@ pub(super) struct State {
     bytes: usize,
     failure: Option<String>,
 }
+/// What durability status reads (#146): the ledger's counts and oldest acceptance, not the
+/// ledger itself.
+#[derive(Clone)]
+pub(super) struct View {
+    session_id: String,
+    durable_through: u64,
+    pending_writes: usize,
+    pending_bytes: usize,
+    oldest: Option<Instant>,
+    failure: Option<String>,
+}
+
+impl super::writer_queue::Observe for State {
+    type View = View;
+    fn view(&self) -> View {
+        View {
+            session_id: self.session_id.clone(),
+            durable_through: self.durable_through,
+            pending_writes: self.pending.len(),
+            pending_bytes: self.bytes,
+            oldest: self.pending.values().map(|pending| pending.at).min(),
+            failure: self.failure.clone(),
+        }
+    }
+}
+
 impl State {
     pub(super) fn new(session_id: String, sequence: u64) -> Self {
         Self {
@@ -141,6 +167,7 @@ impl Writer {
         self.admit_archive_publication(publication.earliest.as_deref())?;
         super::source_context::update(self, &mut batch)?;
         super::source_summary::apply(self, &mut batch)?;
+        super::store_counters::apply(&self.db, &mut batch)?;
         let manifest_features = super::manifest_retire::features(&self.db)?;
         if publication.manifest_retirement || manifest_features.is_some() {
             let receiver_present = self.db.get(super::receiver_stream::KEY)?.is_some();
@@ -307,29 +334,27 @@ impl Store {
     }
 
     /// Inspect current sequence, queue charge, age and any latched uncertainty.
+    /// Reads the observed state without the writer lock, and refuses once it is poisoned.
     pub fn durability_status(&self) -> Result<DurabilityStatus, Error> {
-        let writer = self.lock()?;
-        let state = writer.durability.borrow();
+        self.refuse_poisoned()?;
+        let state = self.unlocked.durability.read();
         let oldest_pending_ms = state
-            .pending
-            .values()
-            .map(|pending| pending.at.elapsed())
-            .max()
-            .map(|age| u64::try_from(age.as_millis()))
+            .oldest
+            .map(|at| u64::try_from(at.elapsed().as_millis()))
             .transpose()
             .map_err(|_| Error::new("STORAGE_FAILURE", "buffered age exceeds millisecond range"))?
             .unwrap_or(0);
         Ok(DurabilityStatus {
-            flush_interval_ms: writer.config.buffered_flush_interval_ms,
+            flush_interval_ms: self.unlocked.config.buffered_flush_interval_ms,
             flush_lag_ms: oldest_pending_ms
-                .saturating_sub(u64::from(writer.config.buffered_flush_interval_ms)),
-            session_id: state.session_id.clone(),
-            accepted_through: writer.db.latest_sequence_number(),
+                .saturating_sub(u64::from(self.unlocked.config.buffered_flush_interval_ms)),
+            session_id: state.session_id,
+            accepted_through: self.unlocked.db.latest_sequence_number(),
             durable_through: state.durable_through,
-            pending_writes: state.pending.len(),
-            pending_bytes: state.bytes,
+            pending_writes: state.pending_writes,
+            pending_bytes: state.pending_bytes,
             oldest_pending_ms,
-            failure: state.failure.clone(),
+            failure: state.failure,
         })
     }
 }
@@ -344,7 +369,8 @@ pub(super) trait BatchObserver {
 }
 
 /// Fold every default-family put, delete and merge of `batch` into `observer`, in batch
-/// order, stopping at its first failure.
+/// order, stopping at its first failure. A batch holding an operation the iterator does not
+/// report, a range delete, is refused: the observers' rows could not follow it (#146).
 pub(super) fn observe_batch(
     batch: &WriteBatch,
     observer: &mut impl BatchObserver,
@@ -352,19 +378,23 @@ pub(super) fn observe_batch(
     struct Fold<'o, O> {
         observer: &'o mut O,
         failure: Option<Error>,
+        seen: usize,
     }
     impl<O: BatchObserver> WriteBatchIteratorCf for Fold<'_, O> {
         fn merge_cf(&mut self, cf: u32, name: &[u8], _value: &[u8]) {
+            self.seen += 1;
             if cf == 0 && self.failure.is_none() {
                 self.failure = self.observer.refuse_merge(name);
             }
         }
         fn put_cf(&mut self, cf: u32, name: &[u8], value: &[u8]) {
+            self.seen += 1;
             if cf == 0 && self.failure.is_none() {
                 self.failure = self.observer.observe(name, Some(value)).err();
             }
         }
         fn delete_cf(&mut self, cf: u32, name: &[u8]) {
+            self.seen += 1;
             if cf == 0 && self.failure.is_none() {
                 self.failure = self.observer.observe(name, None).err();
             }
@@ -373,7 +403,51 @@ pub(super) fn observe_batch(
     let mut fold = Fold {
         observer,
         failure: None,
+        seen: 0,
     };
     batch.iterate_cf(&mut fold);
-    fold.failure.map_or(Ok(()), Err)
+    if let Some(failure) = fold.failure {
+        return Err(failure);
+    }
+    if fold.seen != batch.len() {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "a catalog write holds a range delete, which the derived counters cannot follow",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod observe_tests {
+    use super::*;
+
+    struct Every(usize);
+
+    impl BatchObserver for Every {
+        fn observe(&mut self, _: &[u8], _: Option<&[u8]>) -> Result<(), Error> {
+            self.0 += 1;
+            Ok(())
+        }
+        fn refuse_merge(&self, _: &[u8]) -> Option<Error> {
+            None
+        }
+    }
+
+    /// INVARIANT (#146): a catalog write whose batch holds a range delete is refused before
+    /// any derived counter follows it, because the batch iterator never reports the range;
+    /// the same batch without it is observed in full.
+    #[test]
+    fn a_range_delete_in_a_catalog_write_is_refused() {
+        let mut batch = WriteBatch::default();
+        batch.put(b"record:a", b"{}");
+        batch.delete(b"record:b");
+        let mut every = Every(0);
+        observe_batch(&batch, &mut every).unwrap();
+        assert_eq!(every.0, 2);
+        batch.delete_range(b"record:".as_slice(), b"record;".as_slice());
+        let refused = observe_batch(&batch, &mut Every(0)).unwrap_err();
+        assert_eq!(refused.code, "STORAGE_FAILURE");
+        assert!(refused.message.contains("range delete"), "{refused:?}");
+    }
 }

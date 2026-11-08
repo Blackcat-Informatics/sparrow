@@ -109,6 +109,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             .with("candidates", u64::from(watch.get_candidates()))
             .with("deferred", watch.get_deferred())
             .with("pending_claims", u64::from(watch.get_pending_claims()))
+            .with(
+                "retired_claims",
+                super::watch::retired_claims(watch.get_retired_claims()?)?,
+            )
             .with("completed_claims", watch.get_completed_claims().to_string())
             .with("reconciliations", watch.get_reconciliations().to_string())
             .with("coverage_losses", watch.get_coverage_losses().to_string())
@@ -170,6 +174,14 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with(
             "maintenance_reserve",
             value.get_maintenance_reserve().to_string(),
+        )
+        .with(
+            "counts",
+            if value.get_counts_pending() {
+                "pending"
+            } else {
+                "exact"
+            },
         )
         .with("live_records", value.get_live_records().to_string())
         .with(
@@ -352,7 +364,14 @@ fn migrations(
             Object::new()
                 .with("name", migration.get_name()?.to_str()?)
                 .with("done", migration.get_done().to_string())
-                .with("total", migration.get_total().to_string())
+                .with(
+                    "total",
+                    if migration.get_total_pending() {
+                        "counting".to_owned()
+                    } else {
+                        migration.get_total().to_string()
+                    },
+                )
                 .with(
                     "watermark",
                     super::optional_value(migration.get_watermark()?)?,

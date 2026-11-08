@@ -157,6 +157,14 @@ impl Operation {
                         read_only: name == "watch_handoff_get",
                     }))
                 }
+                "watch_claim_retire" => {
+                    Self::Query(Command::Watch(super::watch::Input::RetireClaim {
+                        store: Some(fields.required("store_id")?),
+                        watch: fields.required("watch")?,
+                        claim: fields.required("claim_id")?,
+                        reason: fields.required("reason")?,
+                    }))
+                }
                 "file_generation_get" => Self::Query(Command::Tail(super::tail::Input {
                     store: fields.required("store_id")?,
                     id: fields.required("generation_id")?,

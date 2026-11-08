@@ -40,7 +40,7 @@ const RETAINED: &str = "artifact-retained:";
 pub(super) const INDEX: &str = "source-artifact:";
 /// Migration checkpoint: `[0]` complete; `[1]` then the last counted artifact ID in the
 /// artifact phase; `[2]` then the last examined record ID in the orphan record phase.
-const CHECKPOINT: &str = "source-summary-upgrade";
+pub(super) const CHECKPOINT: &str = "source-summary-upgrade";
 const ARTIFACT_PREFIX: &[u8] = b"artifact:";
 const RECORD_PREFIX: &[u8] = b"record:";
 /// Artifacts one migration page counts. Each is read with its records.
@@ -89,7 +89,8 @@ pub(super) fn index_entry<'k>(prefix: &[u8], key: &'k [u8]) -> Result<(u64, &'k 
     Ok((time, id))
 }
 
-fn failure(message: impl Into<String>) -> Error {
+/// A `STORAGE_FAILURE` for a broken derived counter row; the store counters share it.
+pub(super) fn failure(message: impl Into<String>) -> Error {
     Error::new("STORAGE_FAILURE", message.into())
 }
 
@@ -392,29 +393,6 @@ pub(super) fn fence(
     let format = super::writer_format::enable_source_summary(format)?;
     batch.put("store_format", format);
     Ok(format)
-}
-
-/// Catalog entries the migration has passed, and all of them.
-pub(super) fn migration_counts(db: &DB, progress: &Progress) -> Result<(u64, u64), Error> {
-    let artifact =
-        |after: Option<&str>| super::count_prefix(db, ARTIFACT_PREFIX, after.map(str::as_bytes));
-    let record =
-        |after: Option<&str>| super::count_prefix(db, RECORD_PREFIX, after.map(str::as_bytes));
-    Ok(match progress {
-        Progress::Complete => {
-            let total = artifact(None)?.1 + record(None)?.1;
-            (total, total)
-        }
-        Progress::Artifacts(after) => {
-            let (done, artifacts) = artifact(after.as_deref())?;
-            (done, artifacts + record(None)?.1)
-        }
-        Progress::Records(after) => {
-            let artifacts = artifact(None)?.1;
-            let (done, records) = record(after.as_deref())?;
-            (artifacts + done, artifacts + records)
-        }
-    })
 }
 
 /// A record entry's identity and retirement state.

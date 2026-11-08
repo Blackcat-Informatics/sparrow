@@ -31,7 +31,10 @@ Usage: deploy/verify-backup.sh [--time-records] [--window FROM BEFORE] [--image 
 
 Copy BACKUP/store into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), open
 the copy query-only with the image BACKUP/SOURCE records, and check it. A backup counts as
-verified only once this exits 0. SPARROW_CONFIG (default /etc/sparrow/server.toml) must be
+verified only once this exits 0. Exit 1 is a failed check, or a SOURCE that records no
+unique_payload_chunks (NOT VERIFIED); exit 2 is a usage error; exit 3 means every other check
+passed but the payload chunk count is not verifiable because the copy's or SOURCE's counts are
+pending, so the backup is not counted as verified. SPARROW_CONFIG (default /etc/sparrow/server.toml) must be
 readable: its data_dir and socket_path are the live paths the copy must never touch.
 
 --time-records  after the checks, print five elapsed times of the records window
@@ -43,7 +46,8 @@ readable: its data_dir and socket_path are the live paths the copy must never to
 --measure-migration
                 instead of verifying, open a writable copy with `sparrowd --no-intake` under
                 `systemd-run --user --scope` (CPUQuota=100%, IOWeight=20, MemoryHigh=2G,
-                MemoryMax=4G) and measure the online migrations until status reports them
+                MemoryMax=4G, and the Nice of the user unit SPARROW_MEASURE_UNIT, default
+                sparrow.service) and measure the online migrations until status reports them
                 all complete. The filesystem holding SPARROW_VERIFY must have 50 GB free to
                 start (SPARROW_MEASURE_MIN_FREE_GB may raise it); the run aborts below 40 GB
                 (SPARROW_MEASURE_ABORT_FREE_GB may raise it). Output lines starting
@@ -91,8 +95,11 @@ POLL_SECONDS=15
 # 64-graph page (34 minutes over 2,360 pages), so a healthy backfill moves every poll; ten retry
 # intervals without movement is a stopped migration, and also the switch gate's whole budget.
 STALL_SECONDS=600
-# The scope limits as systemd reports them once applied (deploy/systemd/sparrow.service).
+# The scope limits as systemd reports them once applied (deploy/systemd/sparrow.service). The
+# measured daemon also runs at the nice level of the user unit that serves the live store, read
+# from systemd below, and SCOPE_LIMITS ends with it.
 SCOPE_LIMITS='CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=2147483648 MemoryMax=4294967296'
+MEASURE_UNIT=${SPARROW_MEASURE_UNIT:-sparrow.service}
 if ((MEASURE_MIGRATION)); then
     ((TIME_RECORDS == 0)) && [[ -z $WINDOW_FROM ]] \
         || die "--measure-migration measures the migrations only; it takes no --time-records or --window"
@@ -101,6 +108,16 @@ if ((MEASURE_MIGRATION)); then
         die "the disk guard needs SPARROW_MEASURE_MIN_FREE_GB >= 50 and SPARROW_MEASURE_ABORT_FREE_GB >= 40, below it"
     fi
     command -v systemd-run >/dev/null || die "--measure-migration needs systemd-run for the user scope that limits the daemon"
+    # A copy measured at another priority than the unit's does not predict the unit: the
+    # 2026-11-07 copy ran at nice 0 while the unit runs at Nice=10.
+    unit_load=$(systemctl --user show "$MEASURE_UNIT" -p LoadState --value) \
+        || die "systemctl cannot show the user unit $MEASURE_UNIT whose Nice the measurement applies"
+    [[ $unit_load == loaded ]] || die "the user unit $MEASURE_UNIT is $unit_load, so its Nice is \
+unknown; set SPARROW_MEASURE_UNIT to the user unit that serves the store"
+    UNIT_NICE=$(systemctl --user show "$MEASURE_UNIT" -p Nice --value) \
+        || die "systemctl cannot show the Nice of the user unit $MEASURE_UNIT"
+    [[ $UNIT_NICE =~ ^-?[0-9]+$ ]] || die "the user unit $MEASURE_UNIT reports Nice '$UNIT_NICE', not a nice level"
+    SCOPE_LIMITS="$SCOPE_LIMITS Nice=$UNIT_NICE"
 fi
 BACKUP=$(realpath -e -- "$1") || die "backup $1 does not exist"
 [[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup"
@@ -160,6 +177,11 @@ json_field() {
     python3 -I -c 'import json,sys; v=json.load(sys.stdin)
 for k in sys.argv[1:]: v=v[int(k)] if isinstance(v,list) else v[k]
 print(json.dumps(v) if isinstance(v,(dict,list,bool)) or v is None else v)' "$@"
+}
+# The status counts field: pending while the store counters seed, else exact. An image older
+# than schema 70 reports none; its counts are exact.
+status_counts() {
+    python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("counts","exact"))'
 }
 
 expected_store=$(source_value store_id)
@@ -326,8 +348,10 @@ if ((MEASURE_MIGRATION)); then
     started=$(date +%s%N) || exit 1
     printf 'verify-backup: MEASURE start_utc=%s\n' "$(date -u -d "@$((started / 1000000000))" +%Y-%m-%dT%H:%M:%SZ)"
     # A scope runs the daemon as this process (systemd-run execs it), so PID is the daemon's.
+    # A scope unit has no Nice property: systemd-run sets the nice level itself before it execs
+    # the daemon, whose threads inherit it.
     systemd-run --user --scope --quiet --collect --unit="sparrow-${SCRATCH##*/}" \
-        -p CPUQuota=100% -p IOWeight=20 -p MemoryHigh=2G -p MemoryMax=4G \
+        --nice="$UNIT_NICE" -p CPUQuota=100% -p IOWeight=20 -p MemoryHigh=2G -p MemoryMax=4G \
         -- "$daemon" --config "$CONFIG" --no-intake 2>"$LOG" >/dev/null &
     PID=$!
     # No readiness ceiling: how long the first open takes is what this mode measures.
@@ -374,6 +398,8 @@ daemon and removing $SCRATCH"
             scope="sparrow-${SCRATCH##*/}.scope"
             applied=$(systemctl --user show "$scope" -p CPUQuotaPerSecUSec -p IOWeight -p MemoryHigh \
                 -p MemoryMax | sort | paste -sd ' ') || fail scope "systemctl cannot show $scope"
+            nice=$(ps -o ni= -p "$PID") || fail scope "cannot read the nice level of the daemon $PID"
+            applied="$applied Nice=${nice//[[:space:]]/}"
             printf 'verify-backup: MEASURE scope=%s %s\n' "$scope" "$applied"
             [[ $applied == "$SCOPE_LIMITS" ]] || fail scope "$scope runs with $applied, not $SCOPE_LIMITS"
         fi
@@ -398,7 +424,7 @@ print("; ".join("%s: %s" % (r["name"], r["failure"]) for r in failed))' <<<"$sta
     done
     printf 'verify-backup: MEASURE backfill_seconds=%s\n' "$(elapsed "$started")"
     printf 'verify-backup: MEASURE end_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'verify-backup: MEASURE live_records=%s\n' "$(json_field live_records <<<"$status")"
+    printf 'verify-backup: MEASURE live_records=%s counts=%s\n' "$(json_field live_records <<<"$status")" "$(status_counts <<<"$status")"
     pass migrate "every migration is complete with no failure: $progress"
     kill -INT "$PID"
     stopped=0
@@ -450,12 +476,26 @@ durability=$(json_field durability failure <<<"$status") || exit 1
 pass status "ready, schema $(json_field schema_version <<<"$status"), format $(json_field store_format <<<"$status")"
 
 # Unique payload chunks change only when evidence is retired, which a query-only daemon never
-# does, so the copy holds exactly the count sparrow-backup recorded, however old it is.
+# does, so the copy holds exactly the count sparrow-backup recorded, however old it is. While
+# the store counters seed (status counts=pending, as on a copy a newer --image upgrades, or
+# SOURCE unique_payload_chunks=pending) a count is exact only through the seeding watermark, so
+# it is never compared: the check reports not verifiable, and every other check still runs. A
+# query-only daemon runs no maintenance, so a copy's pending counts stay pending until it stops.
 chunks=$(json_field unique_payload_chunks <<<"$status") || exit 1
-unrecorded=0
+counts=$(status_counts <<<"$status") || exit 1
+[[ $counts == exact || $counts == pending ]] || fail status "status reports counts=$counts, neither exact nor pending"
+unrecorded=0 unverifiable=0
 if [[ -z $expected_chunks ]]; then
     unrecorded=1
     printf 'verify-backup: SKIP payload-chunks: %s chunks; SOURCE records no unique_payload_chunks, so this backup or its image predates the count\n' "$chunks"
+elif [[ $counts == pending ]]; then
+    unverifiable=1
+    printf "verify-backup: NOT VERIFIABLE payload-chunks: not verifiable (counts pending); the copy's store counters are still seeding, so its %s chunks are not a total to compare with SOURCE's %s\n" "$chunks" "$expected_chunks"
+elif [[ $expected_chunks == pending ]]; then
+    unverifiable=1
+    printf "verify-backup: NOT VERIFIABLE payload-chunks: not verifiable (counts pending); SOURCE recorded unique_payload_chunks=pending, so the live daemon logged no total to compare with the copy's %s chunks\n" "$chunks"
+elif [[ ! $expected_chunks =~ ^[0-9]+$ ]]; then
+    fail payload-chunks "SOURCE records unique_payload_chunks=$expected_chunks, neither a count nor pending"
 elif [[ $chunks == "$expected_chunks" ]]; then
     pass payload-chunks "$chunks unique payload chunks, as SOURCE recorded"
 else
@@ -520,12 +560,19 @@ stopped=0
 wait "$PID" || stopped=$?
 PID=''
 ((stopped == 0)) || fail shutdown "the daemon exited with status $stopped after SIGINT"
-# The closing count sparrow-backup records comes from this same line of the live daemon.
-grep -qx "sparrowd: closed store=$store unique_payload_chunks=$chunks" -- "$LOG" \
-    || fail shutdown "the daemon did not log its closing count of $chunks unique payload chunks"
-pass shutdown "the daemon stopped cleanly and logged $chunks unique payload chunks; removing $SCRATCH"
+# The closing count sparrow-backup records comes from this same line of the live daemon. A copy
+# whose counts were pending at status is still pending at the stop, so its line says pending.
+closing=$chunks
+[[ $counts == exact ]] || closing=pending
+grep -qx "sparrowd: closed store=$store unique_payload_chunks=$closing" -- "$LOG" \
+    || fail shutdown "the daemon did not log its closing count of unique_payload_chunks=$closing"
+pass shutdown "the daemon stopped cleanly and logged unique_payload_chunks=$closing; removing $SCRATCH"
 if ((unrecorded)); then
     printf 'verify-backup: NOT VERIFIED: SOURCE records no unique_payload_chunks; take a new backup with sparrow-backup\n' >&2
     exit 1
+fi
+if ((unverifiable)); then
+    printf 'verify-backup: %s verified except payload-chunks: not verifiable (counts pending)\n' "$BACKUP"
+    exit 3
 fi
 printf 'verify-backup: %s verified\n' "$BACKUP"

@@ -177,6 +177,8 @@ pub fn catalog_db(path: &std::path::Path) -> Result<rocksdb::DB, rocksdb::Error>
 /// the start, and every record metadata graph without its receipt-time fallback facts, with
 /// the backfill at the start. Graph declarations and records are unchanged.
 pub fn pending_schema_69_migrations(db: &rocksdb::DB) -> Result<(), Box<dyn std::error::Error>> {
+    // The checkpoints below are rewritten offline, so the store counters are reseeded too.
+    sparrow_core::remove_store_counters_for_legacy_fixture(db)?;
     sparrow_core::remove_event_fallback_rdf_for_legacy_fixture(db)?;
     let mut batch = rocksdb::WriteBatch::default();
     for row in db.prefix_iterator(b"rdf:o:") {
@@ -201,6 +203,7 @@ pub fn pending_schema_69_migrations(db: &rocksdb::DB) -> Result<(), Box<dyn std:
 pub fn pending_source_summary_migration(
     db: &rocksdb::DB,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    sparrow_core::remove_store_counters_for_legacy_fixture(db)?;
     sparrow_core::remove_source_summary_for_legacy_fixture(db)?;
     Ok(())
 }

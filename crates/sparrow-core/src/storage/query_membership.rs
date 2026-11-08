@@ -338,6 +338,7 @@ mod tests {
             intake: None,
             chunks: Vec::new(),
             evicted: false,
+            retired: false,
         };
         for (id, time) in [
             ("record:past", 10),

@@ -150,6 +150,80 @@ fn key(id: &str) -> String {
     format!("consumption:{id}")
 }
 
+/// Most claims a store keeps as retired unrecoverable. Each is an operator's audit record and
+/// is never removed, so the bound is a hard refusal rather than an eviction.
+pub const MAX_RETIRED_CONSUMPTION_CLAIMS: usize = 64;
+const RETIRED_PREFIX: &str = "consumption-retired:";
+const RETIREMENT_TEXT: usize = 512;
+
+fn retired_key(id: &str) -> String {
+    format!("{RETIRED_PREFIX}{id}")
+}
+
+/// Whether claim `id` is retired unrecoverable; its consumption import is then reclaimable.
+pub(super) fn retired(writer: &Writer, id: &str) -> Result<bool, Error> {
+    Ok(writer.db.get(retired_key(id))?.is_some())
+}
+
+/// An operator's durable retirement of a claim that can never complete: claimed, its private
+/// source missing, and never published. The journal leaves the active recovery set, so it no
+/// longer counts as a pending claim, and is kept with this record as retired unrecoverable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumptionRetirement {
+    /// Unix milliseconds of the retirement.
+    pub retired_at: u64,
+    /// The authenticated administrator, as the daemon identified the connection.
+    pub caller: String,
+    /// The operator's reason.
+    pub reason: String,
+}
+
+/// A retired unrecoverable claim: its original journal and the retirement record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredConsumption {
+    /// The journal as it stood when retired: claimed, unpublished, never removed.
+    pub journal: ConsumptionJournal,
+    /// Who retired it, when and why.
+    pub retirement: ConsumptionRetirement,
+}
+
+impl Catalog for RetiredConsumption {
+    fn encode(&self) -> Value {
+        Object::new()
+            .with("journal", self.journal.encode())
+            .with("retired_at", self.retirement.retired_at.to_string())
+            .with("caller", self.retirement.caller.clone())
+            .with("reason", self.retirement.reason.clone())
+            .into()
+    }
+
+    fn decode(value: &Value) -> Result<Self, Error> {
+        let retired = Self {
+            journal: ConsumptionJournal::decode(super::field(value, "journal")?)?,
+            retirement: ConsumptionRetirement {
+                retired_at: integer(value, "retired_at")?,
+                caller: read_field(value, "caller")?,
+                reason: read_field(value, "reason")?,
+            },
+        };
+        if !retired.unrecoverable() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "retired consumption claim is not an unpublished claim",
+            ));
+        }
+        Ok(retired)
+    }
+}
+
+impl RetiredConsumption {
+    fn unrecoverable(&self) -> bool {
+        self.journal.claimed.is_some()
+            && self.journal.published_id().is_none()
+            && self.journal.removed_at.is_none()
+    }
+}
+
 fn completed_key(id: &str) -> String {
     format!("request:consumption-complete:{id}")
 }
@@ -444,6 +518,26 @@ impl Writer {
         Ok(Some(journal))
     }
 
+    /// The retired unrecoverable claim `id`, if any, charged against an admitted read.
+    pub(super) fn consumption_retired_admitted(
+        &self,
+        id: &str,
+        remaining: &mut usize,
+    ) -> Result<Option<RetiredConsumption>, Error> {
+        let Some(bytes) = self.db.get(retired_key(id))? else {
+            return Ok(None);
+        };
+        Self::charge_catalog_shape(remaining, &bytes)?;
+        let claim = RetiredConsumption::decode(&parse(&bytes)?)?;
+        if claim.journal.import_id != id {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "retired consumption claim key mismatch",
+            ));
+        }
+        Ok(Some(claim))
+    }
+
     pub(super) fn require_consumption(
         &self,
         request: &str,
@@ -683,6 +777,117 @@ impl Store {
             journals.push(journal);
         }
         Ok(journals)
+    }
+
+    /// Retire a claim that can never complete, as an operator's explicit decision. The
+    /// caller has verified that the claimed private source is missing; this refuses unless the
+    /// journal is active, belongs to `watch`, holds a claimed generation and has no recorded
+    /// publication, so a claim whose publication is recorded is never retired. One batch
+    /// moves the journal out of the active recovery set into the retired record and ends the
+    /// staging lease of the claim's import if one began, so the next [`Store::import_reclaim`]
+    /// frees its staged bytes and journal slot. A claim already retired is refused, so each
+    /// retirement is recorded once.
+    pub fn consumption_retire(
+        &self,
+        id: &str,
+        watch: &str,
+        caller: &str,
+        reason: &str,
+        now: u64,
+    ) -> Result<RetiredConsumption, Error> {
+        crate::format_instant(now)?;
+        for (name, text) in [("caller", caller), ("reason", reason)] {
+            if text.trim().is_empty() || text.len() > RETIREMENT_TEXT || text.contains('\n') {
+                return Err(Error::new(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "claim retirement {name} requires 1..{RETIREMENT_TEXT} bytes on one line"
+                    ),
+                ));
+            }
+        }
+        let writer = self.lock()?;
+        let journal = writer.consumption(id)?;
+        if writer.db.get(retired_key(id))?.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "the claim is already retired unrecoverable",
+            ));
+        }
+        let journal = match journal {
+            Some(journal) if writer.db.get(key(id))?.is_some() => journal,
+            Some(_) => {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "the claim's source removal is already confirmed; nothing is pending",
+                ));
+            }
+            None => return Err(Error::new("NOT_FOUND", "unknown consumption journal")),
+        };
+        if journal.watch != watch {
+            return Err(Error::new("CONFLICT", "the claim belongs to another watch"));
+        }
+        if journal.published_id().is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "the claim's publication is recorded; recovery removes its source, never retire it",
+            ));
+        }
+        if journal.claimed.is_none() {
+            return Err(Error::new(
+                "CONFLICT",
+                "the claim never moved its source; recovery still reads it from the original path",
+            ));
+        }
+        if writer.count_prefix(RETIRED_PREFIX)? >= MAX_RETIRED_CONSUMPTION_CLAIMS as u64 {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "64 retired claims are recorded; no further claim can be retired",
+            ));
+        }
+        let retired = RetiredConsumption {
+            journal,
+            retirement: ConsumptionRetirement {
+                retired_at: now,
+                caller: caller.into(),
+                reason: reason.into(),
+            },
+        };
+        let mut batch = WriteBatch::default();
+        put(&mut batch, &retired_key(id), &retired);
+        batch.delete(key(id));
+        // A begun import of this claim can never publish now; release it to reclamation.
+        writer.end_retired_consumption_import(&mut batch, id, now)?;
+        writer.commit(batch)?;
+        Ok(retired)
+    }
+
+    /// Every retired unrecoverable claim, read by one iterator (its own implicit snapshot)
+    /// without the writer lock, so status and watch listings never wait for a writer.
+    pub fn consumption_retired(&self) -> Result<Vec<RetiredConsumption>, Error> {
+        self.refuse_poisoned()?;
+        let mut retired = Vec::new();
+        for entry in self.unlocked.db.prefix_iterator(RETIRED_PREFIX) {
+            let (name, bytes) = entry?;
+            if !name.starts_with(RETIRED_PREFIX.as_bytes()) {
+                break;
+            }
+            if retired.len() >= MAX_RETIRED_CONSUMPTION_CLAIMS {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "retired consumption claims exceed their admitted bound",
+                ));
+            }
+            let claim = RetiredConsumption::decode(&parse(&bytes)?)?;
+            if name[RETIRED_PREFIX.len()..] != *claim.journal.import_id.as_bytes() {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "retired consumption claim key mismatch",
+                ));
+            }
+            retired.push(claim);
+        }
+        Ok(retired)
     }
 
     /// Record the stable descriptor observation only after the same-filesystem

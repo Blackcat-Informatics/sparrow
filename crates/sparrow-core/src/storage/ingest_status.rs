@@ -84,6 +84,9 @@ pub enum IngestDeletion {
     Published,
     /// The ownership journal confirms directory-synchronized source removal.
     Removed,
+    /// An administrator retired the claim as unrecoverable: claimed, its private source
+    /// missing, never published. Nothing will publish or remove it.
+    Retired,
 }
 
 /// One catalog membership instant; inspecting it never flushes or advances intake.
@@ -179,7 +182,14 @@ impl Store {
                 }
             }
         };
-        let ownership = writer.consumption_admitted(&import_id, Some(&mut remaining))?;
+        let mut ownership = writer.consumption_admitted(&import_id, Some(&mut remaining))?;
+        let mut retired = false;
+        if ownership.is_none()
+            && let Some(claim) = writer.consumption_retired_admitted(&import_id, &mut remaining)?
+        {
+            ownership = Some(claim.journal);
+            retired = true;
+        }
         let published =
             publication::published_admitted(&writer, &import_id, now, Some(&mut remaining))?;
         let mut staging = published.as_ref().map(|(manifest, _)| manifest.clone());
@@ -271,6 +281,7 @@ impl Store {
         }
         let deletion = match &ownership {
             None => IngestDeletion::NotManaged,
+            Some(_) if retired => IngestDeletion::Retired,
             Some(j) if j.removed_at.is_some() => IngestDeletion::Removed,
             Some(j) if j.published_artifact.is_some() || j.tail_published => {
                 IngestDeletion::Published

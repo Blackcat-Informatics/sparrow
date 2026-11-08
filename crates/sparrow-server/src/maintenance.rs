@@ -66,7 +66,12 @@ enum Job {
     Reclaim,
     Expiry,
     Recompress,
-    Migrate,
+    /// One migration page. With `defer`, the page first waits inline for writers waiting on
+    /// the writer lock: the first page after a retry tick, and a page whose background
+    /// deferral finished while another duty ran, so writers may have arrived since.
+    Migrate {
+        defer: bool,
+    },
 }
 
 impl Job {
@@ -77,7 +82,7 @@ impl Job {
             Self::Reclaim => "import journal reclamation",
             Self::Expiry => "retention maintenance",
             Self::Recompress => "table rewrite",
-            Self::Migrate => "online migration",
+            Self::Migrate { .. } => "online migration",
         }
     }
 
@@ -98,9 +103,28 @@ impl Job {
             Self::Recompress => store
                 .recompress_step(sparrow_server::now()?, RECOMPRESSION_SETTLE_SECONDS)
                 .map(|_| done),
-            Self::Migrate => store.migrate_step().map(Outcome::Migrated),
+            Self::Migrate { defer } => {
+                if defer {
+                    store.defer_migration_page();
+                }
+                store.migrate_step().map(Outcome::Migrated)
+            }
         }
     }
+}
+
+/// Wait for the deferral before the next page. Polling it is cancel-safe: a duty that wins
+/// the select leaves the deferral running, and the next poll resumes the same wait.
+async fn deferred_page(
+    deferral: &mut Option<tokio::task::JoinHandle<std::time::Duration>>,
+) -> Result<(), String> {
+    if let Some(handle) = deferral.as_mut() {
+        handle
+            .await
+            .map_err(|error| format!("migration page deferral join failed: {error}"))?;
+        *deferral = None;
+    }
+    Ok(())
 }
 
 enum Outcome {
@@ -115,33 +139,26 @@ struct MigrationJournal {
 }
 
 impl MigrationJournal {
-    async fn page(&mut self, store: &Store, page: MigrationPage) {
+    /// Journal one committed page from the counters its own batch updated; it reads
+    /// nothing more and never waits for the writer.
+    fn page(&mut self, page: &MigrationPage) {
         let pages = &mut self.pages[page.migration.index()];
         *pages += 1;
         let pages = *pages;
         let name = page.migration.name();
         if page.complete {
-            eprintln!("sparrowd: migration {name} complete pages={pages}");
+            eprintln!(
+                "sparrowd: migration {name} complete pages={pages} done={}",
+                page.done
+            );
         } else if pages.is_multiple_of(MIGRATION_PROGRESS_PAGES) {
-            // Counting takes the writer and scans the source keys: keep it off the loop.
-            let owner = store.clone();
-            let statuses = tokio::task::spawn_blocking(move || owner.migrations())
-                .await
-                .map_err(|error| Error::new("STORAGE_FAILURE", error.to_string()))
-                .and_then(|statuses| statuses);
-            match statuses {
-                Ok(statuses) => {
-                    for status in statuses.iter().filter(|status| status.name == name) {
-                        eprintln!(
-                            "sparrowd: migration {name} progress pages={pages} done={} total={} watermark={}",
-                            status.done,
-                            status.total,
-                            status.watermark.as_deref().unwrap_or("none")
-                        );
-                    }
-                }
-                Err(error) => eprintln!("sparrowd: migration {name} progress failed: {error}"),
-            }
+            eprintln!(
+                "sparrowd: migration {name} progress pages={pages} done={} total={} watermark={}",
+                page.done,
+                page.total
+                    .map_or_else(|| "counting".to_owned(), |total| total.to_string()),
+                page.watermark.as_deref().unwrap_or("none")
+            );
         }
     }
 }
@@ -171,8 +188,14 @@ async fn run(
     flush.tick().await;
     let mut continuation = false;
     // Pages continue back to back once the first succeeds, until every migration is
-    // complete; a failed page waits for the retry tick, never a busy loop.
+    // complete; a failed page waits for the retry tick, never a busy loop. Immediately
+    // before every page the worker waits for writers waiting on the writer lock (#146).
+    // After a page that wait runs in a blocking task it polls with its other duties, so it
+    // delays only the page. If that task finished while another duty ran, writers may have
+    // arrived since, so the page waits again inline, as the first page after a retry does.
     let mut migrating = false;
+    let mut deferral: Option<tokio::task::JoinHandle<std::time::Duration>> = None;
+    let mut stale = false;
     let mut journal = MigrationJournal::default();
     loop {
         let job = tokio::select! {
@@ -182,17 +205,20 @@ async fn run(
                 // Keep duties fair even when a flush interval is shorter than
                 // native work. Only stop admission has strict priority.
                 tokio::select! {
-                    _ = flush.tick() => Job::Flush,
-                    _ = pressure.tick() => Job::Pressure,
-                    _ = reclaim.tick() => Job::Reclaim,
-                    _ = recompress.tick() => Job::Recompress,
-                    _ = expiry.tick(), if !continuation => Job::Expiry,
-                    _ = tokio::task::yield_now(), if continuation => Job::Expiry,
-                    _ = migrate.tick(), if !migrating => Job::Migrate,
-                    _ = tokio::task::yield_now(), if migrating => Job::Migrate,
+                    _ = flush.tick() => Ok(Job::Flush),
+                    _ = pressure.tick() => Ok(Job::Pressure),
+                    _ = reclaim.tick() => Ok(Job::Reclaim),
+                    _ = recompress.tick() => Ok(Job::Recompress),
+                    _ = expiry.tick(), if !continuation => Ok(Job::Expiry),
+                    _ = tokio::task::yield_now(), if continuation => Ok(Job::Expiry),
+                    _ = migrate.tick(), if !migrating => Ok(Job::Migrate { defer: true }),
+                    deferred = deferred_page(&mut deferral), if migrating => {
+                        deferred.map(|()| Job::Migrate { defer: stale })
+                    }
                 }
             } => job,
         };
+        let job = job?;
         // Below the free-space floor every write is refused. Synchronizing
         // accepted writes is still allowed and still needed, and the table
         // rewrite step must run to turn native rewriting off.
@@ -205,6 +231,7 @@ async fn run(
         {
             continuation = false;
             migrating = false;
+            deferral = None;
             continue;
         }
         let owner = store.clone();
@@ -228,6 +255,15 @@ async fn run(
                 "store durability uncertain; exiting so it is reopened: {failure}"
             ));
         }
+        // A deferral that finished while this duty ran no longer reflects the writers
+        // waiting now; the page it admits waits again first.
+        if !matches!(job, Job::Migrate { .. })
+            && deferral
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            stale = true;
+        }
         match result {
             Ok(Outcome::Continue(Some(more))) => {
                 // The pause runs from the end of a traversal, however long it took.
@@ -239,8 +275,15 @@ async fn run(
             Ok(Outcome::Continue(None)) => {}
             Ok(Outcome::Migrated(page)) => {
                 migrating = page.is_some();
-                if let Some(page) = page {
-                    journal.page(&store, page).await;
+                if migrating {
+                    let owner = store.clone();
+                    deferral = Some(tokio::task::spawn_blocking(move || {
+                        owner.defer_migration_page()
+                    }));
+                    stale = false;
+                }
+                if let Some(page) = &page {
+                    journal.page(page);
                 }
             }
             Err(error) => {
@@ -248,7 +291,7 @@ async fn run(
                 // Retry a refused pass or page on the ordinary tick, never a busy loop.
                 match job {
                     Job::Expiry => continuation = false,
-                    Job::Migrate => {
+                    Job::Migrate { .. } => {
                         migrating = false;
                         migrate.reset();
                     }
@@ -404,17 +447,21 @@ mod tests {
         let store = config.open_store().unwrap();
         let pending = store.migrations().unwrap();
         assert!(
-            pending.iter().all(|m| !m.complete() && m.total > 0),
+            pending.iter().all(|m| !m.complete() && m.total.is_none()),
             "{pending:?}"
         );
-        // Commit the worker's first two pages (the owner index, then one backfill page) so
-        // the read below lands part-way through the backfill, not before or after it.
-        for _ in 0..2 {
-            store.migrate_step().unwrap().unwrap();
-        }
+        // Seed the store counters, then commit the worker's next two pages (the owner index,
+        // then one backfill page) so the read below lands part-way through the backfill, not
+        // before or after it.
+        while store.migrate_step().unwrap().unwrap().migration == Migration::StoreCounters {}
+        store.migrate_step().unwrap().unwrap();
         let part = store.migrations().unwrap();
-        assert!(part[0].complete() && !part[1].complete(), "{part:?}");
-        assert!(part[1].done > 0, "{part:?}");
+        let (index, fallback) = (
+            &part[Migration::OwnerGraphIndex.index()],
+            &part[Migration::EventFallbackRdf.index()],
+        );
+        assert!(index.complete() && !fallback.complete(), "{part:?}");
+        assert!(fallback.done > 0, "{part:?}");
         use sparrow_core::QueryScope;
         let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1000);
         let read = |store: &sparrow_core::Store| {
@@ -441,7 +488,7 @@ mod tests {
             result.coverage.event_fallback_pending
         };
         let waiting = read(&store);
-        assert_eq!(waiting, part[1].total - part[1].done, "{part:?}");
+        assert_eq!(waiting, fallback.total.unwrap() - fallback.done, "{part:?}");
         let worker = Worker::start(store.clone(), Duration::from_millis(1));
         tokio::time::timeout(Duration::from_secs(30), async {
             while !store
@@ -459,7 +506,7 @@ mod tests {
         let done = store.migrations().unwrap();
         assert!(
             done.iter()
-                .all(|m| m.failure.is_none() && m.done == m.total),
+                .all(|m| m.failure.is_none() && m.total == Some(m.done)),
             "{done:?}"
         );
         assert_eq!(read(&store), 0);

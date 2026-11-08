@@ -240,13 +240,15 @@ copy. The script then prints one line per check:
 | `query-only` | Status and the startup line report `query_only`, and no stored watch root is open |
 | `store-id` | The copy's store identity equals `store_id` in `SOURCE` |
 | `status` | `pressure.phase` is `ready` and `durability.failure` is `null` |
-| `payload-chunks` | The copy's `unique_payload_chunks` equals the count `SOURCE` recorded |
+| `payload-chunks` | The copy's `unique_payload_chunks` equals the count `SOURCE` recorded; not verifiable while counts are pending (below) |
 | `records` | A `records` window over the hour before `taken_utc` returns rows |
 | `artifact` | The first row's artifact reads back to the BLAKE3 digest its catalog row records |
-| `shutdown` | The daemon exits 0 after SIGINT and logs its closing payload chunk count |
+| `shutdown` | The daemon exits 0 after SIGINT and logs its closing payload chunk count, or `pending` when the copy's counts are pending |
 
-It exits 1 at the first failed check, and always stops the daemon and removes
-the scratch copy.
+It exits 1 at the first failed check, 2 on a usage error, 3 when every other
+check passed but the payload chunk count is not verifiable because counts are
+pending (below), and 0 only when every check passed. It always stops the daemon
+and removes the scratch copy.
 
 The count check uses stored payload chunks rather than live records. A record is
 live only until its retention deadline, measured by the reader's clock, so a
@@ -270,6 +272,24 @@ one, keep working. For the clock reason above, the `records` and
 the daemon reports (`retention_seconds`, 30 days). After that its records have
 expired, and the script prints that both were skipped.
 
+From schema 70, a store counts its records and payload chunks in counter rows
+that a newer image seeds online after an upgrade. Until seeding finishes, status
+reports `counts` as `pending`, and each count is exact only through the seeding
+watermark, not a total. The closing line then reads
+`sparrowd: closed store=ID unique_payload_chunks=pending`, and `SOURCE` records
+`unique_payload_chunks=pending` and `live_records=pending` rather than numbers.
+A pending count is never compared. When the copy's status reports
+`counts=pending` (for example `--image NEWER` on a backup of schema 69 or
+older, which upgrades the copy), or `SOURCE` records
+`unique_payload_chunks=pending`, the script prints
+`NOT VERIFIABLE payload-chunks: not verifiable (counts pending)` instead of
+passing or failing that check. It runs every other check, expects the closing
+line to say `pending` when the copy's counts were pending, and ends with
+`verified except payload-chunks: not verifiable (counts pending)` and exit 3,
+which is distinct from a failed check (1) and a usage error (2). Exit 3 is not
+verified: take a backup once the live counts are exact, or verify the copy with
+an image that opens it without an upgrade.
+
 A backup whose `SOURCE` has no `unique_payload_chunks` predates the count, or
 was taken from an image that predates it: the script skips that check, runs the others and still exits 1 as not verified. An
 image without query-only mode (schema 66 and older) is refused before it starts,
@@ -290,7 +310,8 @@ A backup `/SPARROW/backups/NAME` (a `STAMP`, or a named `pre-upgrade-IMAGE`)
 holds `store`, `intake` and `config` (the server configuration, `/etc/sparrow`
 with the secret, and `/SPARROW/ship`) from one moment, `images/` with the
 image pair that last opened the store, `lexicons/` with the bundle it read, and `SOURCE`, which names that image
-(`image=`) and the store's identity, schema, format and live record count.
+(`image=`) and the store's identity, schema, format and live record count
+(`pending` while the store counters seed).
 Restore only a backup that `deploy/verify-backup.sh` has passed ("Verify a
 backup").
 

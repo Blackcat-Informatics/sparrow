@@ -6,7 +6,9 @@
 use crate::source_file::{BENEATH, open};
 use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
 use sparrow_client::{ArtifactReceipt, Client, CompletedFileIdentity};
-use sparrow_core::{ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, Store};
+use sparrow_core::{
+    ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, RetiredConsumption, Store,
+};
 use std::{
     fs::File,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -520,6 +522,53 @@ impl ClaimRoot {
                 .ok_or(Error::State("claim observation absent"))?,
         )?;
         Ok(Recovery::Claimed(ClaimedFile { journal, file }))
+    }
+
+    /// Retire, on an administrator's word, a claim that can never complete: claimed, its
+    /// private source missing, and never published. While the private source exists the
+    /// claim is recoverable, so this refuses; the store refuses a journal whose publication
+    /// is recorded or whose source never moved. The source path is never touched.
+    pub fn retire(
+        &self,
+        id: &str,
+        caller: &str,
+        reason: &str,
+        now: u64,
+    ) -> Result<RetiredConsumption, Error> {
+        let journal = match self.store.consumption_get(id) {
+            Ok(journal) => journal,
+            Err(error) if error.code == "NOT_FOUND" => {
+                if self
+                    .store
+                    .consumption_retired()?
+                    .iter()
+                    .any(|retired| retired.journal.import_id == id)
+                {
+                    return Err(Error::State("the claim is already retired unrecoverable"));
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.scope(&journal)?;
+        self.private_namespace()?;
+        match open(
+            &self.inflight,
+            Path::new(&journal.import_id),
+            OFlags::RDONLY,
+            BENEATH,
+        ) {
+            Ok(_) => {
+                return Err(Error::State(
+                    "the claimed source still exists in the private claim directory; recover it, never retire it",
+                ));
+            }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(self
+            .store
+            .consumption_retire(id, &self.watch, caller, reason, now)?)
     }
 
     /// Upload through the production typed SDK's sole descriptor uploader.

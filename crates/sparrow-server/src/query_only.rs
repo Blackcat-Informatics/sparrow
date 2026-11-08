@@ -130,5 +130,6 @@ classify! {
         tail_finish: TailFinishParams, TailFinishResults;
         source_time_define: SourceTimeDefineParams, SourceTimeDefineResults;
         diagnostic_define: DiagnosticDefineParams, DiagnosticDefineResults;
+        watch_claim_retire: WatchClaimRetireParams, WatchClaimRetireResults;
     }
 }

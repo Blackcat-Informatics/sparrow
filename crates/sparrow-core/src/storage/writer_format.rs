@@ -369,6 +369,84 @@ const SOURCE_SUMMARY: [[&[u8]; 11]; 5] = [
     SOURCE_SUMMARY_INTAKE_ARCHIVE,
 ];
 
+// Store counters (#146): older binaries cannot change a counted key or move a migration
+// checkpoint without the `store-counter:` rows. Each family lifts one source summary family
+// by 55, keeping its log time, archive and intake switches.
+const STORE_COUNTERS_TRACING: [&[u8]; 11] = [
+    b"sparrow.store/297",
+    b"sparrow.store/298",
+    b"sparrow.store/299",
+    b"sparrow.store/300",
+    b"sparrow.store/301",
+    b"sparrow.store/302",
+    b"sparrow.store/303",
+    b"sparrow.store/304",
+    b"sparrow.store/305",
+    b"sparrow.store/306",
+    b"sparrow.store/307",
+];
+const STORE_COUNTERS_LOG_TIME: [&[u8]; 11] = [
+    b"sparrow.store/308",
+    b"sparrow.store/309",
+    b"sparrow.store/310",
+    b"sparrow.store/311",
+    b"sparrow.store/312",
+    b"sparrow.store/313",
+    b"sparrow.store/314",
+    b"sparrow.store/315",
+    b"sparrow.store/316",
+    b"sparrow.store/317",
+    b"sparrow.store/318",
+];
+const STORE_COUNTERS_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/319",
+    b"sparrow.store/320",
+    b"sparrow.store/321",
+    b"sparrow.store/322",
+    b"sparrow.store/323",
+    b"sparrow.store/324",
+    b"sparrow.store/325",
+    b"sparrow.store/326",
+    b"sparrow.store/327",
+    b"sparrow.store/328",
+    b"sparrow.store/329",
+];
+const STORE_COUNTERS_INTAKE: [&[u8]; 11] = [
+    b"sparrow.store/330",
+    b"sparrow.store/331",
+    b"sparrow.store/332",
+    b"sparrow.store/333",
+    b"sparrow.store/334",
+    b"sparrow.store/335",
+    b"sparrow.store/336",
+    b"sparrow.store/337",
+    b"sparrow.store/338",
+    b"sparrow.store/339",
+    b"sparrow.store/340",
+];
+const STORE_COUNTERS_INTAKE_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/341",
+    b"sparrow.store/342",
+    b"sparrow.store/343",
+    b"sparrow.store/344",
+    b"sparrow.store/345",
+    b"sparrow.store/346",
+    b"sparrow.store/347",
+    b"sparrow.store/348",
+    b"sparrow.store/349",
+    b"sparrow.store/350",
+    b"sparrow.store/351",
+];
+
+/// Families the store counter fence lifts, in the order of their lifted counterparts.
+const STORE_COUNTERS: [[&[u8]; 11]; 5] = [
+    STORE_COUNTERS_TRACING,
+    STORE_COUNTERS_LOG_TIME,
+    STORE_COUNTERS_ARCHIVE,
+    STORE_COUNTERS_INTAKE,
+    STORE_COUNTERS_INTAKE_ARCHIVE,
+];
+
 fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize, usize)> {
     families
         .iter()
@@ -381,9 +459,12 @@ fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize
         })
 }
 
-/// The pre-fallback identity a source-summary, owner-graph or fallback-fenced format lifts;
+/// The pre-fallback identity a store-counter, source-summary, owner-graph or fallback-fenced
+/// format lifts;
 /// other formats are unchanged.
 fn lower(format: &[u8]) -> &[u8] {
+    let format = position(&STORE_COUNTERS, format)
+        .map_or(format, |(family, index)| SOURCE_SUMMARY[family][index]);
     let format = position(&SOURCE_SUMMARY, format)
         .map_or(format, |(family, index)| OWNER_GRAPH[family][index]);
     let format =
@@ -391,7 +472,7 @@ fn lower(format: &[u8]) -> &[u8] {
     position(&FALLBACK, format).map_or(format, |(family, index)| LIFTED[family][index])
 }
 
-/// Re-apply the fallback, owner graph and source summary fences to a transition computed on
+/// Re-apply the fallback, owner graph, source summary and store counter fences to a transition computed on
 /// the lowered identity.
 fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
     let next = if has_event_fallback(current) {
@@ -404,8 +485,13 @@ fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
     } else {
         next
     };
-    if has_source_summary(current) {
-        enable_source_summary(next)
+    let next = if has_source_summary(current) {
+        enable_source_summary(next)?
+    } else {
+        next
+    };
+    if has_store_counters(current) {
+        enable_store_counters(next)
     } else {
         Ok(next)
     }
@@ -419,19 +505,48 @@ pub(super) fn has_owner_graphs(format: &[u8]) -> bool {
     position(&OWNER_GRAPH, format).is_some() || has_source_summary(format)
 }
 
-/// The owner graph identity a source summary family lifts; other formats are unchanged.
+/// The owner graph identity a source summary or store counter family lifts; other formats
+/// are unchanged.
 #[cfg(feature = "test-support")]
 pub(super) fn lower_source_summary(format: &[u8]) -> &[u8] {
+    let format = lower_store_counters(format);
     position(&SOURCE_SUMMARY, format).map_or(format, |(family, index)| OWNER_GRAPH[family][index])
 }
 
+/// The source summary identity a store counter family lifts; other formats are unchanged.
+#[cfg(feature = "test-support")]
+pub(super) fn lower_store_counters(format: &[u8]) -> &[u8] {
+    position(&STORE_COUNTERS, format)
+        .map_or(format, |(family, index)| SOURCE_SUMMARY[family][index])
+}
+
 pub(super) fn has_source_summary(format: &[u8]) -> bool {
-    position(&SOURCE_SUMMARY, format).is_some()
+    position(&SOURCE_SUMMARY, format).is_some() || has_store_counters(format)
+}
+
+pub(super) fn has_store_counters(format: &[u8]) -> bool {
+    position(&STORE_COUNTERS, format).is_some()
+}
+
+/// Fence a current source summary family for the store counters; idempotent.
+pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Error> {
+    position(&STORE_COUNTERS, format)
+        .or_else(|| position(&SOURCE_SUMMARY, format))
+        .map(|(family, index)| STORE_COUNTERS[family][index])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "store counters require a source summary authority family",
+            )
+        })
 }
 
 /// Fence a current owner graph family for the per-source counters and artifact index;
 /// idempotent.
 pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&STORE_COUNTERS, format) {
+        return Ok(STORE_COUNTERS[family][index]);
+    }
     position(&SOURCE_SUMMARY, format)
         .or_else(|| position(&OWNER_GRAPH, format))
         .map(|(family, index)| SOURCE_SUMMARY[family][index])
@@ -445,6 +560,9 @@ pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Erro
 
 /// Fence a current event fallback family for the owner-to-graph index; idempotent.
 pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&STORE_COUNTERS, format) {
+        return Ok(STORE_COUNTERS[family][index]);
+    }
     if let Some((family, index)) = position(&SOURCE_SUMMARY, format) {
         return Ok(SOURCE_SUMMARY[family][index]);
     }
@@ -461,6 +579,9 @@ pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error>
 
 /// Fence a current tracing-or-later family for receipt-time fallback RDF; idempotent.
 pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&STORE_COUNTERS, format) {
+        return Ok(STORE_COUNTERS[family][index]);
+    }
     if let Some((family, index)) = position(&SOURCE_SUMMARY, format) {
         return Ok(SOURCE_SUMMARY[family][index]);
     }
@@ -494,6 +615,7 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(FALLBACK.iter().flatten())
         .chain(OWNER_GRAPH.iter().flatten())
         .chain(SOURCE_SUMMARY.iter().flatten())
+        .chain(STORE_COUNTERS.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -641,6 +763,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
             .chain(FALLBACK.iter().flatten())
             .chain(OWNER_GRAPH.iter().flatten())
             .chain(SOURCE_SUMMARY.iter().flatten())
+            .chain(STORE_COUNTERS.iter().flatten())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -734,6 +857,11 @@ mod tests {
             SOURCE_SUMMARY_ARCHIVE,
             SOURCE_SUMMARY_INTAKE,
             SOURCE_SUMMARY_INTAKE_ARCHIVE,
+            STORE_COUNTERS_TRACING,
+            STORE_COUNTERS_LOG_TIME,
+            STORE_COUNTERS_ARCHIVE,
+            STORE_COUNTERS_INTAKE,
+            STORE_COUNTERS_INTAKE_ARCHIVE,
         ] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
@@ -922,6 +1050,48 @@ mod tests {
                 .chain(LIFTED.iter())
                 .chain(FALLBACK.iter())
                 .chain(OWNER_GRAPH.iter())
+                .all(|family| !family.contains(identity))
+            );
+        }
+        // The store counter fence lifts every source summary family, keeps its switches and
+        // every earlier fence, and no older binary knows its identities.
+        for index in 0..BASE.len() {
+            for (summary, counters) in SOURCE_SUMMARY.iter().zip(STORE_COUNTERS.iter()) {
+                assert_eq!(
+                    enable_store_counters(summary[index]).unwrap(),
+                    counters[index]
+                );
+                for enable in [
+                    enable_store_counters,
+                    enable_source_summary,
+                    enable_owner_graphs,
+                    enable_event_fallback,
+                ] {
+                    assert_eq!(enable(counters[index]).unwrap(), counters[index]);
+                }
+                assert!(has_store_counters(counters[index]) && has_source_summary(counters[index]));
+                assert!(has_owner_graphs(counters[index]) && !has_store_counters(summary[index]));
+            }
+            assert!(enable_store_counters(OWNER_GRAPH_TRACING[index]).is_err());
+            assert_eq!(
+                enable_archive(STORE_COUNTERS_LOG_TIME[index]).unwrap(),
+                STORE_COUNTERS_ARCHIVE[index]
+            );
+            assert_eq!(
+                enable_intake(STORE_COUNTERS_ARCHIVE[index]).unwrap(),
+                STORE_COUNTERS_INTAKE_ARCHIVE[index]
+            );
+        }
+        for identity in STORE_COUNTERS.iter().flatten() {
+            assert!(
+                [
+                    BASE, RDF, ALL_RDF, PROVENANCE, TRACING, LOG_TIME, ARCHIVE, INTAKE
+                ]
+                .iter()
+                .chain(LIFTED.iter())
+                .chain(FALLBACK.iter())
+                .chain(OWNER_GRAPH.iter())
+                .chain(SOURCE_SUMMARY.iter())
                 .all(|family| !family.contains(identity))
             );
         }

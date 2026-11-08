@@ -273,17 +273,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 accepted = endpoint.listener.accept(), if space_ok => {
                     let (stream, _) = accepted?;
-                    let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::Local);
+                    // A connection whose peer the kernel cannot name is dropped unanswered.
+                    match sparrow_server::local_caller(&stream) {
+                        Ok(caller) => {
+                            let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::Local(caller));
+                        }
+                        Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
+                    }
                 }
                 accepted = async { ingest.as_ref().expect("enabled ingest branch").0.listener.accept().await }, if space_ok && ingest.is_some() => {
                     let (stream, _) = accepted?;
                     let _ = ingest.as_ref().expect("enabled ingest branch").1.admit(stream, rpc.clone());
                 }
                 accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if space_ok && tcp_listener.is_some() => {
-                    let (stream, _) = accepted?;
+                    let (stream, peer) = accepted?;
                     stream.set_nodelay(true)?;
                     let secret = tcp_secret.clone().expect("configuration pairs TCP with its secret");
-                    let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::PublicTcp(secret));
+                    let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::PublicTcp(secret, peer.to_string()));
                 }
             }
         }

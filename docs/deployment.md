@@ -290,6 +290,19 @@ them under `migrations` with `done`, `total`, `watermark` and any `failure`, and
 the journal logs a progress line every 64 pages and a completion line per
 migration. A restart resumes after the last committed page.
 
+Schema 70 images (#146) first seed the store counters, the `store-counters`
+migration, ahead of the others. Until it completes, `status` reports
+`counts=pending` and every migration's `total` as `counting`; `live_records`
+and the two unique counts then cover only the keys seeded so far and are not
+totals. Every consumer of those counts says so rather than printing a partial
+number as a total: the closing line logs `unique_payload_chunks=pending`,
+`sparrow-backup` records `live_records=pending` and
+`unique_payload_chunks=pending` in `SOURCE`, `deploy/verify-backup.sh` reports
+its payload chunk check as not verifiable (counts pending), and
+`deploy/user-unit-upgrade.sh` prints `counts=` beside `live_records`.
+`tools/install-bin.sh` names the pair from `SCHEMA_VERSION`, so a
+schema 70 build installs as `sparrowd-schema70-REV` and `sparrow-schema70-REV`.
+
 ## Shipping finished files from producers that keep them
 
 A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
@@ -371,6 +384,8 @@ run unless free space covers twice the store plus 10 GiB, in case extents are
 not shared. Each backup lists its sources in `SOURCE`, with the image the link names and
 the store's `live_records` before the stop and the `unique_payload_chunks` the
 stopped daemon logged in its closing line, taken only when the daemon exited 0.
+While the store counters seed (status `counts=pending`), either count is
+recorded as `pending` instead of a number, because it is not a total.
 The script reads the journal of the stopped invocation with
 `journalctl --invocation=`, which needs systemd 257 or newer. An image that
 predates the closing line (schema 66 and older) is recognised before the stop,
@@ -395,7 +410,16 @@ every intake root is empty and every watch's `pending_claims` is zero. It never
 moves files under the running daemon, because a reserved claim binds the file's
 identity, including its change time. If the roots have not drained within 30
 minutes the run fails without stopping the service; a file that never drains is
-itself a fault to investigate. The shipper's global `max_pending_bytes` bounds
+itself a fault to investigate. A claim whose private source is missing never
+drains: status shows it in `pending_claims` with the watch failure "unpublished
+claimed source is missing". Once its bytes are confirmed lost, retire it with
+`sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID REASON` (schema 70 and
+newer; interfaces, "Retiring an unrecoverable claim"). It leaves
+`pending_claims`, stays listed as `retired-unrecoverable`, and the next backup
+drains. If its staged import had begun, the next reclaim pass frees that
+import's staged chunks and slot. The watch failure clears only if that claim
+caused it. A claim whose private source still exists or whose publication is
+recorded is refused; reconcile the private entry first, keeping its bytes. The shipper's global `max_pending_bytes` bounds
 the wait: with the example's 16 MiB budget and 1 MiB chunks, the roots hold at
 most 16 MiB, which drains in about eight minutes at the measured 30 seconds per
 MiB. A whole file larger than the budget is fed only when every consume root is
@@ -426,8 +450,9 @@ exercised; the drill covers only reading a restored store. `deploy/RECOVERY.md`,
 verify the backup with `deploy/verify-backup.sh BACKUP` (`deploy/RECOVERY.md`,
 "Verify a backup"). It opens a reflinked copy with `sparrowd --query-only`,
 which opens no watch root and refuses every write, and checks the store
-identity, status, the stored payload chunk count, and, within the retention
-window, a records window and one artifact's bytes. A backup counts as verified only after the script passes on it.
+identity, status, the stored payload chunk count, and, within the retention window, a records window and one artifact's bytes. A backup counts as verified only after the script exits 0.
+While either the copy's or `SOURCE`'s counts are pending, the chunk count is not
+verifiable: the script runs every other check and exits 3, which is not verified.
 
 ### Measure the online migration
 
@@ -444,7 +469,12 @@ and, as in query-only mode, the stored watch catalog is reported but no root is
 opened, so the live intake folders it names are never consumed. An image
 without `--no-intake` in its usage line is refused. The daemon runs under
 `systemd-run --user --scope` with `CPUQuota=100%`, `IOWeight=20`,
-`MemoryHigh=2G` and `MemoryMax=4G`, the limits of the service unit.
+`MemoryHigh=2G` and `MemoryMax=4G`, the limits of the service unit, and at the
+nice level of the user unit that serves the live store. The script reads that
+level with `systemctl --user show` from `sparrow.service`, or from the unit
+`SPARROW_MEASURE_UNIT` names, and refuses to run when the unit is not loaded or
+reports no nice level: a copy measured at nice 0 does not predict a unit that
+runs at `Nice=10`.
 
 The disk guard reads the free space of the filesystem holding
 `SPARROW_VERIFY`. The run refuses to start under 50 GB free, before anything
@@ -501,10 +531,10 @@ Each measurement is one `verify-backup: MEASURE` line on standard output:
 | `first_status_seconds=S` | Seconds from start to the first status answer |
 | `progress elapsed_seconds=S NAME=DONE/TOTAL ...` | Each migration's progress, every minute |
 | `free_space phase=start\|minute\|end path=P bytes=N gb=N` | Free space at start, every minute and at the end |
-| `scope=UNIT CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=N MemoryMax=N` | The scope's limits as systemd applied them |
+| `scope=UNIT CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=N MemoryMax=N Nice=N` | The scope's limits as systemd applied them, and the daemon's nice level |
 | `backfill_seconds=S` | Seconds from start until every migration was complete |
 | `end_utc=TIME` | Clock time when every migration was complete |
-| `live_records=N` | `live_records` from the final status |
+| `live_records=N counts=exact\|pending` | `live_records` and `counts` from the final status |
 
 This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live
@@ -519,8 +549,13 @@ it from one kept image pair to another and takes the named pre-upgrade backup
 in the stopped window:
 
 ```bash
-deploy/user-unit-upgrade.sh --from sparrowd-schema68-2aa56a9 --to sparrowd-schema69-3a64e08
+deploy/user-unit-upgrade.sh --from sparrowd-schema68-2aa56a9 --to sparrowd-schema70-REV
 ```
+
+The live service runs `sparrowd-schema68-2aa56a9` since the schema 69 rollback,
+so the switch goes from schema 68 straight to schema 70. After it, the daemon
+refuses schema 69 clients as well as schema 68 ones; switch every CLI and
+producer to the schema 70 pair with it.
 
 Both arguments name daemon images under `~/.local/libexec/sparrow`. Each CLI
 image is the daemon's name with `sparrowd-` replaced by `sparrow-`, and the

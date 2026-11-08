@@ -31,7 +31,8 @@ pub(crate) fn encode_migrations(
         let mut target = out.reborrow().get(index as u32);
         target.set_name(migration.name);
         target.set_done(migration.done);
-        target.set_total(migration.total);
+        target.set_total(migration.total.unwrap_or(0));
+        target.set_total_pending(migration.total.is_none());
         optional(target.reborrow().init_watermark(), &migration.watermark);
         optional(target.init_failure(), &migration.failure);
     }

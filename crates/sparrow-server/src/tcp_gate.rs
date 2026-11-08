@@ -16,14 +16,17 @@ use std::cell::Cell;
 /// One public TCP connection's single CHAP attempt.
 pub(crate) struct AnonymousTcp {
     secret: TcpSecret,
+    /// The connection's peer address, recorded as the administrator once CHAP succeeds.
+    peer: String,
     nonce: Cell<Option<[u8; CHAP_BYTES]>>,
     finished: Cell<bool>,
 }
 
 impl AnonymousTcp {
-    pub(crate) fn new(secret: TcpSecret) -> Self {
+    pub(crate) fn new(secret: TcpSecret, peer: String) -> Self {
         Self {
             secret,
+            peer,
             nonce: Cell::new(None),
             finished: Cell::new(false),
         }
@@ -69,7 +72,10 @@ impl crate::ingest_gate::Policy for AnonymousTcp {
         {
             return Err(unauthenticated("CHAP response refused; reconnect to retry"));
         }
-        Ok(gate.rpc().clone())
+        Ok(gate
+            .rpc()
+            .clone()
+            .with_admin(format!("tcp-chap peer={}", self.peer)))
     }
 }
 
@@ -109,7 +115,7 @@ mod tests {
         let client: crate::sparrow_capnp::sparrow::Client =
             capnp_rpc::new_client(crate::ingest_gate::IngestGate::new(
                 rpc,
-                AnonymousTcp::new(TcpSecret::read(&secret).unwrap()),
+                AnonymousTcp::new(TcpSecret::read(&secret).unwrap(), "test".into()),
             ));
         let mut request = client.ingest_request();
         let mut input = request.get().init_request();
