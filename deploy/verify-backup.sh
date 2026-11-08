@@ -245,11 +245,11 @@ done
 # Log the free space for PHASE; with FLOOR (GB), also return 1 when it is below the floor.
 # Return 2 when the free space cannot be read.
 report_free() {
-    local free
+    local free floor=${2:-0}
     free=$(free_bytes "$free_root") || return 2
     printf 'verify-backup: MEASURE free_space phase=%s path=%s bytes=%s gb=%s\n' \
         "$1" "$free_root" "$free" $((free / GB))
-    ((${2:-0} == 0 || free >= $2 * GB))
+    ((floor == 0 || free >= floor * GB))
 }
 if ((MEASURE_MIGRATION)); then
     report_free start "$MIN_FREE_GB" || {
