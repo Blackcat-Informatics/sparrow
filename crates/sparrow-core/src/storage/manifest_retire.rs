@@ -76,13 +76,19 @@ impl State {
         let Some(bytes) = db.get_pinned(key(id))? else {
             return Ok(None);
         };
-        if bytes.len() != 17
-            || bytes[16] > 1
-            || !matches!(
-                super::writer_format::read(db)?.as_deref(),
-                Some(FORMAT | WATCH_FORMAT)
-            )
-        {
+        if !matches!(
+            super::writer_format::read(db)?.as_deref(),
+            Some(FORMAT | WATCH_FORMAT)
+        ) {
+            return Err(failure(
+                "invalid manifest retirement state or missing writer fence",
+            ));
+        }
+        Self::decode(&bytes).map(Some)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != 17 || bytes[16] > 1 {
             return Err(failure(
                 "invalid manifest retirement state or missing writer fence",
             ));
@@ -105,8 +111,13 @@ impl State {
                 "manifest retirement position exceeds its original count",
             ));
         }
-        Ok(Some(state))
+        Ok(state)
     }
+}
+
+/// Whether an encoded manifest retirement state retires its complete artifact.
+pub(super) fn evicted_flag(bytes: &[u8]) -> Result<bool, Error> {
+    State::decode(bytes).map(|state| state.evicted)
 }
 
 /// Apply effective ownership only to stored catalogs, never to original retry receipts.
@@ -287,6 +298,22 @@ pub(super) fn header(
 }
 
 impl Header {
+    /// Up to `take` of the artifact's record identities after the first `skip`, read from
+    /// the same encoded row the header was read from.
+    pub(super) fn record_ids(
+        &self,
+        bytes: &[u8],
+        remaining: &mut usize,
+        skip: u64,
+        take: usize,
+    ) -> Result<Vec<String>, Error> {
+        let row = bytes
+            .get(self.records.clone())
+            .ok_or_else(|| failure("record manifest lies outside its artifact row"))?;
+        let mut reader = json::Reader::from_slice(row, CATALOG_LIMITS)?;
+        Ok(strings(&mut reader, remaining, skip, take, None)?.prefix)
+    }
+
     /// Return scalar metadata only; the arrays are validated but intentionally absent.
     pub(super) fn stored(mut self, db: &rocksdb::DB, id: &str) -> Result<Self, Error> {
         if self.artifact.id != id {

@@ -22,6 +22,8 @@ mod tracing_rdf;
 pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
 #[cfg(feature = "test-support")]
 pub use event_fallback_rdf::remove_event_fallback_rdf_for_legacy_fixture;
+#[cfg(feature = "test-support")]
+pub use source_summary::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
 pub(crate) mod artifact_read;
 pub(crate) mod catalog_lease;
 mod catalog_upgrade;
@@ -62,6 +64,7 @@ mod retire;
 mod sequence_window;
 mod source_context;
 pub(crate) mod source_read;
+mod source_summary;
 pub(crate) mod source_time;
 pub(crate) mod syslog;
 mod table_options;
@@ -486,6 +489,9 @@ pub struct Store {
     source_reads: Arc<Mutex<source_read::Reads>>,
     record_reads: Arc<Mutex<record_read::Reads>>,
     sparql_reads: Arc<Mutex<rdf_view::pages::Reads>>,
+    /// Runs while a source listing reads its snapshot without the writer lock.
+    #[cfg(feature = "test-support")]
+    source_read_pause: Arc<Mutex<Option<source_read::Pause>>>,
 }
 
 struct ReadLeaseStats {
@@ -1164,16 +1170,14 @@ impl Writer {
         mut expired: Option<&mut Vec<Box<[u8]>>>,
     ) -> Result<BTreeSet<String>, Error> {
         let mut protected = BTreeSet::new();
-        let mut iterator = self.db.prefix_iterator("pin:");
-        loop {
-            let _admission = admit()?;
-            let Some(entry) = iterator.next() else {
-                break;
-            };
+        for entry in self.db.prefix_iterator("pin:") {
             let (key, bytes) = entry?;
             if !key.starts_with(b"pin:") {
                 break;
             }
+            // Admission is charged for each pin row read, never for the probe that ends
+            // the range.
+            let _admission = admit()?;
             if maximum.is_some_and(|maximum| bytes.len() > maximum) {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
@@ -1487,6 +1491,8 @@ impl Store {
             source_reads: Arc::new(Mutex::new(source_read::Reads::default())),
             record_reads: Arc::new(Mutex::new(record_read::Reads::default())),
             sparql_reads: Arc::new(Mutex::new(rdf_view::pages::Reads::default())),
+            #[cfg(feature = "test-support")]
+            source_read_pause: Arc::new(Mutex::new(None)),
         };
         let writer = store.lock()?;
         producer_stream::registry(&writer)?;

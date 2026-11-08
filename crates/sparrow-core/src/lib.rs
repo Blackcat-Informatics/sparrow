@@ -116,4 +116,6 @@ pub use storage::{
     Artifact, Config, Error, INLINE_ARTIFACT_BYTES, Pin, QUERY_SCOPE_PROFILE,
     QUERY_SCOPE_WORKSPACE_BYTES, RETENTION_MS, Record, Store,
 };
+#[cfg(feature = "test-support")]
+pub use storage::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
 pub use text::resolve_text_analyzer;

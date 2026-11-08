@@ -4,7 +4,7 @@
 //! One serialized WAL boundary for durable control and bounded buffered intake.
 
 use super::{Artifact, Error, Store, Writer};
-use rocksdb::{WriteBatch, WriteOptions};
+use rocksdb::{WriteBatch, WriteBatchIteratorCf, WriteOptions};
 use std::{collections::BTreeMap, time::Instant};
 
 /// Maximum accepted writes awaiting an explicit synchronization boundary.
@@ -140,6 +140,7 @@ impl Writer {
         publication.check()?;
         self.admit_archive_publication(publication.earliest.as_deref())?;
         super::source_context::update(self, &mut batch)?;
+        super::source_summary::apply(self, &mut batch)?;
         let manifest_features = super::manifest_retire::features(&self.db)?;
         if publication.manifest_retirement || manifest_features.is_some() {
             let receiver_present = self.db.get(super::receiver_stream::KEY)?.is_some();
@@ -331,4 +332,48 @@ impl Store {
             failure: state.failure.clone(),
         })
     }
+}
+
+/// A catalog write observer run by [`Writer::apply`]: it folds each default-family put and
+/// delete of one batch, and refuses merges on the keys it reads.
+pub(super) trait BatchObserver {
+    /// Fold one put (`Some` value) or delete (`None`) of `name`.
+    fn observe(&mut self, name: &[u8], value: Option<&[u8]>) -> Result<(), Error>;
+    /// The refusal of a merge on `name`, when the observer reads that key.
+    fn refuse_merge(&self, name: &[u8]) -> Option<Error>;
+}
+
+/// Fold every default-family put, delete and merge of `batch` into `observer`, in batch
+/// order, stopping at its first failure.
+pub(super) fn observe_batch(
+    batch: &WriteBatch,
+    observer: &mut impl BatchObserver,
+) -> Result<(), Error> {
+    struct Fold<'o, O> {
+        observer: &'o mut O,
+        failure: Option<Error>,
+    }
+    impl<O: BatchObserver> WriteBatchIteratorCf for Fold<'_, O> {
+        fn merge_cf(&mut self, cf: u32, name: &[u8], _value: &[u8]) {
+            if cf == 0 && self.failure.is_none() {
+                self.failure = self.observer.refuse_merge(name);
+            }
+        }
+        fn put_cf(&mut self, cf: u32, name: &[u8], value: &[u8]) {
+            if cf == 0 && self.failure.is_none() {
+                self.failure = self.observer.observe(name, Some(value)).err();
+            }
+        }
+        fn delete_cf(&mut self, cf: u32, name: &[u8]) {
+            if cf == 0 && self.failure.is_none() {
+                self.failure = self.observer.observe(name, None).err();
+            }
+        }
+    }
+    let mut fold = Fold {
+        observer,
+        failure: None,
+    };
+    batch.iterate_cf(&mut fold);
+    fold.failure.map_or(Ok(()), Err)
 }

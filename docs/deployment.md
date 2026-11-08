@@ -432,7 +432,8 @@ window, a records window and one artifact's bytes. A backup counts as verified o
 ### Measure the online migration
 
 `deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP` measures
-the online schema 69 migrations ("Online store migrations" in the interfaces)
+the online migrations, the schema 69 pair and `source-summary` ("Online store
+migrations" and "Per-source counters and artifact index" in the interfaces)
 on a writable reflinked copy of the backup's store below `SPARROW_VERIFY`
 (default `/SPARROW/verify`). The switch gate is a first open under 10 minutes
 measured this way. The copy has its own socket, and its scratch configuration

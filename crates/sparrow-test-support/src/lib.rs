@@ -195,6 +195,16 @@ pub fn pending_schema_69_migrations(db: &rocksdb::DB) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// Remove the per-source counters, retained counts and artifact index, and lower the writer
+/// fence to its owner graph family, as a store written before #14 is. The next open fences
+/// it again and seeds the online source-summary migration.
+pub fn pending_source_summary_migration(
+    db: &rocksdb::DB,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sparrow_core::remove_source_summary_for_legacy_fixture(db)?;
+    Ok(())
+}
+
 /// Remove the range index explicitly when constructing a historical writer fixture.
 /// This does not alter record bytes, generation authority, or their acceptance clocks.
 pub fn remove_tail_range_index(db: &rocksdb::DB) -> Result<(), rocksdb::Error> {

@@ -111,24 +111,6 @@ impl<'a> TemporalRows<'a> {
     }
 }
 
-/// Receipt time of a width-checked entry whose key suffix names its identity.
-pub(super) fn entry_time(prefix: &str, key: &[u8], value: &[u8]) -> Result<u64, Error> {
-    let digits = prefix.len()..prefix.len() + 20;
-    key.get(digits)
-        .filter(|digits| {
-            digits.iter().all(u8::is_ascii_digit)
-                && key.get(prefix.len() + 20) == Some(&b':')
-                && key.get(prefix.len() + 21..) == Some(value)
-        })
-        .and_then(|digits| std::str::from_utf8(digits).ok()?.parse().ok())
-        .ok_or_else(|| {
-            Error::new(
-                "STORAGE_FAILURE",
-                "temporal index key disagrees with its receipt time or identity",
-            )
-        })
-}
-
 pub(super) fn check_width(prefix: &str, key: &[u8], value: &[u8]) -> Result<(), Error> {
     if key.len() > prefix.len() + 21 + ID_BYTES || value.is_empty() || value.len() > ID_BYTES {
         return Err(Error::new(

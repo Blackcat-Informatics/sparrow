@@ -111,7 +111,7 @@ impl Writer {
             |_| true,
             || {
                 pin_visits += 1;
-                if pin_visits > limits.scan_budget + 1 {
+                if pin_visits > limits.scan_budget {
                     Err(Error::new(
                         "RESOURCE_LIMIT",
                         "pin capture exceeds expiry scan budget",

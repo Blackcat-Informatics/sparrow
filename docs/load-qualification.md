@@ -427,3 +427,19 @@ Frozen failed-load probes `typed-load-qualification-4zk0g50_` and
 exit zero about 0.114 seconds after SIGINT, removing their sockets. These are
 failed workloads with successful teardown observations, not larger successful
 load measurements or a general shutdown latency guarantee.
+
+## Source summary migration (issue #14)
+
+Issue #14 set a target of seeding the per-source counters and artifact index in
+under 60 seconds at open. The 2026-11-07 ruling that store format changes
+follow the online migration criterion of #18 replaces that target: the open
+fences the store and serves at once, and the `source-summary` migration runs in
+the maintenance duty afterwards (see "Per-source counters and artifact index"
+in the [interfaces](interfaces.md)). Its duration is measured with
+`deploy/verify-backup.sh --measure-migration` on a copy of the newest
+closed-store backup, which reports `backfill_seconds`, done/total progress and
+`live_records`.
+
+That measurement is pending: it has not been run on the newest backup, so no
+duration is recorded here. It is recorded in this section with the image, its
+sha256 and the backup it ran on once it runs.

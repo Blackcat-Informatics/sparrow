@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 //! Cursor-only continuation of captured results. Live artifact listings read
-//! their next receipt-ordered page; every other operation replays its capture.
+//! their next page of the per-source artifact index; every other operation
+//! replays its capture.
 
 use super::{Error, Store, catalog_lease, record_read};
 use crate::{ArtifactReadPage, PinReadPage, RecordReadPage, SourceReadPage};

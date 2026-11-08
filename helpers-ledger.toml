@@ -156,6 +156,20 @@ fingerprints = []
 names = ['^(copy_fallback_upgrade_pager|decode_metadata_graph_elsewhere|append_fallback_triples_elsewhere)$']
 
 [[job]]
+id = "source-summary-counters"
+summary = "One WriteBatch observer, called in Writer::apply for every catalog write, adds the exact per-source counter, artifact retained-count and per-source artifact index row changes for the batch's artifact, artifact-retirement and record changes; negative or missing counters refuse with STORAGE_FAILURE naming the source, never clamped. One online migration, fenced and seeded at open behind the source summary writer families and paged by the maintenance worker, seeds the rows from existing artifact and record entries. Source keys use the one BLAKE3 source-key hash shared with the source context, source time and diagnostic indexes; it and the source context observer fold batches through the one durability::observe_batch."
+home = "sparrow_core::storage::source_summary::apply"
+entry_points = ["sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::source_summary::page", "sparrow_core::storage::source_summary::fence", "sparrow_core::storage::source_summary::counts", "sparrow_core::storage::source_summary::ready", "sparrow_core::storage::source_summary::source_hash", "sparrow_core::storage::writer_format::enable_source_summary", "sparrow_core::storage::artifact_read::Writer::artifact_index_page"]
+spec = "docs/interfaces.md: per-source counters and artifact index (store format); docs/architecture.md section 7."
+vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/maintenance.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(source_counter_delta|update_source_summary|clamp_source_count|copy_source_summary_pager|source_sha256|fold_catalog_batch)$']
+
+[[job]]
 id = "owner-graph-index"
 summary = "One RDF writer puts and deletes every rdf:g graph declaration together with its rdf:o owner-to-graph mirror in the same batch. One online migration, fenced and seeded at open and paged by the maintenance worker, builds the mirror from existing declaration keys in resumable pages behind the owner-graph writer families, covering privately prepared graphs. Scoped views enumerate graphs from the mirror and merge graph-leading twins of the store-wide plan through the one ScopedRows heap."
 home = "sparrow_core::storage::rdf_index::owner_graph_key"
@@ -257,7 +271,7 @@ names = ['^(recapture_pin_for_receipt|serialize_full_scope_for_receipt)$']
 id = "temporal-backend-candidates"
 summary = "Current and snapshot-bound readers use the same native half-open temporal iterator and catalog/index integrity checks; backends supply lookup only."
 home = "sparrow_core::storage::query_membership::temporal_candidates"
-entry_points = ["sparrow_core::storage::Writer::query_candidates", "sparrow_core::storage::temporal_index::TemporalRows::new", "sparrow_core::storage::temporal_index::TemporalRows::after", "sparrow_core::storage::temporal_index::TemporalRows::read_next", "sparrow_core::storage::temporal_index::TemporalRows::peek", "sparrow_core::storage::temporal_index::row_bound", "sparrow_core::storage::temporal_index::check_width", "sparrow_core::storage::temporal_index::entry_time"]
+entry_points = ["sparrow_core::storage::Writer::query_candidates", "sparrow_core::storage::temporal_index::TemporalRows::new", "sparrow_core::storage::temporal_index::TemporalRows::after", "sparrow_core::storage::temporal_index::TemporalRows::read_next", "sparrow_core::storage::temporal_index::TemporalRows::peek", "sparrow_core::storage::temporal_index::row_bound", "sparrow_core::storage::temporal_index::check_width"]
 spec = "docs/query-streaming.md: native read foundation."
 vectors = ["crates/sparrow-core/src/storage/query_membership.rs", "crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -268,18 +282,18 @@ fingerprints = []
 names = ['^(snapshot_time_candidates|stream_time_candidates)$']
 
 [[job]]
-id = "artifact-receipt-fold"
-summary = "One staged receipt-ordered reader walks the artifact and record receipt indexes, or one source's context and recordless indexes, one millisecond at a time; the live artifact listing stops it at its page bound and resumes by cursor inside a millisecond, and the source inventory runs it over the whole interval."
-home = "sparrow_core::storage::artifact_read::Writer::artifact_receipt_page"
-entry_points = ["sparrow_core::storage::artifact_read::Writer::artifact_capture", "sparrow_core::storage::artifact_read::Writer::fold_indexed", "sparrow_core::storage::artifact_read::Indexes::next_time", "sparrow_core::storage::artifact_read::Store::artifact_next"]
-spec = "docs/interfaces.md: live artifact listing pages."
+id = "artifact-index-fold"
+summary = "One live artifact page reader walks the per-source artifact index of the selected sources (all of them, source by source, without a source), seeking the receipt bounds, and folds each listed artifact from its entry and its record_ids, or a reclaimed parent's surviving records through the source record receipt index; it stops at its page bound and resumes by cursor inside an artifact, charging only the entries it reads."
+home = "sparrow_core::storage::artifact_read::Writer::artifact_index_page"
+entry_points = ["sparrow_core::storage::artifact_read::Writer::artifact_capture", "sparrow_core::storage::artifact_read::Writer::next_index_row", "sparrow_core::storage::artifact_read::Writer::fold_index_row", "sparrow_core::storage::artifact_read::Writer::fold_index_record", "sparrow_core::storage::artifact_read::Store::artifact_next"]
+spec = "docs/interfaces.md: live artifact pages (schema 66) and per-source counters and artifact index."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
 enforced = true
 [job.forbidden]
 constants = []
 fingerprints = []
-names = ['^(scan_artifact_prefix|scan_record_prefix)$']
+names = ['^(scan_artifact_prefix|scan_record_prefix|artifact_receipt_page|receipt_ordered_artifact_walk)$']
 
 [[job]]
 id = "backend-field-witnesses"
@@ -313,7 +327,7 @@ names = ['^(stream_record_summary|snapshot_record_summary)$']
 id = "source-context-timeline-cache"
 summary = "One derived source timeline is rebuilt through the shared bounded catalog pager on every open and maintained atomically with authoritative record/time publication; context uses one indexed reader, never a global-scan fallback."
 home = "sparrow_core::storage::source_context::update"
-entry_points = ["sparrow_core::storage::source_context::rebuild", "sparrow_core::storage::source_context::indexed", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::context::Store::records_context"]
+entry_points = ["sparrow_core::storage::source_context::rebuild", "sparrow_core::storage::source_context::indexed", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::source_context::hashed_prefix", "sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::context::Store::records_context"]
 spec = "docs/interfaces.md: source-indexed context capture."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2890,7 +2904,7 @@ names = ['^(encode_discovery_durability|encode_status_durability)$']
 
 [[job]]
 id = "source-catalog-discovery"
-summary = "Discover exact intake keys, retained occurrences, durable mappings, producer windows, active/recent tail generation checkpoints and runtime-owned watch/syslog listener declarations through one immutable metadata capture."
+summary = "Discover exact intake keys, retained occurrence counts from the per-source counter rows, durable mappings, producer windows, active/recent tail generation checkpoints and runtime-owned watch/syslog listener declarations through one immutable metadata capture read from a snapshot taken under the writer lock and released before reading."
 home = "sparrow_core::Store::source_read"
 entry_points = ["sparrow_server::rpc::Rpc::sources_list", "sparrow_server::agent::sources::Input::execute"]
 spec = "docs/interfaces.md: source discovery, schema 47 syslog listener IDs and explicit unknown producer continuity."
@@ -2900,7 +2914,7 @@ enforced = true
 [job.forbidden]
 constants = []
 fingerprints = []
-names = ['^capture_source_catalog$']
+names = ['^(capture_source_catalog|count_source_records|scan_sources_from_catalog)$']
 
 [[job]]
 id = "source-rdf-identity"
