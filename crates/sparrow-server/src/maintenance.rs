@@ -378,10 +378,11 @@ mod tests {
         worker.shutdown().await.unwrap();
     }
 
-    /// INVARIANT: a store opened with both schema 69 migrations pending serves reads while
-    /// the backfill is part done, and those reads report the record graphs still pending;
-    /// the joined worker's pages then finish both migrations, after which the same read
-    /// reports nothing pending.
+    /// INVARIANT: a store opened with both schema 69 migrations and the source summary
+    /// migration pending serves reads while the backfill is part done, and those reads
+    /// report the record graphs still pending; the joined worker's pages then finish every
+    /// migration, after which the same read reports nothing pending and the per-source
+    /// counters equal a full recount.
     #[tokio::test]
     async fn reads_report_pending_mid_migration_and_the_worker_finishes_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -398,6 +399,7 @@ mod tests {
         drop(store);
         let db = sparrow_test_support::catalog_db(&data).unwrap();
         sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+        sparrow_test_support::pending_source_summary_migration(&db).unwrap();
         drop(db);
         let store = config.open_store().unwrap();
         let pending = store.migrations().unwrap();
@@ -461,6 +463,9 @@ mod tests {
             "{done:?}"
         );
         assert_eq!(read(&store), 0);
+        let (stored, recounted) = store.source_count_audit_for_tests().unwrap();
+        assert_eq!(stored, recounted);
+        assert_eq!(stored["source"], [300, 1, 0]);
     }
 
     /// INVARIANT: in the no-intake shape (maintenance, but no consume or syslog worker) the

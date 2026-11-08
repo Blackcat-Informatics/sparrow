@@ -32,7 +32,7 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/198")
+        Some("sparrow.store/253")
     );
     assert_eq!(
         store
@@ -218,12 +218,12 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/198")
+        Some("sparrow.store/253")
     );
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/200")
+        Some("sparrow.store/255")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -287,7 +287,7 @@ fn native_log_time_refusals_do_not_publish_records_or_guess_optional_captures() 
         assert!(store.time_profile("invalid-log-map").unwrap().is_none());
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some("sparrow.store/187")
+            Some("sparrow.store/242")
         );
     }
     store
@@ -588,7 +588,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/187")
+        Some("sparrow.store/242")
     );
     assert!(migrate(&store) > 0);
     // The fallback backfill restored the receipt-time facts and wrote no source eventTime.
@@ -1273,7 +1273,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(12).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/195")
+        Some("sparrow.store/250")
     );
     assert_eq!(
         store.watch_registry().unwrap().as_deref(),
@@ -1454,7 +1454,7 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     let intact = db.get("syslog-receiver-registry").unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/194".as_slice())
+        Some(b"sparrow.store/249".as_slice())
     );
     db.delete("syslog-receiver-registry").unwrap();
     drop(db);
@@ -1757,7 +1757,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/191")
+        Some("sparrow.store/246")
     );
     assert_eq!(
         store
@@ -1884,7 +1884,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/191")
+        Some("sparrow.store/246")
     );
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -2423,7 +2423,7 @@ fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfe
         let store = Store::open(dir.path(), config()).unwrap();
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", legacy + 162).as_str())
+            Some(format!("sparrow.store/{}", legacy + 217).as_str())
         );
         assert_eq!(store.tail_generation(&generation.id).unwrap(), original);
         assert_eq!(store.bytes(&first.record_ids[0], 0, 2, 3).unwrap(), b"n\n");
@@ -2923,7 +2923,7 @@ fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() 
         }
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 154).as_str())
+            Some(format!("sparrow.store/{}", current + 209).as_str())
         );
         let state = store.producer_stream(&id, 2).unwrap();
         assert_eq!(state.accepted_events, 2);
@@ -3266,7 +3266,7 @@ fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_anno
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 154).as_str())
+            Some(format!("sparrow.store/{}", current + 209).as_str())
         );
         let record = store.record(&a.record_ids[0]).unwrap();
         assert!(record.producer.is_none());
@@ -3910,7 +3910,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 178).as_str())
+            Some(format!("sparrow.store/{}", version + 233).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -4429,7 +4429,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(3).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 154).as_str())
+            Some(format!("sparrow.store/{}", current + 209).as_str())
         );
         assert_eq!(
             store.bytes(&populated.id, 0, 10, 3).unwrap(),
@@ -4714,7 +4714,7 @@ fn manifest_retirement_survives_reopen_without_rewriting_original_catalog_or_rec
     let root = db.get(&original.id).unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/196".as_slice())
+        Some(b"sparrow.store/251".as_slice())
     );
     let position = db
         .get(format!("artifact-retirement:{}", original.id))
@@ -4792,7 +4792,7 @@ fn manifest_retirement_fences_later_writers_and_rejects_corrupt_state() {
         .unwrap();
     assert_eq!(
         store.status(3).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/197")
+        Some("sparrow.store/252")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -5371,7 +5371,7 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     // Force a strictly larger linked footprint: this is no native recovery observation.
     assert_eq!(
         store.status(4).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/196")
+        Some("sparrow.store/251")
     );
     file.set_len(15 * 1024 * 1024).unwrap();
     drop(file);
@@ -5409,21 +5409,21 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/196".as_slice())
+        Some(b"sparrow.store/251".as_slice())
     );
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/197")
+        Some("sparrow.store/252")
     );
     store
         .watch_registry_replace(Some(b"registered"), b"updated")
         .unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/197")
+        Some("sparrow.store/252")
     );
 }
 
@@ -5974,7 +5974,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/189")
+        Some("sparrow.store/244")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -5989,7 +5989,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/189")
+        Some("sparrow.store/244")
     );
 }
 
@@ -6037,7 +6037,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/187")
+        Some("sparrow.store/242")
     );
     let digest = format!(
         "blake3:{}",
@@ -6062,7 +6062,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/188")
+        Some("sparrow.store/243")
     );
     assert_eq!(
         store
@@ -6097,7 +6097,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/190")
+        Some("sparrow.store/245")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     let selector = IngestSelector::Handoff(handoff.request_id.clone());
@@ -6114,7 +6114,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/190")
+        Some("sparrow.store/245")
     );
     assert_eq!(
         store
@@ -6392,7 +6392,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/189")
+        Some("sparrow.store/244")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -10200,10 +10200,20 @@ fn artifact_discovery_keeps_reclaimed_parent_unknown_and_never_invents_complete_
         },
         ..Default::default()
     };
+    // The per-source index keeps the reclaimed parent's receipt, so a receipt window finds
+    // it as a fragment without inventing an origin.
+    let windowed = store.artifact_read(&timed, 31 * DAY).unwrap();
+    assert_eq!(windowed.total_items, 1);
+    let row = &windowed.body.artifacts[0];
     assert_eq!(
-        store.artifact_read(&timed, 31 * DAY).unwrap_err().code,
-        "INDEX_NOT_READY"
+        (
+            row.id.as_str(),
+            row.retained_records,
+            row.complete_bytes_available
+        ),
+        (artifact.id.as_str(), 1, false)
     );
+    assert!(row.origin.is_none());
     let timed_empty = ArtifactRead {
         selector: ArtifactSelector {
             source: Some("empty-source".into()),
@@ -10240,6 +10250,16 @@ fn artifact_capture_refuses_budget_and_corruption_without_publishing_prefixes() 
     let store = Store::open(dir.path(), config()).unwrap();
     let artifact = store
         .ingest("artifact-budget", "source", "json", b"{}", 0)
+        .unwrap();
+    // A live pin's row spends the only entry, so the page cannot read one catalog row.
+    store
+        .pin(
+            "artifact-budget-pin",
+            "budget",
+            std::slice::from_ref(&artifact.id),
+            1,
+            0,
+        )
         .unwrap();
     let tiny = ArtifactRead {
         scan_budget: 1,
@@ -10320,8 +10340,8 @@ fn artifacts_listing_reads_only_its_page() {
             .collect::<Vec<_>>()
     };
     assert_eq!(ids(&first), narrow[..2]);
-    // Two artifacts, their two records and the pin scan's terminal probe.
-    assert_eq!(first.scanned, 5, "page read {} entries", first.scanned);
+    // Two artifacts and their two records; an empty pin range costs nothing.
+    assert_eq!(first.scanned, 4, "page read {} entries", first.scanned);
     // Without a receipt window, a source listing seeks its own rows. Filtering
     // after a store-wide read would spend this budget on the bulk rows first.
     let source_only = ArtifactRead {
@@ -10392,8 +10412,17 @@ fn artifacts_listing_page_over_its_bound_is_refused_by_name() {
     let artifact = store
         .ingest("page-over-bound", "source", "jsonl", b"{}\n", 0)
         .unwrap();
-    // The pin scan's terminal probe spends the only entry, so not even the
-    // artifact's own catalog row fits.
+    // One live pin's row spends the only entry, so not even the artifact's own
+    // catalog row fits.
+    store
+        .pin(
+            "page-over-bound-pin",
+            "bound",
+            std::slice::from_ref(&artifact.id),
+            1,
+            0,
+        )
+        .unwrap();
     let query = ArtifactRead {
         page_size: 100,
         scan_budget: 1,
@@ -10426,8 +10455,8 @@ fn artifacts_listing_spans_an_artifact_larger_than_one_page() {
     let small = store
         .ingest("page-span-small", "source", "jsonl", b"{}\n", 1)
         .unwrap();
-    // Each page admits ten entries: the pin probe and nine catalog rows, far
-    // fewer than the large artifact's row and its forty records.
+    // Each page admits ten catalog rows, far fewer than the large artifact's row
+    // and its forty records.
     let mut query = ArtifactRead {
         page_size: 5,
         scan_budget: 10,
@@ -10731,7 +10760,8 @@ fn artifact_selection_seeks_members_without_reading_unrelated_corrupt_catalog_en
     };
     let page = store.artifact_read(&query, 1).unwrap();
     assert_eq!(page.total_items, 1);
-    assert_eq!(page.scanned, 5);
+    // The selection's seeks alone; an empty pin range costs nothing.
+    assert_eq!(page.scanned, 4);
     assert_eq!(page.body.artifacts[0].id, selected.id);
     assert_eq!(page.body.artifacts[0].retained_records, 1);
     query.selector.selection = QuerySelection::Evidence(vec![selected.id, unrelated.id]);
@@ -11820,7 +11850,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/187")
+        Some("sparrow.store/242")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]
@@ -18389,8 +18419,8 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
             .parse::<u32>()
             .unwrap()
     };
-    assert!((209..=219).contains(&number(&fenced)), "{fenced}");
-    assert_eq!(number(&fenced) - 209, (number(&unfenced) - 33) % 11);
+    assert!((264..=274).contains(&number(&fenced)), "{fenced}");
+    assert_eq!(number(&fenced) - 264, (number(&unfenced) - 33) % 11);
     assert_eq!(
         store.archive_state().unwrap(),
         Some(sparrow_core::ArchiveState::default())
@@ -18401,7 +18431,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!((209..=219).contains(&number(&watched)), "{watched}");
+    assert!((264..=274).contains(&number(&watched)), "{watched}");
     drop(store);
     let refused = Store::open(dir.path(), config()).err().unwrap();
     assert_eq!(refused.code, "INVALID_ARGUMENT");
@@ -18433,7 +18463,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
     // The log time law is removed so the format identity alone decides the refusal.
     let db = catalog_db(dir.path()).unwrap();
     db.put("archive:through", through).unwrap();
-    db.put("store_format", b"sparrow.store/242").unwrap();
+    db.put("store_format", b"sparrow.store/297").unwrap();
     db.delete("log-time-profile-law").unwrap();
     drop(db);
     assert_eq!(
@@ -19003,7 +19033,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
             .iter()
             .filter(|m| m.complete())
             .count(),
-        2
+        3
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -19014,14 +19044,16 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/187")
+        Some("sparrow.store/242")
     );
     let pending = store.migrations().unwrap();
     assert_eq!(
         pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-        ["owner-graph-index", "event-fallback-rdf"]
+        ["owner-graph-index", "event-fallback-rdf", "source-summary"]
     );
-    for migration in &pending {
+    // The per-source counters were not part of schema 69 and stay complete.
+    assert!(pending[2].complete(), "{pending:?}");
+    for migration in &pending[..2] {
         assert!(!migration.complete(), "{migration:?}");
         assert_eq!(migration.done, 0, "{migration:?}");
         assert!(migration.total > 0, "{migration:?}");
@@ -19146,5 +19178,685 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     assert_eq!(
         Store::open(dir.path(), config()).err().unwrap().code,
         "STORAGE_FAILURE"
+    );
+}
+
+/// The storage fixture with room for the 20,000-record listing stores.
+fn large_config() -> Config {
+    Config {
+        disk_budget: 1 << 30,
+        ..config()
+    }
+}
+
+/// Stored per-source counter rows equal a recount from the catalog entries.
+fn assert_counts_match_recount(store: &Store) {
+    let (stored, recounted) = store.source_count_audit_for_tests().unwrap();
+    assert_eq!(stored, recounted);
+}
+
+/// `(retained_records, complete_artifacts, fragment_parents)` of one source, as listed.
+fn listed_counts(store: &Store, source: &str, now: u64) -> Option<(usize, usize, usize)> {
+    use sparrow_core::{SourceRead, SourceSelector};
+    let page = store
+        .source_read(
+            &SourceRead {
+                selector: SourceSelector {
+                    source: Some(source.into()),
+                },
+                ..Default::default()
+            },
+            now,
+            &[],
+        )
+        .unwrap();
+    page.body.sources.first().map(|row| {
+        (
+            row.retained_records,
+            row.complete_artifacts,
+            row.fragment_parents,
+        )
+    })
+}
+
+fn listed_artifacts(store: &Store, source: &str, now: u64) -> Vec<(String, usize, bool)> {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+    let page = store
+        .artifact_read(
+            &ArtifactRead {
+                selector: ArtifactSelector {
+                    source: Some(source.into()),
+                    ..Default::default()
+                },
+                page_size: 1000,
+                scan_budget: 100_000,
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    assert!(page.next_cursor.is_none());
+    page.body
+        .artifacts
+        .iter()
+        .map(|row| {
+            (
+                row.id.clone(),
+                row.retained_records,
+                row.complete_bytes_available,
+            )
+        })
+        .collect()
+}
+
+/// INVARIANT: listing every source, or one, costs one catalog entry per counter row read,
+/// whatever the store holds; it never scans the record catalog. A capture that read the
+/// catalog refused this store at any budget below its 20,000 records.
+#[test]
+fn source_listing_cost_is_independent_of_store_size() {
+    use sparrow_core::{SourceRead, SourceSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    // 20,000 records in artifacts of 1,000, within the per-artifact record ceiling.
+    let bytes = "{\"listing\":\"cost\"}\n".repeat(1_000);
+    for (source, artifacts) in [("cost-a", 10), ("cost-b", 9), ("cost-c", 1)] {
+        for index in 0..artifacts {
+            store
+                .ingest(
+                    &format!("{source}-{index}"),
+                    source,
+                    "jsonl",
+                    bytes.as_bytes(),
+                    1,
+                )
+                .unwrap();
+        }
+    }
+    let all = store
+        .source_read(
+            &SourceRead {
+                scan_budget: 10,
+                ..Default::default()
+            },
+            2,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        all.body
+            .sources
+            .iter()
+            .map(|row| (row.source_id.as_str(), row.retained_records))
+            .collect::<Vec<_>>(),
+        [("cost-a", 10_000), ("cost-b", 9_000), ("cost-c", 1_000)]
+    );
+    // One entry per counter row, whatever the record catalog holds, beside the three
+    // bounded producer, receiver and file-generation registries every listing reads.
+    assert_eq!(all.scanned, 3 + 3, "read {} entries", all.scanned);
+    let one = store
+        .source_read(
+            &SourceRead {
+                selector: SourceSelector {
+                    source: Some("cost-b".into()),
+                },
+                scan_budget: 10,
+                ..Default::default()
+            },
+            2,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(one.body.sources.len(), 1);
+    assert_eq!(
+        (
+            one.body.sources[0].retained_records,
+            one.body.sources[0].complete_artifacts
+        ),
+        (9_000, 9)
+    );
+    assert_eq!(one.scanned, 1 + 3, "read {} entries", one.scanned);
+    drop(store);
+    // The record catalog the listing did not read holds at least 4 MiB.
+    let db = catalog_db(dir.path()).unwrap();
+    let catalog = db
+        .prefix_iterator(b"record:")
+        .map(Result::unwrap)
+        .take_while(|(key, _)| key.starts_with(b"record:"))
+        .map(|(_, value)| value.len())
+        .sum::<usize>();
+    assert!(catalog >= 4 << 20, "record catalog {catalog} bytes");
+}
+
+/// INVARIANT: after ingest, import publish, typed events, eviction, expiry with a pin and
+/// pin release, every source's stored counters equal a recount from the catalog entries.
+#[test]
+fn source_counters_match_a_full_recount_after_every_lifecycle_step() {
+    use sparrow_core::{Durability, EvictionLimits, ProducerBatch};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let a = store
+        .ingest("life-a", "life", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    store
+        .ingest("life-b", "other", "log", b"x\ny\n", 2)
+        .unwrap();
+    assert_counts_match_recount(&store);
+    let bytes = b"{}\n{}\n{}\n";
+    let payload = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+    );
+    let stage = store
+        .import_begin(
+            "life-import",
+            "life",
+            "jsonl",
+            bytes.len() as u64,
+            &payload,
+            3,
+        )
+        .unwrap();
+    store.import_append(&stage.id, 0, bytes, 3).unwrap();
+    store.import_seal(&stage.id, 3).unwrap();
+    store.import_prepare_layout(&stage.id, 3).unwrap();
+    store.import_prepare_record(&stage.id, 0, 3).unwrap();
+    let imported = store.import_publish(&stage.id, 3).unwrap();
+    assert_counts_match_recount(&store);
+    assert_eq!(listed_counts(&store, "life", 4), Some((5, 2, 0)));
+    let event = b"{\"profile\":\"sparrow.events/1\",\"client_instance\":\"33333333333333333333333333333333\",\"sequence\":1,\"kind\":\"event\",\"level\":\"info\",\"name\":\"observation\",\"target\":\"worker\",\"context\":[],\"fields\":[]}\n";
+    let events = store
+        .ingest_producer(
+            "life-events",
+            "life-events",
+            event,
+            &ProducerBatch {
+                instance: [0x33; 16],
+                sequences: vec![1],
+            },
+            4,
+            Durability::Durable,
+        )
+        .unwrap();
+    assert_counts_match_recount(&store);
+    // The pin keeps the second record through pressure eviction of the first and through
+    // expiry of their parent.
+    let pin = store
+        .pin("life-pin", "life-pin", &[a.record_ids[1].clone()], 400, 5)
+        .unwrap();
+    let report = store
+        .evict_oldest(
+            6,
+            EvictionLimits {
+                max_records: 1,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(report.records, [a.record_ids[0].clone()]);
+    assert_counts_match_recount(&store);
+    assert_eq!(listed_counts(&store, "life", 6), Some((4, 1, 1)));
+    // A day past the last deadline, when expiry deletes every unpinned entry.
+    let after_deadline = a.expires_at.max(imported.expires_at).max(events.expires_at) + DAY + 1;
+    store.expire(after_deadline).unwrap();
+    assert_counts_match_recount(&store);
+    assert_eq!(
+        listed_counts(&store, "life", after_deadline),
+        Some((1, 0, 1))
+    );
+    store.release(&pin.id).unwrap();
+    store.expire(after_deadline).unwrap();
+    assert_counts_match_recount(&store);
+    assert_eq!(listed_counts(&store, "life", after_deadline), None);
+}
+
+/// INVARIANT: an artifact whose entry is retired while a pinned record survives counts as
+/// one fragment parent, and the artifact listing still reaches it through the per-source
+/// index, until the pin is released and the record retires.
+#[test]
+fn fragment_parent_counts_follow_pinned_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("fragment", "fragment-source", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    assert_eq!(listed_counts(&store, "fragment-source", 2), Some((2, 1, 0)));
+    let pin = store
+        .pin(
+            "fragment-pin",
+            "fragment-pin",
+            &[artifact.record_ids[0].clone()],
+            400,
+            2,
+        )
+        .unwrap();
+    let after = artifact.expires_at + DAY + 1;
+    store.expire(after).unwrap();
+    assert_eq!(
+        listed_counts(&store, "fragment-source", after),
+        Some((1, 0, 1))
+    );
+    assert_eq!(
+        listed_artifacts(&store, "fragment-source", after),
+        [(artifact.id.clone(), 1, false)]
+    );
+    store.release(&pin.id).unwrap();
+    store.expire(after).unwrap();
+    assert_eq!(listed_counts(&store, "fragment-source", after), None);
+    assert!(listed_artifacts(&store, "fragment-source", after).is_empty());
+    assert_counts_match_recount(&store);
+}
+
+/// INVARIANT: a counter that a write would take below 0, or a missing counter row for a
+/// source with counted entries, is a STORAGE_FAILURE naming the source; nothing is
+/// clamped and the refused write commits nothing.
+#[test]
+fn negative_or_missing_source_counter_is_a_storage_failure() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .ingest("counter-a", "counted", "jsonl", b"{}\n", 1)
+        .unwrap();
+    drop(store);
+    let key = format!(
+        "source-summary:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(b"counted").as_bytes())
+    );
+    let db = catalog_db(dir.path()).unwrap();
+    let saved = db.get(&key).unwrap().unwrap();
+    db.delete(&key).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    for error in [
+        store
+            .source_read(
+                &sparrow_core::SourceRead {
+                    selector: sparrow_core::SourceSelector {
+                        source: Some("counted".into()),
+                    },
+                    ..Default::default()
+                },
+                2,
+                &[],
+            )
+            .unwrap_err(),
+        store
+            .ingest("counter-b", "counted", "jsonl", b"{}\n", 2)
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code, "STORAGE_FAILURE");
+        assert!(error.message.contains("\"counted\""), "{}", error.message);
+    }
+    drop(store);
+    // A row that undercounts the retained records refuses the retirement that would take
+    // it below 0.
+    let db = catalog_db(dir.path()).unwrap();
+    let undercount = String::from_utf8(saved)
+        .unwrap()
+        .replace("\"retained_records\":\"1\"", "\"retained_records\":\"0\"");
+    assert!(undercount.contains("\"retained_records\":\"0\""));
+    db.put(&key, undercount).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let error = store
+        .evict_oldest(
+            3,
+            EvictionLimits {
+                max_records: 1,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "STORAGE_FAILURE");
+    assert!(
+        error
+            .message
+            .contains("retained_records of source \"counted\""),
+        "{}",
+        error.message
+    );
+    assert_eq!(listed_counts(&store, "counted", 3), Some((0, 1, 0)));
+    assert_eq!(listed_artifacts(&store, "counted", 3)[0].1, 1);
+}
+
+/// INVARIANT: `artifacts --source A` reads only A's per-source index rows, A's artifact
+/// entries and their records: a scan budget of exactly those catalog rows suffices beside a
+/// second source of 20,000 records, and the listing reads exactly that many.
+#[test]
+fn artifacts_by_source_reads_only_that_source() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    let bulk = "{}\n".repeat(1_000);
+    for index in 0..20 {
+        store
+            .ingest(
+                &format!("by-source-bulk-{index}"),
+                "bulk",
+                "jsonl",
+                bulk.as_bytes(),
+                1,
+            )
+            .unwrap();
+    }
+    let mut a = Vec::new();
+    for time in 2..5 {
+        a.push(
+            store
+                .ingest(&format!("by-source-a-{time}"), "a", "jsonl", b"{}\n", time)
+                .unwrap()
+                .id,
+        );
+    }
+    // Three artifact rows and their three records; an empty pin range costs nothing.
+    let rows = 3 + 3;
+    let page = store
+        .artifact_read(
+            &ArtifactRead {
+                selector: ArtifactSelector {
+                    source: Some("a".into()),
+                    ..Default::default()
+                },
+                page_size: 10,
+                scan_budget: rows,
+                ..Default::default()
+            },
+            5,
+        )
+        .unwrap();
+    assert_eq!(
+        page.body
+            .artifacts
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>(),
+        a
+    );
+    assert_eq!(page.scanned, rows);
+    assert!(page.next_cursor.is_none());
+}
+
+/// INVARIANT: a store written before the per-source counters reopens fenced into the
+/// source summary writer families (identities no older binary knows) with the online
+/// migration seeded; the migration resumes across a restart and the finished counters
+/// equal a full recount. Writes made while it runs stay exact on every observer path,
+/// each placed by its position against the committed checkpoint: a retirement of an
+/// artifact the artifact phase has passed and of one it has not, a new artifact the
+/// phase has not reached, and, during the record phase, the retirement of an orphan
+/// parent's records on both sides of the record watermark. A fenced store without its
+/// migration state refuses to open.
+#[test]
+fn source_index_migration_seeds_exact_counters_and_fences_older_writers() {
+    use sparrow_core::{EvictionLimits, Migration};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    // An orphan: its entry expires a day after its deadline while two pinned records,
+    // its lowest and highest record IDs, survive.
+    let orphan = store
+        .ingest(
+            "migrate-orphan",
+            "migrate-orphan",
+            "jsonl",
+            "{}\n".repeat(2_000).as_bytes(),
+            1,
+        )
+        .unwrap();
+    let mut sorted = orphan.record_ids.clone();
+    sorted.sort();
+    let (low, high) = (sorted[0].clone(), sorted[sorted.len() - 1].clone());
+    let pin = store
+        .pin(
+            "migrate-pin",
+            "migrate-pin",
+            &[low.clone(), high.clone()],
+            400,
+            1,
+        )
+        .unwrap();
+    let start = orphan.expires_at + DAY + 1;
+    // Each bounded pass retires a few records; run passes until none is left to retire.
+    let expire_all = |store: &Store, now: u64| {
+        while store
+            .expire_bounded(now, EvictionLimits::default())
+            .unwrap()
+            .continuation
+        {}
+    };
+    expire_all(&store, start);
+    let mut bulk = Vec::new();
+    for index in 0..600 {
+        bulk.push(
+            store
+                .ingest(
+                    &format!("migrate-{index}"),
+                    "migrate-bulk",
+                    "jsonl",
+                    b"{}\n",
+                    start + index,
+                )
+                .unwrap(),
+        );
+    }
+    // More records than one record phase page reads, received after the bulk artifacts
+    // so pressure eviction reaches the bulk artifacts first.
+    let wide = "{}\n".repeat(1_000);
+    for index in 0..17 {
+        store
+            .ingest(
+                &format!("migrate-wide-{index}"),
+                "migrate-wide",
+                "jsonl",
+                wide.as_bytes(),
+                start + 700 + index,
+            )
+            .unwrap();
+    }
+    // Pressure eviction retires the oldest unpinned record: the bulk artifacts in order.
+    fn evict(
+        store: &Store,
+        bulk: &[sparrow_core::Artifact],
+        evicted: &mut usize,
+        now: u64,
+    ) -> String {
+        let limits = EvictionLimits {
+            max_records: 1,
+            ..EvictionLimits::default()
+        };
+        let report = store.evict_oldest(now, limits).unwrap();
+        assert_eq!(report.records, [bulk[*evicted].record_ids[0].clone()]);
+        *evicted += 1;
+        bulk[*evicted - 1].id.clone()
+    }
+    let mut evicted = 0;
+    evict(&store, &bulk, &mut evicted, start + 800);
+    assert_counts_match_recount(&store);
+    let expected = store.source_count_audit_for_tests().unwrap().0;
+    assert_eq!(expected["migrate-orphan"], [2, 0, 1]);
+    let fenced = store.properties().unwrap()["store_format"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = |format: &str| {
+        format
+            .strip_prefix("sparrow.store/")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    assert!((242..=296).contains(&number(&fenced)), "{fenced}");
+    drop(store);
+    // Before #14 the store carried the owner-graph family 55 identities below.
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    let legacy = String::from_utf8(db.get("store_format").unwrap().unwrap()).unwrap();
+    assert_eq!(number(&legacy), number(&fenced) - 55);
+    let entries = [b"artifact:".as_slice(), b"record:"]
+        .into_iter()
+        .map(|prefix| {
+            db.prefix_iterator(prefix)
+                .map(Result::unwrap)
+                .take_while(|(key, _)| key.starts_with(prefix))
+                .count() as u64
+        })
+        .sum::<u64>();
+    drop(db);
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        Some(fenced.as_str())
+    );
+    let status =
+        |store: &Store| store.migrations().unwrap()[Migration::SourceSummary.index()].clone();
+    let pending = status(&store);
+    assert!(!pending.complete() && pending.done == 0, "{pending:?}");
+    assert_eq!(pending.total, entries);
+    assert_eq!(pending.watermark.as_deref(), Some("start"));
+    let page = store.migrate_step().unwrap().unwrap();
+    assert_eq!(
+        (page.migration, page.complete),
+        (Migration::SourceSummary, false)
+    );
+    // Artifact phase writes, each placed against the committed artifact watermark.
+    let watermark = status(&store).watermark.unwrap();
+    assert!(watermark.starts_with("artifact:"), "{watermark}");
+    let (mut passed, mut ahead) = (false, false);
+    while !(passed && ahead) {
+        assert!(
+            evicted < 500,
+            "every eviction fell on one side of {watermark}"
+        );
+        let id = evict(&store, &bulk, &mut evicted, start + 900);
+        if id <= watermark {
+            passed = true;
+        } else {
+            ahead = true;
+        }
+    }
+    let mut created_ahead = false;
+    for index in 0..200 {
+        let created = store
+            .ingest(
+                &format!("migrate-more-{index}"),
+                "migrate-bulk",
+                "jsonl",
+                b"{}\n",
+                start + 1_000,
+            )
+            .unwrap();
+        if created.id > watermark {
+            created_ahead = true;
+            break;
+        }
+    }
+    assert!(created_ahead, "no new artifact lay beyond {watermark}");
+    store
+        .ingest(
+            "migrate-new",
+            "migrate-new",
+            "jsonl",
+            b"{}\n",
+            start + 1_001,
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    let resumed = status(&store);
+    assert!(resumed.done > 0 && !resumed.complete(), "{resumed:?}");
+    // Run to the record phase, past its first page.
+    let record_watermark = loop {
+        store.migrate_step().unwrap().unwrap();
+        let watermark = status(&store).watermark.unwrap();
+        if watermark.starts_with("record:") {
+            break watermark;
+        }
+    };
+    // The orphan's lowest record lies at or before the record watermark and its highest
+    // beyond it, so releasing both retires one counted and one uncounted record.
+    assert!(
+        low <= record_watermark && high > record_watermark,
+        "{record_watermark}"
+    );
+    store.release(&pin.id).unwrap();
+    expire_all(&store, start + 1_002);
+    while store.migrate_step().unwrap().is_some() {}
+    assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
+    assert_counts_match_recount(&store);
+    let finished = store.source_count_audit_for_tests().unwrap().0;
+    assert!(!finished.contains_key("migrate-orphan"), "{finished:?}");
+    assert_eq!(finished["migrate-new"], [1, 1, 0]);
+    assert_eq!(finished["migrate-wide"], [17_000, 17, 0]);
+    drop(store);
+    // The fence without its migration state refuses rather than serving stale counters.
+    let db = catalog_db(dir.path()).unwrap();
+    let checkpoint = db.get("source-summary-upgrade").unwrap().unwrap();
+    db.delete("source-summary-upgrade").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), large_config()).err().unwrap().code,
+        "STORAGE_FAILURE"
+    );
+    // A binary refuses an identity it does not know, which is how a binary that predates
+    // these families refuses this store.
+    let db = catalog_db(dir.path()).unwrap();
+    db.put("source-summary-upgrade", checkpoint).unwrap();
+    db.put("store_format", b"sparrow.store/297").unwrap();
+    drop(db);
+    assert_eq!(
+        Store::open(dir.path(), large_config()).err().unwrap().code,
+        "UNSUPPORTED"
+    );
+}
+
+/// INVARIANT: a store opened with the source summary migration pending serves at once;
+/// while it runs, `sources` and `artifacts` refuse with INDEX_NOT_READY naming the
+/// migration instead of presenting partial counts, record reads are served, and once the
+/// migration completes both listings answer with counts equal to a full recount.
+#[test]
+fn source_summary_migration_serves_at_once_and_listings_wait_for_it() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector, Migration, SourceRead};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pending", "pending-source", "jsonl", b"{}\n{}\n", 1)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(!store.migrations().unwrap()[Migration::SourceSummary.index()].complete());
+    assert_eq!(
+        store.record(&artifact.record_ids[0]).unwrap().id,
+        artifact.record_ids[0]
+    );
+    let sources = store
+        .source_read(&SourceRead::default(), 2, &[])
+        .unwrap_err();
+    let artifacts = store
+        .artifact_read(
+            &ArtifactRead {
+                selector: ArtifactSelector {
+                    source: Some("pending-source".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap_err();
+    for error in [sources, artifacts] {
+        assert_eq!(error.code, "INDEX_NOT_READY");
+        assert!(
+            error.message.contains("source-summary"),
+            "{}",
+            error.message
+        );
+    }
+    while store.migrate_step().unwrap().is_some() {}
+    assert_counts_match_recount(&store);
+    assert_eq!(listed_counts(&store, "pending-source", 2), Some((2, 1, 0)));
+    assert_eq!(
+        listed_artifacts(&store, "pending-source", 2),
+        [(artifact.id, 2, true)]
     );
 }

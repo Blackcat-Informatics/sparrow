@@ -294,27 +294,32 @@ itself. `Store::recompression_status` reads the last observation.
 ### Live artifact pages (schema 66)
 
 Schema 66 changes the live artifact listing, the one with no explicit selection,
-from one immutable capture into pages read in receipt order. A page reads only
+from one immutable capture into pages read from the per-source artifact index. A page reads only
 the rows it selects, so the listing answers at any store size. Explicit
 selections keep one immutable capture, and the earlier statements still hold
 for them.
 
 How a page reads:
 
-- Without a source, a page reads the artifact and record receipt indexes
-  (`artifact-time:` and `time:`) from its position in the receipt interval.
-  With a source, it reads that source's record receipt index
-  (`source-context-v1:`) and the recordless-artifact index (`empty-time:`)
-  instead, so it never reads or charges another source's records.
-- A record shares its parent's receipt time, so the page folds one receipt
-  millisecond at a time and emits that millisecond's rows in artifact-ID order.
-  Rows are ordered by original receipt time, then artifact ID.
+- A page walks the per-source artifact index (`source-artifact:`, see
+  "Per-source counters and artifact index") from its position. With a source,
+  it walks only that source's rows, seeking straight to the
+  `--received-from` bound and stopping at `--received-before`, so it never reads
+  or charges another source's rows. Without a source it walks the index source
+  by source in the same way, so an unfiltered page costs what its selected rows
+  cost. Index rows are positions and are not charged.
+- For each index row the page reads the artifact's entry and then its records
+  through the entry's `record_ids`. For a parent whose entry was retired while
+  pinned records survive, it reads those records through the source's record
+  receipt index (`source-context-v1:`) at the parent's receipt time.
+- Rows are ordered by source (an opaque per-source key order, not the label's
+  order), then original receipt time, then artifact ID.
 - A page stops at its page size, at most 31 rows. It charges each catalog row
   it reads against its own admission: the scan budget in entries and the
   32 MiB conservative catalog charge. Artifact rows are decoded without owning
   their record and chunk arrays.
-- A millisecond whose artifacts and records exceed one page's admission spans
-  pages, and the cursor resumes inside it. A page that exhausts its admission
+- An artifact whose records exceed one page's admission spans pages, and the
+  cursor resumes inside it. A page that exhausts its admission
   after reading a row ends early with a cursor, possibly with no rows. Only a
   page that cannot fit a single catalog row refuses with `RESOURCE_LIMIT`. The
   message names the page size, both bounds, the artifact and its receipt time.
@@ -342,8 +347,12 @@ Continuation:
   or failed continuation. After a rendered continuation it returns
   `RESULT_EXPIRED`. A reply lost after rendering still spends the cursor the
   client held, and the new page's handle lives out its lease.
-- A retained record whose parent catalog was reclaimed appears at its receipt
-  time. Receipt filtering over it still refuses with `INDEX_NOT_READY`.
+- A retained record whose parent catalog was reclaimed appears under its
+  parent's index row, at the parent's receipt time, with no origin. The index
+  keeps that receipt time, so receipt filtering finds it.
+- While the online `source-summary` migration is seeding the index, a live
+  listing refuses with `INDEX_NOT_READY` naming the migration (see "Per-source
+  counters and artifact index").
 
 For live listings only, this section supersedes four groups of statements. The
 first is the replay and "never creates another handle" statements under
@@ -352,8 +361,8 @@ coverage is identical across continuation, that `total_items` counts captured
 proven rows, and that continuation serves the immutable capture. The third is
 the schema 24 receipt with a fixed store, snapshot and as-of. The fourth is
 the earlier MCP descriptions of `artifacts_list` and `result_next`. The
-`sources` inventory reads the same indexes over its whole interval and remains
-one immutable capture.
+`sources` inventory does not read the artifact index: it reads the per-source
+counter rows (see `sources_list` below) and remains one immutable capture.
 
 ### Large artifacts (schema 65)
 
@@ -581,7 +590,8 @@ small row for it. Until it completes, scoped SPARQL keeps the whole-store plan.
 Opening a store that owes the schema 69 migrations applies both writer fences
 and seeds both checkpoints in one synchronized batch, then serves; the open
 does not wait for either job. The joined maintenance worker runs them as one
-duty, `owner-graph-index` first and then `event-fallback-rdf`, one page per
+duty, `owner-graph-index` first, then `event-fallback-rdf`, then
+`source-summary` (see "Per-source counters and artifact index"), one page per
 admission. It is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as pressure maintenance, import reclamation and
@@ -596,15 +606,22 @@ it succeeds. Nothing is skipped. The daemon logs
 `sparrowd: migration NAME progress pages=P done=D total=T watermark=W` every 64
 pages and `sparrowd: migration NAME complete pages=P` when a migration finishes.
 
-`Status.migrations` (CLI and MCP `migrations`) lists both migrations with
+`Status.migrations` (CLI and MCP `migrations`) lists every migration with
 `name`, `done` and `total` (decimal strings), `watermark` and `failure`. `total`
-counts the migration's source entries now in the store: graph declarations for
+counts the migration's source entries in the store, frozen when it completes: graph declarations for
 `owner-graph-index`, record metadata graphs (counted by their provenance
-markers) for `event-fallback-rdf`. `done` counts those at or before the
+markers) for `event-fallback-rdf`, `artifact:` and `record:` entries for
+`source-summary`. `done` counts those at or before the
 watermark, so it moves with ingest and retirement as well as with pages. The
 watermark is an opaque position, `start` before the first page and null once
 complete, when `done` equals `total`. A store that never owed a migration
-reports it complete.
+reports it complete. Only a running migration counts its entries on a status
+read. The page that completes a migration records its total in the same
+batch (`migration-total:NAME`), and a complete migration reports that recorded
+total as both `done` and `total`, so `status` never walks a finished
+migration's keys. A migration that completed before totals were recorded is
+counted once per daemon session. Fencing a migration again clears its recorded
+total.
 
 Readers are explicit while a migration is pending:
 
@@ -624,6 +641,82 @@ with `RESOURCE_LIMIT` during the migration and succeed after it.
 
 The wire schema stays 69: no schema 69 endpoint was deployed before these fields
 were added.
+
+### Per-source counters and artifact index (store format)
+
+The store keeps three derived catalog row families exact in every write:
+
+- `source-summary:<source key>`, one per source with retained input: the exact
+  source label and its `retained_records`, `complete_artifacts` and
+  `fragment_parents` counts. The row is deleted when all three are zero.
+- `artifact-retained:<artifact id>`: the artifact's retained record count, and
+  whether that count is full or partial. A full count covers every retained
+  record of the artifact. A partial count belongs to a parent whose entry was
+  deleted before the `source-summary` migration reached it, and covers only the
+  records the migration's record phase has passed; the migration completes it,
+  and the marker stays partial afterwards.
+  The row exists while the artifact is listable: its entry is present and not
+  evicted, or at least one of its records is retained.
+- `source-artifact:<source key>:<received_at as 16 hex digits>:<artifact id>`,
+  the per-source artifact index, present exactly while the artifact is
+  listable.
+
+The source key is the lower-case hex BLAKE3 digest of the exact source label,
+the same key the source record index (`source-context-v1:`) uses. It is an
+internal key and never appears on the wire.
+
+One owner, `source_summary::apply`, observes every catalog write batch before
+it commits and adds the row changes to the same batch. It reads the `artifact:`,
+`artifact-retirement:` and `record:` changes in the batch, so ingest, import
+publication, typed producer events, eviction, manifest retirement, expiry and
+pin release all keep the rows exact without their own bookkeeping. A count that
+a write would take below zero, a missing counter row for a source with counted
+entries, a merge on an observed key, or a batch that writes these rows itself
+together with catalog changes refuses the whole write with `STORAGE_FAILURE`
+naming the source or the key. Nothing is clamped.
+
+The counts follow retirement, not the retention deadline. A record past its
+deadline that has not been retired, for example while the archive gate holds
+it, still counts. Status `live_records` keeps its deadline meaning.
+
+Opening a store written before these rows moves its format to a source summary
+writer family, `sparrow.store/242` to `/296`, which lifts each owner-graph
+family by 55 and keeps its log time, archive and intake switches, so older
+binaries refuse the store. The same synchronized batch seeds the checkpoint of
+the third online migration, `source-summary` (`source-summary-upgrade`), and
+the service answers at once. Rows found under an older writer identity are not
+trusted: that batch discards them and the migration recounts every source.
+
+The migration runs in the maintenance duty after `owner-graph-index` and
+`event-fallback-rdf`, with the same admission, failure, retry and journal rules
+(see "Online store migrations"). It has two phases. The first walks `artifact:`
+entries and counts each artifact from its entry and its `record_ids`, up to 512
+artifacts or 16,384 records per page, always counting one artifact whole. The
+second walks `record:` entries and counts the retained records of parents whose
+entry was already deleted. Each page commits its rows and its checkpoint in one
+synchronized batch, so a restart resumes after the last committed page. Writes
+during the migration keep exact every artifact the migration has passed or
+that the write creates; the migration reads the current state of the rest when
+it reaches them. `total` counts `artifact:` and `record:` entries, and `done`
+those at or before the watermark.
+
+Readers while the migration is pending:
+
+| Reader | Pending | Complete |
+| --- | --- | --- |
+| `sources` (`sourcesList`, CLI `sources`, MCP `sources_list`) | Refuses with `INDEX_NOT_READY` naming the `source-summary` migration and its watermark | Reads the counter rows |
+| Live `artifacts` listing | Refuses with `INDEX_NOT_READY` the same way | Walks the per-source index |
+| Explicit artifact selections, record reads, SPARQL, search | Served; they do not read these rows | The same |
+
+The listings refuse rather than mark their counts incomplete because
+`SourceSummary` and the live artifact page have no coverage field for the
+counters, and adding one would change the wire schema, which this format
+change does not do. Strict reads refuse in the same way while the schema 69
+migrations are pending.
+
+The migration's duration on the live store is measured on a copy of the newest
+closed-store backup with `deploy/verify-backup.sh --measure-migration`, recorded
+in [load qualification](load-qualification.md).
 
 ## 1. Common types and defaults
 
@@ -2158,7 +2251,20 @@ and `Scope.sourceIds`, and a separate `rdf_iri` matching native occurrence RDF
 metadata. Treat both as opaque; no normalization or label/ID guessing occurs.
 Complete artifact occurrences, unavailable parents with retained fragments and
 retained record occurrences have separate exact counts. Identical content does
-not collapse occurrences. Immutable time/diagnostic mapping IDs are optional;
+not collapse occurrences. The counts come from the per-source counter rows (see
+"Per-source counters and artifact index") and follow retirement, not the
+retention deadline: a record past its deadline that has not been retired, for
+example while the archive gate holds it, still counts, while status
+`live_records` keeps its deadline meaning. A listing reads a snapshot taken
+under the writer lock, which it releases before reading, so a listing never
+holds up ingest. It costs one entry against `scan_budget`, and that row's
+encoded size against the byte budget, per counter row it reads: one point read
+with `source`, one row per source without. A selected or bound source without a
+counter row costs one more entry, a probe of its artifact index that proves it
+has no counted entries; finding one is a `STORAGE_FAILURE` naming the source.
+It never reads the record catalog.
+Bindings (watches, producer and receiver windows, tail generations, mapping
+profiles) are charged as before. Immutable time/diagnostic mapping IDs are optional;
 use their existing get operations for definitions. Declared mapping and
 configured watch sources remain discoverable with zero retained input.
 Watch IDs, revisions and enabled state are captured and sorted within each row.

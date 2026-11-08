@@ -306,7 +306,7 @@ fn owner_graph_failure(message: &str) -> Error {
     Error::new("STORAGE_FAILURE", format!("owner graph index: {message}"))
 }
 
-/// Fence older writers into `batch` and seed the `rdf:o:` build from the existing graph
+/// Fence older writers into `batch`, returning the fenced format, and seed the `rdf:o:` build from the existing graph
 /// declarations; the build itself runs online, one page per maintenance admission. It
 /// reads only `rdf:g:` keys, so graphs prepared by an unfinished staged import, which have
 /// no catalog record yet, are covered too.
@@ -314,17 +314,15 @@ pub(super) fn fence_owner_graphs(
     db: &DB,
     format: &[u8],
     batch: &mut WriteBatch,
-) -> Result<(), Error> {
+) -> Result<&'static [u8], Error> {
     // With no declaration to copy the build is complete as it starts.
     batch.put(
         OWNER_GRAPH_UPGRADE,
         [u8::from(super::any_key(db, GRAPH_PREFIX)?)],
     );
-    batch.put(
-        "store_format",
-        super::writer_format::enable_owner_graphs(format)?,
-    );
-    Ok(())
+    let format = super::writer_format::enable_owner_graphs(format)?;
+    batch.put("store_format", format);
+    Ok(format)
 }
 
 /// Committed progress of the owner graph build: `None` once complete, otherwise the

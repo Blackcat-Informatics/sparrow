@@ -316,7 +316,7 @@ impl Writer {
             |_| true,
             || {
                 pins += 1;
-                if pins > limits.scan_budget + 1 {
+                if pins > limits.scan_budget {
                     Err(Error::new(
                         "RESOURCE_LIMIT",
                         "pin capture exceeds eviction scan budget",

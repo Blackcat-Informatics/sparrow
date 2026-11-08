@@ -4,7 +4,7 @@
 //! Session-rebuilt source timeline cache over the authoritative record/time catalog.
 
 use super::{Error, Record, Writer, catalog_upgrade, integer, parse, read_field};
-use rocksdb::{DB, WriteBatch, WriteBatchIteratorCf};
+use rocksdb::{DB, WriteBatch};
 use std::collections::BTreeMap;
 
 const PREFIX_STR: &str = "source-context-v1:";
@@ -23,10 +23,12 @@ const JOB: catalog_upgrade::Job = catalog_upgrade::Job {
 };
 
 pub(super) fn prefix(source: &str) -> String {
-    format!(
-        "source-context-v1:{}:",
-        super::hex::encode(super::blake3::hash(source.as_bytes()).as_bytes())
-    )
+    hashed_prefix(&super::source_summary::source_hash(source))
+}
+
+/// The record receipt index prefix of the source whose key hash is `hash`.
+pub(super) fn hashed_prefix(hash: &str) -> String {
+    format!("{PREFIX_STR}{hash}:")
 }
 
 pub(super) fn key(record: &Record) -> String {
@@ -156,7 +158,6 @@ struct Change {
 
 struct Changes {
     rows: BTreeMap<String, Change>,
-    failure: Option<Error>,
 }
 
 impl Changes {
@@ -175,7 +176,9 @@ impl Changes {
         }
         Ok(self.rows.entry(id.to_owned()).or_default())
     }
+}
 
+impl super::durability::BatchObserver for Changes {
     fn observe(&mut self, name: &[u8], value: Option<&[u8]>) -> Result<(), Error> {
         if name.starts_with(b"record:") {
             let id = std::str::from_utf8(name)
@@ -209,30 +212,14 @@ impl Changes {
         }
         Ok(())
     }
-}
-
-impl WriteBatchIteratorCf for Changes {
-    fn merge_cf(&mut self, cf: u32, name: &[u8], _value: &[u8]) {
-        if cf == 0
-            && (name.starts_with(b"record:")
-                || name.starts_with(b"time:")
-                || name.starts_with(PREFIX))
-        {
-            self.failure = Some(Error::new(
-                "STORAGE_FAILURE",
-                "source context requires exact catalog/time writes, not merges",
-            ));
-        }
-    }
-    fn put_cf(&mut self, cf: u32, name: &[u8], value: &[u8]) {
-        if cf == 0 && self.failure.is_none() {
-            self.failure = self.observe(name, Some(value)).err();
-        }
-    }
-    fn delete_cf(&mut self, cf: u32, name: &[u8]) {
-        if cf == 0 && self.failure.is_none() {
-            self.failure = self.observe(name, None).err();
-        }
+    fn refuse_merge(&self, name: &[u8]) -> Option<Error> {
+        (name.starts_with(b"record:") || name.starts_with(b"time:") || name.starts_with(PREFIX))
+            .then(|| {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    "source context requires exact catalog/time writes, not merges",
+                )
+            })
     }
 }
 
@@ -241,12 +228,8 @@ impl WriteBatchIteratorCf for Changes {
 pub(super) fn update(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error> {
     let mut changes = Changes {
         rows: BTreeMap::new(),
-        failure: None,
     };
-    batch.iterate_cf(&mut changes);
-    if let Some(error) = changes.failure {
-        return Err(error);
-    }
+    super::durability::observe_batch(batch, &mut changes)?;
     for (id, change) in changes.rows {
         let old = writer
             .db

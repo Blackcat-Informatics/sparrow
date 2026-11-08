@@ -395,10 +395,7 @@ impl purrdf_lex::json::record::FromJson for EventTime {
 }
 
 pub(super) fn source_key(source: &str) -> String {
-    format!(
-        "source-time:{}",
-        hex::encode(blake3::hash(source.as_bytes()).as_bytes())
-    )
+    format!("source-time:{}", super::source_summary::source_hash(source))
 }
 
 impl Writer {

@@ -290,6 +290,85 @@ const OWNER_GRAPH: [[&[u8]; 11]; 5] = [
     OWNER_GRAPH_INTAKE_ARCHIVE,
 ];
 
+// Per-source counters and the per-source artifact index (#14): older binaries cannot change
+// a record or artifact entry without its `source-summary:`, `artifact-retained:` and
+// `source-artifact:` rows. Each family lifts one owner graph family by 55, keeping its log
+// time, archive and intake switches.
+const SOURCE_SUMMARY_TRACING: [&[u8]; 11] = [
+    b"sparrow.store/242",
+    b"sparrow.store/243",
+    b"sparrow.store/244",
+    b"sparrow.store/245",
+    b"sparrow.store/246",
+    b"sparrow.store/247",
+    b"sparrow.store/248",
+    b"sparrow.store/249",
+    b"sparrow.store/250",
+    b"sparrow.store/251",
+    b"sparrow.store/252",
+];
+const SOURCE_SUMMARY_LOG_TIME: [&[u8]; 11] = [
+    b"sparrow.store/253",
+    b"sparrow.store/254",
+    b"sparrow.store/255",
+    b"sparrow.store/256",
+    b"sparrow.store/257",
+    b"sparrow.store/258",
+    b"sparrow.store/259",
+    b"sparrow.store/260",
+    b"sparrow.store/261",
+    b"sparrow.store/262",
+    b"sparrow.store/263",
+];
+const SOURCE_SUMMARY_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/264",
+    b"sparrow.store/265",
+    b"sparrow.store/266",
+    b"sparrow.store/267",
+    b"sparrow.store/268",
+    b"sparrow.store/269",
+    b"sparrow.store/270",
+    b"sparrow.store/271",
+    b"sparrow.store/272",
+    b"sparrow.store/273",
+    b"sparrow.store/274",
+];
+const SOURCE_SUMMARY_INTAKE: [&[u8]; 11] = [
+    b"sparrow.store/275",
+    b"sparrow.store/276",
+    b"sparrow.store/277",
+    b"sparrow.store/278",
+    b"sparrow.store/279",
+    b"sparrow.store/280",
+    b"sparrow.store/281",
+    b"sparrow.store/282",
+    b"sparrow.store/283",
+    b"sparrow.store/284",
+    b"sparrow.store/285",
+];
+const SOURCE_SUMMARY_INTAKE_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/286",
+    b"sparrow.store/287",
+    b"sparrow.store/288",
+    b"sparrow.store/289",
+    b"sparrow.store/290",
+    b"sparrow.store/291",
+    b"sparrow.store/292",
+    b"sparrow.store/293",
+    b"sparrow.store/294",
+    b"sparrow.store/295",
+    b"sparrow.store/296",
+];
+
+/// Families the source summary fence lifts, in the order of their lifted counterparts.
+const SOURCE_SUMMARY: [[&[u8]; 11]; 5] = [
+    SOURCE_SUMMARY_TRACING,
+    SOURCE_SUMMARY_LOG_TIME,
+    SOURCE_SUMMARY_ARCHIVE,
+    SOURCE_SUMMARY_INTAKE,
+    SOURCE_SUMMARY_INTAKE_ARCHIVE,
+];
+
 fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize, usize)> {
     families
         .iter()
@@ -302,24 +381,31 @@ fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize
         })
 }
 
-/// The pre-fallback identity an owner-graph or fallback-fenced format lifts; other formats
-/// are unchanged.
+/// The pre-fallback identity a source-summary, owner-graph or fallback-fenced format lifts;
+/// other formats are unchanged.
 fn lower(format: &[u8]) -> &[u8] {
+    let format = position(&SOURCE_SUMMARY, format)
+        .map_or(format, |(family, index)| OWNER_GRAPH[family][index]);
     let format =
         position(&OWNER_GRAPH, format).map_or(format, |(family, index)| FALLBACK[family][index]);
     position(&FALLBACK, format).map_or(format, |(family, index)| LIFTED[family][index])
 }
 
-/// Re-apply the fallback and owner graph fences to a transition computed on the lowered
-/// identity.
+/// Re-apply the fallback, owner graph and source summary fences to a transition computed on
+/// the lowered identity.
 fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
     let next = if has_event_fallback(current) {
         enable_event_fallback(next)?
     } else {
         next
     };
-    if has_owner_graphs(current) {
-        enable_owner_graphs(next)
+    let next = if has_owner_graphs(current) {
+        enable_owner_graphs(next)?
+    } else {
+        next
+    };
+    if has_source_summary(current) {
+        enable_source_summary(next)
     } else {
         Ok(next)
     }
@@ -330,11 +416,38 @@ pub(super) fn has_event_fallback(format: &[u8]) -> bool {
 }
 
 pub(super) fn has_owner_graphs(format: &[u8]) -> bool {
-    position(&OWNER_GRAPH, format).is_some()
+    position(&OWNER_GRAPH, format).is_some() || has_source_summary(format)
+}
+
+/// The owner graph identity a source summary family lifts; other formats are unchanged.
+#[cfg(feature = "test-support")]
+pub(super) fn lower_source_summary(format: &[u8]) -> &[u8] {
+    position(&SOURCE_SUMMARY, format).map_or(format, |(family, index)| OWNER_GRAPH[family][index])
+}
+
+pub(super) fn has_source_summary(format: &[u8]) -> bool {
+    position(&SOURCE_SUMMARY, format).is_some()
+}
+
+/// Fence a current owner graph family for the per-source counters and artifact index;
+/// idempotent.
+pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Error> {
+    position(&SOURCE_SUMMARY, format)
+        .or_else(|| position(&OWNER_GRAPH, format))
+        .map(|(family, index)| SOURCE_SUMMARY[family][index])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "per-source counters require an owner graph authority family",
+            )
+        })
 }
 
 /// Fence a current event fallback family for the owner-to-graph index; idempotent.
 pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&SOURCE_SUMMARY, format) {
+        return Ok(SOURCE_SUMMARY[family][index]);
+    }
     position(&OWNER_GRAPH, format)
         .or_else(|| position(&FALLBACK, format))
         .map(|(family, index)| OWNER_GRAPH[family][index])
@@ -348,6 +461,9 @@ pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error>
 
 /// Fence a current tracing-or-later family for receipt-time fallback RDF; idempotent.
 pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&SOURCE_SUMMARY, format) {
+        return Ok(SOURCE_SUMMARY[family][index]);
+    }
     if let Some((family, index)) = position(&OWNER_GRAPH, format) {
         return Ok(OWNER_GRAPH[family][index]);
     }
@@ -377,6 +493,7 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(INTAKE_ARCHIVE.iter())
         .chain(FALLBACK.iter().flatten())
         .chain(OWNER_GRAPH.iter().flatten())
+        .chain(SOURCE_SUMMARY.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -523,6 +640,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
             .chain(INTAKE_ARCHIVE.iter())
             .chain(FALLBACK.iter().flatten())
             .chain(OWNER_GRAPH.iter().flatten())
+            .chain(SOURCE_SUMMARY.iter().flatten())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -611,6 +729,11 @@ mod tests {
             OWNER_GRAPH_ARCHIVE,
             OWNER_GRAPH_INTAKE,
             OWNER_GRAPH_INTAKE_ARCHIVE,
+            SOURCE_SUMMARY_TRACING,
+            SOURCE_SUMMARY_LOG_TIME,
+            SOURCE_SUMMARY_ARCHIVE,
+            SOURCE_SUMMARY_INTAKE,
+            SOURCE_SUMMARY_INTAKE_ARCHIVE,
         ] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
@@ -760,6 +883,45 @@ mod tests {
                 .iter()
                 .chain(LIFTED.iter())
                 .chain(FALLBACK.iter())
+                .all(|family| !family.contains(identity))
+            );
+        }
+        // The source summary fence lifts every owner graph family, keeps its switches and
+        // both earlier fences, and no older binary knows its identities.
+        for index in 0..BASE.len() {
+            for (owner, summary) in OWNER_GRAPH.iter().zip(SOURCE_SUMMARY.iter()) {
+                assert_eq!(enable_source_summary(owner[index]).unwrap(), summary[index]);
+                assert_eq!(
+                    enable_source_summary(summary[index]).unwrap(),
+                    summary[index]
+                );
+                assert_eq!(enable_owner_graphs(summary[index]).unwrap(), summary[index]);
+                assert_eq!(
+                    enable_event_fallback(summary[index]).unwrap(),
+                    summary[index]
+                );
+                assert!(has_source_summary(summary[index]) && has_owner_graphs(summary[index]));
+                assert!(has_event_fallback(summary[index]) && !has_source_summary(owner[index]));
+            }
+            assert!(enable_source_summary(FALLBACK_TRACING[index]).is_err());
+            assert_eq!(
+                enable_archive(SOURCE_SUMMARY_LOG_TIME[index]).unwrap(),
+                SOURCE_SUMMARY_ARCHIVE[index]
+            );
+            assert_eq!(
+                enable_intake(SOURCE_SUMMARY_ARCHIVE[index]).unwrap(),
+                SOURCE_SUMMARY_INTAKE_ARCHIVE[index]
+            );
+        }
+        for identity in SOURCE_SUMMARY.iter().flatten() {
+            assert!(
+                [
+                    BASE, RDF, ALL_RDF, PROVENANCE, TRACING, LOG_TIME, ARCHIVE, INTAKE
+                ]
+                .iter()
+                .chain(LIFTED.iter())
+                .chain(FALLBACK.iter())
+                .chain(OWNER_GRAPH.iter())
                 .all(|family| !family.contains(identity))
             );
         }

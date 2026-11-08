@@ -553,8 +553,29 @@ atomically through the ordinary write path, so a restart resumes after the last
 committed page and a failed page is retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
 could differ: the schema 69 receipt-time fallback backfill is reported in
-SPARQL coverage. `status` reports each migration's progress. A query-only
+SPARQL coverage, and the source listings refuse while their counters are seeded. `status` reports each migration's progress. A query-only
 daemon runs no maintenance worker, so it serves on the pending paths.
+
+Source and artifact discovery read three derived catalog row families instead of
+the record catalog:
+
+- `source-summary:<source key>` holds a source's label and its exact
+  `retained_records`, `complete_artifacts` and `fragment_parents` counts;
+- `artifact-retained:<artifact id>` holds an artifact's retained record count,
+  marked full, or partial for a parent whose entry was deleted before the
+  seeding migration reached it, while the artifact is listable;
+- `source-artifact:<source key>:<receipt>:<artifact id>` is the per-source
+  artifact index, ordered by receipt time within each source.
+
+The source key is the BLAKE3 hex of the exact source label, shared with the
+source record index. One owner observes every catalog write batch and adds the
+row changes to the same batch, so no writer can change a record or artifact
+entry without them; a count that would go negative or a missing row refuses the
+write. `sources` reads one counter row per source from a snapshot taken under
+the writer lock and released before reading, and the live artifact listing walks
+the index of the selected sources, so neither costs the size of the store. The
+online `source-summary` migration seeds the rows of an older store; until it
+completes both listings refuse with `INDEX_NOT_READY`.
 
 Use PurRDF's governed prepared queries and fail-aware execution boundary.
 Storage faults refuse publication of an apparently successful prefix. Governor

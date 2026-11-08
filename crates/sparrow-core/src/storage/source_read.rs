@@ -3,10 +3,7 @@
 
 //! Immutable discovery of intake keys, retained provenance and durable mappings.
 
-use super::{
-    Catalog, Error, Store, artifact_read::ArtifactSelector, catalog_lease, diagnostic, random_id,
-    source_time,
-};
+use super::{Catalog, Error, Store, catalog_lease, diagnostic, random_id, source_time};
 use catalog_lease::{CAPTURE_BYTES, HANDLE_BYTES, LEASE_MS, MAX_HANDLES, MAX_ITEMS, SCAN_BYTES};
 use std::{collections::BTreeMap, time::Instant};
 
@@ -85,11 +82,12 @@ pub struct SourceSummary {
     pub source_id: String,
     /// The source IRI used by native occurrence RDF metadata.
     pub rdf_iri: String,
-    /// Eligible complete artifact occurrences.
+    /// Artifact entries present and not evicted. Counts follow retirement, not the
+    /// retention deadline.
     pub complete_artifacts: usize,
-    /// Parents with retained records whose complete bytes are unavailable.
+    /// Artifacts whose entry is retired while at least one of their records is retained.
     pub fragment_parents: usize,
-    /// Exact number of eligible record occurrences.
+    /// Exact number of record entries present and not evicted.
     pub retained_records: usize,
     /// Declared immutable time mapping, or explicit absence.
     pub time_profile_id: Option<String>,
@@ -213,6 +211,39 @@ impl catalog_lease::PageBody for SourcePageBody {
 pub type SourceReadPage = catalog_lease::CatalogReadPage<SourcePageBody>;
 pub(super) type Reads = catalog_lease::Reads<SourceSelector, SourcePageBody>;
 
+/// Test hook run while a source listing reads its snapshot without the writer lock.
+#[cfg(feature = "test-support")]
+pub(super) type Pause = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(feature = "test-support")]
+impl Store {
+    /// Run `pause` in every later source listing after it has taken its snapshot and released
+    /// the writer lock, and before it reads any row. Acceptance tests only.
+    pub fn pause_source_reads_for_tests(
+        &self,
+        pause: impl Fn() + Send + Sync + 'static,
+    ) -> Result<(), Error> {
+        *self
+            .source_read_pause
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "source read pause poisoned"))? =
+            Some(std::sync::Arc::new(pause));
+        Ok(())
+    }
+
+    fn source_read_paused(&self) -> Result<(), Error> {
+        let pause = self
+            .source_read_pause
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "source read pause poisoned"))?
+            .clone();
+        if let Some(pause) = pause {
+            pause();
+        }
+        Ok(())
+    }
+}
+
 impl Store {
     /// Discover retained provenance and durable mapping declarations atomically.
     /// No successful prefix is published on resource, catalog or identity failure.
@@ -305,8 +336,38 @@ impl Store {
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "source read deadline overflow"))?;
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
+        // The registries are single bounded rows; read them, and take the snapshot every
+        // other row is read from, at one instant under the writer lock. The lock is then
+        // released, so a listing never holds back ingestion while it reads.
         let writer = self.lock()?;
         cancellation.checkpoint()?;
+        let producer_bytes = writer
+            .db
+            .get(super::producer_stream::KEY)?
+            .map_or(0, |bytes| bytes.len());
+        let streams = super::producer_stream::registry(&writer)?;
+        let receiver_bytes = writer
+            .db
+            .get(super::receiver_stream::KEY)?
+            .map_or(0, |bytes| bytes.len());
+        let windows = super::receiver_stream::registry(&writer)?;
+        let tail_registry = writer.db.get(super::tail::KEY)?.ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "file-generation checkpoint registry missing",
+            )
+        })?;
+        let store_id = writer.id.clone();
+        let db = writer.db.clone();
+        let view = db.snapshot();
+        drop(writer);
+        #[cfg(feature = "test-support")]
+        self.source_read_paused()?;
+        let read = |key: &str| Ok::<_, Error>(view.get(key)?);
+        super::source_summary::ready(
+            &super::source_summary::progress(read)?,
+            "the source listing",
+        )?;
         let mut scanned = 0;
         let mut remaining = SCAN_BYTES;
         let mut admission = catalog_lease::CaptureAdmission {
@@ -316,22 +377,57 @@ impl Store {
             scanned: &mut scanned,
             remaining: &mut remaining,
         };
-        let artifacts = writer.artifact_capture(
-            &ArtifactSelector {
-                source: query.selector.source.clone(),
-                ..Default::default()
-            },
-            now,
-            &mut admission,
-        )?;
         let mut rows = BTreeMap::<String, SourceSummary>::new();
         let mut capacity = 4096;
-        for artifact in artifacts.artifacts {
-            cancellation.checkpoint()?;
-            let row = admit_source(&mut rows, &artifact.source, &mut capacity)?;
-            row.complete_artifacts += usize::from(artifact.complete_bytes_available);
-            row.fragment_parents += usize::from(!artifact.complete_bytes_available);
-            row.retained_records += artifact.retained_records;
+        let mut counted = std::collections::BTreeSet::new();
+        let mut count = |rows: &mut BTreeMap<String, SourceSummary>,
+                         capacity: &mut usize,
+                         counts: super::source_summary::Counts|
+         -> Result<(), Error> {
+            let wide = |value: u64| {
+                usize::try_from(value).map_err(|_| {
+                    Error::new("STORAGE_FAILURE", "per-source count exceeds address space")
+                })
+            };
+            let row = admit_source(rows, &counts.source, capacity)?;
+            row.complete_artifacts = wide(counts.complete_artifacts)?;
+            row.fragment_parents = wide(counts.fragment_parents)?;
+            row.retained_records = wide(counts.retained_records)?;
+            counted.insert(counts.source);
+            Ok(())
+        };
+        match &query.selector.source {
+            // One point read.
+            Some(source) => {
+                let key = super::source_summary::summary_key(source);
+                if let Some(bytes) = view.get(&key)? {
+                    admission.entry(bytes.len())?;
+                    let counts = super::source_summary::Counts::decode(key.as_bytes(), &bytes)?;
+                    count(&mut rows, &mut capacity, counts)?;
+                }
+            }
+            // One walk over the summary rows, one entry each.
+            None => {
+                let prefix = super::source_summary::SUMMARY.as_bytes();
+                let mut iterator = view.raw_iterator();
+                iterator.seek(prefix);
+                while iterator.valid() {
+                    let key = iterator.key().ok_or_else(|| {
+                        Error::new("STORAGE_FAILURE", "source counter iterator key missing")
+                    })?;
+                    if !key.starts_with(prefix) {
+                        break;
+                    }
+                    let bytes = iterator.value().ok_or_else(|| {
+                        Error::new("STORAGE_FAILURE", "source counter iterator value missing")
+                    })?;
+                    admission.entry(bytes.len())?;
+                    let counts = super::source_summary::Counts::decode(key, bytes)?;
+                    count(&mut rows, &mut capacity, counts)?;
+                    iterator.next();
+                }
+                iterator.status()?;
+            }
         }
         if configured.len() > 8 {
             return Err(Error::new(
@@ -375,13 +471,8 @@ impl Store {
                 }
             }
         }
-        admission.entry(
-            writer
-                .db
-                .get(super::producer_stream::KEY)?
-                .map_or(0, |bytes| bytes.len()),
-        )?;
-        for stream in super::producer_stream::registry(&writer)? {
+        admission.entry(producer_bytes)?;
+        for stream in streams {
             admission.entry(0)?;
             if stream.expires_at > now
                 && query
@@ -401,13 +492,8 @@ impl Store {
                 row.producer_stream_ids.push(stream.id);
             }
         }
-        admission.entry(
-            writer
-                .db
-                .get(super::receiver_stream::KEY)?
-                .map_or(0, |bytes| bytes.len()),
-        )?;
-        for window in super::receiver_stream::registry(&writer)? {
+        admission.entry(receiver_bytes)?;
+        for window in windows {
             admission.entry(0)?;
             if window.expires_at > now
                 && query
@@ -427,12 +513,6 @@ impl Store {
                 row.receiver_window_ids.push(window.id);
             }
         }
-        let tail_registry = writer.db.get(super::tail::KEY)?.ok_or_else(|| {
-            Error::new(
-                "STORAGE_FAILURE",
-                "file-generation checkpoint registry missing",
-            )
-        })?;
         admission.entry(tail_registry.len())?;
         for generation in super::tail::decode_registry(&tail_registry)? {
             admission.entry(0)?;
@@ -507,7 +587,7 @@ impl Store {
             }
         }
         for prefix in [b"source-time:".as_slice(), b"source-diagnostic:".as_slice()] {
-            let mut iterator = writer.db.raw_iterator();
+            let mut iterator = view.raw_iterator();
             iterator.seek(prefix);
             while iterator.valid() {
                 let key = iterator.key().ok_or_else(|| {
@@ -560,6 +640,33 @@ impl Store {
             }
             iterator.status()?;
         }
+        // A source with counted entries always has its counter row; one probe of its
+        // artifact index rows per listed or selected source the read did not count proves
+        // it.
+        let uncounted = rows
+            .keys()
+            .chain(query.selector.source.as_ref())
+            .filter(|source| !counted.contains(*source))
+            .collect::<std::collections::BTreeSet<_>>();
+        for source in uncounted {
+            admission.entry(0)?;
+            let prefix = super::source_summary::index_prefix(source);
+            let mut probe = view.raw_iterator();
+            probe.seek(prefix.as_bytes());
+            if probe.valid()
+                && probe
+                    .key()
+                    .is_some_and(|key| key.starts_with(prefix.as_bytes()))
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    format!(
+                        "source {source:?} has counted catalog entries but no per-source counter row"
+                    ),
+                ));
+            }
+            probe.status()?;
+        }
         for row in rows.values_mut() {
             cancellation.checkpoint()?;
             row.tail_generation_ids.sort();
@@ -570,7 +677,7 @@ impl Store {
         let snapshot = catalog_lease::Snapshot {
             bytes: 0,
             id: random_id("source-read")?,
-            store_id: writer.id.clone(),
+            store_id,
             selector: query.selector.clone(),
             as_of: now,
             expires_at,
@@ -582,7 +689,7 @@ impl Store {
                 sources: rows.into_values().collect(),
             },
         };
-        drop(writer);
+        drop(view);
         reads.publish(
             snapshot,
             now,

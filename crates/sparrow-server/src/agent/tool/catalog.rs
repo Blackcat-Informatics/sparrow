@@ -64,15 +64,15 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "result_next",
-        "Resume the captured operation, scope and limits from a cursor; reading never renews its lease or evidence retention. A live artifact listing reads its next receipt-ordered page under a new lease.",
+        "Resume the captured operation, scope and limits from a cursor; reading never renews its lease or evidence retention. A live artifact listing reads its next page of the per-source index under a new lease.",
     ),
     (
         "sources_list",
-        "Page an immutable capture of exact intake keys, retained occurrence counts, mapping IDs, producer and receiver windows, file-generation checkpoint IDs and configured watch/syslog listener bindings; continuity remains explicitly unknown.",
+        "Page an immutable capture of exact intake keys, retained occurrence counts from per-source counter rows, mapping IDs, producer and receiver windows, file-generation checkpoint IDs and configured watch/syslog listener bindings; continuity remains explicitly unknown.",
     ),
     (
         "artifacts_list",
-        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads receipt-ordered pages that count delivered rows until the last page. Original receipt-time filters refuse reclaimed parents with unknown origin metadata.",
+        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads pages of the per-source index, ordered by source key, then original receipt, then ID, that count delivered rows until the last page. In the live listing, original receipt-time filters find reclaimed parents at their indexed receipt, without origin metadata; an explicit scope still refuses a receipt filter that meets a parent with no origin. The live listing refuses INDEX_NOT_READY while the source-summary migration seeds the index.",
     ),
     (
         "diagnostic_define",

@@ -206,7 +206,7 @@ impl Store {
             Some(1024 * 1024),
             Some(&mut admission.remaining),
         )?;
-        // The protection owner's admission callback also checks the terminal seek.
+        // The protection owner's admission callback counts each pin row read.
         admission.visits = pin_visits;
         let mut report = RetentionMetrics {
             store_id: writer.id.clone(),

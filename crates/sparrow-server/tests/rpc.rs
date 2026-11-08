@@ -273,7 +273,7 @@ async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture
             assert_eq!(artifact["record_ids"].as_array().unwrap().len(), 3);
             assert_eq!(
                 cli(&endpoint, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/200")
+                Some("sparrow.store/255")
             );
             let first = cli(
                 &endpoint,
@@ -625,7 +625,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/191"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/246"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -2972,7 +2972,7 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 )
                 .await;
             assert!(!second["isError"].as_bool().unwrap());
-            // A live continuation reads the next receipt-ordered page under a new
+            // A live continuation reads the next per-source index page under a new
             // handle, and the later artifact still lies ahead of it.
             let second = &second["structuredContent"];
             assert_ne!(second["snapshot_id"], first["snapshot_id"]);
@@ -3014,6 +3014,28 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 Some(false)
             );
             assert_eq!(fragments["rows"][0]["retained_records"].as_str(), Some("1"));
+            // The per-source index keeps the reclaimed parent's receipt, so a receipt window
+            // finds the fragment, still without an origin.
+            let windowed = cli(
+                &socket,
+                &[
+                    "artifacts",
+                    &store,
+                    "--source",
+                    "wire-fragments",
+                    "--received-from",
+                    "1970-01-01T00:00:00Z",
+                    "--received-before",
+                    "2099-01-01T00:00:00Z",
+                ],
+            );
+            assert_eq!(windowed["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                windowed["rows"][0]["artifact_id"],
+                fragments["rows"][0]["artifact_id"]
+            );
+            assert_eq!(windowed["rows"][0]["origin"], Value::Null);
+            assert_eq!(windowed["rows"][0]["retained_records"].as_str(), Some("1"));
             for (args, code) in [
                 (
                     vec!["artifacts", &store, "--scan-budget", "1"],
@@ -3033,22 +3055,7 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     ],
                     "CONFLICT",
                 ),
-                (
-                    vec![
-                        "artifacts",
-                        &store,
-                        "--source",
-                        "wire-fragments",
-                        "--received-from",
-                        "1970-01-01T00:00:00Z",
-                    ],
-                    "INDEX_NOT_READY",
-                ),
             ] {
-                let mut args = args;
-                if code == "INDEX_NOT_READY" {
-                    args.extend(["--received-before", "2099-01-01T00:00:00Z"]);
-                }
                 let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
                     .args(args)
@@ -3866,7 +3873,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/190");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/245");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -4083,7 +4090,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/189")
+                Some("sparrow.store/244")
             );
         })
         .await;
@@ -4262,9 +4269,11 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 .status()
                 .unwrap();
             assert!(status.success());
-            // The copy owes both schema 69 migrations, which only a maintenance worker runs.
+            // The copy owes both schema 69 migrations and the source summary migration,
+            // which only a maintenance worker runs.
             let db = sparrow_test_support::catalog_db(&copied).unwrap();
             sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+            sparrow_test_support::pending_source_summary_migration(&db).unwrap();
             drop(db);
             let copy_socket = copied.join("rpc.sock");
             let copy_config = write_server_config(&copy, &copied, &copy_socket);
@@ -4372,7 +4381,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             assert_eq!(status["live_records"].as_str(), Some("1"));
             // A query-only open fences and serves, but never runs a migration page.
             let migrations = status["migrations"].as_array().unwrap();
-            assert_eq!(migrations.len(), 2, "{migrations:?}");
+            assert_eq!(migrations.len(), 3, "{migrations:?}");
             for migration in migrations {
                 assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
                 assert_ne!(migration["total"].as_str(), Some("0"), "{migration:?}");
@@ -5024,7 +5033,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/189"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/244"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -13161,6 +13170,95 @@ async fn key_paths_share_native_counts_cursor_binding_and_typed_cli_mcp_admissio
                 assert!(!output.status.success() && output.stdout.is_empty());
                 assert!(String::from_utf8_lossy(&output.stderr).contains("INVALID_ARGUMENT"));
             }
+        })
+        .await;
+}
+
+/// INVARIANT: a source listing reads a snapshot taken under the writer lock and releases the
+/// lock before it reads any row, so an ingest issued while the listing is still reading
+/// completes before the listing finishes, and the listing answers from its snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn sources_listing_does_not_hold_the_writer_lock() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::{Rpc, ServerConfig};
+            use std::sync::{Arc, Mutex, mpsc};
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config =
+                ServerConfig::read(&write_server_config(dir.path(), &data, &socket)).unwrap();
+            let store = config.open_store().unwrap();
+            store
+                .ingest(
+                    "before-listing",
+                    "listed",
+                    "jsonl",
+                    b"{}\n",
+                    sparrow_server::now().unwrap(),
+                )
+                .unwrap();
+            let (paused, reached) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let released = Mutex::new(released);
+            store
+                .pause_source_reads_for_tests(move || {
+                    // Later listings find the channels closed and do not wait.
+                    if paused.send(()).is_ok() {
+                        let _ = released.lock().unwrap().recv();
+                    }
+                })
+                .unwrap();
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
+                store.clone(),
+                Arc::new(tokio::sync::Semaphore::new(4)),
+                config.max_pin_members,
+            ));
+            let _serving = tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    tokio::task::spawn_local(sparrow_server::serve_connection(
+                        stream,
+                        capability.clone(),
+                    ));
+                }
+            });
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let mut request = client.capability().sources_list_request();
+            let mut query = request.get().init_query();
+            query.set_store_id(&client.discovery().store_id);
+            query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+            query.set_page_size(200);
+            query.set_scan_budget(10000);
+            let listing = tokio::task::spawn_local(request.send().promise);
+            tokio::task::spawn_blocking(move || reached.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                client.ingest(
+                    "during-listing",
+                    "ingested-meanwhile",
+                    wire::Format::Jsonl,
+                    b"{}\n",
+                ),
+            )
+            .await
+            .expect("an ingest completes while a listing is reading")
+            .unwrap();
+            assert!(!listing.is_finished(), "the listing is still reading");
+            release.send(()).unwrap();
+            let response = listing.await.unwrap().unwrap();
+            let rows = rpc_ok(response.get().unwrap().get_result().unwrap())
+                .get_rows()
+                .unwrap();
+            let sources = rows
+                .iter()
+                .map(|row| row.get_source_id().unwrap().to_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(sources, ["listed"], "the listing answers from its snapshot");
         })
         .await;
 }

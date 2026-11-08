@@ -404,7 +404,7 @@ pub(super) fn capture(
 pub(super) fn source_key(source: &str) -> String {
     format!(
         "source-diagnostic:{}",
-        hex::encode(blake3::hash(source.as_bytes()).as_bytes())
+        super::source_summary::source_hash(source)
     )
 }
 

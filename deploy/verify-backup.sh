@@ -14,13 +14,13 @@
 # or holds a symlink leading outside the backup, and refuses any scratch path that resolves under
 # the live store, socket, intake or the backup.
 #
-# With --measure-migration it instead measures the online schema 69 migrations on a writable copy
-# (docs/deployment.md, "Measure the online migration"): the image opens the copy with
-# `sparrowd --no-intake` (maintenance runs; no watch root, ingest socket, TCP listener or archive
-# is opened) under a systemd user scope with the service unit's CPU, IO and memory limits, and the
-# script logs machine-greppable `MEASURE` lines until status reports every migration complete. A
-# disk guard refuses to start below 50 GB free and aborts below 40 GB, and the copy is removed
-# however the run ends.
+# With --measure-migration it instead measures the online migrations (schema 69 and
+# source-summary) on a writable copy (docs/deployment.md, "Measure the online migration"): the
+# image opens the copy with `sparrowd --no-intake` (maintenance runs; no watch root, ingest
+# socket, TCP listener or archive is opened) under a systemd user scope with the service unit's
+# CPU, IO and memory limits, and the script logs machine-greppable `MEASURE` lines until status
+# reports every migration complete. A disk guard refuses to start below 50 GB free and aborts
+# below 40 GB, and the copy is removed however the run ends.
 set -euo pipefail
 umask 077
 
