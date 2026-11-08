@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 14,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/14-make-sources-and-artifacts-work-on-a",
+  "branch": "paudley/14-make-sources-and-artifacts-work-on-a",
+  "slug": "make-sources-and-artifacts-work-on-a",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/14-make-sources-and-artifacts-work-on-a/.stage/make-sources-and-artifacts-work-on-a",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "3a64e08d201ec09054f45e9ce4f3fa2dee2276f9",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/14-make-sources-and-artifacts-work-on-a",
+    "branch:paudley/14-make-sources-and-artifacts-work-on-a",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow caches into /home/paudley/Active/sparrow/.worktrees/14-make-sources-and-artifacts-work-on-a plus 0 dependency units from 0 other checkouts in 12.7s; 274 unchanged files keep their built mtimes; 4 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/14-make-sources-and-artifacts-work-on-a/.stage/make-sources-and-artifacts-work-on-a",
+    "issue:/home/paudley/Active/sparrow/.worktrees/14-make-sources-and-artifacts-work-on-a/.stage/make-sources-and-artifacts-work-on-a/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-07T15:11:31-0600",
+  "seed_error": ""
+}
