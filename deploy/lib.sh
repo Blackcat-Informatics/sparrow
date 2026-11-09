@@ -307,6 +307,14 @@ status_field() {
     python3 -I -c 'import json,sys; v=json.load(sys.stdin); [v := v[k] for k in sys.argv[1:]]; print(v)' "$@"
 }
 
+# Field of a JSON document on stdin, by key path (a list index is a number); an object, a
+# list, a boolean or null prints as JSON.
+json_field() {
+    python3 -I -c 'import json,sys; v=json.load(sys.stdin)
+for k in sys.argv[1:]: v=v[int(k)] if isinstance(v,list) else v[k]
+print(json.dumps(v) if isinstance(v,(dict,list,bool)) or v is None else v)' "$@"
+}
+
 # Wait until the started daemon answers status on its socket, or the unit fails.
 wait_ready() {
     local deadline=$((SECONDS + READY_SECONDS))

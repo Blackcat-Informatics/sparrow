@@ -524,6 +524,37 @@ with an error, as a normal daemon does. The startup line reports
 uses the mode; see [the deployment guide](deployment.md), "Measure the online
 migration".
 
+`sparrowd --config FILE --private-intake DIR` opens a disposable copy of a
+store writable with its maintenance worker and its watches. Every stored watch
+definition, and every definition `watchPut` accepts, is rebound to `DIR/NAME`,
+where `NAME` is the final component of its root, before any root opens; a root
+without a final component refuses the open, or the put with
+`INVALID_ARGUMENT`. So does a configured root that is `DIR`, lies under it or
+holds it: rebinding would then reach that root itself, or put the private
+roots inside a root another daemon consumes. Paths are compared canonically,
+and a configured root present on the host is also compared by device and
+inode with `DIR`, its ancestors and `DIR/NAME`, so a bind mount or other alias
+of the root is refused too. Two configured roots with one final component
+would share a private root, so they refuse the open, or the put with
+`INVALID_ARGUMENT`, naming both. Never point `DIR` at a live
+intake directory or its parent; the refusal covers the configured roots
+only, so use a fresh scratch directory. The rebinding is held in memory: a
+later watch mutation persists the configured roots, never the private ones,
+so the catalog keeps naming where its watches consume. A consume or
+tail claim bound to another root identity, such as the original root's, does
+not refuse the open in this mode and is never recovered: each recovery refuses
+a claim of another root, which becomes the watch's failure. An active tail
+generation of another root is never resumed, adopted or given a gap; a file
+under the private root that reuses its file identity is refused. The configuration
+may not set `consume`, `syslog`, `rpc_tcp_address`, `archive` or
+`backup_root`, and the refusal names the key; `ingest_socket_path` is allowed.
+A copy shares the live store's identity, so its online backup would land in
+the live backup root and purge its oldest sets. The mode cannot be
+combined with query-only mode. The startup line reports
+`query_only=false intake=private`. `deploy/verify-backup.sh --measure-migration
+--with-traffic` uses the mode; see [the deployment guide](deployment.md),
+"Measure the online migration with intake and traffic".
+
 ### Receipt-time event fallback (schema 69)
 
 A record whose source profile yields no event time is placed on the event
@@ -2820,7 +2851,8 @@ Configuration keys in the server file:
 `Status.backup` is a `BackupStatus` with `phase` (`unconfigured`, `idle`,
 `running`, `complete` or `failed`), `root`, `keep`, `startedAt`, `finishedAt`,
 `backupId`, `files`, `bytes` and `failure`. The phase is `unconfigured` under
-`--no-intake` or `--query-only`, and without `backup_root`. Times are Unix
+`--no-intake` or `--query-only`, and without `backup_root`. `--private-intake`
+refuses to start with `backup_root` set, so its phase is always `unconfigured`. Times are Unix
 milliseconds, 0 until set; `backupId`, `files` and `bytes` are 0 until a backup
 completes. The state is the latest backup since the daemon started. CLI and MCP
 status render the object as `backup` with `phase`, `root`, `keep`,
@@ -2833,7 +2865,7 @@ Refusals:
 | Condition | Error |
 | --- | --- |
 | Query-only daemon | `READ_ONLY` (the write gate) |
-| `--no-intake` daemon (it serves a copy) | `UNSUPPORTED` |
+| `--no-intake` or `--private-intake` daemon (it serves a copy; `backup_root` refuses a private-intake startup) | `UNSUPPORTED` |
 | No `backup_root` configured | `UNSUPPORTED` |
 | A backup is already running | `CONFLICT` |
 | `storeId` is not this store | `STORE_MISMATCH` |

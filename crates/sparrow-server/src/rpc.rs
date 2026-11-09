@@ -185,10 +185,11 @@ impl Rpc {
         self
     }
 
-    /// Refuse online backups: a `--no-intake` daemon serves a copy of a store.
+    /// Refuse online backups: a `--no-intake` or `--private-intake` daemon serves a copy of a
+    /// store.
     #[must_use]
-    pub fn without_backup_for_no_intake(mut self) -> Self {
-        self.backup = crate::backup::Backup::NoIntake;
+    pub fn without_backup_for_copy(mut self) -> Self {
+        self.backup = crate::backup::Backup::Copy;
         self
     }
 
