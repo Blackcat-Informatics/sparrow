@@ -1,0 +1,29 @@
+Back up Sparrow online, only to the NAS archive (#156)
+
+The running daemon now takes its own backup. `sparrow SOCKET backup`
+(RPC `backup`) starts RocksDB's BackupEngine on one nice-19 thread over
+the shared database handle. It takes no writer lock and flushes nothing,
+and nothing is stopped, paused or drained. `status` reports the backup's
+phase. The backup root (`backup_root`, `backup_keep`) must be on a
+network filesystem apart from the store's. Every backup checks this in
+/proc/self/mountinfo before it creates anything. Startup checks only the
+path, so a daemon whose NAS is down still serves.
+
+RocksDB keeps the files that become obsolete while it copies. They no
+longer count toward the disk budget or eviction: table and blob files
+count only the bytes RocksDB versions reference, and write-ahead logs
+below the oldest one recovery needs do not count. A guard thread at
+normal priority re-enables file deletions once free space falls below
+twice min_free_bytes. A backup therefore never refuses a write, evicts
+evidence or brings ingest to the floor, even one stalled on the NAS.
+
+deploy/libexec/sparrow-backup asks the daemon for the backup and copies
+the image pair, lexicons, configuration and intake into sets/ID.partial
+on the NAS. It writes a MANIFEST.b3 read back from the NAS and renames
+the set into place, then prunes the sets whose engine backup was purged.
+pre-upgrade-backup.sh and user-unit-upgrade.sh take the pre-upgrade
+backup online; --no-backup REASON covers a running image without the
+operation. verify-backup.sh checks a NAS set against its manifest,
+restores it with `sparrowd --restore-backup` and checks the copy
+query-only. Nothing local holds a backup. The units, AppArmor profile,
+tmpfiles, install and uninstall scripts and the docs change with it.

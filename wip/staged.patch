@@ -1,0 +1,1439 @@
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index b45c52a..2a5515b 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -4817,12 +4817,12 @@ fn backup_fixture(
+     (live, live_data, backup, identity)
+ }
+ 
+-/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a reflinked copy,
++/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a scratch copy,
+ /// still passes on its clock-independent chunk count once the backup has aged out of
+ /// retention, and fails, removing its scratch copy, when SOURCE names another store.
+ #[test]
+ fn verify_backup_fails_on_wrong_store_id() {
+-    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
++    // The script's scratch copy stays below the cargo target directory and is removed.
+     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+     let (live, _, backup, identity) = backup_fixture(dir.path());
+     let verify = dir.path().join("verify");
+@@ -4887,7 +4887,7 @@ fn verify_backup_fails_on_wrong_store_id() {
+ /// expects the closing line to say pending for a pending copy, and exits 3, not 0.
+ #[test]
+ fn verify_backup_reports_pending_counts_as_not_verifiable() {
+-    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
++    // The script's scratch copy stays below the cargo target directory and is removed.
+     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+     let (live, _, backup, _) = backup_fixture(dir.path());
+     let verify = dir.path().join("verify");
+@@ -5196,6 +5196,54 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
+     unchanged(from);
+ }
+ 
++/// INVARIANT (issue #156; Patrick, 2026-11-08: Sparrow never backs up to a local disk):
++/// deploy/libexec/sparrow-backup refuses a backup root on a local filesystem before it creates
++/// anything or addresses a unit. An absent root is not created, and an existing one gains no
++/// lock, partial or backup. The unit named does not exist, so a refusal that came after the
++/// script's first systemctl call would name the unit instead.
++#[test]
++fn backup_refuses_a_local_backup_root_before_stopping_anything() {
++    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
++    let (data, intake, runtime) = (
++        dir.path().join("store"),
++        dir.path().join("intake"),
++        dir.path().join("runtime"),
++    );
++    for path in [&data, &intake, &runtime] {
++        std::fs::create_dir_all(path).unwrap();
++    }
++    let config = write_server_config(dir.path(), &data, &data.join("rpc.sock"));
++    let run = |root: &Path| {
++        let output = Command::new(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/../../deploy/libexec/sparrow-backup"
++        ))
++        .arg(&config)
++        .arg(root)
++        .arg("3")
++        .arg(&intake)
++        .env("RUNTIME_DIRECTORY", &runtime)
++        .env("SPARROW_SCOPE", "user")
++        .env("SPARROW_UNIT", "sparrow-backup-refusal-test.service")
++        .env("SPARROW_PREFIX", dir.path())
++        .admitted_output()
++        .unwrap();
++        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
++        assert_eq!(output.status.code(), Some(1), "{stderr}");
++        assert!(
++            stderr.contains("not a network filesystem")
++                && !stderr.contains("sparrow-backup-refusal-test"),
++            "{stderr}"
++        );
++    };
++    let root = dir.path().join("backups");
++    run(&root);
++    assert!(!root.exists());
++    std::fs::create_dir(&root).unwrap();
++    run(&root);
++    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
++}
++
+ /// INVARIANT (issue #148): a daemon whose soft open-file limit leaves no room for the table
+ /// cache beside the descriptor reserve refuses to open the store and names the unit setting,
+ /// instead of serving until a table read fails with EMFILE. 1024 is the user manager's default,
+diff --git deploy/MANUAL.md deploy/MANUAL.md
+index f7e4844..c500f4b 100644
+--- deploy/MANUAL.md
++++ deploy/MANUAL.md
+@@ -104,7 +104,7 @@ sudo systemctl start sparrow.service
+ 
+ ```bash
+ sudo -u paudley sh -c 'umask 0077; exec /usr/local/libexec/sparrow/sparrow-ship /etc/sparrow/ship.toml'
+-sudo env RUNTIME_DIRECTORY=/run/sparrow-backup sh -c 'install -d -m 0700 /run/sparrow-backup && exec flock /SPARROW/ship/lock /usr/local/libexec/sparrow/sparrow-backup /etc/sparrow/server.toml /SPARROW/backups 3 /SPARROW/intake /etc/sparrow /SPARROW/ship'
++sudo env RUNTIME_DIRECTORY=/run/sparrow-backup sh -c 'install -d -m 0700 /run/sparrow-backup && exec flock /SPARROW/ship/lock /usr/local/libexec/sparrow/sparrow-backup /etc/sparrow/server.toml /net/synology/archives/sparrow 3 /SPARROW/intake /etc/sparrow /SPARROW/ship'
+ ```
+ 
+ The backup stops and starts `sparrow.service` through `systemctl`, so it
+diff --git deploy/README.md deploy/README.md
+index bcbb141..76f095c 100644
+--- deploy/README.md
++++ deploy/README.md
+@@ -57,20 +57,26 @@ Patrick's decisions for this deployment, 2026-11-01:
+   Fleet producers ingest through the ingest-only group socket of Sparrow
+   issue #10 (Forgejo `fleet/sparrow`), never the private socket; this
+   directory does not implement it.
+-- The NAS archive (`/net/synology/archives/sparrow`) is the backup. Its worker
+-  is not deployed and nothing here grants its path; Sparrow issues #15 to #17
+-  add it.
++- The NAS archive (`/net/synology/archives/sparrow`) is the backup, and the
++  only one: Sparrow never backs up to a local disk (Patrick, 2026-11-08:
++  "Sparrow and katamaria are FORBIDDEN from backing up to local disks").
++  `sparrow-backup.service` writes its closed-store backups there, and the
++  backup scripts refuse any root that is not on a network filesystem or that
++  shares the store's filesystem. The daemon's archive worker, which will write
++  its own per-store directories under the same root, is not deployed; Sparrow
++  issues #15 to #17 add it.
+ - Restarts of the live service are approved and announced by the coordination
+   session.
+ 
+ ## Layout
+ 
+ Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"). `install.sh`
+-sets the btrfs no-copy-on-write attribute on `/SPARROW/store` and `/SPARROW/backups` while they
+-are empty, so every file created in them inherits it. `restart.sh` rewrites a closed store that
++sets the btrfs no-copy-on-write attribute on `/SPARROW/store` while it is empty, so every file
++created in it inherits it. `restart.sh` rewrites a closed store that
+ still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keeps the original
+-beside it as `store.cow-STAMP`; remove that copy once a backup of the converted store has verified. Every backup, verification and restore copy takes its source's
+-attribute, because btrfs refuses a reflink between the two kinds of file. The store gives up
++beside it as `store.cow-STAMP`; remove that copy once a backup of the converted store has verified. Backups
++are byte copies on the NAS, and the verification and restore copies made from them go into a
++no-copy-on-write directory. The store gives up
+ btrfs checksums and compression; its own digests and compression cover both.
+ 
+ | Path | Owner, mode | Contents |
+@@ -90,7 +96,7 @@ btrfs checksums and compression; its own digests and compression cover both.
+ | `/SPARROW/store` | sparrow, 0710, no copy-on-write (`C`) | The store and `rpc.sock` (0660). |
+ | `/SPARROW/intake/NAME` | the operator who made it (plain `mkdir`; the cutover gives existing roots to `sparrow`), 0770, ACL `group:sparrow:rwx` | One consume root per watch. |
+ | `/SPARROW/ship` | paudley:sparrow, 2700 | The shipper's queue, staging, ledgers and lock. |
+-| `/SPARROW/backups` | root, 0700, no copy-on-write (`C`) | Closed-store backups: three daily `STAMP` copies, and the named `pre-upgrade-IMAGE` copies, which the rotation never prunes. |
++| `/net/synology/archives/sparrow` | on the NAS (NFSv4), 0700; create it before the first backup | Closed-store backups: three daily `STAMP` copies, each verified against its `MANIFEST.b3`, and the named `pre-upgrade-IMAGE` copies, which the rotation never prunes. Nothing local holds a backup. |
+ | `/etc/systemd/system/sparrow*.{service,timer}` | root, 0644 | The units, from `systemd/`. |
+ | `/etc/apparmor.d/sparrow` | root, 0644 | The profile, from `apparmor/`. |
+ | `/etc/sysusers.d/sparrow.conf`, `/etc/tmpfiles.d/sparrow.conf` | root, 0644 | The user, group and layout, from `config/`. |
+@@ -111,7 +117,8 @@ device as `/home`. Filling `/home` still fills `/SPARROW`
+   `sparrow --secret-file PATH tcp://ADDRESS:518 COMMAND`. The operator's copy is
+   `~/.config/sparrow/tcp.secret`.
+ - `sparrow-backup` copies `/etc/sparrow`, so each backup under
+-  `/SPARROW/backups` holds the secret; those directories are root-only.
++  `/net/synology/archives/sparrow` holds the secret; those directories are
++  mode 0700, and anyone with root on the NAS can read them.
+ - Custody: the secret is generated on the host, never committed, never kept in
+   this directory, and never passed on a command line. Rotating it means
+   replacing the file, restarting the service and replacing every remote copy.
+@@ -336,14 +343,15 @@ sudo systemctl start sparrow-ship.timer
+ `pre-upgrade-backup.sh` runs `sparrow-backup.service` once and stops at the
+ first failure. While the daemon runs, the service copies the configuration
+ and the image pair that last opened the store. It then stops the daemon
+-through its drain, copies the store and intake, and starts it again. Its `SOURCE` records that image (`image=`), the
++through its drain, finishes the network copy of the store and intake, and
++starts it again, then verifies the copy on the NAS against its manifest. Its `SOURCE` records that image (`image=`), the
+ store's identity, schema and format, and `taken_utc`. The script accepts only
+ the backup this run took, with `taken_utc` at or after its own start and
+ `image=` equal to the current image, and renames it to
+-`/SPARROW/backups/pre-upgrade-CURRENT`, which the three-day rotation never
++`/net/synology/archives/sparrow/pre-upgrade-CURRENT`, which the three-day rotation never
+ prunes. It refuses if that name already exists, as it does after a restore of
+ it: rename the old copy first, for example
+-`sudo mv -T /SPARROW/backups/pre-upgrade-CURRENT /SPARROW/backups/pre-upgrade-CURRENT.retired-STAMP`.
++`sudo mv -T /net/synology/archives/sparrow/pre-upgrade-CURRENT /net/synology/archives/sparrow/pre-upgrade-CURRENT.retired-STAMP`.
+ Remove a pre-upgrade copy by hand once the upgrade is settled.
+ 
+ `restart.sh` installs and verifies the newest pair while the old daemon still
+@@ -351,7 +359,7 @@ runs, records the store identity, stops through the drain, points the links at
+ the new pair (the old pair becomes `.previous`), starts, and fails unless the
+ store identity is unchanged. `sudo deploy/restart.sh --rev REV` selects another
+ kept pair; `sudo deploy/restart.sh --rollback` swaps back to the previous pair.
+-`start.sh` and `restart.sh` hold the backup's lock (`/SPARROW/backups/.lock`)
++`start.sh` and `restart.sh` hold the backup's lock (`/net/synology/archives/sparrow/.lock`)
+ while they run, and refuse while a backup holds it, so a backup and an image
+ switch never interleave.
+ 
+@@ -359,7 +367,7 @@ A newer image may upgrade the store's format, and an older image then refuses
+ to open it. The scripts enforce this by the schema number in the image names
+ (`sparrowd-schemaN-REV`), not by reading the store: `start.sh` and `restart.sh`
+ refuse an image with a lower number than the current one, and refuse one with
+-a higher number unless `/SPARROW/backups/pre-upgrade-CURRENT` exists, names
++a higher number unless `/net/synology/archives/sparrow/pre-upgrade-CURRENT` exists, names
+ the current image and is fresh. Fresh means two things:
+ 
+ - its `taken_utc` is at or after the time the image link was last set (every
+diff --git deploy/RECOVERY.md deploy/RECOVERY.md
+index 55dfaf3..ff86f13 100644
+--- deploy/RECOVERY.md
++++ deploy/RECOVERY.md
+@@ -20,10 +20,13 @@ Commands prefixed with `sudo` need root.
+ | Images and lexicons | `/usr/local/libexec/sparrow`, `/usr/local/share/sparrow` | Each backup's `images/` and `lexicons/` keep the pair that last opened its store and its bundle; everything else is rebuilt from the repository into `./bin` |
+ | Units, profile, layout | `/etc/systemd/system`, `/etc/apparmor.d`, `/etc/{sysusers,tmpfiles}.d` | This directory (`install.sh`) |
+ 
+-The closed-store backups in `/SPARROW/backups` share the store's disk, so they
+-protect against software faults and operator error, not against losing the
+-disk. The NAS archive, the off-host backup, is not deployed yet (Sparrow
+-issues #15 to #17).
++The closed-store backups live on the NAS, under
++`/net/synology/archives/sparrow` (an NFSv4 mount of the Synology), and nowhere
++else: Sparrow never backs up to a local disk (Patrick, 2026-11-08). Each one is
++a full copy, read back from the NAS and checked against its `MANIFEST.b3` (the
++b3sum of every file) before it is renamed into place. The daemon's own archive
++worker, which will write per-store directories under the same root, is not
++deployed yet (Sparrow issues #15 to #17).
+ 
+ ## Verify health
+ 
+@@ -77,8 +80,8 @@ every watch in `consume_watches` names a root that exists.
+   connect, or the unit waits at startup with `waiting to open the store`.
+ - Diagnose: `df -h /SPARROW /home`, then find what grew:
+   `sudo du -xsh /home/* /SPARROW/* | sort -h | tail`.
+-- Recover: free space on the filesystem (another program's files, old backups
+-  in `/SPARROW/backups`, a read-only pre-move copy once approved). The daemon
++- Recover: free space on the filesystem (another program's files, a read-only
++  pre-move copy once approved). No backup is kept on it. The daemon
+   resumes by itself within a second of crossing the floor; nothing needs a
+   restart. Do not lower `min_free_bytes` to get past it.
+ - Reversible: yes, unless the space came from deleting something.
+@@ -157,7 +160,7 @@ every watch in `consume_watches` names a root that exists.
+   `start.sh` and `restart.sh` therefore refuse an image whose schema number
+   (`sparrowd-schemaN-REV`) is lower than the current image's, before stopping
+   anything. Stay on the new image and fix forward, or restore the named
+-  pre-upgrade backup `/SPARROW/backups/pre-upgrade-IMAGE` ("Restore from a
++  pre-upgrade backup `/net/synology/archives/sparrow/pre-upgrade-IMAGE` ("Restore from a
+   backup"). `deploy/pre-upgrade-backup.sh` takes it, and `restart.sh` requires
+   it before it raises the schema. It must be no older than the image link's
+   last start and no older than 24 hours (README.md, "Upgrades and rollback")
+@@ -204,9 +207,21 @@ every watch in `consume_watches` names a root that exists.
+ 
+ ## NAS archive unavailable
+ 
+-- Not applicable yet: the archive worker is not deployed, and neither the unit
+-  nor the profile names the NAS, so a NAS outage does not affect the service.
+-  Sparrow issues #15 to #17 add the archive and this entry's procedure.
++- Symptom: `sparrow-backup` fails with "backup root ... is on autofs (or
++  btrfs, or an unknown filesystem) ..., not a network filesystem", or a copy
++  or read-back step fails with an I/O error.
++- Effect: none on the service. The network-filesystem check runs before the
++  script creates anything or stops the service. A copy that fails while the
++  service is stopped restarts it as every other failure does, and leaves only
++  `STAMP.partial` on the NAS, which the next run removes.
++- Diagnose: `findmnt -T /net/synology/archives/sparrow` must show `nfs4` from
++  `192.168.1.1:/volume1/archives`.
++- Recover: restore the mount, then run the backup again. Never point the
++  backup at a local directory instead: the scripts refuse it, and Patrick's
++  ruling forbids it.
++- The daemon's archive worker is not deployed, and neither the daemon unit nor
++  the profile names the NAS. Sparrow issues #15 to #17 add it and its
++  procedure.
+ 
+ ## Verify a backup
+ 
+@@ -215,16 +230,21 @@ Run it as the operator, who must be able to read the backup and the live server
+ configuration:
+ 
+ ```bash
+-deploy/verify-backup.sh /SPARROW/backups/NAME; echo "exit=$?"
++deploy/verify-backup.sh /net/synology/archives/sparrow/NAME; echo "exit=$?"
+ ```
+ 
+ The script reads the live `data_dir` and `socket_path` from `SPARROW_CONFIG`
+ (default `/etc/sparrow/server.toml`) and refuses to run when it cannot read
+ them, since those are the paths a copy must never touch. It refuses a
+ `BACKUP/store` that is a symbolic link or holds one: `sparrow-backup` copies no
+-links, and a copied absolute link would lead the daemon out of the copy. It reflinks `BACKUP/store` into a scratch directory below
+-`/SPARROW/verify/` (`SPARROW_VERIFY` overrides it), so the backup itself is
+-never opened. Before it creates that directory, and again on the copy, it
++links, and a copied absolute link would lead the daemon out of the copy. The NAS
++takes no reflink, so it copies `BACKUP/store` byte for byte into a scratch
++directory below `/SPARROW/verify/` (`SPARROW_VERIFY` overrides it), so the
++backup itself is never opened. That scratch working copy is not a backup: the
++script removes it however the run ends, and refuses to start unless its
++filesystem has the store's size plus 10 GiB free. When the backup holds
++`MANIFEST.b3`, the copy must hold exactly the store files it lists, each with
++its b3sum, before anything opens it. Before it creates that directory, and again on the copy, it
+ refuses any path that resolves under the live store, the live socket, the intake
+ (`SPARROW_INTAKE`), the backup, or the `data_dir` and `intake` the backup itself
+ records in `SOURCE` and its configuration copy. It writes a configuration for the copy with its own socket and
+@@ -237,6 +257,7 @@ copy. The script then prints one line per check:
+ 
+ | Check | Passes when |
+ | --- | --- |
++| `manifest` | The copy's store files are exactly those `MANIFEST.b3` lists, each with its b3sum (a backup without the file prints a note instead) |
+ | `query-only` | Status and the startup line report `query_only`, and no stored watch root is open |
+ | `store-id` | The copy's store identity equals `store_id` in `SOURCE` |
+ | `status` | `pressure.phase` is `ready` and `durability.failure` is `null` |
+@@ -306,14 +327,16 @@ exact command, so the live times can be taken the same way.
+ 
+ ## Restore from a backup
+ 
+-A backup `/SPARROW/backups/NAME` (a `STAMP`, or a named `pre-upgrade-IMAGE`)
++A backup `/net/synology/archives/sparrow/NAME` (a `STAMP`, or a named `pre-upgrade-IMAGE`)
+ holds `store`, `intake` and `config` (the server configuration, `/etc/sparrow`
+ with the secret, and `/SPARROW/ship`) from one moment, `images/` with the
+ image pair that last opened the store, `lexicons/` with the bundle it read, and `SOURCE`, which names that image
+ (`image=`) and the store's identity, schema, format and live record count
+-(`pending` while the store counters seed).
+-Restore only a backup that `deploy/verify-backup.sh` has passed ("Verify a
+-backup").
++(`pending` while the store counters seed), and `MANIFEST.b3`, the b3sum of
++every file it holds. Restore only a backup that `deploy/verify-backup.sh` has
++passed ("Verify a backup"). The restore copies from the NAS into the local
++directories; the NAS takes no reflink, so every byte crosses the network, and
++the copy is checked against the manifest before the service starts.
+ 
+ ```bash
+ sudo systemctl stop sparrow-backup.timer sparrow-ship.timer
+@@ -321,22 +344,25 @@ sudo deploy/stop.sh
+ sudo mv /SPARROW/store /SPARROW/store.damaged
+ sudo mv /SPARROW/intake /SPARROW/intake.damaged
+ sudo mv /SPARROW/ship /SPARROW/ship.damaged
++B=/net/synology/archives/sparrow/NAME
+ sudo mkdir /SPARROW/store
+-sudo deploy/copy-on-write.sh match /SPARROW/backups/NAME/store /SPARROW/store
+-sudo cp -a --reflink=auto /SPARROW/backups/NAME/store/. /SPARROW/store/
+-sudo cp -a --reflink=auto /SPARROW/backups/NAME/intake /SPARROW/intake
+-sudo cp -a --reflink=auto /SPARROW/backups/NAME/config/ship /SPARROW/ship
++sudo chattr +C /SPARROW/store
++sudo cp -a "$B/store/." /SPARROW/store/
++sudo cp -a "$B/intake" /SPARROW/intake
++sudo cp -a "$B/config/ship" /SPARROW/ship
++sudo sh -c "cd /SPARROW && grep -E '^\\\\?[0-9a-f]{64}  (store|intake)/' '$B/MANIFEST.b3' | b3sum --check --quiet"
+ sudo systemd-tmpfiles --create sparrow.conf
+-sudo deploy/start.sh --restored-from /SPARROW/backups/NAME
++sudo deploy/start.sh --restored-from "$B"
+ sudo deploy/check.sh --store-id STORE_ID
+ sudo systemctl start sparrow-ship.timer sparrow-backup.timer
+ ```
+ 
+-The restored store takes the backup's copy-on-write attribute, because btrfs
+-refuses a reflink between a copy-on-write file and a no-copy-on-write one and
+-`--reflink=auto` would then copy every byte. A backup taken before copy-on-write
+-was switched off restores a store that still has it, and the next
+-`deploy/restart.sh` rewrites that store without it while it is closed.
++The restored store directory has copy-on-write off before anything is copied
++into it, so every restored file inherits that ("COW off everywhere"). The
++`b3sum --check` line reads the restored store and intake back and prints
++nothing when every file matches its manifest line; any output, or a nonzero
++exit, means the restore is damaged, so copy again before starting. A backup
++without `MANIFEST.b3` predates the NAS backups; skip that line for it.
+ 
+ `start.sh --restored-from` starts exactly the image `SOURCE` names, taken from
+ `/usr/local/libexec/sparrow`, `./bin` or the backup's `images/`, and fails
+@@ -348,7 +374,7 @@ identity recorded before the failure. Restore
+ host it always was, so run this before `deploy/start.sh`:
+ 
+ ```bash
+-sudo cp -a --reflink=auto /SPARROW/backups/NAME/config/sparrow/. /etc/sparrow/
++sudo cp -a /net/synology/archives/sparrow/NAME/config/sparrow/. /etc/sparrow/
+ sudo stat -c '%U %a' /etc/sparrow/tcp.secret
+ ls /usr/local/share/sparrow
+ grep text_lexicon_dir /etc/sparrow/server.toml
+@@ -357,7 +383,7 @@ grep text_lexicon_dir /etc/sparrow/server.toml
+ Expect `root 600`, and a `text_lexicon_dir` naming a bundle installed on this
+ host: the same PurRDF revision, or the open is refused ("Refused open"). If
+ `install.sh` installed a different bundle, install the backup's:
+-`sudo cp -a --no-preserve=ownership /SPARROW/backups/NAME/lexicons/. /usr/local/share/sparrow/`. The shipper
++`sudo cp -a --no-preserve=ownership /net/synology/archives/sparrow/NAME/lexicons/. /usr/local/share/sparrow/`. The shipper
+ then resends every file shipped after the backup whose original still exists;
+ records producers sent directly after the backup are lost unless they resend
+ them. On a fresh host, follow README.md steps 1 to 3 first, then this
+@@ -378,7 +404,9 @@ the schema guard refuses it before the next upgrade. Rename it
+ - Needs: the issue's step 5a backup,
+   `/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97`, taken from the
+   closed store before `install.sh` ran, and the user units, disabled but not
+-  removed.
++  removed. That copy was on the local disk and was deleted on 2026-11-08 with
++  every local backup (Patrick's ruling forbids them), so a revert now needs a
++  pre-upgrade backup of the same image on the NAS instead; set `B` to it.
+ - Before the cutover (`stat`, 2026-11-02), `/SPARROW` was `paudley:root` 0700
+   with no ACL entries, `/SPARROW/store` was `paudley:paudley` 0700, and
+   nothing else existed under `/SPARROW`.
+@@ -396,8 +424,8 @@ the schema guard refuses it before the next upgrade. Rename it
+ 
+ It checks first, changing nothing, that no Sparrow system unit is active and
+ that the sysusers file names exactly one operator. It leaves `/etc/sparrow`,
+-the `sparrow` user and group, the installed images, `/SPARROW/ship` and
+-`/SPARROW/backups` in place, and says so. Once `/SPARROW` is paudley's again,
++the `sparrow` user and group, the installed images, `/SPARROW/ship` and the
++backups on the NAS in place, and says so. Once `/SPARROW` is paudley's again,
+ the user manager does not need the `sparrow` group.
+ 
+ Optionally, drain a system unit that still serves. This only lets it consume
+@@ -470,8 +498,8 @@ for part in store intake; do
+     if [ ! -e "/SPARROW/$part" ]; then
+         sudo rm -rf "/SPARROW/$part.restoring"
+         sudo mkdir "/SPARROW/$part.restoring"
+-        sudo deploy/copy-on-write.sh match "$B/$part" "/SPARROW/$part.restoring"
+-        sudo cp -a --reflink=always "$B/$part/." "/SPARROW/$part.restoring/"
++        sudo chattr +C "/SPARROW/$part.restoring"
++        sudo cp -a "$B/$part/." "/SPARROW/$part.restoring/"
+         sudo mv -T "/SPARROW/$part.restoring" "/SPARROW/$part"
+     fi
+ done
+@@ -608,7 +636,7 @@ Each remaining item and why it stays:
+ | `sparrow` | `AmbientCapabilities=`, `CAP_NET_BIND_SERVICE` | Binding port 518, Patrick's ruling of 2026-11-01; the bounding set holds nothing else. |
+ | `sparrow` | `RestrictSUIDSGID=` | systemd implements it with a seccomp rule that cannot inspect `openat2`'s mode, so it refuses `openat2` outright, and the daemon needs `openat2` to open files beneath a consume root without following symlinks (measured, [evidence/lifecycle.md](evidence/lifecycle.md)). `NoNewPrivileges=yes` makes a setuid file inert, and the daemon creates every file with a fixed mode. |
+ | `ship` | `ProtectHome=read-only` | It reads the producers' directories under `/home/paudley`. |
+-| `backup` | `User=` root, `CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_*`, `@privileged` (`@chown`) | It stops and starts the system unit and copies trees owned by `sparrow`, `paudley` and root with their owners preserved. Its writes are confined to `/SPARROW/backups`. |
++| `backup` | `User=` root, `CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_*`, `@privileged` (`@chown`) | It stops and starts the system unit and copies trees owned by `sparrow`, `paudley` and root with their owners preserved. Its writes are confined to the NAS backup root `/net/synology/archives/sparrow`. |
+ 
+ Hardening settings the specification lists that the units do not use, and why:
+ `StateDirectory=`, `RuntimeDirectory=`, `CacheDirectory=` and `LogsDirectory=`
+diff --git deploy/config/tmpfiles-sparrow.conf deploy/config/tmpfiles-sparrow.conf
+index cb918e8..b4bcdf3 100644
+--- deploy/config/tmpfiles-sparrow.conf
++++ deploy/config/tmpfiles-sparrow.conf
+@@ -26,5 +26,3 @@ d /SPARROW/ship 2700 paudley sparrow -
+ # The lock the shipper and the backup share. It must exist with the shipper's owner: a lock that
+ # root's flock created would lock the shipper out.
+ f /SPARROW/ship/lock 0600 paudley sparrow -
+-# Closed-store backups taken by sparrow-backup.service (root).
+-d /SPARROW/backups 0700 root root -
+diff --git deploy/install.sh deploy/install.sh
+index 09f7d51..f407561 100755
+--- deploy/install.sh
++++ deploy/install.sh
+@@ -132,10 +132,9 @@ host systemd-sysusers sparrow.conf
+ # 2. /SPARROW, its modes and ACLs (re-asserted at every boot by systemd-tmpfiles).
+ if put "$DEPLOY_DIR/config/tmpfiles-sparrow.conf" /etc/tmpfiles.d/sparrow.conf 0644; then :; fi
+ host systemd-tmpfiles --create sparrow.conf
+-# Copy-on-write off for the store and for the copies made of it (lib.sh, switch_off_copy_on_write).
+-for dir in /SPARROW/store /SPARROW/backups; do
+-    switch_off_copy_on_write "$dir"
+-done
++# Copy-on-write off for the store (lib.sh, switch_off_copy_on_write). Backups go to the NAS only
++# (Patrick, 2026-11-08); nothing local holds them.
++switch_off_copy_on_write /SPARROW/store
+ 
+ # 3. /etc/sparrow: configuration templates, watch definitions, and the secret's location.
+ if [[ -n $DEST ]]; then
+diff --git deploy/lib.sh deploy/lib.sh
+index a42aa7b..5957f6a 100644
+--- deploy/lib.sh
++++ deploy/lib.sh
+@@ -11,7 +11,7 @@
+ #   SPARROW_PREFIX    images, CLI link and lexicons         /usr/local
+ #   SPARROW_CONFIG    the daemon's configuration            /etc/sparrow/server.toml
+ #   SPARROW_BIN       the kept images (make install-bin)    <repository>/bin
+-#   SPARROW_BACKUPS   closed-store backups                  /SPARROW/backups
++#   SPARROW_BACKUPS   closed-store backups, on the NAS      /net/synology/archives/sparrow
+ #   SPARROW_INTAKE    the watched intake tree                /SPARROW/intake
+ #   SPARROW_PRE_UPGRADE_MAX_HOURS  the oldest pre-upgrade backup accepted        24
+ 
+@@ -22,7 +22,7 @@ SPARROW_SCOPE=${SPARROW_SCOPE:-system}
+ SPARROW_PREFIX=${SPARROW_PREFIX:-/usr/local}
+ SPARROW_CONFIG=${SPARROW_CONFIG:-/etc/sparrow/server.toml}
+ SPARROW_BIN=${SPARROW_BIN:-$REPO_DIR/bin}
+-SPARROW_BACKUPS=${SPARROW_BACKUPS:-/SPARROW/backups}
++SPARROW_BACKUPS=${SPARROW_BACKUPS:-/net/synology/archives/sparrow}
+ SPARROW_INTAKE=${SPARROW_INTAKE:-/SPARROW/intake}
+ LIBEXEC=$SPARROW_PREFIX/libexec/sparrow
+ CLI_LINK=$SPARROW_PREFIX/bin/sparrow
+@@ -435,6 +435,24 @@ match_copy_on_write() {
+     output=$(chattr "$flag" -- "$dir" 2>&1) || die "cannot chattr $flag $dir to match $source: $output"
+ }
+ 
++# Sparrow never backs up to a local disk (Patrick, 2026-11-08: "Sparrow and katamaria are FORBIDDEN
++# from backing up to local disks"). Refuse the backup root ROOT unless it, or its nearest existing
++# ancestor when it is absent, is on a network filesystem that is not STORE's. deploy/libexec/
++# sparrow-backup applies the same rule.
++NETWORK_FILESYSTEMS='nfs nfs4 cifs smb3'
++require_network_root() {
++    local root=$1 store=$2 probe=$1 fstype
++    while [[ ! -e $probe ]]; do
++        probe=$(dirname -- "$probe")
++    done
++    fstype=$(findmnt -no FSTYPE -T "$probe") || die "findmnt cannot read the filesystem of $probe"
++    [[ " $NETWORK_FILESYSTEMS " == *" $fstype "* ]] || die "backup root $root is on \
++${fstype:-an unknown filesystem} ($probe), not a network filesystem ($NETWORK_FILESYSTEMS); Sparrow \
++never backs up to a local disk (Patrick, 2026-11-08). Mount the NAS archive first"
++    [[ $(stat -c %d -- "$probe") != "$(stat -c %d -- "$store")" ]] \
++        || die "backup root $root shares the filesystem of $store"
++}
++
+ # Bytes available to an unprivileged writer on the filesystem holding PATH. Run it in a command
+ # substitution followed by "|| exit 1", since die there ends only the subshell.
+ free_bytes() {
+diff --git deploy/libexec/sparrow-backup deploy/libexec/sparrow-backup
+index ba7a878..cdd9104 100755
+--- deploy/libexec/sparrow-backup
++++ deploy/libexec/sparrow-backup
+@@ -1,15 +1,25 @@
+ #!/usr/bin/python3 -I
+ # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+ # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+-"""Take a closed-store backup of the running Sparrow service and prune old ones.
++"""Take a closed-store backup of the running Sparrow service on the NAS and prune old ones.
+ 
+-Sparrow has no online checkpoint, so a consistent copy needs a closed store.
+-The service is stopped (SIGINT drains workers and fences the WAL), `data_dir`,
+-the consume intake roots and the deployment configuration are copied, and the
+-service is started again. On btrfs the copy is a reflink: it completes in
+-seconds whatever the store size, and later store writes never change it. A
+-backup directory is renamed into place only after every file is copied and
+-synchronized, so a partial copy is never mistaken for a backup.
++Sparrow never backs up to a local disk (Patrick, 2026-11-08: "Sparrow and katamaria are FORBIDDEN
++from backing up to local disks"). The backup root is the NAS archive, /net/synology/archives/sparrow
++in production. The script refuses a root that is not on a network filesystem (nfs, nfs4, cifs or
++smb3) or that shares the store's filesystem, before it creates anything or stops the service. It
++stages nothing locally: every byte goes straight to ROOT/STAMP.partial on the NAS.
++
++Sparrow has no online checkpoint, so a consistent copy needs a closed store. Everything that does
++not change while the daemon runs (the image pair, the lexicon bundle and the configuration) is
++copied first, and the running store is seeded into the partial with rsync. Then the service is
++stopped (SIGINT drains workers and fences the WAL). While it is stopped, the script hashes every
++file of the closed store and intake with b3sum, read locally, and rsync brings the seed up to the
++closed store, so the window holds only the hashing and the files that changed since the seed. The
++service is then started again. After the restart the partial is synchronized, its cached pages
++are dropped, and every file of the NAS copy is read back and checked against the manifest, with
++the file lists compared both ways. Only then is SOURCE written and the partial renamed to STAMP,
++so a partial or unverified copy is never mistaken for a backup. A failed check keeps the partial
++for inspection and names the first failing file.
+ 
+ An unfinished consume claim binds the inode of its intake root and claimed
+ file, which a restored copy cannot reproduce. Before stopping the service the
+@@ -24,7 +34,8 @@ the daemon logged once it had stopped and exited 0 (an image that predates that
+ payload_chunks=unrecorded instead). A count taken while the store counters seed is exact only
+ through the seeding watermark, so SOURCE records it as pending rather than a number
+ (live_records=pending, unique_payload_chunks=pending). It keeps that image pair under images/
+-and the lexicon bundle it reads under lexicons/, so `deploy/start.sh --restored-from BACKUP` can start exactly that image. Only
++and the lexicon bundle it reads under lexicons/, so `deploy/start.sh --restored-from BACKUP` can
++start exactly that image. MANIFEST.b3 holds the b3sum of every file in the backup. Only
+ timestamp-named backups are pruned; a copy under another name (README.md,
+ "Upgrades and rollback": pre-upgrade-IMAGE) is kept until removed by hand.
+ 
+@@ -41,6 +52,7 @@ import os
+ import re
+ import shutil
+ import signal
++import stat
+ import subprocess
+ import sys
+ import time
+@@ -57,9 +69,20 @@ LIBEXEC = Path(os.environ.get("SPARROW_PREFIX", "/usr/local")) / "libexec" / "sp
+ # only its own backup unit sets this, to back it up (#31). #22 removes it with the user unit.
+ INTERIM_USER_PRODUCTION = os.environ.get("SPARROW_INTERIM_USER_PRODUCTION") == "1"
+ STAMP = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
++PARTIAL = re.compile(r"^[0-9]{8}T[0-9]{6}Z\.partial$")
+ QUIESCE_SECONDS = 30 * 60
+ # The unit's RuntimeDirectory=; its ExecStopPost reads the same name.
+ MARKER_NAME = "stopped"
++# The filesystems a backup root may be on: network filesystems only, never a local disk.
++NETWORK_FILESYSTEMS = ("nfs", "nfs4", "cifs", "smb3")
++MANIFEST = "MANIFEST.b3"
++# rsync exits 24 when a source file vanished during the transfer, which only the seed of the
++# running store may see; the closed copy accepts nothing but success.
++RSYNC_VANISHED = 24
++# One line per transferred item: its itemized change and its length in bytes. Sockets and device
++# nodes (the daemon's socket may sit in data_dir) hold no data, so neither is copied or listed.
++RSYNC = ["rsync", "-a", "--no-D", "--delete", "--modify-window=-1", "--out-format=%i %l"]
++B3SUM_LINE = re.compile(rb"(\\?)([0-9a-f]{64})  \./(.*)", re.S)
+ 
+ 
+ def fail(message):
+@@ -85,24 +108,164 @@ def du(path):
+     return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file())
+ 
+ 
+-def no_copy_on_write(path):
+-    flags = subprocess.run(["lsattr", "-d", "--", str(path)], check=True, capture_output=True,
+-                           text=True).stdout.split(maxsplit=1)[0]
+-    return "C" in flags
++def filesystem_type(path):
++    return subprocess.run(["findmnt", "-no", "FSTYPE", "-T", str(path)], check=True,
++                          capture_output=True, text=True).stdout.strip()
+ 
+ 
+-def copy_tree(source, target):
+-    # btrfs refuses a reflink between a copy-on-write file and a no-copy-on-write one, and
+-    # --reflink=auto then copies every byte. So the copy's directory takes its source's attribute
+-    # before anything is created in it (deploy/lib.sh, match_copy_on_write). Copy-on-write is off
+-    # for the store (Patrick, 2026-10-15).
+-    target.mkdir()
+-    fstype = subprocess.run(["findmnt", "-no", "FSTYPE", "-T", str(target)], check=True,
+-                            capture_output=True, text=True).stdout.strip()
+-    if fstype == "btrfs":
+-        flag = "+C" if no_copy_on_write(source) else "-C"
+-        subprocess.run(["chattr", flag, "--", str(target)], check=True)
+-    subprocess.run(["cp", "-a", "--reflink=auto", "--", f"{source}/.", str(target)], check=True)
++def require_network_filesystem(root, probe, data_dir):
++    """Refuse the backup root ROOT unless PROBE (the root or its nearest existing ancestor) is on
++    a network filesystem other than the store's."""
++    fstype = filesystem_type(probe)
++    if fstype not in NETWORK_FILESYSTEMS:
++        fail(f"backup root {root} is on {fstype or 'an unknown filesystem'} ({probe}), not a "
++             f"network filesystem ({', '.join(NETWORK_FILESYSTEMS)}); Sparrow never backs up to "
++             "a local disk (Patrick, 2026-11-08). Mount the NAS archive first")
++    if os.stat(probe).st_dev == os.stat(data_dir).st_dev:
++        fail(f"backup root {root} shares the store's filesystem ({data_dir})")
++
++
++def network_root(root, data_dir):
++    """The backup root, created mode 0700 if absent, once it and the directory it is created in
++    are known to be on a network filesystem."""
++    probe = root.absolute()
++    while not probe.exists():
++        probe = probe.parent
++    require_network_filesystem(root, probe, data_dir)
++    root.mkdir(mode=0o700, parents=True, exist_ok=True)
++    require_network_filesystem(root, root, data_dir)
++    if root.resolve().is_relative_to(data_dir.resolve()):
++        fail("backup_root must not be inside data_dir")
++    return root
++
++
++def entry_type(mode):
++    if stat.S_ISDIR(mode):
++        return "d"
++    if stat.S_ISREG(mode):
++        return "f"
++    if stat.S_ISLNK(mode):
++        return "l"
++    return "o"
++
++
++def listing(top):
++    """Every entry under TOP (not TOP itself), as {relative path: type}, without following links."""
++    entries = {}
++    for directory, dirs, files in os.walk(top):
++        for name in dirs + files:
++            path = os.path.join(directory, name)
++            entries[os.path.relpath(path, top)] = entry_type(os.lstat(path).st_mode)
++    return entries
++
++
++class Manifest:
++    """The b3sum lines of every file the backup holds, under the paths the backup holds them, with
++    the entry list the copy must reproduce. Sources are read locally, never from the NAS."""
++
++    def __init__(self):
++        self.lines = []
++        self.entries = {}
++        self.bytes = 0
++
++    def add(self, source, destination):
++        """Record SOURCE, a file or directory, as copied to DESTINATION, relative to the backup."""
++        if source.is_dir():
++            self.entries[destination] = "d"
++            entries = {rel: kind for rel, kind in listing(source).items() if kind != "o"}
++            for rel, kind in entries.items():
++                self.entries[os.path.join(destination, rel)] = kind
++            self.hash(source, sorted(rel for rel, kind in entries.items() if kind == "f"),
++                      destination)
++        else:
++            self.entries[destination] = "f"
++            self.hash(source.parent, [source.name], os.path.dirname(destination))
++
++    def hash(self, base, names, prefix):
++        encoded = os.fsencode(prefix) + b"/"
++        if b"\\" in encoded or b"\n" in encoded:
++            raise RuntimeError(f"cannot record {prefix!r} in the manifest: b3sum escapes it")
++        for name in names:
++            self.bytes += os.stat(base / name).st_size
++        for start in range(0, len(names), 256):
++            chunk = ["./" + name for name in names[start:start + 256]]
++            output = subprocess.run(["b3sum", "--", *chunk], cwd=base, check=True,
++                                    capture_output=True).stdout
++            for line in output.splitlines():
++                parsed = B3SUM_LINE.fullmatch(line)
++                if parsed is None:
++                    raise RuntimeError(f"unexpected b3sum output {line!r}")
++                self.lines.append(parsed[1] + parsed[2] + b"  " + encoded + parsed[3])
++
++    def files(self):
++        return sum(1 for kind in self.entries.values() if kind == "f")
++
++
++def copy_tree(source, target, running=False):
++    """Bring TARGET up to SOURCE with rsync and return the bytes it wrote. Only the seed of the
++    running store (RUNNING) may see a file vanish; it then copies the rest."""
++    copied = subprocess.run([*RSYNC, "--", f"{source}/", f"{target}/"], capture_output=True,
++                            text=True)
++    if copied.returncode != 0 and not (running and copied.returncode == RSYNC_VANISHED):
++        raise RuntimeError(f"rsync {source} to {target} exited {copied.returncode}: "
++                           f"{copied.stderr.strip()}")
++    written = 0
++    for line in copied.stdout.splitlines():
++        fields = line.split()
++        if fields and fields[0].startswith(">f"):
++            written += int(fields[-1])
++    return written
++
++
++def copy_file(source, target):
++    shutil.copy2(source, target)
++    return os.stat(target).st_size
++
++
++def write_durable(path, data):
++    with open(path, "wb") as handle:
++        handle.write(data)
++        handle.flush()
++        os.fsync(handle.fileno())
++
++
++def drop_cached_pages(top):
++    """Drop the client's cached pages of every file under TOP, so the check reads the NAS. The
++    copy is synchronized first, so every page is clean and the kernel may drop it."""
++    for directory, _dirs, files in os.walk(top):
++        for name in files:
++            path = os.path.join(directory, name)
++            if not stat.S_ISREG(os.lstat(path).st_mode):
++                continue
++            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
++            try:
++                os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
++            finally:
++                os.close(descriptor)
++
++
++def verify_copy(partial, manifest):
++    """Read the NAS copy back and check it against the manifest: the entry lists both ways, then
++    every file's b3sum. Returns nothing; a failure keeps the partial and names the first file."""
++    copied = listing(partial)
++    copied.pop(MANIFEST, None)
++    missing = sorted(set(manifest.entries) - set(copied))
++    extra = sorted(set(copied) - set(manifest.entries))
++    changed = sorted(rel for rel in set(copied) & set(manifest.entries)
++                     if copied[rel] != manifest.entries[rel])
++    for problem, paths in (("is missing from the NAS copy", missing),
++                           ("is in the NAS copy but not in the source", extra),
++                           ("has another type in the NAS copy", changed)):
++        if paths:
++            fail(f"verification failed: {paths[0]} {problem} "
++                 f"({len(missing)} missing, {len(extra)} extra, {len(changed)} changed type); "
++                 f"{partial} is kept for inspection")
++    checked = subprocess.run(["b3sum", "--check", "--quiet", MANIFEST], cwd=partial,
++                             capture_output=True, text=True, errors="replace")
++    if checked.returncode != 0:
++        report = (checked.stdout + checked.stderr).strip().splitlines()
++        first = report[0] if report else f"b3sum --check exited {checked.returncode}"
++        fail(f"verification failed: {first}; {partial} is kept for inspection")
+ 
+ 
+ def sync_tree(path):
+@@ -237,54 +400,68 @@ def main(server_config, backup_root, keep, intake, extra):
+     data_dir, socket = Path(server["data_dir"]), Path(server["socket_path"])
+     if not data_dir.is_dir():
+         fail(f"data_dir {data_dir} is missing")
++    for tool in ("findmnt", "rsync", "b3sum"):
++        if shutil.which(tool) is None:
++            fail(f"{tool} is missing; the backup needs it")
++    # Before anything is created or stopped: the root must be on the NAS (Patrick, 2026-11-08).
++    backup_root = network_root(backup_root, data_dir)
+     if subprocess.run([*systemctl_command(), "is-active", "--quiet", UNIT]).returncode != 0:
+         fail(f"{UNIT} is not running; refusing to stop or start it")
+-    backup_root.mkdir(parents=True, exist_ok=True)
+-    if backup_root.resolve().is_relative_to(data_dir.resolve()):
+-        fail("backup_root must not be inside data_dir")
+     lock = open(backup_root / ".lock", "w")
+     try:
+         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+     except BlockingIOError:
+         fail("another backup run holds the lock")
+-    # Guard against filling the disk if reflinks are unavailable or extents diverged.
++    # The NAS takes no reflink, so every backup is a full copy of the store and the intake.
+     free = shutil.disk_usage(backup_root).free
+-    needed = 2 * du(data_dir) + 10 * 1024**3
++    needed = du(data_dir) + du(intake) + 10 * 1024**3
+     if free < needed:
+         fail(f"only {free} bytes free under {backup_root}; need {needed}")
+     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+-    partial = backup_root / f".partial-{stamp}"
++    partial = backup_root / f"{stamp}.partial"
+     final = backup_root / stamp
+     if final.exists():
+         fail(f"{final} already exists")
+-    for leftover in backup_root.glob(".partial-*"):
+-        shutil.rmtree(leftover)
+-    partial.mkdir()
++    for leftover in backup_root.iterdir():
++        if PARTIAL.match(leftover.name):
++            print(f"sparrow-backup: removing the unfinished {leftover}")
++            shutil.rmtree(leftover)
++    partial.mkdir(mode=0o700)
++    manifest = Manifest()
++    written = 0
+     stopped = False
+     try:
+-        # Everything that does not change while the daemon runs is copied first, before the drain
+-        # wait, so the closed-store window holds only the store and the intake, and nothing slow
+-        # runs between the drain check and the stop.
++        # Everything that does not change while the daemon runs is copied and hashed first, before
++        # the drain wait, and the running store is seeded, so the closed-store window holds only
++        # the hashing and the files that changed since, and nothing slow runs between the drain
++        # check and the stop.
+         prepared = time.monotonic()
+         image = selected_image()
+         # Whether this image prints the closing count: only then is a missing line a failure.
+         counted = logs_closing_count(LIBEXEC / image)
+         # The image pair that last opened the store, so a restore needs nothing from ./bin.
+-        images = partial / "images"
+-        images.mkdir()
++        (partial / "images").mkdir()
++        manifest.entries["images"] = "d"
+         for name in (image, "sparrow-" + image.removeprefix("sparrowd-")):
+-            shutil.copy2(LIBEXEC / name, images / name)
++            written += copy_file(LIBEXEC / name, partial / "images" / name)
++            manifest.add(LIBEXEC / name, f"images/{name}")
+         # And the lexicon bundle it reads (text_lexicon_dir is the bundle's artifacts directory).
+         bundle = Path(server["text_lexicon_dir"]).parent
+         (partial / "lexicons").mkdir()
+-        copy_tree(bundle, partial / "lexicons" / bundle.name)
+-        config = partial / "config"
+-        config.mkdir()
++        manifest.entries["lexicons"] = "d"
++        written += copy_tree(bundle, partial / "lexicons" / bundle.name)
++        manifest.add(bundle, f"lexicons/{bundle.name}")
++        (partial / "config").mkdir()
++        manifest.entries["config"] = "d"
+         for path in [server_config, *extra]:
+             if path.is_dir():
+-                copy_tree(path, config / path.name)
++                written += copy_tree(path, partial / "config" / path.name)
+             else:
+-                shutil.copy2(path, config / path.name)
++                written += copy_file(path, partial / "config" / path.name)
++            manifest.add(path, f"config/{path.name}")
++        # The seed: most of the store, copied while the daemon runs, for the closed copy to finish.
++        seeded = copy_tree(data_dir, partial / "store", running=True)
++        written += seeded
+         prepared = time.monotonic() - prepared
+         waited = time.monotonic()
+         while waiting_files(intake) or pending_claims(socket):
+@@ -321,9 +498,14 @@ def main(server_config, backup_root, keep, intake, extra):
+         systemctl("stop", UNIT)
+         stop_seconds = time.monotonic() - started
+         result = stop_result()
+-        copy_tree(data_dir, partial / "store")
+-        copy_tree(intake, partial / "intake")
+-        copy_seconds = time.monotonic() - started - stop_seconds
++        # The closed store and intake, hashed from the local disk, then copied over the seed.
++        manifest.add(data_dir, "store")
++        manifest.add(intake, "intake")
++        hash_seconds = time.monotonic() - started - stop_seconds
++        closed = copy_tree(data_dir, partial / "store")
++        closed += copy_tree(intake, partial / "intake")
++        written += closed
++        copy_seconds = time.monotonic() - started - stop_seconds - hash_seconds
+     finally:
+         if stopped:
+             systemctl("start", UNIT)
+@@ -339,6 +521,10 @@ def main(server_config, backup_root, keep, intake, extra):
+                 fail(f"{UNIT} restarted but did not answer status within 120s")
+             time.sleep(1)
+     downtime = time.monotonic() - started
++    ready_seconds = downtime - stop_seconds - hash_seconds - copy_seconds
++    print(f"sparrow-backup: service downtime {downtime:.1f}s: stop {stop_seconds:.1f}s, "
++          f"closed hash {hash_seconds:.1f}s, closed copy {copy_seconds:.1f}s ({closed} bytes), "
++          f"restart until ready {ready_seconds:.1f}s")
+     # Read after the restart, so it adds no downtime. The count was taken once every worker
+     # had stopped and the final flush had succeeded, so it is exactly what the copied store
+     # holds; it counts only when the daemon then exited 0.
+@@ -346,25 +532,36 @@ def main(server_config, backup_root, keep, intake, extra):
+         recorded = "payload_chunks=unrecorded (image predates the closing count)\n"
+     elif result != "success":
+         fail(f"{UNIT} invocation {invocation} did not exit 0 when stopped (Result={result}); "
+-             "its closing count is not recorded")
++             f"its closing count is not recorded; {partial} is kept for inspection")
+     else:
+         recorded = f"unique_payload_chunks={closing_chunks(invocation, status['store_id'])}\n"
+-    (partial / "SOURCE").write_text(source + recorded)
+-    ready_seconds = downtime - stop_seconds - copy_seconds
+-    # The copy becomes durable after the daemon is back, and before the rename publishes it.
++    # The copy becomes durable after the daemon is back, and is read back from the NAS before
++    # anything publishes it.
++    write_durable(partial / MANIFEST, b"".join(line + b"\n" for line in sorted(manifest.lines)))
+     synced = time.monotonic()
+     sync_tree(partial)
+     sync_seconds = time.monotonic() - synced
++    verified = time.monotonic()
++    drop_cached_pages(partial)
++    verify_copy(partial, manifest)
++    verify_seconds = time.monotonic() - verified
++    write_durable(partial / "SOURCE", (
++        source + recorded + f"manifest={MANIFEST}\nverified=b3sum\n"
++        f"files={manifest.files()}\nbytes={manifest.bytes}\n").encode())
++    fsync_directory(partial)
+     os.rename(partial, final)
+     fsync_directory(backup_root)
+     backups = sorted(path for path in backup_root.iterdir() if STAMP.match(path.name))
+     for old in backups[:-keep]:
+         shutil.rmtree(old)
+-    print(f"sparrow-backup: phases: drain wait {waited:.1f}s, copy before stop {prepared:.1f}s, "
+-          f"stop {stop_seconds:.1f}s, closed copy {copy_seconds:.1f}s, restart until ready "
+-          f"{ready_seconds:.1f}s, sync {sync_seconds:.1f}s")
+-    print(f"sparrow-backup: {final} complete; {downtime:.1f}s service downtime; "
+-          f"kept {min(len(backups), keep)} backup(s)")
++    print(f"sparrow-backup: phases: drain wait {waited:.1f}s, copy and seed before stop "
++          f"{prepared:.1f}s ({seeded} store bytes seeded), stop {stop_seconds:.1f}s, closed hash "
++          f"{hash_seconds:.1f}s, closed copy {copy_seconds:.1f}s, restart until ready "
++          f"{ready_seconds:.1f}s, sync {sync_seconds:.1f}s, read-back verify "
++          f"{verify_seconds:.1f}s")
++    print(f"sparrow-backup: {final} complete and verified: {manifest.files()} files, "
++          f"{manifest.bytes} bytes, {written} bytes written to the NAS; {downtime:.1f}s service "
++          f"downtime; kept {min(len(backups), keep)} backup(s)")
+ 
+ 
+ if __name__ == "__main__":
+diff --git deploy/systemd/sparrow-backup.service deploy/systemd/sparrow-backup.service
+index aab35d3..5517661 100644
+--- deploy/systemd/sparrow-backup.service
++++ deploy/systemd/sparrow-backup.service
+@@ -7,14 +7,17 @@
+ #
+ # It runs as root: it stops and starts the system unit sparrow.service, and copies the store
+ # (sparrow's, 0700 files), the intake roots, the shipper's state (paudley's) and /etc/sparrow with
+-# their owners preserved. Its writes are confined to /SPARROW/backups. The NAS archive
+-# (/net/synology/archives/sparrow) is the off-host backup (Patrick, 2026-11-01); these copies share
+-# the store's disk and protect against software faults and operator error only.
++# their owners preserved. Its writes are confined to the NAS archive /net/synology/archives/sparrow
++# (Patrick, 2026-11-01), the only backup location: Sparrow never backs up to a local disk (Patrick,
++# 2026-11-08), and the script refuses a backup root that is not on a network filesystem or that
++# shares the store's filesystem. The root must exist before the unit starts (ReadWritePaths=), and
++# the NFS export must let root write it with owners preserved. The kernel NFS client carries the
++# traffic, so the unit's private network and address-family limits do not apply to it.
+ 
+ [Unit]
+ Description=Closed-store backup of the Sparrow service
+ Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
+-RequiresMountsFor=/SPARROW
++RequiresMountsFor=/SPARROW /net/synology/archives/sparrow
+ 
+ [Service]
+ Type=oneshot
+@@ -24,16 +27,17 @@ Environment=PATH=/usr/local/bin:/usr/bin
+ RuntimeDirectory=sparrow-backup
+ RuntimeDirectoryMode=0700
+ UMask=0077
+-# Keep three daily copies; reflinks share unchanged extents with the live store. Hold the
+-# shipper's lock so the copied store, intake roots and ledgers agree.
+-ExecStart=/usr/bin/flock /SPARROW/ship/lock /usr/local/libexec/sparrow/sparrow-backup /etc/sparrow/server.toml /SPARROW/backups 3 /SPARROW/intake /etc/sparrow /SPARROW/ship
++# Keep three daily copies on the NAS, each a full copy verified against its b3sum manifest. Hold
++# the shipper's lock so the copied store, intake roots and ledgers agree.
++ExecStart=/usr/bin/flock /SPARROW/ship/lock /usr/local/libexec/sparrow/sparrow-backup /etc/sparrow/server.toml /net/synology/archives/sparrow 3 /SPARROW/intake /etc/sparrow /SPARROW/ship
+ # Restart Sparrow only if the script stopped it and was killed before restarting.
+ ExecStopPost=/bin/sh -c 'if [ -e /run/sparrow-backup/stopped ]; then systemctl start sparrow.service && rm -f /run/sparrow-backup/stopped; fi'
+-# Draining the intake roots may take up to 30 minutes before the copy.
+-TimeoutStartSec=45min
++# Draining the intake roots may take up to 30 minutes, and the seed and the read-back each move
++# the whole store over the network (the first seed copies all of it).
++TimeoutStartSec=6h
+ 
+-# A copy job (cp, sync and the CLI): bounded so a stuck or runaway run cannot crowd the daemon in
+-# the shared slice. Reflink copies need little memory.
++# A copy job (rsync, b3sum, sync and the CLI): bounded so a stuck or runaway run cannot crowd the
++# daemon in the shared slice. Streaming copies and hashes need little memory.
+ MemoryMax=1G
+ TasksMax=64
+ CPUQuota=100%
+@@ -48,15 +52,15 @@ IOSchedulingPriority=0
+ OOMScoreAdjust=-500
+ RestrictRealtime=yes
+ 
+-# Not confined by AppArmor: a Python program that runs cp, sync, systemctl and the sparrow CLI; its
+-# profile is a follow-up (deploy/RECOVERY.md, "Exposure"). It keeps only the capabilities a copy
+-# that preserves owners needs.
++# Not confined by AppArmor: a Python program that runs rsync, b3sum, sync, systemctl and the
++# sparrow CLI; its profile is a follow-up (deploy/RECOVERY.md, "Exposure"). It keeps only the
++# capabilities a copy that preserves owners needs.
+ NoNewPrivileges=yes
+ RestrictSUIDSGID=yes
+ CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+ ProtectSystem=strict
+ ProtectHome=yes
+-ReadWritePaths=/SPARROW/backups
++ReadWritePaths=/net/synology/archives/sparrow
+ PrivateTmp=yes
+ PrivateDevices=yes
+ PrivateNetwork=yes
+diff --git deploy/uninstall.sh deploy/uninstall.sh
+index 65f9b08..da36fb9 100755
+--- deploy/uninstall.sh
++++ deploy/uninstall.sh
+@@ -10,7 +10,8 @@
+ #
+ # It leaves in place, and says so: /etc/sparrow (configuration and the secret's copy), the sparrow
+ # user and group and their sysusers entry, the installed images, helpers, lexicons and documents,
+-# /SPARROW/ship and /SPARROW/backups. It never starts or stops a unit: stop them first.
++# /SPARROW/ship and the backups on the NAS (/net/synology/archives/sparrow). It never starts or
++# stops a unit: stop them first.
+ #
+ # Run as root. With SPARROW_DESTDIR=DIR it removes the staged files under DIR instead and prints
+ # each step that would change the running host (systemd, AppArmor, ownership, ACLs).
+@@ -138,4 +139,4 @@ fi
+ 
+ report_changes
+ note "kept: /etc/sparrow, the sparrow user and group (/etc/sysusers.d/sparrow.conf), the images, \
+-helpers, lexicons and documents under $PREFIX, /SPARROW/ship and /SPARROW/backups"
++helpers, lexicons and documents under $PREFIX, /SPARROW/ship and the backups under $SPARROW_BACKUPS"
+diff --git deploy/user-unit-upgrade.sh deploy/user-unit-upgrade.sh
+index f621c43..133648a 100755
+--- deploy/user-unit-upgrade.sh
++++ deploy/user-unit-upgrade.sh
+@@ -24,11 +24,17 @@ Before anything changes it refuses unless: BACKUPS/pre-upgrade-FROM (and .partia
+ the daemon link names --from; all four images are executable; the --to pair is byte-identical
+ to the kept pair in SPARROW_BIN; the --to daemon carries cap_net_bind_service (getcap: a human
+ with root runs setcap, this script never does); server.toml sets the ingest keys; the store has
+-copy-on-write off; the backups directory is on the store's filesystem, which has the store's
+-size plus 10 GiB free; the unit's drop-in directory holds no .conf but an identical
+-limits.conf (deploy/systemd/user/sparrow.service.d); no nightly backup is running; and the
+-running daemon reports the --from schema. Then it stops both timers and waits for the shipper,
+-stops the unit, takes the named pre-upgrade backup, installs limits.conf (LimitNOFILE=65536, the
++copy-on-write off; rsync and b3sum are installed; the backups directory is on a network
++filesystem (the NAS; never a local disk, nor the store's filesystem) with the store's size plus
++10 GiB free; the unit's drop-in directory holds no .conf but an identical limits.conf
++(deploy/systemd/user/sparrow.service.d); no nightly backup is running; and the running daemon
++reports the --from schema. Then it stops both timers and waits for the shipper, copies the FROM
++images and configuration and seeds the backup's store from the running daemon with rsync, stops
++the unit, hashes every file of the closed store with b3sum, brings the seed up to the closed store,
++reads the NAS copy back and checks every file and the file list against that manifest, and only
++then renames the backup into place. The backup is a network copy, so the stopped window grows by
++the copy of the files changed since the seed and by the read-back of the whole store from the
++NAS. It then installs limits.conf (LimitNOFILE=65536, the
+ store refuses to open below 2048) with daemon-reload and checks the unit's LimitNOFILESoft,
+ switches the links, starts the unit, waits up to
+ 600 s for the first status answer, checks the store identity and the --to schema, prints the
+@@ -40,13 +46,15 @@ Environment (defaults are the user-unit layout):
+   SPARROW_PREFIX   images in PREFIX/libexec/sparrow, CLI link PREFIX/bin/sparrow   ~/.local
+   SPARROW_CONFIG   the daemon's server.toml, with ship.toml beside it; the store
+                    (data_dir) and sockets are read from it       ~/.config/sparrow/server.toml
+-  SPARROW_BACKUPS  where the pre-upgrade backup is written       /SPARROW/backups
++  SPARROW_BACKUPS  where the pre-upgrade backup is written, on the NAS
++                                                  /net/synology/archives/sparrow
+   SPARROW_BIN      the kept images the --to pair must match      <repository>/bin
+ 
+ Recovery depends on where it failed; the FAILED line names the unit and timer states.
+ - Before "stop timers": nothing changed. Fix the cause and rerun.
+ - From "stop timers" up to "switch links": the links still name FROM and the store is untouched.
+-  Remove BACKUPS/pre-upgrade-FROM.partial if it exists (a rerun refuses while it does), then
++  Remove BACKUPS/pre-upgrade-FROM.partial if it exists (a rerun refuses while it does; a failed
++  verification names the first failing file and keeps it for inspection), then
+   start sparrow.service (if stopped) and both timers. A completed BACKUPS/pre-upgrade-FROM
+   must be moved aside before a rerun. An installed limits.conf may stay: either image needs it.
+ - At "switch links", before "start sparrow.service": check both links with readlink; one may
+@@ -58,9 +66,10 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
+   without failing), confirm its store_id and the TO schema, then start both timers.
+   Roll back only if TO cannot serve: stop sparrow.service; point the daemon link
+   at FROM and the CLI link at the FROM CLI (an image restored from the backup's images/ needs
+-  setcap cap_net_bind_service=ep, run by a human with root); move the store aside and restore
+-  BACKUPS/pre-upgrade-FROM/store (cp -a --reflink=always into a chattr +C directory), which
+-  drops everything TO accepted; then start sparrow.service and both timers.
++  setcap cap_net_bind_service=ep, run by a human with root); move the store aside and copy
++  BACKUPS/pre-upgrade-FROM/store back from the NAS (cp -a into a chattr +C directory, then
++  b3sum --check its store/ lines of MANIFEST.b3), which drops everything TO accepted; then
++  start sparrow.service and both timers.
+ - Claims after a rollback or restore. An intake root's .sparrow-inflight/ can hold a private
+   claim entry the restored store does not journal; the daemon then refuses to start with
+   "unrecognized private claim entry" (or "private claim directory exceeds its bounded journal
+@@ -161,18 +170,17 @@ INGEST_SOCKET=$(config_value ingest_socket_path) || exit 1
+ LEXICONS=$(config_value text_lexicon_dir) || exit 1
+ [[ -r $CONFIG_DIR/ship.toml ]] || die "cannot read $CONFIG_DIR/ship.toml; the backup keeps it"
+ no_copy_on_write "$STORE" || die "$STORE is not no-COW (lsattr shows no C)"
+-# The backup is a reflink copy, so it must share the store's filesystem; refuse now rather than
+-# after the stop.
++# The backup goes to the NAS only, never a local disk (Patrick, 2026-11-08); refuse now rather
++# than after the stop. The NAS takes no reflink, so the backup is a full copy of the store.
++for tool in rsync b3sum; do
++    command -v "$tool" >/dev/null || die "$tool is missing; the pre-upgrade backup needs it"
++done
++require_network_root "$SPARROW_BACKUPS" "$STORE"
+ backups_fs=$SPARROW_BACKUPS
+-[[ -d $backups_fs ]] || backups_fs=$(dirname -- "$SPARROW_BACKUPS")
+-# A filesystem's UUID spans its btrfs subvolumes, whose device numbers differ; a filesystem
+-# without a UUID falls back to the device number.
+-fs_identity() { findmnt -no UUID -T "$1" | grep . || stat -c 'dev:%d' -- "$1"; }
+-[[ $(fs_identity "$backups_fs") == "$(fs_identity "$STORE")" ]] \
+-    || die "$SPARROW_BACKUPS is not on $STORE's filesystem; the reflink backup needs one filesystem"
+-free=$(free_bytes "$STORE") || exit 1
++while [[ ! -e $backups_fs ]]; do backups_fs=$(dirname -- "$backups_fs"); done
++free=$(free_bytes "$backups_fs") || exit 1
+ need=$(du -s -B1 -- "$STORE" | cut -f1)
+-((free > need + 10 * 1024 ** 3)) || die "only $free bytes free beside $STORE; the backup needs $need bytes plus 10 GiB"
++((free > need + 10 * 1024 ** 3)) || die "only $free bytes free under $SPARROW_BACKUPS; the backup needs $need bytes plus 10 GiB"
+ 
+ # After the preconditions, a failure says what state it left (the recovery note is in --help).
+ report_failure() {
+@@ -203,6 +211,32 @@ if ! settled sparrow-ship.service || ! settled sparrow-backup.service; then
+     "${USER_SYSTEMCTL[@]}" start sparrow-ship.timer sparrow-backup.timer
+     die "the shipper or the backup is still running; timers started again, nothing else changed"
+ fi
++
++# The named pre-upgrade backup: once TO opens the store, the only way back to FROM's format. What
++# does not change while the daemon runs is copied and hashed first, and the running store is
++# seeded, so the stopped window copies only the files that changed since. Its taken_utc is the
++# compact stamp sparrow-backup writes, which lib.sh and verify-backup.sh read.
++RSYNC=(rsync -a --no-D --delete --modify-window=-1)
++MANIFEST=$BACKUP.partial/MANIFEST.b3
++log "seed $BACKUP.partial from the running store"
++[[ -d $SPARROW_BACKUPS ]] || mkdir -m 0700 -- "$SPARROW_BACKUPS"
++require_network_root "$SPARROW_BACKUPS" "$STORE"
++mkdir -m 0700 -- "$BACKUP.partial"
++mkdir -- "$BACKUP.partial/images" "$BACKUP.partial/config"
++cp -a -- "$LIBEXEC/$FROM" "$LIBEXEC/$FROM_CLI" "$BACKUP.partial/images/"
++# Under the names verify-backup.sh reads back, whatever SPARROW_CONFIG is called.
++cp -a -- "$SPARROW_CONFIG" "$BACKUP.partial/config/server.toml"
++cp -a -- "$CONFIG_DIR/ship.toml" "$BACKUP.partial/config/ship.toml"
++{
++    printf '%s  images/%s\n' "$(b3sum --no-names -- "$LIBEXEC/$FROM")" "$FROM"
++    printf '%s  images/%s\n' "$(b3sum --no-names -- "$LIBEXEC/$FROM_CLI")" "$FROM_CLI"
++    printf '%s  config/server.toml\n' "$(b3sum --no-names -- "$SPARROW_CONFIG")"
++    printf '%s  config/ship.toml\n' "$(b3sum --no-names -- "$CONFIG_DIR/ship.toml")"
++} >"$MANIFEST.head"
++# rsync exits 24 when a file vanished under the running daemon; the closed copy below finishes it.
++"${RSYNC[@]}" -- "$STORE/" "$BACKUP.partial/store/" || (($? == 24)) \
++    || die "cannot seed $BACKUP.partial/store from $STORE"
++
+ T0=$EPOCHREALTIME
+ log "stop sparrow.service"
+ "${USER_SYSTEMCTL[@]}" stop sparrow.service
+@@ -213,21 +247,36 @@ if [[ -n $(ps -C sparrowd -o pid=) ]]; then
+ fi
+ log "daemon stopped"
+ 
+-# The named pre-upgrade backup: once TO opens the store, the only way back to FROM's format. Its
+-# taken_utc is the compact stamp sparrow-backup writes, which lib.sh and verify-backup.sh read.
+-[[ -d $SPARROW_BACKUPS ]] || mkdir -m 0700 -- "$SPARROW_BACKUPS"
+-mkdir -m 0700 -- "$BACKUP.partial"
+-mkdir -m 0700 -- "$BACKUP.partial/store"
+-chattr +C -- "$BACKUP.partial/store"
+-cp -a --reflink=always -- "$STORE/." "$BACKUP.partial/store/"
+-diff <(cd -- "$STORE" && find . -printf '%P %y %s\n' | sort) \
+-    <(cd -- "$BACKUP.partial/store" && find . -printf '%P %y %s\n' | sort) \
++# The closed store, hashed from the local disk, then copied over the seed.
++log "hash the closed store and copy it to $BACKUP.partial"
++{
++    cat -- "$MANIFEST.head"
++    (cd -- "$STORE" && find . -type f -print0 | sort -z | xargs -0r b3sum --) \
++        | sed 's|^\(\\\{0,1\}[0-9a-f]\{64\}  \)\./|\1store/|'
++} >"$MANIFEST"
++rm -- "$MANIFEST.head"
++"${RSYNC[@]}" -- "$STORE/" "$BACKUP.partial/store/" || die "cannot copy $STORE to $BACKUP.partial/store"
++# Read the NAS copy back, not the client's cache: synchronize it, drop its cached pages, compare
++# the file lists both ways (sockets and device nodes are not copied) and check every file.
++log "verify $BACKUP.partial against the manifest"
++sync -f -- "$BACKUP.partial"
++python3 -I -c 'import os, sys
++for directory, _dirs, files in os.walk(sys.argv[1]):
++    for name in files:
++        fd = os.open(os.path.join(directory, name), os.O_RDONLY | os.O_NOFOLLOW)
++        try:
++            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++        finally:
++            os.close(fd)' "$BACKUP.partial"
++diff <(cd -- "$STORE" && find . ! -type s ! -type p ! -type b ! -type c -printf '%P %y\n' | sort) \
++    <(cd -- "$BACKUP.partial/store" && find . -printf '%P %y\n' | sort) \
+     || die "the backup's file list differs from $STORE; $BACKUP.partial is kept for inspection"
+-mkdir -- "$BACKUP.partial/images" "$BACKUP.partial/config"
+-cp -a --reflink=auto -- "$LIBEXEC/$FROM" "$LIBEXEC/$FROM_CLI" "$BACKUP.partial/images/"
+-# Under the names verify-backup.sh reads back, whatever SPARROW_CONFIG is called.
+-cp -a -- "$SPARROW_CONFIG" "$BACKUP.partial/config/server.toml"
+-cp -a -- "$CONFIG_DIR/ship.toml" "$BACKUP.partial/config/ship.toml"
++diff <(sed -E 's/^\\?[0-9a-f]{64}  //' -- "$MANIFEST" | sort) \
++    <(cd -- "$BACKUP.partial" && find . -type f ! -path ./MANIFEST.b3 -printf '%P\n' | sort) \
++    || die "the backup's files differ from its manifest; $BACKUP.partial is kept for inspection"
++if ! check=$(cd -- "$BACKUP.partial" && b3sum --check --quiet MANIFEST.b3 2>&1); then
++    die "verification failed: ${check%%$'\n'*}; $BACKUP.partial is kept for inspection"
++fi
+ cat >"$BACKUP.partial/SOURCE" <<SOURCE
+ image=$FROM
+ cli=$FROM_CLI
+@@ -237,11 +286,13 @@ store_format=$FORMAT
+ text_lexicon_dir=$LEXICONS
+ source=$STORE (closed, user unit sparrow.service)
+ taken_utc=$(date -u +%Y%m%dT%H%M%SZ)
++manifest=MANIFEST.b3
++verified=b3sum
+ SOURCE
+ sync -f -- "$BACKUP.partial"
+ mv -T -- "$BACKUP.partial" "$BACKUP"
+ sync -f -- "$SPARROW_BACKUPS"
+-log "backup at $BACKUP ($(find "$BACKUP/store" -type f | wc -l) store files)"
++log "backup at $BACKUP verified ($(find "$BACKUP/store" -type f | wc -l) store files, $(du -s -B1 -- "$BACKUP" | cut -f1) bytes)"
+ 
+ log "install $DROPIN_DIR/limits.conf (LimitNOFILE=$LIMIT_NOFILE)"
+ install -D -m 0644 -- "$LIMITS_SOURCE" "$DROPIN_DIR/limits.conf"
+diff --git deploy/verify-backup.sh deploy/verify-backup.sh
+index d690f0a..e0bfa93 100755
+--- deploy/verify-backup.sh
++++ deploy/verify-backup.sh
+@@ -2,9 +2,12 @@
+ # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+ # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+ #
+-# Verify a closed-store backup end to end (RECOVERY.md, "Verify a backup"). The backup's store is
+-# reflinked into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), and the image
+-# the backup recorded opens that copy in query-only mode, so no watch root is opened, no file is
++# Verify a closed-store backup end to end (RECOVERY.md, "Verify a backup"). Backups live on the NAS
++# (/net/synology/archives/sparrow), which takes no reflink, so the backup's store is copied into a
++# scratch working copy below SPARROW_VERIFY (default /SPARROW/verify); the copy is not a backup and
++# is removed however the run ends. When the backup holds MANIFEST.b3, every file of the copy is
++# checked against it, and the file lists compared both ways, before anything opens the copy. The
++# image the backup recorded then opens that copy in query-only mode, so no watch root is opened, no file is
+ # claimed and nothing is retired. The script checks the store identity, status and the stored
+ # payload chunk count, and, while the backup is younger than the retention window, a records window
+ # over its newest hour and one artifact's bytes against its catalog digest. It then stops the
+@@ -29,8 +32,10 @@ usage() {
+ Usage: deploy/verify-backup.sh [--time-records] [--window FROM BEFORE] [--image DAEMON] BACKUP
+        deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP
+ 
+-Copy BACKUP/store into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), open
+-the copy query-only with the image BACKUP/SOURCE records, and check it. A backup counts as
++Copy BACKUP/store (on the NAS) into a scratch directory below SPARROW_VERIFY (default
++/SPARROW/verify), check every file against BACKUP/MANIFEST.b3 when the backup has one, open the
++copy query-only with the image BACKUP/SOURCE records, and check it. The scratch filesystem needs
++the backup store's size plus 10 GiB free; the copy is removed however the run ends. A backup counts as
+ verified only once this exits 0. Exit 1 is a failed check, or a SOURCE that records no
+ unique_payload_chunks (NOT VERIFIED); exit 2 is a usage error; exit 3 means every other check
+ passed but the payload chunk count is not verifiable because the copy's or SOURCE's counts are
+@@ -316,12 +321,31 @@ scratch=$(realpath -e -- "$SCRATCH") || exit 1
+ guard "$SCRATCH" "$scratch"
+ require_socket_length "$SOCKET"
+ 
+-# The copy's directory takes the backup store's copy-on-write attribute, since btrfs refuses a
+-# reflink between a copy-on-write file and a no-copy-on-write one.
++# A byte copy from the NAS, which takes no reflink, into a no-copy-on-write directory ("COW off
++# everywhere"). The scratch working copy is removed by cleanup however the run ends.
++need=$(du -s -B1 -- "$BACKUP/store" | cut -f1) || die "cannot read the size of $BACKUP/store"
++free=$(free_bytes "$SCRATCH") || exit 1
++((free > need + 10 * 1024 ** 3)) || die "only $free bytes free under $VERIFY_ROOT; the scratch copy of \
++$BACKUP/store needs $need bytes plus 10 GiB"
+ mkdir -- "$DATA"
+-match_copy_on_write "$BACKUP/store" "$DATA"
+-cp -a --reflink=always -- "$BACKUP/store/." "$DATA/" \
+-    || die "cannot reflink $BACKUP/store below $VERIFY_ROOT; it must be on the backup's btrfs filesystem, and every file in it must share the store directory's copy-on-write attribute (lsattr)"
++switch_off_copy_on_write "$DATA"
++cp -a -- "$BACKUP/store/." "$DATA/" || die "cannot copy $BACKUP/store below $VERIFY_ROOT"
++# The backup's own manifest (sparrow-backup and user-unit-upgrade.sh write it): the copy holds
++# exactly the store files it lists, with their b3sum. An older backup has none and says so.
++if [[ -r $BACKUP/MANIFEST.b3 ]]; then
++    command -v b3sum >/dev/null || die "b3sum is missing; it checks the copy against $BACKUP/MANIFEST.b3"
++    grep -E '^\\?[0-9a-f]{64}  store/' -- "$BACKUP/MANIFEST.b3" >"$SCRATCH/store.b3" \
++        || fail manifest "$BACKUP/MANIFEST.b3 lists no store file"
++    diff <(sed -E 's/^\\?[0-9a-f]{64}  //' -- "$SCRATCH/store.b3" | sort) \
++        <(cd -- "$SCRATCH" && find store -type f -printf '%p\n' | sort) >"$SCRATCH/store.diff" \
++        || fail manifest "the store files differ from $BACKUP/MANIFEST.b3: $(head -n 1 -- "$SCRATCH/store.diff")"
++    if ! check=$(cd -- "$SCRATCH" && b3sum --check --quiet store.b3 2>&1); then
++        fail manifest "${check%%$'\n'*} (against $BACKUP/MANIFEST.b3)"
++    fi
++    pass manifest "$(wc -l <"$SCRATCH/store.b3") store files match $BACKUP/MANIFEST.b3"
++else
++    printf 'verify-backup: %s holds no MANIFEST.b3; the copy is not checked against a manifest\n' "$BACKUP"
++fi
+ {
+     ((MEASURE_MIGRATION)) || printf 'query_only = true\n'
+     printf 'socket_path = "%s"\ndata_dir = "%s"\ntext_lexicon_dir = "%s"\n' "$SOCKET" "$DATA" "$lexicons"
+diff --git docs/deployment.md docs/deployment.md
+index 842f034..21f825b 100644
+--- docs/deployment.md
++++ docs/deployment.md
+@@ -380,21 +380,45 @@ its producer finishes a file, not as it is written.
+ ## Closed-store backups
+ 
+ Sparrow has no online checkpoint, so a consistent backup needs a closed store.
+-`deploy/libexec/sparrow-backup` first copies, while the service still runs,
+-what the daemon does not change: the image pair, the lexicon bundle, the server
+-configuration and any extra paths. It then waits for the intake to drain, stops
+-`sparrow.service` through its SIGINT drain, copies `data_dir` and the consume
+-intake root, and starts the service again. It refuses to run when the
+-service is not already active, so it never starts a service an operator
+-stopped. Once it has stopped the service it restarts it after a failure or a
+-SIGTERM, and the unit's `ExecStopPost` restarts it if the script is killed
+-outright, guided by a marker in the runtime directory. On btrfs the copy is
+-a reflink: it takes seconds at any store size and later writes never change
+-it. The copy is synchronized after the
+-service answers again, so the sync is outside the closed window. Only then is
+-the backup renamed into place and the oldest beyond `KEEP` removed. The script refuses to
+-run unless free space covers twice the store plus 10 GiB, in case extents are
+-not shared. Each backup lists its sources in `SOURCE`, with the image the link names and
++Backups go to the NAS archive `/net/synology/archives/sparrow` (an NFSv4 mount
++of `192.168.1.1:/volume1/archives`) and nowhere else (Patrick, 2026-11-08:
++"Sparrow and katamaria are FORBIDDEN from backing up to local disks"). Before
++it creates anything or stops the service, `deploy/libexec/sparrow-backup`
++refuses a backup root that is not on a network filesystem (`findmnt -T` must
++report `nfs`, `nfs4`, `cifs` or `smb3` for the root, or for its nearest
++existing parent when the root is absent) or that shares the store's
++filesystem. It creates the root, mode 0700, when it is absent. Nothing is
++staged locally: every byte goes straight to `ROOT/STAMP.partial` on the NAS.
++
++The flow, in order:
++
++1. While the service runs, it copies what the daemon does not change (the
++   image pair, the lexicon bundle, the server configuration and any extra
++   paths) and records their b3sums, then seeds the partial with the running
++   store using `rsync`.
++2. It waits for the intake to drain.
++3. It stops `sparrow.service` through its SIGINT drain. Downtime starts here.
++4. It computes the b3sum of every file of the closed `data_dir` and intake
++   root, read from the local disk, and runs `rsync` again to bring the seed up
++   to the closed store and copy the intake. Only the files changed since the
++   seed cross the network in this window.
++5. It starts the service again. Downtime ends when status answers.
++6. It writes `MANIFEST.b3`, synchronizes the partial, drops the cached pages,
++   and reads the NAS copy back: the file lists must agree both ways and every
++   file must match its b3sum.
++7. Only then does it write `SOURCE`, with `manifest=MANIFEST.b3` and
++   `verified=b3sum` and the file and byte totals, synchronize it, and rename
++   `STAMP.partial` to `STAMP`. It then removes the oldest `STAMP` copies
++   beyond `KEEP`.
++
++A failed check exits nonzero, names the first failing file and keeps
++`STAMP.partial` for inspection; the next run removes it before it starts. The
++script refuses to run when the service is not already active, so it never
++starts a service an operator stopped. Once it has stopped the service it
++restarts it after a failure or a SIGTERM, and the unit's `ExecStopPost`
++restarts it if the script is killed outright, guided by a marker in the
++runtime directory. It refuses to run unless the NAS root has the size of the
++store and intake plus 10 GiB free, because every backup is a full copy. Each backup lists its sources in `SOURCE`, with the image the link names and
+ the store's `live_records` before the stop and the `unique_payload_chunks` the
+ stopped daemon logged in its closing line, taken only when the daemon exited 0.
+ While the store counters seed (status `counts=pending`), either count is
+@@ -407,8 +431,10 @@ records `payload_chunks=unrecorded (image predates the closing count)`. For an
+ image that prints the line, a missing line or a nonzero exit fails the backup. It
+ refuses when that image's schema number differs from the running daemon's
+ `schema_version`, because then the link does not name the running image. The journal records the measured
+-downtime and each phase's time: the drain wait, the copy before the stop, the
+-stop, the closed copy, the restart until ready, and the sync. A lock prevents overlapping runs.
++downtime with its parts (the stop, the closed hash, the closed copy with its
++bytes, and the restart until ready), each phase's time (the drain wait, the
++copy and seed before the stop, the sync and the read-back), and the files, bytes
++and bytes written to the NAS. A lock in the backup root prevents overlapping runs.
+ 
+ `deploy/install.sh` installs it with `sparrow-backup.service`, a system unit
+ that runs it as root, because it stops and starts the system unit and copies
+@@ -438,21 +464,41 @@ most 16 MiB, which drains in about eight minutes at the measured 30 seconds per
+ MiB. A whole file larger than the budget is fed only when every consume root is
+ empty, and then alone, so the wait then grows with that file.
+ 
+-The unit keeps three daily copies under `/SPARROW/backups/`,
++The unit keeps three daily copies under `/net/synology/archives/sparrow/`,
+ taken between 04:00 and 04:15 local time. It also copies the shipper ledgers and
+ watch definitions and holds the shipper's lock throughout, so the store, the
+-files awaiting ingest and the ledgers all describe the same moment. Reflink copies share unchanged extents with the live
+-store, but compaction rewrites files, so the copies gradually stop sharing.
+-Budget up to three times the store size. A copy on the same disk protects
+-against software faults and operator error, not disk loss.
++files awaiting ingest and the ledgers all describe the same moment. The NAS
++takes no reflink, so each copy is a full copy: budget three times the store
++size there. The shipper waits for the whole run, the seed and the read-back
++included; the first run seeds the whole store. Backups are named `STAMP`
++(`20261108T040000Z`); the daemon's archive worker, once deployed, writes
++hexadecimal per-store directories under the same root, which the rotation
++never touches.
+ 
+-The NAS archive (`/net/synology/archives/sparrow`) is the off-host backup
+-once its worker is deployed (Sparrow issues #15 to #17); the unit does not
+-grant its path until then. To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
++The interim user unit `~/.config/systemd/user/sparrow-backup.service` is not
++in the repository. To back up to the NAS it must carry these lines in
++`[Unit]` and `[Service]`, replacing its old local backup root:
++
++```ini
++[Unit]
++RequiresMountsFor=/net/synology/archives/sparrow
++
++[Service]
++ExecStart=/usr/bin/flock %h/.local/state/sparrow/ship/lock %h/.local/libexec/sparrow/sparrow-backup %h/.config/sparrow/server.toml /net/synology/archives/sparrow 3 %h/.local/state/sparrow/intake %h/.config/sparrow %h/.local/state/sparrow/ship %h/.local/state/sparrow/ship-watches
++TimeoutStartSec=6h
++```
++
++Install the repository's `deploy/libexec/sparrow-backup` as
++`~/.local/libexec/sparrow/sparrow-backup`, then run
++`systemctl --user daemon-reload`.
++
++To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
+ `sparrow.service`. Move the damaged `data_dir`, the intake root directory and
+ the shipper's `state_dir` aside rather than deleting them. Copy `BACKUP/store`
+-to `data_dir`, `BACKUP/intake` to the intake root and `BACKUP/config/ship` to
+-`state_dir`, each with `cp -a --reflink=auto`, and restore any needed
++from the NAS to `data_dir` (a new directory with copy-on-write off),
++`BACKUP/intake` to the intake root and `BACKUP/config/ship` to `state_dir`,
++each with `cp -a`, check the restored store and intake against
++`BACKUP/MANIFEST.b3` with `b3sum --check`, and restore any needed
+ configuration from `BACKUP/config`. Then start the service and both timers. The
+ three must come from the same backup, so that the files awaiting ingest match
+ the ledgers. The shipper then resends every file shipped after the backup whose
+@@ -461,7 +507,9 @@ are lost unless they resend them. This whole-service procedure has not been
+ exercised; the drill covers only reading a restored store. `deploy/RECOVERY.md`,
+ "Restore from a backup", gives the commands. Before replacing a live store,
+ verify the backup with `deploy/verify-backup.sh BACKUP` (`deploy/RECOVERY.md`,
+-"Verify a backup"). It opens a reflinked copy with `sparrowd --query-only`,
++"Verify a backup"). It copies the store from the NAS into a scratch working
++copy, which it removes however the run ends, checks that copy against the
++backup's `MANIFEST.b3`, and opens it with `sparrowd --query-only`,
+ which opens no watch root and refuses every write, and checks the store
+ identity, status, the stored payload chunk count, and, within the retention window, a records window and one artifact's bytes. A backup counts as verified only after the script exits 0.
+ While either the copy's or `SOURCE`'s counts are pending, the chunk count is not
+@@ -472,7 +520,7 @@ verifiable: the script runs every other check and exits 3, which is not verified
+ `deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP` measures
+ the online migrations, the schema 69 pair and `source-summary` ("Online store
+ migrations" and "Per-source counters and artifact index" in the interfaces)
+-on a writable reflinked copy of the backup's store below `SPARROW_VERIFY`
++on a writable scratch copy of the backup's store below `SPARROW_VERIFY`
+ (default `/SPARROW/verify`). The switch gate is a first open under 10 minutes
+ measured this way. The copy has its own socket, and its scratch configuration
+ takes the backup's budgets and lexicons as the verify mode's does, with no
+@@ -587,8 +635,10 @@ Before anything changes it refuses unless all of these hold:
+ - The `--to` daemon carries `cap_net_bind_service`.
+ - `server.toml` sets the ingest keys.
+ - The store has copy-on-write off.
+-- The backup directory is on the store's filesystem, which the reflink copy needs.
+-- The store's filesystem has the store's size plus 10 GiB free.
++- `rsync` and `b3sum` are installed.
++- The backup directory (`SPARROW_BACKUPS`, default `/net/synology/archives/sparrow`) is on a
++  network filesystem that is not the store's: the backup never goes to a local disk.
++- The backup directory has the store's size plus 10 GiB free.
+ - No nightly backup is running.
+ - The running daemon reports the `--from` schema.
+ 
+@@ -596,11 +646,18 @@ The capability is a prerequisite done by a human with root,
+ `sudo setcap cap_net_bind_service=ep ~/.local/libexec/sparrow/IMAGE`; the
+ script checks it with `getcap` and never runs `setcap`.
+ 
+-It then stops both timers and waits for the shipper, stops the unit and checks
+-that no `sparrowd` remains. Next it copies the closed store by reflink into a
+-no-copy-on-write `pre-upgrade-FROM` and compares the file lists. The backup
+-also keeps the old image pair, `server.toml`, `ship.toml` and a `SOURCE` file.
+-Last, it switches the links and starts the unit.
++It then stops both timers and waits for the shipper. While the daemon still
++runs, it copies the old image pair, `server.toml` and `ship.toml` into
++`pre-upgrade-FROM.partial` on the NAS with their b3sums, and seeds the
++partial's store with `rsync`. It stops the unit and checks that no `sparrowd`
++remains. In the stopped window it hashes every file of the closed store with
++`b3sum`, brings the seed up to the closed store, synchronizes the partial,
++drops its cached pages, compares the file lists both ways, and checks every
++file of the NAS copy against `MANIFEST.b3`. Only then does it write `SOURCE`
++and rename the partial to `pre-upgrade-FROM`. The backup is a network copy, so
++the stopped window grows by the copy of the files changed since the seed and
++by reading the whole store back from the NAS. Last, it switches the links and
++starts the unit.
+ 
+ It waits up to 10 minutes, the switch gate, for the first status answer. The
+ measured first open of schema 69 on a copy of the live store under the unit's
