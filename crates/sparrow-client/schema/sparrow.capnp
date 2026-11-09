@@ -255,6 +255,18 @@ struct Status {
   # uniqueJsonProjections then count only the keys through the `store-counters` watermark;
   # they are not totals until this is false.
   countsPending @54 :Bool;
+  # Schema 70: the online backup into the configured backup_root (#156).
+  backup @55 :BackupStatus;
+}
+# The online backup (#156). `unconfigured` when the daemon has no backup_root or runs
+# --no-intake or --query-only; otherwise the latest backup since the daemon started. Times are
+# Unix milliseconds, 0 until set; `backupId`, `files` and `bytes` are 0 until a backup completes.
+enum BackupPhase { unconfigured @0; idle @1; running @2; complete @3; failed @4; }
+struct BackupStatus {
+  phase @0 :BackupPhase; root @1 :Text; keep @2 :UInt32;
+  startedAt @3 :UInt64; finishedAt @4 :UInt64;
+  backupId @5 :UInt32; files @6 :UInt32; bytes @7 :UInt64;
+  failure @8 :OptionalText;
 }
 # One online store migration. `done` of `total` source entries are migrated; `watermark` is
 # the opaque last committed position, `start` before the first page and absent only once
@@ -754,6 +766,9 @@ interface Sparrow {
   # Administration: retire a claim that can never complete (claimed, private source missing,
   # never published). Refused for a recoverable or published claim.
   watchClaimRetire @52 (request :WatchClaimRetire) -> (result :Result(RetiredClaim));
+  # Administration (schema 70, #156): start an online backup into the configured backup_root
+  # and return at once; status reports its progress. Refused while one runs (CONFLICT).
+  backup @53 (storeId :Text) -> (result :Result(BackupStatus));
 }
 
 struct TcpChallenge { nonce @0 :Data; }

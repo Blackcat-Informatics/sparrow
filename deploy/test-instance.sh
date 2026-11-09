@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# A disposable test instance for rehearsing start.sh, stop.sh, restart.sh, pre-upgrade-backup.sh and
-# check.sh without root and without touching the production unit: install.sh stages the files under
+# A disposable test instance for rehearsing start.sh, stop.sh, restart.sh and check.sh without
+# root and without touching the production unit: install.sh stages the files under
 # SCRATCH/root, the configuration gets a scratch store and socket and no TCP listener, and a user
 # unit sparrow-deploytest.service is rendered from deploy/systemd/sparrow.service into the user
 # manager's runtime directory ($XDG_RUNTIME_DIR/systemd/user, gone at logout).
@@ -13,6 +13,10 @@
 # unprivileged user manager cannot apply: the user and group, the credential, the AppArmor
 # profile, the capability, the slice, negative nice and OOM adjustment. ProtectHome= becomes
 # read-only because the scratch directory is under /home. deploy/evidence/lifecycle.md records a run.
+#
+# pre-upgrade-backup.sh is not rehearsed here: an online backup goes only to a network filesystem
+# (#156), which a scratch instance does not have. SPARROW_BACKUPS names a scratch directory that
+# holds only the lifecycle scripts' lock (lib.sh, hold_backup_lock), never a backup.
 set -euo pipefail
 umask 077
 

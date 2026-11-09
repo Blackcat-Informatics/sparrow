@@ -73,6 +73,14 @@ pub struct ServerConfig {
     /// sets it too. It refuses every intake and archive key.
     #[serde(default)]
     pub query_only: bool,
+    /// Online backup root (#156): a directory on a network filesystem (nfs, nfs4, cifs or
+    /// smb3) that is not the store's; every backup refuses any other. Sparrow never backs up to
+    /// a local disk. Absent, the daemon refuses the backup operation.
+    #[serde(default)]
+    pub backup_root: Option<PathBuf>,
+    /// Online backups the engine keeps; older ones are purged after each backup.
+    #[serde(default = "default_backup_keep")]
+    pub backup_keep: u32,
 }
 
 /// Archive-before-delete destination and segment policy; unknown fields are errors.
@@ -203,6 +211,10 @@ fn default_min_free() -> u64 {
     4 * 1024 * 1024 * 1024
 }
 
+fn default_backup_keep() -> u32 {
+    3
+}
+
 fn default_rpc_connections() -> usize {
     16
 }
@@ -250,7 +262,23 @@ impl ServerConfig {
             );
         }
         config.check_query_only()?;
+        config.backup_target()?;
         Ok(config)
+    }
+
+    /// The configured online backup target. Startup checks only its paths: the network
+    /// filesystem rule is applied at every backup, so a daemon that starts before the NAS is
+    /// mounted still serves its intake (sparrow_core::BackupTarget::new).
+    pub fn backup_target(
+        &self,
+    ) -> Result<Option<sparrow_core::BackupTarget>, Box<dyn std::error::Error>> {
+        self.backup_root
+            .as_ref()
+            .map(|root| {
+                sparrow_core::BackupTarget::new(root.clone(), self.backup_keep, &self.data_dir)
+                    .map_err(|error| error.message.into())
+            })
+            .transpose()
     }
 
     /// Select query-only mode, as `sparrowd --query-only` does, and check that nothing in the
