@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 149,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/149-answer-status-without-a-synchronous",
+  "branch": "paudley/149-answer-status-without-a-synchronous",
+  "slug": "answer-status-without-a-synchronous",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/149-answer-status-without-a-synchronous/.stage/answer-status-without-a-synchronous",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "5813c33bff7ad87243bae517e6c205d782678ceb",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/149-answer-status-without-a-synchronous",
+    "branch:paudley/149-answer-status-without-a-synchronous",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/152-box-the-tail-owner-so-release-clippy caches into /home/paudley/Active/sparrow/.worktrees/149-answer-status-without-a-synchronous plus 0 dependency units from 0 other checkouts in 5.5s; 277 unchanged files keep their built mtimes; 29 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/149-answer-status-without-a-synchronous/.stage/answer-status-without-a-synchronous",
+    "issue:/home/paudley/Active/sparrow/.worktrees/149-answer-status-without-a-synchronous/.stage/answer-status-without-a-synchronous/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-08T18:41:14-0600",
+  "seed_error": ""
+}
