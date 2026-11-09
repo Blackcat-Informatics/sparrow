@@ -1,0 +1,14 @@
+[
+  {
+    "path": "crates/sparrow-server/src/main.rs",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/0.bin"
+  },
+  {
+    "path": "crates/sparrow-server/src/watches.rs",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/1.bin"
+  }
+]

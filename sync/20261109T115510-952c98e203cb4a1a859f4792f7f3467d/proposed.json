@@ -1,0 +1,38 @@
+[
+  {
+    "path": "crates/sparrow-server/src/main.rs",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/0.bin"
+  },
+  {
+    "path": "crates/sparrow-server/tests/rpc.rs",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/1.bin"
+  },
+  {
+    "path": "deploy/README.md",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/2.bin"
+  },
+  {
+    "path": "deploy/user-unit-upgrade.sh",
+    "kind": "file",
+    "executable": true,
+    "content": "proposed/3.bin"
+  },
+  {
+    "path": "deploy/verify-backup.sh",
+    "kind": "file",
+    "executable": true,
+    "content": "proposed/4.bin"
+  },
+  {
+    "path": "docs/deployment.md",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/5.bin"
+  }
+]

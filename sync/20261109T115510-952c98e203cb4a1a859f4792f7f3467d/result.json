@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/145-measure-online-migrations-with-live",
+  "branch": "paudley/145-measure-online-migrations-with-live",
+  "base_ref": "origin/main",
+  "head": "682a7a0ae7d788424ef70e44e777fad27d3a02a4",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/145-measure-online-migrations-with-live/.stage/measure-online-migrations-with-live/sync/20261109T115510-952c98e203cb4a1a859f4792f7f3467d",
+  "conflicts": [
+    "crates/sparrow-server/src/main.rs",
+    "crates/sparrow-server/tests/rpc.rs",
+    "deploy/README.md",
+    "deploy/user-unit-upgrade.sh",
+    "deploy/verify-backup.sh",
+    "docs/deployment.md"
+  ],
+  "status": "aborted",
+  "base": "3735c1e4bfa1e8e4188be465fbf40b9b84638e2b",
+  "merge_bases": [
+    "ea1a4b2b250e6e56fc1175b5fddf480ca5162a90"
+  ],
+  "merge_index": "df930b350502a1abf4e68b7be9120b8bc95ba34a1a6c8d9f59149267e44f8875",
+  "reused_paths": [],
+  "rerere_output": "Recorded preimage for 'crates/sparrow-server/src/main.rs'\nRecorded preimage for 'crates/sparrow-server/tests/rpc.rs'\nRecorded preimage for 'deploy/README.md'\nRecorded preimage for 'deploy/user-unit-upgrade.sh'\nRecorded preimage for 'deploy/verify-backup.sh'\nRecorded preimage for 'docs/deployment.md'\n"
+}

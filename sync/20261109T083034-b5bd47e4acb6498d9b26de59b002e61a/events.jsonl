@@ -1,0 +1,6 @@
+{"time": "2026-11-09T08:30:34.994552+00:00", "status": "started"}
+{"time": "2026-11-09T08:30:37.112523+00:00", "status": "merging"}
+{"time": "2026-11-09T08:30:41.175465+00:00", "status": "conflicted"}
+{"time": "2026-11-09T08:30:41.238756+00:00", "status": "review_required", "reused_paths": [], "rerere_output": "Recorded preimage for 'crates/sparrow-server/src/main.rs'\nRecorded preimage for 'crates/sparrow-server/src/watches.rs'\n"}
+{"time": "2026-11-09T08:48:42.335892+00:00", "status": "committing", "candidate_tree": "3256ec5c04e4aa1e58de009079f428c38ab10c22", "candidate_patch": "candidate-bbe081eccdb54ffca66b9a88d7cb0395.patch", "validation_records": []}
+{"time": "2026-11-09T08:58:33.047294+00:00", "status": "completed", "commit": "38c374486a5a5e00dbfa101be207fa7822f8d751", "tree": "3256ec5c04e4aa1e58de009079f428c38ab10c22"}

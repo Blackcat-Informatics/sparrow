@@ -1,0 +1,19 @@
+Merge origin/main: port the traffic measurement to online backup sets
+
+Integrates #161 (online backup sets) with the #145 measurement:
+
+- verify-backup.sh --with-traffic restores the measured copy and the
+  query-only prep copy from BACKUP_ROOT/sets/ID with
+  sparrowd --restore-backup, counts both restores in the free-space
+  check, and reads ship.toml from the set's config/sparrow/. No
+  closed-store path remains.
+- The traffic test fixture takes its set through backup_start from a
+  store with intake state, a watch catalog and a pending claim.
+- sparrowd keeps --restore-backup beside --private-intake;
+  --private-intake refuses backup_root, and both copy modes refuse
+  backups (Backup::Copy).
+- Docs and help state the new measurement target: before D147 a set
+  taken by the online path from the fixture's test store, after D147
+  the first real online set on the NAS.
+
+Refs #145

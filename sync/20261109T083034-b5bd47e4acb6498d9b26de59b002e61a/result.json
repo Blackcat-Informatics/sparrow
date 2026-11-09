@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/145-measure-online-migrations-with-live",
+  "branch": "paudley/145-measure-online-migrations-with-live",
+  "base_ref": "origin/main",
+  "head": "6bb5a7ac9286ccaff8e527f52f8b8e06ba9bb09b",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/145-measure-online-migrations-with-live/.stage/measure-online-migrations-with-live/sync/20261109T083034-b5bd47e4acb6498d9b26de59b002e61a",
+  "conflicts": [
+    "crates/sparrow-server/src/main.rs",
+    "crates/sparrow-server/src/watches.rs"
+  ],
+  "status": "completed",
+  "base": "ea1a4b2b250e6e56fc1175b5fddf480ca5162a90",
+  "merge_bases": [
+    "5813c33bff7ad87243bae517e6c205d782678ceb"
+  ],
+  "merge_index": "dd4e14c1226b2ca60109334236599cca944afc306080ab6a9c064d9bd73d8daf",
+  "reused_paths": [],
+  "rerere_output": "Recorded preimage for 'crates/sparrow-server/src/main.rs'\nRecorded preimage for 'crates/sparrow-server/src/watches.rs'\n",
+  "candidate_tree": "3256ec5c04e4aa1e58de009079f428c38ab10c22",
+  "candidate_patch": "candidate-bbe081eccdb54ffca66b9a88d7cb0395.patch",
+  "validation_records": [],
+  "commit": "38c374486a5a5e00dbfa101be207fa7822f8d751",
+  "tree": "3256ec5c04e4aa1e58de009079f428c38ab10c22"
+}

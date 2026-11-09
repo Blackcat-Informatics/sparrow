@@ -1,0 +1,122 @@
+{
+  "crates/sparrow-server/src/main.rs": [
+    {
+      "mode": "100644",
+      "oid": "bc0f2c26ce61cc2599c1ee83eb8f4870107381e0",
+      "stage": 1,
+      "content": "inputs/0-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "d1a111ddd61c7d4c19c068d0a23770c82b755cc8",
+      "stage": 2,
+      "content": "inputs/0-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "d642c2116334f5a2128ce766350e53ee89e8696f",
+      "stage": 3,
+      "content": "inputs/0-3.bin"
+    }
+  ],
+  "crates/sparrow-server/tests/rpc.rs": [
+    {
+      "mode": "100644",
+      "oid": "8322a3c752a7fcff5789683b3b81f953ad3975a0",
+      "stage": 1,
+      "content": "inputs/1-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "7e497ad876d0e36f8e6c5b6f6de97ef3ab4dd82e",
+      "stage": 2,
+      "content": "inputs/1-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "58291c29a7cbfcb0830ed6ada8e739eb311f437e",
+      "stage": 3,
+      "content": "inputs/1-3.bin"
+    }
+  ],
+  "deploy/README.md": [
+    {
+      "mode": "100644",
+      "oid": "bcbb1419770340aa699a888385c670ada91594b1",
+      "stage": 1,
+      "content": "inputs/2-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "51ea592d600cc71bbf24804d572b83650fe70464",
+      "stage": 2,
+      "content": "inputs/2-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "4bc9d108d9427d35422daf58e550b516f3eec378",
+      "stage": 3,
+      "content": "inputs/2-3.bin"
+    }
+  ],
+  "deploy/user-unit-upgrade.sh": [
+    {
+      "mode": "100755",
+      "oid": "f621c43844c994799d1a8acd7784918c7ed5465d",
+      "stage": 1,
+      "content": "inputs/3-1.bin"
+    },
+    {
+      "mode": "100755",
+      "oid": "2b14308466129c2c5bb60069ac236fdbc02982d3",
+      "stage": 2,
+      "content": "inputs/3-2.bin"
+    },
+    {
+      "mode": "100755",
+      "oid": "c7c80a5c54274499d3a59971070f1b0611544086",
+      "stage": 3,
+      "content": "inputs/3-3.bin"
+    }
+  ],
+  "deploy/verify-backup.sh": [
+    {
+      "mode": "100755",
+      "oid": "1ff48aa906c38b6cd856793c88b8db4aa21abec3",
+      "stage": 1,
+      "content": "inputs/4-1.bin"
+    },
+    {
+      "mode": "100755",
+      "oid": "85baae4b38fa7365f1c611f8eabd628f9f1821d4",
+      "stage": 2,
+      "content": "inputs/4-2.bin"
+    },
+    {
+      "mode": "100755",
+      "oid": "fa32dbab5856bb32971ffad1f810d59035836a02",
+      "stage": 3,
+      "content": "inputs/4-3.bin"
+    }
+  ],
+  "docs/deployment.md": [
+    {
+      "mode": "100644",
+      "oid": "b62fa9b7a3ebc1a2592eb7d6c0224373a92ff7f6",
+      "stage": 1,
+      "content": "inputs/5-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "4e1e1c9518be31f8302ccb2bffb43ad70f4ff6ef",
+      "stage": 2,
+      "content": "inputs/5-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "4e4863c247a2c26cea95b804bb1a234674d4d30b",
+      "stage": 3,
+      "content": "inputs/5-3.bin"
+    }
+  ]
+}

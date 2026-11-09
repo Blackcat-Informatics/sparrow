@@ -1,0 +1,14 @@
+[
+  {
+    "path": "crates/sparrow-server/src/main.rs",
+    "kind": "file",
+    "executable": false,
+    "content": "accepted-bbe081eccdb54ffca66b9a88d7cb0395/0.bin"
+  },
+  {
+    "path": "crates/sparrow-server/src/watches.rs",
+    "kind": "file",
+    "executable": false,
+    "content": "accepted-bbe081eccdb54ffca66b9a88d7cb0395/1.bin"
+  }
+]

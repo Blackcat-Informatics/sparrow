@@ -1,0 +1,5 @@
+{"time": "2026-11-09T11:55:10.089467+00:00", "status": "started"}
+{"time": "2026-11-09T11:55:10.291644+00:00", "status": "merging"}
+{"time": "2026-11-09T11:55:10.776853+00:00", "status": "conflicted"}
+{"time": "2026-11-09T11:55:10.786338+00:00", "status": "review_required", "reused_paths": [], "rerere_output": "Recorded preimage for 'crates/sparrow-server/src/main.rs'\nRecorded preimage for 'crates/sparrow-server/tests/rpc.rs'\nRecorded preimage for 'deploy/README.md'\nRecorded preimage for 'deploy/user-unit-upgrade.sh'\nRecorded preimage for 'deploy/verify-backup.sh'\nRecorded preimage for 'docs/deployment.md'\n"}
+{"time": "2026-11-09T11:56:05.949416+00:00", "status": "aborted"}

@@ -1,0 +1,6 @@
+{"time": "2026-11-09T11:59:05.180240+00:00", "status": "started"}
+{"time": "2026-11-09T11:59:05.444298+00:00", "status": "merging"}
+{"time": "2026-11-09T11:59:06.103134+00:00", "status": "conflicted"}
+{"time": "2026-11-09T11:59:06.229713+00:00", "status": "review_required", "reused_paths": [], "rerere_output": "Recorded preimage for 'crates/sparrow-server/src/main.rs'\nRecorded preimage for 'crates/sparrow-server/tests/rpc.rs'\nRecorded preimage for 'deploy/README.md'\nRecorded preimage for 'deploy/user-unit-upgrade.sh'\nRecorded preimage for 'deploy/verify-backup.sh'\nRecorded preimage for 'docs/deployment.md'\n"}
+{"time": "2026-11-09T21:15:29.333308+00:00", "status": "committing", "candidate_tree": "d91ca53b51e5e9865e6be64dc1479decc2f0ad22", "candidate_patch": "candidate-d21959c959ed4217a07dfd2578765a1c.patch", "validation_records": []}
+{"time": "2026-11-09T21:26:12.758841+00:00", "status": "completed", "commit": "62ee39e2e3f33700b1b0545b958538341e86cb49", "tree": "d91ca53b51e5e9865e6be64dc1479decc2f0ad22"}
