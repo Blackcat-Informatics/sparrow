@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 152,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/152-box-the-tail-owner-so-release-clippy",
+  "branch": "paudley/152-box-the-tail-owner-so-release-clippy",
+  "slug": "box-the-tail-owner-so-release-clippy",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/152-box-the-tail-owner-so-release-clippy/.stage/box-the-tail-owner-so-release-clippy",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "5813c33bff7ad87243bae517e6c205d782678ceb",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/152-box-the-tail-owner-so-release-clippy",
+    "branch:paudley/152-box-the-tail-owner-so-release-clippy",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/148-bound-the-store-s-open-files-below-the caches into /home/paudley/Active/sparrow/.worktrees/152-box-the-tail-owner-so-release-clippy plus 0 dependency units from 0 other checkouts in 4.5s; 267 unchanged files keep their built mtimes; 9 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/152-box-the-tail-owner-so-release-clippy/.stage/box-the-tail-owner-so-release-clippy",
+    "issue:/home/paudley/Active/sparrow/.worktrees/152-box-the-tail-owner-so-release-clippy/.stage/box-the-tail-owner-so-release-clippy/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-08T18:25:19-0600",
+  "seed_error": ""
+}
