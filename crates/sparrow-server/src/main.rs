@@ -14,8 +14,37 @@ mod shutdown;
 /// How often the daemon compares filesystem free space with its floor.
 const SPACE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Also the contract `deploy/verify-backup.sh` reads to tell an image with query-only mode
-/// and, for its migration measurement, an image with `--no-intake`.
-const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only | --no-intake]";
+/// and, for its migration measurements, an image with `--no-intake` or `--private-intake`.
+const USAGE: &str =
+    "usage: sparrowd --config FILE.toml [--query-only | --no-intake | --private-intake DIR]";
+
+/// The daemon's mode, from its command line.
+enum Mode {
+    Normal,
+    QueryOnly,
+    /// Writable with maintenance, no intake.
+    NoIntake,
+    /// Writable with full intake whose watch roots are rebound below this directory.
+    PrivateIntake(std::path::PathBuf),
+}
+
+/// Parse `--config FILE` and at most one mode, in either order.
+fn arguments(args: &[String]) -> Result<(&str, Mode), Box<dyn std::error::Error>> {
+    let (mut path, mut mode) = (None, None);
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--config" if path.is_none() => path = Some(args.next().ok_or(USAGE)?),
+            "--query-only" if mode.is_none() => mode = Some(Mode::QueryOnly),
+            "--no-intake" if mode.is_none() => mode = Some(Mode::NoIntake),
+            "--private-intake" if mode.is_none() => {
+                mode = Some(Mode::PrivateIntake(args.next().ok_or(USAGE)?.into()));
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    Ok((path.ok_or(USAGE)?, mode.unwrap_or(Mode::Normal)))
+}
 
 /// How often the serving loop checks that every worker it started is still running.
 const WORKER_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -63,21 +92,32 @@ async fn worker_health(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (path, mode) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["--config", path] => (path, None),
-        ["--config", path, mode @ ("--query-only" | "--no-intake")]
-        | [mode @ ("--query-only" | "--no-intake"), "--config", path] => (path, Some(mode)),
-        _ => return Err(USAGE.into()),
-    };
+    let (path, mode) = arguments(&args)?;
     let mut config = ServerConfig::read(Path::new(path))?;
     // A no-intake daemon writes and runs maintenance but, like a query-only one, opens no
     // stored watch root, so a copy of a store never consumes the intake its catalog names.
-    let intake = mode != Some("--no-intake");
-    match mode {
-        Some("--query-only") => config = config.into_query_only()?,
-        Some(_) => config.check_no_intake()?,
-        None => {}
-    }
+    // A private-intake daemon opens every watch at a private root instead.
+    let intake = !matches!(mode, Mode::NoIntake);
+    let private = match &mode {
+        Mode::QueryOnly => {
+            config = config.into_query_only()?;
+            None
+        }
+        Mode::NoIntake => {
+            config.check_no_intake()?;
+            None
+        }
+        Mode::PrivateIntake(dir) => {
+            config.check_private_intake()?;
+            Some(sparrow_server::watches::PrivateIntake::new(dir)?)
+        }
+        Mode::Normal => None,
+    };
+    let intake_label = match (&private, intake && !config.query_only) {
+        (Some(_), _) => "private",
+        (None, true) => "true",
+        (None, false) => "false",
+    };
     let tcp_secret = config.tcp_secret()?;
     // Keep the subscription alive through startup and awaited maintenance work.
     // Recreating ctrl_c() inside select drops its listener when another branch wins.
@@ -123,12 +163,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     } else {
         let watches = sparrow_server::watches::WatchRegistry::default();
-        let consumer = sparrow_server::watches::ConsumeWorker::start(
+        let consumer = sparrow_server::watches::ConsumeWorker::start_with(
             store.clone(),
             &config.consume,
             config.socket_path.clone(),
             watches.clone(),
             operations.clone(),
+            private,
         )?;
         (watches, Some(consumer))
     };
@@ -233,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_rpc_connections,
         config.max_concurrent_requests,
         config.query_only,
-        intake && !config.query_only
+        intake_label
     );
     if let (Some(path), Some(gid)) = (&config.ingest_socket_path, config.ingest_socket_gid) {
         eprintln!(

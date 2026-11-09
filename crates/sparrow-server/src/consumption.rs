@@ -64,6 +64,17 @@ impl From<rustix::io::Errno> for Error {
 
 const INFLIGHT: &str = ".sparrow-inflight";
 
+/// Whether a watch root is the one its stored claims were bound to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootBinding {
+    /// The stored root: a claim bound to another root identity refuses the open.
+    Stored,
+    /// `sparrowd --private-intake`: a disposable copy's private root. Claims bound to the
+    /// original root identity are foreign here; they never refuse the open and are never
+    /// recovered, because every recovery first refuses a claim of another root.
+    Private,
+}
+
 #[cfg(test)]
 mod crash_tests;
 
@@ -199,28 +210,45 @@ impl ClaimRoot {
     /// Open an admitted producer root; never follow symlinks or overlap store data.
     /// Creates only the excluded private claim directory and its ownership lock.
     pub fn open(store: Store, watch: &str, path: &Path) -> Result<Self, Error> {
+        Self::open_bound(store, watch, path, RootBinding::Stored)
+    }
+
+    /// Open as [`Self::open`] does, under an explicit root binding.
+    pub(crate) fn open_bound(
+        store: Store,
+        watch: &str,
+        path: &Path,
+        binding: RootBinding,
+    ) -> Result<Self, Error> {
         if watch.is_empty() || watch.len() > 128 || !path.is_absolute() {
             return Err(Error::State(
                 "require a bounded watch identity and absolute producer root",
             ));
         }
         let root = crate::source_file::root(&store, path)?;
-        Self::from_root(store, watch, root)
+        Self::from_root(store, watch, root, binding)
     }
 
     /// Share an already admitted rooted descriptor with a tail owner; never reopen
     /// a pathname that could now identify a replacement directory.
-    pub(crate) fn from_root(store: Store, watch: &str, root: File) -> Result<Self, Error> {
+    pub(crate) fn from_root(
+        store: Store,
+        watch: &str,
+        root: File,
+        binding: RootBinding,
+    ) -> Result<Self, Error> {
         let root_identity = CompletedFileIdentity::capture(&root.metadata()?);
+        let bound_here = |journal: &ConsumptionJournal| {
+            journal.directories.root_device == root_identity.device
+                && journal.directories.root_inode == root_identity.inode
+        };
         let pending = store
             .consumption_pending()?
             .into_iter()
             .filter(|journal| journal.watch == watch)
+            .filter(|journal| binding == RootBinding::Stored || bound_here(journal))
             .collect::<Vec<_>>();
-        if pending.iter().any(|journal| {
-            journal.directories.root_device != root_identity.device
-                || journal.directories.root_inode != root_identity.inode
-        }) {
+        if !pending.iter().all(bound_here) {
             return Err(Error::State(
                 "configured watch root was replaced while source recovery ownership remains",
             ));

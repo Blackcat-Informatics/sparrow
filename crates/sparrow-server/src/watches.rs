@@ -6,7 +6,7 @@
 
 use crate::{
     ConsumeWatch,
-    consumption::{ClaimRoot, Error, Recovery},
+    consumption::{ClaimRoot, Error, Recovery, RootBinding},
     watch_admin::{self, Action, Catalog, ManagedWatch},
 };
 use rustix::fs::{
@@ -34,6 +34,106 @@ use std::{
 
 #[cfg(test)]
 mod tests;
+
+/// `sparrowd --private-intake DIR`: every watch definition the daemon opens or accepts is
+/// rebound to `DIR/NAME`, where NAME is the final component of its root, so a disposable
+/// copy of a store consumes its own private roots and never the roots its catalog names.
+/// The catalog keeps naming the configured roots: a mutation persists them, not the
+/// rebound ones.
+#[derive(Clone, Debug)]
+pub struct PrivateIntake {
+    dir: PathBuf,
+}
+
+impl PrivateIntake {
+    /// Admit an absolute existing directory, held by its canonical path.
+    pub fn new(dir: &Path) -> Result<Self, Error> {
+        if !dir.is_absolute() || !dir.is_dir() {
+            return Err(Error::State(
+                "--private-intake requires an absolute existing directory",
+            ));
+        }
+        Ok(Self {
+            dir: std::fs::canonicalize(dir)?,
+        })
+    }
+
+    /// Rebind one definition's root below the private directory and return the configured
+    /// root it replaced. A configured root that is the directory, lies under it or holds it
+    /// is refused: rebinding would then reach the configured root itself, or put the private
+    /// roots inside a root another daemon consumes, as running the mode by hand on a live
+    /// intake directory would. Paths are compared canonically, and an existing configured
+    /// root is also compared by device and inode, so a bind mount or other alias of it is
+    /// refused too.
+    fn rebind(&self, definition: &mut ConsumeWatch) -> Result<PathBuf, Error> {
+        let name = match definition.root.components().next_back() {
+            Some(std::path::Component::Normal(name)) => name.to_owned(),
+            _ => {
+                return Err(Error::State(
+                    "a watch root under --private-intake needs a final path component",
+                ));
+            }
+        };
+        // A configured root absent on this host (the copy came from another) is compared as
+        // written; one present is compared through its links.
+        let configured =
+            std::fs::canonicalize(&definition.root).unwrap_or_else(|_| definition.root.clone());
+        let private = self.dir.join(&name);
+        if configured.starts_with(&self.dir)
+            || self.dir.starts_with(&configured)
+            || aliased(
+                &identity_chain(&self.dir)?,
+                identity(&private)?,
+                &identity_chain(&configured)?,
+            )
+        {
+            return Err(Error::State(
+                "--private-intake DIR must not be, hold or lie under a watch's configured root; choose a scratch directory",
+            ));
+        }
+        Ok(std::mem::replace(&mut definition.root, private))
+    }
+
+    fn binding(intake: Option<&Self>) -> RootBinding {
+        intake.map_or(RootBinding::Stored, |_| RootBinding::Private)
+    }
+}
+
+/// The device and inode of PATH, or None when it does not exist.
+fn identity(path: &Path) -> Result<Option<(u64, u64)>, Error> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The identities of PATH and each of its ancestors, PATH first; empty when PATH does not
+/// exist.
+fn identity_chain(path: &Path) -> Result<Vec<(u64, u64)>, Error> {
+    let mut chain = Vec::new();
+    for ancestor in path.ancestors() {
+        match identity(ancestor)? {
+            Some(found) => chain.push(found),
+            None if chain.is_empty() => return Ok(chain),
+            None => {}
+        }
+    }
+    Ok(chain)
+}
+
+/// Whether, by identity, the configured root (the head of CONFIGURED, when it exists) is the
+/// private directory or one of its ancestors (the head and tail of DIR), is the private root
+/// PRIVATE, or holds the private directory among its own ancestors.
+fn aliased(dir: &[(u64, u64)], private: Option<(u64, u64)>, configured: &[(u64, u64)]) -> bool {
+    let Some(root) = configured.first() else {
+        return false;
+    };
+    dir.contains(root)
+        || private == Some(*root)
+        || dir.first().is_some_and(|d| configured.contains(d))
+}
 
 const SCAN_QUANTUM: usize = 64;
 const EVENT_QUANTUM: usize = 4096;
@@ -267,14 +367,17 @@ struct Detector {
 }
 
 impl Detector {
-    fn open(store: Store, watch: ManagedWatch) -> Result<Self, Error> {
+    fn open(store: Store, watch: ManagedWatch, binding: RootBinding) -> Result<Self, Error> {
         let config = watch.definition;
         let owner = match config.producer_contract {
-            crate::ProducerContract::FinishedFiles => {
-                Owner::Consume(ClaimRoot::open(store, &config.id, &config.root)?)
-            }
+            crate::ProducerContract::FinishedFiles => Owner::Consume(ClaimRoot::open_bound(
+                store,
+                &config.id,
+                &config.root,
+                binding,
+            )?),
             crate::ProducerContract::ActiveFilesRetain => Owner::Tail(
-                crate::tailing::TailRoot::open(store, &config, watch.revision)?,
+                crate::tailing::TailRoot::open(store, &config, watch.revision, binding)?,
             ),
         };
         let events = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
@@ -655,7 +758,24 @@ impl ConsumeWorker {
         registry: WatchRegistry,
         operations: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self, Error> {
+        Self::start_with(store, configs, socket, registry, operations, None)
+    }
+
+    /// Start as [`Self::start`] does. With `private`, every stored root is first rebound
+    /// below the private directory (`sparrowd --private-intake`).
+    pub fn start_with(
+        store: Store,
+        configs: &[ConsumeWatch],
+        socket: PathBuf,
+        registry: WatchRegistry,
+        operations: Arc<tokio::sync::Semaphore>,
+        private: Option<PrivateIntake>,
+    ) -> Result<Self, Error> {
         let mut catalog = Catalog::load(&store, configs)?;
+        if let Some(intake) = &private {
+            catalog.rebind_roots(|definition| intake.rebind(definition))?;
+        }
+        let binding = PrivateIntake::binding(private.as_ref());
         let definitions = catalog
             .watches()
             .iter()
@@ -676,7 +796,7 @@ impl ConsumeWorker {
             .watches()
             .iter()
             .cloned()
-            .map(|watch| Detector::open(store.clone(), watch))
+            .map(|watch| Detector::open(store.clone(), watch, binding))
             .collect::<Result<Vec<_>, _>>()?;
         registry.update(&detectors, &pending)?;
         if catalog.needs_initial_commit() {
@@ -705,6 +825,7 @@ impl ConsumeWorker {
                             Control {
                                 commands,
                                 operations,
+                                private,
                             },
                         ),
                     )
@@ -943,6 +1064,7 @@ fn administrate(
     detectors: &mut Vec<Detector>,
     action: Action,
     pending: &[sparrow_core::ConsumptionJournal],
+    binding: RootBinding,
 ) -> Result<ManagedWatch, AdminFailure> {
     let (mut next, watch, duplicate) = catalog
         .prepare(&action, crate::now().map_err(AdminFailure::Refused)?)
@@ -991,7 +1113,7 @@ fn administrate(
                 )));
             }
             prepared = Some(
-                Detector::open(store.clone(), watch.clone()).map_err(|error| {
+                Detector::open(store.clone(), watch.clone(), binding).map_err(|error| {
                     AdminFailure::Refused(watch_admin::failure(
                         "INVALID_ARGUMENT",
                         format!("watch root admission refused: {error}"),
@@ -1039,6 +1161,7 @@ fn administrate(
 struct Control {
     commands: tokio::sync::mpsc::Receiver<watch_admin::Command>,
     operations: Arc<tokio::sync::Semaphore>,
+    private: Option<PrivateIntake>,
 }
 
 async fn run(
@@ -1079,10 +1202,40 @@ async fn run(
                 }
             };
             match command {
-                watch_admin::Command::Mutation { action, reply } => {
+                watch_admin::Command::Mutation { mut action, reply } => {
                     let pending = store.consumption_pending()?;
-                    let result =
-                        administrate(&store, &mut catalog, &mut detectors, action, &pending);
+                    let rebound = match (&control.private, &mut action) {
+                        (Some(intake), Action::Put { definition, .. }) => intake
+                            .rebind(definition)
+                            .map(|configured| Some((definition.root.clone(), configured)))
+                            .map_err(|error| {
+                                AdminFailure::Refused(watch_admin::failure(
+                                    "INVALID_ARGUMENT",
+                                    error,
+                                ))
+                            }),
+                        _ => Ok(None),
+                    };
+                    let result = rebound.and_then(|rebound| {
+                        // The put persists the root it was given, which a failed put forgets.
+                        let previous = rebound.map(|(private, configured)| {
+                            let prior = catalog.remember_root(private.clone(), configured);
+                            (private, prior)
+                        });
+                        administrate(
+                            &store,
+                            &mut catalog,
+                            &mut detectors,
+                            action,
+                            &pending,
+                            PrivateIntake::binding(control.private.as_ref()),
+                        )
+                        .inspect_err(|_| {
+                            if let Some((private, previous)) = previous {
+                                catalog.restore_root(private, previous);
+                            }
+                        })
+                    });
                     acknowledge(reply, result, &store, &registry, &detectors)?;
                 }
                 watch_admin::Command::Handoff { intent, reply } => {

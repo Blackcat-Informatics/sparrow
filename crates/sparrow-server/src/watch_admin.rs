@@ -46,6 +46,10 @@ struct State {
 pub(crate) struct Catalog {
     state: State,
     raw: Option<Vec<u8>>,
+    /// Under `sparrowd --private-intake`, each private root and the configured root it
+    /// replaced; persistence writes the configured one, so a disposable copy never rewrites
+    /// where its catalog's watches consume.
+    configured: std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>,
 }
 
 pub(crate) enum Action {
@@ -397,18 +401,68 @@ impl Catalog {
                 receipts: Vec::new(),
             }
         };
-        Ok(Self { state, raw })
+        Ok(Self {
+            state,
+            raw,
+            configured: std::collections::BTreeMap::new(),
+        })
     }
 
     pub(crate) fn watches(&self) -> &[ManagedWatch] {
         &self.state.watches
+    }
+    /// Rebind every definition in memory, as `sparrowd --private-intake` does before any root
+    /// opens; REBIND returns the configured root it replaced. A later mutation persists the
+    /// configured roots, never the rebound ones.
+    pub(crate) fn rebind_roots<E>(
+        &mut self,
+        mut rebind: impl FnMut(&mut ConsumeWatch) -> Result<std::path::PathBuf, E>,
+    ) -> Result<(), E> {
+        for watch in &mut self.state.watches {
+            let configured = rebind(&mut watch.definition)?;
+            self.configured
+                .insert(watch.definition.root.clone(), configured);
+        }
+        Ok(())
+    }
+    /// Record that PRIVATE replaced CONFIGURED for a put; returns the previous record.
+    pub(crate) fn remember_root(
+        &mut self,
+        private: std::path::PathBuf,
+        configured: std::path::PathBuf,
+    ) -> Option<std::path::PathBuf> {
+        self.configured.insert(private, configured)
+    }
+    /// Put back the record [`Self::remember_root`] replaced, after a refused put.
+    pub(crate) fn restore_root(
+        &mut self,
+        private: std::path::PathBuf,
+        previous: Option<std::path::PathBuf>,
+    ) {
+        match previous {
+            Some(configured) => self.configured.insert(private, configured),
+            None => self.configured.remove(&private),
+        };
     }
     pub(crate) fn needs_initial_commit(&self) -> bool {
         self.raw.is_none()
     }
 
     pub(crate) fn persist(&mut self, store: &Store) -> Result<(), Error> {
-        let next = toml::to_string(&self.state)
+        let mut state = self.state.clone();
+        let State {
+            watches, receipts, ..
+        } = &mut state;
+        for definition in watches.iter_mut().map(|watch| &mut watch.definition).chain(
+            receipts
+                .iter_mut()
+                .map(|receipt| &mut receipt.watch.definition),
+        ) {
+            if let Some(configured) = self.configured.get(&definition.root) {
+                definition.root = configured.clone();
+            }
+        }
+        let next = toml::to_string(&state)
             .map_err(|error| failure("STORAGE_FAILURE", error))?
             .into_bytes();
         store.watch_registry_replace(self.raw.as_deref(), &next)?;
@@ -444,6 +498,7 @@ impl Catalog {
                 Self {
                     state: self.state.clone(),
                     raw: self.raw.clone(),
+                    configured: self.configured.clone(),
                 },
                 receipt.watch.clone(),
                 true,
@@ -522,6 +577,7 @@ impl Catalog {
             Self {
                 state,
                 raw: self.raw.clone(),
+                configured: self.configured.clone(),
             },
             watch,
             false,

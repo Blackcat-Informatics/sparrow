@@ -265,7 +265,7 @@ impl ServerConfig {
         if !self.query_only {
             return Ok(());
         }
-        self.refuse_intake("query_only", "a query-only daemon")
+        self.refuse_intake("query_only", "a query-only daemon", true)
     }
 
     /// Check the configuration for `sparrowd --no-intake`: a writable daemon with its
@@ -276,16 +276,37 @@ impl ServerConfig {
         if self.query_only {
             return Err("--no-intake and query-only mode exclude each other".into());
         }
-        self.refuse_intake("--no-intake", "a no-intake daemon")
+        self.refuse_intake("--no-intake", "a no-intake daemon", true)
     }
 
-    /// Refuse the first configured intake, public listener or archive key for `mode`.
-    fn refuse_intake(&self, mode: &str, daemon: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// Check the configuration for `sparrowd --private-intake DIR`: a writable daemon with
+    /// full intake for a disposable copy of a store, whose watches consume private roots
+    /// below DIR and whose ingest socket is the copy's own. It refuses configured consume
+    /// roots, syslog listeners, the public listener and the archive, whose endpoints and
+    /// paths would be the live ones.
+    pub fn check_private_intake(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.query_only {
+            return Err("--private-intake and query-only mode exclude each other".into());
+        }
+        self.refuse_intake("--private-intake", "a private-intake daemon", false)
+    }
+
+    /// Refuse the first configured intake, public listener or archive key for `mode`; the
+    /// ingest socket only when `ingest_socket` says so.
+    fn refuse_intake(
+        &self,
+        mode: &str,
+        daemon: &str,
+        ingest_socket: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let conflicting = [
             ("consume", !self.consume.is_empty()),
             ("syslog", !self.syslog.is_empty()),
             ("rpc_tcp_address", self.rpc_tcp_address.is_some()),
-            ("ingest_socket_path", self.ingest_socket_path.is_some()),
+            (
+                "ingest_socket_path",
+                ingest_socket && self.ingest_socket_path.is_some(),
+            ),
             ("archive", self.archive.is_some()),
         ];
         match conflicting.iter().find(|(_, set)| *set) {

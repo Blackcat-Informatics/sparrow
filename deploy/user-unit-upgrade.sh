@@ -58,17 +58,27 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
   setcap cap_net_bind_service=ep, run by a human with root); move the store aside and restore
   BACKUPS/pre-upgrade-FROM/store (cp -a --reflink=always into a chattr +C directory), which
   drops everything TO accepted; then start sparrow.service and both timers.
-- Claims after a rollback or restore. An intake root's .sparrow-inflight/ can hold a private
-  claim entry the restored store does not journal; the daemon then refuses to start with
+- Claims after a rollback or restore (docs/deployment.md, "Claims after a rollback"). Keep the
+  set-aside TO store: it records every claim TO made. Before starting sparrow.service on the
+  restored store, open the restored store with the FROM image and the set-aside store with the
+  TO image, each query-only on its own scratch configuration and socket, then run
+  deploy/reconcile-inflight.sh inflight --restored FROM_CLI SOCK1 --newer TO_CLI SOCK2.
+  It lists each consume root's .sparrow-inflight/ and moves every entry whose claim the
+  restored catalog does not know back to its root under its original batch name, by a hard
+  link under that name and an unlink of the entry (same inode, bytes unchanged). Without this the daemon refuses to start with
   "unrecognized private claim entry" (or "private claim directory exceeds its bounded journal
-  registry"). Move each such entry out of the intake root, keeping its bytes, never delete it,
-  and start again. A claim the store journals whose private source is missing never completes:
-  status shows it in pending_claims, the watch failure reads "unpublished claimed source is
-  missing", and every nightly backup waits for it. On a schema 70 image retire it, once its
-  bytes are confirmed lost: sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON". It
-  leaves pending_claims, status and watch list show it as retired-unrecoverable, and the
-  daemon logs one line. A claim whose private source exists or whose publication is recorded
-  is refused. Older images lack the command; go forward to TO first.
+  registry"). Stop the restored query-only daemon, start sparrow.service, then run
+  deploy/reconcile-inflight.sh missing --restored FROM_CLI SOCKET --newer TO_CLI SOCK2 for
+  claims TO published after the backup: the restored store still journals them, their watch
+  failure reads "unpublished claimed source is missing", and every nightly backup waits for
+  them. It reads each one's bytes back from the set-aside store, checks them against their
+  catalog digest, re-ships them into the root as NAME.reshipped.EXT and retires the claim
+  with sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON" (schema 70 and newer).
+  A retired claim leaves pending_claims, status and watch list show it as
+  retired-unrecoverable, and the daemon logs one line. Rerun it until no watch reports that
+  failure. A FROM image older than schema 70 cannot retire (exit 3): the bytes are re-shipped
+  and the claim stays pending until a schema 70 image retires it. A claim whose private
+  source exists or whose publication is recorded is refused.
 USAGE
 }
 

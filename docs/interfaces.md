@@ -525,6 +525,33 @@ with an error, as a normal daemon does. The startup line ends
 uses the mode; see [the deployment guide](deployment.md), "Measure the online
 migration".
 
+`sparrowd --config FILE --private-intake DIR` opens a disposable copy of a
+store writable with its maintenance worker and its watches. Every stored watch
+definition, and every definition `watchPut` accepts, is rebound to `DIR/NAME`,
+where `NAME` is the final component of its root, before any root opens; a root
+without a final component refuses the open, or the put with
+`INVALID_ARGUMENT`. So does a configured root that is `DIR`, lies under it or
+holds it: rebinding would then reach that root itself, or put the private
+roots inside a root another daemon consumes. Paths are compared canonically,
+and a configured root present on the host is also compared by device and
+inode with `DIR`, its ancestors and `DIR/NAME`, so a bind mount or other alias
+of the root is refused too. Never point `DIR` at a live
+intake directory or its parent; the refusal covers the configured roots
+only, so use a fresh scratch directory. The rebinding is held in memory: a
+later watch mutation persists the configured roots, never the private ones,
+so the catalog keeps naming where its watches consume. A consume or
+tail claim bound to another root identity, such as the original root's, does
+not refuse the open in this mode and is never recovered: each recovery refuses
+a claim of another root, which becomes the watch's failure. An active tail
+generation of another root is never resumed, adopted or given a gap; a file
+under the private root that reuses its file identity is refused. The configuration
+may not set `consume`, `syslog`, `rpc_tcp_address` or `archive`, and the
+refusal names the key; `ingest_socket_path` is allowed. The mode cannot be
+combined with query-only mode. The startup line ends
+`query_only=false intake=private`. `deploy/verify-backup.sh --measure-migration
+--with-traffic` uses the mode; see [the deployment guide](deployment.md),
+"Measure the online migration with intake and traffic".
+
 ### Receipt-time event fallback (schema 69)
 
 A record whose source profile yields no event time is placed on the event

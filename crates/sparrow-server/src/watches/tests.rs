@@ -35,6 +35,7 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
             revision: 1,
             enabled: true,
         },
+        crate::consumption::RootBinding::Stored,
     )
     .unwrap();
     detector.scan_step().unwrap();
@@ -282,6 +283,7 @@ fn periodic_rescan_keeps_quiet_clocks_and_finds_missed_files() {
             revision: 1,
             enabled: true,
         },
+        crate::consumption::RootBinding::Stored,
     )
     .unwrap();
     detector.scan_step().unwrap();
@@ -351,6 +353,7 @@ fn retiring_a_claim_clears_only_the_failure_that_claim_caused() {
             revision: 1,
             enabled: true,
         },
+        crate::consumption::RootBinding::Stored,
     )
     .unwrap()];
     // Three claimed sources whose private copies are gone, so each may be retired.
@@ -397,4 +400,166 @@ fn retiring_a_claim_clears_only_the_failure_that_claim_caused() {
     detectors[0].failure = Some("discovery refused".into());
     retire(&mut detectors, &discovered);
     assert_eq!(detectors[0].failure.as_deref(), Some("discovery refused"));
+}
+
+/// INVARIANT: a private root (`sparrowd --private-intake`) never touches the original root's
+/// active tail generations after it opens: reconciliation records no gap for them, and a file
+/// below the private root that reuses a foreign generation's (device, inode) is refused, as the
+/// store refuses a second active generation of one identity, instead of resuming the foreign one.
+#[test]
+fn private_tail_root_leaves_foreign_generations_alone() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original");
+    let private = directory.path().join("private");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&private).unwrap();
+    let active = private.join("active.log");
+    std::fs::write(&active, b"first line\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let (root, file) = (
+        std::fs::metadata(&original).unwrap(),
+        std::fs::metadata(&active).unwrap(),
+    );
+    // The original root's active generation, whose file identity the private file reuses.
+    let declared = store
+        .tail_start(
+            &sparrow_core::TailStart {
+                request_id: "foreign-active".into(),
+                watch: "tail-private".into(),
+                watch_revision: 1,
+                directories: sparrow_core::ConsumptionDirectories {
+                    root_device: root.dev(),
+                    root_inode: root.ino(),
+                    parent_device: root.dev(),
+                    parent_inode: root.ino(),
+                },
+                path: b"active.log".to_vec(),
+                source: "tail-private".into(),
+                format: "log".into(),
+                device: file.dev(),
+                inode: file.ino(),
+            },
+            crate::now().unwrap(),
+        )
+        .unwrap();
+    let config = ConsumeWatch {
+        id: "tail-private".into(),
+        root: private.clone(),
+        producer_contract: crate::ProducerContract::ActiveFilesRetain,
+        source: "tail-private".into(),
+        format: "log".into(),
+        quiet_ms: 30_000,
+        max_directories: 2,
+        max_candidates: 2,
+    };
+    let mut owner = crate::tailing::TailRoot::open(
+        store.clone(),
+        &config,
+        1,
+        crate::consumption::RootBinding::Private,
+    )
+    .unwrap();
+    owner.reconcile_missing("tail-private").unwrap();
+    assert!(
+        owner.attach(Path::new("active.log"), &config, 1).is_err(),
+        "a reused identity is never adopted"
+    );
+    owner.drain().unwrap();
+    let generations = store.tail_generations("tail-private").unwrap();
+    assert_eq!(generations.len(), 1);
+    assert_eq!(generations[0].id, declared.id);
+    assert_eq!(
+        generations[0].gap, None,
+        "no gap is recorded for the original root's generation"
+    );
+    assert_eq!(
+        generations[0].offset, 0,
+        "the foreign generation is never resumed"
+    );
+}
+
+/// INVARIANT: `sparrowd --private-intake DIR` refuses a DIR that is, holds or lies under a
+/// watch's configured root, so a hand run on a live intake directory never reaches the live
+/// roots, and a catalog persisted by a private daemon still names the configured roots, so a
+/// disposable copy never rewrites where its watches consume.
+#[test]
+fn private_intake_refuses_configured_roots_and_persists_them_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let live = directory.path().join("live").join("intake");
+    let configured = live.join("events");
+    std::fs::create_dir_all(&configured).unwrap();
+    let scratch = directory.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let definition = |root: &Path| ConsumeWatch {
+        id: "events".into(),
+        root: root.into(),
+        producer_contract: crate::ProducerContract::FinishedFiles,
+        source: "events".into(),
+        format: "jsonl".into(),
+        quiet_ms: 1000,
+        max_directories: 4,
+        max_candidates: 4,
+    };
+    // The live intake directory (holds the root), the root itself, and a directory inside it.
+    for dir in [live.clone(), configured.clone(), configured.join("nested")] {
+        std::fs::create_dir_all(&dir).unwrap();
+        let intake = PrivateIntake::new(&dir).unwrap();
+        assert!(
+            intake.rebind(&mut definition(&configured)).is_err(),
+            "{} overlaps the configured root",
+            dir.display()
+        );
+    }
+    let intake = PrivateIntake::new(&scratch).unwrap();
+    let mut rebound = definition(&configured);
+    assert_eq!(intake.rebind(&mut rebound).unwrap(), configured);
+    assert_eq!(rebound.root, scratch.canonicalize().unwrap().join("events"));
+
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut catalog = Catalog::load(&store, &[definition(&configured)]).unwrap();
+    catalog
+        .rebind_roots(|definition| intake.rebind(definition))
+        .unwrap();
+    assert_eq!(catalog.watches()[0].definition.root, rebound.root);
+    catalog.persist(&store).unwrap();
+    let reloaded = Catalog::load(&store, &[]).unwrap();
+    assert_eq!(reloaded.watches()[0].definition.root, configured);
+}
+
+/// INVARIANT: an existing configured root that is, by device and inode, the private directory,
+/// one of its ancestors, the private root itself, or an ancestor-held directory of the private
+/// directory is refused however its path is spelled (a bind mount aliases it), while a
+/// disjoint root and a root absent on this host are compared by path alone.
+#[test]
+fn private_intake_refuses_configured_roots_aliased_by_identity() {
+    // Chains are (device, inode), the path first and "/" last.
+    let dir = [(1, 30), (1, 20), (1, 2)];
+    let private = Some((1, 31));
+    for (configured, expected) in [
+        (vec![(1, 30), (9, 5), (9, 2)], true), // the private directory, by another path
+        (vec![(1, 20), (9, 5), (9, 2)], true), // an ancestor of the private directory
+        (vec![(1, 31), (9, 5), (9, 2)], true), // the private root DIR/NAME
+        (vec![(9, 7), (1, 30), (9, 2)], true), // holds the private directory
+        (vec![(9, 7), (9, 5), (1, 2)], false), // shares only "/"
+        (vec![], false),                       // absent on this host
+    ] {
+        assert_eq!(
+            super::aliased(&dir, private, &configured),
+            expected,
+            "{configured:?}"
+        );
+    }
 }

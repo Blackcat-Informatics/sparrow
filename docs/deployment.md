@@ -474,7 +474,10 @@ nice level of the user unit that serves the live store. The script reads that
 level with `systemctl --user show` from `sparrow.service`, or from the unit
 `SPARROW_MEASURE_UNIT` names, and refuses to run when the unit is not loaded or
 reports no nice level: a copy measured at nice 0 does not predict a unit that
-runs at `Nice=10`.
+runs at `Nice=10`. The unit must also run under the default time-sharing
+policy (`CPUSchedulingPolicy=0`), and the daemon is started through
+`chrt --other 0`, so a caller under `SCHED_IDLE` does not hand that policy to
+the scope. The run fails `FAIL scope` unless the daemon reports class `TS`.
 
 The disk guard reads the free space of the filesystem holding
 `SPARROW_VERIFY`. The run refuses to start under 50 GB free, before anything
@@ -531,10 +534,194 @@ Each measurement is one `verify-backup: MEASURE` line on standard output:
 | `first_status_seconds=S` | Seconds from start to the first status answer |
 | `progress elapsed_seconds=S NAME=DONE/TOTAL ...` | Each migration's progress, every minute |
 | `free_space phase=start\|minute\|end path=P bytes=N gb=N` | Free space at start, every minute and at the end |
-| `scope=UNIT CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=N MemoryMax=N Nice=N` | The scope's limits as systemd applied them, and the daemon's nice level |
+| `scope=UNIT CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=N MemoryMax=N Nice=N Policy=TS` | The scope's limits as systemd applied them, and the daemon's nice level and scheduling class |
 | `backfill_seconds=S` | Seconds from start until every migration was complete |
 | `end_utc=TIME` | Clock time when every migration was complete |
 | `live_records=N counts=exact\|pending` | `live_records` and `counts` from the final status |
+
+### Measure the online migration with intake and traffic
+
+The schema 69 gate measured its backfill with no intake and no queries: 2,614
+pages in 7,914 s, about 3.0 s per page. Live on 2026-11-07, with intake,
+watches and queries, the same backfill ran at more than 16 s per page, status,
+records and sparql were cut off at 60 s, and katamari publications expired.
+`deploy/verify-backup.sh --measure-migration --with-traffic --image DAEMON
+BACKUP` measures the backfill the way the live store runs it. The daemon runs
+under the same user scope, limits and nice level as above.
+
+- The image opens the copy with `sparrowd --private-intake DIR`. That is a
+  writable daemon with its watches and its own ingest socket, for a disposable
+  copy only. Every watch it opens or accepts is rebound to `DIR/NAME`, where
+  `NAME` is the final component of its stored root. The script creates each
+  root under the scratch directory, and the shipper's `intake_root/NAME`
+  layout feeds the same roots. The daemon refuses a `DIR` that is, holds or
+  lies under a watch's configured root, so a hand run on a live intake
+  directory is refused, and its catalog keeps naming the configured roots: a
+  watch mutation on the copy persists them, never the private ones. The mode refuses `consume`, `syslog`,
+  `rpc_tcp_address` and `archive` in its configuration; the ingest socket is
+  allowed and is the copy's own. Claims the copy journals for its original
+  roots never refuse the open and are never recovered: each recovery refuses a
+  claim bound to another root, and the watch reports it as its failure. The
+  startup line ends `query_only=false intake=private`. On the first status
+  answer the run fails (`FAIL private-intake`) unless every watch root is
+  under `DIR` and the ingest socket is the copy's. An image without
+  `--private-intake` in its usage line is refused before anything is copied.
+- Replay source: what the copy itself received in the hour before the
+  backup's `taken_utc`, so the replay needs no producer spool, reads no
+  producer directory, and covers every shipper rule. A `daily` file whose
+  modification time is its last append, after the window, and a `sealed`
+  segment whose manifest decides when it ships, are replayed as the store
+  received them, not by their file times. Every artifact received in the
+  window is read once, before the run, from a separate query-only prep copy,
+  so the measured open is still the copy's first. An artifact whose source is
+  a watch's source replays into that watch's private root, released at its
+  recorded receipt offset. When `BACKUP/config/ship.toml` has a source named
+  after the root, as live, the item goes through a scratch producer directory
+  and `deploy/libexec/sparrow-ship` ships it into the root with a scratch
+  configuration, the live budgets and a scratch state, 300 s after each
+  completed run, as `sparrow-ship.timer` does. Each scratch source is
+  `settled` with no settle time, because what it replays is what the live
+  shipper already found finished. A watch with no shipper source has its item
+  placed in its root directly. Any other artifact, a direct producer's, is
+  re-sent over the copy's ingest socket at its recorded offset; live it
+  arrived over the ingest socket or TCP, and the copy has only the socket.
+  Syslog artifacts are skipped, since the mode refuses the listener. Both
+  replays loop over the window for the whole backfill, each later cycle under
+  new file names and request IDs. Nothing is read from or written to the live
+  intake roots, sockets, store, shipper state or producer directories; each
+  is a guarded path the scratch directory must not lie under.
+- Replay checks, before the measured open: the run fails (`FAIL prep`) when a
+  `ship.toml` source names no watch root (no watch root ends in that name),
+  when a `ship.toml` source's watch received nothing in the window, or when
+  the window holds nothing at all. `SPARROW_MEASURE_REPLAY_SECONDS` (3600 to
+  86400) widens the window for a source whose deliveries one hour does not
+  hold.
+- Traffic: `status`, `records` (received in the last hour, 100 rows) and
+  `sparql` (record sources received in the last hour, 100 rows) each start
+  every 30 seconds, from the first status answer until the backfill ends. A
+  call that outlasts its period skips the ticks it covered. A call still
+  running at the end finishes and is counted, and one still running after 600
+  seconds is killed and counted failed.
+
+The extra `MEASURE` lines:
+
+| Line | Meaning |
+| --- | --- |
+| `replay source=NAME via=ship\|direct\|socket artifacts=N bytes=N skipped=N` | Per source, what the window holds to replay: a watch root through the shipper or placed directly, or a socket source; `skipped` has no ingestible origin |
+| `replay watch_artifacts=N socket_artifacts=N window_from=T window_before=T` | The saved items in the window |
+| `prep_seconds=S` | Seconds spent preparing the replay, before the measured open |
+| `backup_live_records=N counts=exact source=backup-image\|prep-query-only` | The backup's own record count, before any replay (below); `backup_live_records=pending counts=pending source=none` when no exact count exists |
+| `pages migration=NAME pages=P seconds=S pages_per_second=R` | Each migration, from the previous completion, or the start, to its own; ` shared_poll=A,B shared_pages=P` follows when migrations were first seen complete at the same poll, and the rate is then theirs together |
+| `pages overall pages=P seconds=S pages_per_second=R` | Every page over the backfill seconds |
+| `replay_added=N since_utc=T` | Records the copy received since the load started, all of them replayed |
+| `live_records=N counts=exact\|pending` | The copy's record count at the end, replay included |
+| `watch_claims_completed=N` | Claims the copy's watches completed since the first status |
+| `watch_claims_refused=N` | Claim reservations the daemon refused (`reservation refused` lines in its log) |
+| `watch_intake watch=NAME via=ship\|direct released=N due=N completed=N inflight_allowance_seconds=S` | Per watch: the items released to it, those released before the final status less its in-flight allowance (due), and the claims it completed since the first status |
+| `rpc kind=KIND calls=N failed=N over_60s=N p50=S p95=S max=S` | Latency of `status`, `records`, `sparql` and the replayed `ingest` calls |
+| `replayed via=watch\|socket source=NAME released=N failed=N` | Per source, the items released into a root or the shipper, or sent to the socket |
+| `replay watch_items_released=N release_failures=N socket_ingests=N cycles=N ship_runs=N ship_failures=N ship_held_back=N ship_run_max_seconds=S` | What the replay did; `ship_held_back` counts the distinct items a shipper run left queued because the roots were over `max_pending_bytes` |
+| `publication_deadline_expiries=N` | Consume publications that hit their 45-second deadline, from the daemon's log |
+| `gate name=NAME value=V threshold=T margin=M verdict=PASS\|FAIL` | One line per gate threshold below; a positive margin passes |
+
+Page counts come from the daemon's `sparrowd: migration` lines, timed at the
+15-second status poll that first sees them, so a migration's seconds are
+accurate to one poll. The backfill ends at the first poll that sees every
+migration complete, and `backfill_seconds` keeps its meaning.
+
+`backup_live_records` is what a store of the backup's size holds, to compare
+with live's count. It is read before anything is replayed by the image the
+backup records (`BACKUP/images`), query-only on the prep copy: that image
+neither migrates nor expires, so its count is the store's as it was taken. A
+newer image can upgrade the prep copy and report its counts pending, so the
+backup's image opens it first. When that image is missing or also reports
+pending, the measured image's answer on the same prep copy, also query-only,
+counts if its counts are exact. Otherwise the line says pending: a count taken
+while the store counters seed covers only the records below the seeding
+watermark, so it is never printed as the backup's. The writable copy never
+supplies it, because its maintenance worker may run an expiry pass before its
+first answer.
+`replay_added` counts, page by page, the records received since the load
+started. No record of the backup was received that late, so all of them are
+the replay's. The final `live_records` includes them and lacks any backup
+record retention expired during the run.
+
+The gate thresholds, which the script enforces:
+
+- `first_status_seconds`: the first status answer within 600 seconds, the
+  switch's own gate.
+- `pages_per_second`: at least 0.125 migration pages per second over the
+  backfill, 8 seconds per page. The floor rejects the failed live backfill
+  (over 16 s per page). It is about 38 percent of the schema 69 copy without
+  traffic (0.33 pages per second), which leaves the writers, served first,
+  their share. At the floor a 2,614-page backfill ends within 5.8 hours,
+  inside one night before the 04:00 backup.
+- `rpc_calls_over_limit`: no call of 60 seconds or more, the connection lease
+  that cut calls off live. Its margin is 60 less the slowest call.
+- `rpc_calls_failed`: no failed call. A call that fails fast still means the
+  store did not serve it.
+- `traffic_answered`: `status`, `records` and `sparql` each answered at least
+  once, so a run without measured traffic cannot pass.
+- `publication_deadline_expiries`: none.
+- `replay_failures`: no item failed to release into the shipper or a root, no
+  shipper run failed, and no shipper run left an item queued because the roots
+  were over `max_pending_bytes`. This shows the replay delivered its items to
+  the roots, not that the watches consumed them; the next gates check that.
+- `watch_claims_refused`: no claim reservation refused by the daemon.
+- `watch_claims_completed`: at least one claim completed by the copy's
+  watches, so a run whose watch intake never reached the store cannot pass.
+- `watch_intake:NAME`, one per watch: the claims the watch completed since the
+  first status reach the items released to it before the final status less its
+  in-flight allowance. The allowance is the watch's `quiet_ms` from the copy's
+  status, plus the daemon's 45-second publication deadline (a compiled
+  constant, not configuration), plus, for a shipped watch, the ship interval
+  and the longest shipper run. A shipped part is within the shipper's split
+  limits and a direct item is one file, so one released item is at least one
+  claim. A tail watch's finished generations are claims too. A pending claim
+  the backup journals is not counted: its source is not in the empty private
+  root, so it cannot complete. Its margin is completed less due.
+- `socket_ingests_accepted`: at least one replayed socket ingest accepted
+  when any socket artifact was saved.
+
+When every gate passes the run exits 0. When the run completes and a gate
+fails it prints one `verify-backup: FAIL gate:` line per failed gate on
+standard error and exits 4. The failures of the plain mode still exit 1, and
+so do `FAIL prep`, when the replay cannot be prepared, `FAIL private-intake`,
+and `FAIL load`, when the load helper fails or exits before the backfill
+completes (it is checked at every poll). `SPARROW_MEASURE_GATE_FIRST_STATUS_SECONDS`,
+`SPARROW_MEASURE_GATE_RPC_SECONDS`,
+`SPARROW_MEASURE_GATE_PAGES_PER_SECOND` and
+`SPARROW_MEASURE_GATE_INFLIGHT_SECONDS`, a ceiling on each watch's in-flight
+allowance, may only tighten their gate.
+`SPARROW_MEASURE_REPLAY_SECONDS` may only widen the window, to a day.
+`SPARROW_MEASURE_SHIP_SECONDS` may only shorten the shipper interval, and
+`SPARROW_MEASURE_MIN_TRAFFIC_SECONDS` (up to 300) keeps the load running that
+long after the first status when the backfill ends sooner.
+
+`--rehearse-rollback` adds, after the measurement, the rollback rehearsal on
+scratch copies of the measured copy, with the measured image in every role and
+every watch rebound below the rehearsal's own directory (see "Claims after a
+rollback" below). A watch put on the copy feeds record batches through it, and
+`max_records` decides what each daemon can publish. A daemon claims a batch it
+cannot publish and stops, and a reflink copy of that closed store becomes the
+backup. A newer daemon publishes that batch, claims another it cannot publish,
+and stops. The restored daemon on the backup must refuse to start with
+"unrecognized private claim entry" (`PASS rehearsal-refusal`).
+`deploy/reconcile-inflight.sh inflight` must move the unknown entry back to
+its root under its batch name with the same inode (`PASS rehearsal-inflight`).
+After the restored daemon starts, `deploy/reconcile-inflight.sh missing` must
+re-ship the batch the newer store published and retire its claim
+(`PASS rehearsal-missing`). Any other outcome is `FAIL rehearsal`.
+
+To measure a switch, take the newest closed backup the coordination session
+names and the `--to` image, which must be built from a revision with
+`--private-intake`:
+
+```bash
+deploy/verify-backup.sh --measure-migration --with-traffic --rehearse-rollback \
+    --image ~/.local/libexec/sparrow/sparrowd-schema70-REV \
+    /SPARROW/backups/pre-upgrade-sparrowd-schema68-2aa56a9
+```
 
 This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live
@@ -606,4 +793,57 @@ migration.
 leaves the `--to` daemon running with both timers stopped, and it may already
 have accepted ingest. The recovery goes forward first: wait for status, confirm
 the store identity and schema, then start the timers. A rollback restores the
-pre-upgrade backup and drops everything `--to` accepted.
+pre-upgrade backup and drops everything `--to` accepted. It must then reconcile
+the consume claims, as below.
+
+### Claims after a rollback
+
+The schema 69 to 68 rollback of 2026-11-07 found two kinds of claim the
+restored store cannot settle by itself:
+
+1. The newer daemon claimed a file after the backup and moved it into its
+   root's `.sparrow-inflight/`. The restored catalog has no journal for it, so
+   the restored daemon exits at the end of each startup with "unrecognized
+   private claim entry; inspect and reconcile it without discarding its
+   bytes".
+2. The newer daemon published a file the backup still journals as claimed,
+   then removed it. The restored daemon reports "unpublished claimed source is
+   missing" for that claim and retries it every few seconds to 15 minutes,
+   and every nightly backup waits for it. Recovery needs the exact claimed
+   file, inode and change time included, so no recreated file can complete it.
+
+`deploy/reconcile-inflight.sh` handles both, asking the set-aside newer store
+what each claim was. Never delete an entry or a claim's bytes:
+
+1. Stop `sparrow.service` and both timers, set the newer store aside and
+   restore the backup, as `deploy/user-unit-upgrade.sh --help` describes. Keep
+   the set-aside store.
+2. Open the restored store with the old image and the set-aside store with the
+   newer image, each with `--query-only` on its own scratch configuration:
+   `query_only = true`, `data_dir`, a scratch `socket_path`,
+   `text_lexicon_dir` and the live budgets, with no `consume`, ingest socket,
+   TCP listener or archive. Query-only mode opens no root.
+3. `deploy/reconcile-inflight.sh inflight --restored OLD_CLI OLD_SOCKET
+   --newer NEW_CLI NEW_SOCKET`. For each consume root of the restored store,
+   it moves every entry of `ROOT/.sparrow-inflight/` that the restored
+   store's `ingest-get` does not know back to the root under the original
+   name the newer store records. The move is one link and unlink, so the
+   inode and bytes stay the same. It stops, moving nothing more, at an
+   entry neither store knows or whose original name is taken.
+4. Stop the restored query-only daemon and start `sparrow.service`.
+5. `deploy/reconcile-inflight.sh missing --restored OLD_CLI SOCKET --newer
+   NEW_CLI NEW_SOCKET`. For each watch whose failure names a claim with
+   "unpublished claimed source is missing", the newer store must record that
+   claim as published. Its artifact's bytes are read back from the newer
+   store and checked against the artifact's payload digest. They are then
+   renamed into the root as `NAME.reshipped.EXT`, a new file the watch
+   ingests, so the records the rollback dropped come back. Last, the claim is
+   retired with `sparrow SOCKET watch retire-claim` (schema 70 and newer). A
+   watch names one failing claim at a time, so rerun it until no watch
+   reports that failure. An old image without the command makes it exit 3
+   after re-shipping: the claim stays pending until a schema 70 image retires
+   it.
+6. Stop the newer query-only daemon and start both timers.
+
+`deploy/verify-backup.sh --rehearse-rollback` rehearses both cases on a copy
+(see "Measure the online migration with intake and traffic").
