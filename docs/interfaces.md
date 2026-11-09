@@ -2786,6 +2786,53 @@ ownership journal supplies `removed_at`. Completed handoff lookup follows its
 existing finite retry lifetime. `watch_handoff_get` continues to certify the exact
 saved producer intent when that authority is needed.
 
+### Per-claim state listing (schema 71)
+
+Status reports only per-watch counts. `watchClaims` (CLI `watch claims
+[--since RFC3339] [--until RFC3339]`) lists claims one by one, so the zero-loss
+check after a write stall is one read: of the claims that went pending since T,
+how many completed, which are still pending and for how long, and whether any
+was abandoned. It is read-only: anonymous TCP and the ingest socket refuse it,
+and a query-only daemon serves it. The daemon reads its own store; the CLI
+never opens the store.
+
+Each claim journal keeps a history from schema 71 on: `first_seen`, the
+reservation time; `attempts`, one for each publication attempt that left the
+claim pending and one for the attempt that completed it; `last_attempt`; and
+`last_pending_at` with `last_pending_reason`, the time and error of the latest
+attempt that left it pending, such as the 45-second consume publication
+deadline. The reason is cut to 320 encoded bytes. The history moves with the
+journal when the claim completes or is retired. A journal reserved by an
+older binary has no `first_seen` and counts only the attempts made since.
+Reserving a source now refuses a journal that would leave less than 448
+bytes of its 8 KiB for this history.
+
+A claim is `pending` while it is in the active recovery set, `complete` once
+its publication and source removal are recorded, and `abandoned` once an
+administrator retired it unrecoverable. The listing returns every pending
+claim, every complete claim whose `last_pending_at` falls in the window, and
+every abandoned claim whose `last_pending_at` or retirement falls in it. A
+claim that completed on its first attempt never went pending and is not
+listed. A completed journal reserved before schema 71 has no history, so
+whether it went pending is unknown; it is listed when its completion falls in
+the window, so a window from before the upgrade can still show its claims
+complete. The window is inclusive Unix milliseconds; `--since` defaults to the
+epoch and `--until` to the daemon's current time. Completed claims are kept
+for the two-day retry window, so a window reaching further back can miss
+them. One snapshot is read without the writer lock. More than 2048 matching
+claims refuse with `RESOURCE_LIMIT` rather than return a partial list.
+
+The CLI prints `as_of`, `since`, `until`, the `listed`, `pending`,
+`complete` and `abandoned` counts, and `claims`. Each claim has `claim_id`,
+`watch`, `state`, `relative_path_hex`, `first_seen`, `age_ms` (from first
+seen to `as_of`, pending claims only), `attempts`, `last_attempt`,
+`last_pending_at`, `last_pending_reason` and `finished_at`, the completion or
+retirement time. Absent times are null.
+
+```sh
+sparrow SOCKET watch claims --since 2026-11-09T00:00:00Z
+```
+
 ### Online backup
 
 `backup(storeId)` (CLI `sparrow SOCKET backup`, which takes the store id from
@@ -2877,50 +2924,6 @@ state `retired-unrecoverable`, and `ingest_get` reports its deletion as
 `retired_unrecoverable`. The daemon logs one line,
 `sparrowd: watch=W claim=ID retired-unrecoverable caller=… reason=… path=…`.
 A store keeps at most 64 retired claims, which are never removed.
-
-### Per-claim state listing (schema 71)
-
-Status reports only per-watch counts. `watchClaims` (CLI `watch claims
-[--since RFC3339] [--until RFC3339]`) lists claims one by one, so the zero-loss
-check after a write stall is one read: of the claims that went pending since T,
-how many completed, which are still pending and for how long, and whether any
-was abandoned. It is read-only: anonymous TCP and the ingest socket refuse it,
-and a query-only daemon serves it. The daemon reads its own store; the CLI
-never opens the store.
-
-Each claim journal keeps a history from schema 71 on: `first_seen`, the
-reservation time; `attempts`, one for each publication attempt that left the
-claim pending and one for the attempt that completed it; `last_attempt`; and
-`last_pending_at` with `last_pending_reason`, the time and error of the latest
-attempt that left it pending, such as the 45-second consume publication
-deadline. The reason is cut to 320 encoded bytes. The history moves with the
-journal when the claim completes or is retired. A journal reserved by an
-older binary has no `first_seen` and counts only the attempts made since.
-Reserving a source now refuses a journal that would leave less than 448
-bytes of its 8 KiB for this history.
-
-A claim is `pending` while it is in the active recovery set, `complete` once
-its publication and source removal are recorded, and `abandoned` once an
-administrator retired it unrecoverable. The listing returns every pending
-claim, every complete claim whose `last_pending_at` falls in the window, and
-every abandoned claim whose `last_pending_at` or retirement falls in it. A
-claim that completed on its first attempt never went pending and is not
-listed. The window is inclusive Unix milliseconds; `--since` defaults to the
-epoch and `--until` to the daemon's current time. Completed claims are kept
-for the two-day retry window, so a window reaching further back can miss
-them. One snapshot is read without the writer lock. More than 2048 matching
-claims refuse with `RESOURCE_LIMIT` rather than return a partial list.
-
-The CLI prints `as_of`, `since`, `until`, the `listed`, `pending`,
-`complete` and `abandoned` counts, and `claims`. Each claim has `claim_id`,
-`watch`, `state`, `relative_path_hex`, `first_seen`, `age_ms` (from first
-seen to `as_of`, pending claims only), `attempts`, `last_attempt`,
-`last_pending_at`, `last_pending_reason` and `finished_at`, the completion or
-retirement time. Absent times are null.
-
-```sh
-sparrow SOCKET watch claims --since 2026-11-09T00:00:00Z
-```
 
 The default scan budget is 10,000 (maximum 100,000) records and pin collections;
 aggregate native catalog construction defaults to and is capped at 32 MiB.

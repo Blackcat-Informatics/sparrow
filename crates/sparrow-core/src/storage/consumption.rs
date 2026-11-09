@@ -1176,14 +1176,7 @@ impl Store {
                 if journal.import_id.as_bytes() != id {
                     return Err(Error::new("STORAGE_FAILURE", "claim record key mismatch"));
                 }
-                let listed = match state {
-                    ClaimState::Pending => true,
-                    ClaimState::Complete => within(journal.history.last_pending_at),
-                    ClaimState::Abandoned => {
-                        within(journal.history.last_pending_at) || within(finished_at)
-                    }
-                };
-                if !listed {
+                if !listed_in(state, &journal.history, finished_at, &within) {
                     continue;
                 }
                 if claims.len() >= MAX_LISTED_CLAIMS {
@@ -1206,6 +1199,27 @@ impl Store {
                 .cmp(&(b.journal.history.first_seen, &b.journal.import_id))
         });
         Ok(claims)
+    }
+}
+
+/// Whether one claim belongs in a listing window. Pending claims always do. A complete or
+/// abandoned claim does when it went pending in the window, and an abandoned one also when it
+/// was retired there. A journal reserved before schema 71 has no history, so whether it went
+/// pending is unknown; it is listed when it finished in the window, so a window from before
+/// the upgrade can still show its claims complete.
+fn listed_in(
+    state: ClaimState,
+    history: &ClaimHistory,
+    finished_at: Option<u64>,
+    within: &impl Fn(Option<u64>) -> bool,
+) -> bool {
+    let unrecorded = history.first_seen.is_none() && history.last_pending_at.is_none();
+    match state {
+        ClaimState::Pending => true,
+        ClaimState::Complete => {
+            within(history.last_pending_at) || (unrecorded && within(finished_at))
+        }
+        ClaimState::Abandoned => within(history.last_pending_at) || within(finished_at),
     }
 }
 
@@ -1238,12 +1252,9 @@ pub struct ClaimListing {
 mod tests {
     use super::*;
 
-    /// INVARIANT (issue 160): a journal written before schema 71 has no history, and every
-    /// active and completed claim of a live store is such a journal at the switch. It must
-    /// decode with an empty history rather than refuse, or recovery and listing would fail.
-    #[test]
-    fn a_journal_without_history_decodes_with_an_empty_history() {
-        let journal = ConsumptionJournal::reservation(
+    /// One reserved journal at time 1000.
+    fn fixture() -> ConsumptionJournal {
+        ConsumptionJournal::reservation(
             "watch",
             b"input.log",
             "source",
@@ -1263,17 +1274,28 @@ mod tests {
             },
             1_000,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// INVARIANT (issue 160): a journal written before schema 71 has no history, and every
+    /// active and completed claim of a live store is such a journal at the switch. It must
+    /// decode with an empty history rather than refuse, or recovery and listing would fail.
+    #[test]
+    fn a_journal_without_history_decodes_with_an_empty_history() {
+        let journal = fixture();
         let text = json::write_compact(&journal.encode());
         let legacy = text.replace(r#","history":{"attempts":0,"first_seen":"1000"}"#, "");
         assert_ne!(legacy, text, "the fixture removes the history field");
         let decoded = ConsumptionJournal::decode(&parse(legacy.as_bytes()).unwrap()).unwrap();
         assert_eq!(decoded.history, ClaimHistory::default());
         assert_eq!(decoded.import_id, journal.import_id);
+    }
 
-        // A pending reason never grows the journal past what its reader accepts, however
-        // much JSON escaping expands it.
-        let mut journal = journal;
+    /// INVARIANT (issue 160): a pending reason never grows the journal past what its reader
+    /// accepts, however much JSON escaping expands it, and is cut rather than refused.
+    #[test]
+    fn a_pending_reason_is_cut_to_its_encoded_budget() {
+        let mut journal = fixture();
         journal
             .record_pending(2_000, &"\"\u{1}".repeat(4096))
             .unwrap();
@@ -1284,5 +1306,39 @@ mod tests {
             json::write_compact(&journal.encode()).len() + COMPLETION_ROOM + CLAIMED_ROOM
                 <= JOURNAL_BYTES
         );
+    }
+
+    /// INVARIANT (issue 160): the zero-loss check lists, for a window, every claim that went
+    /// pending in it. A completed journal from before schema 71 has no pending time, so it is
+    /// listed by its completion time; otherwise claims pending in the incident windows before
+    /// the upgrade could never be shown complete. A recorded claim that completed without
+    /// going pending stays out.
+    #[test]
+    fn a_completed_claim_without_history_is_listed_by_its_completion_time() {
+        let within = |clock: Option<u64>| clock.is_some_and(|at| (2_000..=3_000).contains(&at));
+        let unrecorded = ClaimHistory::default();
+        assert!(listed_in(
+            ClaimState::Complete,
+            &unrecorded,
+            Some(2_500),
+            &within
+        ));
+        assert!(!listed_in(
+            ClaimState::Complete,
+            &unrecorded,
+            Some(3_500),
+            &within
+        ));
+        let at_once = ClaimHistory {
+            first_seen: Some(1_000),
+            ..ClaimHistory::default()
+        };
+        assert!(!listed_in(
+            ClaimState::Complete,
+            &at_once,
+            Some(2_500),
+            &within
+        ));
+        assert!(listed_in(ClaimState::Pending, &unrecorded, None, &within));
     }
 }
