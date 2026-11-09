@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 1274cf1ee42d1acbd1c1fcf5a9b6a6c76dfa5dff
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 162
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/162
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 3735c1e4bfa1e8e4188be465fbf40b9b84638e2b
+GhpRsq-Head-Ref: paudley/145-measure-online-migrations-with-live
+GhpRsq-Head-OID: 1274cf1ee42d1acbd1c1fcf5a9b6a6c76dfa5dff
+GhpRsq-Result-Tree: ed76da0fdb36af66de48ae58d18df20b9f7b6734
+GhpRsq-Result-Commit: 23c3509278097a2ccce583acbaf9cb0b91f26cbe
+GhpRsq-Parent-Hashes: 1274cf1ee42d1acbd1c1fcf5a9b6a6c76dfa5dff
+GhpRsq-Squash-Notes-SHA256: 8b080517e84198f7a150d856c98ae5bdf225f8767d7bd2ad59ebce58ebeaa74b
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 6c6b08033d2a4866462a78893e846f3c1ea5e723
+GhpRsq-Stage-Commit: 02e52ed6b0650d8f9e6d3868e258532c88cde278
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/02e52ed6b0650d8f9e6d3868e258532c88cde278
+GhpRsq-Stage-Ref: refs/ghprsq/pr/162/stage
+GhpRsq-Stage-Files: 123
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/02e52ed6b0650d8f9e6d3868e258532c88cde278
