@@ -24,7 +24,7 @@ lives.
 | `install.sh` | Idempotent install of everything below onto the host; prints what changed. |
 | `uninstall.sh` | Undoes `install.sh`'s host changes so the old user unit can serve `/SPARROW` again. |
 | `pre-upgrade-backup.sh` | Takes the named backup `restart.sh` requires before raising the schema. |
-| `user-unit-upgrade.sh` | Switches the old user unit's image with its pre-upgrade backup, until #22 retires that unit. |
+| `user-unit-upgrade.sh` | Switches the old user unit's image with its pre-upgrade backup, and installs its `LimitNOFILE` drop-in (`systemd/user/sparrow.service.d/limits.conf`), until #22 retires that unit. |
 | `start.sh`, `stop.sh`, `restart.sh` | The lifecycle scripts; `restart.sh --rollback` swaps back. |
 | `check.sh` | Post-deploy verification. |
 | `test-instance.sh` | A disposable unprivileged test instance for rehearsing the scripts. |

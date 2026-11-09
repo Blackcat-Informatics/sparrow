@@ -520,7 +520,7 @@ configuration may not set `consume`, `syslog`, `rpc_tcp_address`,
 configuration key and cannot be combined with query-only mode. Reads and
 writes on its Unix socket are served as by a normal daemon, and
 `Status.queryOnly` is false. If its maintenance worker ends, the daemon exits
-with an error, as a normal daemon does. The startup line ends
+with an error, as a normal daemon does. The startup line reports
 `query_only=false intake=false`. `deploy/verify-backup.sh --measure-migration`
 uses the mode; see [the deployment guide](deployment.md), "Measure the online
 migration".

@@ -61,8 +61,9 @@ CPUQuota=100%
 # Within lillith.slice Sparrow yields disk to her other services (default weight 100); the slice
 # as a whole outweighs user.slice 100 to 1.
 IOWeight=20
-# RocksDB keeps every table file open: 514 files at 16 GB today, about 800 at the 50 GiB budget,
-# plus RPC and intake descriptors. The default soft limit of 1024 would run out.
+# The store keeps 1024 descriptors for RPC, intake, logs and the WAL and bounds RocksDB's table
+# cache (max_open_files) to the rest; below a soft limit of 2048 it refuses to open. The live store
+# held 917 table files at 32 GB, which the default soft limit of 1024 ran out on (issue #148).
 LimitNOFILE=65536
 # Six threads in normal running; tokio's blocking pool may grow to 512 threads under load.
 TasksMax=1024

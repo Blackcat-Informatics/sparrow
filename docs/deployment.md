@@ -269,9 +269,22 @@ development (`user.slice`) 100 to 1 in CPU and IO, and the daemon runs at nice
 contention. Within the slice, `CPUQuota=100%` holds the daemon to one core and
 `IOWeight=20` makes it yield disk to the other production services: a
 sustained deep-JSON backlog once saturated the host's CPU and disk, and under
-these limits ingest slows instead. `LimitNOFILE=65536` covers RocksDB, which
-keeps every table file open. Journal output is available through
-`journalctl -u sparrow.service`.
+these limits ingest slows instead.
+
+`LimitNOFILE=65536` gives the store its descriptors. At open the store reads
+its soft `RLIMIT_NOFILE`, keeps 1024 descriptors for sockets, connections,
+logs, the WAL, intake and archive files, and gives the rest to RocksDB's
+table cache (`max_open_files`), which closes the least recently used table
+file instead of exceeding it. Below a soft limit of 2048 the store refuses to
+open, naming `LimitNOFILE=65536`. The reserve covers the connection ceilings
+at their defaults and one descriptor per watched directory at the live
+coverage; ceilings and watch coverage near 1024 need a higher limit. The
+startup line ends `nofile=N max_open_files=M`. Tests and `make check` open
+stores too, so they need a shell whose `ulimit -Sn` is at least 2048. The old user unit sets no limit of its own and
+inherited the user manager's soft 1024, which a store of 917 table files
+exhausted (issue #148). `deploy/user-unit-upgrade.sh` installs
+`deploy/systemd/user/sparrow.service.d/limits.conf` for it. Journal output is
+available through `journalctl -u sparrow.service`.
 
 After a release that changes the table options profile, the daemon rewrites
 older table files once in the background. `sparrow SOCKET status` reports it as

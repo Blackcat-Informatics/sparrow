@@ -18712,7 +18712,8 @@ fn native_options(path: &std::path::Path) -> std::collections::BTreeMap<String, 
 #[test]
 fn every_column_family_uses_the_shared_table_options() {
     // INVARIANT: each family is opened with its measured table and compression
-    // options, and a new store owes no rewrite.
+    // options, the table cache is bounded below the descriptor limit (#148), and
+    // a new store owes no rewrite.
     use sparrow_core::RecompressionPhase;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -18721,6 +18722,12 @@ fn every_column_family_uses_the_shared_table_options() {
     let database = section("[DBOptions]");
     assert!(database.contains("keep_log_file_num=10\n"));
     assert!(database.contains("max_log_file_size=8388608\n"));
+    let bound = store.open_files().max_open_files;
+    assert!(bound > 0);
+    assert!(
+        database.contains(&format!("max_open_files={bound}\n")),
+        "{database}"
+    );
     for (family, block, dictionary, training) in [
         ("default", 32768, 0, 0),
         ("payload", 32768, 114688, 11468800),

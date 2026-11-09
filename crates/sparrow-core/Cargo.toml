@@ -20,7 +20,7 @@ purrdf-hash.workspace = true
 purrdf-lex.workspace = true
 purrdf-core.workspace = true
 getrandom.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 sparrow-test-support = { path = "../sparrow-test-support" }
