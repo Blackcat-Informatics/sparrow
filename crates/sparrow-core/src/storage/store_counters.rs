@@ -30,7 +30,7 @@
 //! its bound covers. Until seeding completes, readers report the rows as pending: exact
 //! through the seeding watermark, never a total. Nothing recounts at run time.
 
-use super::{Error, event_fallback_rdf, rdf_index, read_field, source_summary};
+use super::{Error, event_fallback_rdf, rdf_index, read_field, source_context, source_summary};
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
 use source_summary::failure;
 use std::cmp::Ordering;
@@ -71,6 +71,7 @@ enum Follows {
     EventFallbackRdf,
     SourceSummaryArtifacts,
     SourceSummaryRecords,
+    SourceContext,
 }
 
 struct Term {
@@ -92,10 +93,11 @@ pub(super) enum Counter {
     OwnerGraphIndexDone,
     EventFallbackRdfDone,
     SourceSummaryDone,
+    SourceContextDone,
 }
 
 impl Counter {
-    pub(super) const ALL: [Self; 10] = [
+    pub(super) const ALL: [Self; 11] = [
         Self::Records,
         Self::RetainedRecords,
         Self::Artifacts,
@@ -106,6 +108,7 @@ impl Counter {
         Self::OwnerGraphIndexDone,
         Self::EventFallbackRdfDone,
         Self::SourceSummaryDone,
+        Self::SourceContextDone,
     ];
 
     fn name(self) -> &'static str {
@@ -120,6 +123,7 @@ impl Counter {
             Self::OwnerGraphIndexDone => "done:owner-graph-index",
             Self::EventFallbackRdfDone => "done:event-fallback-rdf",
             Self::SourceSummaryDone => "done:source-summary",
+            Self::SourceContextDone => "done:source-context",
         }
     }
 
@@ -130,7 +134,7 @@ impl Counter {
     fn terms(self) -> &'static [Term] {
         use Filter::{Any, Retained};
         use Follows::{
-            EventFallbackRdf, OwnerGraphIndex, Population, SourceSummaryArtifacts,
+            EventFallbackRdf, OwnerGraphIndex, Population, SourceContext, SourceSummaryArtifacts,
             SourceSummaryRecords,
         };
         match self {
@@ -191,6 +195,11 @@ impl Counter {
                     follows: SourceSummaryRecords,
                 },
             ],
+            Self::SourceContextDone => &[Term {
+                prefix: RECORD,
+                filter: Any,
+                follows: SourceContext,
+            }],
         }
     }
 }
@@ -320,6 +329,7 @@ pub(super) struct Positions {
     owner: Bound,
     fallback: Bound,
     summary: (Bound, Bound),
+    context: Bound,
 }
 
 /// The checkpoint keys [`Positions`] reads.
@@ -328,6 +338,7 @@ fn checkpoint_key(name: &[u8]) -> bool {
         || name == rdf_index::OWNER_GRAPH_UPGRADE.as_bytes()
         || name == event_fallback_rdf::CHECKPOINT.as_bytes()
         || name == source_summary::CHECKPOINT.as_bytes()
+        || name == source_context::CHECKPOINT.as_bytes()
 }
 
 impl Positions {
@@ -359,11 +370,18 @@ impl Positions {
                 Bound::after(after.map(String::into_bytes)),
             ),
         };
+        let context = super::catalog_upgrade::read_progress(source_context::CHECKPOINT, read)?;
+        let context = if context.complete {
+            Bound::Everything
+        } else {
+            Bound::after(context.after.map(String::into_bytes))
+        };
         Ok(Self {
             seed,
             owner,
             fallback,
             summary,
+            context,
         })
     }
 
@@ -386,6 +404,7 @@ impl Positions {
             Follows::EventFallbackRdf => self.fallback.clone(),
             Follows::SourceSummaryArtifacts => self.summary.0.clone(),
             Follows::SourceSummaryRecords => self.summary.1.clone(),
+            Follows::SourceContext => self.context.clone(),
         };
         follows.min(self.seed.bound(term.prefix))
     }
@@ -568,6 +587,13 @@ pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
         .encode(),
     );
     Ok(())
+}
+
+/// Zero one migration's `done` row into `batch`, for a migration reset at open: the caller
+/// moves that migration's checkpoint to its start in the same batch and commits it directly,
+/// outside [`apply`], so the row and the checkpoint agree.
+pub(super) fn reset(batch: &mut WriteBatch, counter: Counter) {
+    batch.put(counter.key(), 0_u64.to_be_bytes());
 }
 
 /// Stage one seeding page: the advanced checkpoint alone, and whether seeding is complete

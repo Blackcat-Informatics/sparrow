@@ -14,8 +14,9 @@
 # or holds a symlink leading outside the backup, and refuses any scratch path that resolves under
 # the live store, socket, intake or the backup.
 #
-# With --measure-migration it instead measures the online migrations (schema 69 and
-# source-summary) on a writable copy (docs/deployment.md, "Measure the online migration"): the
+# With --measure-migration it instead measures the online migrations (schema 69,
+# source-summary and, when the open found the source timeline cache stale, source-context) on a
+# writable copy (docs/deployment.md, "Measure the online migration"): the
 # image opens the copy with `sparrowd --no-intake` (maintenance runs; no watch root, ingest
 # socket, TCP listener or archive is opened) under a systemd user scope with the service unit's
 # CPU, IO and memory limits, and the script logs machine-greppable `MEASURE` lines until status
@@ -237,6 +238,11 @@ $unit_policy, not the time-sharing policy (0) this measurement applies"
     command -v chrt >/dev/null || die "--measure-migration needs chrt to start the daemon under the unit's time-sharing policy"
     SCOPE_LIMITS="$SCOPE_LIMITS Nice=$UNIT_NICE Policy=TS"
 fi
+# The daemon started here inherits this shell's descriptor limit, not the unit's. The store
+# refuses to open below a soft limit of 2048 and bounds its table cache to the rest (#148), so
+# the copy runs under the unit's LimitNOFILE=65536, before anything is copied.
+ulimit -Sn 65536 2>/dev/null \
+    || die "cannot raise the soft open-file limit to 65536 (hard limit $(ulimit -Hn)); the store needs the unit's LimitNOFILE"
 BACKUP=$(realpath -e -- "$1") || die "backup $1 does not exist"
 [[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup"
 [[ ! -L $BACKUP/store ]] || die "$BACKUP/store is a symbolic link; a backup holds its store itself"

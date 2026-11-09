@@ -146,7 +146,10 @@ impl MigrationJournal {
         *pages += 1;
         let pages = *pages;
         let name = page.migration.name();
-        if page.complete {
+        if let Some(failure) = &page.failure {
+            // The migration stops on a latched failure, so this logs once.
+            eprintln!("sparrowd: migration {name} failed pages={pages}: {failure}");
+        } else if page.complete {
             eprintln!(
                 "sparrowd: migration {name} complete pages={pages} done={}",
                 page.done
@@ -421,8 +424,8 @@ mod tests {
         worker.shutdown().await.unwrap();
     }
 
-    /// INVARIANT: a store opened with both schema 69 migrations and the source summary
-    /// migration pending serves reads while the backfill is part done, and those reads
+    /// INVARIANT: a store opened with both schema 69 migrations, the source summary
+    /// migration and a source timeline rebuild pending serves reads while the backfill is part done, and those reads
     /// report the record graphs still pending; the joined worker's pages then finish every
     /// migration, after which the same read reports nothing pending and the per-source
     /// counters equal a full recount.
@@ -443,6 +446,7 @@ mod tests {
         let db = sparrow_test_support::catalog_db(&data).unwrap();
         sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
         sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+        sparrow_test_support::stale_source_context_cache(&db).unwrap();
         drop(db);
         let store = config.open_store().unwrap();
         let pending = store.migrations().unwrap();

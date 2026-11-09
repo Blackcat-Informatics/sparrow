@@ -151,6 +151,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let store = config.open_store()?;
+    let phases = store.open_phases();
+    eprintln!(
+        "sparrowd: store_open_ms {} total={}",
+        phases
+            .iter()
+            .map(|phase| format!("{}={}", phase.name, phase.elapsed.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        phases
+            .iter()
+            .map(|phase| phase.elapsed)
+            .sum::<std::time::Duration>()
+            .as_millis()
+    );
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let operation_slots = u32::try_from(config.max_concurrent_requests)?;
@@ -267,14 +281,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpc = rpc.with_watch_controller(consumer.controller());
     }
     eprintln!(
-        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={} intake={}",
+        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={} intake={} {}",
         store_id,
         config.socket_path.display(),
         config.data_dir.display(),
         config.max_rpc_connections,
         config.max_concurrent_requests,
         config.query_only,
-        intake_label
+        intake_label,
+        store.open_files()
     );
     if let (Some(path), Some(gid)) = (&config.ingest_socket_path, config.ingest_socket_gid) {
         eprintln!(

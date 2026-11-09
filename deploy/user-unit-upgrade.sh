@@ -25,9 +25,12 @@ the daemon link names --from; all four images are executable; the --to pair is b
 to the kept pair in SPARROW_BIN; the --to daemon carries cap_net_bind_service (getcap: a human
 with root runs setcap, this script never does); server.toml sets the ingest keys; the store has
 copy-on-write off; the backups directory is on the store's filesystem, which has the store's
-size plus 10 GiB free; no nightly backup is running; and the running daemon reports the --from
-schema. Then it stops both timers and waits for the shipper, stops
-the unit, takes the named pre-upgrade backup, switches the links, starts the unit, waits up to
+size plus 10 GiB free; the unit's drop-in directory holds no .conf but an identical
+limits.conf (deploy/systemd/user/sparrow.service.d); no nightly backup is running; and the
+running daemon reports the --from schema. Then it stops both timers and waits for the shipper,
+stops the unit, takes the named pre-upgrade backup, installs limits.conf (LimitNOFILE=65536, the
+store refuses to open below 2048) with daemon-reload and checks the unit's LimitNOFILESoft,
+switches the links, starts the unit, waits up to
 600 s for the first status answer, checks the store identity and the --to schema, prints the
 migrations, watches and ingest socket, and starts the timers again. It exits 0 without waiting
 for the online backfill, which continues in the running daemon; watch it with
@@ -45,7 +48,7 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
 - From "stop timers" up to "switch links": the links still name FROM and the store is untouched.
   Remove BACKUPS/pre-upgrade-FROM.partial if it exists (a rerun refuses while it does), then
   start sparrow.service (if stopped) and both timers. A completed BACKUPS/pre-upgrade-FROM
-  must be moved aside before a rerun.
+  must be moved aside before a rerun. An installed limits.conf may stay: either image needs it.
 - At "switch links", before "start sparrow.service": check both links with readlink; one may
   name TO and the other FROM. Point both at FROM and recover as in the step above, or both at
   TO and start sparrow.service, then continue as below.
@@ -144,6 +147,20 @@ done
 for image in "$TO" "$TO_CLI"; do
     cmp -s -- "$SPARROW_BIN/$image" "$LIBEXEC/$image" || die "$LIBEXEC/$image differs from $SPARROW_BIN/$image"
 done
+# The unit's descriptor limit (issue #148). The user unit sets none, so the daemon inherited the
+# user manager's soft limit of 1024 and failed table reads with EMFILE; the store now refuses to
+# open below 2048. The stopped window installs this drop-in. Any other drop-in in the unit's
+# directory is refused, so nothing unreviewed changes the unit while the daemon is down.
+LIMITS_SOURCE=$(dirname -- "${BASH_SOURCE[0]}")/systemd/user/sparrow.service.d/limits.conf
+DROPIN_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/sparrow.service.d
+LIMIT_NOFILE=65536
+[[ -r $LIMITS_SOURCE ]] || die "cannot read $LIMITS_SOURCE"
+for dropin in "$DROPIN_DIR"/*.conf; do
+    [[ -e $dropin ]] || continue
+    if [[ $dropin != "$DROPIN_DIR/limits.conf" ]] || ! cmp -s -- "$LIMITS_SOURCE" "$dropin"; then
+        die "foreign drop-in $dropin; only $LIMITS_SOURCE is installed there. Move it aside or bring it into the repository first"
+    fi
+done
 command -v getcap >/dev/null || die "getcap is missing; it checks the --to daemon's bind capability"
 getcap -- "$LIBEXEC/$TO" 2>/dev/null | grep -q cap_net_bind_service \
     || die "$LIBEXEC/$TO lacks cap_net_bind_service; a human with root runs: setcap cap_net_bind_service=ep $LIBEXEC/$TO"
@@ -235,6 +252,13 @@ sync -f -- "$BACKUP.partial"
 mv -T -- "$BACKUP.partial" "$BACKUP"
 sync -f -- "$SPARROW_BACKUPS"
 log "backup at $BACKUP ($(find "$BACKUP/store" -type f | wc -l) store files)"
+
+log "install $DROPIN_DIR/limits.conf (LimitNOFILE=$LIMIT_NOFILE)"
+install -D -m 0644 -- "$LIMITS_SOURCE" "$DROPIN_DIR/limits.conf"
+"${USER_SYSTEMCTL[@]}" daemon-reload
+soft=$("${USER_SYSTEMCTL[@]}" show -p LimitNOFILESoft --value sparrow.service)
+[[ $soft == "$LIMIT_NOFILE" ]] \
+    || die "sparrow.service has LimitNOFILESoft=$soft after daemon-reload, not $LIMIT_NOFILE; another unit setting overrides $DROPIN_DIR/limits.conf"
 
 log "switch links"
 swap_link "$LIBEXEC/sparrowd" "$TO"

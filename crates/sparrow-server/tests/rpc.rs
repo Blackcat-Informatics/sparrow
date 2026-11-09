@@ -4475,11 +4475,12 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 .status()
                 .unwrap();
             assert!(status.success());
-            // The copy owes both schema 69 migrations and the source summary migration,
-            // which only a maintenance worker runs.
+            // The copy owes both schema 69 migrations, the source summary migration and a
+            // source timeline rebuild, which only a maintenance worker runs.
             let db = sparrow_test_support::catalog_db(&copied).unwrap();
             sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
             sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+            sparrow_test_support::stale_source_context_cache(&db).unwrap();
             drop(db);
             let copy_socket = copied.join("rpc.sock");
             let copy_config = write_server_config(&copy, &copied, &copy_socket);
@@ -4589,7 +4590,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             assert_eq!(status["counts"].as_str(), Some("pending"));
             assert_eq!(status["live_records"].as_str(), Some("0"));
             let migrations = status["migrations"].as_array().unwrap();
-            assert_eq!(migrations.len(), 4, "{migrations:?}");
+            assert_eq!(migrations.len(), 5, "{migrations:?}");
             for migration in migrations {
                 assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
                 assert_eq!(
@@ -5719,8 +5720,10 @@ fn verify_backup_traffic_measurement_refuses_an_empty_or_unrooted_replay() {
 }
 
 /// INVARIANT: deploy/user-unit-upgrade.sh refuses a trailing --to without a value, a daemon
-/// link that does not name --from, and a --to daemon without cap_net_bind_service before it
-/// changes anything: no backup is started and the links are untouched. Every path is a scratch
+/// link that does not name --from, a drop-in for the unit other than the repository's
+/// limits.conf (issue #148: the window installs only that file), and a --to daemon without
+/// cap_net_bind_service before it changes anything: no backup is started, the links and the
+/// drop-in directory are untouched, and an identical limits.conf passes. Every path is a scratch
 /// override, and each refusal precedes the script's first systemctl call, so no unit is ever
 /// addressed.
 #[test]
@@ -5757,6 +5760,7 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
         ))
         .args(args)
         .env("HOME", dir.path())
+        .env_remove("XDG_CONFIG_HOME")
         .env("SPARROW_SCOPE", "system")
         .env_remove("SPARROW_UNIT")
         .env("SPARROW_PREFIX", &prefix)
@@ -5802,10 +5806,54 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
 
     std::fs::remove_file(&link).unwrap();
     symlink(from, &link).unwrap();
+    let dropins = dir.path().join(".config/systemd/user/sparrow.service.d");
+    std::fs::create_dir_all(&dropins).unwrap();
+    let foreign = b"[Service]\nLimitNOFILE=4096\n";
+    std::fs::write(dropins.join("limits.conf"), foreign).unwrap();
+    let (code, stdout, stderr) = run(&switch);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("foreign drop-in"), "{stderr}");
+    assert_eq!(std::fs::read(dropins.join("limits.conf")).unwrap(), foreign);
+    unchanged(from);
+
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/systemd/user/sparrow.service.d/limits.conf"
+        ),
+        dropins.join("limits.conf"),
+    )
+    .unwrap();
     let (code, stdout, stderr) = run(&switch);
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("lacks cap_net_bind_service"), "{stderr}");
     unchanged(from);
+}
+
+/// INVARIANT (issue #148): a daemon whose soft open-file limit leaves no room for the table
+/// cache beside the descriptor reserve refuses to open the store and names the unit setting,
+/// instead of serving until a table read fails with EMFILE. 1024 is the user manager's default,
+/// which the live user unit inherited before it crashed twice.
+#[test]
+fn daemon_refuses_a_soft_open_file_limit_without_room_for_the_table_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    let result = Command::new("prlimit")
+        .arg("--nofile=1024:1024")
+        .arg(env!("CARGO_BIN_EXE_sparrowd"))
+        .arg("--config")
+        .arg(&config)
+        .admitted_output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(!socket.exists());
+    assert!(
+        stderr.contains("soft open-file limit is 1024") && stderr.contains("LimitNOFILE=65536"),
+        "{stderr}"
+    );
 }
 
 #[test]

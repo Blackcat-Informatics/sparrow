@@ -269,9 +269,22 @@ development (`user.slice`) 100 to 1 in CPU and IO, and the daemon runs at nice
 contention. Within the slice, `CPUQuota=100%` holds the daemon to one core and
 `IOWeight=20` makes it yield disk to the other production services: a
 sustained deep-JSON backlog once saturated the host's CPU and disk, and under
-these limits ingest slows instead. `LimitNOFILE=65536` covers RocksDB, which
-keeps every table file open. Journal output is available through
-`journalctl -u sparrow.service`.
+these limits ingest slows instead.
+
+`LimitNOFILE=65536` gives the store its descriptors. At open the store reads
+its soft `RLIMIT_NOFILE`, keeps 1024 descriptors for sockets, connections,
+logs, the WAL, intake and archive files, and gives the rest to RocksDB's
+table cache (`max_open_files`), which closes the least recently used table
+file instead of exceeding it. Below a soft limit of 2048 the store refuses to
+open, naming `LimitNOFILE=65536`. The reserve covers the connection ceilings
+at their defaults and one descriptor per watched directory at the live
+coverage; ceilings and watch coverage near 1024 need a higher limit. The
+startup line ends `nofile=N max_open_files=M`. Tests and `make check` open
+stores too, so they need a shell whose `ulimit -Sn` is at least 2048. The old user unit sets no limit of its own and
+inherited the user manager's soft 1024, which a store of 917 table files
+exhausted (issue #148). `deploy/user-unit-upgrade.sh` installs
+`deploy/systemd/user/sparrow.service.d/limits.conf` for it. Journal output is
+available through `journalctl -u sparrow.service`.
 
 After a release that changes the table options profile, the daemon rewrites
 older table files once in the background. `sparrow SOCKET status` reports it as
@@ -457,8 +470,10 @@ verifiable: the script runs every other check and exits 3, which is not verified
 ### Measure the online migration
 
 `deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP` measures
-the online migrations, the schema 69 pair and `source-summary` ("Online store
-migrations" and "Per-source counters and artifact index" in the interfaces)
+the online migrations, the schema 69 pair, `source-summary` and, when the open
+found the source timeline cache stale, `source-context` ("Online store
+migrations", "Per-source counters and artifact index" and "Single context
+capture admission" in the interfaces)
 on a writable reflinked copy of the backup's store below `SPARROW_VERIFY`
 (default `/SPARROW/verify`). The switch gate is a first open under 10 minutes
 measured this way. The copy has its own socket, and its scratch configuration
@@ -562,7 +577,7 @@ under the same user scope, limits and nice level as above.
   allowed and is the copy's own. Claims the copy journals for its original
   roots never refuse the open and are never recovered: each recovery refuses a
   claim bound to another root, and the watch reports it as its failure. The
-  startup line ends `query_only=false intake=private`. On the first status
+  startup line reports `query_only=false intake=private`. On the first status
   answer the run fails (`FAIL private-intake`) unless every watch root is
   under `DIR` and the ingest socket is the copy's. An image without
   `--private-intake` in its usage line is refused before anything is copied.

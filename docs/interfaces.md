@@ -481,9 +481,9 @@ to the schema without a decision in the gate returns Cap'n Proto
 `unimplemented`.
 
 A query-only daemon still modifies the store directory, so open only a
-disposable copy, never the only one. Every open, including one of a current
-store, deletes and rebuilds the source-context catalog rows and their job
-checkpoint in synchronous batches. Opening also applies any catalog upgrade that
+disposable copy, never the only one. An open whose source-context cache is
+stale resets it with one range deletion in the fence batch (see "Single
+context capture admission"); an open of a current store leaves it alone. Opening also applies any catalog upgrade that
 a store written by an older image still needs, and RocksDB writes its own files
 in `data_dir` (the write-ahead log, `MANIFEST`, `OPTIONS` and `LOG`). It replays
 a write-ahead log left by an unclean stop and may compact the files that replay
@@ -520,7 +520,7 @@ configuration may not set `consume`, `syslog`, `rpc_tcp_address`,
 configuration key and cannot be combined with query-only mode. Reads and
 writes on its Unix socket are served as by a normal daemon, and
 `Status.queryOnly` is false. If its maintenance worker ends, the daemon exits
-with an error, as a normal daemon does. The startup line ends
+with an error, as a normal daemon does. The startup line reports
 `query_only=false intake=false`. `deploy/verify-backup.sh --measure-migration`
 uses the mode; see [the deployment guide](deployment.md), "Measure the online
 migration".
@@ -547,7 +547,7 @@ generation of another root is never resumed, adopted or given a gap; a file
 under the private root that reuses its file identity is refused. The configuration
 may not set `consume`, `syslog`, `rpc_tcp_address` or `archive`, and the
 refusal names the key; `ingest_socket_path` is allowed. The mode cannot be
-combined with query-only mode. The startup line ends
+combined with query-only mode. The startup line reports
 `query_only=false intake=private`. `deploy/verify-backup.sh --measure-migration
 --with-traffic` uses the mode; see [the deployment guide](deployment.md),
 "Measure the online migration with intake and traffic".
@@ -618,8 +618,9 @@ Opening a store that owes the schema 69 migrations applies both writer fences
 and seeds both checkpoints in one synchronized batch, then serves; the open
 does not wait for either job. The joined maintenance worker runs them as one
 duty, `store-counters` first (see "Store counters"), then `owner-graph-index`,
-`event-fallback-rdf` and `source-summary` (see "Per-source counters and
-artifact index"), one page per admission. It is selected fairly with buffered synchronization, pressure
+`event-fallback-rdf`, `source-summary` (see "Per-source counters and
+artifact index") and `source-context` (see "Single context capture admission"), one page
+per admission. It is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as pressure maintenance, import reclamation and
 retention are; buffered synchronization and the table rewrite still run there.
@@ -660,7 +661,8 @@ writable daemon seeds them.
 counts the migration's source entries now in the store: every counted key for
 `store-counters`, graph declarations for `owner-graph-index`, record metadata
 graphs (counted by their provenance markers) for `event-fallback-rdf`,
-`artifact:` and `record:` entries for `source-summary`. `done` counts those at
+`artifact:` and `record:` entries for `source-summary`, `record:` entries for
+`source-context`. `done` counts those at
 or before the watermark, so it moves with ingest and retirement as well as with
 pages. The watermark is an opaque position, `start` before the first page and
 null once complete, when `done` equals `total` (or `total` is still counting). A
@@ -678,6 +680,7 @@ Readers are explicit while a migration is pending:
 | Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph is beyond the backfill watermark and lacks `eventTimeFallback` is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`); the answer's `complete` is false, and a request with `require_complete_index` refuses with `INDEX_NOT_READY`. A correlation reads only `eventTime` and `receivedAt`, so it neither counts nor refuses | Zero; no refusal |
 | New graphs written during the migration | Owner-to-graph rows and fallback facts in the same batch | The same |
 | Catalog event time (intervals, sorting, correlation clocks, `event_time_fallback`) | Derived from each record's `received_at`; independent of the RDF rewrite | The same |
+| Record context (`recordsContext`, CLI `context`, MCP `records_context`), and a live `artifacts` listing row that reads its parent records through the cache | Refuses with `INDEX_NOT_READY` naming the `source-context` migration and its watermark; never answers from the partial cache | Walks the source timeline cache |
 
 While the backfill is pending, each candidate record (a selected record without
 a source event time whose graph is beyond the backfill watermark) costs an
@@ -701,7 +704,7 @@ big-endian 64-bit count, from one RocksDB snapshot:
 | `graph-declarations` | `rdf:g:` graph declarations |
 | `record-graphs` | `provenance-rdf:record:` markers, one per record metadata graph |
 | `payload-chunks`, `json-projections` | `ref:` and `projection-ref:` rows |
-| `done:owner-graph-index`, `done:event-fallback-rdf`, `done:source-summary` | The migration's source entries at or before its checkpoint |
+| `done:owner-graph-index`, `done:event-fallback-rdf`, `done:source-summary`, `done:source-context` | The migration's source entries at or before its checkpoint |
 
 Status `live_records` is `retained-records` and keeps its deadline meaning:
 records neither evicted nor retired by expiry. Expiry marks a record `retired`
@@ -1529,19 +1532,33 @@ RESOURCE_LIMIT with no successful result; it never publishes a byte-limited
 prefix. Request fewer neighbors or narrow the acceptance interval to reduce work.
 These are host admission allowances, not a measured RSS or all-I/O guarantee.
 
-The source timeline is a disk-backed derivative of the authoritative record and
-primary time catalogs. Every store open clears and rebuilds it with the shared
-bounded catalog pager before serving requests. This permits preceding binaries
-to write the unchanged catalog format without leaving stale context answers.
-Production record and time mutations maintain the derivative in their original
-atomic batch. Selected entries must agree with the primary time index and the
+The source timeline (`source-context-v1:`) is a disk-backed derivative of the
+authoritative record and primary time catalogs. Production record and time
+mutations maintain it in their original atomic batch, so a crash cannot leave
+it stale. Its generation marker, `source-context-v1:!generation`, sorts before
+every entry. An open keeps the cache when the marker holds the current
+generation, no reconstruction failure is latched and the job checkpoint
+decodes. Otherwise the open resets it in the migration fence batch: one range
+deletion of the whole family, the marker, a checkpoint at `start` and a zero
+`done:source-context` row. It writes no point tombstone per entry. Images
+before #149 rebuilt the cache on every open by deleting its entries in key
+order; their first deletion batch removes the marker, so a cache such an image
+touched, or left half cleared, is reset at the next open. The `source-context`
+online migration then rebuilds the cache with the shared bounded catalog pager,
+one page per maintenance admission, while the daemon serves. Until it
+completes, context reads refuse with `INDEX_NOT_READY`. A query-only daemon
+runs no page, so on a stale cache its context reads refuse until a writable
+daemon completes the rebuild. Selected entries must agree with the primary time index and the
 record's source; disagreement refuses the capture without a global scan fallback.
-Corrupt record metadata found during reconstruction disables all context captures
-with an actionable storage failure until catalog repair and reopen; it does not
-publish a partial timeline or prevent unrelated evidence reads. Storage I/O and
-reconstruction admission failures still fail startup.
-Reconstruction adds startup writes and catalog reads; production-scale startup
-latency, disk headroom and write amplification remain unqualified.
+Corrupt record metadata found during reconstruction latches a durable failure:
+the migration stops paging, `Status.migrations` reports the failure, and every
+context capture refuses with an actionable storage failure until catalog repair
+and a reopen, which resets the cache and rebuilds it. It does not publish a
+partial timeline or prevent unrelated evidence reads. Other page failures, such
+as storage I/O or admission, are retried like any migration page. The daemon
+prints the wall time of each open phase once at startup as
+`sparrowd: store_open_ms rocksdb=N identity=N upgrades=N migration_fence=N archive=N wal_sync=N state=N registries=N total=N`
+(milliseconds).
 
 Limits report direction_visits, catalog_bytes, response_bytes, output_records,
 requested_before, requested_after and independent membership member/record visit
