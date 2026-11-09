@@ -28,6 +28,16 @@ pub enum Error {
     State(&'static str),
     /// A discovered declared-finished generation is terminal; this does not defer other scan entries.
     FinishedGeneration(&'static str),
+    /// `--private-intake` would rebind two configured roots with one final component to one
+    /// private root.
+    PrivateRootShared {
+        /// The private root both would consume.
+        private: std::path::PathBuf,
+        /// The configured root already bound to it.
+        first: std::path::PathBuf,
+        /// The configured root that would share it.
+        second: std::path::PathBuf,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -37,6 +47,17 @@ impl std::fmt::Display for Error {
             Self::Upload(e) => std::fmt::Display::fmt(e, f),
             Self::Io(e) => std::fmt::Display::fmt(e, f),
             Self::State(message) | Self::FinishedGeneration(message) => f.write_str(message),
+            Self::PrivateRootShared {
+                private,
+                first,
+                second,
+            } => write!(
+                f,
+                "--private-intake would bind configured roots {} and {} to one private root {}; their final path components must differ",
+                first.display(),
+                second.display(),
+                private.display()
+            ),
         }
     }
 }

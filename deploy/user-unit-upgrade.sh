@@ -68,7 +68,8 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
   deploy/reconcile-inflight.sh inflight --restored FROM_CLI SOCK1 --newer TO_CLI SOCK2.
   It lists each consume root's .sparrow-inflight/ and moves every entry whose claim the
   restored catalog does not know back to its root under its original batch name, by a hard
-  link under that name and an unlink of the entry (same inode, bytes unchanged). Without this the daemon refuses to start with
+  link under that name and an unlink of the entry (same inode, bytes unchanged). Without
+  this the daemon refuses to start with
   "unrecognized private claim entry" (or "private claim directory exceeds its bounded journal
   registry"). Stop the restored query-only daemon, start sparrow.service, then run
   deploy/reconcile-inflight.sh missing --restored FROM_CLI SOCKET --newer TO_CLI SOCK2 for

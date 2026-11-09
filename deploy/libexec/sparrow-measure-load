@@ -27,7 +27,10 @@ run             Until SIGTERM: release the saved watch intake and re-send the
                 completed run as its timer does, and run status, records and
                 sparql at a fixed cadence. On SIGTERM no new call starts, calls
                 in flight finish, and it prints the MEASURE lines and writes a
-                JSON summary.
+                JSON summary. A worker that raises stops every worker: the
+                helper prints its traceback and the MEASURE lines, then exits
+                1 before SIGTERM, so verify-backup fails the run with
+                `FAIL load` instead of measuring without that load.
 count-records   Print the number of records the copy received at or after an
                 instant, read page by page.
 gates           Print one gate line per switch-gate threshold with its margin,
@@ -46,6 +49,7 @@ import sys
 import threading
 import time
 import tomllib
+import traceback
 from pathlib import Path
 
 PREFIX = "verify-backup: MEASURE"
@@ -396,15 +400,28 @@ def run(args):
                     log(f"sparrow-ship exited {done.returncode}; see its lines in ship.log")
                 stop.wait(args.ship_interval)
 
-    threads = [threading.Thread(target=traffic, args=(args, kind, calls, stop, log), daemon=True)
+    crashed = []
+
+    def worker(name, target, *target_args):
+        """A worker that raises must not leave the run measuring without its load: record it,
+        log its traceback and stop every worker, so the helper exits 1 early."""
+        def body():
+            try:
+                target(*target_args)
+            except BaseException:  # noqa: BLE001 - every failure must end the run, not the thread
+                with log_lock:
+                    crashed.append(name)
+                log(f"worker {name} failed:\n{traceback.format_exc().rstrip()}")
+                stop.set()
+        return threading.Thread(target=body, name=name, daemon=True)
+
+    threads = [worker(kind, traffic, args, kind, calls, stop, log)
                for kind in ("status", "records", "sparql")]
     watches = rows_of(work / "watch.tsv", 4)
     sockets = rows_of(work / "socket.tsv", 4)
-    threads.append(threading.Thread(target=replay, args=(watches, args.window, stop, release),
-                                    daemon=True))
-    threads.append(threading.Thread(target=replay, args=(sockets, args.window, stop, resend),
-                                    daemon=True))
-    threads.append(threading.Thread(target=ship, daemon=True))
+    threads.append(worker("watch-replay", replay, watches, args.window, stop, release))
+    threads.append(worker("socket-replay", replay, sockets, args.window, stop, resend))
+    threads.append(worker("ship", ship))
     for thread in threads:
         thread.start()
     while not stop.wait(1):
@@ -432,6 +449,8 @@ def run(args):
           f"ship_runs={counts['ship_runs']} ship_failures={counts['ship_failures']} "
           f"ship_held_back={len(held)} ship_run_max_seconds={counts['ship_run_max_seconds']:.3f}")
     Path(args.summary).write_text(json.dumps(summary))
+    if crashed:
+        fail(f"worker(s) {', '.join(crashed)} failed; the run lacks their load (traceback above)")
 
 
 def watch_intake(args, summary):

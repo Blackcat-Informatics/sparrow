@@ -488,7 +488,8 @@ fn private_tail_root_leaves_foreign_generations_alone() {
 /// INVARIANT: `sparrowd --private-intake DIR` refuses a DIR that is, holds or lies under a
 /// watch's configured root, so a hand run on a live intake directory never reaches the live
 /// roots, and a catalog persisted by a private daemon still names the configured roots, so a
-/// disposable copy never rewrites where its watches consume.
+/// disposable copy never rewrites where its watches consume. Two configured roots that would
+/// share one private root refuse the open rather than lose one on persist.
 #[test]
 fn private_intake_refuses_configured_roots_and_persists_them_unchanged() {
     let directory = tempfile::tempdir().unwrap();
@@ -537,6 +538,29 @@ fn private_intake_refuses_configured_roots_and_persists_them_unchanged() {
     catalog.persist(&store).unwrap();
     let reloaded = Catalog::load(&store, &[]).unwrap();
     assert_eq!(reloaded.watches()[0].definition.root, configured);
+
+    // Two configured roots with one final name would share a private root, and persisting
+    // would lose one of them, so the open refuses and names both.
+    let elsewhere = directory.path().join("elsewhere").join("events");
+    let mut second = definition(&elsewhere);
+    second.id = "elsewhere".into();
+    let fresh = directory.path().join("fresh");
+    std::fs::create_dir(&fresh).unwrap();
+    let data = fresh.join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(&fresh, &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut shared = Catalog::load(&store, &[definition(&configured), second]).unwrap();
+    let refusal = shared
+        .rebind_roots(|definition| intake.rebind(definition))
+        .unwrap_err()
+        .to_string();
+    for root in [&configured, &elsewhere] {
+        assert!(refusal.contains(&root.display().to_string()), "{refusal}");
+    }
 }
 
 /// INVARIANT: an existing configured root that is, by device and inode, the private directory,

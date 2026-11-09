@@ -7,10 +7,13 @@
 # made after the backup, and it still holds claims the newer daemon finished after it. Both
 # findings come from the schema 69 to 68 rollback of 2026-11-07 (#145). The newer store, set
 # aside by the rollback, answers what each claim was. Bytes are never discarded: an entry
-# goes back to its root under its original name by a link and an unlink, and a finished claim's bytes are
-# read back from the newer store and checked against their catalog digest before re-shipping.
+# goes back to its root under its original name by a link and an unlink, and a finished
+# claim's bytes are read back from the newer store and checked against their catalog digest
+# before re-shipping.
 set -euo pipefail
 umask 077
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 usage() {
     cat <<'USAGE'
@@ -48,11 +51,6 @@ claim stays pending until a schema 70 image retires it.
 USAGE
 }
 
-die() {
-    printf 'reconcile-inflight: %s\n' "$*" >&2
-    exit 1
-}
-
 (($# >= 1)) || { usage >&2; exit 2; }
 case $1 in
     -h | --help) usage; exit 0 ;;
@@ -70,13 +68,6 @@ while (($#)); do
 done
 [[ -n $RESTORED_CLI && -n $NEWER_CLI ]] || { usage >&2; exit 2; }
 [[ -x $RESTORED_CLI && -x $NEWER_CLI ]] || die "both CLI images must be executable"
-
-# Field of a JSON document on stdin, by key path; null prints as an empty line.
-json_field() {
-    python3 -I -c 'import json,sys; v=json.load(sys.stdin)
-for k in sys.argv[1:]: v=None if v is None else v[k]
-print("" if v is None else v)' "$@"
-}
 
 restored_status=$("$RESTORED_CLI" "$RESTORED_SOCKET" status) || die "the restored daemon did not answer status"
 newer_status=$("$NEWER_CLI" "$NEWER_SOCKET" status) || die "the newer daemon did not answer status"
@@ -137,8 +128,7 @@ if [[ $PHASE == inflight ]]; then
             [[ $name != .lock ]] || continue
             known=$(ingest_get "$RESTORED_CLI" "$RESTORED_SOCKET" "$name")
             if [[ -n $known ]]; then
-                printf 'reconcile-inflight: keep %s/%s: the restored store holds it (%s)\n' \
-                    "$watch" "$name" "$(json_field deletion <<<"$known")"
+                note "keep $watch/$name: the restored store holds it ($(json_field deletion <<<"$known"))"
                 kept=$((kept + 1))
                 continue
             fi
@@ -151,11 +141,11 @@ if [[ $PHASE == inflight ]]; then
             ln -- "$entry" "$target" || die "cannot restore $entry to $target (it may exist already)"
             rm -- "$entry"
             sync -f -- "$root"
-            printf 'reconcile-inflight: moved %s/%s back to %s\n' "$watch" "$name" "$target"
+            note "moved $watch/$name back to $target"
             moved=$((moved + 1))
         done
     done
-    printf 'reconcile-inflight: inflight moved=%d kept=%d\n' "$moved" "$kept"
+    note "inflight moved=$moved kept=$kept"
     exit 0
 fi
 
@@ -197,19 +187,17 @@ print(a["artifact_id"], a["payload_id"], a["byte_length"])' <<<"$newer") \
     mv -T --no-clobber -- "$work/bytes" "$target"
     [[ ! -e $work/bytes ]] || die "$target appeared while re-shipping; the bytes stay in $work"
     rmdir -- "$work"
-    printf 'reconcile-inflight: re-shipped %s of %s/%s (%s bytes, %s) as %s\n' \
-        "$artifact" "$watch" "$claim" "$length" "$payload" "$target"
+    note "re-shipped $artifact of $watch/$claim ($length bytes, $payload) as $target"
     reshipped=$((reshipped + 1))
     reason="published after the restored backup as $artifact by the newer store; its bytes were re-shipped as ${target##*/}"
     if ((retire == 0)); then
-        printf 'reconcile-inflight: %s stays pending: the restored image has no "watch retire-claim" (its watch usage: %s)\n' \
-            "$claim" "$watch_usage" >&2
+        note "$claim stays pending: the restored image has no \"watch retire-claim\" (its watch usage: $watch_usage)" >&2
         unretired=$((unretired + 1))
         continue
     fi
     err=$("$RESTORED_CLI" "$RESTORED_SOCKET" watch retire-claim "$watch" "$claim" "$reason" 2>&1 >/dev/null) \
         || die "retiring $claim failed: $err"
-    printf 'reconcile-inflight: retired %s/%s\n' "$watch" "$claim"
+    note "retired $watch/$claim"
 done
-printf 'reconcile-inflight: missing reshipped=%d unretired=%d\n' "$reshipped" "$unretired"
+note "missing reshipped=$reshipped unretired=$unretired"
 ((unretired == 0)) || exit 3

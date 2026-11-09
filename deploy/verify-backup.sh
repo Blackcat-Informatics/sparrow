@@ -310,12 +310,6 @@ backup_config() {
     sed -n -e '/^\[/q' -e "s/^$1 *= *\"\\{0,1\\}\\([^\"#]*[^\" #]\\)\"\\{0,1\\}.*/\\1/p" \
         "$BACKUP/config/server.toml" | head -n 1
 }
-# Field of a JSON document on stdin, by key path.
-json_field() {
-    python3 -I -c 'import json,sys; v=json.load(sys.stdin)
-for k in sys.argv[1:]: v=v[int(k)] if isinstance(v,list) else v[k]
-print(json.dumps(v) if isinstance(v,(dict,list,bool)) or v is None else v)' "$@"
-}
 # The status counts field: pending while the store counters seed, else exact. An image older
 # than schema 70 reports none; its counts are exact.
 status_counts() {
@@ -566,7 +560,7 @@ if ((WITH_TRAFFIC)); then
                 BACKUP_COUNTS=exact BACKUP_COUNT_SOURCE=backup-image
             fi
         else
-            printf 'verify-backup: the backup image %s is missing or has no --query-only; its record count comes from the first status\n' "$recorded_daemon"
+            printf 'verify-backup: the backup image %s is missing or has no --query-only; its record count comes from the query-only prep status when exact, otherwise it is pending\n' "$recorded_daemon"
         fi
     fi
     spawn "$PREP/daemon.log" --config "$PREP/server.toml" --query-only
@@ -968,7 +962,7 @@ print(sum(int(w["completed_claims"]) - first.get(w["id"], 0) for w in json.load(
     # Retention runs in a writable copy, so its closing count need not equal SOURCE's.
     grep -Eq "^sparrowd: closed store=$store unique_payload_chunks=[0-9]+\$" -- "$LOG" \
         || fail shutdown "the daemon did not log its closing count"
-    pass shutdown "the daemon stopped cleanly; removing $SCRATCH"
+    pass shutdown "the daemon stopped cleanly; $SCRATCH is removed when the run ends"
     ((REHEARSE == 0)) || rehearse_rollback
     if ((gate_failed)); then
         printf 'verify-backup: migration of %s measured; the switch gate FAILED\n' "$BACKUP" >&2

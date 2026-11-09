@@ -413,17 +413,54 @@ impl Catalog {
     }
     /// Rebind every definition in memory, as `sparrowd --private-intake` does before any root
     /// opens; REBIND returns the configured root it replaced. A later mutation persists the
-    /// configured roots, never the rebound ones.
-    pub(crate) fn rebind_roots<E>(
+    /// configured roots, never the rebound ones. Two configured roots with one final name
+    /// would share a private root and only one of them could be persisted, so that refuses
+    /// the open and names both.
+    pub(crate) fn rebind_roots(
         &mut self,
-        mut rebind: impl FnMut(&mut ConsumeWatch) -> Result<std::path::PathBuf, E>,
-    ) -> Result<(), E> {
+        mut rebind: impl FnMut(&mut ConsumeWatch) -> Result<std::path::PathBuf, Error>,
+    ) -> Result<(), Error> {
         for watch in &mut self.state.watches {
             let configured = rebind(&mut watch.definition)?;
-            self.configured
-                .insert(watch.definition.root.clone(), configured);
+            let private = watch.definition.root.clone();
+            if let Some(other) = self.configured.get(&private)
+                && *other != configured
+            {
+                return Err(Error::PrivateRootShared {
+                    first: other.clone(),
+                    second: configured,
+                    private,
+                });
+            }
+            self.configured.insert(private, configured);
         }
         Ok(())
+    }
+    /// Refuse a put of watch ID whose rebound root PRIVATE another watch already holds for a
+    /// different configured root: the two would consume one private root, and persisting
+    /// would lose one configured root.
+    pub(crate) fn admit_private_root(
+        &self,
+        id: &str,
+        private: &std::path::Path,
+        configured: &std::path::Path,
+    ) -> Result<(), sparrow_core::Error> {
+        let held = self
+            .state
+            .watches
+            .iter()
+            .any(|watch| watch.definition.id != id && watch.definition.root == private);
+        match self.configured.get(private) {
+            Some(other) if held && other != configured => Err(failure(
+                "INVALID_ARGUMENT",
+                Error::PrivateRootShared {
+                    private: private.to_owned(),
+                    first: other.clone(),
+                    second: configured.to_owned(),
+                },
+            )),
+            _ => Ok(()),
+        }
     }
     /// Record that PRIVATE replaced CONFIGURED for a put; returns the previous record.
     pub(crate) fn remember_root(

@@ -1209,12 +1209,21 @@ async fn run(
                     let rebound = match (&control.private, &mut action) {
                         (Some(intake), Action::Put { definition, .. }) => intake
                             .rebind(definition)
-                            .map(|configured| Some((definition.root.clone(), configured)))
                             .map_err(|error| {
                                 AdminFailure::Refused(watch_admin::failure(
                                     "INVALID_ARGUMENT",
                                     error,
                                 ))
+                            })
+                            .and_then(|configured| {
+                                catalog
+                                    .admit_private_root(
+                                        &definition.id,
+                                        &definition.root,
+                                        &configured,
+                                    )
+                                    .map_err(AdminFailure::Refused)?;
+                                Ok(Some((definition.root.clone(), configured)))
                             }),
                         _ => Ok(None),
                     };

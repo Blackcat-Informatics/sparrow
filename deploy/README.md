@@ -28,11 +28,13 @@ lives.
 | `start.sh`, `stop.sh`, `restart.sh` | The lifecycle scripts; `restart.sh --rollback` swaps back. |
 | `check.sh` | Post-deploy verification. |
 | `test-instance.sh` | A disposable unprivileged test instance for rehearsing the scripts. |
+| `verify-backup.sh` | Verifies a closed-store backup on a reflinked copy, and measures the online migration on it (`--measure-migration`), with replayed intake and query traffic under `--with-traffic`. |
+| `reconcile-inflight.sh` | Reconciles consume claims after a rollback restores an older store (`docs/deployment.md`, "Claims after a rollback"). |
 | `lib.sh` | Code shared by the scripts above. |
 | `systemd/` | `sparrow.service`, `sparrow-ship.{service,timer}`, `sparrow-backup.{service,timer}`. |
 | `apparmor/sparrow` | The daemon's AppArmor profile, enforce mode. |
 | `config/` | Templates: server, shipper, watch, sysusers and tmpfiles configuration. |
-| `libexec/` | `sparrow-ship` (the shipper) and `sparrow-backup` (closed-store backups). |
+| `libexec/` | `sparrow-ship` (the shipper), `sparrow-backup` (closed-store backups) and `sparrow-measure-load` (the replay and traffic load of `verify-backup.sh --with-traffic`). |
 | `evidence/` | Verification records for this deployment (security exposure, rehearsal, lifecycle, AppArmor, credentials). |
 
 The units are the source of truth. The scripts are thin wrappers over them

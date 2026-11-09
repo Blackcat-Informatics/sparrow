@@ -632,7 +632,7 @@ The extra `MEASURE` lines:
 | `live_records=N counts=exact\|pending` | The copy's record count at the end, replay included |
 | `watch_claims_completed=N` | Claims the copy's watches completed since the first status |
 | `watch_claims_refused=N` | Claim reservations the daemon refused (`reservation refused` lines in its log) |
-| `watch_intake watch=NAME via=ship\|direct released=N due=N completed=N inflight_allowance_seconds=S` | Per watch: the items released to it, those released before the final status less its in-flight allowance (due), and the claims it completed since the first status |
+| `watch_intake watch=NAME via=ship\|direct\|none released=N due=N completed=N inflight_allowance_seconds=S` | Per watch: the items released to it, those released before the final status less its in-flight allowance (due), and the claims it completed since the first status; `via=none` is a watch the window gave nothing to replay, so its due count is 0 |
 | `rpc kind=KIND calls=N failed=N over_60s=N p50=S p95=S max=S` | Latency of `status`, `records`, `sparql` and the replayed `ingest` calls |
 | `replayed via=watch\|socket source=NAME released=N failed=N` | Per source, the items released into a root or the shipper, or sent to the socket |
 | `replay watch_items_released=N release_failures=N socket_ingests=N cycles=N ship_runs=N ship_failures=N ship_held_back=N ship_run_max_seconds=S` | What the replay did; `ship_held_back` counts the distinct items a shipper run left queued because the roots were over `max_pending_bytes` |
@@ -703,7 +703,9 @@ fails it prints one `verify-backup: FAIL gate:` line per failed gate on
 standard error and exits 4. The failures of the plain mode still exit 1, and
 so do `FAIL prep`, when the replay cannot be prepared, `FAIL private-intake`,
 and `FAIL load`, when the load helper fails or exits before the backfill
-completes (it is checked at every poll). `SPARROW_MEASURE_GATE_FIRST_STATUS_SECONDS`,
+completes (it is checked at every poll). A load worker (one traffic kind, a
+replay or the shipper) that raises stops the helper, which exits 1, so the run
+never measures without that load. `SPARROW_MEASURE_GATE_FIRST_STATUS_SECONDS`,
 `SPARROW_MEASURE_GATE_RPC_SECONDS`,
 `SPARROW_MEASURE_GATE_PAGES_PER_SECOND` and
 `SPARROW_MEASURE_GATE_INFLIGHT_SECONDS`, a ceiling on each watch's in-flight

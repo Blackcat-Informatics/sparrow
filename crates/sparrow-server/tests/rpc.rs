@@ -5520,7 +5520,7 @@ fn verify_backup_traffic_measurement_replays_privately_and_rehearses_the_rollbac
             std::fs::metadata(&produced).unwrap().modified().unwrap()
         ),
         produced_before,
-        "the producer's file is only read"
+        "the producer's file is untouched: the replay reads the copy's catalog, never a producer directory"
     );
     assert_eq!(
         std::fs::read_dir(&live_data).unwrap().count(),
@@ -5614,7 +5614,8 @@ fn verify_backup_traffic_measurement_fails_on_each_gate_breach() {
     let intake = "verify-backup: MEASURE watch_intake watch=replayed via=ship ";
     assert_eq!(measure_value(&stdout, intake, "due"), 1, "{stdout}");
     assert_eq!(measure_value(&stdout, intake, "completed"), 0, "{stdout}");
-    // Two backup records, the direct producer's and the watch's.
+    // Four backup records: the fixture's two, and the direct producer's and the watch's
+    // artifacts in the window.
     assert!(
         stdout.contains(
             "verify-backup: MEASURE backup_live_records=4 counts=exact source=backup-image"

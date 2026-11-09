@@ -535,7 +535,9 @@ holds it: rebinding would then reach that root itself, or put the private
 roots inside a root another daemon consumes. Paths are compared canonically,
 and a configured root present on the host is also compared by device and
 inode with `DIR`, its ancestors and `DIR/NAME`, so a bind mount or other alias
-of the root is refused too. Never point `DIR` at a live
+of the root is refused too. Two configured roots with one final component
+would share a private root, so they refuse the open, or the put with
+`INVALID_ARGUMENT`, naming both. Never point `DIR` at a live
 intake directory or its parent; the refusal covers the configured roots
 only, so use a fresh scratch directory. The rebinding is held in memory: a
 later watch mutation persists the configured roots, never the private ones,
