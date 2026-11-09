@@ -172,6 +172,13 @@ pub fn catalog_db(path: &std::path::Path) -> Result<rocksdb::DB, rocksdb::Error>
     rocksdb::DB::open_cf(&options, path, columns)
 }
 
+/// Leave a closed store's source timeline cache as an image before #149 leaves it once its
+/// open began clearing the cache: without its generation marker. The next open resets the
+/// cache and the online `source-context` migration rebuilds it.
+pub fn stale_source_context_cache(db: &rocksdb::DB) -> Result<(), rocksdb::Error> {
+    db.delete("source-context-v1:!generation")
+}
+
 /// Return a closed current store to the state its first schema 69 open leaves before any
 /// online migration page: writers fenced, the owner-to-graph index empty with its build at
 /// the start, and every record metadata graph without its receipt-time fallback facts, with

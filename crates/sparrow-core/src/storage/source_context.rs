@@ -1,15 +1,26 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! Session-rebuilt source timeline cache over the authoritative record/time catalog.
+//! Generation-marked source timeline cache over the authoritative record/time catalog.
 
-use super::{Error, Record, Writer, catalog_upgrade, integer, parse, read_field};
+use super::{Error, Record, Writer, catalog_upgrade, integer, parse, read_field, store_counters};
 use rocksdb::{DB, WriteBatch};
 use std::collections::BTreeMap;
 
 const PREFIX_STR: &str = "source-context-v1:";
 const PREFIX: &[u8] = PREFIX_STR.as_bytes();
+/// The first key after the family: `;` follows the prefix's final `:`.
+const FAMILY_END: &[u8] = b"source-context-v1;";
+/// Cache generation marker. Bump [`GENERATION`] when the cache's meaning changes; any other
+/// value, or none, resets the cache at open.
+const GENERATION_KEY: &str = "source-context-v1:!generation";
+const GENERATION: &[u8] = b"1";
+// INVARIANT: the marker sorts before every cache entry (`!` precedes the hex source
+// hashes), so a preceding binary's key-order clear deletes it in its first batch.
+const _: () = assert!(GENERATION_KEY.as_bytes()[PREFIX_STR.len()] < b'0');
 const FAILURE: &str = "source-context-cache-failure";
+/// The rebuild migration's checkpoint.
+pub(super) const CHECKPOINT: &str = JOB.checkpoint;
 const SCRATCH_BYTES: usize = 32 * 1024 * 1024;
 const METADATA_BYTES: usize = 32 * 1024 * 1024;
 const JOB: catalog_upgrade::Job = catalog_upgrade::Job {
@@ -91,41 +102,79 @@ fn publish(
     Ok(())
 }
 
-/// This cache is not a catalog format or a writer fence. Rebuilding every open
-/// permits preceding binaries to write authoritative rows without stale answers.
-/// Cold reconstruction uses the shared finite catalog pager, never a resident corpus.
-pub(super) fn rebuild(db: &DB) -> Result<(), Error> {
-    loop {
-        let mut batch = WriteBatch::default();
-        let mut count = 0;
-        for entry in db.prefix_iterator(PREFIX).take(512) {
-            let (key, _) = entry?;
-            if !key.starts_with(PREFIX) {
-                break;
-            }
-            batch.delete(&key);
-            count += 1;
-        }
-        if count == 0 {
-            break;
-        }
-        catalog_upgrade::commit(db, batch)?;
+/// Fence the cache at open: keep it when its generation marker is current, it carries no
+/// latched reconstruction failure and its checkpoint decodes; otherwise stage one reset into
+/// `batch`.
+///
+/// [`update`] maintains the cache in the same atomic batch as every catalog write, so a
+/// crash cannot leave it stale. Every binary that wrote this store before the marker
+/// existed rebuilt the cache on each open by point-deleting its prefix in key order; its
+/// first deletion batch removes the marker, which sorts first. A cache such a binary
+/// touched, or left half cleared, therefore has no marker and is reset here.
+///
+/// The reset is one range deletion of the whole family, never a point tombstone per key,
+/// and it seeds the `source-context` online migration, which the maintenance worker pages
+/// through the writer. Until it completes [`ready`] refuses context reads retryably.
+pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
+    let checkpoint = db.get(CHECKPOINT)?;
+    let intact = db.get_pinned(GENERATION_KEY)?.as_deref() == Some(GENERATION)
+        && db.get_pinned(FAILURE)?.is_none()
+        && catalog_upgrade::read_progress(CHECKPOINT, |_| Ok(checkpoint)).is_ok();
+    if intact {
+        return Ok(());
     }
-    let mut batch = WriteBatch::default();
-    batch.delete(JOB.checkpoint);
+    batch.delete_range(PREFIX, FAMILY_END);
     batch.delete(FAILURE);
-    catalog_upgrade::commit(db, batch)?;
-    let mut batch = WriteBatch::default();
-    catalog_upgrade::seed(db, &JOB, &mut batch)?;
-    catalog_upgrade::commit(db, batch)?;
-    match catalog_upgrade::run(db, &JOB, None) {
+    batch.put(GENERATION_KEY, GENERATION);
+    let progress = catalog_upgrade::Progress {
+        after: None,
+        complete: !super::any_key(db, JOB.source.as_bytes())?,
+    };
+    super::put(batch, CHECKPOINT, &progress);
+    store_counters::reset(batch, store_counters::Counter::SourceContextDone);
+    Ok(())
+}
+
+/// Stage one rebuild page with its checkpoint, and whether the rebuild is complete after
+/// it; `None` when it was already complete or latched a failure. A page that finds corrupt
+/// record metadata latches the failure durably instead, so the worker stops retrying and
+/// context reads refuse until a reopen resets the cache.
+pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
+    if db.get_pinned(FAILURE)?.is_some() {
+        return Ok(None);
+    }
+    let progress = catalog_upgrade::progress(db, &JOB)?;
+    if progress.complete {
+        return Ok(None);
+    }
+    match catalog_upgrade::page(db, &JOB, progress, JOB.page_entries) {
         Err(error) if error.code == "CONTEXT_CATALOG_INVALID" => {
             let mut batch = WriteBatch::default();
             batch.put(FAILURE, error.message.as_bytes());
-            catalog_upgrade::commit(db, batch)
+            Ok(Some((batch, false)))
         }
-        result => result,
+        result => result.map(Some),
     }
+}
+
+/// Whether the rebuild still has pages to run: incomplete and no latched failure.
+pub(super) fn pending(db: &DB) -> Result<bool, Error> {
+    Ok(db.get_pinned(FAILURE)?.is_none() && !catalog_upgrade::progress(db, &JOB)?.complete)
+}
+
+/// The rebuild's status watermark, absent once complete, from any reader.
+pub(super) fn watermark(
+    read: impl FnOnce(&str) -> Result<Option<Vec<u8>>, Error>,
+) -> Result<Option<String>, Error> {
+    let progress = catalog_upgrade::read_progress(CHECKPOINT, read)?;
+    Ok((!progress.complete).then(|| progress.after.unwrap_or_else(|| "start".to_owned())))
+}
+
+/// The durably latched reconstruction failure, if any, from any reader.
+pub(super) fn latched_failure(
+    read: impl FnOnce(&str) -> Result<Option<Vec<u8>>, Error>,
+) -> Result<Option<String>, Error> {
+    Ok(read(FAILURE)?.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn reconstruction_charge(bytes: &[u8]) -> Result<usize, Error> {
@@ -147,7 +196,15 @@ pub(super) fn ready(writer: &Writer) -> Result<(), Error> {
             "source context reconstruction found corrupt record metadata; repair the authoritative catalog and reopen before requesting context",
         ));
     }
-    Ok(())
+    match watermark(|key| Ok(writer.db.get(key)?))? {
+        None => Ok(()),
+        Some(watermark) => Err(Error::new(
+            "INDEX_NOT_READY",
+            format!(
+                "context reads the source timeline cache, which the online migration source-context is still rebuilding (watermark {watermark}); retry once status.migrations reports it complete"
+            ),
+        )),
+    }
 }
 
 #[derive(Default)]

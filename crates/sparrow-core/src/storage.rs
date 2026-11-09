@@ -520,6 +520,40 @@ pub struct Store {
     /// Runs while a source listing reads its snapshot without the writer lock.
     #[cfg(feature = "test-support")]
     source_read_pause: Arc<Mutex<Option<source_read::Pause>>>,
+    open_phases: Arc<[OpenPhase]>,
+}
+
+/// Wall time of one phase of [`Store::open`], in the order the open ran them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenPhase {
+    /// Stable phase name.
+    pub name: &'static str,
+    /// Wall time the phase took.
+    pub elapsed: std::time::Duration,
+}
+
+/// Records consecutive open phases: each lap ends the previous phase.
+struct OpenTimer {
+    phases: Vec<OpenPhase>,
+    mark: std::time::Instant,
+}
+
+impl OpenTimer {
+    fn start() -> Self {
+        Self {
+            phases: Vec::with_capacity(8),
+            mark: std::time::Instant::now(),
+        }
+    }
+
+    fn lap(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases.push(OpenPhase {
+            name,
+            elapsed: now - self.mark,
+        });
+        self.mark = now;
+    }
 }
 
 struct ReadLeaseStats {
@@ -1357,6 +1391,7 @@ impl Store {
 
     /// Open a single-writer RocksDB store with an explicit disk budget.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
+        let mut timer = OpenTimer::start();
         config.validate()?;
         let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
         let open_files = open_files::OpenFiles::from_process()?;
@@ -1365,6 +1400,7 @@ impl Store {
             path,
             table_options::descriptors(),
         )?;
+        timer.lap("rocksdb");
         source_time::validate_log_fence(&db)?;
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
         let rdf_fingerprint = rdf_index::profile_identity()?;
@@ -1463,6 +1499,7 @@ impl Store {
                 ));
             }
         };
+        timer.lap("identity");
         rdf_index::upgrade_reverse(&db)?;
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
@@ -1470,8 +1507,11 @@ impl Store {
         artifact_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         provenance_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
         tracing_rdf::upgrade(&db, config.disk_budget, config.maintenance_reserve)?;
-        // Schema 69's backfills run online, one page per maintenance admission.
+        timer.lap("upgrades");
+        // Schema 69's backfills and a stale source-context cache's rebuild run online, one
+        // page per maintenance admission.
         migration::fence(&db)?;
+        timer.lap("migration_fence");
         let archive = archive::open(&db, config.archive.as_ref())?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(
@@ -1484,8 +1524,10 @@ impl Store {
             // synchronization below makes it durable.
             db.put("rdf_profile", &rdf_fingerprint)?;
         }
+        timer.lap("archive");
         // Recovered buffered writes are certified only after a real synchronization.
         db.flush_wal(true)?;
+        timer.lap("wal_sync");
         let durability = writer_queue::Observed::new(durability::State::new(
             random_id("session")?,
             db.latest_sequence_number(),
@@ -1493,10 +1535,10 @@ impl Store {
         manifest_retire::features(&db)?;
         let pressure = writer_queue::Observed::new(pressure::State::load(&db)?);
         let recompression = writer_queue::Observed::new(recompression::State::load(&db)?);
-        source_context::rebuild(&db)?;
+        timer.lap("state");
         let db = Arc::new(db);
         let query_staging = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let store = Self {
+        let mut store = Self {
             id: Arc::from(id.as_str()),
             open_files,
             space: space.clone(),
@@ -1535,13 +1577,23 @@ impl Store {
             sparql_reads: Arc::new(Mutex::new(rdf_view::pages::Reads::default())),
             #[cfg(feature = "test-support")]
             source_read_pause: Arc::new(Mutex::new(None)),
+            open_phases: Arc::new([]),
         };
         let writer = store.lock()?;
         producer_stream::registry(&writer)?;
         receiver_stream::registry(&writer)?;
         tail::registry(&writer)?;
         drop(writer);
+        timer.lap("registries");
+        store.open_phases = timer.phases.into();
         Ok(store)
+    }
+
+    /// Wall time of each phase of the open that produced this store, in order. A stale
+    /// source-context cache is reset inside `migration_fence` and rebuilt online afterwards.
+    #[must_use]
+    pub fn open_phases(&self) -> &[OpenPhase] {
+        &self.open_phases
     }
 
     /// Return the immutable identity validated at open, without waiting for a writer.

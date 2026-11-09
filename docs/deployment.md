@@ -470,8 +470,10 @@ verifiable: the script runs every other check and exits 3, which is not verified
 ### Measure the online migration
 
 `deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP` measures
-the online migrations, the schema 69 pair and `source-summary` ("Online store
-migrations" and "Per-source counters and artifact index" in the interfaces)
+the online migrations, the schema 69 pair, `source-summary` and, when the open
+found the source timeline cache stale, `source-context` ("Online store
+migrations", "Per-source counters and artifact index" and "Single context
+capture admission" in the interfaces)
 on a writable reflinked copy of the backup's store below `SPARROW_VERIFY`
 (default `/SPARROW/verify`). The switch gate is a first open under 10 minutes
 measured this way. The copy has its own socket, and its scratch configuration

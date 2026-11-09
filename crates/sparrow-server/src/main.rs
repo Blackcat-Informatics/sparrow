@@ -111,6 +111,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let store = config.open_store()?;
+    let phases = store.open_phases();
+    eprintln!(
+        "sparrowd: store_open_ms {} total={}",
+        phases
+            .iter()
+            .map(|phase| format!("{}={}", phase.name, phase.elapsed.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        phases
+            .iter()
+            .map(|phase| phase.elapsed)
+            .sum::<std::time::Duration>()
+            .as_millis()
+    );
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let operation_slots = u32::try_from(config.max_concurrent_requests)?;

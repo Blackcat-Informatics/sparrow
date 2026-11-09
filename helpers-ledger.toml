@@ -367,9 +367,9 @@ names = ['^(stream_record_summary|snapshot_record_summary)$']
 
 [[job]]
 id = "source-context-timeline-cache"
-summary = "One derived source timeline is rebuilt through the shared bounded catalog pager on every open and maintained atomically with authoritative record/time publication; context uses one indexed reader, never a global-scan fallback."
+summary = "One derived source timeline is maintained atomically with authoritative record/time publication; an open resets it with one range deletion only when its generation marker shows it stale, and the source-context online migration rebuilds it through the shared bounded catalog pager while context refuses INDEX_NOT_READY; context uses one indexed reader, never a global-scan fallback."
 home = "sparrow_core::storage::source_context::update"
-entry_points = ["sparrow_core::storage::source_context::rebuild", "sparrow_core::storage::source_context::indexed", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::source_context::hashed_prefix", "sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::context::Store::records_context"]
+entry_points = ["sparrow_core::storage::source_context::fence", "sparrow_core::storage::source_context::page", "sparrow_core::storage::source_context::ready", "sparrow_core::storage::source_context::indexed", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::source_context::hashed_prefix", "sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::context::Store::records_context"]
 spec = "docs/interfaces.md: source-indexed context capture."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []

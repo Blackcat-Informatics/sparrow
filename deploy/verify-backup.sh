@@ -14,8 +14,9 @@
 # or holds a symlink leading outside the backup, and refuses any scratch path that resolves under
 # the live store, socket, intake or the backup.
 #
-# With --measure-migration it instead measures the online migrations (schema 69 and
-# source-summary) on a writable copy (docs/deployment.md, "Measure the online migration"): the
+# With --measure-migration it instead measures the online migrations (schema 69,
+# source-summary and, when the open found the source timeline cache stale, source-context) on a
+# writable copy (docs/deployment.md, "Measure the online migration"): the
 # image opens the copy with `sparrowd --no-intake` (maintenance runs; no watch root, ingest
 # socket, TCP listener or archive is opened) under a systemd user scope with the service unit's
 # CPU, IO and memory limits, and the script logs machine-greppable `MEASURE` lines until status
