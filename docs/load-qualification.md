@@ -436,8 +436,8 @@ follow the online migration criterion of #18 replaces that target: the open
 fences the store and serves at once, and the `source-summary` migration runs in
 the maintenance duty afterwards (see "Per-source counters and artifact index"
 in the [interfaces](interfaces.md)). Its duration is measured with
-`deploy/verify-backup.sh --measure-migration` on a copy of the newest
-closed-store backup, which reports `backfill_seconds`, done/total progress and
+`deploy/verify-backup.sh --measure-migration` on a copy restored from the
+newest online backup, which reports `backfill_seconds`, done/total progress and
 `live_records`.
 
 That measurement is pending: it has not been run on the newest backup, so no

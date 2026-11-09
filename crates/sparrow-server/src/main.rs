@@ -15,7 +15,25 @@ mod shutdown;
 const SPACE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Also the contract `deploy/verify-backup.sh` reads to tell an image with query-only mode
 /// and, for its migration measurement, an image with `--no-intake`.
-const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only | --no-intake]";
+const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only | --no-intake] | sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID] EMPTY_DIR";
+
+/// Restore an online backup into an empty directory, offline: no daemon, socket or store opens.
+fn restore_backup(
+    root: &str,
+    id: Option<&str>,
+    target: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id = id
+        .map(|id| {
+            id.parse::<u32>()
+                .map_err(|_| format!("backup id {id} is not a number"))
+        })
+        .transpose()?;
+    let restored = sparrow_core::restore_backup(Path::new(root), id, Path::new(target))
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    eprintln!("sparrowd: restored backup {restored} from {root} into {target}");
+    Ok(())
+}
 
 /// How often the serving loop checks that every worker it started is still running.
 const WORKER_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -64,6 +82,8 @@ async fn worker_health(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let (path, mode) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--restore-backup", root, target] => return restore_backup(root, None, target),
+        ["--restore-backup", root, id, target] => return restore_backup(root, Some(id), target),
         ["--config", path] => (path, None),
         ["--config", path, mode @ ("--query-only" | "--no-intake")]
         | [mode @ ("--query-only" | "--no-intake"), "--config", path] => (path, Some(mode)),
@@ -231,6 +251,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_syslog(syslog_registry);
     if let Some((_, socket)) = &ingest {
         rpc = rpc.with_ingest_socket(socket.clone());
+    }
+    // Only the daemon serving the live intake backs up; a query-only one refuses at its write
+    // gate, and a no-intake one serves a copy.
+    if !intake {
+        rpc = rpc.without_backup_for_no_intake();
+    } else if !config.query_only
+        && let Some(target) = config.backup_target()?
+    {
+        rpc = rpc.with_backup(target);
     }
     if config.query_only {
         rpc = rpc.query_only();
