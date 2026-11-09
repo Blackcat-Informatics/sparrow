@@ -26,6 +26,9 @@ pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,
     ArtifactSummary,
 };
+pub use storage::backup::{
+    BackupPhase, BackupStatus, BackupTarget, NETWORK_FILESYSTEMS, restore as restore_backup,
+};
 pub use storage::catalog_lease::CatalogReadPage;
 pub use storage::consumption::{
     ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, ConsumptionRetirement,

@@ -10,7 +10,8 @@
 #
 # It leaves in place, and says so: /etc/sparrow (configuration and the secret's copy), the sparrow
 # user and group and their sysusers entry, the installed images, helpers, lexicons and documents,
-# /SPARROW/ship and /SPARROW/backups. It never starts or stops a unit: stop them first.
+# /SPARROW/ship and the backups on the NAS (/net/synology/archives/sparrow). It never starts or
+# stops a unit: stop them first.
 #
 # Run as root. With SPARROW_DESTDIR=DIR it removes the staged files under DIR instead and prints
 # each step that would change the running host (systemd, AppArmor, ownership, ACLs).
@@ -138,4 +139,4 @@ fi
 
 report_changes
 note "kept: /etc/sparrow, the sparrow user and group (/etc/sysusers.d/sparrow.conf), the images, \
-helpers, lexicons and documents under $PREFIX, /SPARROW/ship and /SPARROW/backups"
+helpers, lexicons and documents under $PREFIX, /SPARROW/ship and the backups under $SPARROW_BACKUPS"

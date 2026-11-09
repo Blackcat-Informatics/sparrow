@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
 # Switch the operator's old user unit sparrow.service from one kept image pair to another, with
-# the named pre-upgrade backup of the closed store taken in the stopped window. It serves until
+# the named pre-upgrade backup taken online through the running daemon before anything stops
+# (Patrick, 2026-11-08: no backup may stop the server). --no-backup REASON switches without one
+# when the running daemon has no online backup (coordination D147: the schema 68 to 70 switch). It serves until
 # Sparrow issue #22 moves the store to the system unit, whose scripts (restart.sh,
 # pre-upgrade-backup.sh) refuse the user unit. Ported from the operator's restart-bundle.sh; its
 # predecessor restart-schema68.sh ran clean on the live host on 2026-11-07 (exit 0, 180 s down).
@@ -13,42 +15,59 @@ umask 077
 
 usage() {
     cat <<'USAGE'
-Usage: deploy/user-unit-upgrade.sh --from DAEMON_IMAGE --to DAEMON_IMAGE
+Usage: deploy/user-unit-upgrade.sh --from DAEMON_IMAGE --to DAEMON_IMAGE [--no-backup REASON]
 
 Switch the user unit sparrow.service (systemctl --user) from the kept daemon image --from to
 --to, both names under the libexec directory such as sparrowd-schema68-2aa56a9 and
 sparrowd-schema69-3a64e08. Each CLI image is the daemon's name with sparrowd- replaced by
 sparrow-; the schema numbers come from the names. Run as the operator, never as root.
 
-Before anything changes it refuses unless: BACKUPS/pre-upgrade-FROM (and .partial) is absent;
-the daemon link names --from; all four images are executable; the --to pair is byte-identical
-to the kept pair in SPARROW_BIN; the --to daemon carries cap_net_bind_service (getcap: a human
-with root runs setcap, this script never does); server.toml sets the ingest keys; the store has
-copy-on-write off; the backups directory is on the store's filesystem, which has the store's
-size plus 10 GiB free; the unit's drop-in directory holds no .conf but an identical
-limits.conf (deploy/systemd/user/sparrow.service.d); no nightly backup is running; and the
-running daemon reports the --from schema. Then it stops both timers and waits for the shipper,
-stops the unit, takes the named pre-upgrade backup, installs limits.conf (LimitNOFILE=65536, the
-store refuses to open below 2048) with daemon-reload and checks the unit's LimitNOFILESoft,
+Before anything changes it refuses unless: BACKUPS/pre-upgrade-FROM is absent; the daemon link
+names --from; all four images are executable; the --to pair is byte-identical to the kept pair
+in SPARROW_BIN; the --to daemon carries cap_net_bind_service (getcap: a human with root runs
+setcap, this script never does); server.toml sets the ingest keys and backup_root equals
+SPARROW_BACKUPS (with --no-backup too, so TO starts with its online backup; add the keys
+immediately before the run, since a FROM image without them refuses to start with them, and
+remove them before any rollback to such an image); the store has copy-on-write off; the unit's drop-in directory holds no .conf
+but an identical limits.conf (deploy/systemd/user/sparrow.service.d); no nightly backup is
+running; the running daemon reports the --from schema; and, without --no-backup, the running
+daemon reports an online backup configured (its status has a backup state other than
+unconfigured). Then, with the daemon serving, it takes the named pre-upgrade backup online
+(SPARROW_PREFIX/libexec/sparrow/sparrow-backup: the daemon copies its store into backup_root and
+the script records the set beside it) and points BACKUPS/pre-upgrade-FROM at that set. Only then
+does it stop both timers and wait for the shipper, stop the unit, install limits.conf
+(LimitNOFILE=65536, the store refuses to open below 2048) with daemon-reload and check the unit's
+LimitNOFILESoft,
 switches the links, starts the unit, waits up to
 600 s for the first status answer, checks the store identity and the --to schema, prints the
 migrations, watches and ingest socket, and starts the timers again. It exits 0 without waiting
 for the online backfill, which continues in the running daemon; watch it with
 "sparrow SOCKET status" (migrations) and journalctl --user -u sparrow.service.
 
+--no-backup REASON  switch without a pre-upgrade backup, for a running daemon that has no online
+                    backup (an image older than the backup operation, such as schema 68). REASON
+                    is required and must not be empty; the run logs it prominently. A stopped
+                    copy is never taken instead: no backup may stop the server. Without a backup
+                    a rollback can only go forward: there is no store to restore FROM's format
+                    from, so fix forward on TO. Take the first online backup as soon as status
+                    answers after the start: "sparrow SOCKET backup" and watch status, or run
+                    the sparrow-backup client (the nightly sparrow-backup.timer runs it too).
+
 Environment (defaults are the user-unit layout):
   SPARROW_PREFIX   images in PREFIX/libexec/sparrow, CLI link PREFIX/bin/sparrow   ~/.local
   SPARROW_CONFIG   the daemon's server.toml, with ship.toml beside it; the store
                    (data_dir) and sockets are read from it       ~/.config/sparrow/server.toml
-  SPARROW_BACKUPS  where the pre-upgrade backup is written       /SPARROW/backups
+  SPARROW_BACKUPS  the online backup root (server.toml backup_root), on the NAS
+                                                                 /net/synology/archives/sparrow
+  SPARROW_INTAKE   the intake tree the backup set keeps          /SPARROW/intake
   SPARROW_BIN      the kept images the --to pair must match      <repository>/bin
 
 Recovery depends on where it failed; the FAILED line names the unit and timer states.
-- Before "stop timers": nothing changed. Fix the cause and rerun.
+- Before "stop timers": nothing stopped and the links name FROM. A completed
+  BACKUPS/pre-upgrade-FROM link must be moved aside before a rerun. Fix the cause and rerun.
 - From "stop timers" up to "switch links": the links still name FROM and the store is untouched.
-  Remove BACKUPS/pre-upgrade-FROM.partial if it exists (a rerun refuses while it does), then
-  start sparrow.service (if stopped) and both timers. A completed BACKUPS/pre-upgrade-FROM
-  must be moved aside before a rerun. An installed limits.conf may stay: either image needs it.
+  Start sparrow.service (if stopped) and both timers. Move BACKUPS/pre-upgrade-FROM aside before
+  a rerun. An installed limits.conf may stay: either image needs it.
 - At "switch links", before "start sparrow.service": check both links with readlink; one may
   name TO and the other FROM. Point both at FROM and recover as in the step above, or both at
   TO and start sparrow.service, then continue as below.
@@ -56,11 +75,13 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
   daemon runs TO with both timers stopped, and TO may have accepted ingest and watch work.
   Go forward first: wait for "sparrow SOCKET status" to answer (a slow open passes 600 s
   without failing), confirm its store_id and the TO schema, then start both timers.
-  Roll back only if TO cannot serve: stop sparrow.service; point the daemon link
-  at FROM and the CLI link at the FROM CLI (an image restored from the backup's images/ needs
-  setcap cap_net_bind_service=ep, run by a human with root); move the store aside and restore
-  BACKUPS/pre-upgrade-FROM/store (cp -a --reflink=always into a chattr +C directory), which
-  drops everything TO accepted; then start sparrow.service and both timers.
+  Roll back only if TO cannot serve, and only with a pre-upgrade backup (after --no-backup there
+  is none: go forward). Stop sparrow.service; point the daemon link at FROM and the CLI link at
+  the FROM CLI (an image restored from the set's images/ needs setcap cap_net_bind_service=ep,
+  run by a human with root); move the store aside and restore the backup into an empty chattr +C
+  directory with an image that has --restore-backup (TO does): TO --restore-backup BACKUPS ID
+  STORE, where ID is backup_id in BACKUPS/pre-upgrade-FROM/SOURCE. That drops everything
+  accepted after the backup started; then start sparrow.service and both timers.
 - Claims after a rollback or restore (docs/deployment.md, "Claims after a rollback"). Keep the
   set-aside TO store: it records every claim TO made. Before starting sparrow.service on the
   restored store, open the restored store with the FROM image and the set-aside store with the
@@ -86,10 +107,15 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
 USAGE
 }
 
-FROM='' TO=''
+FROM='' TO='' NO_BACKUP=0 NO_BACKUP_REASON=''
 while (($#)); do
     case $1 in
         -h | --help) usage; exit 0 ;;
+        --no-backup)
+            (($# >= 2)) && [[ -n ${2//[[:space:]]/} ]] || { printf 'user-unit-upgrade.sh: --no-backup needs a nonempty REASON\n' >&2; exit 2; }
+            NO_BACKUP=1 NO_BACKUP_REASON=$2
+            shift 2
+            ;;
         --from | --to)
             (($# >= 2)) && [[ -n $2 ]] || { printf 'user-unit-upgrade.sh: %s needs a daemon image name\n' "$1" >&2; exit 2; }
             if [[ $1 == --from ]]; then FROM=$2; else TO=$2; fi
@@ -106,6 +132,7 @@ done
 # sparrow.service, so this script drives the user manager itself (USER_SYSTEMCTL).
 SPARROW_PREFIX=${SPARROW_PREFIX:-${HOME:?}/.local}
 SPARROW_CONFIG=${SPARROW_CONFIG:-${HOME:?}/.config/sparrow/server.toml}
+# The user-unit pre-upgrade backup prints its own progress; lib.sh supplies the backup root.
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 USER_SYSTEMCTL=(systemctl --user)
@@ -138,7 +165,7 @@ settled() {
 }
 
 # Preconditions, all before anything changes.
-[[ ! -e $BACKUP && ! -e $BACKUP.partial ]] || die "backup target $BACKUP (or .partial) exists"
+[[ ! -e $BACKUP && ! -L $BACKUP ]] || die "pre-upgrade backup $BACKUP exists; move it aside first"
 current=$(readlink -- "$LIBEXEC/sparrowd" 2>/dev/null || true)
 [[ $current == "$FROM" ]] || die "unexpected daemon link $LIBEXEC/sparrowd -> ${current:-none}, not $FROM"
 refuse_schema_downgrade "$LIBEXEC/$TO"
@@ -169,22 +196,18 @@ grep -q '^ingest_socket_path = ' "$SPARROW_CONFIG" || die "$SPARROW_CONFIG lacks
 STORE=$(config_value data_dir) || exit 1
 SOCKET=$(config_value socket_path) || exit 1
 INGEST_SOCKET=$(config_value ingest_socket_path) || exit 1
-LEXICONS=$(config_value text_lexicon_dir) || exit 1
 [[ -r $CONFIG_DIR/ship.toml ]] || die "cannot read $CONFIG_DIR/ship.toml; the backup keeps it"
 no_copy_on_write "$STORE" || die "$STORE is not no-COW (lsattr shows no C)"
-# The backup is a reflink copy, so it must share the store's filesystem; refuse now rather than
-# after the stop.
-backups_fs=$SPARROW_BACKUPS
-[[ -d $backups_fs ]] || backups_fs=$(dirname -- "$SPARROW_BACKUPS")
-# A filesystem's UUID spans its btrfs subvolumes, whose device numbers differ; a filesystem
-# without a UUID falls back to the device number.
-fs_identity() { findmnt -no UUID -T "$1" | grep . || stat -c 'dev:%d' -- "$1"; }
-[[ $(fs_identity "$backups_fs") == "$(fs_identity "$STORE")" ]] \
-    || die "$SPARROW_BACKUPS is not on $STORE's filesystem; the reflink backup needs one filesystem"
-free=$(free_bytes "$STORE") || exit 1
-need=$(du -s -B1 -- "$STORE" | cut -f1)
-((free > need + 10 * 1024 ** 3)) || die "only $free bytes free beside $STORE; the backup needs $need bytes plus 10 GiB"
-
+# TO must start with its online backup configured, or its first backup would need another restart.
+# With --no-backup, FROM predates the keys and a FROM restart would refuse them, so they are added
+# immediately before this run (the running FROM daemon does not reread its configuration) and
+# removed again before any rollback to FROM.
+root=$(config_value backup_root 2>/dev/null) || die "$SPARROW_CONFIG sets no backup_root, so $TO \
+would start without its online backup. Add backup_root = \"$SPARROW_BACKUPS\" and backup_keep \
+immediately before this switch (README.md, \"Interim user unit\")"
+[[ $root == "$SPARROW_BACKUPS" ]] || die "$SPARROW_CONFIG backs up into $root, not \
+SPARROW_BACKUPS=$SPARROW_BACKUPS"
+((NO_BACKUP)) || [[ -x $LIBEXEC/sparrow-backup ]] || die "missing or not executable: $LIBEXEC/sparrow-backup"
 # After the preconditions, a failure says what state it left (the recovery note is in --help).
 report_failure() {
     local rc=$?
@@ -203,6 +226,33 @@ FORMAT=$(status_field store_format <<<"$before")
 schema=$(status_field schema_version <<<"$before")
 [[ $schema == "$FROM_SCHEMA" ]] || die "the running daemon reports schema $schema, not $FROM's $FROM_SCHEMA"
 log "store_id before: $STORE_ID, format $FORMAT, schema $schema"
+if ((NO_BACKUP)); then
+    log "NO PRE-UPGRADE BACKUP (--no-backup): $NO_BACKUP_REASON"
+    log "NO PRE-UPGRADE BACKUP: a rollback can only go forward on $TO; take the first online backup as soon as status answers"
+else
+    # The running daemon's backup state; an image without the online backup reports none.
+    phase=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin).get("backup", {}).get("phase", "absent"))' <<<"$before")
+    case $phase in
+        absent) die "the running daemon ($FROM) has no online backup, and no backup may stop it. \
+Switch with --no-backup REASON, then take the first online backup once $TO answers" ;;
+        unconfigured) die "the running daemon reports no backup_root; configure it and restart \
+the daemon first, or switch with --no-backup REASON" ;;
+    esac
+    log "pre-upgrade backup, online: the daemon keeps serving"
+    PATH=$(dirname -- "$CLI_LINK"):$PATH "$LIBEXEC/sparrow-backup" "$SPARROW_CONFIG" \
+        "$SPARROW_INTAKE" "$CONFIG_DIR" "$CONFIG_DIR/ship.toml"
+    fresh=''
+    for dir in "$SPARROW_BACKUPS"/sets/*; do
+        [[ -d $dir && ${dir##*/} =~ ^[0-9]+$ ]] || continue
+        if [[ -z $fresh ]] || ((${dir##*/} > ${fresh##*/})); then fresh=$dir; fi
+    done
+    if [[ -z $fresh ]] || ! grep -qx "image=$FROM" "$fresh/SOURCE" \
+        || ! grep -qx "store_id=$STORE_ID" "$fresh/SOURCE"; then
+        die "the newest backup set ${fresh:-none} does not record image=$FROM and store_id=$STORE_ID"
+    fi
+    ln -s -- "sets/${fresh##*/}" "$BACKUP"
+    log "pre-upgrade backup $BACKUP -> sets/${fresh##*/} ($(sed -n 's/^taken_utc=//p' "$fresh/SOURCE"))"
+fi
 
 log "stop timers"
 "${USER_SYSTEMCTL[@]}" stop sparrow-ship.timer sparrow-backup.timer
@@ -223,36 +273,6 @@ if [[ -n $(ps -C sparrowd -o pid=) ]]; then
     die "a sparrowd process remains"
 fi
 log "daemon stopped"
-
-# The named pre-upgrade backup: once TO opens the store, the only way back to FROM's format. Its
-# taken_utc is the compact stamp sparrow-backup writes, which lib.sh and verify-backup.sh read.
-[[ -d $SPARROW_BACKUPS ]] || mkdir -m 0700 -- "$SPARROW_BACKUPS"
-mkdir -m 0700 -- "$BACKUP.partial"
-mkdir -m 0700 -- "$BACKUP.partial/store"
-chattr +C -- "$BACKUP.partial/store"
-cp -a --reflink=always -- "$STORE/." "$BACKUP.partial/store/"
-diff <(cd -- "$STORE" && find . -printf '%P %y %s\n' | sort) \
-    <(cd -- "$BACKUP.partial/store" && find . -printf '%P %y %s\n' | sort) \
-    || die "the backup's file list differs from $STORE; $BACKUP.partial is kept for inspection"
-mkdir -- "$BACKUP.partial/images" "$BACKUP.partial/config"
-cp -a --reflink=auto -- "$LIBEXEC/$FROM" "$LIBEXEC/$FROM_CLI" "$BACKUP.partial/images/"
-# Under the names verify-backup.sh reads back, whatever SPARROW_CONFIG is called.
-cp -a -- "$SPARROW_CONFIG" "$BACKUP.partial/config/server.toml"
-cp -a -- "$CONFIG_DIR/ship.toml" "$BACKUP.partial/config/ship.toml"
-cat >"$BACKUP.partial/SOURCE" <<SOURCE
-image=$FROM
-cli=$FROM_CLI
-store_id=$STORE_ID
-schema_version=$FROM_SCHEMA
-store_format=$FORMAT
-text_lexicon_dir=$LEXICONS
-source=$STORE (closed, user unit sparrow.service)
-taken_utc=$(date -u +%Y%m%dT%H%M%SZ)
-SOURCE
-sync -f -- "$BACKUP.partial"
-mv -T -- "$BACKUP.partial" "$BACKUP"
-sync -f -- "$SPARROW_BACKUPS"
-log "backup at $BACKUP ($(find "$BACKUP/store" -type f | wc -l) store files)"
 
 log "install $DROPIN_DIR/limits.conf (LimitNOFILE=$LIMIT_NOFILE)"
 install -D -m 0644 -- "$LIMITS_SOURCE" "$DROPIN_DIR/limits.conf"
@@ -310,6 +330,10 @@ for w in v["consume_watches"]:
 stat -c 'ingest socket %n %a %U:%G' -- "$INGEST_SOCKET"
 "${USER_SYSTEMCTL[@]}" start sparrow-ship.timer sparrow-backup.timer
 log "timers: ship $("${USER_SYSTEMCTL[@]}" is-active sparrow-ship.timer), backup $("${USER_SYSTEMCTL[@]}" is-active sparrow-backup.timer)"
+if ((NO_BACKUP)); then
+    log "NO PRE-UPGRADE BACKUP was taken ($NO_BACKUP_REASON). Take the first online backup now:"
+    printf '  %s %s backup   (then watch the backup state in status), or run sparrow-backup\n' "$CLI_LINK" "$SOCKET"
+fi
 log "switched to $TO. Any online backfill continues in the running daemon; watch it with:"
 printf '  %s %s status   (migrations: done/total, failure)\n' "$CLI_LINK" "$SOCKET"
 printf "  journalctl --user -u sparrow.service -g 'sparrowd: (migration|online migration failed)'\n"

@@ -4676,7 +4676,8 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
 }
 
 /// INVARIANT: query-only, no-intake and private-intake modes start no configured consume root,
-/// public listener or archive (the first two no ingest socket either), so a configuration that
+/// public listener or archive (the first two no ingest socket either, the last no online
+/// backup, since a copy shares the live store's identity), so a configuration that
 /// names one refuses startup with the conflicting key, whether a flag or the `query_only` key
 /// selects the mode, before any store or socket is created.
 #[test]
@@ -4739,6 +4740,13 @@ fn query_only_and_no_intake_refuse_conflicting_configuration() {
         "consume",
     );
     refused(&tcp, &["--private-intake", private], "rpc_tcp_address");
+    // A copy shares the live store's identity: its backup would land in the live root.
+    let backups = dir.path().join("backups");
+    refused(
+        &format!("backup_root = \"{}\"\n", backups.display()),
+        &["--private-intake", private],
+        "backup_root",
+    );
 }
 
 /// Run deploy/verify-backup.sh with a scratch root and the given live configuration.
@@ -4898,13 +4906,30 @@ fn backup_fixture(
     std::path::PathBuf,
     String,
 ) {
+    backup_fixture_with(dir, false, |_, _, _| {})
+}
+
+/// As [`backup_fixture`], with PREPARE run on the open store (its data_dir and the backup's
+/// instant given) before the online backup is taken, and, when OWED, the store counters
+/// removed before the backup, so a copy restored from the set owes their migration pages.
+fn backup_fixture_with(
+    dir: &Path,
+    owed: bool,
+    prepare: impl FnOnce(&sparrow_core::Store, &Path, u64),
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
     let live_data = dir.join("live").join("store");
     std::fs::create_dir_all(&live_data).unwrap();
     let live = write_server_config(&dir.join("live"), &live_data, &live_data.join("rpc.sock"));
-    let backup = dir.join("backup");
-    let data = backup.join("store");
-    std::fs::create_dir_all(backup.join("config")).unwrap();
-    let config = write_server_config(&backup.join("config"), &data, &data.join("rpc.sock"));
+    // The backed-up store, an engine backup of it, and its set, as sparrow-backup lays them out.
+    let source = dir.join("source");
+    let data = source.join("store");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = write_server_config(&source, &data, &data.join("rpc.sock"));
     let store = sparrow_server::ServerConfig::read(&config)
         .unwrap()
         .open_store()
@@ -4920,29 +4945,79 @@ fn backup_fixture(
         )
         .unwrap();
     let identity = store.store_id().unwrap();
-    let chunks = store.status(now).unwrap()["unique_payload_chunks"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    prepare(&store, &data, now);
+    let store = if owed {
+        drop(store);
+        let db = sparrow_test_support::catalog_db(&data).unwrap();
+        sparrow_core::remove_store_counters_for_legacy_fixture(&db).unwrap();
+        drop(db);
+        sparrow_server::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap()
+    } else {
+        store
+    };
+    let root = dir.join("backups");
+    let target = sparrow_core::BackupTarget::local_for_test(root.clone(), 2, &data).unwrap();
+    store.backup_start(&target, now).unwrap();
+    let status = loop {
+        let status = store.backup_status();
+        if status.phase != sparrow_core::BackupPhase::Running {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(
+        status.phase,
+        sparrow_core::BackupPhase::Complete,
+        "{status:?}"
+    );
     drop(store);
+    let backup = root.join("sets").join(status.backup_id.to_string());
+    std::fs::create_dir_all(backup.join("config")).unwrap();
+    std::fs::copy(&config, backup.join("config").join("server.toml")).unwrap();
     std::fs::write(
         backup.join("SOURCE"),
         format!(
-            "taken_utc={}\nimage=sparrowd-test\nstore_id={identity}\nunique_payload_chunks={chunks}\ntext_lexicon_dir={}\n",
+            "taken_utc={}\nbackup_id={}\nimage=sparrowd-test\nstore_id={identity}\nengine_bytes={}\ntext_lexicon_dir={}\n",
             sparrow_core::format_instant(now + 1000).unwrap(),
+            status.backup_id,
+            status.bytes,
             sparrow_test_support::text_lexicon_dir().display()
         ),
     )
     .unwrap();
+    write_backup_manifest(&backup);
     (live, live_data, backup, identity)
 }
 
-/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a reflinked copy,
-/// still passes on its clock-independent chunk count once the backup has aged out of
-/// retention, and fails, removing its scratch copy, when SOURCE names another store.
+/// Write the manifest sparrow-backup writes for the set BACKUP_ROOT/sets/ID: every file of the
+/// set and every engine file the backup's metadata lists, relative to the backup root. A test
+/// that edits a set file on purpose rewrites it, so only the edit under test can fail it.
+fn write_backup_manifest(backup: &Path) {
+    let id = backup.file_name().unwrap().to_str().unwrap();
+    let root = backup.parent().unwrap().parent().unwrap();
+    let manifest = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -o pipefail; {{ find sets/{id} -type f ! -name MANIFEST.b3; echo engine/meta/{id}; \
+             sed -nE 's#^((private|shared|shared_checksum)/[^ ]+).*#engine/\\1#p' engine/meta/{id}; }} \
+             | xargs -d '\\n' b3sum -- >sets/{id}/MANIFEST.b3"
+        ))
+        .current_dir(root)
+        .admitted_output()
+        .unwrap();
+    assert!(manifest.status.success(), "{manifest:?}");
+}
+
+/// INVARIANT (issue #156): deploy/verify-backup.sh passes a matching online backup end to end,
+/// checking its manifest against the backup root and restoring it into a scratch copy, still
+/// passes once the backup has aged out of retention, and fails, removing its scratch copy, when
+/// SOURCE names another store or a file differs from the manifest.
 #[test]
 fn verify_backup_fails_on_wrong_store_id() {
-    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
+    // The script's scratch copy stays below the cargo target directory and is removed.
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (live, _, backup, identity) = backup_fixture(dir.path());
     let verify = dir.path().join("verify");
@@ -4950,10 +5025,11 @@ fn verify_backup_fails_on_wrong_store_id() {
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     for check in [
+        "manifest",
+        "restore",
         "query-only",
         "store-id",
         "status",
-        "payload-chunks",
         "records",
         "artifact",
         "shutdown",
@@ -4969,7 +5045,7 @@ fn verify_backup_fails_on_wrong_store_id() {
         "the scratch copy is removed"
     );
     // Once the backup's newest hour is older than retention, its records have expired by the
-    // reader's clock; the chunk count still holds, and the window checks are skipped.
+    // reader's clock; the window checks are skipped.
     let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
     let taken = source.lines().next().unwrap().to_owned();
     let aged =
@@ -4980,95 +5056,29 @@ fn verify_backup_fails_on_wrong_store_id() {
         source.replace(&taken, &format!("taken_utc={aged}")),
     )
     .unwrap();
+    write_backup_manifest(&backup);
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(stdout.contains("PASS payload-chunks:"), "{stdout}");
+    assert!(stdout.contains("PASS restore:"), "{stdout}");
     assert!(stdout.contains("SKIP records:"), "{stdout}");
     std::fs::write(
         backup.join("SOURCE"),
         source.replace(&identity, "store:00000000000000000000000000000000"),
     )
     .unwrap();
+    write_backup_manifest(&backup);
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("FAIL store-id:"), "{stderr}");
     assert!(!stdout.contains("PASS records"), "{stdout}");
-    assert_eq!(
-        std::fs::read_dir(&verify).unwrap().count(),
-        0,
-        "the scratch copy is removed"
-    );
-}
-
-/// INVARIANT: verify-backup.sh never compares a pending count. When SOURCE recorded
-/// `unique_payload_chunks=pending`, or the copy's store counters are still seeding (a store
-/// written before #146 that the image upgrades), it reports the payload-chunks check as not
-/// verifiable rather than passing or failing it, still runs and passes every other check,
-/// expects the closing line to say pending for a pending copy, and exits 3, not 0.
-#[test]
-fn verify_backup_reports_pending_counts_as_not_verifiable() {
-    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (live, _, backup, _) = backup_fixture(dir.path());
-    let verify = dir.path().join("verify");
-    let image = ["--image", env!("CARGO_BIN_EXE_sparrowd")];
-    let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
-    let recorded = source
-        .lines()
-        .find(|line| line.starts_with("unique_payload_chunks="))
-        .unwrap()
-        .to_owned();
-    let others = ["query-only", "store-id", "status", "records", "artifact"];
-    let unverifiable = "NOT VERIFIABLE payload-chunks: not verifiable (counts pending)";
-    let summary = "verified except payload-chunks: not verifiable (counts pending)";
-
-    // SOURCE pending, copy exact: the live daemon logged no total, so nothing is compared.
-    std::fs::write(
-        backup.join("SOURCE"),
-        source.replace(&recorded, "unique_payload_chunks=pending"),
-    )
-    .unwrap();
-    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
-    assert_eq!(code, Some(3), "not verified: {stdout}{stderr}");
-    assert!(stdout.contains(unverifiable), "{stdout}");
-    assert!(!stdout.contains("PASS payload-chunks"), "{stdout}");
-    assert!(stdout.contains(summary), "{stdout}");
-    for check in others {
-        assert!(
-            stdout.contains(&format!("PASS {check}:")),
-            "{check}: {stdout}"
-        );
-    }
-    assert!(
-        stdout.contains(&format!(
-            "PASS shutdown: the daemon stopped cleanly and logged {recorded};"
-        )),
-        "an exact copy still logs its count: {stdout}"
-    );
-
-    // SOURCE numeric, copy pending: the copy's count covers only the seeded keys.
     std::fs::write(backup.join("SOURCE"), &source).unwrap();
-    let db = sparrow_test_support::catalog_db(&backup.join("store")).unwrap();
-    sparrow_core::remove_store_counters_for_legacy_fixture(&db).unwrap();
-    drop(db);
+    write_backup_manifest(&backup);
+    let mut changed = std::fs::read(backup.join("config").join("server.toml")).unwrap();
+    changed.extend_from_slice(b"\n");
+    std::fs::write(backup.join("config").join("server.toml"), changed).unwrap();
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
-    assert_eq!(code, Some(3), "not verified: {stdout}{stderr}");
-    assert!(stdout.contains(unverifiable), "{stdout}");
-    assert!(!stdout.contains("PASS payload-chunks"), "{stdout}");
-    assert!(!stderr.contains("FAIL"), "{stderr}");
-    assert!(stdout.contains(summary), "{stdout}");
-    for check in others {
-        assert!(
-            stdout.contains(&format!("PASS {check}:")),
-            "{check}: {stdout}"
-        );
-    }
-    assert!(
-        stdout.contains(
-            "PASS shutdown: the daemon stopped cleanly and logged unique_payload_chunks=pending"
-        ),
-        "{stdout}"
-    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("FAIL manifest:"), "{stderr}");
     assert_eq!(
         std::fs::read_dir(&verify).unwrap().count(),
         0,
@@ -5077,54 +5087,14 @@ fn verify_backup_reports_pending_counts_as_not_verifiable() {
 }
 
 /// INVARIANT: verify-backup.sh never starts a daemon that could reach the live store or the
-/// live intake: it refuses a backup whose store is or holds a link (here, to the live
-/// data_dir), and it refuses the backup's own image when that image has no query-only mode,
-/// without running it with a configuration.
+/// live intake: it refuses the backup's own image when that image has no query-only mode,
+/// without running it with a configuration, before any scratch directory exists.
 #[test]
-fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
+fn verify_backup_refuses_an_image_without_query_only() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (live, live_data, backup, _) = backup_fixture(dir.path());
+    let (live, _, backup, _) = backup_fixture(dir.path());
     let verify = dir.path().join("verify");
-
-    let linked = dir.path().join("linked");
-    std::fs::create_dir_all(&linked).unwrap();
-    std::fs::copy(backup.join("SOURCE"), linked.join("SOURCE")).unwrap();
-    std::os::unix::fs::symlink(&live_data, linked.join("store")).unwrap();
-    let (code, stdout, stderr) = verify_backup(
-        &linked,
-        &verify,
-        &live,
-        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
-    );
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("store is a symbolic link"), "{stderr}");
-    assert!(
-        !verify.exists(),
-        "refused before any scratch directory exists"
-    );
-    assert_eq!(
-        std::fs::read_dir(&live_data).unwrap().count(),
-        0,
-        "the live store is untouched"
-    );
-
-    // A link inside the store is refused too, even one that stays inside the backup.
-    let inner = backup.join("store").join("inner-link");
-    std::os::unix::fs::symlink(backup.join("SOURCE"), &inner).unwrap();
-    let (code, stdout, stderr) = verify_backup(
-        &backup,
-        &verify,
-        &live,
-        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
-    );
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("holds the symbolic link"), "{stderr}");
-    assert!(
-        !verify.exists(),
-        "refused before any scratch directory exists"
-    );
-    std::fs::remove_file(&inner).unwrap();
 
     // The backup's own pre-query-only image: it prints the old usage line, and marks any run
     // that passes it arguments.
@@ -5158,7 +5128,9 @@ fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
 
 /// INVARIANT: the migration measurement's disk guard refuses to start below its free-space
 /// floor, and refuses an override that would lower a floor, before any scratch copy exists or
-/// any daemon starts.
+/// any daemon starts. With --with-traffic the set is restored twice (the measured copy and the
+/// query-only prep copy), so a set whose single restore fits but whose two do not is refused
+/// before anything is restored.
 #[test]
 fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -5204,16 +5176,63 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
         !verify.exists(),
         "refused before any scratch directory exists"
     );
+
+    // 26 GB of engine files: one restore and 10 GiB fit the double's 60 GB, two do not.
+    let (live, _, backup, _, _) = traffic_fixture(&dir.path().join("traffic"), true, false, 1000);
+    let source = backup.join("SOURCE");
+    let resized = std::fs::read_to_string(&source)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.starts_with("engine_bytes=") {
+                "engine_bytes=26000000000".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&source, format!("{resized}\n")).unwrap();
+    write_backup_manifest(&backup);
+    let (code, stdout, stderr) = verify_backup_measured(
+        &backup,
+        &verify,
+        &live,
+        &[
+            "--measure-migration",
+            "--with-traffic",
+            "--image",
+            env!("CARGO_BIN_EXE_sparrowd"),
+        ],
+        &[],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("2 time(s) needs 52000000000 bytes plus 10 GiB"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("PASS restore:"),
+        "nothing was restored: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch directory is removed"
+    );
 }
 
-/// A backup for the traffic measurement: the two-record fixture, with its store counters owed
-/// when OWED (so the copy runs migration pages and its counts are pending), whose stored watch
-/// catalog names a "live" consume root with quiet interval QUIET_MS and journals a claim whose file sits in that root's
-/// `.sparrow-inflight/`, one direct producer artifact received one second into the hour before
-/// `taken_utc`, with WATCH_INTAKE one artifact of the watch's source received two seconds into
-/// it, the backup's image pair in `images/`, and a `config/ship.toml` whose source, named after
-/// the watch root, is a "live" producer directory holding one file. Returns the live
-/// configuration, live data_dir, the backup, the live consume root and the live producer file.
+/// An online backup set for the traffic measurement, taken by `backup_start` from a test store
+/// with live intake: the two-record fixture plus, before the backup, a stored watch catalog
+/// naming a "live" consume root with quiet interval QUIET_MS, a claim journaled against that
+/// root whose file sits in its `.sparrow-inflight/`, one direct producer artifact received one
+/// second into the hour before `taken_utc` and, with WATCH_INTAKE, one artifact of the watch's
+/// source received two seconds into it; with OWED the store counters are removed before the
+/// backup, so the restored copy runs migration pages and its counts are pending. The set holds
+/// the image pair in `images/` and, as sparrow-backup copies /etc/sparrow, a
+/// `config/sparrow/ship.toml` whose source, named after the watch root, is a "live" producer
+/// directory holding one file. Returns the live configuration, live data_dir, the set, the
+/// live consume root and the live producer file.
 fn traffic_fixture(
     dir: &Path,
     watch_intake: bool,
@@ -5226,91 +5245,79 @@ fn traffic_fixture(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    let (live, live_data, backup, _) = backup_fixture(dir);
-    let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
-    let taken = sparrow_core::parse_instant(
-        source
-            .lines()
-            .find_map(|line| line.strip_prefix("taken_utc="))
-            .unwrap(),
-    )
-    .unwrap();
-    let window_start = taken - 3_600_000;
     let intake = dir.join("live").join("intake");
     let live_root = intake.join("replayed");
     let producers = dir.join("live").join("producer");
     for path in [&live_root, &producers] {
         std::fs::create_dir_all(path).unwrap();
     }
-    let config = backup.join("config").join("server.toml");
-    let server = sparrow_server::ServerConfig::read(&config).unwrap();
-    let store = server.open_store().unwrap();
-    store
-        .ingest(
-            "direct-producer",
-            "replay",
-            "jsonl",
-            b"{\"direct\":1}\n",
-            window_start + 1000,
-        )
-        .unwrap();
-    if watch_intake {
-        // What the watch received in the window, as the live shipper fed its root.
+    let mut window_start = 0;
+    let (live, live_data, backup, _) = backup_fixture_with(dir, owed, |store, data, now| {
+        // backup_fixture records taken_utc one second after NOW.
+        window_start = now + 1000 - 3_600_000;
         store
             .ingest(
-                "watch-intake",
-                "consume-acceptance",
+                "direct-producer",
+                "replay",
                 "jsonl",
-                b"{\"watch\":1}\n",
-                window_start + 2000,
+                b"{\"direct\":1}\n",
+                window_start + 1000,
             )
             .unwrap();
-    }
-    // Seed the stored catalog with a watch on the live root, as the live store's names its
-    // roots; the worker persists it before it starts and is stopped at once.
-    let worker = sparrow_server::watches::ConsumeWorker::start(
-        store.clone(),
-        &[watch_definition(&live_root, "replayed", quiet_ms, 16, 16)],
-        backup.join("store").join("seed.sock"),
-        sparrow_server::watches::WatchRegistry::default(),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-    )
-    .unwrap();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(worker.shutdown())
-        .unwrap();
-    // A claim the backup journals against the live root, its file moved into the live root's
-    // .sparrow-inflight/, as the 2026-11-07 pre-upgrade backup held one: a private-intake copy
-    // must open over it and never touch it.
-    let pending = live_root.join("pending.jsonl");
-    std::fs::write(&pending, b"{\"pending\":1}\n").unwrap();
-    let owner = sparrow_server::consumption::ClaimRoot::open(store.clone(), "replayed", &live_root)
-        .unwrap();
-    let journal = owner
-        .reserve(
-            Path::new("pending.jsonl"),
-            sparrow_client::CompletedFileIdentity::capture(&std::fs::metadata(&pending).unwrap()),
-            "consume-acceptance",
-            "jsonl",
+        if watch_intake {
+            // What the watch received in the window, as the live shipper fed its root.
+            store
+                .ingest(
+                    "watch-intake",
+                    "consume-acceptance",
+                    "jsonl",
+                    b"{\"watch\":1}\n",
+                    window_start + 2000,
+                )
+                .unwrap();
+        }
+        // The stored catalog names the live root, as the live store's names its roots; the
+        // worker persists it before it starts and is stopped at once.
+        let worker = sparrow_server::watches::ConsumeWorker::start(
+            store.clone(),
+            &[watch_definition(&live_root, "replayed", quiet_ms, 16, 16)],
+            data.join("seed.sock"),
+            sparrow_server::watches::WatchRegistry::default(),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         )
         .unwrap();
-    assert!(matches!(
-        owner
-            .recover(&journal.import_id, sparrow_server::now().unwrap())
-            .unwrap(),
-        sparrow_server::consumption::Recovery::Claimed(_)
-    ));
-    drop(owner);
-    drop(store);
-    if owed {
-        let db = sparrow_test_support::catalog_db(&backup.join("store")).unwrap();
-        sparrow_core::remove_store_counters_for_legacy_fixture(&db).unwrap();
-        drop(db);
-    }
-    // The image pair SOURCE names, as sparrow-backup keeps it beside the store.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(worker.shutdown())
+            .unwrap();
+        // A claim journaled against the live root, its file moved into the live root's
+        // .sparrow-inflight/, as the 2026-11-07 pre-upgrade backup held one: a private-intake
+        // copy must open over it and never touch it.
+        let pending = live_root.join("pending.jsonl");
+        std::fs::write(&pending, b"{\"pending\":1}\n").unwrap();
+        let owner =
+            sparrow_server::consumption::ClaimRoot::open(store.clone(), "replayed", &live_root)
+                .unwrap();
+        let journal = owner
+            .reserve(
+                Path::new("pending.jsonl"),
+                sparrow_client::CompletedFileIdentity::capture(
+                    &std::fs::metadata(&pending).unwrap(),
+                ),
+                "consume-acceptance",
+                "jsonl",
+            )
+            .unwrap();
+        assert!(matches!(
+            owner
+                .recover(&journal.import_id, sparrow_server::now().unwrap())
+                .unwrap(),
+            sparrow_server::consumption::Recovery::Claimed(_)
+        ));
+    });
+    // The image pair SOURCE names, as sparrow-backup copies it into the set.
     let images = backup.join("images");
     std::fs::create_dir_all(&images).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_sparrowd"), images.join("sparrowd-test"))
@@ -5324,8 +5331,10 @@ fn traffic_fixture(
         .unwrap()
         .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(window_start + 1000))
         .unwrap();
+    let etc = backup.join("config").join("sparrow");
+    std::fs::create_dir_all(&etc).unwrap();
     std::fs::write(
-        backup.join("config").join("ship.toml"),
+        etc.join("ship.toml"),
         format!(
             "intake_root = \"{}\"\nstate_dir = \"{}\"\nmax_chunk_bytes = 1048576\nmax_chunk_lines = 50000\nmax_files_per_run = 64\nmax_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n[[source]]\nname = \"replayed\"\ndir = \"{}\"\npattern = \"*.jsonl\"\nrule = \"settled\"\nformat = \"jsonl\"\nsettle_seconds = 1\n",
             intake.display(),
@@ -5334,6 +5343,9 @@ fn traffic_fixture(
         ),
     )
     .unwrap();
+    // The set's files changed, so its manifest is written again, as sparrow-backup writes it
+    // last.
+    write_backup_manifest(&backup);
     (live, live_data, backup, live_root, produced)
 }
 
@@ -5642,7 +5654,7 @@ fn verify_backup_traffic_measurement_fails_on_each_gate_breach() {
     let old = images.join("sparrowd-old");
     std::fs::write(
         &old,
-        "#!/bin/sh\necho 'usage: sparrowd --config FILE.toml [--query-only | --no-intake]' >&2\nexit 1\n",
+        "#!/bin/sh\necho 'usage: sparrowd --config FILE.toml [--query-only | --no-intake] | sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID] EMPTY_DIR' >&2\nexit 1\n",
     )
     .unwrap();
     std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -5661,7 +5673,8 @@ fn verify_backup_traffic_measurement_fails_on_each_gate_breach() {
     );
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("has no --private-intake mode"), "{stderr}");
-    std::fs::remove_file(backup.join("config").join("ship.toml")).unwrap();
+    std::fs::remove_file(backup.join("config").join("sparrow").join("ship.toml")).unwrap();
+    write_backup_manifest(&backup);
     let (code, _, stderr) = verify_backup_measured(&backup, &verify, &live, &args, &[]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("ship.toml is missing"), "{stderr}");
@@ -5705,11 +5718,12 @@ fn verify_backup_traffic_measurement_refuses_an_empty_or_unrooted_replay() {
         "the scratch copy is removed"
     );
 
-    let ship = backup.join("config").join("ship.toml");
+    let ship = backup.join("config").join("sparrow").join("ship.toml");
     let renamed = std::fs::read_to_string(&ship)
         .unwrap()
         .replace("name = \"replayed\"", "name = \"unrooted\"");
     std::fs::write(&ship, renamed).unwrap();
+    write_backup_manifest(&backup);
     let (code, stdout, stderr) = verify_backup_measured(&backup, &verify, &live, &args, &[]);
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("unrooted name no watch root"), "{stderr}");
@@ -5720,7 +5734,8 @@ fn verify_backup_traffic_measurement_refuses_an_empty_or_unrooted_replay() {
     );
 }
 
-/// INVARIANT: deploy/user-unit-upgrade.sh refuses a trailing --to without a value, a daemon
+/// INVARIANT: deploy/user-unit-upgrade.sh refuses a trailing --to without a value, --no-backup
+/// with an empty reason, a daemon
 /// link that does not name --from, a drop-in for the unit other than the repository's
 /// limits.conf (issue #148: the window installs only that file), and a --to daemon without
 /// cap_net_bind_service before it changes anything: no backup is started, the links and the
@@ -5793,6 +5808,14 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
         "{stderr}"
     );
     unchanged(from);
+    // Skipping the pre-upgrade backup needs a stated reason (#156, coordination D147).
+    let (code, stdout, stderr) = run(&["--from", from, "--to", to, "--no-backup", " "]);
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("--no-backup needs a nonempty REASON"),
+        "{stderr}"
+    );
+    unchanged(from);
 
     std::fs::remove_file(&link).unwrap();
     symlink("sparrowd-schema67-ccccccc", &link).unwrap();
@@ -5829,6 +5852,120 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("lacks cap_net_bind_service"), "{stderr}");
     unchanged(from);
+}
+
+/// INVARIANT (issue #156; Patrick, 2026-11-08: Sparrow never backs up to a local disk):
+/// deploy/libexec/sparrow-backup refuses a backup_root on a local filesystem before it asks the
+/// daemon for anything or creates anything: the socket named does not exist, so a refusal that
+/// came after its first daemon call would name the socket instead, and an absent root is not
+/// created.
+#[test]
+fn backup_client_refuses_a_local_backup_root_before_asking_the_daemon() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (data, intake) = (dir.path().join("store"), dir.path().join("intake"));
+    for path in [&data, &intake] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let config = write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+    let root = dir.path().join("backups");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("backup_root = {root:?}\n"));
+    std::fs::write(&config, text).unwrap();
+    let output = Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/libexec/sparrow-backup"
+    ))
+    .arg(&config)
+    .arg(&intake)
+    .env("SPARROW_PREFIX", dir.path())
+    .admitted_output()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("not a network filesystem") && !stderr.contains("rpc.sock"),
+        "{stderr}"
+    );
+    assert!(!root.exists());
+}
+
+/// INVARIANT (issue #156; Patrick, 2026-11-08: Sparrow never backs up to a local disk): through
+/// the daemon's own entry points, a daemon without backup_root reports the backup phase
+/// unconfigured and refuses `sparrow SOCKET backup` with UNSUPPORTED; a daemon whose backup_root
+/// is on a local disk starts the backup, returns the running state at once, then reports it
+/// failed in status, naming the root and its filesystem, without creating the root, and keeps
+/// serving. The fields asserted are the ones deploy/libexec/sparrow-backup reads.
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_backup_refuses_a_local_root_and_reports_it_in_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let backup = |socket: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            .arg(socket)
+            .arg("backup")
+            .admitted_output()
+            .unwrap()
+    };
+
+    let plain = dir.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let socket = plain.join("store").join("rpc.sock");
+    let config = write_server_config(&plain, &plain.join("store"), &socket);
+    let daemon = start(&config, &socket).await;
+    assert_eq!(
+        cli(&socket, &["status"])["backup"]["phase"].as_str(),
+        Some("unconfigured")
+    );
+    let refused = backup(&socket);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("UNSUPPORTED"), "{stderr}");
+    drop(daemon);
+
+    let local = dir.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    let socket = local.join("store").join("rpc.sock");
+    let config = write_server_config(&local, &local.join("store"), &socket);
+    let root = local.join("backups");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("backup_root = {root:?}\nbackup_keep = 2\n"));
+    std::fs::write(&config, text).unwrap();
+    let _daemon = start(&config, &socket).await;
+    let started = backup(&socket);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let running =
+        purrdf_lex::json::read_slice(&started.stdout, purrdf_lex::json::Limits::default()).unwrap();
+    assert_eq!(running["phase"].as_str(), Some("running"));
+    assert_eq!(running["root"].as_str(), root.to_str());
+    assert_eq!(running["keep"].as_u64(), Some(2));
+    assert!(running["started_at"].as_str().is_some(), "{running:?}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let status = cli(&socket, &["status"]);
+        if status["backup"]["phase"].as_str() != Some("running") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the backup never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let state = &status["backup"];
+    assert_eq!(state["phase"].as_str(), Some("failed"), "{state:?}");
+    assert_eq!(state["started_at"], running["started_at"]);
+    assert!(state["finished_at"].as_str().is_some(), "{state:?}");
+    assert_eq!(state["backup_id"].as_u64(), Some(0));
+    let failure = state["failure"].as_str().unwrap();
+    assert!(
+        failure.contains(&format!("backup_root {} is on ", root.display()))
+            && failure.contains("not a network filesystem"),
+        "{failure}"
+    );
+    assert!(!root.exists(), "a local backup root was created");
+    for field in ["store_id", "schema_version", "store_format"] {
+        assert!(!status[field].is_null(), "status lacks {field}");
+    }
 }
 
 /// INVARIANT (issue #148): a daemon whose soft open-file limit leaves no room for the table

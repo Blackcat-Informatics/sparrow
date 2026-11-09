@@ -2,17 +2,21 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# Verify a closed-store backup end to end (RECOVERY.md, "Verify a backup"). The backup's store is
-# reflinked into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), and the image
-# the backup recorded opens that copy in query-only mode, so no watch root is opened, no file is
-# claimed and nothing is retired. The script checks the store identity, status and the stored
-# payload chunk count, and, while the backup is younger than the retention window, a records window
-# over its newest hour and one artifact's bytes against its catalog digest. It then stops the
-# daemon with SIGINT and removes the copy. It prints one line per check and exits 1 at the first
-# failed one. It never starts a daemon on the live store, socket or intake: the live data_dir and
-# socket_path come from SPARROW_CONFIG, and it refuses without them, refuses a backup store that is
-# or holds a symlink leading outside the backup, and refuses any scratch path that resolves under
-# the live store, socket, intake or the backup.
+# Verify an online backup end to end (RECOVERY.md, "Verify a backup"). BACKUP is one backup set,
+# BACKUP_ROOT/sets/ID on the NAS (/net/synology/archives/sparrow), written by sparrow-backup beside
+# the engine backup ID in BACKUP_ROOT/engine. Every file its MANIFEST.b3 lists (the set's files and
+# the engine files the backup references) is checked with b3sum against the NAS, and the set's file
+# list compared both ways. The image the backup recorded then restores engine backup ID into a
+# scratch working copy below SPARROW_VERIFY (default /SPARROW/verify) with `sparrowd
+# --restore-backup`, which checks every file's checksum as it reads it; the copy is not a backup and
+# is removed however the run ends. That image opens the copy in query-only mode, so no watch root
+# is opened, no file is claimed and nothing is retired. The script checks the store identity and
+# status, and, while the backup is younger than the retention window, a records window over its
+# newest hour and one artifact's bytes against its catalog digest. It then stops the daemon with
+# SIGINT and removes the copy. It prints one line per check and exits 1 at the first failed one.
+# It never starts a daemon on the live store, socket or intake: the live data_dir and socket_path
+# come from SPARROW_CONFIG, and it refuses without them, and refuses any scratch path that resolves
+# under the live store, socket, intake or the backup root.
 #
 # With --measure-migration it instead measures the online migrations (schema 69,
 # source-summary and, when the open found the source timeline cache stale, source-context) on a
@@ -42,13 +46,13 @@ Usage: deploy/verify-backup.sh [--time-records] [--window FROM BEFORE] [--image 
        deploy/verify-backup.sh --measure-migration [--image DAEMON] BACKUP
        deploy/verify-backup.sh --measure-migration --with-traffic [--rehearse-rollback] --image DAEMON BACKUP
 
-Copy BACKUP/store into a scratch directory below SPARROW_VERIFY (default /SPARROW/verify), open
-the copy query-only with the image BACKUP/SOURCE records, and check it. A backup counts as
-verified only once this exits 0. Exit 1 is a failed check, or a SOURCE that records no
-unique_payload_chunks (NOT VERIFIED); exit 2 is a usage error; exit 3 means every other check
-passed but the payload chunk count is not verifiable because the copy's or SOURCE's counts are
-pending, so the backup is not counted as verified. SPARROW_CONFIG (default /etc/sparrow/server.toml) must be
-readable: its data_dir and socket_path are the live paths the copy must never touch.
+BACKUP is a backup set, BACKUP_ROOT/sets/ID. Check every file BACKUP/MANIFEST.b3 lists against
+the NAS, restore engine backup ID into a scratch directory below SPARROW_VERIFY (default
+/SPARROW/verify) with the image BACKUP/SOURCE records, open the copy query-only and check it. The
+scratch filesystem needs the backup's engine_bytes plus 10 GiB free; the copy is removed however
+the run ends. A backup counts as verified only once this exits 0. Exit 1 is a failed check; exit
+2 is a usage error. SPARROW_CONFIG (default /etc/sparrow/server.toml) must be readable: its
+data_dir and socket_path are the live paths the copy must never touch.
 
 --time-records  after the checks, print five elapsed times of the records window
 --window FROM BEFORE
@@ -76,11 +80,12 @@ readable: its data_dir and socket_path are the live paths the copy must never to
                 instead, with its watches on private roots below the scratch directory and
                 its own ingest socket, and run recorded intake and query traffic for the
                 whole backfill (docs/deployment.md, "Measure the online migration with
-                intake and traffic"). It needs BACKUP/config/ship.toml and an image whose
-                usage line has --private-intake. The window is the hour before the
-                backup's taken_utc (SPARROW_MEASURE_REPLAY_SECONDS may widen it up to
-                86400). Every artifact the copy received then is read from a query-only
-                prep copy first and replayed at its recorded time, looping: a watch's
+                intake and traffic"). It needs BACKUP/config/sparrow/ship.toml (the set's
+                copy of /etc/sparrow) and an image whose usage line has --private-intake.
+                The window is the hour before the backup's taken_utc
+                (SPARROW_MEASURE_REPLAY_SECONDS may widen it up to 86400). Every artifact
+                the copy received then is read from a query-only prep copy, a second
+                restore of the set, and replayed at its recorded time, looping: a watch's
                 artifact into that watch's private root, through deploy/libexec/sparrow-ship
                 every 300 s when ship.toml has a source named after the root, and any other
                 artifact over the copy's ingest socket. A ship.toml source with no watch
@@ -244,13 +249,15 @@ fi
 ulimit -Sn 65536 2>/dev/null \
     || die "cannot raise the soft open-file limit to 65536 (hard limit $(ulimit -Hn)); the store needs the unit's LimitNOFILE"
 BACKUP=$(realpath -e -- "$1") || die "backup $1 does not exist"
-[[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup"
-[[ ! -L $BACKUP/store ]] || die "$BACKUP/store is a symbolic link; a backup holds its store itself"
-[[ -d $BACKUP/store ]] || die "$BACKUP holds no store; it is not a backup"
-# sparrow-backup copies no links, and the copy keeps an absolute one, which the daemon would
-# then follow out of the scratch directory; so a store holding any link is refused.
-link=$(find "$BACKUP/store" -type l -print -quit) || die "cannot inspect the links under $BACKUP/store"
-[[ -z $link ]] || die "$BACKUP/store holds the symbolic link $link; a backup's store holds no links"
+[[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup set"
+BACKUP_ID=${BACKUP##*/}
+[[ $BACKUP_ID =~ ^[0-9]+$ && ${BACKUP%/*} == */sets ]] || die "$BACKUP is not a backup set \
+BACKUP_ROOT/sets/ID"
+BACKUP_ROOT=${BACKUP%/sets/*}
+[[ -d $BACKUP_ROOT/engine/meta && -r $BACKUP_ROOT/engine/meta/$BACKUP_ID ]] \
+    || die "$BACKUP_ROOT/engine holds no backup $BACKUP_ID"
+[[ $(sed -n 's/^backup_id=//p' "$BACKUP/SOURCE") == "$BACKUP_ID" ]] \
+    || die "$BACKUP/SOURCE does not record backup_id=$BACKUP_ID"
 
 # The paths the copy must never open: the live store and socket, the intake, and the backup.
 [[ -r $SPARROW_CONFIG ]] || die "cannot read the live configuration $SPARROW_CONFIG (set \
@@ -269,7 +276,8 @@ if [[ -r $BACKUP/config/server.toml ]]; then
 fi
 # With traffic, also the live ingest socket, the shipper's intake root and state, and the
 # producers' own directories, none of which the replay reads: its bytes come from the copy.
-SHIP_CONFIG=$BACKUP/config/ship.toml
+# sparrow-backup copies /etc/sparrow, which holds ship.toml, into the set as config/sparrow.
+SHIP_CONFIG=$BACKUP/config/sparrow/ship.toml
 if ((WITH_TRAFFIC)); then
     value=$(sed -n -e '/^\[/q' -e 's/^ingest_socket_path *= *"\([^"]*\)".*/\1/p' "$SPARROW_CONFIG" | head -n 1)
     [[ -z $value ]] || recorded+=("$value")
@@ -282,7 +290,7 @@ for s in c.get("source",[]): print(s["dir"])' "$SHIP_CONFIG") || die "cannot rea
     recorded+=("${shipped[@]}")
 fi
 guarded=()
-for path in "$live_data" "$live_socket" "$SPARROW_INTAKE" "$BACKUP" "${recorded[@]}"; do
+for path in "$live_data" "$live_socket" "$SPARROW_INTAKE" "$BACKUP_ROOT" "${recorded[@]}"; do
     resolved=$(realpath -m -- "$path") || exit 1
     guarded+=("$resolved")
 done
@@ -310,21 +318,15 @@ backup_config() {
     sed -n -e '/^\[/q' -e "s/^$1 *= *\"\\{0,1\\}\\([^\"#]*[^\" #]\\)\"\\{0,1\\}.*/\\1/p" \
         "$BACKUP/config/server.toml" | head -n 1
 }
-# The status counts field: pending while the store counters seed, else exact. An image older
-# than schema 70 reports none; its counts are exact.
+# The status counts field: pending while the store counters seed, else exact.
 status_counts() {
-    python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("counts","exact"))'
+    python3 -I -c 'import json,sys; print(json.load(sys.stdin)["counts"])'
 }
 
 expected_store=$(source_value store_id)
 [[ -n $expected_store ]] || die "$BACKUP/SOURCE records no store_id"
-expected_chunks=$(source_value unique_payload_chunks)
 taken=$(source_value taken_utc)
 [[ -n $taken ]] || die "$BACKUP/SOURCE records no taken_utc"
-# sparrow-backup writes a compact stamp (20261103T014038Z); older backups an RFC 3339 instant.
-if [[ $taken =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$ ]]; then
-    taken="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}T${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}Z"
-fi
 taken_seconds=$(date -u -d "$taken" +%s) || die "$BACKUP/SOURCE taken_utc $taken is not a time"
 if [[ -n $WINDOW_FROM ]]; then
     from_seconds=$(date -u -d "$WINDOW_FROM" +%s) || die "--window FROM $WINDOW_FROM is not a time"
@@ -358,6 +360,9 @@ daemon_usage=$("$daemon" 2>&1 || true)
 [[ $daemon_usage == *"--query-only"* ]] || die "$daemon predates query-only mode \
 (it reports: $daemon_usage), so it cannot open a copy without claiming its watch roots. \
 Verify with an image that has the mode (--image); a newer image may upgrade the disposable copy"
+# The restore is the image's own: an image without it cannot read an online backup.
+[[ $daemon_usage == *"--restore-backup"* ]] || die "$daemon has no --restore-backup (it reports: \
+$daemon_usage), so it cannot restore an online backup; choose an image that has it (--image)"
 # The writable measurement needs the mode that runs maintenance but opens no watch root.
 ((MEASURE_MIGRATION == 0)) || [[ $daemon_usage == *"--no-intake"* ]] || die "$daemon has no \
 --no-intake mode (it reports: $daemon_usage), so a writable copy would claim its watch roots; \
@@ -456,12 +461,38 @@ scratch=$(realpath -e -- "$SCRATCH") || exit 1
 guard "$SCRATCH" "$scratch"
 require_socket_length "$SOCKET"
 
-# The copy's directory takes the backup store's copy-on-write attribute, since btrfs refuses a
-# reflink between a copy-on-write file and a no-copy-on-write one.
+# Every file the manifest lists is read back from the NAS, and the set holds exactly the files it
+# lists, before anything is restored.
+command -v b3sum >/dev/null || die "b3sum is missing; it checks the backup against $BACKUP/MANIFEST.b3"
+[[ -r $BACKUP/MANIFEST.b3 ]] || fail manifest "$BACKUP holds no MANIFEST.b3"
+set_prefix="sets/$BACKUP_ID/"
+diff <(sed -E 's/^[0-9a-f]{64}  //' -- "$BACKUP/MANIFEST.b3" | grep -F -- "$set_prefix" | sort) \
+    <(cd -- "$BACKUP_ROOT" && find "sets/$BACKUP_ID" -type f ! -name MANIFEST.b3 -printf '%p\n' | sort) \
+    >"$SCRATCH/set.diff" \
+    || fail manifest "the files of $BACKUP differ from its MANIFEST.b3: $(head -n 1 -- "$SCRATCH/set.diff")"
+grep -Eq "^[0-9a-f]{64}  engine/meta/$BACKUP_ID\$" -- "$BACKUP/MANIFEST.b3" \
+    || fail manifest "$BACKUP/MANIFEST.b3 does not list engine/meta/$BACKUP_ID"
+if ! check=$(cd -- "$BACKUP_ROOT" && b3sum --check --quiet -- "sets/$BACKUP_ID/MANIFEST.b3" 2>&1); then
+    fail manifest "${check%%$'\n'*} (against $BACKUP/MANIFEST.b3)"
+fi
+pass manifest "$(wc -l <"$BACKUP/MANIFEST.b3") files match $BACKUP/MANIFEST.b3, read from $BACKUP_ROOT"
+
+# The restore writes the engine's files into a no-copy-on-write directory ("COW off everywhere");
+# the scratch working copy is removed by cleanup however the run ends.
+need=$(source_value engine_bytes)
+[[ $need =~ ^[0-9]+$ ]] || die "$BACKUP/SOURCE records no engine_bytes"
+# --with-traffic restores the set a second time, into the query-only prep copy, while the
+# measured copy exists.
+copies=1
+((WITH_TRAFFIC == 0)) || copies=2
+free=$(free_bytes "$SCRATCH") || exit 1
+((free > copies * need + 10 * 1024 ** 3)) || die "only $free bytes free under $VERIFY_ROOT; restoring \
+backup $BACKUP_ID $copies time(s) needs $((copies * need)) bytes plus 10 GiB"
 mkdir -- "$DATA"
-match_copy_on_write "$BACKUP/store" "$DATA"
-cp -a --reflink=always -- "$BACKUP/store/." "$DATA/" \
-    || die "cannot reflink $BACKUP/store below $VERIFY_ROOT; it must be on the backup's btrfs filesystem, and every file in it must share the store directory's copy-on-write attribute (lsattr)"
+switch_off_copy_on_write "$DATA"
+"$daemon" --restore-backup "$BACKUP_ROOT" "$BACKUP_ID" "$DATA" 2>"$SCRATCH/restore.log" \
+    || fail restore "$(tail -n 1 -- "$SCRATCH/restore.log")"
+pass restore "backup $BACKUP_ID restored from $BACKUP_ROOT with every file's checksum checked"
 {
     ((MEASURE_MIGRATION)) || printf 'query_only = true\n'
     printf 'socket_path = "%s"\ndata_dir = "%s"\ntext_lexicon_dir = "%s"\n' "$SOCKET" "$DATA" "$lexicons"
@@ -523,12 +554,13 @@ if ((WITH_TRAFFIC)); then
     # The window's artifacts, read once from a query-only prep copy, so the measured open stays
     # the copy's first and the prep's reads are not measured.
     prep_started=$SECONDS
+    # The prep copy is a second restore of the set, so nothing the prep daemons do reaches the
+    # measured copy.
     PREP=$SCRATCH/prep
-    mkdir -- "$PREP"
-    match_copy_on_write "$BACKUP/store" "$PREP"
-    mkdir -- "$PREP/store"
-    match_copy_on_write "$BACKUP/store" "$PREP/store"
-    cp -a --reflink=always -- "$BACKUP/store/." "$PREP/store/" || die "cannot reflink the prep copy"
+    mkdir -- "$PREP" "$PREP/store"
+    switch_off_copy_on_write "$PREP/store"
+    "$daemon" --restore-backup "$BACKUP_ROOT" "$BACKUP_ID" "$PREP/store" 2>"$PREP/restore.log" \
+        || fail prep "cannot restore the prep copy: $(tail -n 1 -- "$PREP/restore.log")"
     {
         printf 'query_only = true\nsocket_path = "%s"\ndata_dir = "%s"\n' "$PREP/store/p.sock" "$PREP/store"
         printf 'text_lexicon_dir = "%s"\nmax_concurrent_requests = 4\nmax_rpc_connections = 16\n' "$lexicons"
@@ -638,11 +670,13 @@ place_batch() {
     mv -- "$SCRATCH/rehearsal/$name" "$root/$name"
 }
 # Rehearse the rollback's claim reconciliation (docs/deployment.md, "Claims after a rollback")
-# on scratch copies of the closed, measured copy, with the measured image in every role and
+# on the measured copy, restored from the set, with the measured image in every role and
 # every watch rebound below the rehearsal's own private directory. A watch put on the copy
 # feeds three record batches through it; max_records decides what each daemon can publish.
 #  1. Daemon A (max_records 2) claims batch-1 (3 records) and cannot publish it; it stops.
-#  2. The "backup": a reflink copy of that closed store, which journals claim C1.
+#  2. The "restored backup": a scratch copy of A's stopped store, which journals claim C1. It
+#     stands in for the store `--restore-backup` makes from a set taken at that point; the
+#     daemon takes online backups only to a network backup_root, so a scratch run cannot.
 #  3. The newer daemon B (max_records 4) publishes and removes batch-1, then claims batch-2
 #     (5 records) and cannot publish it: C2 stays in .sparrow-inflight/; it stops.
 #  4. The restored daemon on the backup refuses to start: C2 is unknown to it (finding 1).
@@ -1008,32 +1042,8 @@ durability=$(json_field durability failure <<<"$status") || exit 1
     || fail status "pressure phase $phase, durability failure $durability"
 pass status "ready, schema $(json_field schema_version <<<"$status"), format $(json_field store_format <<<"$status")"
 
-# Unique payload chunks change only when evidence is retired, which a query-only daemon never
-# does, so the copy holds exactly the count sparrow-backup recorded, however old it is. While
-# the store counters seed (status counts=pending, as on a copy a newer --image upgrades, or
-# SOURCE unique_payload_chunks=pending) a count is exact only through the seeding watermark, so
-# it is never compared: the check reports not verifiable, and every other check still runs. A
-# query-only daemon runs no maintenance, so a copy's pending counts stay pending until it stops.
-chunks=$(json_field unique_payload_chunks <<<"$status") || exit 1
 counts=$(status_counts <<<"$status") || exit 1
 [[ $counts == exact || $counts == pending ]] || fail status "status reports counts=$counts, neither exact nor pending"
-unrecorded=0 unverifiable=0
-if [[ -z $expected_chunks ]]; then
-    unrecorded=1
-    printf 'verify-backup: SKIP payload-chunks: %s chunks; SOURCE records no unique_payload_chunks, so this backup or its image predates the count\n' "$chunks"
-elif [[ $counts == pending ]]; then
-    unverifiable=1
-    printf "verify-backup: NOT VERIFIABLE payload-chunks: not verifiable (counts pending); the copy's store counters are still seeding, so its %s chunks are not a total to compare with SOURCE's %s\n" "$chunks" "$expected_chunks"
-elif [[ $expected_chunks == pending ]]; then
-    unverifiable=1
-    printf "verify-backup: NOT VERIFIABLE payload-chunks: not verifiable (counts pending); SOURCE recorded unique_payload_chunks=pending, so the live daemon logged no total to compare with the copy's %s chunks\n" "$chunks"
-elif [[ ! $expected_chunks =~ ^[0-9]+$ ]]; then
-    fail payload-chunks "SOURCE records unique_payload_chunks=$expected_chunks, neither a count nor pending"
-elif [[ $chunks == "$expected_chunks" ]]; then
-    pass payload-chunks "$chunks unique payload chunks, as SOURCE recorded"
-else
-    fail payload-chunks "the copy holds $chunks unique payload chunks, but SOURCE recorded $expected_chunks"
-fi
 
 # Records expire by the reader's clock, so the window answers only while all of it is younger
 # than the retention window the daemon reports.
@@ -1093,19 +1103,7 @@ stopped=0
 wait "$PID" || stopped=$?
 PID=''
 ((stopped == 0)) || fail shutdown "the daemon exited with status $stopped after SIGINT"
-# The closing count sparrow-backup records comes from this same line of the live daemon. A copy
-# whose counts were pending at status is still pending at the stop, so its line says pending.
-closing=$chunks
-[[ $counts == exact ]] || closing=pending
-grep -qx "sparrowd: closed store=$store unique_payload_chunks=$closing" -- "$LOG" \
-    || fail shutdown "the daemon did not log its closing count of unique_payload_chunks=$closing"
-pass shutdown "the daemon stopped cleanly and logged unique_payload_chunks=$closing; removing $SCRATCH"
-if ((unrecorded)); then
-    printf 'verify-backup: NOT VERIFIED: SOURCE records no unique_payload_chunks; take a new backup with sparrow-backup\n' >&2
-    exit 1
-fi
-if ((unverifiable)); then
-    printf 'verify-backup: %s verified except payload-chunks: not verifiable (counts pending)\n' "$BACKUP"
-    exit 3
-fi
+grep -Eq "^sparrowd: closed store=$store unique_payload_chunks=([0-9]+|pending)\$" -- "$LOG" \
+    || fail shutdown "the daemon did not log its closing count"
+pass shutdown "the daemon stopped cleanly; removing $SCRATCH"
 printf 'verify-backup: %s verified\n' "$BACKUP"

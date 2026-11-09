@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 [Unit]
-Description=Daily closed-store backup of the Sparrow service
+Description=Daily online backup of the Sparrow service to the NAS archive
 Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
 
 [Timer]
