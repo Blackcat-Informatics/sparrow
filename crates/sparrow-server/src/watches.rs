@@ -211,9 +211,11 @@ struct Candidate {
     stable_since: Instant,
 }
 
+/// The tail owner is boxed: it is more than twice the size of a claim root, and every
+/// consume detector would otherwise carry its size (clippy::large_enum_variant).
 enum Owner {
     Consume(ClaimRoot),
-    Tail(crate::tailing::TailRoot),
+    Tail(Box<crate::tailing::TailRoot>),
 }
 impl Owner {
     fn directory(&self, relative: &Path) -> Result<File, Error> {
@@ -273,9 +275,9 @@ impl Detector {
             crate::ProducerContract::FinishedFiles => {
                 Owner::Consume(ClaimRoot::open(store, &config.id, &config.root)?)
             }
-            crate::ProducerContract::ActiveFilesRetain => Owner::Tail(
+            crate::ProducerContract::ActiveFilesRetain => Owner::Tail(Box::new(
                 crate::tailing::TailRoot::open(store, &config, watch.revision)?,
-            ),
+            )),
         };
         let events = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
         let mut detector = Self {
