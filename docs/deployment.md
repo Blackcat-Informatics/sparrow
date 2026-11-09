@@ -900,8 +900,9 @@ restored store cannot settle by itself:
 2. The newer daemon published a file the backup still journals as claimed,
    then removed it. The restored daemon reports "unpublished claimed source is
    missing" for that claim and retries it every few seconds to 15 minutes,
-   and every nightly backup waits for it. Recovery needs the exact claimed
-   file, inode and change time included, so no recreated file can complete it.
+   and the watch reports that failure until the claim is retired. Recovery
+   needs the exact claimed file, inode and change time included, so no
+   recreated file can complete it.
 
 `deploy/reconcile-inflight.sh` handles both, asking the set-aside newer store
 what each claim was. Never delete an entry or a claim's bytes:
