@@ -37,9 +37,12 @@ const PAYLOAD_TRAINING_BYTES: i32 = 100 * PAYLOAD_DICTIONARY_BYTES;
 const INFO_LOGS: usize = 10;
 const INFO_LOG_BYTES: usize = 8 * 1024 * 1024;
 
-/// Database-wide options, including the info-log bound.
-pub(super) fn database() -> Options {
+/// Database-wide options, including the info-log bound and the table cache
+/// bound `max_open_files` derived from the descriptor limit
+/// ([`super::open_files::OpenFiles`]).
+pub(super) fn database(max_open_files: i32) -> Options {
     let mut options = family("default");
+    options.set_max_open_files(max_open_files);
     options.create_if_missing(true);
     options.create_missing_column_families(true);
     options.set_max_background_jobs(2);

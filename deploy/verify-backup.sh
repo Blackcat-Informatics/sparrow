@@ -119,6 +119,11 @@ unknown; set SPARROW_MEASURE_UNIT to the user unit that serves the store"
     [[ $UNIT_NICE =~ ^-?[0-9]+$ ]] || die "the user unit $MEASURE_UNIT reports Nice '$UNIT_NICE', not a nice level"
     SCOPE_LIMITS="$SCOPE_LIMITS Nice=$UNIT_NICE"
 fi
+# The daemon started here inherits this shell's descriptor limit, not the unit's. The store
+# refuses to open below a soft limit of 2048 and bounds its table cache to the rest (#148), so
+# the copy runs under the unit's LimitNOFILE=65536, before anything is copied.
+ulimit -Sn 65536 2>/dev/null \
+    || die "cannot raise the soft open-file limit to 65536 (hard limit $(ulimit -Hn)); the store needs the unit's LimitNOFILE"
 BACKUP=$(realpath -e -- "$1") || die "backup $1 does not exist"
 [[ -r $BACKUP/SOURCE ]] || die "$BACKUP holds no SOURCE; it is not a backup"
 [[ ! -L $BACKUP/store ]] || die "$BACKUP/store is a symbolic link; a backup holds its store itself"

@@ -59,6 +59,7 @@ mod record_spool;
 mod scope_receipt;
 pub(crate) mod space;
 pub use scope_receipt::{QUERY_SCOPE_PROFILE, QUERY_SCOPE_WORKSPACE_BYTES};
+pub(crate) mod open_files;
 mod recordless;
 pub(crate) mod result_read;
 pub(crate) mod retention_metrics;
@@ -506,6 +507,7 @@ struct Unlocked {
 #[derive(Clone)]
 pub struct Store {
     id: Arc<str>,
+    open_files: open_files::OpenFiles,
     space: space::SpaceFloor,
     inner: Arc<Mutex<Writer>>,
     unlocked: Arc<Unlocked>,
@@ -1357,8 +1359,9 @@ impl Store {
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         config.validate()?;
         let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
+        let open_files = open_files::OpenFiles::from_process()?;
         let db = DB::open_cf_descriptors(
-            &table_options::database(),
+            &table_options::database(open_files.max_open_files),
             path,
             table_options::descriptors(),
         )?;
@@ -1495,6 +1498,7 @@ impl Store {
         let query_staging = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let store = Self {
             id: Arc::from(id.as_str()),
+            open_files,
             space: space.clone(),
             unlocked: Arc::new(Unlocked {
                 db: Arc::clone(&db),
@@ -1543,6 +1547,12 @@ impl Store {
     /// Return the immutable identity validated at open, without waiting for a writer.
     pub fn store_id(&self) -> Result<String, Error> {
         Ok(self.id.to_string())
+    }
+
+    /// The descriptor limit at open and the table cache bound derived from it.
+    #[must_use]
+    pub fn open_files(&self) -> open_files::OpenFiles {
+        self.open_files
     }
 
     /// The free-space floor every write checks, readable without the writer lock.

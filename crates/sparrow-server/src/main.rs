@@ -226,14 +226,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpc = rpc.with_watch_controller(consumer.controller());
     }
     eprintln!(
-        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={} intake={}",
+        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={} intake={} {}",
         store_id,
         config.socket_path.display(),
         config.data_dir.display(),
         config.max_rpc_connections,
         config.max_concurrent_requests,
         config.query_only,
-        intake && !config.query_only
+        intake && !config.query_only,
+        store.open_files()
     );
     if let (Some(path), Some(gid)) = (&config.ingest_socket_path, config.ingest_socket_gid) {
         eprintln!(
