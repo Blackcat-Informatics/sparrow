@@ -163,13 +163,18 @@ pub(super) fn step<P: Publication>(
 
 /// Read a job's committed checkpoint.
 pub(super) fn progress<P>(db: &DB, job: &Job<P>) -> Result<Progress, Error> {
-    let bytes = db.get(job.checkpoint)?.ok_or_else(|| {
+    read_progress(job.checkpoint, |key| Ok(db.get(key)?))
+}
+
+/// Read the checkpoint `checkpoint` through `read`, a database or snapshot reader.
+pub(super) fn read_progress(
+    checkpoint: &str,
+    read: impl FnOnce(&str) -> Result<Option<Vec<u8>>, Error>,
+) -> Result<Progress, Error> {
+    let bytes = read(checkpoint)?.ok_or_else(|| {
         Error::new(
             "STORAGE_FAILURE",
-            format!(
-                "required {} state missing; restore the original catalog",
-                job.checkpoint
-            ),
+            format!("required {checkpoint} state missing; restore the original catalog"),
         )
     })?;
     if bytes.len() > 1024 {

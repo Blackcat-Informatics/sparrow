@@ -4475,11 +4475,12 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 .status()
                 .unwrap();
             assert!(status.success());
-            // The copy owes both schema 69 migrations and the source summary migration,
-            // which only a maintenance worker runs.
+            // The copy owes both schema 69 migrations, the source summary migration and a
+            // source timeline rebuild, which only a maintenance worker runs.
             let db = sparrow_test_support::catalog_db(&copied).unwrap();
             sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
             sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+            sparrow_test_support::stale_source_context_cache(&db).unwrap();
             drop(db);
             let copy_socket = copied.join("rpc.sock");
             let copy_config = write_server_config(&copy, &copied, &copy_socket);
@@ -4589,7 +4590,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             assert_eq!(status["counts"].as_str(), Some("pending"));
             assert_eq!(status["live_records"].as_str(), Some("0"));
             let migrations = status["migrations"].as_array().unwrap();
-            assert_eq!(migrations.len(), 4, "{migrations:?}");
+            assert_eq!(migrations.len(), 5, "{migrations:?}");
             for migration in migrations {
                 assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
                 assert_eq!(

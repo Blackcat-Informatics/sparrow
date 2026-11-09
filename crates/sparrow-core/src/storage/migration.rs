@@ -3,7 +3,8 @@
 
 //! Online store migrations: the store counter seeding (#146), the owner-to-graph index
 //! build (#13), the receipt-time event fallback backfill of record metadata graphs (#20),
-//! and the per-source counters and artifact index (#14).
+//! the per-source counters and artifact index (#14), and the source-context cache rebuild
+//! (#149).
 //!
 //! Opening a store fences older writers and seeds every checkpoint in one synchronized
 //! batch, then serves. The maintenance worker runs one page per admission through the
@@ -14,7 +15,9 @@
 //! completes its readers take the pending path: scoped SPARQL keeps the whole-store plan,
 //! SPARQL coverage counts the selected record graphs that still lack their fallback facts,
 //! the source and artifact listings refuse with `INDEX_NOT_READY` rather than present
-//! partial counts, and `status` recounts from a snapshot while the store counters seed.
+//! partial counts, record context refuses with `INDEX_NOT_READY` rather than read a partial
+//! source timeline cache, and `status` recounts from a snapshot while the store counters
+//! seed.
 //!
 //! Progress comes from the store counters ([`super::store_counters`]): a migration's
 //! `done` is its `done:` counter row, maintained with its checkpoint, and its `total` is
@@ -22,8 +25,8 @@
 
 use super::store_counters::{self, Counter, Positions, Reader};
 use super::{
-    Error, Store, Writer, catalog_upgrade, event_fallback_rdf, rdf_index, source_summary,
-    writer_format,
+    Error, Store, Writer, catalog_upgrade, event_fallback_rdf, rdf_index, source_context,
+    source_summary, writer_format,
 };
 use rocksdb::{DB, WriteBatch};
 
@@ -48,16 +51,20 @@ pub enum Migration {
     EventFallbackRdf,
     /// Per-source counters, retained record counts and the per-source artifact index (#14).
     SourceSummary,
+    /// The source timeline cache record context reads, rebuilt only when the open found it
+    /// stale (#149).
+    SourceContext,
 }
 
 impl Migration {
     /// Every migration, in run order: the counters first, then the index, since its pages
     /// are few and cheap.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::StoreCounters,
         Self::OwnerGraphIndex,
         Self::EventFallbackRdf,
         Self::SourceSummary,
+        Self::SourceContext,
     ];
 
     /// Stable status and journal name.
@@ -68,6 +75,7 @@ impl Migration {
             Self::OwnerGraphIndex => "owner-graph-index",
             Self::EventFallbackRdf => "event-fallback-rdf",
             Self::SourceSummary => "source-summary",
+            Self::SourceContext => "source-context",
         }
     }
 
@@ -91,6 +99,7 @@ impl Migration {
             Self::OwnerGraphIndex => &[Counter::GraphDeclarations],
             Self::EventFallbackRdf => &[Counter::RecordGraphs],
             Self::SourceSummary => &[Counter::Artifacts, Counter::Records],
+            Self::SourceContext => &[Counter::Records],
         }
     }
 }
@@ -135,15 +144,19 @@ pub struct MigrationPage {
     pub total: Option<u64>,
     /// Committed position after the page; absent once complete.
     pub watermark: Option<String>,
+    /// A failure the page latched durably, which stops the migration: the source-context
+    /// rebuild's corrupt record metadata.
+    pub failure: Option<String>,
 }
 
 /// Latched page failures of this session, by migration. Held apart from the writer so the
 /// progress report never waits for it.
 pub(super) type Failures = std::sync::Mutex<[Option<String>; Migration::ALL.len()]>;
 
-/// Fence older writers and seed every migration this store has not started, in one
-/// synchronized batch, then validate every checkpoint. A fenced store without its
-/// migration state refuses rather than serving a partial index, backfill or counter.
+/// Fence older writers, seed every migration this store has not started and reset a stale
+/// source-context cache, in one synchronized batch, then validate every checkpoint. A
+/// fenced store without its migration state refuses rather than serving a partial index,
+/// backfill or counter.
 pub(super) fn fence(db: &DB) -> Result<(), Error> {
     let mut format = db
         .get("store_format")?
@@ -158,6 +171,7 @@ pub(super) fn fence(db: &DB) -> Result<(), Error> {
     if !writer_format::has_source_summary(&format) {
         format = source_summary::fence(db, &format, &mut batch)?.to_vec();
     }
+    source_context::fence(db, &mut batch)?;
     // Last, so its zero rows and start position describe every checkpoint seeded above.
     if !writer_format::has_store_counters(&format) {
         store_counters::fence(db, &mut batch)?;
@@ -226,13 +240,24 @@ pub(super) fn report(
                     values[&Counter::SourceSummaryDone],
                     source_summary::progress(|key| reader.get(key.as_bytes()))?.watermark(),
                 ),
+                Migration::SourceContext => (
+                    values[&Counter::SourceContextDone],
+                    source_context::watermark(|key| reader.get(key.as_bytes()))?,
+                ),
+            };
+            // The source-context rebuild latches corrupt metadata durably, not per session.
+            let failure = match (&failures[migration.index()], migration) {
+                (None, Migration::SourceContext) => {
+                    source_context::latched_failure(|key| reader.get(key.as_bytes()))?
+                }
+                (failure, _) => failure.clone(),
             };
             Ok(MigrationStatus {
                 name: migration.name(),
                 done,
                 total,
                 watermark,
-                failure: failures[migration.index()].clone(),
+                failure,
             })
         })
         .collect()
@@ -257,6 +282,7 @@ impl Writer {
                         .watermark()
                         .is_none()
                 }
+                Migration::SourceContext => !source_context::pending(&self.db)?,
             };
             if !complete {
                 return Ok(Some(*migration));
@@ -273,6 +299,7 @@ impl Writer {
             Migration::OwnerGraphIndex => rdf_index::owner_graph_page(&self.db, OWNER_GRAPH_PAGE)?,
             Migration::EventFallbackRdf => event_fallback_rdf::page(&self.db, EVENT_FALLBACK_PAGE)?,
             Migration::SourceSummary => source_summary::page(&self.db)?,
+            Migration::SourceContext => source_context::page(&self.db)?,
         };
         let Some((batch, complete)) = staged else {
             return Ok(true);
@@ -327,6 +354,7 @@ impl Store {
             done: status.done,
             total: status.total,
             watermark: status.watermark,
+            failure: status.failure,
         }))
     }
 

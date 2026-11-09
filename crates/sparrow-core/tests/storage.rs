@@ -1498,6 +1498,9 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     );
 }
 
+/// INVARIANT: temporal reads never load a record outside their half-open interval, so
+/// corrupt metadata outside it does not fail them; the source timeline rebuild that meets
+/// that metadata latches a durable failure, stops paging and refuses context.
 #[test]
 fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
     use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery};
@@ -1518,8 +1521,20 @@ fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
         db.put(&artifact.record_ids[0], b"broken catalog encoding")
             .unwrap();
     }
+    // A reset makes the source timeline rebuild read the corrupt metadata.
+    sparrow_test_support::stale_source_context_cache(&db).unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
+    // The rebuild latches the corruption durably and stops paging instead of retrying.
+    let page = store.migrate_step().unwrap().unwrap();
+    assert_eq!(page.migration, sparrow_core::Migration::SourceContext);
+    assert_eq!(store.migrate_step().unwrap(), None);
+    let rebuild =
+        store.migrations().unwrap()[sparrow_core::Migration::SourceContext.index()].clone();
+    assert!(
+        rebuild.failure.is_some() && !rebuild.complete(),
+        "{rebuild:?}"
+    );
     let scope = QueryScope {
         selection: QuerySelection::Live,
         source: None,
@@ -12420,8 +12435,59 @@ fn context_catalog_admission_still_charges_skipped_same_source_members() {
     );
 }
 
+fn context_scope() -> sparrow_core::QueryScope {
+    sparrow_core::QueryScope {
+        selection: sparrow_core::QuerySelection::Live,
+        source: None,
+        sources: None,
+        diagnostics: Default::default(),
+        require_complete_index: false,
+        received_from: 0,
+        received_before: 3,
+        limit: 100,
+        scan_budget: 100,
+    }
+}
+
+/// INVARIANT (#149): reopening a store whose source-context cache carries its current
+/// generation marker rebuilds nothing: an entry planted in the cache survives the reopen,
+/// no migration page is owed, and context answers at once.
+#[test]
+fn reopening_an_intact_context_cache_does_no_rebuild() {
+    use sparrow_core::Migration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let anchor = store
+        .ingest("intact-anchor", "intact", "log", b"anchor\n", 1)
+        .unwrap();
+    store
+        .ingest("intact-neighbor", "intact", "log", b"neighbor\n", 2)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.put(b"source-context-v1:planted", b"record:planted")
+        .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let status = store.migrations().unwrap()[Migration::SourceContext.index()].clone();
+    assert!(status.complete(), "{status:?}");
+    assert_eq!(store.migrate_step().unwrap(), None);
+    let context = store
+        .records_context(&anchor.record_ids[0], &context_scope(), 1, 1, 3)
+        .unwrap();
+    assert_eq!(context.after.records.len(), 1);
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    assert!(db.get(b"source-context-v1:planted").unwrap().is_some());
+}
+
+/// INVARIANT (#149): a cache without its generation marker, as a preceding binary's
+/// interrupted clear leaves it, is reset at open and rebuilt online. Until the rebuild
+/// completes, context refuses retryably with `INDEX_NOT_READY` rather than answer from the
+/// partial cache; afterwards stale entries are gone and missing ones are restored.
 #[test]
 fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
+    use sparrow_core::Migration;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let anchor = store
@@ -12440,27 +12506,32 @@ fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
         }
         entries.push(key);
     }
-    assert_eq!(entries.len(), 2);
-    // Simulate a derivative left stale by a preceding catalog writer.
+    // The generation marker sorts first, then the two record entries.
+    assert_eq!(entries.len(), 3);
     db.delete(&entries[0]).unwrap();
-    db.put(&entries[1], b"record:missing").unwrap();
+    // Simulate derivatives left stale by a preceding catalog writer.
+    db.delete(&entries[1]).unwrap();
+    db.put(&entries[2], b"record:missing").unwrap();
     db.put(b"source-context-v1:obsolete", b"record:missing")
         .unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
-    let scope = sparrow_core::QueryScope {
-        selection: sparrow_core::QuerySelection::Live,
-        source: None,
-        sources: None,
-        diagnostics: Default::default(),
-        require_complete_index: false,
-        received_from: 0,
-        received_before: 3,
-        limit: 100,
-        scan_budget: 100,
-    };
+    let refused = store
+        .records_context(&anchor.record_ids[0], &context_scope(), 1, 1, 3)
+        .unwrap_err();
+    assert_eq!(refused.code, "INDEX_NOT_READY", "{refused:?}");
+    assert!(refused.message.contains("source-context"), "{refused:?}");
+    let pending = store.migrations().unwrap()[Migration::SourceContext.index()].clone();
+    assert_eq!(
+        (pending.done, pending.total, pending.watermark.as_deref()),
+        (0, Some(2), Some("start"))
+    );
+    while let Some(page) = store.migrate_step().unwrap() {
+        assert_eq!(page.migration, Migration::SourceContext);
+    }
+    assert!(store.migrations().unwrap()[Migration::SourceContext.index()].complete());
     let context = store
-        .records_context(&anchor.record_ids[0], &scope, 1, 1, 3)
+        .records_context(&anchor.record_ids[0], &context_scope(), 1, 1, 3)
         .unwrap();
     assert!(context.before.records.is_empty());
     assert_eq!(context.after.records[0].id, neighbor.record_ids[0]);
@@ -19244,15 +19315,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     };
     let migrated = answers(&store);
     assert!(!migrated[2].0.is_empty(), "fallback facts are queryable");
-    assert_eq!(
-        store
-            .migrations()
-            .unwrap()
-            .iter()
-            .filter(|m| m.complete())
-            .count(),
-        4
-    );
+    assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
     let (declared, _) = owner_graph_rows(&db);
@@ -19271,12 +19334,14 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
             "store-counters",
             "owner-graph-index",
             "event-fallback-rdf",
-            "source-summary"
+            "source-summary",
+            "source-context"
         ]
     );
-    // The per-source counters were not part of schema 69 and stay complete; the store
-    // counters are reseeded because the fixture rewrote checkpoints offline.
-    assert!(pending[3].complete(), "{pending:?}");
+    // The per-source counters and the source timeline cache were not part of schema 69
+    // and stay complete; the store counters are reseeded because the fixture rewrote
+    // checkpoints offline.
+    assert!(pending[3..].iter().all(|m| m.complete()), "{pending:?}");
     assert!(!pending[0].complete(), "{pending:?}");
     for migration in &pending[1..3] {
         assert!(!migration.complete(), "{migration:?}");

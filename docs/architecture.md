@@ -553,7 +553,8 @@ atomically through the ordinary write path, so a restart resumes after the last
 committed page and a failed page is retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
 could differ: the schema 69 receipt-time fallback backfill is reported in
-SPARQL coverage, and the source listings refuse while their counters are seeded. `status` reports each migration's progress. A query-only
+SPARQL coverage, the source listings refuse while their counters are seeded,
+and record context refuses while a stale source timeline cache is rebuilt. `status` reports each migration's progress. A query-only
 daemon runs no maintenance worker, so it serves on the pending paths. Writers
 come before pages: before a page the maintenance worker waits while an ingest,
 publication or RPC write is waiting for the writer lock, for at most the longer

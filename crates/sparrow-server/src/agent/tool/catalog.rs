@@ -76,7 +76,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "artifacts_list",
-        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads pages of the per-source index, ordered by source key, then original receipt, then ID, that count delivered rows until the last page. In the live listing, original receipt-time filters find reclaimed parents at their indexed receipt, without origin metadata; an explicit scope still refuses a receipt filter that meets a parent with no origin. The live listing refuses INDEX_NOT_READY while the source-summary migration seeds the index.",
+        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads pages of the per-source index, ordered by source key, then original receipt, then ID, that count delivered rows until the last page. In the live listing, original receipt-time filters find reclaimed parents at their indexed receipt, without origin metadata; an explicit scope still refuses a receipt filter that meets a parent with no origin. The live listing refuses INDEX_NOT_READY while the source-summary migration seeds the index, or while the source-context migration rebuilds the source timeline cache a reclaimed parent's records are read through.",
     ),
     (
         "diagnostic_define",
@@ -136,7 +136,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "records_context",
-        "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity.",
+        "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity. Refuses INDEX_NOT_READY while the source-context migration rebuilds the source timeline cache.",
     ),
     (
         "rdf_inspect",
