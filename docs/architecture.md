@@ -151,6 +151,16 @@ as well as payload storage, and one publication boundary for its catalog. This
 is an architectural choice to benchmark, not a demonstrated performance win.
 Filesystems remain relevant for disk placement and hard quotas.
 
+Intake must never wait on a stopped write path. Each family keeps four 32 MiB memtables,
+so up to three can wait for a flush before RocksDB stops writes. Six background jobs give
+one flush slot that never queues behind a compaction, and up to five compactions that
+RocksDB starts only while level-0 files or pending compaction bytes call for a speed-up;
+an idle store runs one. A level-0 compaction may split into two threads. Compaction
+threads run at the lowest CPU priority, so on a host shared with other services they
+yield to intake. The stated target is no hard stops and at most 1 percent of the time
+stalled at the live write rate; the measurement is in
+[load qualification](load-qualification.md#write-stalls-issue-160).
+
 ### 4.2 Deduplication and compression
 
 Hash original bytes before content lookup. Deduplicate complete identical

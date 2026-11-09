@@ -1302,6 +1302,24 @@ async fn run(
                     Some(format!("claim {id}: {error}").chars().take(1024).collect());
                 detector.failed_claim = Some(id.clone());
                 eprintln!("sparrowd: watch={watch} claim={id} pending: {error}");
+                // The claim's durable history answers `watch claims` after any restart.
+                match store.consumption_attempt_pending(&id, &error.to_string(), crate::now()?) {
+                    Ok(_) => {}
+                    Err(record) if record.code == "STORAGE_FAILURE" => {
+                        return Err(Error::Storage(record));
+                    }
+                    Err(record) => {
+                        eprintln!(
+                            "sparrowd: watch={watch} claim={id} pending attempt not recorded: {record}"
+                        );
+                        detector.failure = Some(
+                            format!("claim {id}: {error}; attempt not recorded: {record}")
+                                .chars()
+                                .take(1024)
+                                .collect(),
+                        );
+                    }
+                }
                 let failures = retry
                     .get(&id)
                     .map_or(0, |(_, failures)| *failures)

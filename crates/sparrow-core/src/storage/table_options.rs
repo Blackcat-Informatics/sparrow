@@ -16,8 +16,8 @@
 //! ZSTD linked, the RocksDB build requires ZSTD 1.4 or newer and always
 //! supports its dictionary trainer.
 
-use super::{FAMILIES, pressure, rdf_index};
-use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, DBCompressionType, Options};
+use super::{Error, FAMILIES, pressure, rdf_index};
+use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, DBCompressionType, Env, Options};
 
 /// Identity of the options below. Change it with any option that alters how
 /// new table files are written, and list the families it rewrites.
@@ -26,7 +26,20 @@ pub(super) const PROFILE: &str = "sparrow.table-options/2";
 /// predecessor. Their existing files are rewritten once in the background.
 pub(super) const REWRITTEN: [&str; 2] = ["default", "payload"];
 
-const WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Memtable bytes per family. Larger memtables flush less often into fewer, larger level-0
+/// files, so level 0 reaches its slowdown trigger later; memtable size changes no table file
+/// encoding, so the profile is unchanged.
+const WRITE_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+/// Memtables per family: one filling and up to three waiting for a flush before RocksDB
+/// stops writes, where two (its default) stopped intake whenever one flush lagged.
+const WRITE_BUFFERS: i32 = 4;
+/// Background flush and compaction slots. RocksDB gives one of every four to flushes, so a
+/// flush never queues behind a compaction. It runs more than one compaction only while
+/// level-0 files or pending compaction bytes call for a speed-up, so an idle store still
+/// uses one compaction thread and takes no shared cores.
+const BACKGROUND_JOBS: i32 = 6;
+/// Threads one level-0 compaction may split into, so a backlog drains in parallel.
+const SUBCOMPACTIONS: u32 = 2;
 const BLOCK_BYTES: usize = 32 * 1024;
 const REVERSE_BLOCK_BYTES: usize = 4 * 1024;
 const BOTTOMMOST_ZSTD_LEVEL: i32 = 6;
@@ -40,15 +53,28 @@ const INFO_LOG_BYTES: usize = 8 * 1024 * 1024;
 /// Database-wide options, including the info-log bound and the table cache
 /// bound `max_open_files` derived from the descriptor limit
 /// ([`super::open_files::OpenFiles`]).
-pub(super) fn database(max_open_files: i32) -> Options {
+///
+/// Compaction threads run at the lowest CPU priority, below intake and the flush threads;
+/// their I/O priority is left alone, because an idle I/O class lets other disk users on a
+/// shared host starve compaction until writes stall.
+pub(super) fn database(max_open_files: i32) -> Result<Options, Error> {
     let mut options = family("default");
     options.set_max_open_files(max_open_files);
     options.create_if_missing(true);
     options.create_missing_column_families(true);
-    options.set_max_background_jobs(2);
+    options.set_max_background_jobs(BACKGROUND_JOBS);
+    options.set_max_subcompactions(SUBCOMPACTIONS);
+    let mut env = Env::new().map_err(|error| {
+        Error::new(
+            "STORAGE_FAILURE",
+            format!("RocksDB environment unavailable: {error}"),
+        )
+    })?;
+    env.lower_thread_pool_cpu_priority();
+    options.set_env(&env);
     options.set_keep_log_file_num(INFO_LOGS);
     options.set_max_log_file_size(INFO_LOG_BYTES);
-    options
+    Ok(options)
 }
 
 /// One descriptor for every declared family, each built by [`family`].
@@ -63,6 +89,7 @@ pub(super) fn descriptors() -> Vec<ColumnFamilyDescriptor> {
 pub(super) fn family(name: &str) -> Options {
     let mut options = Options::default();
     options.set_write_buffer_size(WRITE_BUFFER_BYTES);
+    options.set_max_write_buffer_number(WRITE_BUFFERS);
     options.set_compression_type(DBCompressionType::Lz4);
     options.set_bottommost_compression_type(DBCompressionType::Zstd);
     pressure::native_compaction_options(&mut options);

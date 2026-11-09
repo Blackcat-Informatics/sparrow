@@ -443,3 +443,47 @@ newest online backup, which reports `backfill_seconds`, done/total progress and
 That measurement is pending: it has not been run on the newest backup, so no
 duration is recorded here. It is recorded in this section with the image, its
 sha256 and the backup it ran on once it runs.
+
+## Write stalls (issue 160)
+
+The live daemon (schema 68 image, two background jobs, two 8 MiB memtables per family)
+spent 35 percent of its life with writes stalled or stopped. Its LOG on 2026-11-09 shows
+57 slowdowns and 19 stops from 01:00 to 04:40, 440 and 141 from 04:40 to 09:00, and 139
+and 51 from 09:00 to 14:30, with level 0 at 21 to 25 files on the slowdown lines.
+
+The measurement uses a scratch store driven by a throwaway in-process driver at about the
+live key rate (17,000 to 19,000 RocksDB keys and 1.2 to 1.4 MB per second, against about
+15,000 keys and 1.35 MB live). A synthetic ingest makes about two times the live key rate
+per producer thread, so a store of the live 37.6 GB was out of reach; the base store is
+5.4 GB. Driven at the live rate without compaction debt, the current options showed no
+slowdown or stop and 0.0 percent stall, which reproduces nothing of the live store. So
+each set starts from one reflinked copy of a debt store: the base plus 13 minutes of
+four-producer ingest with automatic compaction off and 256 MiB memtables, leaving 32
+level-0 files in the default family and 5.3 GB of estimated pending compaction on a
+9.7 GB store, about the live ratio. Each set then ran 12 minutes at the live rate, at
+nice 10, on the shared 32-core host. A status probe made the reads of the status RPC
+once a second throughout.
+
+| Set | Options | Stall % | Stops | Slowdowns | Pending start / end GB | Status max ms |
+|---|---|---|---|---|---|---|
+| A, current | 2 jobs, 8 MiB x 2 | 6.5 | 1 | 1 | 5.34 / 0.27 | 54 |
+| B | 4 jobs, 8 MiB x 4 | 9.2 | 1 | 1 | 5.34 / 0.00 | 78 |
+| C, chosen | 6 jobs, 2 subcompactions, 32 MiB x 4, low CPU priority | 0.1 | 0 | 3 | 5.34 / 0.00 | 164 |
+| D | C with idle I/O priority | 4.6 | 1 | 4 | 5.34 / 0.00 | 378 |
+| E | 8 jobs, 4 subcompactions, 64 MiB x 4, low CPU priority | 0.1 | 0 | 3 | 5.34 / 0.00 | 196 |
+
+Stall percent is RocksDB's cumulative stall over the run's uptime. A stop is a "Stopping
+writes" line; under A, B and D level 0 reached 36 files while one level-0 compaction held
+every level-0 file. More compaction jobs alone (B) do not help that compaction; two
+subcompactions split it (C). An idle I/O class for compaction (D) brought the stop back
+on the shared disk, so only CPU priority is lowered. E matches C with twice the
+subcompaction threads and memtable memory, so C is chosen. The stated target is no stops
+and at most 1 percent stall at the live rate. Status reads take no writer lock; the probe's
+slowest answer in any run was 378 ms. The logs do not show whether a probe fell inside a
+stop: under A the stop was logged by the thread still opening the store, before the probe
+started.
+
+The live 24-hour acceptance runs after the D147 switch. A one-off four-producer stress run
+of the current options stopped after 72 slowdowns at 0.5 percent stall, when its driver
+failed on a full buffered-durability ledger; it is kept as found. The scripts, logs and
+table are under `.stage/160/` in the main checkout.

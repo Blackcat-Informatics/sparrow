@@ -144,6 +144,125 @@ pub struct ConsumptionJournal {
     pub tail_published: bool,
     /// Explicit directory-synced removal confirmation clock.
     pub removed_at: Option<u64>,
+    /// Publication attempts and the last reason the claim stayed pending. Not part of the
+    /// claim's identity.
+    pub history: ClaimHistory,
+}
+
+/// Room each new journal keeps for its history to grow: two clocks and a pending reason.
+const HISTORY_ROOM: usize = 448;
+/// Most bytes a recorded pending reason occupies once JSON-encoded.
+const REASON_BYTES: usize = 320;
+/// Room a journal keeps for the removal clock and the completed-receipt wrapper.
+const COMPLETION_ROOM: usize = 128;
+/// Room an unclaimed journal keeps for its claimed observation.
+const CLAIMED_ROOM: usize = 384;
+
+/// Durable publication history of one claim, kept in its journal through completion or
+/// retirement. A journal reserved before schema 71 has no first-seen time and counts only
+/// attempts made since.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClaimHistory {
+    /// Unix milliseconds of the reservation.
+    pub first_seen: Option<u64>,
+    /// Publication attempts: each one that left the claim pending, and the one completing it.
+    pub attempts: u32,
+    /// Unix milliseconds of the latest attempt.
+    pub last_attempt_at: Option<u64>,
+    /// Unix milliseconds of the latest attempt that left the claim pending.
+    pub last_pending_at: Option<u64>,
+    /// Why that attempt left the claim pending.
+    pub last_pending_reason: Option<String>,
+}
+
+fn optional_clock(value: &Value, name: &'static str) -> Result<Option<u64>, Error> {
+    if value.get(name).is_none() {
+        return Ok(None);
+    }
+    read_field::<String>(value, name)?
+        .parse()
+        .map(Some)
+        .map_err(|_| Error::new("STORAGE_FAILURE", format!("invalid claim {name}")))
+}
+
+impl Catalog for ClaimHistory {
+    fn encode(&self) -> Value {
+        let mut out = Object::new().with("attempts", u64::from(self.attempts));
+        for (name, clock) in [
+            ("first_seen", self.first_seen),
+            ("last_attempt_at", self.last_attempt_at),
+            ("last_pending_at", self.last_pending_at),
+        ] {
+            if let Some(clock) = clock {
+                out = out.with(name, clock.to_string());
+            }
+        }
+        if let Some(reason) = &self.last_pending_reason {
+            out = out.with("last_pending_reason", reason.clone());
+        }
+        out.into()
+    }
+
+    fn decode(value: &Value) -> Result<Self, Error> {
+        Ok(Self {
+            first_seen: optional_clock(value, "first_seen")?,
+            attempts: read_field(value, "attempts")?,
+            last_attempt_at: optional_clock(value, "last_attempt_at")?,
+            last_pending_at: optional_clock(value, "last_pending_at")?,
+            last_pending_reason: match value.get("last_pending_reason") {
+                None => None,
+                Some(_) => Some(read_field(value, "last_pending_reason")?),
+            },
+        })
+    }
+}
+
+/// The longest prefix of `reason` whose JSON encoding fits in `budget` bytes.
+fn fit_reason(reason: &str, budget: usize) -> String {
+    let mut used = 2;
+    let mut fitted = String::new();
+    for c in reason.chars() {
+        let mut one = [0; 4];
+        let bytes = json::write_compact(&Value::from(&*c.encode_utf8(&mut one))).len() - 2;
+        if used + bytes > budget {
+            break;
+        }
+        used += bytes;
+        fitted.push(c);
+    }
+    fitted
+}
+
+impl ConsumptionJournal {
+    /// Record one attempt that left this active claim pending, at `now`, because of `reason`.
+    /// The reason is shortened to the journal's remaining room; a journal with no room left
+    /// even for the clocks refuses, so the record never grows past what readers accept.
+    fn record_pending(&mut self, now: u64, reason: &str) -> Result<(), Error> {
+        let history = &mut self.history;
+        history.attempts = history.attempts.saturating_add(1);
+        history.last_attempt_at = Some(now);
+        history.last_pending_at = Some(now);
+        history.last_pending_reason = Some(String::new());
+        let room = COMPLETION_ROOM
+            + if self.claimed.is_none() {
+                CLAIMED_ROOM
+            } else {
+                0
+            };
+        let used = json::write_compact(&self.encode()).len() + room;
+        let budget = JOURNAL_BYTES
+            .checked_sub(used)
+            .ok_or_else(|| {
+                Error::new(
+                    "RESOURCE_LIMIT",
+                    "the claim journal has no room left to record a pending attempt",
+                )
+            })?
+            .min(REASON_BYTES - 2)
+            + 2;
+        self.history.last_pending_reason = Some(fit_reason(reason, budget));
+        Ok(())
+    }
 }
 
 fn key(id: &str) -> String {
@@ -250,6 +369,7 @@ impl Catalog for ConsumptionJournal {
             .with("tail", self.tail.as_ref().map(Catalog::encode))
             .with("tail_published", self.tail_published)
             .with("removed_at", self.removed_at.map(|v| v.to_string()))
+            .with("history", self.history.encode())
             .into()
     }
 
@@ -290,6 +410,11 @@ impl Catalog for ConsumptionJournal {
                         .map_err(|_| Error::new("STORAGE_FAILURE", "invalid removal clock"))
                 })
                 .transpose()?,
+            // A journal written before schema 71 has no history.
+            history: match value.get("history") {
+                None => ClaimHistory::default(),
+                Some(history) => ClaimHistory::decode(history)?,
+            },
         };
         journal
             .validate()
@@ -320,6 +445,7 @@ impl ConsumptionJournal {
         format: &str,
         observed: ConsumptionGeneration,
         directories: ConsumptionDirectories,
+        now: u64,
     ) -> Result<Self, Error> {
         let mut journal = Self {
             import_id: String::new(),
@@ -335,6 +461,10 @@ impl ConsumptionJournal {
             tail: None,
             tail_published: false,
             removed_at: None,
+            history: ClaimHistory {
+                first_seen: Some(now),
+                ..ClaimHistory::default()
+            },
         };
         journal.validate()?;
         journal.request_id = journal.reserved_request();
@@ -621,6 +751,11 @@ impl Writer {
 impl Store {
     /// Reserve one source generation before any rename. Repeated reservation
     /// returns its original journal; changed interpretation refuses atomically.
+    /// `now` is the claim's first-seen time.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one reservation names its watch, path, interpretation, generation, anchors and time"
+    )]
     pub fn consumption_reserve(
         &self,
         watch: &str,
@@ -629,7 +764,9 @@ impl Store {
         format: &str,
         observed: ConsumptionGeneration,
         directories: ConsumptionDirectories,
+        now: u64,
     ) -> Result<ConsumptionJournal, Error> {
+        crate::format_instant(now)?;
         let journal = ConsumptionJournal::reservation(
             watch,
             relative_path,
@@ -637,6 +774,7 @@ impl Store {
             format,
             observed,
             directories,
+            now,
         )?;
         self.reserve_consumption(journal, None)
     }
@@ -684,9 +822,11 @@ impl Store {
         let mut batch = WriteBatch::default();
         let is_new = previous.is_none();
         let journal = previous.unwrap_or(journal);
-        // Leave room for the claimed observation, completed receipt wrapper,
-        // and removal clock without exceeding the reader's 8 KiB ceiling.
-        if json::write_compact(&journal.encode()).len() > JOURNAL_BYTES - 512 {
+        // Leave room for the claimed observation, completed receipt wrapper, removal clock
+        // and history without exceeding the reader's 8 KiB ceiling.
+        if json::write_compact(&journal.encode()).len()
+            > JOURNAL_BYTES - COMPLETION_ROOM - CLAIMED_ROOM - HISTORY_ROOM
+        {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 "source ownership proof exceeds the 8 KiB journal budget",
@@ -947,6 +1087,8 @@ impl Store {
         now.checked_add(RETRY_WINDOW)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "removal retry deadline overflow"))?;
         journal.removed_at = Some(now);
+        journal.history.attempts = journal.history.attempts.saturating_add(1);
+        journal.history.last_attempt_at = Some(now);
         let mut batch = WriteBatch::default();
         let saved: Value = Object::new()
             .with("journal", journal.encode())
@@ -957,5 +1099,190 @@ impl Store {
         writer.finish_handoffs(&mut batch, id, now)?;
         writer.commit(batch)?;
         Ok(journal)
+    }
+
+    /// Record that one publication attempt of active claim `id` left it pending at `now`,
+    /// and why. The claim stays in the active set; only its history changes.
+    pub fn consumption_attempt_pending(
+        &self,
+        id: &str,
+        reason: &str,
+        now: u64,
+    ) -> Result<ConsumptionJournal, Error> {
+        crate::format_instant(now)?;
+        let writer = self.lock()?;
+        if writer.db.get(key(id))?.is_none() {
+            return Err(Error::new("NOT_FOUND", "no active consumption journal"));
+        }
+        let mut journal = writer
+            .consumption(id)?
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "active consumption entry missing"))?;
+        journal.record_pending(now, reason)?;
+        let mut batch = WriteBatch::default();
+        put(&mut batch, &key(id), &journal);
+        writer.commit(batch)?;
+        Ok(journal)
+    }
+
+    /// Every claim that is pending now, and every completed or abandoned claim that went
+    /// pending (an attempt left it pending, or it was retired) within `since..=until` Unix
+    /// milliseconds, read from one snapshot without the writer lock. Completed claims are
+    /// kept for the two-day retry window. More than [`MAX_LISTED_CLAIMS`] matches refuse,
+    /// so the caller narrows the window rather than receiving a partial list.
+    pub fn consumption_claims(&self, since: u64, until: u64) -> Result<Vec<ClaimListing>, Error> {
+        if since > until {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "a claim window must not end before it starts",
+            ));
+        }
+        self.refuse_poisoned()?;
+        let within = |clock: Option<u64>| clock.is_some_and(|at| (since..=until).contains(&at));
+        let snapshot = self.unlocked.db.snapshot();
+        let mut claims = Vec::new();
+        for (prefix, state) in [
+            ("consumption:", ClaimState::Pending),
+            ("request:consumption-complete:", ClaimState::Complete),
+            (RETIRED_PREFIX, ClaimState::Abandoned),
+        ] {
+            let rows = snapshot.iterator(rocksdb::IteratorMode::From(
+                prefix.as_bytes(),
+                rocksdb::Direction::Forward,
+            ));
+            for row in rows {
+                let (name, bytes) = row?;
+                let Some(id) = name.strip_prefix(prefix.as_bytes()) else {
+                    break;
+                };
+                if bytes.len() > JOURNAL_BYTES * 2 {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "claim record exceeds its admitted size",
+                    ));
+                }
+                let value = parse(&bytes)?;
+                let (journal, finished_at) = match state {
+                    ClaimState::Pending => (ConsumptionJournal::decode(&value)?, None),
+                    ClaimState::Complete => {
+                        let journal = ConsumptionJournal::decode(super::field(&value, "journal")?)?;
+                        let removed = journal.removed_at;
+                        (journal, removed)
+                    }
+                    ClaimState::Abandoned => {
+                        let retired = RetiredConsumption::decode(&value)?;
+                        (retired.journal, Some(retired.retirement.retired_at))
+                    }
+                };
+                if journal.import_id.as_bytes() != id {
+                    return Err(Error::new("STORAGE_FAILURE", "claim record key mismatch"));
+                }
+                let listed = match state {
+                    ClaimState::Pending => true,
+                    ClaimState::Complete => within(journal.history.last_pending_at),
+                    ClaimState::Abandoned => {
+                        within(journal.history.last_pending_at) || within(finished_at)
+                    }
+                };
+                if !listed {
+                    continue;
+                }
+                if claims.len() >= MAX_LISTED_CLAIMS {
+                    return Err(Error::new(
+                        "RESOURCE_LIMIT",
+                        format!(
+                            "more than {MAX_LISTED_CLAIMS} claims match; narrow the time window"
+                        ),
+                    ));
+                }
+                claims.push(ClaimListing {
+                    journal,
+                    state,
+                    finished_at,
+                });
+            }
+        }
+        claims.sort_by(|a, b| {
+            (a.journal.history.first_seen, &a.journal.import_id)
+                .cmp(&(b.journal.history.first_seen, &b.journal.import_id))
+        });
+        Ok(claims)
+    }
+}
+
+/// Most claims one [`Store::consumption_claims`] listing returns.
+pub const MAX_LISTED_CLAIMS: usize = 2048;
+
+/// Where one claim stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimState {
+    /// In the active recovery set: not yet published and removed.
+    Pending,
+    /// Published and its source removal confirmed.
+    Complete,
+    /// Retired unrecoverable by an administrator; it will never publish.
+    Abandoned,
+}
+
+/// One claim in a [`Store::consumption_claims`] listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimListing {
+    /// The claim's journal, including its history.
+    pub journal: ConsumptionJournal,
+    /// Where the claim stands.
+    pub state: ClaimState,
+    /// Unix milliseconds of its completion or retirement; none while pending.
+    pub finished_at: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// INVARIANT (issue 160): a journal written before schema 71 has no history, and every
+    /// active and completed claim of a live store is such a journal at the switch. It must
+    /// decode with an empty history rather than refuse, or recovery and listing would fail.
+    #[test]
+    fn a_journal_without_history_decodes_with_an_empty_history() {
+        let journal = ConsumptionJournal::reservation(
+            "watch",
+            b"input.log",
+            "source",
+            "log",
+            ConsumptionGeneration {
+                device: 1,
+                inode: 2,
+                byte_length: 4,
+                modified: (10, 20),
+                changed: (10, 30),
+            },
+            ConsumptionDirectories {
+                root_device: 1,
+                root_inode: 100,
+                parent_device: 1,
+                parent_inode: 101,
+            },
+            1_000,
+        )
+        .unwrap();
+        let text = json::write_compact(&journal.encode());
+        let legacy = text.replace(r#","history":{"attempts":0,"first_seen":"1000"}"#, "");
+        assert_ne!(legacy, text, "the fixture removes the history field");
+        let decoded = ConsumptionJournal::decode(&parse(legacy.as_bytes()).unwrap()).unwrap();
+        assert_eq!(decoded.history, ClaimHistory::default());
+        assert_eq!(decoded.import_id, journal.import_id);
+
+        // A pending reason never grows the journal past what its reader accepts, however
+        // much JSON escaping expands it.
+        let mut journal = journal;
+        journal
+            .record_pending(2_000, &"\"\u{1}".repeat(4096))
+            .unwrap();
+        let reason = journal.history.last_pending_reason.clone().unwrap();
+        assert!(json::write_compact(&Value::from(reason.as_str())).len() <= REASON_BYTES);
+        assert!(!reason.is_empty());
+        assert!(
+            json::write_compact(&journal.encode()).len() + COMPLETION_ROOM + CLAIMED_ROOM
+                <= JOURNAL_BYTES
+        );
     }
 }

@@ -539,3 +539,51 @@ impl Catalog {
         before != self.state.watches.len()
     }
 }
+
+fn encode_clock(mut out: crate::sparrow_capnp::optional_instant::Builder<'_>, clock: Option<u64>) {
+    match clock {
+        Some(at) => out.init_value().set_unix_millis(at),
+        None => out.set_absent(()),
+    }
+}
+
+/// One claim listing on the wire: the window it answers and every listed claim.
+pub(crate) fn encode_claims(
+    mut out: crate::sparrow_capnp::watch_claims::Builder<'_>,
+    store: &str,
+    window: (u64, u64, u64),
+    claims: &[sparrow_core::ClaimListing],
+) {
+    use crate::sparrow_capnp::ClaimState as Wire;
+    let (as_of, since, until) = window;
+    out.set_store_id(store);
+    out.reborrow().init_as_of().set_unix_millis(as_of);
+    out.reborrow().init_since().set_unix_millis(since);
+    out.reborrow().init_until().set_unix_millis(until);
+    let mut rows = out.init_claims(claims.len() as u32);
+    for (index, claim) in claims.iter().enumerate() {
+        let mut row = rows.reborrow().get(index as u32);
+        let journal = &claim.journal;
+        let history = &journal.history;
+        row.set_claim_id(&journal.import_id);
+        row.set_watch(&journal.watch);
+        row.set_state(match claim.state {
+            sparrow_core::ClaimState::Pending => Wire::Pending,
+            sparrow_core::ClaimState::Complete => Wire::Complete,
+            sparrow_core::ClaimState::Abandoned => Wire::Abandoned,
+        });
+        row.set_relative_path(&journal.relative_path);
+        encode_clock(row.reborrow().init_first_seen(), history.first_seen);
+        encode_clock(row.reborrow().init_last_attempt(), history.last_attempt_at);
+        row.set_attempts(history.attempts);
+        encode_clock(
+            row.reborrow().init_last_pending_at(),
+            history.last_pending_at,
+        );
+        match &history.last_pending_reason {
+            Some(reason) => row.reborrow().init_last_pending_reason().set_value(reason),
+            None => row.reborrow().init_last_pending_reason().set_absent(()),
+        }
+        encode_clock(row.init_finished_at(), claim.finished_at);
+    }
+}

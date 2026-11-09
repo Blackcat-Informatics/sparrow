@@ -5996,6 +5996,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
                 changed: (10, 30),
             },
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     assert_eq!(
@@ -6080,6 +6081,7 @@ fn consumption_retire_moves_only_an_unpublished_claim_out_of_pending() {
                 "log",
                 generation(inode),
                 CONSUMPTION_DIRECTORIES,
+                1_000,
             )
             .unwrap()
     };
@@ -6161,6 +6163,139 @@ fn consumption_retire_moves_only_an_unpublished_claim_out_of_pending() {
     assert_eq!(store.consumption_pending().unwrap().len(), 1);
 }
 
+/// INVARIANT (issue 160): the zero-loss check after a write stall reads each claim's final
+/// state, not an inference. A claim's history (first seen, attempts, last attempt, last
+/// pending time and reason) is durable in its journal and follows it into completion and
+/// retirement. The listing returns every pending claim, and a completed or abandoned claim
+/// only when it went pending inside the window; a claim that completed at once is absent.
+#[test]
+fn claim_listing_reports_each_claims_final_state_and_history() {
+    use sparrow_core::{ClaimState, ConsumptionGeneration};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"one\n";
+    let generation = |inode| ConsumptionGeneration {
+        device: 1,
+        inode,
+        byte_length: input.len() as u64,
+        modified: (10, 20),
+        changed: (10, 30),
+    };
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    // Reserve, claim and publish; `stalls` attempts are left pending before completion.
+    let complete = |path: &[u8], inode, stalls: &[u64], done: u64| {
+        let claim = store
+            .consumption_reserve(
+                "watch",
+                path,
+                "source",
+                "log",
+                generation(inode),
+                CONSUMPTION_DIRECTORIES,
+                1_000,
+            )
+            .unwrap();
+        store
+            .consumption_claimed(&claim.import_id, generation(inode))
+            .unwrap();
+        for at in stalls {
+            store
+                .consumption_attempt_pending(&claim.import_id, "deadline expired", *at)
+                .unwrap();
+        }
+        let manifest = store
+            .import_begin(&claim.request_id, "source", "log", 4, &digest, DAY)
+            .unwrap();
+        store.import_append(&manifest.id, 0, input, DAY).unwrap();
+        store.import_seal(&manifest.id, DAY).unwrap();
+        store.import_prepare_layout(&manifest.id, DAY).unwrap();
+        store.import_prepare_record(&manifest.id, 0, DAY).unwrap();
+        let artifact = store.import_publish(&manifest.id, DAY).unwrap();
+        store
+            .consumption_removed(&claim.import_id, &artifact.id, &generation(inode), done)
+            .unwrap();
+        claim.import_id
+    };
+    let at_once = complete(b"once.log", 2, &[], 5_000);
+    let stalled = complete(b"stalled.log", 3, &[2_000, 3_000], 6_000);
+    let early = complete(b"early.log", 4, &[1_500], 6_000);
+    let stuck = store
+        .consumption_reserve(
+            "watch",
+            b"stuck.log",
+            "source",
+            "log",
+            generation(5),
+            CONSUMPTION_DIRECTORIES,
+            1_000,
+        )
+        .unwrap();
+    store
+        .consumption_attempt_pending(&stuck.import_id, "deadline expired", 4_000)
+        .unwrap();
+    store
+        .consumption_claimed(&stuck.import_id, generation(5))
+        .unwrap();
+    let lost = store
+        .consumption_reserve(
+            "watch",
+            b"lost.log",
+            "source",
+            "log",
+            generation(6),
+            CONSUMPTION_DIRECTORIES,
+            1_000,
+        )
+        .unwrap();
+    store
+        .consumption_claimed(&lost.import_id, generation(6))
+        .unwrap();
+    store
+        .consumption_retire(&lost.import_id, "watch", "admin", "source deleted", 7_000)
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+
+    let listed = store.consumption_claims(2_000, 8_000).unwrap();
+    let by_id = |id: &str| listed.iter().find(|claim| claim.journal.import_id == id);
+    assert!(by_id(&at_once).is_none(), "never pending, never listed");
+    assert!(by_id(&early).is_none(), "went pending before the window");
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    let stalled = by_id(&stalled).unwrap();
+    assert_eq!(stalled.state, ClaimState::Complete);
+    assert_eq!(stalled.finished_at, Some(6_000));
+    let history = &stalled.journal.history;
+    assert_eq!(history.first_seen, Some(1_000));
+    assert_eq!(
+        history.attempts, 3,
+        "two pending attempts and the completing one"
+    );
+    assert_eq!(history.last_attempt_at, Some(6_000));
+    assert_eq!(history.last_pending_at, Some(3_000));
+    assert_eq!(
+        history.last_pending_reason.as_deref(),
+        Some("deadline expired")
+    );
+    let stuck = by_id(&stuck.import_id).unwrap();
+    assert_eq!(stuck.state, ClaimState::Pending);
+    assert_eq!(stuck.finished_at, None);
+    assert_eq!(stuck.journal.history.attempts, 1);
+    let lost = by_id(&lost.import_id).unwrap();
+    assert_eq!(lost.state, ClaimState::Abandoned);
+    assert_eq!(lost.finished_at, Some(7_000));
+    // A pending claim is listed whatever the window; the others fall outside this one.
+    let later = store.consumption_claims(9_000, 10_000).unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].state, ClaimState::Pending);
+    assert_eq!(
+        store.consumption_claims(2, 1).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+}
+
 /// INVARIANT (review 3 D1): a retired claim whose consumption import had begun does not keep
 /// that import forever. The retirement ends its staging lease in the same batch, and the
 /// ordinary reclaim pass frees its staged chunks and its import slot, so a 16th staged import
@@ -6192,6 +6327,7 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
             "log",
             generation.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     store
@@ -6284,6 +6420,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
             "log",
             observed.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     assert_eq!(
@@ -6298,7 +6435,8 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
                 "source",
                 "log",
                 observed.clone(),
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap(),
         reserved
@@ -6722,7 +6860,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                     "source",
                     "log",
                     observed.clone(),
-                    CONSUMPTION_DIRECTORIES
+                    CONSUMPTION_DIRECTORIES,
+                    1_000
                 )
                 .unwrap_err()
                 .code,
@@ -6737,6 +6876,7 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
             "log",
             observed.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     assert_eq!(
@@ -6747,7 +6887,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "other",
                 "log",
                 observed.clone(),
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap_err()
             .code,
@@ -6781,6 +6922,7 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "log",
                 observed.clone(),
                 CONSUMPTION_DIRECTORIES,
+                1_000,
             )
             .unwrap();
     }
@@ -6792,7 +6934,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "source",
                 "log",
                 observed.clone(),
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap_err()
             .code,
@@ -6806,7 +6949,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "source",
                 "log",
                 observed,
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap()
             .import_id,
@@ -6847,6 +6991,7 @@ fn consumption_missing_publication_receipt_is_a_hard_failure_without_republicati
             "log",
             observation.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     store

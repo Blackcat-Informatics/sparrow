@@ -336,6 +336,24 @@ struct RetiredClaim {
   claimId @0 :Text; relativePath @1 :Data; retiredAt @2 :Instant; caller @3 :Text; reason @4 :Text;
 }
 
+# Schema 71: one claim's state and durable publication history.
+enum ClaimState { pending @0; complete @1; abandoned @2; }
+struct ClaimRow {
+  claimId @0 :Text; watch @1 :Text; state @2 :ClaimState; relativePath @3 :Data;
+  # Absent for a claim reserved before schema 71.
+  firstSeen @4 :OptionalInstant;
+  lastAttempt @5 :OptionalInstant; attempts @6 :UInt32;
+  lastPendingAt @7 :OptionalInstant; lastPendingReason @8 :OptionalText;
+  # Completion or retirement time; absent while pending.
+  finishedAt @9 :OptionalInstant;
+}
+# Window bounds are inclusive Unix milliseconds; an absent until means now.
+struct WatchClaimsQuery { storeId @0 :Text; since @1 :Instant; until @2 :OptionalInstant; }
+struct WatchClaims {
+  storeId @0 :Text; asOf @1 :Instant; since @2 :Instant; until @3 :Instant;
+  claims @4 :List(ClaimRow);
+}
+
 enum WatchMode { consume @0; tail @1; }
 enum WatchReadiness { closeOrIdle @0; }
 struct WatchAuthority {
@@ -769,6 +787,9 @@ interface Sparrow {
   # Administration (schema 70, #156): start an online backup into the configured backup_root
   # and return at once; status reports its progress. Refused while one runs (CONFLICT).
   backup @53 (storeId :Text) -> (result :Result(BackupStatus));
+  # Schema 71: read-only per-claim states; every pending claim and every completed or
+  # abandoned claim that went pending within the window.
+  watchClaims @54 (query :WatchClaimsQuery) -> (result :Result(WatchClaims));
 }
 
 struct TcpChallenge { nonce @0 :Data; }
