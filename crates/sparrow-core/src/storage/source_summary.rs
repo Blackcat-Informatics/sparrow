@@ -810,9 +810,9 @@ impl Base {
     /// and record entries at or before the checkpoint, which is what `done` counts). Its
     /// pages and the pass walk the same entries in the same order, so the migration is then
     /// ahead of the pass and a newer view owes less than the pass has left. The lead keeps a
-    /// re-base from repeating at every check. Entries a write adds or removes at or before the checkpoint move `done`
-    /// too; that changes only when a re-base happens, never what the build returns. A fixed
-    /// number of point reads.
+    /// re-base from repeating at every check. Entries a write adds or removes at or before
+    /// the checkpoint move `done` too; that changes only when a re-base happens, never what
+    /// the build returns. A fixed number of point reads.
     pub(super) fn overtaken(&self, live: &Reader<'_>, read: u64) -> Result<bool, Error> {
         let now = progress(|key| live.get(key.as_bytes()))?;
         if now == Progress::Complete {

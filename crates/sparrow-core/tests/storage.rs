@@ -20460,11 +20460,11 @@ fn a_source_listing_build_the_migration_overtakes_delivers_the_finished_rows_at_
 
 /// INVARIANT (#176): a live `artifacts` window build re-bases once the running migration
 /// has passed more entries since its snapshot than the build has read plus a lead of 4,096,
-/// in the migration's own unit, while the migration is still unfinished. It then reads only what the newer
-/// snapshot owes, fewer entries than its first snapshot owed. Its selected artifacts were
-/// owed rows in the first snapshot and are stored rows in the newer one, and the listing it
-/// delivers equals the finished index's rows once the migration completes, with no artifact
-/// lost or listed twice.
+/// in the migration's own unit, while the migration is still unfinished. It then reads only
+/// what the newer snapshot owes, fewer entries than its first snapshot owed. Its selected
+/// artifacts were owed rows in the first snapshot and are stored rows in the newer one, and
+/// the listing it delivers equals the finished index's rows once the migration completes,
+/// with no artifact lost or listed twice.
 #[test]
 fn a_live_artifact_window_build_re_bases_onto_a_newer_snapshot_mid_migration() {
     use sparrow_core::{ArtifactRead, ArtifactReadPage, ArtifactSelector, Migration};
@@ -20537,8 +20537,9 @@ fn a_live_artifact_window_build_re_bases_onto_a_newer_snapshot_mid_migration() {
     let first = read(None);
     let cursor = first.next_cursor.clone().expect("the build's cursor");
     let owed = first.build.and_then(|build| build.total).unwrap();
-    // Run pages until the migration has passed more than two check intervals beyond the
-    // held build's snapshot, short of completing.
+    // Run pages until the migration's `done` leads the held build's snapshot by more than
+    // 2 x 4,096 entries, past the re-base lead plus what the build reads before its first
+    // check, short of completing.
     let summary =
         |store: &Store| store.migrations().unwrap()[Migration::SourceSummary.index()].clone();
     let base = summary(&store).done;
