@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: f3f8b5c10d98dd2e3ca6d45a6b591de08e2fbe79
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 171
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/171
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: a83294daa105cab15d7cc962800be4ec5961e77a
+GhpRsq-Head-Ref: paudley/168-hold-systemd-s-own-lines-about-katamari
+GhpRsq-Head-OID: f3f8b5c10d98dd2e3ca6d45a6b591de08e2fbe79
+GhpRsq-Result-Tree: 01397ad0cfcc32e36c2ea3f434ee8ee938294371
+GhpRsq-Result-Commit: f1219ee5ab748519d679a26d5584dc7a9dc0185f
+GhpRsq-Parent-Hashes: f3f8b5c10d98dd2e3ca6d45a6b591de08e2fbe79
+GhpRsq-Squash-Notes-SHA256: 747b672831db5d0254e88cfac7625b71daabd2059cf852bd0da5f4a1fdaeaba5
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 4ee87ca5002c79ba960097f04460b07987595d85
+GhpRsq-Stage-Commit: 799efa79d69ab1ee5684dd689805983729eb65c6
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/799efa79d69ab1ee5684dd689805983729eb65c6
+GhpRsq-Stage-Ref: refs/ghprsq/pr/171/stage
+GhpRsq-Stage-Files: 5
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/799efa79d69ab1ee5684dd689805983729eb65c6
