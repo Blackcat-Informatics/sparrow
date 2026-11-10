@@ -27,13 +27,19 @@ pub(crate) struct TailRoot {
     store: Store,
     watch: String,
     root: File,
+    binding: crate::consumption::RootBinding,
     claim: std::cell::OnceCell<crate::consumption::ClaimRoot>,
     held: BTreeMap<(u64, u64), Held>,
     next: Option<(u64, u64)>,
 }
 
 impl TailRoot {
-    pub(crate) fn open(store: Store, config: &ConsumeWatch, revision: u64) -> Result<Self, Error> {
+    pub(crate) fn open(
+        store: Store,
+        config: &ConsumeWatch,
+        revision: u64,
+        binding: crate::consumption::RootBinding,
+    ) -> Result<Self, Error> {
         let root = source_file::root(&store, &config.root)?;
         let identity = CompletedFileIdentity::capture(&root.metadata()?);
         for generation in store.tail_generations(&config.id)? {
@@ -41,6 +47,10 @@ impl TailRoot {
                 continue;
             }
             let declared = generation.declaration;
+            // A private root never holds the original root's active generations.
+            if foreign(binding, (identity.device, identity.inode), &declared) {
+                continue;
+            }
             if declared.directories.root_device != identity.device
                 || declared.directories.root_inode != identity.inode
                 || declared.watch_revision != revision
@@ -56,10 +66,17 @@ impl TailRoot {
             store,
             watch: config.id.clone(),
             root,
+            binding,
             claim: std::cell::OnceCell::new(),
             held: BTreeMap::new(),
             next: None,
         })
+    }
+
+    /// The held root's (device, inode), which every generation it may read declares.
+    fn root_identity(&self) -> Result<(u64, u64), Error> {
+        let identity = CompletedFileIdentity::capture(&self.root.metadata()?);
+        Ok((identity.device, identity.inode))
     }
 
     pub(crate) fn status(&self, watch: &str) -> Result<(Vec<String>, u64, u32, u64), Error> {
@@ -89,6 +106,7 @@ impl TailRoot {
             self.store.clone(),
             &self.watch,
             self.root.try_clone()?,
+            self.binding,
         )?;
         self.claim
             .set(claim)
@@ -130,7 +148,15 @@ impl TailRoot {
         if self.held.contains_key(&key) {
             return Ok(());
         }
-        let generations = self.store.tail_generations(&config.id)?;
+        // A private root reads only its own generations: a generation of the original root
+        // whose file (device, inode) a file below the private root reuses is never adopted.
+        let held_root = self.root_identity()?;
+        let generations = self
+            .store
+            .tail_generations(&config.id)?
+            .into_iter()
+            .filter(|row| !foreign(self.binding, held_root, &row.declaration))
+            .collect::<Vec<_>>();
         for row in &generations {
             if row.declaration.watch_revision != revision
                 || (row.declaration.device, row.declaration.inode) != key
@@ -368,9 +394,13 @@ impl TailRoot {
     }
 
     pub(crate) fn reconcile_missing(&mut self, watch: &str) -> Result<(), Error> {
+        let held_root = self.root_identity()?;
         for generation in self.store.tail_generations(watch)? {
+            // The original root's generations stay as the copy holds them: a private root
+            // records no gap for a file it never held.
             if !generation.complete
                 && generation.gap.is_none()
+                && !foreign(self.binding, held_root, &generation.declaration)
                 && !self
                     .held
                     .contains_key(&(generation.declaration.device, generation.declaration.inode))
@@ -385,4 +415,19 @@ impl TailRoot {
         }
         Ok(())
     }
+}
+
+/// Whether a generation declared on another root than ROOT must be left alone: only under a
+/// private root (`sparrowd --private-intake`), where the original root's generations are
+/// never resumed, adopted or closed.
+fn foreign(
+    binding: crate::consumption::RootBinding,
+    root: (u64, u64),
+    declared: &TailStart,
+) -> bool {
+    binding == crate::consumption::RootBinding::Private
+        && (
+            declared.directories.root_device,
+            declared.directories.root_inode,
+        ) != root
 }

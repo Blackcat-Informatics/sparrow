@@ -12,9 +12,9 @@ pub(crate) enum Backup {
     /// No `backup_root` is configured.
     #[default]
     Unconfigured,
-    /// A `--no-intake` daemon serves a disposable copy; backing it up would mix another store
-    /// into the live backup root.
-    NoIntake,
+    /// A `--no-intake` or `--private-intake` daemon serves a disposable copy; backing it up
+    /// would mix another store into the live backup root.
+    Copy,
     /// Back up into this target.
     Configured(BackupTarget),
 }
@@ -27,9 +27,9 @@ impl Backup {
                 "UNSUPPORTED",
                 "this daemon has no backup_root; configure backup_root on the NAS archive and restart",
             )),
-            Self::NoIntake => Err(Error::new(
+            Self::Copy => Err(Error::new(
                 "UNSUPPORTED",
-                "a --no-intake daemon serves a copy of a store and takes no backup; back up the daemon that serves the live store",
+                "a --no-intake or --private-intake daemon serves a copy of a store and takes no backup; back up the daemon that serves the live store",
             )),
             Self::Configured(target) => store.backup_start(target, now),
         }
