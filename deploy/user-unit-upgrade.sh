@@ -5,7 +5,7 @@
 # Switch the operator's old user unit sparrow.service from one kept image pair to another, with
 # the named pre-upgrade backup taken online through the running daemon before anything stops
 # (Patrick, 2026-11-08: no backup may stop the server). --no-backup REASON switches without one
-# when the running daemon has no online backup (coordination D147: the schema 68 to 70 switch). It serves until
+# when the running daemon has no online backup (coordination D147: the schema 68 to 71 switch). It serves until
 # Sparrow issue #22 moves the store to the system unit, whose scripts (restart.sh,
 # pre-upgrade-backup.sh) refuse the user unit. Ported from the operator's restart-bundle.sh; its
 # predecessor restart-schema68.sh ran clean on the live host on 2026-11-07 (exit 0, 180 s down).
@@ -40,9 +40,16 @@ does it stop both timers and wait for the shipper, stop the unit, install limits
 LimitNOFILESoft,
 switches the links, starts the unit, waits up to
 600 s for the first status answer, checks the store identity and the --to schema, prints the
-migrations, watches and ingest socket, and starts the timers again. It exits 0 without waiting
+migrations, watches and ingest socket, and starts sparrow-ship.timer again. It never starts
+sparrow-backup.timer: the installed sparrow-backup.service may still be the old closed-store form,
+and the timer restarts only after a first online backup verifies. It stays stopped, and the run
+ends by printing the steps: take the first online backup, run deploy/verify-backup.sh SET, and only
+after it exits 0 run systemctl --user start sparrow-backup.timer. It exits 0 without waiting
 for the online backfill, which continues in the running daemon; watch it with
-"sparrow SOCKET status" (migrations) and journalctl --user -u sparrow.service.
+"sparrow SOCKET status" (migrations) and journalctl --user -u sparrow.service. If the shipper or
+the backup is still running when the timers have been stopped, the run starts again only the
+timers that were active before it stopped them (so the backup timer only if it was running) and
+changes nothing else.
 
 --no-backup REASON  switch without a pre-upgrade backup, for a running daemon that has no online
                     backup (an image older than the backup operation, such as schema 68). REASON
@@ -51,7 +58,8 @@ for the online backfill, which continues in the running daemon; watch it with
                     a rollback can only go forward: there is no store to restore FROM's format
                     from, so fix forward on TO. Take the first online backup as soon as status
                     answers after the start: "sparrow SOCKET backup" and watch status, or run
-                    the sparrow-backup client (the nightly sparrow-backup.timer runs it too).
+                    the sparrow-backup client (the nightly sparrow-backup.timer runs it too, but
+                    this script leaves that timer stopped until a backup verifies).
 
 Environment (defaults are the user-unit layout):
   SPARROW_PREFIX   images in PREFIX/libexec/sparrow, CLI link PREFIX/bin/sparrow   ~/.local
@@ -66,7 +74,8 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
 - Before "stop timers": nothing stopped and the links name FROM. A completed
   BACKUPS/pre-upgrade-FROM link must be moved aside before a rerun. Fix the cause and rerun.
 - From "stop timers" up to "switch links": the links still name FROM and the store is untouched.
-  Start sparrow.service (if stopped) and both timers. Move BACKUPS/pre-upgrade-FROM aside before
+  Start sparrow.service (if stopped) and sparrow-ship.timer; the backup timer only if it was
+  running before the run and the online sparrow-backup.service is installed. Move BACKUPS/pre-upgrade-FROM aside before
   a rerun. An installed limits.conf may stay: either image needs it.
 - At "switch links", before "start sparrow.service": check both links with readlink; one may
   name TO and the other FROM. Point both at FROM and recover as in the step above, or both at
@@ -74,14 +83,17 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
 - After "start sparrow.service": unless the FAILED line shows the unit inactive or failed, the
   daemon runs TO with both timers stopped, and TO may have accepted ingest and watch work.
   Go forward first: wait for "sparrow SOCKET status" to answer (a slow open passes 600 s
-  without failing), confirm its store_id and the TO schema, then start both timers.
+  without failing), confirm its store_id and the TO schema, then start sparrow-ship.timer. Start
+  sparrow-backup.timer only after a first online backup verifies (deploy/verify-backup.sh SET
+  exits 0).
   Roll back only if TO cannot serve, and only with a pre-upgrade backup (after --no-backup there
   is none: go forward). Stop sparrow.service; point the daemon link at FROM and the CLI link at
   the FROM CLI (an image restored from the set's images/ needs setcap cap_net_bind_service=ep,
   run by a human with root); move the store aside and restore the backup into an empty chattr +C
   directory with an image that has --restore-backup (TO does): TO --restore-backup BACKUPS ID
   STORE, where ID is backup_id in BACKUPS/pre-upgrade-FROM/SOURCE. That drops everything
-  accepted after the backup started; then start sparrow.service and both timers.
+  accepted after the backup started; then start sparrow.service and sparrow-ship.timer. Start
+  sparrow-backup.timer only after a first online backup of the restored store verifies (deploy/verify-backup.sh SET exits 0).
 - Claims after a rollback or restore (docs/deployment.md, "Claims after a rollback"). Keep the
   set-aside TO store: it records every claim TO made. Before starting sparrow.service on the
   restored store, open the restored store with the FROM image and the set-aside store with the
@@ -254,6 +266,10 @@ the daemon first, or switch with --no-backup REASON" ;;
     log "pre-upgrade backup $BACKUP -> sets/${fresh##*/} ($(sed -n 's/^taken_utc=//p' "$fresh/SOURCE"))"
 fi
 
+# Which timers ran before this script stopped them: the abort path restores only those.
+ship_timer_was_active=0 backup_timer_was_active=0
+"${USER_SYSTEMCTL[@]}" is-active --quiet sparrow-ship.timer && ship_timer_was_active=1
+"${USER_SYSTEMCTL[@]}" is-active --quiet sparrow-backup.timer && backup_timer_was_active=1
 log "stop timers"
 "${USER_SYSTEMCTL[@]}" stop sparrow-ship.timer sparrow-backup.timer
 for _ in $(seq 360); do
@@ -261,8 +277,13 @@ for _ in $(seq 360); do
     sleep 5
 done
 if ! settled sparrow-ship.service || ! settled sparrow-backup.service; then
-    "${USER_SYSTEMCTL[@]}" start sparrow-ship.timer sparrow-backup.timer
-    die "the shipper or the backup is still running; timers started again, nothing else changed"
+    # Restore only the timers that were active before they were stopped; sparrow-backup.timer is
+    # never started here unless it was running, because it restarts only after a verified backup.
+    restore=()
+    ((ship_timer_was_active)) && restore+=(sparrow-ship.timer)
+    ((backup_timer_was_active)) && restore+=(sparrow-backup.timer)
+    ((${#restore[@]} == 0)) || "${USER_SYSTEMCTL[@]}" start "${restore[@]}"
+    die "the shipper or the backup is still running; timers that were active before are started again (${restore[*]:-none}), nothing else changed"
 fi
 T0=$EPOCHREALTIME
 log "stop sparrow.service"
@@ -328,12 +349,17 @@ for w in v["consume_watches"]:
     print("watch id=%s coverage=%s pending_claims=%s failure=%s"
           % (w.get("id"), w.get("coverage"), w.get("pending_claims"), w.get("failure")))' <<<"$out"
 stat -c 'ingest socket %n %a %U:%G' -- "$INGEST_SOCKET"
-"${USER_SYSTEMCTL[@]}" start sparrow-ship.timer sparrow-backup.timer
-log "timers: ship $("${USER_SYSTEMCTL[@]}" is-active sparrow-ship.timer), backup $("${USER_SYSTEMCTL[@]}" is-active sparrow-backup.timer)"
+"${USER_SYSTEMCTL[@]}" start sparrow-ship.timer
+# sparrow-backup.timer stays stopped: it restarts only after a first online backup verifies.
+log "timers: ship $("${USER_SYSTEMCTL[@]}" is-active sparrow-ship.timer), backup $("${USER_SYSTEMCTL[@]}" is-active sparrow-backup.timer) (left stopped on purpose)"
 if ((NO_BACKUP)); then
     log "NO PRE-UPGRADE BACKUP was taken ($NO_BACKUP_REASON). Take the first online backup now:"
     printf '  %s %s backup   (then watch the backup state in status), or run sparrow-backup\n' "$CLI_LINK" "$SOCKET"
 fi
+log "sparrow-backup.timer is NOT started. Install the online sparrow-backup.service lines (deploy/README.md, \"Interim user unit\"), then:"
+printf '  1. take the first online backup: %s %s backup (watch the backup state in status), or run sparrow-backup\n' "$CLI_LINK" "$SOCKET"
+printf '  2. deploy/verify-backup.sh SET   (SET is the new set, %s/sets/ID)\n' "$SPARROW_BACKUPS"
+printf '  3. only after step 2 exits 0: systemctl --user start sparrow-backup.timer\n'
 log "switched to $TO. Any online backfill continues in the running daemon; watch it with:"
 printf '  %s %s status   (migrations: done/total, failure)\n' "$CLI_LINK" "$SOCKET"
 printf "  journalctl --user -u sparrow.service -g 'sparrowd: (migration|online migration failed)'\n"

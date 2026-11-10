@@ -925,6 +925,16 @@ then does it stop both timers and wait for the shipper, stop the unit, install
 the `LimitNOFILE` drop-in, switch the links and start the unit. Nothing stops
 for the backup; the unit stops only for the image switch itself.
 
+At the end it starts `sparrow-ship.timer` only. `sparrow-backup.timer` stays
+stopped, because it restarts only after a first online backup has been verified
+and the installed `sparrow-backup.service` may still be the old closed-store
+form. The run prints the steps: take the first online backup, run
+`deploy/verify-backup.sh SET`, and only after it exits 0 run
+`systemctl --user start sparrow-backup.timer`. If the shipper or the backup is
+still running after the timers stop, the script starts again only the timers
+that were active before (the backup timer only if it was running) and changes
+nothing else.
+
 `--no-backup REASON` switches without a backup, for a running daemon that has no
 online backup (an image older than the backup operation, such as schema 68).
 `REASON` must not be empty, and the run logs it. Without the option, a daemon
