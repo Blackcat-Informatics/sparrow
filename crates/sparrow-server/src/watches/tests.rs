@@ -886,3 +886,74 @@ async fn a_released_permit_wakes_a_waiting_tail_drain() {
         })
         .await;
 }
+
+/// INVARIANT (#184): the drain before a wait can take producer events from the pass. The
+/// worker reports what they changed, and freed candidate capacity for deferred inputs makes
+/// the deferred-capacity rescan due at once instead of at the next rescan or quiet deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn the_drain_before_a_wait_reports_and_wakes_for_what_it_found() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("producer");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("first.bin"), b"first\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut detectors = vec![
+        Detector::open(
+            store.clone(),
+            ManagedWatch {
+                definition: ConsumeWatch {
+                    id: "settle".into(),
+                    root: root.clone(),
+                    producer_contract: crate::ProducerContract::FinishedFiles,
+                    source: "settle".into(),
+                    format: "opaque".into(),
+                    quiet_ms: 30_000,
+                    max_directories: 2,
+                    max_candidates: 1,
+                },
+                revision: 1,
+                enabled: true,
+            },
+            RootBinding::Stored,
+        )
+        .unwrap(),
+    ];
+    detectors[0].scan_step().unwrap();
+    detectors[0].drain().unwrap();
+    assert!(detectors[0].covered && detectors[0].candidates.len() == 1);
+    // During a pass: a second input finds the capacity full, then the first one goes away.
+    std::fs::write(root.join("second.bin"), b"second\n").unwrap();
+    std::fs::remove_file(root.join("first.bin")).unwrap();
+
+    let registry = WatchRegistry::default();
+    let (_controller, commands) = watch_admin::channel();
+    let mut control = Control {
+        commands,
+        operations: Arc::new(tokio::sync::Semaphore::new(1)),
+        private: None,
+        outputs: crate::config::OutputPaths::default(),
+    };
+    // Stop is already requested, so the wait returns once it has settled.
+    let (_stop, mut stopped) = tokio::sync::watch::channel(true);
+    let waiting = Waiting {
+        store: &store,
+        registry: &registry,
+        stop: &mut stopped,
+        control: &mut control,
+        received: &mut None,
+        permit: &mut None,
+    };
+    pause(waiting, &mut detectors, true, false, true, Wake::default())
+        .await
+        .unwrap();
+    let status = registry.snapshot().unwrap().pop().unwrap();
+    assert!(status.deferred && status.candidates == 0);
+    assert!(detectors[0].due(true).unwrap() <= Instant::now());
+    assert!(detectors[0].due(false).unwrap() > Instant::now());
+}
