@@ -32,7 +32,7 @@ remove them before any rollback to such an image); the store has copy-on-write o
 but an identical limits.conf (deploy/systemd/user/sparrow.service.d); no nightly backup is
 running; the running daemon reports the --from schema; and, without --no-backup, the running
 daemon reports an online backup configured (its status has a backup state other than
-unconfigured). Then, with the daemon serving, it takes the named pre-upgrade backup online
+unconfigured), and the intake, ship and ship-watches directories exist. Then, with the daemon serving, it takes the named pre-upgrade backup online
 (SPARROW_PREFIX/libexec/sparrow/sparrow-backup: the daemon copies its store into backup_root and
 the script records the set beside it) and points BACKUPS/pre-upgrade-FROM at that set. Only then
 does it stop both timers and wait for the shipper, stop the unit, install limits.conf
@@ -67,7 +67,8 @@ Environment (defaults are the user-unit layout):
                    (data_dir) and sockets are read from it       ~/.config/sparrow/server.toml
   SPARROW_BACKUPS  the online backup root (server.toml backup_root), on the NAS
                                                                  /net/synology/archives/sparrow
-  SPARROW_INTAKE   the intake tree the backup set keeps          /SPARROW/intake
+  SPARROW_STATE    the state tree holding ship and ship-watches  ~/.local/state/sparrow
+  SPARROW_INTAKE   the intake tree the backup set keeps          ~/.local/state/sparrow/intake
   SPARROW_BIN      the kept images the --to pair must match      <repository>/bin
 
 Recovery depends on where it failed; the FAILED line names the unit and timer states.
@@ -144,6 +145,10 @@ done
 # stays system: its unit helpers address SPARROW_UNIT, and it refuses user scope for
 # sparrow.service, so this script drives the user manager itself (USER_SYSTEMCTL).
 SPARROW_PREFIX=${SPARROW_PREFIX:-${HOME:?}/.local}
+export SPARROW_PREFIX
+# The user unit's state tree, as sparrow-backup.service passes it (%h/.local/state/sparrow/...).
+SPARROW_STATE=${SPARROW_STATE:-${HOME:?}/.local/state/sparrow}
+SPARROW_INTAKE=${SPARROW_INTAKE:-$SPARROW_STATE/intake}
 SPARROW_CONFIG=${SPARROW_CONFIG:-${HOME:?}/.config/sparrow/server.toml}
 # The user-unit pre-upgrade backup prints its own progress; lib.sh supplies the backup root.
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -251,9 +256,12 @@ Switch with --no-backup REASON, then take the first online backup once $TO answe
         unconfigured) die "the running daemon reports no backup_root; configure it and restart \
 the daemon first, or switch with --no-backup REASON" ;;
     esac
+    for dir in "$SPARROW_INTAKE" "$SPARROW_STATE/ship" "$SPARROW_STATE/ship-watches"; do
+        [[ -d $dir ]] || die "the backup would keep $dir, which does not exist; set SPARROW_STATE or SPARROW_INTAKE"
+    done
     log "pre-upgrade backup, online: the daemon keeps serving"
     PATH=$(dirname -- "$CLI_LINK"):$PATH "$LIBEXEC/sparrow-backup" "$SPARROW_CONFIG" \
-        "$SPARROW_INTAKE" "$CONFIG_DIR" "$CONFIG_DIR/ship.toml"
+        "$SPARROW_INTAKE" "$CONFIG_DIR" "$SPARROW_STATE/ship" "$SPARROW_STATE/ship-watches"
     fresh=''
     for dir in "$SPARROW_BACKUPS"/sets/*; do
         [[ -d $dir && ${dir##*/} =~ ^[0-9]+$ ]] || continue
