@@ -450,7 +450,7 @@ The live daemon (schema 68 image, two background jobs, two 8 MiB memtables per f
 spent 35 percent of its life with writes stalled or stopped (issue 160). Its LOG on
 2026-11-09 shows 57 slowdowns and 19 stops from 01:00 to 04:40 (the issue's comment), and
 440 and 141 from 04:40 to 09:00 and 139 and 51 from 09:00 to 14:30 (coordination's count
-over all rotated logs), with level 0 at 20 to 25 files on the slowdown lines. The live
+over all rotated logs), with level 0 at 20 to 24 files on the slowdown lines. The live
 stops were "2 immutable memtables (waiting for flush)": both write buffers were full
 while one flushed.
 
@@ -512,11 +512,12 @@ run's scope reported `CPUQuotaPerSecUSec=1s`, `IOWeight=20`, `MemoryHigh` 2 GiB 
 Under the unit's limits C stalls 7.0 percent with one stop during the debt drain, against
 37.6 percent for the default, and does not meet the target until the debt has drained.
 A's stop again came while the store replayed its log at open; C's came in the run, about
-90 seconds after open, and its 59 seconds of stall all fall in that one stats interval.
+90 seconds after open, and 58 of its 59 seconds of stall fall in that one stats interval.
 Every later interval (nine) shows 0.0 percent. The default never caught up: 4.07 GB was
 still pending at the end, intake fell to 11,906 keys per second against about 18,000, and
 its last interval was 96.7 percent stalled. The limits alone take the default from 6.5 to
-37.6 percent, so for the current options the unit's quota is the larger cause; the CPU
+37.6 percent, so for the current options the unit's quota is the larger cause in this harness, whose
+synthetic producers share the one-core quota with the store; the CPU
 quota and I/O weight were applied together, so this does not separate them. The live
 backlog, about 41 GB pending, is about eight times the scratch debt, so stops are likely
 while the live store drains. Status slowed under the quota, to at most 12.4 seconds (two
