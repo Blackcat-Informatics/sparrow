@@ -385,7 +385,8 @@ future reopen remains possible; event counting is not a writer-lock mechanism.
 
 An active-file (tail) watch does not react to `IN_OPEN`: an open adds no bytes, and the
 daemon's own descriptor open would otherwise re-trigger a refused attach. Modification,
-attribute, creation, writable-close and move-in events still drive attach and capture.
+attribute, creation, writable-close and move-in events still drive attach, and a refused
+attach is retried by the periodic rescan rather than by every worker tick.
 
 Install per-directory watches before scanning that directory, then reconcile
 queued changes. Add and scan newly discovered/moved-in directories. Inotify is

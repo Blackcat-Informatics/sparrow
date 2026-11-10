@@ -700,9 +700,10 @@ impl Detector {
             if flags.contains(ReadFlags::DELETE) {
                 self.candidates.remove(&relative);
             }
-            // An open adds no bytes. For a completed-file watch it restarts the quiet clock; for
-            // a tail watch it is only ever the daemon's own descriptor open in `attach`, and
-            // reacting to it would reopen a refused file on every event.
+            // An open adds no bytes. For a completed-file watch it restarts the quiet clock. A
+            // tail watch ignores it: the daemon's own open in `attach` raises it, and reacting
+            // would reopen a refused file on every event. A producer that appends or truncates
+            // still raises MODIFY, so no needed attach is lost.
             let activity = if matches!(self.owner, Owner::Tail(_)) {
                 ReadFlags::empty()
             } else {
@@ -1378,8 +1379,11 @@ async fn run(
                     }
                     break;
                 }
+                // A tail watch never fills `candidates`, so capacity is never what a refused
+                // attach waits for; its periodic reconcile is the retry.
                 if detector.covered
                     && detector.deferred
+                    && !matches!(detector.owner, Owner::Tail(_))
                     && detector.todo.is_empty()
                     && detector.scan.is_none()
                     && detector.candidates.len() < detector.config.max_candidates
