@@ -146,8 +146,8 @@ enum Outcome {
 }
 
 /// Journal lines of the online migrations: a start line at each migration's first committed
-/// page of the session, progress every few pages, and completion, each timed from the start
-/// of that first page (#176).
+/// page of the session, then progress every few pages and completion, which carry the time
+/// since the start of that first page (#176).
 #[derive(Default)]
 struct MigrationJournal {
     pages: [u64; Migration::ALL.len()],
