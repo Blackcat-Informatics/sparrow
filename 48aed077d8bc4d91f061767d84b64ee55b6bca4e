@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 4954964431ca0af4937103c17dc895048cf8abbb
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 185
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/185
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: c82bfa49e38f5113b387c4aad03ab99ef666ae26
+GhpRsq-Head-Ref: paudley/184-replace-or-slow-the-sub-second-ticks-50
+GhpRsq-Head-OID: 4954964431ca0af4937103c17dc895048cf8abbb
+GhpRsq-Result-Tree: 525c6e8327fc70d1c96f4579815523354df7e19a
+GhpRsq-Result-Commit: 48aed077d8bc4d91f061767d84b64ee55b6bca4e
+GhpRsq-Parent-Hashes: 4954964431ca0af4937103c17dc895048cf8abbb
+GhpRsq-Squash-Notes-SHA256: 2c1f54dd8a0d727b0a294fa782b1d6c4b86db7476947599004964eeb09009e54
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 9551f36380714b71eb8a43b5fe27f016b8111b72
+GhpRsq-Stage-Commit: b22287e5891e1fe5817d9c331f6f492ae1cfa4fd
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/b22287e5891e1fe5817d9c331f6f492ae1cfa4fd
+GhpRsq-Stage-Ref: refs/ghprsq/pr/185/stage
+GhpRsq-Stage-Files: 16
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/b22287e5891e1fe5817d9c331f6f492ae1cfa4fd
