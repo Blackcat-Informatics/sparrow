@@ -1,0 +1,6 @@
+{"time": "2026-11-10T02:03:24.535883+00:00", "status": "started"}
+{"time": "2026-11-10T02:03:24.990733+00:00", "status": "merging"}
+{"time": "2026-11-10T02:03:26.797529+00:00", "status": "conflicted"}
+{"time": "2026-11-10T02:03:26.816379+00:00", "status": "review_required", "reused_paths": [], "rerere_output": "Recorded preimage for 'crates/sparrow-core/src/storage.rs'\n"}
+{"time": "2026-11-10T02:03:57.091560+00:00", "status": "committing", "candidate_tree": "1e063b4a91018cfbc003b8746033862e1567fe71", "candidate_patch": "candidate-863194c69d0d4583b5c97ab2fe71604e.patch", "validation_records": []}
+{"time": "2026-11-10T02:15:47.781230+00:00", "status": "completed", "commit": "f5788dd2ad84e34baf39eed5df1141d90f739582", "tree": "1e063b4a91018cfbc003b8746033862e1567fe71"}

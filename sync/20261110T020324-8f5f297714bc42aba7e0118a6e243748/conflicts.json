@@ -1,0 +1,22 @@
+{
+  "crates/sparrow-core/src/storage.rs": [
+    {
+      "mode": "100644",
+      "oid": "8a45a6835a565385b4bbc85416b3fca0bcd116ee",
+      "stage": 1,
+      "content": "inputs/0-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "58e6d9088db8cd97c9fc71753af5051efc0f8df3",
+      "stage": 2,
+      "content": "inputs/0-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "72b8cda6d4edc71d5963d7db2d75e4e02b50c588",
+      "stage": 3,
+      "content": "inputs/0-3.bin"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/158-serve-every-query-and-status-call",
+  "branch": "paudley/158-serve-every-query-and-status-call",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "b3162ae9b8bdb189642065f53d5fb077c4fb7283",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/158-serve-every-query-and-status-call/.stage/serve-every-query-and-status-call/sync/20261110T020324-8f5f297714bc42aba7e0118a6e243748",
+  "conflicts": [
+    "crates/sparrow-core/src/storage.rs"
+  ],
+  "status": "completed",
+  "base": "f1219ee5ab748519d679a26d5584dc7a9dc0185f",
+  "merge_bases": [
+    "ea1a4b2b250e6e56fc1175b5fddf480ca5162a90"
+  ],
+  "merge_index": "ef40de37a179cae021c64373eebaea92a9edce78682e485081122bb35feb70fa",
+  "reused_paths": [],
+  "rerere_output": "Recorded preimage for 'crates/sparrow-core/src/storage.rs'\n",
+  "candidate_tree": "1e063b4a91018cfbc003b8746033862e1567fe71",
+  "candidate_patch": "candidate-863194c69d0d4583b5c97ab2fe71604e.patch",
+  "validation_records": [],
+  "commit": "f5788dd2ad84e34baf39eed5df1141d90f739582",
+  "tree": "1e063b4a91018cfbc003b8746033862e1567fe71"
+}

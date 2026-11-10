@@ -1,0 +1,2520 @@
+diff --git crates/sparrow-core/src/storage.rs crates/sparrow-core/src/storage.rs
+index 8a45a68..bd029a1 100644
+--- crates/sparrow-core/src/storage.rs
++++ crates/sparrow-core/src/storage.rs
+@@ -2053,7 +2053,7 @@ impl Store {
+                 failed += 1;
+                 if scope.require_complete_index {
+                     return Err(Error::new(
+-                        "INDEX_NOT_READY",
++                        "EVIDENCE_INCOMPLETE",
+                         "selected JSON projection unavailable",
+                     ));
+                 }
+diff --git crates/sparrow-core/src/storage/artifact_read.rs crates/sparrow-core/src/storage/artifact_read.rs
+index 87ceb7d..4f47b2d 100644
+--- crates/sparrow-core/src/storage/artifact_read.rs
++++ crates/sparrow-core/src/storage/artifact_read.rs
+@@ -201,8 +201,8 @@ enum Consumed {
+     Start,
+     /// This many identities of the artifact entry's record manifest.
+     Listed(u64),
+-    /// A deleted parent's records, read from the source's record receipt index at the
+-    /// parent's receipt; the last record row consumed.
++    /// A deleted parent's records, read from the source's receipt timeline at the parent's
++    /// receipt; the ID of the last record consumed.
+     Indexed(Option<String>),
+ }
+ 
+@@ -706,7 +706,8 @@ impl Writer {
+     /// Read one live page from the per-source artifact index from `start`. Stop at the page
+     /// size, or when the page's admission runs out after it consumed a catalog entry, and
+     /// return the position to continue from. A page that cannot consume one catalog entry
+-    /// refuses by naming the row. Refuses while the per-source index is being seeded.
++    /// refuses by naming the row. While the per-source index is being seeded, the rows its
++    /// migration still owes are listed with the stored ones.
+     fn artifact_index_page(
+         &self,
+         selector: &ArtifactSelector,
+@@ -715,14 +716,17 @@ impl Writer {
+         now: u64,
+         admission: &mut CaptureAdmission<'_>,
+     ) -> Result<ArtifactPageBody, Error> {
+-        source_summary::ready(
+-            &source_summary::progress(|key| Ok(self.db.get(key)?))?,
+-            "the artifact listing",
+-        )?;
+         let limit = page_size.min(<ArtifactPageBody as catalog_lease::PageBody>::PAGE_ITEMS);
++        let prefixes = selected_prefixes(selector);
++        let owed = self.owed_index_rows(
++            selector,
++            prefixes.clone(),
++            start.after.clone(),
++            limit + 1,
++            admission,
++        )?;
+         let protected = self.artifact_protected(now, admission)?;
+         let scope = selector.scope();
+-        let prefixes = selected_prefixes(selector);
+         let mut position = start;
+         let mut artifacts = Vec::new();
+         let mut diagnostic_coverage = crate::DiagnosticCoverage::default();
+@@ -731,17 +735,23 @@ impl Writer {
+             if artifacts.len() == limit {
+                 let more = position.partial.is_some()
+                     || self
+-                        .next_index_row(prefixes.as_deref(), position.after.as_deref(), selector)?
++                        .next_listed_row(
++                            prefixes.as_deref(),
++                            position.after.as_deref(),
++                            selector,
++                            &owed,
++                        )?
+                         .is_some();
+                 break more.then_some(position);
+             }
+             let mut row = match position.partial.take() {
+                 Some(row) => *row,
+                 None => {
+-                    let Some((key, received_at, id)) = self.next_index_row(
++                    let Some((key, received_at, id)) = self.next_listed_row(
+                         prefixes.as_deref(),
+                         position.after.as_deref(),
+                         selector,
++                        &owed,
+                     )?
+                     else {
+                         break None;
+@@ -798,6 +808,72 @@ impl Writer {
+         })
+     }
+ 
++    /// The index rows the unfinished source-summary migration still owes within the
++    /// selected sources and receipt bounds after `after`, at most `rows` of them in key
++    /// order; empty once it is complete. A listing merges them with the stored rows, so it
++    /// lists exactly the artifacts the finished index will.
++    fn owed_index_rows(
++        &self,
++        selector: &ArtifactSelector,
++        prefixes: Option<Vec<String>>,
++        after: Option<String>,
++        rows: usize,
++        admission: &mut CaptureAdmission<'_>,
++    ) -> Result<BTreeSet<String>, Error> {
++        let reader = super::store_counters::Reader::db(&self.db);
++        let (from, before) = (selector.received_from, selector.received_before);
++        let keep = move |key: &str| {
++            let prefix = key.get(..source_summary::INDEX.len() + 65).unwrap_or(key);
++            after.as_deref().is_none_or(|after| key > after)
++                && prefixes
++                    .as_ref()
++                    .is_none_or(|list| list.iter().any(|wanted| wanted == prefix))
++                && source_summary::index_entry(prefix.as_bytes(), key.as_bytes())
++                    .is_ok_and(|(time, _)| time >= from && time < before)
++        };
++        let cancellation = admission.cancellation;
++        Ok(source_summary::Completion::owed(
++            &reader,
++            &source_summary::progress(|key| reader.get(key.as_bytes()))?,
++            (rows, Box::new(keep)),
++            &mut || cancellation.checkpoint(),
++        )?
++        .map(|owed| owed.index)
++        .unwrap_or_default())
++    }
++
++    /// The next listed row after `after`: the lesser of the next stored index row and the
++    /// next owed one.
++    fn next_listed_row(
++        &self,
++        prefixes: Option<&[String]>,
++        after: Option<&str>,
++        selector: &ArtifactSelector,
++        owed: &BTreeSet<String>,
++    ) -> Result<Option<(String, u64, String)>, Error> {
++        let stored = self.next_index_row(prefixes, after, selector)?;
++        let pending = match after {
++            Some(after) => owed
++                .range::<str, _>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
++                .next(),
++            None => owed.first(),
++        };
++        let Some(pending) = pending.filter(|key| {
++            stored
++                .as_ref()
++                .is_none_or(|(stored, _, _)| key.as_str() < stored.as_str())
++        }) else {
++            return Ok(stored);
++        };
++        let prefix = pending
++            .get(..source_summary::INDEX.len() + 65)
++            .ok_or_else(|| {
++                Error::new("STORAGE_FAILURE", "invalid per-source artifact index key")
++            })?;
++        let (time, id) = source_summary::index_entry(prefix.as_bytes(), pending.as_bytes())?;
++        Ok(Some((pending.clone(), time, id.to_owned())))
++    }
++
+     /// The next per-source index row after `after` within the selected sources and the
+     /// receipt bounds: its key, receipt time and artifact identity. Rows outside the bounds
+     /// are skipped by seeking, never read.
+@@ -943,10 +1019,7 @@ impl Writer {
+                     row.summary = Some(summary);
+                     row.consumed = Consumed::Listed(0);
+                 }
+-                None => {
+-                    super::source_context::ready(self)?;
+-                    row.consumed = Consumed::Indexed(None);
+-                }
++                None => row.consumed = Consumed::Indexed(None),
+             }
+         }
+         loop {
+@@ -978,49 +1051,25 @@ impl Writer {
+                     }
+                 }
+                 Consumed::Indexed(after) => {
+-                    let prefix = format!(
+-                        "{}{:020}:",
+-                        super::source_context::hashed_prefix(&hash),
+-                        row.received_at
+-                    );
+-                    let mut iterator = self.db.raw_iterator();
+-                    match &after {
+-                        Some(after) => {
+-                            iterator.seek(after);
+-                            if iterator.valid() && iterator.key() == Some(after.as_bytes()) {
+-                                iterator.next();
+-                            }
+-                        }
+-                        None => iterator.seek(&prefix),
+-                    }
+-                    if !iterator.valid() {
+-                        iterator.status()?;
++                    let mut next = None;
++                    super::source_context::walk(
++                        self,
++                        &hash,
++                        (row.received_at, after.as_deref()),
++                        row.received_at..=row.received_at,
++                        rocksdb::Direction::Forward,
++                        |_, id| {
++                            next = Some(id.to_owned());
++                            Ok(false)
++                        },
++                    )?;
++                    let Some(id) = next else {
+                         return Ok(());
+-                    }
+-                    let key = iterator.key().ok_or_else(|| {
+-                        Error::new("STORAGE_FAILURE", "context index key missing")
+-                    })?;
+-                    if !key.starts_with(prefix.as_bytes()) {
+-                        return Ok(());
+-                    }
+-                    let key = String::from_utf8(key.to_vec())
+-                        .map_err(|_| Error::new("STORAGE_FAILURE", "invalid context index key"))?;
+-                    let id = iterator
+-                        .value()
+-                        .and_then(|id| std::str::from_utf8(id).ok())
+-                        .filter(|id| key.ends_with(id))
+-                        .ok_or_else(|| {
+-                            Error::new(
+-                                "STORAGE_FAILURE",
+-                                "source context index value disagrees with its key",
+-                            )
+-                        })?
+-                        .to_owned();
+-                    drop(iterator);
++                    };
+                     self.fold_index_record(
+                         row, &hash, &id, false, scope, now, protected, admission,
+                     )?;
+-                    row.consumed = Consumed::Indexed(Some(key));
++                    row.consumed = Consumed::Indexed(Some(id));
+                 }
+             }
+         }
+@@ -1238,7 +1287,7 @@ fn artifact_eligible(
+         }
+         None if scope.received_from == 0 && scope.received_before == u64::MAX => Ok(true),
+         None => Err(Error::new(
+-            "INDEX_NOT_READY",
++            "EVIDENCE_INCOMPLETE",
+             "original artifact receipt time is unknown after parent reclamation; omit the receipt filter or select retained records",
+         )),
+     }
+diff --git crates/sparrow-core/src/storage/context.rs crates/sparrow-core/src/storage/context.rs
+index 47d5a0d..8e5fe7f 100644
+--- crates/sparrow-core/src/storage/context.rs
++++ crates/sparrow-core/src/storage/context.rs
+@@ -5,7 +5,7 @@
+ 
+ use super::{Catalog, Error, Record, Store, Writer, catalog_lease, json, random_id};
+ use crate::QueryScope;
+-use rocksdb::{Direction, IteratorMode};
++use rocksdb::Direction;
+ use std::collections::{BTreeMap, BTreeSet};
+ 
+ /// Host-owned context admission; record interpretation profiles remain in each row.
+@@ -119,7 +119,6 @@ impl Store {
+         }
+         crate::format_instant(now)?;
+         let writer = self.lock()?;
+-        super::source_context::ready(&writer)?;
+         let mut admission = Admission {
+             catalog: catalog_lease::SCAN_BYTES - super::QUERY_SCOPE_WORKSPACE_BYTES,
+             response: catalog_lease::PAGE_BYTES - 4096,
+@@ -169,11 +168,12 @@ impl Store {
+                 "context anchor time index is missing or inconsistent",
+             ));
+         }
+-        if writer
+-            .db
+-            .get(super::source_context::key(&anchor))?
+-            .as_deref()
+-            != Some(anchor.id.as_bytes())
++        if super::source_context::cached(&writer.db)?
++            && writer
++                .db
++                .get(super::source_context::key(&anchor))?
++                .as_deref()
++                != Some(anchor.id.as_bytes())
+         {
+             return Err(Error::new(
+                 "STORAGE_FAILURE",
+@@ -247,59 +247,53 @@ fn scan_context_neighbors(
+         result.frontier = ContextFrontier::RequestedCount;
+         return Ok(result);
+     }
+-    let prefix = super::source_context::prefix(&anchor.source);
+-    let start = super::source_context::key(anchor);
+-    for entry in writer
+-        .db
+-        .iterator(IteratorMode::From(start.as_bytes(), direction))
+-    {
+-        let (key, value) = entry?;
+-        if !key.starts_with(prefix.as_bytes()) {
+-            break;
+-        }
+-        if key.as_ref() == start.as_bytes() {
+-            continue;
+-        }
+-        if result.visited == scope.scan_budget as u64 {
+-            result.frontier = ContextFrontier::ScanBudget;
+-            break;
+-        }
+-        let record = super::source_context::indexed(
+-            writer,
+-            &anchor.source,
+-            &key,
+-            &value,
+-            &mut admission.catalog,
+-        )?;
+-        if record.received_at < scope.received_from || record.received_at >= scope.received_before {
+-            break;
+-        }
+-        result.visited += 1;
+-        if record.source != anchor.source
+-            || membership.is_some_and(|members| !members.contains_key(&record.id))
+-        {
+-            continue;
+-        }
+-        writer.validate_event_record(&record)?;
+-        if !writer.live_record(&record, now, protected) {
+-            result.retired += 1;
+-            continue;
+-        }
+-        if !writer.matches_diagnostic_scope(
+-            scope,
+-            &record,
+-            &mut result.diagnostics,
+-            scope.require_complete_index,
+-        )? {
+-            continue;
+-        }
+-        admission.output(&record)?;
+-        result.records.push(record);
+-        if result.records.len() == count {
+-            result.frontier = ContextFrontier::RequestedCount;
+-            break;
+-        }
+-    }
++    let hash = super::source_summary::source_hash(&anchor.source);
++    super::source_context::walk(
++        writer,
++        &hash,
++        (anchor.received_at, Some(&anchor.id)),
++        // Receipt bounds stop the walk before the visit budget: once the timeline leaves
++        // the interval, no nearer neighbor remains.
++        scope.received_from..scope.received_before,
++        direction,
++        |received_at, id| {
++            if result.visited == scope.scan_budget as u64 {
++                result.frontier = ContextFrontier::ScanBudget;
++                return Ok(false);
++            }
++            let record = super::source_context::record(
++                writer,
++                &anchor.source,
++                received_at,
++                id,
++                &mut admission.catalog,
++            )?;
++            result.visited += 1;
++            if membership.is_some_and(|members| !members.contains_key(&record.id)) {
++                return Ok(true);
++            }
++            writer.validate_event_record(&record)?;
++            if !writer.live_record(&record, now, protected) {
++                result.retired += 1;
++                return Ok(true);
++            }
++            if !writer.matches_diagnostic_scope(
++                scope,
++                &record,
++                &mut result.diagnostics,
++                scope.require_complete_index,
++            )? {
++                return Ok(true);
++            }
++            admission.output(&record)?;
++            result.records.push(record);
++            if result.records.len() == count {
++                result.frontier = ContextFrontier::RequestedCount;
++                return Ok(false);
++            }
++            Ok(true)
++        },
++    )?;
+     if matches!(direction, Direction::Reverse) {
+         result.records.reverse();
+     }
+diff --git crates/sparrow-core/src/storage/diagnostic.rs crates/sparrow-core/src/storage/diagnostic.rs
+index 594515b..56a431b 100644
+--- crates/sparrow-core/src/storage/diagnostic.rs
++++ crates/sparrow-core/src/storage/diagnostic.rs
+@@ -566,7 +566,7 @@ impl Writer {
+         if let Some(dimension) = unknown {
+             if strict {
+                 return Err(Error::new(
+-                    "INDEX_NOT_READY",
++                    "EVIDENCE_INCOMPLETE",
+                     format!(
+                         "{} diagnostic scope cannot be certified for record {}; inspect its captured diagnostics or narrow scope",
+                         dimension.name(),
+diff --git crates/sparrow-core/src/storage/migration.rs crates/sparrow-core/src/storage/migration.rs
+index e0754fc..52917a3 100644
+--- crates/sparrow-core/src/storage/migration.rs
++++ crates/sparrow-core/src/storage/migration.rs
+@@ -13,11 +13,13 @@
+ //! restart resumes after the last committed page. A page yields the writer to waiting
+ //! writers first, for a bounded time (see [`super::writer_queue`]). Until a migration
+ //! completes its readers take the pending path: scoped SPARQL keeps the whole-store plan,
++//! the view serves the event fallback facts still owed,
+ //! SPARQL coverage counts the selected record graphs that still lack their fallback facts,
+-//! the source and artifact listings refuse with `INDEX_NOT_READY` rather than present
+-//! partial counts, record context refuses with `INDEX_NOT_READY` rather than read a partial
+-//! source timeline cache, and `status` recounts from a snapshot while the store counters
+-//! seed.
++//! the source and artifact listings add what the source-summary migration still owes to the
++//! stored rows, record context and reclaimed-parent folds read the primary time index
++//! instead of a partial source timeline cache, and `status` recounts from a snapshot while
++//! the store counters seed. No reader refuses because a migration is unfinished: each
++//! answer equals the answer the finished migration gives for the same catalog.
+ //!
+ //! Progress comes from the store counters ([`super::store_counters`]): a migration's
+ //! `done` is its `done:` counter row, maintained with its checkpoint, and its `total` is
+diff --git crates/sparrow-core/src/storage/rdf_view.rs crates/sparrow-core/src/storage/rdf_view.rs
+index 2650881..0f61c85 100644
+--- crates/sparrow-core/src/storage/rdf_view.rs
++++ crates/sparrow-core/src/storage/rdf_view.rs
+@@ -118,6 +118,9 @@ pub struct StoredRdfView<'a> {
+     /// The owner-to-graph index build is complete in this snapshot. Until it is, every
+     /// scope keeps the whole-store plan, which reads only declarations every writer kept.
+     owner_index: bool,
++    /// The scope's graphs, enumerated once per view: every graph iteration shares them,
++    /// so a query's patterns do not each re-walk the declarations.
++    owned_graphs: std::sync::OnceLock<Option<std::sync::Arc<OwnedGraphSet>>>,
+     /// Present while the event fallback backfill is incomplete in this snapshot.
+     fallback: Option<FallbackPending>,
+     budget: Arc<Budget>,
+@@ -128,12 +131,23 @@ pub struct StoredRdfView<'a> {
+     text_scope: Option<text_relations::TextScope>,
+ }
+ 
+-/// An incomplete event fallback backfill as one snapshot sees it.
++/// An incomplete event fallback backfill as one snapshot sees it, and the facts it still
++/// owes the selected record graphs. The view serves those facts with the stored rows, so a
++/// read during the backfill answers exactly as it will once the backfill is complete.
+ struct FallbackPending {
+     /// Last examined record graph owner; graphs at or before it are migrated.
+     after: Option<String>,
+     /// Dictionary identities of `eventTime` and `eventTimeFallback`, when interned.
+     predicates: [Option<u64>; 2],
++    /// The snapshot's next dictionary ordinal: every stored term's ordinal is below it, so
++    /// owed terms the dictionary lacks take ordinals from here.
++    next: u64,
++    /// Owed terms the dictionary lacks, by ordinal from `next`, with their canonical bytes.
++    terms: Vec<(Vec<u8>, ProjectionTerm)>,
++    /// Owed fallback facts of selected record graphs the backfill has not reached, each in
++    /// its record's metadata graph.
++    quads: Vec<QuadIds<GlobalTermId>>,
++    _reservation: Option<Reservation>,
+ }
+ 
+ /// Owned native term carrier whose strings live through this admitted guard.
+@@ -252,6 +266,7 @@ impl<'a> StoredRdfView<'a> {
+             owners: BTreeSet::new(),
+             scoped: false,
+             owner_index: false,
++            owned_graphs: std::sync::OnceLock::new(),
+             fallback: None,
+             budget,
+             _scope: scope,
+@@ -310,6 +325,7 @@ impl<'a> StoredRdfView<'a> {
+         };
+         let owner = read(rdf_index::OWNER_GRAPH_UPGRADE)?;
+         let checkpoint = read(super::event_fallback_rdf::CHECKPOINT)?;
++        let next = read("rdf:next")?;
+         self.owner_index = rdf_index::owner_graph_progress(|_| Ok(owner))
+             .map_err(|error| self.budget.fail(error))?
+             .is_none();
+@@ -325,10 +341,163 @@ impl<'a> StoredRdfView<'a> {
+         {
+             *slot = self.term_id_by_value(&predicate)?.map(ordinal);
+         }
+-        self.fallback = Some(FallbackPending { after, predicates });
++        let next = next
++            .as_deref()
++            .map(<[u8; 8]>::try_from)
++            .transpose()
++            .ok()
++            .flatten()
++            .map(u64::from_be_bytes)
++            .ok_or_else(|| {
++                self.budget.fail(Error::new(
++                    "STORAGE_FAILURE",
++                    "RDF dictionary allocation counter missing or invalid",
++                ))
++            })?;
++        self.fallback = Some(FallbackPending {
++            after,
++            predicates,
++            next,
++            terms: Vec::new(),
++            quads: Vec::new(),
++            _reservation: None,
++        });
+         Ok(())
+     }
+ 
++    /// Serve the fallback facts the backfill will add to `record`'s metadata graph, derived
++    /// by the backfill's own law from the record's receipt time.
++    fn owe_fallback(&mut self, record: &Record) -> Result<(), ReadError> {
++        use purrdf::TermFactory;
++        let fail = |budget: &Budget, error: Error| budget.fail(error);
++        let mut builder = purrdf::RdfDatasetBuilder::new();
++        let subject_value = TermValue::iri(rdf_index::entity_iri(&record.id));
++        let facts = builder
++            .intern_value(&subject_value)
++            .map_err(Error::from)
++            .and_then(|subject| {
++                rdf_index::fallback_metadata(
++                    &mut builder,
++                    subject,
++                    crate::EventPlacement::receipt(record.received_at),
++                )
++            })
++            .and_then(|()| rdf_index::metadata_dataset(builder))
++            .map_err(|error| fail(&self.budget, error))?;
++        let graph = self
++            .term_id_by_value(&TermValue::iri(rdf_index::graph_iri(&record.id)))?
++            .ok_or_else(|| {
++                fail(
++                    &self.budget,
++                    Error::new("STORAGE_FAILURE", "record RDF graph owner missing"),
++                )
++            })?;
++        let subject = self.term_id_by_value(&subject_value)?.ok_or_else(|| {
++            fail(
++                &self.budget,
++                Error::new("STORAGE_FAILURE", "record RDF graph subject missing"),
++            )
++        })?;
++        for quad in facts.quads() {
++            let [p, o] = [quad.p, quad.o].map(|id| {
++                facts
++                    .term_value(id)
++                    .map_err(|e| fail(&self.budget, Error::new("STORAGE_FAILURE", e.to_string())))
++            });
++            let p = self.owe_term(&p?)?;
++            let o = self.owe_term(&o?)?;
++            let pending = self.fallback.as_mut().ok_or_else(|| {
++                fail(
++                    &self.budget,
++                    Error::new("STORAGE_FAILURE", "event fallback state lost"),
++                )
++            })?;
++            match &mut pending._reservation {
++                Some(reservation) => reservation.grow(64)?,
++                None => pending._reservation = Some(self.budget.reserve(64)?),
++            }
++            pending.quads.push(QuadIds {
++                s: subject,
++                p,
++                o,
++                g: Some(graph),
++            });
++        }
++        Ok(())
++    }
++
++    /// The identity of an owed fact's term: its dictionary identity, or an ordinal from the
++    /// snapshot's next dictionary ordinal when the dictionary lacks it.
++    fn owe_term(&mut self, value: &TermValue) -> Result<GlobalTermId, ReadError> {
++        if let Some(id) = self.term_id_by_value(value)? {
++            return Ok(id);
++        }
++        if let TermValue::Literal { datatype, .. } = value {
++            self.owe_term(&TermValue::iri(datatype.clone()))?;
++        }
++        let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
++        let term = ProjectionTerm::from_term_value(value, limits).map_err(|e| {
++            self.budget
++                .fail(Error::new("STORAGE_FAILURE", e.to_string()))
++        })?;
++        let bytes = term.to_canonical_json(limits).map_err(|e| {
++            self.budget
++                .fail(Error::new("STORAGE_FAILURE", e.to_string()))
++        })?;
++        let charge = bytes.len() as u64 * 2 + 256;
++        let budget = &self.budget;
++        let pending = self.fallback.as_mut().ok_or_else(|| {
++            budget.fail(Error::new("STORAGE_FAILURE", "event fallback state lost"))
++        })?;
++        match &mut pending._reservation {
++            Some(reservation) => reservation.grow(charge)?,
++            None => pending._reservation = Some(budget.reserve(charge)?),
++        }
++        pending.terms.push((bytes, term));
++        global(pending.next + pending.terms.len() as u64 - 1).map_err(|e| budget.fail(e))
++    }
++
++    /// The owed fallback facts matching `pattern` and `graph`, with the graph semantics of
++    /// the stored rows: a metadata graph is named, and the default graph is their union.
++    fn owed_rows(
++        &self,
++        pattern: [Option<GlobalTermId>; 3],
++        graph: GraphMatch<GlobalTermId>,
++    ) -> impl Iterator<Item = QuadIds<GlobalTermId>> + '_ {
++        self.fallback
++            .iter()
++            .flat_map(|pending| pending.quads.iter())
++            .filter(move |quad| {
++                pattern[0].is_none_or(|id| id == quad.s)
++                    && pattern[1].is_none_or(|id| id == quad.p)
++                    && pattern[2].is_none_or(|id| id == quad.o)
++            })
++            .flat_map(move |quad| {
++                let named = match graph {
++                    GraphMatch::Named(id) => quad.g == Some(id),
++                    GraphMatch::Any => true,
++                    GraphMatch::Default => false,
++                };
++                let union = matches!(graph, GraphMatch::Any | GraphMatch::Default);
++                [
++                    named.then_some(*quad),
++                    union.then_some(QuadIds { g: None, ..*quad }),
++                ]
++                .into_iter()
++                .flatten()
++            })
++    }
++
++    /// An owed term by its ordinal, when it is one.
++    fn owed_term(&self, id: GlobalTermId) -> Option<&ProjectionTerm> {
++        let pending = self.fallback.as_ref()?;
++        let index = ordinal(id).checked_sub(pending.next)?;
++        pending
++            .terms
++            .get(usize::try_from(index).ok()?)
++            .map(|(_, term)| term)
++    }
++
+     /// Whether a record's metadata graph still lacks the fallback facts the event fallback
+     /// backfill adds. Graphs at or before its frontier are migrated; one beyond it was
+     /// either published after the fence, with its facts, or still waits for a page.
+@@ -425,7 +594,17 @@ impl<'a> StoredRdfView<'a> {
+         })?;
+         let key = rdf_index::reverse_key(&bytes);
+         let Some(stored) = self.reverse_point(key.as_bytes())? else {
+-            return Ok(None);
++            let owed = self.fallback.as_ref().and_then(|pending| {
++                pending
++                    .terms
++                    .iter()
++                    .position(|(owed, _)| *owed == bytes)
++                    .map(|index| pending.next + index as u64)
++            });
++            return owed
++                .map(global)
++                .transpose()
++                .map_err(|e| self.budget.fail(e));
+         };
+         let id = stored
+             .as_ref()
+@@ -499,7 +678,10 @@ impl<'a> StoredRdfView<'a> {
+             );
+             cursor(plan.0, GraphMatch::Default, true)
+         });
+-        first.chain(union.into_iter().flatten())
++        let owed = (stream == 0).then(|| self.owed_rows(pattern, graph));
++        first
++            .chain(union.into_iter().flatten())
++            .chain(owed.into_iter().flatten())
+     }
+ 
+     fn physical_rows(
+@@ -560,7 +742,23 @@ impl<'a> StoredRdfView<'a> {
+     }
+ 
+     /// Distinct graphs declared by this view's owners, in global graph order.
+-    fn owner_graphs(&self) -> Result<(BTreeSet<u64>, Reservation), ReadError> {
++    fn owner_graphs(&self) -> Option<std::sync::Arc<OwnedGraphSet>> {
++        self.owned_graphs
++            .get_or_init(|| {
++                self.enumerate_owner_graphs()
++                    .ok()
++                    .map(|(graphs, reservation)| {
++                        std::sync::Arc::new(OwnedGraphSet {
++                            graphs: graphs.into_iter().collect(),
++                            _reservation: reservation,
++                        })
++                    })
++            })
++            .clone()
++    }
++
++    /// One enumeration of the scope's graphs; a failure is recorded in the budget.
++    fn enumerate_owner_graphs(&self) -> Result<(BTreeSet<u64>, Reservation), ReadError> {
+         let mut reservation = self.budget.reserve(4096)?;
+         let mut graphs = BTreeSet::new();
+         for owner in &self.owners {
+@@ -699,25 +897,32 @@ struct GraphIter<'a> {
+ enum OwnedGraphs {
+     Pending,
+     Ready {
+-        graphs: std::collections::btree_set::IntoIter<u64>,
+-        _reservation: Reservation,
++        set: std::sync::Arc<OwnedGraphSet>,
++        next: usize,
+     },
+ }
+ 
++/// The graphs of a scope in global graph order, with the reservation that charges them.
++struct OwnedGraphSet {
++    graphs: Vec<u64>,
++    _reservation: Reservation,
++}
++
+ impl GraphIter<'_> {
+     fn next_owned(&mut self) -> Option<GlobalTermId> {
+         let owned = self.owned.as_mut()?;
+         if matches!(owned, OwnedGraphs::Pending) {
+-            let (graphs, reservation) = self.view.owner_graphs().ok()?;
+             *owned = OwnedGraphs::Ready {
+-                graphs: graphs.into_iter(),
+-                _reservation: reservation,
++                set: self.view.owner_graphs()?,
++                next: 0,
+             };
+         }
+-        let OwnedGraphs::Ready { graphs, .. } = owned else {
++        let OwnedGraphs::Ready { set, next } = owned else {
+             unreachable!("owner graphs were enumerated above")
+         };
+-        let graph = match global(graphs.next()?) {
++        let graph = *set.graphs.get(*next)?;
++        *next += 1;
++        let graph = match global(graph) {
+             Ok(id) => id,
+             Err(e) => {
+                 self.view.budget.fail(e);
+@@ -820,12 +1025,17 @@ impl DatasetView for StoredRdfView<'_> {
+         let reservation = self
+             .budget
+             .reserve(self.max_owned_term_bytes().expect("persisted bound"))?;
+-        let bytes = self.verified_forward(id)?;
+-        let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
+-        let value = ProjectionTerm::from_canonical_json(&bytes.bytes, limits).map_err(|e| {
+-            self.budget
+-                .fail(Error::new("STORAGE_FAILURE", e.to_string()))
+-        })?;
++        let value = match self.owed_term(id) {
++            Some(term) => term.clone(),
++            None => {
++                let bytes = self.verified_forward(id)?;
++                let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
++                ProjectionTerm::from_canonical_json(&bytes.bytes, limits).map_err(|e| {
++                    self.budget
++                        .fail(Error::new("STORAGE_FAILURE", e.to_string()))
++                })?
++            }
++        };
+         let mut links = [None; 3];
+         match &value {
+             ProjectionTerm::Literal { datatype, .. } => {
+@@ -940,6 +1150,10 @@ impl DatasetView for StoredRdfView<'_> {
+     }
+     fn term_count(&self) -> u64 {
+         self.terms
++            + self
++                .fallback
++                .as_ref()
++                .map_or(0, |pending| pending.terms.len() as u64)
+     }
+     fn reifier_quads(&self) -> impl Iterator<Item = QuadIds<GlobalTermId>> + '_ {
+         self.rows(1, 0, [None; 3], GraphMatch::Any)
+diff --git crates/sparrow-core/src/storage/rdf_view/query.rs crates/sparrow-core/src/storage/rdf_view/query.rs
+index 648e73c..90669ec 100644
+--- crates/sparrow-core/src/storage/rdf_view/query.rs
++++ crates/sparrow-core/src/storage/rdf_view/query.rs
+@@ -85,7 +85,7 @@ impl<Outcome> ScopedSparqlResult<Outcome> {
+     /// Independent requested-index coverage; this never changes native answer certainty.
+     pub fn index_coverage_complete(&self) -> bool {
+         self.correlation.as_ref().map_or_else(
+-            || self.coverage.complete() && self.coverage.event_fallback_pending == 0,
++            || self.coverage.complete(),
+             |capture| capture.complete(&self.coverage),
+         ) && self
+             .text
+@@ -205,7 +205,7 @@ impl Store {
+             cancellation,
+             |view, coverage| {
+                 if read.scope.require_complete_index && correlation.is_some_and(|capture| !capture.complete(coverage)) {
+-                    return Err(view.budget.fail(Error::new("INDEX_NOT_READY", "correlation requires known diagnostic interpretations and ready event-time projections throughout its selected scope")));
++                    return Err(view.budget.fail(Error::new("EVIDENCE_INCOMPLETE", "correlation requires known diagnostic interpretations and event-time profiles that do not depend on a failed JSON projection throughout its selected scope")));
+                 }
+                 let scope_admission = view
+                     .budget
+diff --git crates/sparrow-core/src/storage/rdf_view/scope.rs crates/sparrow-core/src/storage/rdf_view/scope.rs
+index 7648862..6d66ab8 100644
+--- crates/sparrow-core/src/storage/rdf_view/scope.rs
++++ crates/sparrow-core/src/storage/rdf_view/scope.rs
+@@ -114,9 +114,9 @@ pub struct RdfScopeCoverage {
+     /// Known declared diagnostic values among selected occurrences, by dimension.
+     pub diagnostic_known: std::collections::BTreeMap<crate::DiagnosticDimension, u64>,
+     /// Selected record metadata graphs the online event fallback backfill has not yet
+-    /// rebuilt: they lack `eventTimeFallback` and `eventTimeBasis` until it does. Raw
+-    /// SPARQL counts them; a correlation, whose recipe reads only `eventTime` and
+-    /// `receivedAt`, does not.
++    /// rebuilt. The view serves the `eventTimeFallback` and `eventTimeBasis` facts the
++    /// backfill owes them, so the answer is the one the finished backfill gives; this only
++    /// reports how many graphs were served that way.
+     pub event_fallback_pending: u64,
+ }
+ 
+@@ -184,7 +184,7 @@ impl StoredRdfView<'_> {
+         } else if !scope.diagnostics.is_empty() {
+             coverage.artifact_diagnostic_unknown += 1;
+             if scope.require_complete_index {
+-                return Err(self.budget.fail(Error::new("INDEX_NOT_READY","selected recordless artifact has no diagnostic record; omit diagnostic filters or select records")));
++                return Err(self.budget.fail(Error::new("EVIDENCE_INCOMPLETE","selected recordless artifact has no diagnostic record; omit diagnostic filters or select records")));
+             }
+             return Ok(());
+         }
+@@ -241,12 +241,7 @@ impl StoredRdfView<'_> {
+                 && self.fallback_pending(&record.id)?
+             {
+                 coverage.event_fallback_pending += 1;
+-                if strict {
+-                    return Err(self.budget.fail(Error::new(
+-                        "INDEX_NOT_READY",
+-                        "the event fallback migration is pending for a selected record graph; retry after it completes or omit the complete-index requirement",
+-                    )));
+-                }
++                self.owe_fallback(record)?;
+             }
+         }
+         if layers.diagnostic
+@@ -283,7 +278,7 @@ impl StoredRdfView<'_> {
+                 coverage.content_failed += 1;
+                 if strict {
+                     return Err(self.budget.fail(Error::new(
+-                        "INDEX_NOT_READY",
++                        "EVIDENCE_INCOMPLETE",
+                         "selected record RDF projection failed; inspect its diagnostic",
+                     )));
+                 }
+diff --git crates/sparrow-core/src/storage/record_fields.rs crates/sparrow-core/src/storage/record_fields.rs
+index 062f5d6..cd82ed4 100644
+--- crates/sparrow-core/src/storage/record_fields.rs
++++ crates/sparrow-core/src/storage/record_fields.rs
+@@ -110,7 +110,7 @@ pub(super) fn qualify_from_projection<B: AsRef<[u8]>>(
+             coverage.failed += 1;
+             if require_complete {
+                 return Err(Error::new(
+-                    "INDEX_NOT_READY",
++                    "EVIDENCE_INCOMPLETE",
+                     "selected JSON projection failed",
+                 ));
+             }
+@@ -127,7 +127,7 @@ pub(super) fn qualify_from_projection<B: AsRef<[u8]>>(
+     coverage.decoding_failures += failures;
+     if require_complete && failures > 0 {
+         return Err(Error::new(
+-            "INDEX_NOT_READY",
++            "EVIDENCE_INCOMPLETE",
+             "selected JSON projection has unavailable decoded strings",
+         ));
+     }
+diff --git crates/sparrow-core/src/storage/source_context.rs crates/sparrow-core/src/storage/source_context.rs
+index 73655a0..9e6ae79 100644
+--- crates/sparrow-core/src/storage/source_context.rs
++++ crates/sparrow-core/src/storage/source_context.rs
+@@ -33,7 +33,7 @@ const JOB: catalog_upgrade::Job = catalog_upgrade::Job {
+     publish,
+ };
+ 
+-pub(super) fn prefix(source: &str) -> String {
++fn prefix(source: &str) -> String {
+     hashed_prefix(&super::source_summary::source_hash(source))
+ }
+ 
+@@ -114,7 +114,8 @@ fn publish(
+ ///
+ /// The reset is one range deletion of the whole family, never a point tombstone per key,
+ /// and it seeds the `source-context` online migration, which the maintenance worker pages
+-/// through the writer. Until it completes [`ready`] refuses context reads retryably.
++/// through the writer. Until it completes, [`walk`] serves every reader from the primary
++/// time index.
+ pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
+     let checkpoint = db.get(CHECKPOINT)?;
+     let intact = db.get_pinned(GENERATION_KEY)?.as_deref() == Some(GENERATION)
+@@ -138,7 +139,7 @@ pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
+ /// Stage one rebuild page with its checkpoint, and whether the rebuild is complete after
+ /// it; `None` when it was already complete or latched a failure. A page that finds corrupt
+ /// record metadata latches the failure durably instead, so the worker stops retrying and
+-/// context reads refuse until a reopen resets the cache.
++/// readers keep reading the primary time index until a reopen resets the cache.
+ pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
+     if db.get_pinned(FAILURE)?.is_some() {
+         return Ok(None);
+@@ -189,22 +190,99 @@ fn catalog_failure(error: Error) -> Error {
+     }
+ }
+ 
+-pub(super) fn ready(writer: &Writer) -> Result<(), Error> {
+-    if writer.db.get_pinned(FAILURE)?.is_some() {
+-        return Err(Error::new(
+-            "STORAGE_FAILURE",
+-            "source context reconstruction found corrupt record metadata; repair the authoritative catalog and reopen before requesting context",
+-        ));
++/// Whether the cache is complete: its rebuild finished without a latched failure. Until it
++/// is, [`walk`] reads the authoritative primary time index instead, so a reader never
++/// waits for the rebuild and never sees a partial timeline.
++pub(super) fn cached(db: &DB) -> Result<bool, Error> {
++    Ok(db.get_pinned(FAILURE)?.is_none() && catalog_upgrade::progress(db, &JOB)?.complete)
++}
++
++/// Walk the receipt timeline of the source whose key hash is `hash`, ordered by
++/// `(received_at, record ID)`, from `received_at` and `after` (exclusive; `None` starts
++/// at the first record accepted at `received_at`) in `direction`, stopping at the first
++/// entry whose receipt time is outside `bounds`. `visit` receives each retained record's
++/// receipt time and ID and returns whether to continue.
++///
++/// This is the one timeline every source-local reader uses. A complete cache yields the
++/// source's entries directly. Otherwise the walk reads the primary `time:` index, which
++/// holds every retained record of every source, and skips records of other sources by
++/// their catalog headers without charging the caller; it yields exactly the entries the
++/// rebuilt cache will hold, in the same order. The bounds stop both reads, so a skipped
++/// run of other sources' records never extends past the caller's receipt interval.
++pub(super) fn walk(
++    writer: &Writer,
++    hash: &str,
++    position: (u64, Option<&str>),
++    bounds: impl std::ops::RangeBounds<u64>,
++    direction: rocksdb::Direction,
++    mut visit: impl FnMut(u64, &str) -> Result<bool, Error>,
++) -> Result<(), Error> {
++    let (received_at, after) = position;
++    let cached = cached(&writer.db)?;
++    let family = if cached {
++        hashed_prefix(hash)
++    } else {
++        "time:".to_owned()
++    };
++    let start = format!("{family}{received_at:020}:{}", after.unwrap_or(""));
++    let invalid = || Error::new("STORAGE_FAILURE", "invalid source timeline entry");
++    let mut iterator = writer.db.raw_iterator();
++    let forward = matches!(direction, rocksdb::Direction::Forward);
++    if forward {
++        iterator.seek(&start);
++    } else {
++        iterator.seek_for_prev(&start);
+     }
+-    match watermark(|key| Ok(writer.db.get(key)?))? {
+-        None => Ok(()),
+-        Some(watermark) => Err(Error::new(
+-            "INDEX_NOT_READY",
+-            format!(
+-                "context reads the source timeline cache, which the online migration source-context is still rebuilding (watermark {watermark}); retry once status.migrations reports it complete"
+-            ),
+-        )),
++    while iterator.valid() {
++        let key = iterator.key().ok_or_else(invalid)?;
++        if !key.starts_with(family.as_bytes()) {
++            break;
++        }
++        if after.is_none() || key != start.as_bytes() {
++            let rest = &key[family.len()..];
++            let time = rest
++                .get(..20)
++                .and_then(|time| std::str::from_utf8(time).ok())
++                .and_then(|time| time.parse::<u64>().ok())
++                .ok_or_else(invalid)?;
++            if !bounds.contains(&time) {
++                break;
++            }
++            let id = rest
++                .get(21..)
++                .and_then(|id| std::str::from_utf8(id).ok())
++                .filter(|id| rest[20] == b':' && iterator.value() == Some(id.as_bytes()))
++                .ok_or_else(|| {
++                    Error::new(
++                        "STORAGE_FAILURE",
++                        "source timeline entry value disagrees with its key",
++                    )
++                })?;
++            let selected = cached || {
++                let bytes = writer.db.get_pinned(id)?.ok_or_else(|| {
++                    Error::new("STORAGE_FAILURE", "time index references a missing record")
++                })?;
++                let header = decode(&bytes)?;
++                if header.id != id || header.received_at != time {
++                    return Err(Error::new(
++                        "STORAGE_FAILURE",
++                        "time index does not match its record",
++                    ));
++                }
++                super::source_summary::source_hash(&header.source) == hash
++            };
++            if selected && !visit(time, id)? {
++                return Ok(());
++            }
++        }
++        if forward {
++            iterator.next();
++        } else {
++            iterator.prev();
++        }
+     }
++    iterator.status()?;
++    Ok(())
+ }
+ 
+ #[derive(Default)]
+@@ -343,26 +421,23 @@ pub(super) fn update(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Erro
+     Ok(())
+ }
+ 
+-pub(super) fn indexed(
++/// Read one record [`walk`] yielded, charged to `remaining`, after checking its primary time
++/// index entry and that it belongs to `source`.
++pub(super) fn record(
+     writer: &Writer,
+     source: &str,
+-    name: &[u8],
+-    id: &[u8],
++    received_at: u64,
++    id: &str,
+     remaining: &mut usize,
+ ) -> Result<Record, Error> {
+-    let prefix = prefix(source);
+-    let suffix = name
+-        .strip_prefix(prefix.as_bytes())
+-        .ok_or_else(|| Error::new("STORAGE_FAILURE", "context index source prefix disagrees"))?;
+-    let mut primary = b"time:".to_vec();
+-    primary.extend_from_slice(suffix);
+-    if writer.db.get_pinned(&primary)?.as_deref() != Some(id) {
++    let primary = format!("time:{received_at:020}:{id}");
++    if writer.db.get_pinned(&primary)?.as_deref() != Some(id.as_bytes()) {
+         return Err(Error::new(
+             "STORAGE_FAILURE",
+             "source context index disagrees with primary time index",
+         ));
+     }
+-    let record = writer.time_record(&primary, id, remaining)?;
++    let record = writer.time_record(primary.as_bytes(), id.as_bytes(), remaining)?;
+     if record.source != source {
+         return Err(Error::new(
+             "STORAGE_FAILURE",
+diff --git crates/sparrow-core/src/storage/source_read.rs crates/sparrow-core/src/storage/source_read.rs
+index 906c798..c3f3be2 100644
+--- crates/sparrow-core/src/storage/source_read.rs
++++ crates/sparrow-core/src/storage/source_read.rs
+@@ -363,11 +363,19 @@ impl Store {
+         drop(writer);
+         #[cfg(feature = "test-support")]
+         self.source_read_paused()?;
+-        let read = |key: &str| Ok::<_, Error>(view.get(key)?);
+-        super::source_summary::ready(
+-            &super::source_summary::progress(read)?,
+-            "the source listing",
++        // While the source-summary migration is unfinished, the stored rows plus what its
++        // remaining pages owe, read from the same snapshot, are the finished counts.
++        let reader = super::store_counters::Reader::snapshot(&view);
++        let owed = super::source_summary::Completion::owed(
++            &reader,
++            &super::source_summary::progress(|key| reader.get(key.as_bytes()))?,
++            (0, Box::new(|_| false)),
++            &mut || cancellation.checkpoint(),
+         )?;
++        let finished = |source: &str, stored: Option<super::source_summary::Counts>| match &owed {
++            Some(owed) => owed.counts(source, stored),
++            None => Ok(stored),
++        };
+         let mut scanned = 0;
+         let mut remaining = SCAN_BYTES;
+         let mut admission = catalog_lease::CaptureAdmission {
+@@ -400,9 +408,17 @@ impl Store {
+             // One point read.
+             Some(source) => {
+                 let key = super::source_summary::summary_key(source);
+-                if let Some(bytes) = view.get(&key)? {
+-                    admission.entry(bytes.len())?;
+-                    let counts = super::source_summary::Counts::decode(key.as_bytes(), &bytes)?;
++                let stored = match view.get(&key)? {
++                    Some(bytes) => {
++                        admission.entry(bytes.len())?;
++                        Some(super::source_summary::Counts::decode(
++                            key.as_bytes(),
++                            &bytes,
++                        )?)
++                    }
++                    None => None,
++                };
++                if let Some(counts) = finished(source, stored)? {
+                     count(&mut rows, &mut capacity, counts)?;
+                 }
+             }
+@@ -423,10 +439,24 @@ impl Store {
+                     })?;
+                     admission.entry(bytes.len())?;
+                     let counts = super::source_summary::Counts::decode(key, bytes)?;
+-                    count(&mut rows, &mut capacity, counts)?;
++                    let source = counts.source.clone();
++                    if let Some(counts) = finished(&source, Some(counts))? {
++                        count(&mut rows, &mut capacity, counts)?;
++                    }
+                     iterator.next();
+                 }
+                 iterator.status()?;
++                drop(iterator);
++                // Sources the migration has not reached yet have no stored row.
++                for source in owed.iter().flat_map(|owed| owed.sources()) {
++                    let key = super::source_summary::summary_key(source);
++                    if view.get(&key)?.is_none()
++                        && let Some(counts) = finished(source, None)?
++                    {
++                        admission.entry(0)?;
++                        count(&mut rows, &mut capacity, counts)?;
++                    }
++                }
+             }
+         }
+         if configured.len() > 8 {
+diff --git crates/sparrow-core/src/storage/source_summary.rs crates/sparrow-core/src/storage/source_summary.rs
+index c9d65fb..2649d7f 100644
+--- crates/sparrow-core/src/storage/source_summary.rs
++++ crates/sparrow-core/src/storage/source_summary.rs
+@@ -29,7 +29,12 @@
+ //! write during the migration maintains the rows of every artifact the migration has
+ //! already counted, or that the write itself creates, and leaves the others for the
+ //! migration, which reads their state when it reaches them.
++//!
++//! Until it completes, readers add a [`Completion`] to the stored rows: the migration's own
++//! counting passes run to the end over the reader's view without writing, so a listing
++//! answers exactly as it will once the migration is complete.
+ 
++use super::store_counters::Reader;
+ use super::{Error, Writer, integer, manifest_retire, parse, read_field};
+ use purrdf_lex::json::{self, Object};
+ use rocksdb::{DB, WriteBatch};
+@@ -158,6 +163,30 @@ fn shift(source: &str, name: &str, value: u64, change: i64) -> Result<u64, Error
+     })
+ }
+ 
++/// `counts` with `delta` applied; a count below 0 refuses by naming the source.
++fn shifted(mut counts: Counts, delta: &Delta) -> Result<Counts, Error> {
++    let source = counts.source.clone();
++    counts.retained_records = shift(
++        &source,
++        "retained_records",
++        counts.retained_records,
++        delta.retained_records,
++    )?;
++    counts.complete_artifacts = shift(
++        &source,
++        "complete_artifacts",
++        counts.complete_artifacts,
++        delta.complete_artifacts,
++    )?;
++    counts.fragment_parents = shift(
++        &source,
++        "fragment_parents",
++        counts.fragment_parents,
++        delta.fragment_parents,
++    )?;
++    Ok(counts)
++}
++
+ /// Read one source's summary row from a database or snapshot reader.
+ pub(super) fn counts(
+     read: impl FnOnce(&str) -> Result<Option<Vec<u8>>, Error>,
+@@ -183,7 +212,7 @@ fn merge(db: &DB, batch: &mut WriteBatch, deltas: BTreeMap<String, Delta>) -> Re
+             continue;
+         }
+         let stored = counts(|key| Ok(db.get(key)?), &source)?;
+-        let mut next = match stored {
++        let next = match stored {
+             Some(counts) => counts,
+             None => {
+                 if delta.counted_before || super::any_key(db, index_prefix(&source).as_bytes())? {
+@@ -197,24 +226,7 @@ fn merge(db: &DB, batch: &mut WriteBatch, deltas: BTreeMap<String, Delta>) -> Re
+                 }
+             }
+         };
+-        next.retained_records = shift(
+-            &source,
+-            "retained_records",
+-            next.retained_records,
+-            delta.retained_records,
+-        )?;
+-        next.complete_artifacts = shift(
+-            &source,
+-            "complete_artifacts",
+-            next.complete_artifacts,
+-            delta.complete_artifacts,
+-        )?;
+-        next.fragment_parents = shift(
+-            &source,
+-            "fragment_parents",
+-            next.fragment_parents,
+-            delta.fragment_parents,
+-        )?;
++        let next = shifted(next, &delta)?;
+         if next.is_empty() {
+             batch.delete(summary_key(&source));
+         } else {
+@@ -250,8 +262,8 @@ struct Retained {
+ }
+ 
+ impl Retained {
+-    fn read(db: &DB, id: &str) -> Result<Option<Self>, Error> {
+-        let Some(bytes) = db.get_pinned(retained_key(id))? else {
++    fn read(reader: &Reader<'_>, id: &str) -> Result<Option<Self>, Error> {
++        let Some(bytes) = reader.get(retained_key(id).as_bytes())? else {
+             return Ok(None);
+         };
+         let (count, mode) = bytes
+@@ -350,19 +362,6 @@ pub(super) fn progress(
+     }
+ }
+ 
+-/// Refuse a listing that would read counters or index rows the migration has not finished.
+-pub(super) fn ready(progress: &Progress, operation: &str) -> Result<(), Error> {
+-    match progress.watermark() {
+-        None => Ok(()),
+-        Some(watermark) => Err(Error::new(
+-            "INDEX_NOT_READY",
+-            format!(
+-                "{operation} reads the per-source counters and artifact index, which the online migration source-summary is still seeding (watermark {watermark}); retry once status.migrations reports it complete"
+-            ),
+-        )),
+-    }
+-}
+-
+ /// Fence older writers into `batch` and seed the migration. With no catalog entry to count
+ /// it is complete as it starts. Counter rows, index rows or a checkpoint already present
+ /// under an older writer identity are not trusted: no binary that writes them leaves an
+@@ -612,7 +611,7 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
+         let complete_after = after
+             .as_ref()
+             .is_some_and(|state| !state.evicted && !retired_after);
+-        let row = Retained::read(db, &id)?;
++        let row = Retained::read(&Reader::db(db), &id)?;
+         let created = before.is_none() && after.is_some();
+         let Some((source, received_at)) = change.identity else {
+             // Neither an entry nor a record: a retirement state of an artifact already gone.
+@@ -709,77 +708,184 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
+ /// Stage one migration page: counted rows and the advanced checkpoint in one batch, and
+ /// whether the migration is complete after it. `None` when it was already complete.
+ pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
++    let reader = Reader::db(db);
+     let mut batch = WriteBatch::default();
+     let mut deltas = BTreeMap::<String, Delta>::new();
+-    let next = match progress(|key| Ok(db.get(key)?))? {
++    let next = match progress(|key| reader.get(key.as_bytes()))? {
+         Progress::Complete => return Ok(None),
+-        Progress::Artifacts(after) => artifact_page(db, after, &mut batch, &mut deltas)?,
+-        Progress::Records(after) => record_page(db, after, &mut batch, &mut deltas)?,
++        Progress::Artifacts(after) => artifact_page(
++            &reader,
++            after,
++            (PAGE_ARTIFACTS, PAGE_RECORDS),
++            &mut batch,
++            &mut deltas,
++        )?,
++        Progress::Records(after) => {
++            record_page(&reader, after, PAGE_RECORDS, &mut batch, &mut deltas)?
++        }
+     };
+     merge(db, &mut batch, deltas)?;
+     batch.put(CHECKPOINT, next.encode());
+     Ok(Some((batch, next == Progress::Complete)))
+ }
+ 
+-/// One catalog key and its value.
+-type Entry = Result<(Box<[u8]>, Box<[u8]>), Error>;
++/// Where a counting pass puts the rows it counts: a migration page's batch, or the
++/// in-memory completion a reader takes while the migration is unfinished.
++trait Rows {
++    /// One artifact's retained record count.
++    fn retained(&mut self, id: &str, row: Retained);
++    /// One per-source artifact index row.
++    fn index(&mut self, key: String);
++}
+ 
+-/// Keys under `prefix` after `after`, in order.
+-fn entries_after<'a>(
+-    db: &'a DB,
+-    prefix: &'a [u8],
+-    after: Option<&'a str>,
+-) -> impl Iterator<Item = Entry> + 'a {
+-    let start = after.map_or(prefix, str::as_bytes);
+-    db.iterator(rocksdb::IteratorMode::From(
+-        start,
+-        rocksdb::Direction::Forward,
+-    ))
+-    .map(|row| row.map_err(Error::from))
+-    .take_while(move |row| {
+-        row.as_ref()
+-            .map_or(true, |(key, _)| key.starts_with(prefix))
+-    })
+-    .filter(move |row| {
+-        row.as_ref().map_or(true, |(key, _)| {
+-            after.is_none_or(|after| **key != *after.as_bytes())
+-        })
+-    })
++impl Rows for WriteBatch {
++    fn retained(&mut self, id: &str, row: Retained) {
++        self.put(retained_key(id), row.encode());
++    }
++    fn index(&mut self, key: String) {
++        self.put(key, []);
++    }
++}
++
++/// Which owed index rows a [`Completion`] keeps.
++pub(super) type Keep = Box<dyn Fn(&str) -> bool>;
++
++/// What the unfinished migration still owes, as one reader sees the store: the count
++/// changes per source and the per-source index rows its remaining pages would write.
++/// Stored rows plus this completion equal the rows the finished migration leaves for the
++/// same catalog, because it runs the migration's own counting passes to the end.
++pub(super) struct Completion {
++    deltas: BTreeMap<String, Delta>,
++    keep: Keep,
++    /// The first owed index rows `keep` selected, at most `rows` of them, in key order.
++    pub(super) index: std::collections::BTreeSet<String>,
++    rows: usize,
++}
++
++impl Rows for Completion {
++    fn retained(&mut self, _: &str, _: Retained) {}
++    fn index(&mut self, key: String) {
++        if (self.keep)(&key) {
++            self.index.insert(key);
++            if self.index.len() > self.rows {
++                self.index.pop_last();
++            }
++        }
++    }
++}
++
++impl Completion {
++    /// Complete the migration at `progress` over `reader` without writing, keeping the first
++    /// `rows` owed index rows `keep` selects; `None` once the migration is complete. The pass reads
++    /// the catalog entries the migration has not reached, one entry each, as its pages
++    /// would; `checkpoint` runs before each artifact and record batch it examines.
++    pub(super) fn owed(
++        reader: &Reader<'_>,
++        progress: &Progress,
++        index: (usize, Keep),
++        checkpoint: &mut dyn FnMut() -> Result<(), Error>,
++    ) -> Result<Option<Self>, Error> {
++        if *progress == Progress::Complete {
++            return Ok(None);
++        }
++        let (rows, keep) = index;
++        let mut completion = Self {
++            deltas: BTreeMap::new(),
++            keep,
++            index: std::collections::BTreeSet::new(),
++            rows,
++        };
++        let mut deltas = BTreeMap::new();
++        let mut next = progress.clone();
++        loop {
++            checkpoint()?;
++            next = match next {
++                Progress::Complete => break,
++                Progress::Artifacts(after) => artifact_page(
++                    reader,
++                    after,
++                    (PAGE_ARTIFACTS, PAGE_RECORDS),
++                    &mut completion,
++                    &mut deltas,
++                )?,
++                // One pass: a deleted parent's records are counted together, as the
++                // pages count them across their boundaries.
++                Progress::Records(after) => {
++                    record_page(reader, after, usize::MAX, &mut completion, &mut deltas)?
++                }
++            };
++        }
++        completion.deltas = deltas;
++        Ok(Some(completion))
++    }
++
++    /// One source's counts after the migration: `stored` (absent when the source has no
++    /// row) with the owed changes applied; `None` when every count is 0.
++    pub(super) fn counts(
++        &self,
++        source: &str,
++        stored: Option<Counts>,
++    ) -> Result<Option<Counts>, Error> {
++        let mut next = stored.unwrap_or_else(|| Counts {
++            source: source.to_owned(),
++            ..Counts::default()
++        });
++        if let Some(delta) = self.deltas.get(source) {
++            next = shifted(next, delta)?;
++        }
++        Ok((!next.is_empty()).then_some(next))
++    }
++
++    /// Sources with owed changes, in order.
++    pub(super) fn sources(&self) -> impl Iterator<Item = &str> {
++        self.deltas.keys().map(String::as_str)
++    }
+ }
+ 
+ fn artifact_page(
+-    db: &DB,
++    reader: &Reader<'_>,
+     after: Option<String>,
+-    batch: &mut WriteBatch,
++    limits: (usize, usize),
++    rows: &mut impl Rows,
+     deltas: &mut BTreeMap<String, Delta>,
+ ) -> Result<Progress, Error> {
+     let (mut artifacts, mut records) = (0, 0);
+     let mut last = None;
+-    for row in entries_after(db, ARTIFACT_PREFIX, after.as_deref()) {
+-        if artifacts == PAGE_ARTIFACTS || records >= PAGE_RECORDS {
+-            return Ok(Progress::Artifacts(last.or_else(|| after.clone())));
+-        }
+-        let (key, bytes) = row?;
+-        let id = std::str::from_utf8(&key)
+-            .map_err(|_| failure("invalid artifact catalog key"))?
+-            .to_owned();
+-        artifacts += 1;
+-        records += count_artifact(db, &id, &bytes, batch, deltas)?;
+-        last = Some(id);
+-    }
+-    Ok(Progress::Records(None))
++    let mut full = false;
++    reader.scan(
++        ARTIFACT_PREFIX,
++        after.as_deref().map(str::as_bytes),
++        |key, bytes| {
++            if artifacts == limits.0 || records >= limits.1 {
++                full = true;
++                return Ok(false);
++            }
++            let id = std::str::from_utf8(key)
++                .map_err(|_| failure("invalid artifact catalog key"))?
++                .to_owned();
++            artifacts += 1;
++            records += count_artifact(reader, &id, bytes, rows, deltas)?;
++            last = Some(id);
++            Ok(true)
++        },
++    )?;
++    Ok(if full {
++        Progress::Artifacts(last.or(after))
++    } else {
++        Progress::Records(None)
++    })
+ }
+ 
+ /// Count one artifact with its records unless a write already counted it; returns the
+ /// record entries read.
+ fn count_artifact(
+-    db: &DB,
++    reader: &Reader<'_>,
+     id: &str,
+     bytes: &[u8],
+-    batch: &mut WriteBatch,
++    rows: &mut impl Rows,
+     deltas: &mut BTreeMap<String, Delta>,
+ ) -> Result<usize, Error> {
+-    match Retained::read(db, id)? {
++    match Retained::read(reader, id)? {
+         Some(Retained {
+             mode: Mode::Full, ..
+         }) => return Ok(0),
+@@ -797,8 +903,8 @@ fn count_artifact(
+             "artifact catalog entry {id} names another identity"
+         )));
+     }
+-    let retired = db
+-        .get_pinned(format!("artifact-retirement:{id}"))?
++    let retired = reader
++        .get(format!("artifact-retirement:{id}").as_bytes())?
+         .map(|bytes| manifest_retire::evicted_flag(&bytes))
+         .transpose()?
+         .unwrap_or(false);
+@@ -808,7 +914,7 @@ fn count_artifact(
+     let ids = header.record_ids(bytes, &mut remaining, 0, usize::MAX)?;
+     let mut retained = 0_u64;
+     for record in &ids {
+-        let Some(bytes) = db.get_pinned(record)? else {
++        let Some(bytes) = reader.get(record.as_bytes())? else {
+             continue;
+         };
+         let state = record_state(record, &bytes)?;
+@@ -823,15 +929,14 @@ fn count_artifact(
+         retained += u64::from(state.retained);
+     }
+     if complete || retained > 0 {
+-        batch.put(
+-            retained_key(id),
++        rows.retained(
++            id,
+             Retained {
+                 count: retained,
+                 mode: Mode::Full,
+-            }
+-            .encode(),
++            },
+         );
+-        batch.put(index_key(&source, received_at, id), []);
++        rows.index(index_key(&source, received_at, id));
+         let delta = deltas.entry(source).or_default();
+         delta.retained_records += i64::try_from(retained)
+             .map_err(|_| failure(format!("retained records of artifact {id} overflow")))?;
+@@ -842,63 +947,69 @@ fn count_artifact(
+ }
+ 
+ fn record_page(
+-    db: &DB,
++    reader: &Reader<'_>,
+     after: Option<String>,
+-    batch: &mut WriteBatch,
++    limit: usize,
++    rows: &mut impl Rows,
+     deltas: &mut BTreeMap<String, Delta>,
+ ) -> Result<Progress, Error> {
+     // Deleted parents counted by this page, with their row before it.
+     let mut parents = BTreeMap::<String, (Option<Retained>, u64, String, u64)>::new();
+     let mut last = None;
++    let mut records = 0;
+     let mut exhausted = true;
+-    for (records, row) in entries_after(db, RECORD_PREFIX, after.as_deref()).enumerate() {
+-        if records == PAGE_RECORDS {
+-            exhausted = false;
+-            break;
+-        }
+-        let (key, bytes) = row?;
+-        let id = std::str::from_utf8(&key)
+-            .map_err(|_| failure("invalid record catalog key"))?
+-            .to_owned();
+-        let state = record_state(&id, &bytes)?;
+-        last = Some(id);
+-        if !state.retained || db.get_pinned(&state.artifact)?.is_some() {
+-            continue;
+-        }
+-        let parent = match parents.entry(state.artifact.clone()) {
+-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+-            std::collections::btree_map::Entry::Vacant(entry) => {
+-                let row = Retained::read(db, &state.artifact)?;
+-                entry.insert((row, 0, state.source.clone(), state.received_at))
++    reader.scan(
++        RECORD_PREFIX,
++        after.as_deref().map(str::as_bytes),
++        |key, bytes| {
++            if records == limit {
++                exhausted = false;
++                return Ok(false);
+             }
+-        };
+-        if parent.0.is_some_and(|row| row.mode == Mode::Full) {
+-            continue;
+-        }
+-        let mut known = Some((parent.2.clone(), parent.3));
+-        agree(
+-            &state.artifact,
+-            &mut known,
+-            &state.source,
+-            state.received_at,
+-        )?;
+-        parent.1 += 1;
+-    }
++            records += 1;
++            let id = std::str::from_utf8(key)
++                .map_err(|_| failure("invalid record catalog key"))?
++                .to_owned();
++            let state = record_state(&id, bytes)?;
++            last = Some(id);
++            if !state.retained || reader.get(state.artifact.as_bytes())?.is_some() {
++                return Ok(true);
++            }
++            let parent = match parents.entry(state.artifact.clone()) {
++                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
++                std::collections::btree_map::Entry::Vacant(entry) => {
++                    let row = Retained::read(reader, &state.artifact)?;
++                    entry.insert((row, 0, state.source.clone(), state.received_at))
++                }
++            };
++            if parent.0.is_some_and(|row| row.mode == Mode::Full) {
++                return Ok(true);
++            }
++            let mut known = Some((parent.2.clone(), parent.3));
++            agree(
++                &state.artifact,
++                &mut known,
++                &state.source,
++                state.received_at,
++            )?;
++            parent.1 += 1;
++            Ok(true)
++        },
++    )?;
+     for (id, (row, added, source, received_at)) in parents {
+         if added == 0 {
+             continue;
+         }
+         let before = row.map_or(0, |row| row.count);
+-        batch.put(
+-            retained_key(&id),
++        rows.retained(
++            &id,
+             Retained {
+                 count: before + added,
+                 mode: Mode::Partial,
+-            }
+-            .encode(),
++            },
+         );
+         if before == 0 {
+-            batch.put(index_key(&source, received_at, &id), []);
++            rows.index(index_key(&source, received_at, &id));
+         }
+         let delta = deltas.entry(source).or_default();
+         delta.counted_before |= before > 0;
+diff --git crates/sparrow-core/src/storage/text_index.rs crates/sparrow-core/src/storage/text_index.rs
+index 9ce9bd3..2240b6e 100644
+--- crates/sparrow-core/src/storage/text_index.rs
++++ crates/sparrow-core/src/storage/text_index.rs
+@@ -55,7 +55,7 @@ pub(super) fn text_metadata(
+     }
+     if strict && failed {
+         return Err(Error::new(
+-            "INDEX_NOT_READY",
++            "EVIDENCE_INCOMPLETE",
+             "selected text projection unavailable",
+         ));
+     }
+@@ -563,7 +563,7 @@ impl Store {
+                     && matches!(&record.event_time, crate::EventTime::Unknown { reason, .. } if reason == "projection_failed")
+                 {
+                     return Err(Error::new(
+-                        "INDEX_NOT_READY",
++                        "EVIDENCE_INCOMPLETE",
+                         "selected source-time profile depends on a failed JSON projection",
+                     ));
+                 }
+diff --git crates/sparrow-core/tests/storage.rs crates/sparrow-core/tests/storage.rs
+index 777ebcc..8a1bd3e 100644
+--- crates/sparrow-core/tests/storage.rs
++++ crates/sparrow-core/tests/storage.rs
+@@ -201,7 +201,7 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
+         correlate_failed(sparrow_core::CorrelationClock::Event)
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     assert!(correlate_failed(sparrow_core::CorrelationClock::Received).is_ok());
+     let pin = store
+@@ -1498,9 +1498,11 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
+     );
+ }
+ 
+-/// INVARIANT: temporal reads never load a record outside their half-open interval, so
+-/// corrupt metadata outside it does not fail them; the source timeline rebuild that meets
+-/// that metadata latches a durable failure, stops paging and refuses context.
++/// INVARIANT (#158): temporal reads never load a record outside their half-open interval,
++/// so corrupt metadata outside it does not fail them; the source timeline rebuild that
++/// meets that metadata latches a durable failure and stops paging, and context keeps
++/// answering from the primary time index, stopping at the interval before the corrupt
++/// neighbors.
+ #[test]
+ fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
+     use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery};
+@@ -1548,15 +1550,13 @@ fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
+     };
+     let query = RecordQuery::default();
+     let rows = store.records_query(&scope, &query, 40).unwrap();
+-    let context_error = store
+-        .records_context(&inside.record_ids[0], &scope, 0, 0, 40)
+-        .unwrap_err();
+-    assert_eq!(context_error.code, "STORAGE_FAILURE");
+-    assert!(
+-        context_error
+-            .message
+-            .contains("repair the authoritative catalog and reopen")
+-    );
++    let context = store
++        .records_context(&inside.record_ids[0], &scope, 1, 1, 40)
++        .unwrap();
++    for side in [&context.before, &context.after] {
++        assert!(side.records.is_empty() && side.visited == 0, "{side:?}");
++        assert_eq!(side.frontier, sparrow_core::ContextFrontier::ScopeBoundary);
++    }
+     assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
+     assert_eq!(
+         rows["rows"][0]["record_id"].as_str(),
+@@ -3481,7 +3481,7 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
+             .records_context(&legacy.record_ids[0], &scope, 0, 0, 3)
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     scope.require_complete_index = true;
+     assert_eq!(
+@@ -3489,25 +3489,25 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
+             .json_query(&scope, &JsonQuery::Keys { path: None }, 3)
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     assert_eq!(
+         store.text_query(&scope, "needle", 3).unwrap_err().code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     assert_eq!(
+         store
+             .records_query(&scope, &RecordQuery::default(), 3)
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     assert_eq!(
+         store
+             .records_context(&artifact.record_ids[0], &scope, 10, 10, 3)
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     scope.require_complete_index = false;
+     assert_eq!(
+@@ -3522,7 +3522,7 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
+             )
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     // A certainly excluded record does not contaminate scope with its unknown host.
+     scope.selection = QuerySelection::Evidence(vec![artifact.record_ids[3].clone()]);
+@@ -3786,7 +3786,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership()
+             .json_query(&scope, &JsonQuery::Keys { path: None }, 2)
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     scope.received_from = 3;
+     scope.received_before = 4;
+@@ -3811,7 +3811,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership()
+     );
+     assert_eq!(
+         store.text_query(&scope, "needle", 4).unwrap_err().code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     let pin = store
+         .pin("diag-pin", "case", &artifact.record_ids[..1], 40, 4)
+@@ -7886,7 +7886,7 @@ fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_by
+     };
+     assert_eq!(
+         store.records_query(&scope, &strict, 3).unwrap_err().code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     for (index, expected) in input.chunks(1024 * 1024).enumerate() {
+         assert_eq!(
+@@ -11098,7 +11098,7 @@ fn stored_rdf_layers_select_native_graph_owners_and_keep_failure_and_retention_b
+             .with_rdf_records(&broken.record_ids, 3, RdfReadLimits::default(), |_| ())
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     assert_eq!(
+         store
+@@ -11746,7 +11746,7 @@ fn stored_rdf_reads_refuse_exhaustion_and_failed_projection_without_prefixes() {
+             .with_rdf_records(&malformed.record_ids, 1, Default::default(), |_| ())
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+ }
+ 
+@@ -12481,10 +12481,11 @@ fn reopening_an_intact_context_cache_does_no_rebuild() {
+     assert!(db.get(b"source-context-v1:planted").unwrap().is_some());
+ }
+ 
+-/// INVARIANT (#149): a cache without its generation marker, as a preceding binary's
++/// INVARIANT (#149, #158): a cache without its generation marker, as a preceding binary's
+ /// interrupted clear leaves it, is reset at open and rebuilt online. Until the rebuild
+-/// completes, context refuses retryably with `INDEX_NOT_READY` rather than answer from the
+-/// partial cache; afterwards stale entries are gone and missing ones are restored.
++/// completes, context reads the primary time index and answers with exactly the neighbors
++/// the rebuilt cache gives, never refusing and never reading the partial cache; afterwards
++/// stale entries are gone and missing ones are restored.
+ #[test]
+ fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
+     use sparrow_core::Migration;
+@@ -12516,11 +12517,9 @@ fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
+         .unwrap();
+     drop(db);
+     let store = Store::open(dir.path(), config()).unwrap();
+-    let refused = store
++    let during = store
+         .records_context(&anchor.record_ids[0], &context_scope(), 1, 1, 3)
+-        .unwrap_err();
+-    assert_eq!(refused.code, "INDEX_NOT_READY", "{refused:?}");
+-    assert!(refused.message.contains("source-context"), "{refused:?}");
++        .unwrap();
+     let pending = store.migrations().unwrap()[Migration::SourceContext.index()].clone();
+     assert_eq!(
+         (pending.done, pending.total, pending.watermark.as_deref()),
+@@ -12536,6 +12535,22 @@ fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
+     assert!(context.before.records.is_empty());
+     assert_eq!(context.after.records[0].id, neighbor.record_ids[0]);
+     assert_eq!(context.after.visited, 1);
++    for (rebuilt, served) in [
++        (&context.before, &during.before),
++        (&context.after, &during.after),
++    ] {
++        let ids = |side: &sparrow_core::ContextSide| {
++            side.records
++                .iter()
++                .map(|r| r.id.clone())
++                .collect::<Vec<_>>()
++        };
++        assert_eq!(ids(served), ids(rebuilt));
++        assert_eq!(
++            (served.visited, served.retired, served.frontier),
++            (rebuilt.visited, rebuilt.retired, rebuilt.frontier)
++        );
++    }
+     assert_eq!(
+         store.bytes(&neighbor.record_ids[0], 0, 9, 3).unwrap(),
+         b"neighbor\n"
+@@ -13730,7 +13745,7 @@ fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
+     query.require_complete_index = true;
+     assert_eq!(
+         store.records_query(&scope, &query, 3).unwrap_err().code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     query.require_complete_index = false;
+     scope.scan_budget = 2;
+@@ -13937,7 +13952,7 @@ fn event_intervals_place_unknowns_at_receipt_sort_source_time_and_keep_retention
+     query.require_complete_index = true;
+     assert_eq!(
+         store.records_query(&scope, &query, 100).unwrap_err().code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     query.require_complete_index = false;
+     query.event_interval = Some(EventInterval {
+@@ -14448,7 +14463,7 @@ fn artifact_diagnostic_filters_preserve_unknown_counts_and_original_receipt_scop
+     query.selector.require_complete_index = true;
+     assert_eq!(
+         store.artifact_read(&query, 20).unwrap_err().code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     query.selector.received_from = 12;
+     assert!(
+@@ -15584,7 +15599,7 @@ fn rdf_scope_reports_content_and_unknown_diagnostic_coverage_independently() {
+             )
+             .unwrap_err()
+             .code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     let metadata = RdfGraphLayers {
+         metadata: true,
+@@ -17459,7 +17474,7 @@ text_relations: None,
+             |_, _| panic!("strict unknown capture must not execute"),
+         )
+         .unwrap_err();
+-    assert_eq!(error.code, "INDEX_NOT_READY");
++    assert_eq!(error.code, "EVIDENCE_INCOMPLETE");
+     scope.source = Some("other".into());
+     assert!(run(&scope, RdfGraphLayers::ALL, 30).0.complete());
+ }
+@@ -18344,7 +18359,7 @@ fn native_correlation_recipes_bind_selectors_preserve_occurrences_and_report_unk
+     scope.require_complete_index = true;
+     assert_eq!(
+         run(&scope, &selector, Relation::TraceId).unwrap_err().code,
+-        "INDEX_NOT_READY"
++        "EVIDENCE_INCOMPLETE"
+     );
+     scope.selection = sparrow_core::QuerySelection::Evidence(vec![
+         a.record_ids[0].clone(),
+@@ -19275,10 +19290,12 @@ fn scoped_sparql_cost_is_independent_of_store_size() {
+     );
+ }
+ 
+-/// INVARIANT: the first schema 69 open fences older writers and serves at once, before
+-/// either online migration runs: status reports both pending, scoped SPARQL answers equal
+-/// the store-wide plan's, and coverage names the record graphs still awaiting their
+-/// fallback facts. An ingest during the migration writes its index rows and facts at once.
++/// INVARIANT (#158): the first schema 69 open fences older writers and serves at once,
++/// before either online migration runs: status reports both pending, scoped SPARQL answers
++/// equal the store-wide plan's and the fully migrated store's, because the view serves the
++/// fallback facts still owed to unmigrated record graphs (coverage counts them), and a
++/// strict read answers the same rows instead of refusing. An ingest during the migration
++/// writes its index rows and facts at once.
+ /// Direct `Store::migrate_step` pages (the maintenance worker's unit of work, driven here
+ /// one at a time) then finish both jobs, a restart between them resumes, and the answers
+ /// equal the fully migrated store's, now through the owner index.
+@@ -19351,6 +19368,15 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
+         assert_eq!(migration.watermark.as_deref(), Some("start"));
+         assert_eq!(migration.failure, None);
+     }
++    // Unordered rows compare as multisets: rebuilt graphs take new dictionary identities.
++    let set = |rows: &[Vec<Option<purrdf::TermValue>>]| {
++        let mut rows = rows
++            .iter()
++            .map(|row| format!("{row:?}"))
++            .collect::<Vec<_>>();
++        rows.sort_unstable();
++        rows
++    };
+     // A scoped read keeps the whole-store plan and equals the whole live store's answer.
+     let during = answers(&store);
+     let mut whole = wide.clone();
+@@ -19358,33 +19384,19 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
+     for (query, (rows, _, coverage)) in queries.iter().zip(&during) {
+         let (expected, _, _) = scoped_answer(&store, &whole, RdfGraphLayers::ALL, query, 6);
+         assert_eq!(rows, &expected, "{query}");
+-        // Every unmigrated record graph lacks its facts, and the answer says so.
++        // Every unmigrated record graph is served its owed facts, and coverage counts it.
+         assert!(coverage.event_fallback_pending > 0, "{coverage:?}");
+     }
+-    assert!(during[2].0.len() < migrated[2].0.len());
+-    assert!(during[5].0.is_empty() && during[5].2.event_fallback_pending == 1);
+-    // A strict read refuses rather than answering without the pending facts.
++    // Every answer equals the fully migrated store's.
++    for ((rows, _, _), (expected, _, _)) in during.iter().zip(&migrated) {
++        assert_eq!(set(rows), set(expected));
++    }
++    assert!(during[5].0.len() == 1 && during[5].2.event_fallback_pending == 1);
++    // A strict read answers the same rows: no fact it selects is missing.
+     let mut strict = one.clone();
+     strict.require_complete_index = true;
+-    let refused = store
+-        .sparql_query(
+-            &sparrow_core::SparqlRead {
+-                text_relations: None,
+-                scope: &strict,
+-                layers: RdfGraphLayers::ALL,
+-                request: purrdf::SparqlRequest {
+-                    query: fallback,
+-                    base_iri: None,
+-                    substitutions: &[],
+-                },
+-                governors: &purrdf::sparql::QueryGovernors::METERED.with_fuel(10_000_000),
+-                limits: sparrow_core::RdfReadLimits::default(),
+-            },
+-            6,
+-            &sparrow_core::QueryCancellation::default(),
+-        )
+-        .unwrap_err();
+-    assert_eq!(refused.code, "INDEX_NOT_READY");
++    let (strict_rows, _, _) = scoped_answer(&store, &strict, RdfGraphLayers::ALL, fallback, 6);
++    assert_eq!(set(&strict_rows), set(&migrated[5].0));
+     // An ingest during the migration writes its index rows and fallback facts at once.
+     let late = store
+         .ingest("graphs-late", "graphs", "log", b"late line\n", 5)
+@@ -19439,15 +19451,6 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
+             "{rows:?} {expected:?}"
+         );
+     }
+-    // Rebuilt graphs take new dictionary identities, so unordered rows compare as sets.
+-    let set = |rows: &[Vec<Option<purrdf::TermValue>>]| {
+-        let mut rows = rows
+-            .iter()
+-            .map(|row| format!("{row:?}"))
+-            .collect::<Vec<_>>();
+-        rows.sort_unstable();
+-        rows
+-    };
+     for (rows, (expected, _, _)) in after[queries.len()..]
+         .iter()
+         .zip(&migrated[queries.len()..])
+@@ -20413,13 +20416,206 @@ fn source_index_migration_seeds_exact_counters_and_fences_older_writers() {
+     );
+ }
+ 
+-/// INVARIANT: a store opened with the source summary migration pending serves at once;
+-/// while it runs, `sources` and `artifacts` refuse with INDEX_NOT_READY naming the
+-/// migration instead of presenting partial counts, record reads are served, and once the
+-/// migration completes both listings answer with counts equal to a full recount.
++/// One step's answers to every listing and query kind, reduced to the rows they publish.
++#[derive(Debug, PartialEq)]
++struct OnlineAnswers {
++    context: [(Vec<String>, u64, sparrow_core::ContextFrontier); 2],
++    sources: Vec<(String, usize, usize, usize)>,
++    artifacts: Vec<(String, usize, bool)>,
++    records: Vec<String>,
++    sparql: Vec<Vec<String>>,
++}
++
++/// Every query kind over the records received before `bound`, read at `now`. Every call
++/// must answer: a refusal fails the test.
++fn online_answers(store: &Store, anchor: &str, bound: u64, now: u64) -> OnlineAnswers {
++    use sparrow_core::{ArtifactRead, ArtifactSelector, RdfGraphLayers, RecordQuery, SourceRead};
++    store.status(now).unwrap();
++    let mut scope = context_scope();
++    scope.received_before = bound;
++    let context = store.records_context(anchor, &scope, 3, 3, now).unwrap();
++    let side = |side: &sparrow_core::ContextSide| {
++        (
++            side.records.iter().map(|r| r.id.clone()).collect(),
++            side.visited,
++            side.frontier,
++        )
++    };
++    let mut sources = store
++        .source_read(&SourceRead::default(), now, &[])
++        .unwrap()
++        .body
++        .sources
++        .iter()
++        .map(|row| {
++            (
++                row.source_id.clone(),
++                row.retained_records,
++                row.complete_artifacts,
++                row.fragment_parents,
++            )
++        })
++        .collect::<Vec<_>>();
++    sources.sort();
++    // Small pages, so owed index rows merge with stored ones across continuations.
++    let mut read = ArtifactRead {
++        selector: ArtifactSelector {
++            received_before: bound,
++            ..Default::default()
++        },
++        page_size: 3,
++        scan_budget: 100_000,
++        cursor: None,
++    };
++    let mut artifacts = Vec::new();
++    let mut previous = None;
++    loop {
++        let page = store.artifact_read(&read, now).unwrap();
++        // The client retires a continued handle once its next page is delivered.
++        if let Some(id) = previous.replace(page.snapshot_id.clone()) {
++            assert!(store.result_release(&page.store_id, &id, now).unwrap());
++        }
++        artifacts.extend(page.body.artifacts.iter().map(|row| {
++            (
++                row.id.clone(),
++                row.retained_records,
++                row.complete_bytes_available,
++            )
++        }));
++        match page.next_cursor {
++            Some(cursor) => read.cursor = Some(cursor),
++            None => break,
++        }
++    }
++    let mut wide = record_page_scope("online-a", 1000);
++    wide.source = None;
++    wide.received_before = bound;
++    let records = store
++        .records_query(&wide, &RecordQuery::default(), now)
++        .unwrap()["rows"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|row| row["record_id"].as_str().unwrap().to_owned())
++        .collect();
++    // A graph-enumerating query merges one cursor per selected graph and each cursor walks
++    // the selected graphs again, so its request cost grows with the square of the scope:
++    // one record keeps it far inside the default request budget, before and after the
++    // migrations alike.
++    let mut one = record_page_scope("online-a", 1000);
++    one.source = None;
++    one.selection = sparrow_core::QuerySelection::Evidence(vec![anchor.to_owned()]);
++    let sparql = [
++        "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?b WHERE { ?r sp:eventTimeBasis ?b }",
++        "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
++    ]
++    .iter()
++    .map(|query| {
++        let mut rows = scoped_answer(store, &one, RdfGraphLayers::ALL, query, now)
++            .0
++            .iter()
++            .map(|row| format!("{row:?}"))
++            .collect::<Vec<_>>();
++        rows.sort_unstable();
++        rows
++    })
++    .collect();
++    OnlineAnswers {
++        context: [side(&context.before), side(&context.after)],
++        sources,
++        artifacts,
++        records,
++        sparql,
++    }
++}
++
++/// INVARIANT (#158): while the source-context rebuild, the source-summary backfill and the
++/// schema 69 owner index and event fallback backfill run, with intake still flowing, every
++/// status call, record context, source and artifact listing, records query and SPARQL query
++/// answers, and each answer equals the same query once every migration is complete, for
++/// the records received before it. No read is refused or partial because a migration is
++/// unfinished.
++#[test]
++fn every_read_answers_completely_while_online_migrations_run_and_intake_flows() {
++    let dir = tempfile::tempdir().unwrap();
++    let store = Store::open(dir.path(), config()).unwrap();
++    let mut seeded = Vec::new();
++    // Enough records for several pages of the record-paged migrations.
++    for index in 0..12_u64 {
++        let source = if index % 2 == 0 {
++            "online-a"
++        } else {
++            "online-b"
++        };
++        let lines = (0..50)
++            .map(|line| format!("{{\"n\":{line}}}\n"))
++            .collect::<String>();
++        let artifact = store
++            .ingest(
++                &format!("online-{index}"),
++                source,
++                "jsonl",
++                lines.as_bytes(),
++                index + 1,
++            )
++            .unwrap();
++        seeded.push(artifact);
++    }
++    let anchor = seeded[4].record_ids[25].clone();
++    drop(store);
++    let db = catalog_db(dir.path()).unwrap();
++    sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
++    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
++    sparrow_test_support::stale_source_context_cache(&db).unwrap();
++    drop(db);
++    let store = Store::open(dir.path(), config()).unwrap();
++    assert!(store.migrations().unwrap().iter().all(|m| !m.complete()));
++    let mut steps = Vec::new();
++    let mut now = 100;
++    loop {
++        steps.push((now, online_answers(&store, &anchor, now, now)));
++        // Intake keeps flowing into a queried source between pages.
++        store
++            .ingest(
++                &format!("online-flow-{now}"),
++                "online-a",
++                "log",
++                b"flow\n",
++                now,
++            )
++            .unwrap();
++        // Each step reads at a fresh instant: every read lease of the last one has expired.
++        now += 100_000;
++        if store.migrate_step().unwrap().is_none() {
++            break;
++        }
++    }
++    assert!(steps.len() > 10, "{} steps", steps.len());
++    assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
++    let flows = steps.len();
++    for (index, (bound, during)) in steps.iter().enumerate() {
++        // A fresh instant per comparison, as during the migration: listing handles of the
++        // previous comparison have expired.
++        let mut after = online_answers(&store, &anchor, *bound, now + index as u64 * 100_000);
++        // The source listing is not receipt-bounded: remove the later flow records.
++        let later = flows - index;
++        for row in &mut after.sources {
++            if row.0 == "online-a" {
++                row.1 -= later;
++                row.2 -= later;
++            }
++        }
++        assert_eq!(during, &after, "step {index}");
++    }
++}
++
++/// INVARIANT (#158): a store opened with the source summary migration pending serves at
++/// once; while it runs, `sources` and `artifacts` answer with the counts and rows the
++/// finished migration gives, never refusing and never presenting partial counts, and once
++/// it completes both listings answer the same, equal to a full recount.
+ #[test]
+ fn source_summary_migration_serves_at_once_and_listings_wait_for_it() {
+-    use sparrow_core::{ArtifactRead, ArtifactSelector, Migration, SourceRead};
++    use sparrow_core::Migration;
+     let dir = tempfile::tempdir().unwrap();
+     let store = Store::open(dir.path(), config()).unwrap();
+     let artifact = store
+@@ -20435,29 +20631,11 @@ fn source_summary_migration_serves_at_once_and_listings_wait_for_it() {
+         store.record(&artifact.record_ids[0]).unwrap().id,
+         artifact.record_ids[0]
+     );
+-    let sources = store
+-        .source_read(&SourceRead::default(), 2, &[])
+-        .unwrap_err();
+-    let artifacts = store
+-        .artifact_read(
+-            &ArtifactRead {
+-                selector: ArtifactSelector {
+-                    source: Some("pending-source".into()),
+-                    ..Default::default()
+-                },
+-                ..Default::default()
+-            },
+-            2,
+-        )
+-        .unwrap_err();
+-    for error in [sources, artifacts] {
+-        assert_eq!(error.code, "INDEX_NOT_READY");
+-        assert!(
+-            error.message.contains("source-summary"),
+-            "{}",
+-            error.message
+-        );
+-    }
++    assert_eq!(listed_counts(&store, "pending-source", 2), Some((2, 1, 0)));
++    assert_eq!(
++        listed_artifacts(&store, "pending-source", 2),
++        [(artifact.id.clone(), 2, true)]
++    );
+     while store.migrate_step().unwrap().is_some() {}
+     assert_counts_match_recount(&store);
+     assert_eq!(listed_counts(&store, "pending-source", 2), Some((2, 1, 0)));
+diff --git crates/sparrow-server/src/agent/tool/catalog.rs crates/sparrow-server/src/agent/tool/catalog.rs
+index 4ab2bb5..e70849f 100644
+--- crates/sparrow-server/src/agent/tool/catalog.rs
++++ crates/sparrow-server/src/agent/tool/catalog.rs
+@@ -76,7 +76,7 @@ const TOOLS: &[(&str, &str)] = &[
+     ),
+     (
+         "artifacts_list",
+-        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads pages of the per-source index, ordered by source key, then original receipt, then ID, that count delivered rows until the last page. In the live listing, original receipt-time filters find reclaimed parents at their indexed receipt, without origin metadata; an explicit scope still refuses a receipt filter that meets a parent with no origin. The live listing refuses INDEX_NOT_READY while the source-summary migration seeds the index, or while the source-context migration rebuilds the source timeline cache a reclaimed parent's records are read through.",
++        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads pages of the per-source index, ordered by source key, then original receipt, then ID, that count delivered rows until the last page. In the live listing, original receipt-time filters find reclaimed parents at their indexed receipt, without origin metadata; an explicit scope still refuses a receipt filter that meets a parent with no origin. While an online migration seeds the index or rebuilds the source timeline cache, the live listing adds the rows the migration still owes and reads reclaimed parents' records from the primary time index, so it lists the same rows as after the migration.",
+     ),
+     (
+         "diagnostic_define",
+@@ -136,7 +136,7 @@ const TOOLS: &[(&str, &str)] = &[
+     ),
+     (
+         "records_context",
+-        "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity. Refuses INDEX_NOT_READY while the source-context migration rebuilds the source timeline cache.",
++        "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity. While the source-context migration rebuilds the source timeline cache, reads the primary time index instead and returns the same neighbors.",
+     ),
+     (
+         "rdf_inspect",
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index 8322a3c..e284b35 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -3272,7 +3272,7 @@ async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
+             assert_eq!(coverage["diagnostic_scope"]["unknown"].as_str(),Some(if tool=="records_context" {"1"} else {"2"}));
+             assert_eq!(cli_result["receipt"]["certainty"].as_str(),Some("incomplete"));
+             let strict=mcp.tool(request_id,tool,input.with("require_complete_index",true).into()).await;request_id+=1;
+-            assert_eq!(strict["structuredContent"]["error"]["code"].as_str(),Some("INDEX_NOT_READY"));
++            assert_eq!(strict["structuredContent"]["error"]["code"].as_str(),Some("EVIDENCE_INCOMPLETE"));
+             args.extend(["--require-complete-index","true"]);
+             let refused=Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args(&args).admitted_output().unwrap();
+             assert!(!refused.status.success() && refused.stdout.is_empty());
+@@ -9795,7 +9795,7 @@ async fn mcp_exercise(
+         .await;
+     assert_eq!(
+         strict["result"]["structuredContent"]["error"]["code"].as_str(),
+-        Some("INDEX_NOT_READY")
++        Some("EVIDENCE_INCOMPLETE")
+     );
+     let invalid_time = mcp
+         .call(
+@@ -11008,7 +11008,7 @@ async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_sco
+             assert_eq!(strict["isError"].as_bool(), Some(true));
+             assert_eq!(
+                 strict["structuredContent"]["error"]["code"].as_str(),
+-                Some("INDEX_NOT_READY")
++                Some("EVIDENCE_INCOMPLETE")
+             );
+             let mut partials = 0;
+             for (index, fuel) in [0_u64, 1, 3, 10, 25].into_iter().enumerate() {
+@@ -11572,7 +11572,7 @@ async fn stored_text_graph_relations_preserve_corpus_spans_and_explanations_over
+         sparrow_client::release_result(client.capability(), &store, result["snapshot_id"].as_str().unwrap()).await.unwrap();
+         let response = mcp.tool(8, "sparql_query", incomplete.with("require_complete_index", true).into()).await;
+         assert_eq!(response["isError"].as_bool(), Some(true), "{response:?}");
+-        assert_eq!(response["structuredContent"]["error"]["code"].as_str(), Some("INDEX_NOT_READY"));
++        assert_eq!(response["structuredContent"]["error"]["code"].as_str(), Some("EVIDENCE_INCOMPLETE"));
+         for invalid in [
+             Object::new().with("ranked_iri", "urn:same").with("spans_iri", "urn:same"),
+             Object::new().with("ranked_iri", "relative").with("spans_iri", "urn:spans"),
+@@ -11829,7 +11829,7 @@ async fn artifact_diagnostic_scope_reports_unknown_membership_through_cli_and_mc
+                 .admitted_output()
+                 .unwrap();
+             assert!(!output.status.success() && output.stdout.is_empty());
+-            assert!(String::from_utf8_lossy(&output.stderr).contains("INDEX_NOT_READY"));
++            assert!(String::from_utf8_lossy(&output.stderr).contains("EVIDENCE_INCOMPLETE"));
+             let excluded = cli(
+                 &socket,
+                 &[
+diff --git docs/architecture.md docs/architecture.md
+index 91ec04f..5dee5f7 100644
+--- docs/architecture.md
++++ docs/architecture.md
+@@ -597,7 +597,8 @@ write. `sources` reads one counter row per source from a snapshot taken under
+ the writer lock and released before reading, and the live artifact listing walks
+ the index of the selected sources, so neither costs the size of the store. The
+ online `source-summary` migration seeds the rows of an older store; until it
+-completes both listings refuse with `INDEX_NOT_READY`.
++completes both listings add what the migration still owes, computed by its own
++counting passes over the reader's view, and answer as they will after it.
+ 
+ Use PurRDF's governed prepared queries and fail-aware execution boundary.
+ Storage faults refuse publication of an apparently successful prefix. Governor
+diff --git docs/interfaces.md docs/interfaces.md
+index 739c8db..e56aed3 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -351,8 +351,8 @@ Continuation:
+   parent's index row, at the parent's receipt time, with no origin. The index
+   keeps that receipt time, so receipt filtering finds it.
+ - While the online `source-summary` migration is seeding the index, a live
+-  listing refuses with `INDEX_NOT_READY` naming the migration (see "Per-source
+-  counters and artifact index").
++  listing also lists the rows the migration still owes, so it answers as it will
++  after the migration (see "Per-source counters and artifact index").
+ 
+ For live listings only, this section supersedes four groups of statements. The
+ first is the replay and "never creates another handle" statements under
+@@ -650,16 +650,17 @@ Readers are explicit while a migration is pending:
+ | --- | --- | --- |
+ | Scoped SPARQL (selection, pin, or a source, time or diagnostic filter) | The whole-store plan over every graph declaration, filtered to the scope's owners; the same rows | The owner-to-graph index, at the cost of the scope |
+ | Whole-live-store SPARQL | The whole-store plan | The whole-store plan |
+-| Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph is beyond the backfill watermark and lacks `eventTimeFallback` is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`); the answer's `complete` is false, and a request with `require_complete_index` refuses with `INDEX_NOT_READY`. A correlation reads only `eventTime` and `receivedAt`, so it neither counts nor refuses | Zero; no refusal |
++| Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph is beyond the backfill watermark and lacks `eventTimeFallback` is served the `eventTimeFallback` and `eventTimeBasis` facts the backfill owes it, derived by the backfill's own law from the record's receipt time, and is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`). The answer equals the migrated store's; strict reads answer the same way | Zero |
+ | New graphs written during the migration | Owner-to-graph rows and fallback facts in the same batch | The same |
+ | Catalog event time (intervals, sorting, correlation clocks, `event_time_fallback`) | Derived from each record's `received_at`; independent of the RDF rewrite | The same |
+-| Record context (`recordsContext`, CLI `context`, MCP `records_context`), and a live `artifacts` listing row that reads its parent records through the cache | Refuses with `INDEX_NOT_READY` naming the `source-context` migration and its watermark; never answers from the partial cache | Walks the source timeline cache |
++| Record context (`recordsContext`, CLI `context`, MCP `records_context`), and a live `artifacts` listing row that reads its parent records through the cache | Walks the primary `time:` index and keeps the source's records, never the partial cache; the same neighbors, visits and frontier | Walks the source timeline cache |
+ 
+ While the backfill is pending, each candidate record (a selected record without
+ a source event time whose graph is beyond the backfill watermark) costs an
+ extra manifest point read and a subject lookup, both charged to the request
+-budget; a record at or before the watermark costs nothing extra. A large metadata scope can therefore refuse
+-with `RESOURCE_LIMIT` during the migration and succeed after it.
++budget, and its owed facts are charged as the view holds them; a record at or before the watermark costs
++nothing extra. A metadata scope near its budget can therefore refuse with `RESOURCE_LIMIT` during the
++migration and succeed after it.
+ 
+ These fields were added within schema 69, before its first deployment. The
+ schema 70 flags below were added after it.
+@@ -794,15 +795,16 @@ Readers while the migration is pending:
+ 
+ | Reader | Pending | Complete |
+ | --- | --- | --- |
+-| `sources` (`sourcesList`, CLI `sources`, MCP `sources_list`) | Refuses with `INDEX_NOT_READY` naming the `source-summary` migration and its watermark | Reads the counter rows |
+-| Live `artifacts` listing | Refuses with `INDEX_NOT_READY` the same way | Walks the per-source index |
++| `sources` (`sourcesList`, CLI `sources`, MCP `sources_list`) | Adds the counts the migration still owes to the counter rows of the same snapshot | Reads the counter rows |
++| Live `artifacts` listing | Merges the index rows the migration still owes with the stored rows, page by page | Walks the per-source index |
+ | Explicit artifact selections, record reads, SPARQL, search | Served; they do not read these rows | The same |
+ 
+-The listings refuse rather than mark their counts incomplete because
+-`SourceSummary` and the live artifact page have no coverage field for the
+-counters, and adding one would change the wire schema, which this format
+-change does not do. Strict reads refuse in the same way while the schema 69
+-migrations are pending.
++What the migration owes is computed by running its own counting passes to the
++end over the reader's view without writing, so a listing during the migration
++equals the listing after it. The pass reads each catalog entry the migration
++has not reached once, so its cost shrinks as the migration advances; a live
++artifact page runs it under the writer lock, as every live page reads. No
++reader refuses because a migration is pending.
+ 
+ The migration's duration on the live store is measured on a copy of the newest
+ closed-store backup with `deploy/verify-backup.sh --measure-migration`, recorded
+@@ -964,10 +966,10 @@ reasons: `log_no_match`, `log_capture_missing`, `log_invalid_utf8`,
+ `invalid_instant`, `log_input_unavailable` and `log_wrong_format`. Raw bytes remain
+ authoritative. Syslog retains its protocol timestamp interpretation. Event-time
+ queries place unknown clocks at receipt time, marked with basis `receipt`, and
+-report their count. Strict index readiness does not promise every clock is known;
+-a source time that depends on a failed JSON projection is not ready, so strict
+-event-time reads and strict event-clock correlation refuse it with
+-`INDEX_NOT_READY`.
++report their count. Strict index completeness does not promise every clock is known;
++a source time that depends on a failed JSON projection is incomplete evidence, so
++strict event-time reads and strict event-clock correlation refuse it with
++`EVIDENCE_INCOMPLETE`.
+ 
+ Patterns admit at most 4096 UTF-8 bytes. Compilation has finite native ceilings
+ of 100,000 steps, 16,384 nodes and 65,536 construction slots. Each match has
+@@ -1088,7 +1090,7 @@ erase totals obtained from a complete membership scan.
+ 
+ Every surface accepts `require_complete_index=true` (CLI
+ `--require-complete-index true`). Unknown diagnostic membership then refuses
+-with `INDEX_NOT_READY`, without successful rows; JSON discovery also refuses
++with `EVIDENCE_INCOMPLETE`, without successful rows; JSON discovery also refuses
+ unavailable applicable projections. Context anchors must be proven members even
+ in default mode; uncertain neighbors remain visible in coverage. Operational
+ storage failures always refuse with no successful prefix. Membership references
+@@ -1519,15 +1521,17 @@ order; their first deletion batch removes the marker, so a cache such an image
+ touched, or left half cleared, is reset at the next open. The `source-context`
+ online migration then rebuilds the cache with the shared bounded catalog pager,
+ one page per maintenance admission, while the daemon serves. Until it
+-completes, context reads refuse with `INDEX_NOT_READY`. A query-only daemon
+-runs no page, so on a stale cache its context reads refuse until a writable
+-daemon completes the rebuild. Selected entries must agree with the primary time index and the
++completes, context reads walk the primary `time:` index instead and return the
++neighbors the rebuilt cache will give. A query-only daemon runs no page, so on a
++stale cache its context reads keep using the time index until a writable daemon
++completes the rebuild. Selected entries must agree with the primary time index and the
+ record's source; disagreement refuses the capture without a global scan fallback.
+ Corrupt record metadata found during reconstruction latches a durable failure:
+-the migration stops paging, `Status.migrations` reports the failure, and every
+-context capture refuses with an actionable storage failure until catalog repair
+-and a reopen, which resets the cache and rebuilds it. It does not publish a
+-partial timeline or prevent unrelated evidence reads. Other page failures, such
++the migration stops paging, `Status.migrations` reports the failure, and
++context keeps walking the primary `time:` index until catalog repair and a
++reopen, which resets the cache and rebuilds it. A context read that reaches the
++corrupt record itself refuses with a storage failure. The failure does not
++publish a partial timeline or prevent unrelated evidence reads. Other page failures, such
+ as storage I/O or admission, are retried like any migration page. The daemon
+ prints the wall time of each open phase once at startup as
+ `sparrowd: store_open_ms rocksdb=N identity=N upgrades=N migration_fence=N archive=N wal_sync=N state=N registries=N total=N`
+@@ -1660,7 +1664,7 @@ does not leave it incomplete. An event clock does require that no selected
+ record's source time depends on a failed JSON projection, the same readiness law
+ as a strict records read.
+ Strict `require_complete_index=true` refuses an incomplete interpretation with
+-`INDEX_NOT_READY`. In permissive mode, available relationships retain their native
++`EVIDENCE_INCOMPLETE`. In permissive mode, available relationships retain their native
+ certainty while incomplete coverage prevents an empty result proving absence.
+ Governor at-most results remain candidates and unknown outcomes expose no rows.
+ Raw SPARQL keeps its existing readiness law and has `correlation=null`.
+@@ -1846,7 +1850,7 @@ artifact and pin selections use the shared membership owner and do not expand an
+ empty artifact into a fabricated record. Source filters precede diagnostic
+ coverage. An otherwise eligible empty artifact cannot satisfy record diagnostic
+ filters: permissive reads exclude it and count `artifact_diagnostic_unknown`;
+-strict reads refuse `INDEX_NOT_READY`. Metadata layer exclusion removes its graph.
++strict reads refuse `EVIDENCE_INCOMPLETE`. Metadata layer exclusion removes its graph.
+ 
+ Graph coverage keeps `known_selected_records` unchanged and separately reports
+ `artifacts_visited`, `known_selected_artifacts` and
+@@ -2334,7 +2338,7 @@ a continuing live page the rows delivered so far, with `matching_artifacts` null
+ (schema 66);
+ `matching_artifacts` is null and `answer_certainty` is incomplete when diagnostic
+ membership is unknown. CLI `--require-complete-index` and MCP
+-`require_complete_index=true` refuse with `INDEX_NOT_READY` on applicable unknown
++`require_complete_index=true` refuse with `EVIDENCE_INCOMPLETE` on applicable unknown
+ mappings. No prefix or handle is published on refusal. CLI and MCP share scope
+ decoding, typed coverage encoding and rendering.
+ 
+@@ -2550,7 +2554,7 @@ own lease instead. Summaries carry original artifact
+ metadata in an explicit optional union, complete-byte availability at capture
+ time and exact retained record count. Reclaimed parent catalogs return absent
+ origin metadata while surviving records retain parent ID/source. Receipt-time
+-filtering on an applicable unknown origin refuses with `INDEX_NOT_READY`.
++filtering on an applicable unknown origin refuses with `EVIDENCE_INCOMPLETE`.
+ Complete-byte availability is an observation at `as_of`; byte reads independently
+ check current retention. All counts render as decimal strings in agent output.
+ 
+@@ -3156,7 +3160,7 @@ scope, shorter pin, altered datatype, or unrelated source generation.
+ | `EVIDENCE_UNAVAILABLE` | Known expired, evicted, or incomplete complete-file representation. |
+ | `PIN_NOT_ACTIVE` | Expired/released collection cannot be renewed or used as an active scope. |
+ | `CONFLICT` | Retry identity reuse, revision mismatch, or conflicting source generation. |
+-| `INDEX_NOT_READY` | Required projection coverage is unavailable, with pending/failed diagnostics. |
++| `EVIDENCE_INCOMPLETE` | A `require_complete_index` read selected evidence whose interpretation is permanently unknown or failed at ingest (a failed projection, unknown captured diagnostics, a recordless artifact under a diagnostic filter, a reclaimed parent's unknown origin). Not retryable; no online migration causes it. |
+ | `RESULT_EXPIRED` | Bounded snapshot/result lease ended. |
+ | `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. Native certified governor outcomes retain their read receipts. |
+ | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
+diff --git docs/open-items.md docs/open-items.md
+index 6887582..6a762fb 100644
+--- docs/open-items.md
++++ docs/open-items.md
+@@ -152,7 +152,7 @@ Every row in this group is agent-marked: a reviewer labelled the finding OPTIONA
+ | C-24 | #22: AppArmor profiles for the two timer helpers, `sparrow-backup` and `sparrow-ship` | #22 body, Out of scope; deploy/RECOVERY.md:599-601; deploy/systemd/sparrow-backup.service:51-52; deploy/systemd/sparrow-ship.service:45-46 | Agent: "follow-up work" | Not written. `deploy/apparmor` holds only `sparrow`. | #88 |
+ | C-25 | #36 step 2 is not #18's full re-derivation | W36/plan.md:11-12 | Agent: plan Exclusion. Its placement follows the 06:3x ruling "file it under #18". | #18 open, not started | #18 |
+ | C-26 | #36 plan excludes changes to the #13 owner-index job | pr/37:plan.md:9-10 | Agent: "unless measurement shows it matters" | The step 2 design covers both jobs, as A-16's ruling requires. | #36 |
+-| C-27 | #36 step 2: `with_rdf_records` refuses INDEX_NOT_READY while graphs are pending | W36/implementation.md:225-227 | Agent: "Not done / open" | Still true in the worktree (`rdf_view.rs:980`). The claim that it has no production caller is unverified. | #36 |
++| C-27 | #36 step 2: `with_rdf_records` refused while graphs were pending | W36/implementation.md:225-227 | Agent: "Not done / open" | Resolved by #158: the view serves the facts the event fallback backfill owes, so pending graphs no longer refuse. | #36 |
+ | C-28 | Broad query acceptance is unfinished, and other captured query families keep their old implementation | docs/query-streaming.md:159-163 | Agent: doc text | Still stated at HEAD. Current behavior unverified. | #14 for `sources` and `artifacts`; #89 for the rest |
+ | C-29 | Social-preview card not drawn | docs/BRAND.md:111-112 | Agent: "not yet drawn" | Still true | #90 |
+ | C-30 | Decodes draft (C17): a direct sparrow-client producer in lossless-confirmed mode comes "later", once the registry, spool and profile land | .stage/tmp-rescue-20261103/sparrow-issue.md:38 | Agent draft with a named trigger. The parent ruling, Patrick 2026-11-01: "both must be supported in the capnproto shim" (:9) | Sparrow's prerequisites are not started. | #6, #7, #9 |
+diff --git helpers-ledger.toml helpers-ledger.toml
+index a6bf9d8..9b8fa49 100644
+--- helpers-ledger.toml
++++ helpers-ledger.toml
+@@ -157,9 +157,9 @@ names = ['^(copy_fallback_upgrade_pager|decode_metadata_graph_elsewhere|append_f
+ 
+ [[job]]
+ id = "source-summary-counters"
+-summary = "One WriteBatch observer, called in Writer::apply for every catalog write, adds the exact per-source counter, artifact retained-count and per-source artifact index row changes for the batch's artifact, artifact-retirement and record changes; negative or missing counters refuse with STORAGE_FAILURE naming the source, never clamped. One online migration, fenced and seeded at open behind the source summary writer families and paged by the maintenance worker, seeds the rows from existing artifact and record entries. Source keys use the one BLAKE3 source-key hash shared with the source context, source time and diagnostic indexes; it and the source context observer fold batches through the one durability::observe_batch."
++summary = "One WriteBatch observer, called in Writer::apply for every catalog write, adds the exact per-source counter, artifact retained-count and per-source artifact index row changes for the batch's artifact, artifact-retirement and record changes; negative or missing counters refuse with STORAGE_FAILURE naming the source, never clamped. One online migration, fenced and seeded at open behind the source summary writer families and paged by the maintenance worker, seeds the rows from existing artifact and record entries; until it completes, readers add a Completion that runs the migration's own counting passes to the end over their view through the one Rows sink, so listings answer as after it. Source keys use the one BLAKE3 source-key hash shared with the source context, source time and diagnostic indexes; it and the source context observer fold batches through the one durability::observe_batch."
+ home = "sparrow_core::storage::source_summary::apply"
+-entry_points = ["sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::source_summary::page", "sparrow_core::storage::source_summary::fence", "sparrow_core::storage::source_summary::counts", "sparrow_core::storage::source_summary::ready", "sparrow_core::storage::source_summary::source_hash", "sparrow_core::storage::writer_format::enable_source_summary", "sparrow_core::storage::artifact_read::Writer::artifact_index_page"]
++entry_points = ["sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::source_summary::page", "sparrow_core::storage::source_summary::fence", "sparrow_core::storage::source_summary::counts", "sparrow_core::storage::source_summary::Completion::owed", "sparrow_core::storage::source_summary::source_hash", "sparrow_core::storage::writer_format::enable_source_summary", "sparrow_core::storage::artifact_read::Writer::artifact_index_page"]
+ spec = "docs/interfaces.md: per-source counters and artifact index (store format); docs/architecture.md section 7."
+ vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/maintenance.rs"]
+ bench = []
+@@ -367,9 +367,9 @@ names = ['^(stream_record_summary|snapshot_record_summary)$']
+ 
+ [[job]]
+ id = "source-context-timeline-cache"
+-summary = "One derived source timeline is maintained atomically with authoritative record/time publication; an open resets it with one range deletion only when its generation marker shows it stale, and the source-context online migration rebuilds it through the shared bounded catalog pager while context refuses INDEX_NOT_READY; context uses one indexed reader, never a global-scan fallback."
++summary = "One derived source timeline is maintained atomically with authoritative record/time publication; an open resets it with one range deletion only when its generation marker shows it stale, and the source-context online migration rebuilds it through the shared bounded catalog pager. Every source-local reader walks the one timeline, source_context::walk, which reads the cache once it is complete and the authoritative primary time index, filtered to the source, until then; there is no second reader or separate fallback."
+ home = "sparrow_core::storage::source_context::update"
+-entry_points = ["sparrow_core::storage::source_context::fence", "sparrow_core::storage::source_context::page", "sparrow_core::storage::source_context::ready", "sparrow_core::storage::source_context::indexed", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::source_context::hashed_prefix", "sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::context::Store::records_context"]
++entry_points = ["sparrow_core::storage::source_context::fence", "sparrow_core::storage::source_context::page", "sparrow_core::storage::source_context::cached", "sparrow_core::storage::source_context::walk", "sparrow_core::storage::source_context::record", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::source_context::hashed_prefix", "sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::context::Store::records_context"]
+ spec = "docs/interfaces.md: source-indexed context capture."
+ vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+ bench = []
