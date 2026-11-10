@@ -83,6 +83,37 @@ pub struct ServerConfig {
     pub backup_keep: u32,
 }
 
+/// Paths the daemon writes, by configuration key. `server.toml` names no log file, so these are
+/// the paths a watch root could swallow. Checks are lexical, like the other configuration
+/// checks; the runtime root open also compares canonical paths with the store.
+#[derive(Clone, Debug, Default)]
+pub struct OutputPaths(Vec<(&'static str, PathBuf)>);
+
+impl OutputPaths {
+    /// Refuse the first watch whose root contains, equals or lies inside an output path,
+    /// naming the watch, the key and both paths. Applied to the seed entries in `server.toml`,
+    /// to the stored catalog at startup and to every `watch put`.
+    pub fn refuse_overlap(
+        &self,
+        watches: &[ConsumeWatch],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for watch in watches {
+            for (key, path) in &self.0 {
+                if path.starts_with(&watch.root) || watch.root.starts_with(path) {
+                    return Err(format!(
+                        "watch `{}` root {} overlaps {key} {}: a watch root must neither contain nor lie inside a path Sparrow writes itself; move one of them",
+                        watch.id,
+                        watch.root.display(),
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Archive-before-delete destination and segment policy; unknown fields are errors.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -255,6 +286,7 @@ impl ServerConfig {
         if let Some(archive) = &config.archive {
             archive.validate(&config.data_dir)?;
         }
+        config.output_paths().refuse_overlap(&config.consume)?;
         crate::syslog_listener::validate(&config.syslog)?;
         if config.rpc_tcp_address.is_some() != config.rpc_tcp_secret_file.is_some() {
             return Err(
@@ -384,6 +416,27 @@ impl ServerConfig {
             );
         }
         Ok(())
+    }
+
+    /// The paths the daemon itself writes: no watch root may contain or lie inside one.
+    #[must_use]
+    pub fn output_paths(&self) -> OutputPaths {
+        let optional = |key, path: Option<&PathBuf>| path.map(|path| (key, path.clone()));
+        OutputPaths(
+            [
+                Some(("data_dir", self.data_dir.clone())),
+                Some(("socket_path", self.socket_path.clone())),
+                optional("ingest_socket_path", self.ingest_socket_path.as_ref()),
+                optional("backup_root", self.backup_root.as_ref()),
+                optional(
+                    "archive.dir",
+                    self.archive.as_ref().map(|archive| &archive.dir),
+                ),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        )
     }
 
     /// Read the configured TCP CHAP secret; a configured but unusable file is an error.
@@ -574,5 +627,59 @@ mod tests {
         drop(archiving.open_store().unwrap());
         let unconfigured = with("").unwrap();
         assert!(unconfigured.open_store().is_err());
+    }
+
+    /// INVARIANT: a consume or tail root that contains, or lies inside, any path the daemon
+    /// writes itself (store, sockets, backup root, archive) refuses configuration load and
+    /// names both paths, because the daemon would otherwise watch its own output.
+    #[test]
+    fn watch_root_overlapping_a_daemon_output_path_refuses_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        let watch = |root: &std::path::Path| {
+            format!(
+                "[[consume]]\nid = \"w\"\nroot = \"{}\"\nproducer_contract = \"finished_files\"\nsource = \"s\"\nformat = \"log\"\n",
+                root.display()
+            )
+        };
+        let with = |extra: &str| {
+            std::fs::write(&config, format!("{base}{extra}")).unwrap();
+            ServerConfig::read(&config)
+        };
+        let ingest = dir.path().join("run/ingest.sock");
+        let ingest_keys = format!(
+            "ingest_socket_path = \"{}\"\ningest_socket_gid = 1\n",
+            ingest.display()
+        );
+        let backup = dir.path().join("backup");
+        let archive = dir.path().join("nas");
+        let outputs = format!(
+            "{ingest_keys}backup_root = \"{}\"\n[archive]\ndir = \"{}\"\n",
+            backup.display(),
+            archive.display()
+        );
+        // Top-level keys must precede the tables, so the watch goes last.
+        for root in [
+            dir.path().to_path_buf(),
+            data.clone(),
+            dir.path().join("run"),
+            backup.join("inside"),
+            archive.clone(),
+        ] {
+            let error = with(&format!("{outputs}{}", watch(&root)))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("overlaps"), "{} {error}", root.display());
+            assert!(error.contains(&root.display().to_string()), "{error}");
+        }
+        with(&format!(
+            "{outputs}{}",
+            watch(&dir.path().join("intake/app"))
+        ))
+        .unwrap();
     }
 }

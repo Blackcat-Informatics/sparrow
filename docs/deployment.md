@@ -346,6 +346,19 @@ records took 1.5 seconds for 0.95 MB, 19 seconds for 2.2 MB and 47 seconds for
 4.4 MB. The example's 1 MiB `max_chunk_bytes` keeps such chunks well inside the
 deadline.
 
+`sparrow-ship` refuses its configuration at load, before it reads or writes anything,
+when a source `dir` equals, contains or lies inside `intake_root` or `state_dir`. It
+compares real paths, so a symlink does not hide the overlap, and the error names the
+source, both paths and the key. Such a source would ship the shipper's own queue,
+ledgers and intake items again on every run.
+
+`sparrowd` refuses a consume or tail watch root that equals, contains or lies inside
+`data_dir`, `socket_path`, `ingest_socket_path`, `backup_root` or `archive.dir`, naming
+the watch and both paths. It applies the rule to the `consume` seeds in `server.toml`
+when it loads them, to the stored catalog at startup, and to every `watch put`. The
+check is lexical. `server.toml` names no log file, so the daemon cannot check where its
+standard error is redirected; keep any such file outside every watch root.
+
 Each file is staged completely and checked against the original's size and
 identity before any part of it is queued. Its copies or chunks then enter the
 queue together, the queue directory is synchronized, and a per-source ledger

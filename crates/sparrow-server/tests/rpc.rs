@@ -3890,6 +3890,51 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
     }).await;
 }
 
+/// INVARIANT: a `watch put` whose root lies inside a path the daemon writes (here the
+/// backup root) is refused naming both paths, because live watches come from the stored
+/// catalog and `server.toml` only seeds it; a root beside those paths is still accepted.
+#[tokio::test(flavor = "current_thread")]
+async fn watch_put_refuses_a_root_inside_a_daemon_output_path() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let backup = dir.path().join("backup");
+            let inside = backup.join("inside");
+            let beside = dir.path().join("beside");
+            std::fs::create_dir_all(&inside).unwrap();
+            std::fs::create_dir(&beside).unwrap();
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!("backup_root = {backup:?}\n"));
+            std::fs::write(&config, text).unwrap();
+            let _daemon = start(&config, &socket).await;
+            let put = |root: &Path, request: &str| {
+                let file = dir.path().join(format!("{request}.toml"));
+                let definition = watch_definition(root, request, 30_000, 16, 16);
+                std::fs::write(&file, toml::to_string(&definition).unwrap()).unwrap();
+                Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .args(endpoint_args(&socket))
+                    .args(["watch", "put", request, "0", file.to_str().unwrap()])
+                    .admitted_output()
+                    .unwrap()
+            };
+            let refused = put(&inside, "inside");
+            let errors = String::from_utf8_lossy(&refused.stderr);
+            assert!(!refused.status.success(), "{errors}");
+            assert!(errors.contains("overlaps backup_root"), "{errors}");
+            assert!(errors.contains(&inside.display().to_string()), "{errors}");
+            let accepted = put(&beside, "beside");
+            assert!(
+                accepted.status.success(),
+                "{}",
+                String::from_utf8_lossy(&accepted.stderr)
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect_removed_authority()
 {
@@ -6350,6 +6395,42 @@ fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
         std::fs::metadata(&original).unwrap().len(),
         sparrow_core::MAX_IMPORT_BYTES + 1
     );
+}
+
+/// INVARIANT: the shipper refuses at configuration load, naming both paths, a source
+/// directory that equals, contains or lies inside `intake_root` or `state_dir`, including
+/// through a symlink, because it would otherwise ship its own queue and ledgers forever.
+#[test]
+fn shipper_refuses_a_source_overlapping_its_intake_or_state_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let (intake, state) = (dir.path().join("intake"), dir.path().join("ship"));
+    for tree in [&intake, &state] {
+        std::fs::create_dir_all(tree.join("inner")).unwrap();
+    }
+    std::os::unix::fs::symlink(&state, dir.path().join("alias")).unwrap();
+    let config = dir.path().join("ship.toml");
+    let refuses = |source: &Path, key: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                "intake_root = {intake:?}\nstate_dir = {state:?}\nmax_chunk_bytes = 1048576\n\
+                 max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+                 max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+                 [[source]]\nname = \"s\"\ndir = {source:?}\npattern = \"*.json\"\n\
+                 rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
+            ),
+        )
+        .unwrap();
+        let output = ship(&config);
+        let errors = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{source:?}");
+        assert!(errors.contains(&format!("overlaps {key}")), "{errors}");
+        assert!(errors.contains(&source.display().to_string()), "{errors}");
+    };
+    refuses(&intake, "intake_root");
+    refuses(&state.join("inner"), "state_dir");
+    refuses(dir.path(), "intake_root");
+    refuses(&dir.path().join("alias"), "state_dir");
 }
 
 /// INVARIANT: an artifact above the removed 16 MiB per-artifact limit ingests whole and

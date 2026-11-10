@@ -769,7 +769,15 @@ impl ConsumeWorker {
         registry: WatchRegistry,
         operations: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self, Error> {
-        Self::start_with(store, configs, socket, registry, operations, None)
+        Self::start_with(
+            store,
+            configs,
+            socket,
+            registry,
+            operations,
+            None,
+            crate::config::OutputPaths::default(),
+        )
     }
 
     /// Start as [`Self::start`] does. With `private`, every stored root is first rebound
@@ -781,6 +789,7 @@ impl ConsumeWorker {
         registry: WatchRegistry,
         operations: Arc<tokio::sync::Semaphore>,
         private: Option<PrivateIntake>,
+        outputs: crate::config::OutputPaths,
     ) -> Result<Self, Error> {
         let mut catalog = Catalog::load(&store, configs)?;
         if let Some(intake) = &private {
@@ -793,6 +802,7 @@ impl ConsumeWorker {
             .map(|watch| watch.definition.clone())
             .collect::<Vec<_>>();
         ConsumeWatch::validate(&definitions)
+            .and_then(|()| outputs.refuse_overlap(&definitions))
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         let pending = store.consumption_pending()?;
         if pending
@@ -837,6 +847,7 @@ impl ConsumeWorker {
                                 commands,
                                 operations,
                                 private,
+                                outputs,
                             },
                         ),
                     )
@@ -1076,6 +1087,7 @@ fn administrate(
     action: Action,
     pending: &[sparrow_core::ConsumptionJournal],
     binding: RootBinding,
+    outputs: &crate::config::OutputPaths,
 ) -> Result<ManagedWatch, AdminFailure> {
     let (mut next, watch, duplicate) = catalog
         .prepare(&action, crate::now().map_err(AdminFailure::Refused)?)
@@ -1090,6 +1102,7 @@ fn administrate(
         .map(|watch| watch.definition.clone())
         .collect::<Vec<_>>();
     ConsumeWatch::validate(&definitions)
+        .and_then(|()| outputs.refuse_overlap(&definitions))
         .map_err(|error| AdminFailure::Refused(watch_admin::failure("INVALID_ARGUMENT", error)))?;
     let old = detectors
         .iter()
@@ -1173,6 +1186,7 @@ struct Control {
     commands: tokio::sync::mpsc::Receiver<watch_admin::Command>,
     operations: Arc<tokio::sync::Semaphore>,
     private: Option<PrivateIntake>,
+    outputs: crate::config::OutputPaths,
 }
 
 async fn run(
@@ -1249,6 +1263,7 @@ async fn run(
                             action,
                             &pending,
                             PrivateIntake::binding(control.private.as_ref()),
+                            &control.outputs,
                         )
                         .inspect_err(|_| {
                             if let Some((private, previous)) = previous {
