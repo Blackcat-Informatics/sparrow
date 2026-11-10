@@ -664,8 +664,10 @@ every 64 pages, and
 migration finishes. Each line reports the counters the page's own batch updated
 and reads nothing else; `total` is `counting` while `store-counters` seeds.
 `pages` counts this session's committed pages of that migration, and
-`elapsed_seconds` runs from the start of its first committed page of the
-session, including the waits for writers before each page. So the `complete`
+`elapsed_seconds` runs from the start of the job that committed its first page
+of the session, so it includes the wait for writers before every later page. A
+wait the worker ran beside its other duties before that first page, at most the
+longer of 100 ms and the previous page's hold, is not counted. So the `complete`
 line of a migration that started in this session gives its whole duration, its
 page count and its final `done`; after a restart part way through, the lines
 cover only the remainder. The `start` line's `done` already includes that first
@@ -838,8 +840,8 @@ Opening a store written before these rows moves its format to a source summary
 writer family, `sparrow.store/242` to `/296`, which lifts each owner-graph
 family by 55 and keeps its log time, archive and intake switches, so older
 binaries refuse the store. The same synchronized batch seeds the checkpoint of
-the third online migration, `source-summary` (`source-summary-upgrade`), and
-the service answers at once. Rows found under an older writer identity are not
+the `source-summary` online migration (`source-summary-upgrade`), and the
+service answers at once. Rows found under an older writer identity are not
 trusted: that batch discards them and the migration recounts every source.
 
 The migration runs in the maintenance duty directly after `store-counters`,
@@ -895,8 +897,10 @@ MCP `build`) reports `read`, the catalog entries the build has read, and
 the build's.
 
 The migration's own pages keep reading the same entries while a build runs. So
-every 4,096 entries, when it checks its cancellation and lease, a build also
-reads the migration's checkpoint and `done` counter (a few point reads). It
+each time it has read another 4,096 catalog entries (an artifact's records
+count, though `read` counts the artifact once), when it checks its cancellation
+and lease, a build also reads the migration's checkpoint and `done` counter (a
+few point reads). It
 re-bases when the migration has overtaken it: the migration is complete, or its
 checkpoint has moved and it has passed more entries since the build's snapshot
 than the build has read plus 4,096. A re-base drops the build's snapshot and the

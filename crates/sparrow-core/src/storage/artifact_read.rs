@@ -482,7 +482,7 @@ impl Store {
                 &reader,
                 &progress,
                 (self.owed_window(), Box::new(keep)),
-                &mut || worker.entry(|read| base.overtaken(&live, read)),
+                &mut |entries| worker.entry(entries, |read| base.overtaken(&live, read)),
             )? {
                 source_summary::Pass::Complete => return Ok(Owed::default()),
                 source_summary::Pass::Owed(owed) => break owed,

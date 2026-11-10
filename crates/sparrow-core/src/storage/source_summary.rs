@@ -720,14 +720,14 @@ pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
             after,
             (PAGE_ARTIFACTS, PAGE_RECORDS),
             (&mut batch, &mut deltas),
-            &mut || Ok(true),
+            &mut |_| Ok(true),
         )?,
         Progress::Records(after) => record_page(
             &reader,
             after,
             PAGE_RECORDS,
             (&mut batch, &mut deltas),
-            &mut || Ok(true),
+            &mut |_| Ok(true),
         )?,
     };
     merge(db, &mut batch, deltas)?;
@@ -869,15 +869,17 @@ impl Rows for Completion {
 impl Completion {
     /// Complete the migration at `progress` over `reader` without writing, keeping the first
     /// `rows` owed index rows `keep` selects. The pass reads the catalog entries the
-    /// migration has not reached, one entry each, as its pages would; `entry` runs before
-    /// each artifact and record entry it examines, so a caller can count the pass's progress
-    /// in the migration's own units and stop it: an error ends the pass with that error, and
-    /// `false` ends it as [`Pass::Overtaken`], with nothing it counted kept.
+    /// migration has not reached, one entry each, as its pages would; `entry` runs for each
+    /// artifact and record entry it examines, given the catalog entries that step read (an
+    /// artifact's count also reads its records), so a caller can count the pass's progress
+    /// in the migration's own units, pace its checks by the entries read, and stop it: an
+    /// error ends the pass with that error, and `false` ends it as [`Pass::Overtaken`], with
+    /// nothing it counted kept.
     pub(super) fn owed(
         reader: &Reader<'_>,
         progress: &Progress,
         index: (usize, Keep),
-        entry: &mut dyn FnMut() -> Result<bool, Error>,
+        entry: &mut dyn FnMut(u64) -> Result<bool, Error>,
     ) -> Result<Pass, Error> {
         if *progress == Progress::Complete {
             return Ok(Pass::Complete);
@@ -893,8 +895,8 @@ impl Completion {
         let mut deltas = BTreeMap::new();
         let mut next = progress.clone();
         let stopped = std::cell::Cell::new(false);
-        let mut step = || {
-            let go = entry()?;
+        let mut step = |entries| {
+            let go = entry(entries)?;
             stopped.set(!go);
             Ok(go)
         };
@@ -965,7 +967,7 @@ fn artifact_page(
     after: Option<String>,
     limits: (usize, usize),
     (rows, deltas): (&mut impl Rows, &mut BTreeMap<String, Delta>),
-    entry: &mut dyn FnMut() -> Result<bool, Error>,
+    entry: &mut dyn FnMut(u64) -> Result<bool, Error>,
 ) -> Result<Progress, Error> {
     let (mut artifacts, mut records) = (0, 0);
     let mut last = None;
@@ -974,8 +976,7 @@ fn artifact_page(
         ARTIFACT_PREFIX,
         after.as_deref().map(str::as_bytes),
         |key, bytes| {
-            // A stopped pass ends here; its caller discards what it counted.
-            if artifacts == limits.0 || records >= limits.1 || !entry()? {
+            if artifacts == limits.0 || records >= limits.1 {
                 full = true;
                 return Ok(false);
             }
@@ -983,8 +984,19 @@ fn artifact_page(
                 .map_err(|_| failure("invalid artifact catalog key"))?
                 .to_owned();
             artifacts += 1;
-            records += count_artifact(reader, &id, bytes, rows, deltas)?;
+            let read = count_artifact(reader, &id, bytes, rows, deltas)?;
+            records += read;
+            // The artifact entry and the records its count read.
+            let read = u64::try_from(read)
+                .ok()
+                .and_then(|read| read.checked_add(1))
+                .ok_or_else(|| failure(format!("record count of artifact {id} overflows")))?;
             last = Some(id);
+            // A stopped pass ends here; its caller discards what it counted.
+            if !entry(read)? {
+                full = true;
+                return Ok(false);
+            }
             Ok(true)
         },
     )?;
@@ -1070,7 +1082,7 @@ fn record_page(
     after: Option<String>,
     limit: usize,
     (rows, deltas): (&mut impl Rows, &mut BTreeMap<String, Delta>),
-    entry: &mut dyn FnMut() -> Result<bool, Error>,
+    entry: &mut dyn FnMut(u64) -> Result<bool, Error>,
 ) -> Result<Progress, Error> {
     // Deleted parents counted by this page, with their row before it.
     let mut parents = BTreeMap::<String, (Option<Retained>, u64, String, u64)>::new();
@@ -1082,7 +1094,7 @@ fn record_page(
         after.as_deref().map(str::as_bytes),
         |key, bytes| {
             // A stopped pass ends here; its caller discards what it counted.
-            if records == limit || !entry()? {
+            if records == limit || !entry(1)? {
                 exhausted = false;
                 return Ok(false);
             }

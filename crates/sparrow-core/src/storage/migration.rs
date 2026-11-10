@@ -68,7 +68,8 @@ pub enum Migration {
 
 impl Migration {
     /// Every migration, in the order `status`, the latched failures and [`Migration::index`]
-    /// use. The maintenance worker runs them in [`Migration::RUN_ORDER`].
+    /// use. The maintenance worker runs them in its own run order: the counters, the source
+    /// summary, the owner index, the backfill, then the source timeline cache (#176).
     pub const ALL: [Self; 5] = [
         Self::StoreCounters,
         Self::OwnerGraphIndex,
@@ -82,7 +83,7 @@ impl Migration {
     /// state makes every `sources` and live `artifacts` listing read what it still owes
     /// (#176), then the owner index, since its pages are few and cheap. The migrations are
     /// independent: each reads and checkpoints its own keys.
-    pub const RUN_ORDER: [Self; 5] = [
+    pub(crate) const RUN_ORDER: [Self; 5] = [
         Self::StoreCounters,
         Self::SourceSummary,
         Self::OwnerGraphIndex,
@@ -337,7 +338,7 @@ impl Writer {
 }
 
 impl Store {
-    /// Run one page of the first incomplete online migration in [`Migration::RUN_ORDER`] and
+    /// Run one page of the first incomplete online migration in the worker's run order and
     /// commit it with its checkpoint; `None` when every migration is complete. It does not
     /// yield to waiting writers itself: the caller runs [`Store::defer_migration_page`]
     /// immediately before each call, apart from the writer, as the maintenance worker does.

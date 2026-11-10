@@ -553,10 +553,10 @@ impl Store {
                     &reader,
                     &summary,
                     (0, Box::new(|_| false)),
-                    &mut || {
+                    &mut |entries| {
                         cancellation.checkpoint()?;
                         worker.map_or(Ok(true), |worker| {
-                            worker.entry(|read| base.overtaken(&live, read))
+                            worker.entry(entries, |read| base.overtaken(&live, read))
                         })
                     },
                 )?

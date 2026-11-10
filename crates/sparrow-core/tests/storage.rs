@@ -20362,11 +20362,12 @@ fn await_listing_builds(store: &Store) {
 
 /// INVARIANT (#176): a `sources` listing build that the source-summary migration overtakes
 /// re-bases. A build started during the migration and held until the migration completes
-/// delivers its rows at its next 4,096-entry check instead of finishing its own pass: it
-/// reads no more than one check interval of the more than 4,096 entries it owed. It keeps
-/// its cursor and is the only build, and its rows, read from the newer snapshot, equal the
-/// finished listing's, a source written before the re-base included, with nothing lost or
-/// counted twice.
+/// delivers its rows at its next 4,096-entry check instead of finishing its own pass. The
+/// check counts the records an artifact's count reads, so the 5,000-record artifact reaches
+/// it before the pass reads any record entry: of the more than 4,096 entries the build owed,
+/// it reads at most the four artifact entries. It keeps its cursor and is the only build,
+/// and its rows, read from the newer snapshot, equal the finished listing's, a source
+/// written before the re-base included, with nothing lost or counted twice.
 #[test]
 fn a_source_listing_build_the_migration_overtakes_delivers_the_finished_rows_at_its_next_check() {
     use sparrow_core::{Migration, SourceRead, SourceReadPage};
@@ -20444,7 +20445,7 @@ fn a_source_listing_build_the_migration_overtakes_delivers_the_finished_rows_at_
         "one build, delivered and never restarted"
     );
     let read = store.listing_build_entries_for_tests().unwrap()[0];
-    assert!(read <= 4_096, "{read} of {owed} owed entries");
+    assert!(read <= 4, "{read} of {owed} owed entries");
     let listed = counts(&delivered);
     assert_eq!(listed, counts(&store.source_read(&all, now, &[]).unwrap()));
     assert!(

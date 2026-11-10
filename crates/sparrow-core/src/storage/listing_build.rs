@@ -40,8 +40,9 @@ pub(super) const BUILD_WAIT: Duration = Duration::from_millis(5_000);
 /// Longest a waiting listing call goes without checking its cancellation.
 const CANCEL_CHECK: Duration = Duration::from_secs(1);
 
-/// Entries a build reads between checks of its cancellation, its lease and the migration's
-/// progress.
+/// Catalog entries a build reads between checks of its cancellation, its lease and the
+/// migration's progress, counting the records an artifact's count reads as well as the
+/// entries its progress counts.
 pub(super) const CHECK_EVERY: u64 = 4_096;
 
 /// How far a listing's build has read, in the unit of the migration it completes: the
@@ -100,27 +101,38 @@ impl<T> Shared<T> {
 }
 
 /// What a build's thread uses to report progress and learn that it must stop.
-pub(super) struct Worker<T>(Arc<Shared<T>>);
+pub(super) struct Worker<T> {
+    shared: Arc<Shared<T>>,
+    /// Catalog entries the build's thread has read, the records an artifact's count reads
+    /// included, across re-bases: the clock of its checks.
+    work: std::cell::Cell<u64>,
+}
 
 impl<T> Worker<T> {
-    /// Count one catalog entry read; every [`CHECK_EVERY`] entries, refuse once the build
-    /// is cancelled or its lease has ended, then ask `overtaken`, given the entries read
-    /// since the build's snapshot, whether the migration has overtaken the build. `false`
-    /// means the build stops its pass and re-bases ([`Worker::rebase`]).
+    /// Count one entry of the pass's progress, which read `entries` catalog entries (an
+    /// artifact with the records its count read, or one record). Each time the entries read
+    /// pass a multiple of [`CHECK_EVERY`], refuse once the build is cancelled or its lease
+    /// has ended, then ask `overtaken`, given the progress entries read since the build's
+    /// snapshot, whether the migration has overtaken the build. `false` means the build
+    /// stops its pass and re-bases ([`Worker::rebase`]).
     pub(super) fn entry(
         &self,
+        entries: u64,
         overtaken: impl FnOnce(u64) -> Result<bool, Error>,
     ) -> Result<bool, Error> {
-        let read = self.0.read.fetch_add(1, Ordering::Relaxed) + 1;
+        let read = self.shared.read.fetch_add(1, Ordering::Relaxed) + 1;
         #[cfg(feature = "test-support")]
-        if let Some((at, hold)) = &self.0.hold
+        if let Some((at, hold)) = &self.shared.hold
             && read == *at
         {
             hold();
         }
-        if read.is_multiple_of(CHECK_EVERY) {
+        let before = self.work.get();
+        let work = before.saturating_add(entries);
+        self.work.set(work);
+        if work / CHECK_EVERY > before / CHECK_EVERY {
             self.checkpoint()?;
-            return Ok(!overtaken(self.0.progress().read)?);
+            return Ok(!overtaken(self.shared.progress().read)?);
         }
         Ok(true)
     }
@@ -128,15 +140,15 @@ impl<T> Worker<T> {
     /// Start counting progress again for a pass over a newer snapshot; the caller then
     /// records that pass's [`Worker::total`].
     pub(super) fn rebase(&self) {
-        self.0
+        self.shared
             .rebased
-            .store(self.0.read.load(Ordering::Relaxed), Ordering::Relaxed);
+            .store(self.shared.read.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Refuse once the build is cancelled or its lease has ended.
     pub(super) fn checkpoint(&self) -> Result<(), Error> {
-        self.0.cancellation.checkpoint()?;
-        if self.0.expired() {
+        self.shared.cancellation.checkpoint()?;
+        if self.shared.expired() {
             return Err(Error::new(
                 "RESULT_EXPIRED",
                 "listing build lease ended before the build finished",
@@ -147,12 +159,12 @@ impl<T> Worker<T> {
 
     /// The build's own cancellation, cancelled when its registration is dropped.
     pub(super) fn cancellation(&self) -> QueryCancellation {
-        self.0.cancellation.clone()
+        self.shared.cancellation.clone()
     }
 
     /// Record how many entries the build's pass reads in all, `None` while unknown.
     pub(super) fn total(&self, total: Option<u64>) {
-        self.0.total.store(
+        self.shared.total.store(
             total.map_or(0, |total| total.saturating_add(1)),
             Ordering::Relaxed,
         );
@@ -305,7 +317,10 @@ impl<C, T: Send + 'static> Builds<C, T> {
             #[cfg(feature = "test-support")]
             hold: self.hold.clone(),
         });
-        let worker = Worker(Arc::clone(&shared));
+        let worker = Worker {
+            shared: Arc::clone(&shared),
+            work: std::cell::Cell::new(0),
+        };
         self.running.fetch_add(1, Ordering::SeqCst);
         let running = Running(Arc::clone(&self.running));
         #[cfg(feature = "test-support")]
@@ -324,9 +339,9 @@ impl<C, T: Send + 'static> Builds<C, T> {
                             ))
                         });
                 #[cfg(feature = "test-support")]
-                entries.fetch_add(worker.0.read.load(Ordering::Relaxed), Ordering::SeqCst);
-                *lock(&worker.0.state) = State::Done(result);
-                worker.0.ready.notify_all();
+                entries.fetch_add(worker.shared.read.load(Ordering::Relaxed), Ordering::SeqCst);
+                *lock(&worker.shared.state) = State::Done(result);
+                worker.shared.ready.notify_all();
             })
             .map_err(|error| {
                 Error::new(
