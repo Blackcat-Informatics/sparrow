@@ -435,7 +435,7 @@ RequiresMountsFor=/net/synology/archives/sparrow
 
 [Service]
 Environment=PATH=%h/.local/bin:/usr/bin
-ExecStart=%h/.local/libexec/sparrow/sparrow-backup %h/.config/sparrow/server.toml /SPARROW/intake %h/.config/sparrow /SPARROW/ship
+ExecStart=%h/.local/libexec/sparrow/sparrow-backup %h/.config/sparrow/server.toml %h/.local/state/sparrow/intake %h/.config/sparrow %h/.local/state/sparrow/ship %h/.local/state/sparrow/ship-watches
 TimeoutStartSec=6h
 ```
 

@@ -67,7 +67,8 @@ Environment (defaults are the user-unit layout):
                    (data_dir) and sockets are read from it       ~/.config/sparrow/server.toml
   SPARROW_BACKUPS  the online backup root (server.toml backup_root), on the NAS
                                                                  /net/synology/archives/sparrow
-  SPARROW_INTAKE   the intake tree the backup set keeps          /SPARROW/intake
+  SPARROW_STATE    the user unit's state tree: ship and ship-watches    ~/.local/state/sparrow
+  SPARROW_INTAKE   the intake tree the backup set keeps          ~/.local/state/sparrow/intake
   SPARROW_BIN      the kept images the --to pair must match      <repository>/bin
 
 Recovery depends on where it failed; the FAILED line names the unit and timer states.
@@ -255,6 +256,9 @@ Switch with --no-backup REASON, then take the first online backup once $TO answe
         unconfigured) die "the running daemon reports no backup_root; configure it and restart \
 the daemon first, or switch with --no-backup REASON" ;;
     esac
+    for dir in "$SPARROW_INTAKE" "$SPARROW_STATE/ship" "$SPARROW_STATE/ship-watches"; do
+        [[ -d $dir ]] || die "the backup would keep $dir, which does not exist; set SPARROW_STATE or SPARROW_INTAKE"
+    done
     log "pre-upgrade backup, online: the daemon keeps serving"
     PATH=$(dirname -- "$CLI_LINK"):$PATH "$LIBEXEC/sparrow-backup" "$SPARROW_CONFIG" \
         "$SPARROW_INTAKE" "$CONFIG_DIR" "$SPARROW_STATE/ship" "$SPARROW_STATE/ship-watches"

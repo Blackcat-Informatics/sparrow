@@ -38,7 +38,7 @@ world() {
         # The CLI image answers status the way the daemon of its own schema would.
         cat >"$lib/sparrow-schema$schema-$rev" <<CLI
 #!/bin/sh
-printf '{"store_id":"s1","schema_version":$schema,"store_format":"f","live_records":0,"pressure":{"phase":"ready","failure":null},"durability":{"failure":null},"query_only":false,"consume_watches":[]}\n'
+printf '{"store_id":"s1","schema_version":$schema,"store_format":"f","live_records":0,"backup":{"phase":"idle"},"pressure":{"phase":"ready","failure":null},"durability":{"failure":null},"query_only":false,"consume_watches":[]}\n'
 CLI
         chmod +x "$lib/sparrowd-schema$schema-$rev" "$lib/sparrow-schema$schema-$rev"
     done
@@ -92,13 +92,14 @@ SYSTEMCTL
     printf '%s\n' "$w"
 }
 
+script_args=(--no-backup 'timer check')
 # run W [env...]: runs the script in world W with the given extra env; sets rc and out.
 run() {
     local w=$1; shift
     set +e
     out=$(env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" \
-        SPARROW_BACKUPS="$w/backups" SPARROW_BIN="$w/kept" SPARROW_INTAKE="$w/intake" \
-        "$@" "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb --no-backup 'timer check' 2>&1)
+        SPARROW_BACKUPS="$w/backups" SPARROW_BIN="$w/kept"\
+        "$@" "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb "${script_args[@]}" 2>&1)
     rc=$?
     set -e
 }
@@ -139,3 +140,25 @@ run "$w" STUB_SHIP_BUSY=1
 ! grep -q 'sparrow-backup.timer' <<<"$(starts "$w")" || fail "abort path started sparrow-backup.timer: $(starts "$w")"
 echo "ok   abort, backup timer stopped before: starts $(starts "$w" | tr '\n' ';')"
 echo PASS
+
+# 4. Without --no-backup the script takes its pre-upgrade backup (issue #195): it exports
+#    SPARROW_PREFIX and passes sparrow-backup the arguments sparrow-backup.service passes, all
+#    derived from HOME. The stub client records them and writes the set the script then links.
+w=$(world backup)
+state=$w/home/.local/state/sparrow
+mkdir -p -- "$state/intake" "$state/ship" "$state/ship-watches"
+cat >"$w/home/.local/libexec/sparrow/sparrow-backup" <<STUB
+#!/bin/sh
+{ echo "prefix=\$SPARROW_PREFIX"; for a; do echo "arg=\$a"; done; } >"$w/client"
+mkdir -p "$w/backups/sets/1"
+printf 'image=sparrowd-schema68-aaa\nstore_id=s1\ntaken_utc=t\n' >"$w/backups/sets/1/SOURCE"
+STUB
+chmod +x "$w/home/.local/libexec/sparrow/sparrow-backup"
+script_args=()
+run "$w"
+((rc == 0)) || { echo "$out" >&2; fail "backup path exited $rc"; }
+expected=$(printf '%s\n' "prefix=$w/home/.local" "arg=$w/home/.config/sparrow/server.toml" "arg=$state/intake" \
+    "arg=$w/home/.config/sparrow" "arg=$state/ship" "arg=$state/ship-watches")
+[[ $(cat "$w/client") == "$expected" ]] || fail "sparrow-backup received: $(cat "$w/client")"
+[[ -L $w/backups/pre-upgrade-sparrowd-schema68-aaa ]] || fail "backup path did not link the pre-upgrade set"
+echo "ok   backup: sparrow-backup got the user service's arguments and SPARROW_PREFIX"
