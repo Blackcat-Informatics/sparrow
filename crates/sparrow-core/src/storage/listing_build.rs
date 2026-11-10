@@ -10,6 +10,13 @@
 //! build has read. Following the cursor resumes the same build and never restarts it. A build
 //! whose cursor is abandoned is cancelled at its lease expiry, which ends its thread and
 //! drops its snapshot.
+//!
+//! The migration keeps running while a build reads, and its own pages read the same entries.
+//! At each check of its cancellation the build asks whether the migration has overtaken it;
+//! if so it re-bases (#176): it drops its snapshot and the partial pass, takes a fresh
+//! snapshot and reads only what the migration owes there, under the same identity and
+//! cursor. A build therefore ends no later than one check after the migration completes,
+//! and a redundant pass stops competing with the migration's pages.
 
 use super::{
     Error,
@@ -33,13 +40,15 @@ pub(super) const BUILD_WAIT: Duration = Duration::from_millis(5_000);
 /// Longest a waiting listing call goes without checking its cancellation.
 const CANCEL_CHECK: Duration = Duration::from_secs(1);
 
-/// Entries a build reads between checks of its cancellation and lease.
-const CHECK_EVERY: u64 = 4_096;
+/// Entries a build reads between checks of its cancellation, its lease and the migration's
+/// progress.
+pub(super) const CHECK_EVERY: u64 = 4_096;
 
 /// How far a listing's build has read, in the unit of the migration it completes: the
 /// catalog entries it has examined, of the entries that migration still owed when the
-/// build's snapshot was taken. `total` is `None` while the store counters seed, when the
-/// remainder has no known size.
+/// build's snapshot was taken. A re-base takes a newer snapshot, so both restart from it and
+/// `read` can go down. `total` is `None` while the store counters seed, when the remainder
+/// has no known size.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BuildProgress {
     /// Entries read so far.
@@ -62,7 +71,10 @@ pub(super) type Hold = (u64, Arc<dyn Fn() + Send + Sync>);
 struct Shared<T> {
     state: Mutex<State<T>>,
     ready: Condvar,
+    /// Entries read since the build started, across re-bases.
     read: AtomicU64,
+    /// `read` when the build last re-based: progress counts from there.
+    rebased: AtomicU64,
     /// The total plus one once known; zero while unknown.
     total: AtomicU64,
     cancellation: QueryCancellation,
@@ -74,8 +86,10 @@ struct Shared<T> {
 
 impl<T> Shared<T> {
     fn progress(&self) -> BuildProgress {
+        // A re-base racing this read saturates at 0 rather than wrapping.
+        let rebased = self.rebased.load(Ordering::Relaxed);
         BuildProgress {
-            read: self.read.load(Ordering::Relaxed),
+            read: self.read.load(Ordering::Relaxed).saturating_sub(rebased),
             total: self.total.load(Ordering::Relaxed).checked_sub(1),
         }
     }
@@ -90,8 +104,13 @@ pub(super) struct Worker<T>(Arc<Shared<T>>);
 
 impl<T> Worker<T> {
     /// Count one catalog entry read; every [`CHECK_EVERY`] entries, refuse once the build
-    /// is cancelled or its lease has ended.
-    pub(super) fn entry(&self) -> Result<(), Error> {
+    /// is cancelled or its lease has ended, then ask `overtaken`, given the entries read
+    /// since the build's snapshot, whether the migration has overtaken the build. `false`
+    /// means the build stops its pass and re-bases ([`Worker::rebase`]).
+    pub(super) fn entry(
+        &self,
+        overtaken: impl FnOnce(u64) -> Result<bool, Error>,
+    ) -> Result<bool, Error> {
         let read = self.0.read.fetch_add(1, Ordering::Relaxed) + 1;
         #[cfg(feature = "test-support")]
         if let Some((at, hold)) = &self.0.hold
@@ -101,8 +120,17 @@ impl<T> Worker<T> {
         }
         if read.is_multiple_of(CHECK_EVERY) {
             self.checkpoint()?;
+            return Ok(!overtaken(self.0.progress().read)?);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Start counting progress again for a pass over a newer snapshot; the caller then
+    /// records that pass's [`Worker::total`].
+    pub(super) fn rebase(&self) {
+        self.0
+            .rebased
+            .store(self.0.read.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Refuse once the build is cancelled or its lease has ended.
@@ -122,13 +150,12 @@ impl<T> Worker<T> {
         self.0.cancellation.clone()
     }
 
-    /// Record how many entries the build reads in all.
+    /// Record how many entries the build's pass reads in all, `None` while unknown.
     pub(super) fn total(&self, total: Option<u64>) {
-        if let Some(total) = total {
-            self.0
-                .total
-                .store(total.saturating_add(1), Ordering::Relaxed);
-        }
+        self.0.total.store(
+            total.map_or(0, |total| total.saturating_add(1)),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -219,6 +246,9 @@ pub(super) struct Builds<C, T> {
     hold: Option<Hold>,
     #[cfg(feature = "test-support")]
     fail_delivery: bool,
+    /// Dev-only: entries every finished build read, re-bases included.
+    #[cfg(feature = "test-support")]
+    entries: Arc<AtomicU64>,
 }
 
 impl<C, T> Default for Builds<C, T> {
@@ -232,6 +262,8 @@ impl<C, T> Default for Builds<C, T> {
             hold: None,
             #[cfg(feature = "test-support")]
             fail_delivery: false,
+            #[cfg(feature = "test-support")]
+            entries: Arc::default(),
         }
     }
 }
@@ -266,6 +298,7 @@ impl<C, T: Send + 'static> Builds<C, T> {
             state: Mutex::new(State::Running),
             ready: Condvar::new(),
             read: AtomicU64::new(0),
+            rebased: AtomicU64::new(0),
             total: AtomicU64::new(0),
             cancellation: QueryCancellation::default(),
             polled: Mutex::new(Instant::now()),
@@ -275,6 +308,8 @@ impl<C, T: Send + 'static> Builds<C, T> {
         let worker = Worker(Arc::clone(&shared));
         self.running.fetch_add(1, Ordering::SeqCst);
         let running = Running(Arc::clone(&self.running));
+        #[cfg(feature = "test-support")]
+        let entries = Arc::clone(&self.entries);
         std::thread::Builder::new()
             .name("sparrow-listing-build".into())
             .spawn(move || {
@@ -288,6 +323,8 @@ impl<C, T: Send + 'static> Builds<C, T> {
                                 "listing build failed: its thread panicked",
                             ))
                         });
+                #[cfg(feature = "test-support")]
+                entries.fetch_add(worker.0.read.load(Ordering::Relaxed), Ordering::SeqCst);
                 *lock(&worker.0.state) = State::Done(result);
                 worker.0.ready.notify_all();
             })
@@ -377,6 +414,12 @@ impl<C, T: Send + 'static> Builds<C, T> {
     #[cfg(feature = "test-support")]
     pub(super) fn take_delivery_failure_for_tests(&mut self) -> bool {
         std::mem::take(&mut self.fail_delivery)
+    }
+
+    /// Entries every finished build has read, counting each re-base's passes.
+    #[cfg(feature = "test-support")]
+    pub(super) fn entries(&self) -> u64 {
+        self.entries.load(Ordering::SeqCst)
     }
 
     /// Registered builds, threads still running, and builds ever started.

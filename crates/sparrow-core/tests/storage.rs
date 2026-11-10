@@ -20200,6 +20200,379 @@ fn a_live_artifact_listing_during_the_source_summary_migration_resumes_its_build
     assert_eq!(listed.len(), 4, "{listed:?}");
 }
 
+/// INVARIANT (#176): the maintenance worker runs `source-summary` directly after the
+/// `store-counters` seeding, before the owner index and the backfill, because while it is
+/// unfinished every `sources` and live `artifacts` listing pays for what it still owes.
+/// `status` keeps listing the migrations in their fixed report order.
+#[test]
+fn the_worker_runs_the_source_summary_migration_directly_after_the_store_counters() {
+    use sparrow_core::Migration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    owner_graph_fixture(&store);
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    sparrow_test_support::stale_source_context_cache(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let names = |store: &Store| {
+        store
+            .migrations()
+            .unwrap()
+            .iter()
+            .map(|m| m.name)
+            .collect::<Vec<_>>()
+    };
+    let report = Migration::ALL.map(Migration::name);
+    assert_eq!(names(&store), report);
+    assert!(store.migrations().unwrap().iter().all(|m| !m.complete()));
+    // Each migration's pages run back to back, in the run order.
+    let mut ran = Vec::new();
+    while let Some(page) = store.migrate_step().unwrap() {
+        if ran.last() != Some(&page.migration) {
+            assert!(!ran.contains(&page.migration), "{ran:?} {page:?}");
+            ran.push(page.migration);
+        }
+    }
+    assert_eq!(
+        ran,
+        [
+            Migration::StoreCounters,
+            Migration::SourceSummary,
+            Migration::OwnerGraphIndex,
+            Migration::EventFallbackRdf,
+            Migration::SourceContext,
+        ]
+    );
+    assert_eq!(names(&store), report);
+}
+
+/// INVARIANT (#176): each migration resumes from its own checkpoint, whichever order ran
+/// it. A store an older image left part way through the backfill with `source-summary` not
+/// started runs the source summary to the end next while the backfill's watermark holds; a
+/// restart with the source summary done and the backfill still pending, the state the new
+/// order leaves and an older image would also continue from, resumes the backfill at that
+/// watermark. Once every migration completes, the per-source counters equal a recount, the
+/// owner index mirrors every declaration, and the listings and fallback facts equal those
+/// of the store before the migrations were owed.
+#[test]
+fn a_store_part_way_through_its_migrations_under_either_order_resumes_to_the_finished_rows() {
+    use sparrow_core::{Migration, RdfGraphLayers};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    owner_graph_fixture(&store);
+    // More record graphs than one backfill page rebuilds.
+    let input = (0..200)
+        .map(|i| format!("resume {i}\n"))
+        .collect::<String>();
+    store
+        .ingest("resume", "resume", "log", input.as_bytes(), 5)
+        .unwrap();
+    let fallback = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?b WHERE { ?r sp:eventTimeBasis ?b }";
+    let scope = record_page_scope("resume", 1000);
+    let finished = |store: &Store| {
+        let (rows, _, coverage) = scoped_answer(store, &scope, RdfGraphLayers::ALL, fallback, 10);
+        // Rebuilt graphs take new dictionary identities, so rows compare as multisets.
+        let mut rows = rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        (
+            rows,
+            coverage.event_fallback_pending,
+            listed_counts(store, "resume", 10),
+            listed_counts(store, "graphs", 10),
+            listed_artifacts(store, "graphs", 10),
+        )
+    };
+    let migrated = finished(&store);
+    assert_eq!(migrated.0.len(), 200);
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+    drop(db);
+    // With the source summary complete, the old and new orders agree: the counters, the
+    // owner index, then the backfill, stopped after its first page.
+    let store = Store::open(dir.path(), config()).unwrap();
+    let held = loop {
+        let page = store.migrate_step().unwrap().unwrap();
+        if page.migration == Migration::EventFallbackRdf {
+            assert!(!page.complete, "{page:?}");
+            break page.watermark;
+        }
+    };
+    drop(store);
+    // An older image's run order reached the backfill before the source summary.
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let status = |store: &Store, migration: Migration| {
+        store.migrations().unwrap()[migration.index()].clone()
+    };
+    assert!(status(&store, Migration::OwnerGraphIndex).complete());
+    assert_eq!(status(&store, Migration::EventFallbackRdf).watermark, held);
+    assert!(!status(&store, Migration::SourceSummary).complete());
+    let mut page = store.migrate_step().unwrap().unwrap();
+    while page.migration == Migration::StoreCounters {
+        page = store.migrate_step().unwrap().unwrap();
+    }
+    loop {
+        assert_eq!(page.migration, Migration::SourceSummary, "{page:?}");
+        if page.complete {
+            break;
+        }
+        page = store.migrate_step().unwrap().unwrap();
+    }
+    assert_eq!(status(&store, Migration::EventFallbackRdf).watermark, held);
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(status(&store, Migration::SourceSummary).complete());
+    let backfill = status(&store, Migration::EventFallbackRdf);
+    assert_eq!(backfill.watermark, held);
+    assert!(backfill.done > 0, "{backfill:?}");
+    let page = store.migrate_step().unwrap().unwrap();
+    assert_eq!(page.migration, Migration::EventFallbackRdf);
+    assert!(page.done > backfill.done, "{page:?} {backfill:?}");
+    migrate(&store);
+    let done = store.migrations().unwrap();
+    assert!(
+        done.iter()
+            .all(|m| m.complete() && m.failure.is_none() && m.total == Some(m.done)),
+        "{done:?}"
+    );
+    assert_counts_match_recount(&store);
+    assert_eq!(finished(&store), migrated);
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let (declared, mirrored) = owner_graph_rows(&db);
+    assert_eq!(declared, mirrored);
+}
+
+/// Wait for a listing build's thread on its cursor: the call blocks until the build
+/// finishes, as a client's follow does, rather than polling.
+fn await_listing_builds(store: &Store) {
+    store
+        .set_listing_build_wait_for_tests(std::time::Duration::from_secs(60))
+        .unwrap();
+}
+
+/// INVARIANT (#176): a `sources` listing build that the source-summary migration overtakes
+/// re-bases. A build started during the migration and held until the migration completes
+/// delivers its rows at its next 4,096-entry check instead of finishing its own pass: it
+/// reads no more than one check interval of the more than 4,096 entries it owed. It keeps
+/// its cursor and is the only build, and its rows, read from the newer snapshot, equal the
+/// finished listing's, a source written before the re-base included, with nothing lost or
+/// counted twice.
+#[test]
+fn a_source_listing_build_the_migration_overtakes_delivers_the_finished_rows_at_its_next_check() {
+    use sparrow_core::{Migration, SourceRead, SourceReadPage};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    let wide = (0..5_000)
+        .map(|i| format!("wide {i}\n"))
+        .collect::<String>();
+    store
+        .ingest("rebase-wide", "rebase-wide", "log", wide.as_bytes(), DAY)
+        .unwrap();
+    for (index, source) in ["rebase-a", "rebase-a", "rebase-b"].into_iter().enumerate() {
+        store
+            .ingest(
+                &format!("rebase-{index}"),
+                source,
+                "log",
+                b"one\ntwo\n",
+                DAY + 1 + index as u64,
+            )
+            .unwrap();
+    }
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    while !store.migrations().unwrap()[Migration::StoreCounters.index()].complete() {
+        store.migrate_step().unwrap();
+    }
+    let counts = |page: &SourceReadPage| {
+        page.body
+            .sources
+            .iter()
+            .map(|row| {
+                (
+                    row.source_id.clone(),
+                    row.retained_records,
+                    row.complete_artifacts,
+                    row.fragment_parents,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let all = SourceRead {
+        page_size: 1000,
+        ..Default::default()
+    };
+    let now = 2 * DAY;
+    store
+        .set_listing_build_wait_for_tests(std::time::Duration::from_millis(100))
+        .unwrap();
+    let open = hold_listing_builds(&store);
+    let first = store.source_read(&all, now, &[]).unwrap();
+    let cursor = first.next_cursor.clone().expect("the build's cursor");
+    let owed = first.build.and_then(|build| build.total).unwrap();
+    assert!(owed > 4_096, "{owed}");
+    store
+        .ingest("rebase-late", "rebase-late", "log", b"late\n", DAY + 9)
+        .unwrap();
+    // The migration completes while the build is held after its first entry.
+    migrate(&store);
+    open();
+    await_listing_builds(&store);
+    let follow = SourceRead {
+        cursor: Some(cursor),
+        ..all.clone()
+    };
+    let delivered = store.source_read(&follow, now, &[]).unwrap();
+    assert!(delivered.build.is_none(), "{:?}", delivered.build);
+    let (registered, _, started) = store.listing_builds_for_tests().unwrap()[0];
+    assert_eq!(
+        (registered, started),
+        (0, 1),
+        "one build, delivered and never restarted"
+    );
+    let read = store.listing_build_entries_for_tests().unwrap()[0];
+    assert!(read <= 4_096, "{read} of {owed} owed entries");
+    let listed = counts(&delivered);
+    assert_eq!(listed, counts(&store.source_read(&all, now, &[]).unwrap()));
+    assert!(
+        listed.iter().any(|row| row.0 == "rebase-late"),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&("rebase-wide".to_owned(), 5_000, 1, 0)),
+        "{listed:?}"
+    );
+}
+
+/// INVARIANT (#176): a live `artifacts` window build re-bases once the running migration
+/// has passed more entries since its snapshot than the build has read plus one check
+/// interval, while the migration is still unfinished. It then reads only what the newer
+/// snapshot owes, fewer entries than its first snapshot owed. Its selected artifacts were
+/// owed rows in the first snapshot and are stored rows in the newer one, and the listing it
+/// delivers equals the finished index's rows once the migration completes, with no artifact
+/// lost or listed twice.
+#[test]
+fn a_live_artifact_window_build_re_bases_onto_a_newer_snapshot_mid_migration() {
+    use sparrow_core::{ArtifactRead, ArtifactReadPage, ArtifactSelector, Migration};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    // Four artifacts of 6,000 records: one record phase page of 16,384 records leaves
+    // the migration unfinished. The listing selects the small source beside them, whose
+    // rows the owed pass reaches only after reading the whole catalog.
+    for index in 0..4_u64 {
+        let input = (0..6_000)
+            .map(|i| format!("window {index} {i}\n"))
+            .collect::<String>();
+        store
+            .ingest(
+                &format!("rebase-window-{index}"),
+                "rebase-bulk",
+                "log",
+                input.as_bytes(),
+                DAY + index,
+            )
+            .unwrap();
+    }
+    for index in 0..2_u64 {
+        store
+            .ingest(
+                &format!("rebase-small-{index}"),
+                "rebase-small",
+                "log",
+                b"one\ntwo\n",
+                DAY + 5 + index,
+            )
+            .unwrap();
+    }
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    while !store.migrations().unwrap()[Migration::StoreCounters.index()].complete() {
+        store.migrate_step().unwrap();
+    }
+    let rows = |page: &ArtifactReadPage| {
+        page.body
+            .artifacts
+            .iter()
+            .map(|row| (row.source.clone(), row.id.clone(), row.retained_records))
+            .collect::<Vec<_>>()
+    };
+    let now = 2 * DAY;
+    let read = |cursor: Option<String>| {
+        store
+            .artifact_read(
+                &ArtifactRead {
+                    selector: ArtifactSelector {
+                        source: Some("rebase-small".into()),
+                        ..Default::default()
+                    },
+                    page_size: 1000,
+                    scan_budget: 100_000,
+                    cursor,
+                },
+                now,
+            )
+            .unwrap()
+    };
+    store
+        .set_listing_build_wait_for_tests(std::time::Duration::from_millis(100))
+        .unwrap();
+    let open = hold_listing_builds(&store);
+    let first = read(None);
+    let cursor = first.next_cursor.clone().expect("the build's cursor");
+    let owed = first.build.and_then(|build| build.total).unwrap();
+    // Run pages until the migration has passed more than two check intervals beyond the
+    // held build's snapshot, short of completing.
+    let summary =
+        |store: &Store| store.migrations().unwrap()[Migration::SourceSummary.index()].clone();
+    let base = summary(&store).done;
+    while summary(&store).done <= base + 2 * 4_096 {
+        let page = store.migrate_step().unwrap().unwrap();
+        assert_eq!(page.migration, Migration::SourceSummary);
+        assert!(!page.complete, "{page:?}");
+    }
+    open();
+    await_listing_builds(&store);
+    let delivered = read(Some(cursor));
+    assert!(delivered.build.is_none(), "{:?}", delivered.build);
+    assert!(
+        !summary(&store).complete(),
+        "the build re-based mid-migration"
+    );
+    let entries = store.listing_build_entries_for_tests().unwrap()[1];
+    assert!(entries < owed, "{entries} of {owed} owed entries");
+    let (registered, _, started) = store.listing_builds_for_tests().unwrap()[1];
+    assert_eq!((registered, started), (0, 1));
+    assert!(delivered.next_cursor.is_none());
+    let listed = rows(&delivered);
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(
+        listed
+            .iter()
+            .all(|row| row.0 == "rebase-small" && row.2 == 2),
+        "{listed:?}"
+    );
+    migrate(&store);
+    let finished = read(None);
+    assert!(finished.build.is_none() && finished.next_cursor.is_none());
+    assert_eq!(listed, rows(&finished), "the finished index");
+}
+
 fn listed_artifacts(store: &Store, source: &str, now: u64) -> Vec<(String, usize, bool)> {
     use sparrow_core::{ArtifactRead, ArtifactSelector};
     let page = store

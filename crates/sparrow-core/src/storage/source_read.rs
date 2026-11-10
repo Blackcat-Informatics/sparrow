@@ -512,47 +512,77 @@ impl Store {
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "source read deadline overflow"))?;
         // The registries are single bounded rows; read them, and take the snapshot every
         // other row is read from, at one instant under the writer lock. The lock is then
-        // released, so a listing never holds back ingestion while it reads.
-        let writer = self.lock()?;
-        cancellation.checkpoint()?;
-        let producer_bytes = writer
-            .db
-            .get(super::producer_stream::KEY)?
-            .map_or(0, |bytes| bytes.len());
-        let streams = super::producer_stream::registry(&writer)?;
-        let receiver_bytes = writer
-            .db
-            .get(super::receiver_stream::KEY)?
-            .map_or(0, |bytes| bytes.len());
-        let windows = super::receiver_stream::registry(&writer)?;
-        let tail_registry = writer.db.get(super::tail::KEY)?.ok_or_else(|| {
-            Error::new(
-                "STORAGE_FAILURE",
-                "file-generation checkpoint registry missing",
-            )
-        })?;
-        let store_id = writer.id.clone();
-        let db = writer.db.clone();
-        let view = db.snapshot();
-        drop(writer);
-        // While the source-summary migration is unfinished, the stored rows plus what its
-        // remaining pages owe, read from the same snapshot, are the finished counts.
-        let reader = super::store_counters::Reader::snapshot(&view);
-        let summary = super::source_summary::progress(|key| reader.get(key.as_bytes()))?;
-        if let Some(worker) = worker {
-            worker.total(super::source_summary::owed_entries(&reader, &summary)?);
-        }
-        #[cfg(feature = "test-support")]
-        self.source_read_paused()?;
-        let owed = super::source_summary::Completion::owed(
-            &reader,
-            &summary,
-            (0, Box::new(|_| false)),
-            &mut || {
-                cancellation.checkpoint()?;
-                worker.map_or(Ok(()), listing_build::Worker::entry)
-            },
-        )?;
+        // released, so a listing never holds back ingestion while it reads. A build the
+        // running migration overtakes reads them and takes its snapshot again (#176).
+        let db = std::sync::Arc::clone(&self.unlocked.db);
+        let live = super::store_counters::Reader::db(&db);
+        let (registries, view, owed) = loop {
+            let writer = self.lock()?;
+            cancellation.checkpoint()?;
+            let producer_bytes = writer
+                .db
+                .get(super::producer_stream::KEY)?
+                .map_or(0, |bytes| bytes.len());
+            let streams = super::producer_stream::registry(&writer)?;
+            let receiver_bytes = writer
+                .db
+                .get(super::receiver_stream::KEY)?
+                .map_or(0, |bytes| bytes.len());
+            let windows = super::receiver_stream::registry(&writer)?;
+            let tail_registry = writer.db.get(super::tail::KEY)?.ok_or_else(|| {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    "file-generation checkpoint registry missing",
+                )
+            })?;
+            let store_id = writer.id.clone();
+            let view = db.snapshot();
+            drop(writer);
+            // While the source-summary migration is unfinished, the stored rows plus what its
+            // remaining pages owe, read from the same snapshot, are the finished counts.
+            let pass = {
+                let reader = super::store_counters::Reader::snapshot(&view);
+                let summary = super::source_summary::progress(|key| reader.get(key.as_bytes()))?;
+                let base = super::source_summary::Base::read(&reader, &summary)?;
+                if let Some(worker) = worker {
+                    worker.total(super::source_summary::owed_entries(&reader, &summary)?);
+                }
+                #[cfg(feature = "test-support")]
+                self.source_read_paused()?;
+                super::source_summary::Completion::owed(
+                    &reader,
+                    &summary,
+                    (0, Box::new(|_| false)),
+                    &mut || {
+                        cancellation.checkpoint()?;
+                        worker.map_or(Ok(true), |worker| {
+                            worker.entry(|read| base.overtaken(&live, read))
+                        })
+                    },
+                )?
+            };
+            let owed = match pass {
+                super::source_summary::Pass::Complete => None,
+                super::source_summary::Pass::Owed(owed) => Some(owed),
+                super::source_summary::Pass::Overtaken => {
+                    if let Some(worker) = worker {
+                        worker.rebase();
+                    }
+                    continue;
+                }
+            };
+            let registries = (
+                producer_bytes,
+                streams,
+                receiver_bytes,
+                windows,
+                tail_registry,
+                store_id,
+            );
+            break (registries, view, owed);
+        };
+        let (producer_bytes, streams, receiver_bytes, windows, tail_registry, store_id) =
+            registries;
         // The capture's own admission time runs from here, after the owed pass.
         let started = Instant::now();
         let finished = |source: &str, stored: Option<super::source_summary::Counts>| match &owed {

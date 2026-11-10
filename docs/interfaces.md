@@ -626,10 +626,16 @@ small row for it. Until it completes, scoped SPARQL keeps the whole-store plan.
 Opening a store that owes the schema 69 migrations applies both writer fences
 and seeds both checkpoints in one synchronized batch, then serves; the open
 does not wait for either job. The joined maintenance worker runs them as one
-duty, `store-counters` first (see "Store counters"), then `owner-graph-index`,
-`event-fallback-rdf`, `source-summary` (see "Per-source counters and
-artifact index") and `source-context` (see "Single context capture admission"), one page
-per admission. It is selected fairly with buffered synchronization, pressure
+duty, `store-counters` first (see "Store counters"), then `source-summary` (see
+"Per-source counters and artifact index"), `owner-graph-index`,
+`event-fallback-rdf` and `source-context` (see "Single context capture
+admission"), one page per admission. `source-summary` runs second because every
+`sources` and live `artifacts` listing pays for what it still owes until it
+completes (#176). The migrations are independent: each reads and checkpoints its
+own keys, so a store left part way through by an image that ran them in another
+order resumes each one from its own checkpoint. `status` lists them in a fixed
+order apart from the run order: `store-counters`, `owner-graph-index`,
+`event-fallback-rdf`, `source-summary`, `source-context`. It is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as pressure maintenance, import reclamation and
 retention are; buffered synchronization and the table rewrite still run there.
@@ -650,10 +656,20 @@ have arrived since, so the worker waits again immediately before the page,
 inline. A failed page commits
 nothing, sets that migration's `failure` and is retried every 60 seconds until
 it succeeds. Nothing is skipped. The daemon logs
-`sparrowd: migration NAME progress pages=P done=D total=T watermark=W` every 64
-pages and `sparrowd: migration NAME complete pages=P done=D` when a migration
-finishes. Each line reports the counters the page's own batch updated and reads
-nothing else; `total` is `counting` while `store-counters` seeds.
+`sparrowd: migration NAME start pages=1 done=D total=T` at a migration's first
+committed page of the session,
+`sparrowd: migration NAME progress pages=P done=D total=T watermark=W elapsed_seconds=S`
+every 64 pages, and
+`sparrowd: migration NAME complete pages=P done=D elapsed_seconds=S` when a
+migration finishes. Each line reports the counters the page's own batch updated
+and reads nothing else; `total` is `counting` while `store-counters` seeds.
+`pages` counts this session's committed pages of that migration, and
+`elapsed_seconds` runs from the start of its first committed page of the
+session, including the waits for writers before each page. So the `complete`
+line of a migration that started in this session gives its whole duration, its
+page count and its final `done`; after a restart part way through, the lines
+cover only the remainder. The `start` line's `done` already includes that first
+page.
 
 Schema 70 adds two flags. `Status.countsPending` (CLI and MCP `counts`,
 `pending` or `exact`) is true while the `store-counters` migration seeds;
@@ -826,9 +842,9 @@ the third online migration, `source-summary` (`source-summary-upgrade`), and
 the service answers at once. Rows found under an older writer identity are not
 trusted: that batch discards them and the migration recounts every source.
 
-The migration runs in the maintenance duty after `owner-graph-index` and
-`event-fallback-rdf`, with the same admission, failure, retry and journal rules
-(see "Online store migrations"). It has two phases. The first walks `artifact:`
+The migration runs in the maintenance duty directly after `store-counters`,
+before `owner-graph-index` and `event-fallback-rdf`, with the same admission,
+failure, retry and journal rules (see "Online store migrations"). It has two phases. The first walks `artifact:`
 entries and counts each artifact from its entry and its `record_ids`, up to 512
 artifacts or 16,384 records per page, always counting one artifact whole. The
 second walks `record:` entries and counts the retained records of parents whose
@@ -876,7 +892,22 @@ first page as usual. Otherwise it returns a page with no rows whose
 MCP `build`) reports `read`, the catalog entries the build has read, and
 `total`, the entries the migration still owed at its snapshot (`totalPending`,
 `counting` in CLI and MCP, while the store counters seed). Its `snapshot_id` is
-the build's. Following that cursor waits on the same build again and never
+the build's.
+
+The migration's own pages keep reading the same entries while a build runs. So
+every 4,096 entries, when it checks its cancellation and lease, a build also
+reads the migration's checkpoint and `done` counter (a few point reads). It
+re-bases when the migration has overtaken it: the migration is complete, or its
+checkpoint has moved and it has passed more entries since the build's snapshot
+than the build has read plus 4,096. A re-base drops the build's snapshot and the
+part of the pass it has read, takes a fresh snapshot (a `sources` build reads
+its registries again under the writer lock) and reads only what the migration
+owes there. Its `read` and `total` then count from the fresh snapshot, so `read`
+can go down. The build keeps its identity, cursor and lease, and its rows are
+those of the snapshot it ends on, so a source or artifact written before the
+re-base is included. A build started while the migration runs therefore delivers
+its rows no later than its next check after the migration completes, and a
+redundant pass stops competing with the migration's pages for CPU. Following that cursor waits on the same build again and never
 starts another; a capture's lease starts when its first page is delivered. A
 build's lease runs 60 seconds from the last call that followed its cursor, and
 `resultRelease` with its `snapshot_id` cancels it. An abandoned build is

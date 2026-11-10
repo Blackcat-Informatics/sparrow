@@ -573,10 +573,14 @@ written.
 
 Online store migrations rebuild derived rows while the daemon serves. The open
 applies the writer-format fence and seeds each migration's checkpoint durably,
-then serves. The joined maintenance worker runs one bounded page per admission,
-fairly with its other duties, and each page commits its rows and checkpoint
-atomically through the ordinary write path, so a restart resumes after the last
-committed page and a failed page is retried, never skipped. Readers take an
+then serves. The joined maintenance worker runs the migrations in turn,
+`store-counters` first and `source-summary` second, since every source and live
+artifact listing pays for what it owes until it completes; each migration
+resumes from its own checkpoint, so the order can change between images. It
+runs one bounded page per admission, fairly with its other duties, and each
+page commits its rows and checkpoint atomically through the ordinary write path,
+so a restart resumes after the last committed page and a failed page is
+retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
 could differ: the schema 69 receipt-time fallback backfill is reported in
 SPARQL coverage while the view serves the facts it still owes, scoped SPARQL
@@ -638,7 +642,10 @@ counting passes over a snapshot, once per `sources` capture and once per window
 of owed rows a live artifact listing reaches, and answer as they will after it.
 Each pass runs as a listing build on its own thread: a call waits for it at most
 5 seconds, and until it finishes answers with no rows, the build's cursor and
-its progress, so no page outlasts a caller's deadline.
+its progress, so no page outlasts a caller's deadline. A build the running
+migration overtakes re-bases onto a fresh snapshot at its next 4,096-entry
+check and reads only what is still owed there, so a waiting listing ends no
+later than shortly after the migration does.
 
 Use PurRDF's governed prepared queries and fail-aware execution boundary.
 Storage faults refuse publication of an apparently successful prefix. Governor

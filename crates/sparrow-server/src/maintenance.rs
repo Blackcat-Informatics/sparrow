@@ -111,10 +111,14 @@ impl Job {
                 .recompress_step(sparrow_server::now()?, RECOMPRESSION_SETTLE_SECONDS)
                 .map(|_| done),
             Self::Migrate { defer } => {
+                // The page's time includes its wait for writers, as the migration's does.
+                let began = std::time::Instant::now();
                 if defer {
                     store.defer_migration_page();
                 }
-                store.migrate_step().map(Outcome::Migrated)
+                store
+                    .migrate_step()
+                    .map(|page| Outcome::Migrated(page, began))
             }
         }
     }
@@ -136,37 +140,55 @@ async fn deferred_page(
 
 enum Outcome {
     Continue(Option<bool>),
-    Migrated(Option<MigrationPage>),
+    /// The page, and when its job began.
+    Migrated(Option<MigrationPage>, std::time::Instant),
 }
 
-/// Journal lines of the online migrations: progress every few pages, and completion.
+/// Journal lines of the online migrations: a start line at each migration's first committed
+/// page of the session, progress every few pages, and completion, each timed from the start
+/// of that first page (#176).
 #[derive(Default)]
 struct MigrationJournal {
     pages: [u64; Migration::ALL.len()],
+    started: [Option<std::time::Instant>; Migration::ALL.len()],
 }
 
 impl MigrationJournal {
     /// Journal one committed page from the counters its own batch updated; it reads
-    /// nothing more and never waits for the writer.
-    fn page(&mut self, page: &MigrationPage) {
-        let pages = &mut self.pages[page.migration.index()];
-        *pages += 1;
-        let pages = *pages;
+    /// nothing more and never waits for the writer. `began` is when the page's job began.
+    fn page(&mut self, page: &MigrationPage, began: std::time::Instant) {
+        let index = page.migration.index();
+        self.pages[index] += 1;
+        let pages = self.pages[index];
         let name = page.migration.name();
+        let total = || {
+            page.total
+                .map_or_else(|| "counting".to_owned(), |total| total.to_string())
+        };
+        let started = *self.started[index].get_or_insert(began);
+        if pages == 1 {
+            eprintln!(
+                "sparrowd: migration {name} start pages=1 done={} total={}",
+                page.done,
+                total()
+            );
+        }
+        let elapsed = started.elapsed().as_secs_f64();
         if let Some(failure) = &page.failure {
             // The migration stops on a latched failure, so this logs once.
-            eprintln!("sparrowd: migration {name} failed pages={pages}: {failure}");
+            eprintln!(
+                "sparrowd: migration {name} failed pages={pages} elapsed_seconds={elapsed:.3}: {failure}"
+            );
         } else if page.complete {
             eprintln!(
-                "sparrowd: migration {name} complete pages={pages} done={}",
+                "sparrowd: migration {name} complete pages={pages} done={} elapsed_seconds={elapsed:.3}",
                 page.done
             );
         } else if pages.is_multiple_of(MIGRATION_PROGRESS_PAGES) {
             eprintln!(
-                "sparrowd: migration {name} progress pages={pages} done={} total={} watermark={}",
+                "sparrowd: migration {name} progress pages={pages} done={} total={} watermark={} elapsed_seconds={elapsed:.3}",
                 page.done,
-                page.total
-                    .map_or_else(|| "counting".to_owned(), |total| total.to_string()),
+                total(),
                 page.watermark.as_deref().unwrap_or("none")
             );
         }
@@ -283,7 +305,7 @@ async fn run(
                 continuation = more;
             }
             Ok(Outcome::Continue(None)) => {}
-            Ok(Outcome::Migrated(page)) => {
+            Ok(Outcome::Migrated(page, began)) => {
                 migrating = page.is_some();
                 if migrating {
                     let owner = store.clone();
@@ -293,7 +315,7 @@ async fn run(
                     stale = false;
                 }
                 if let Some(page) = &page {
-                    journal.page(page);
+                    journal.page(page, began);
                 }
             }
             Err(error) => {
@@ -461,11 +483,10 @@ mod tests {
             pending.iter().all(|m| !m.complete() && m.total.is_none()),
             "{pending:?}"
         );
-        // Seed the store counters, then commit the worker's next two pages (the owner index,
-        // then one backfill page) so the read below lands part-way through the backfill, not
-        // before or after it.
-        while store.migrate_step().unwrap().unwrap().migration == Migration::StoreCounters {}
-        store.migrate_step().unwrap().unwrap();
+        // Commit the worker's pages in its run order (the counters, the source summary, the
+        // owner index) through the first backfill page, so the read below lands part-way
+        // through the backfill, not before or after it.
+        while store.migrate_step().unwrap().unwrap().migration != Migration::EventFallbackRdf {}
         let part = store.migrations().unwrap();
         let (index, fallback) = (
             &part[Migration::OwnerGraphIndex.index()],
