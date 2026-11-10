@@ -450,37 +450,44 @@ impl Store {
     /// meanwhile is indexed by its own write. The pass runs to the end of what the migration
     /// owes, so its time follows the unmigrated remainder; CPU is not capped. It runs as a
     /// listing build: `worker` counts each catalog entry it reads and stops it once the
-    /// build is cancelled or its lease ends.
+    /// build is cancelled or its lease ends. Once the running migration overtakes the pass,
+    /// it starts again from a newer snapshot, which owes less (#176); any snapshot taken
+    /// before the page reads the stored rows gives the same listing.
     fn owed_index_rows(
         &self,
         selector: &ArtifactSelector,
         after: Option<&str>,
         worker: &listing_build::Worker<Owed>,
     ) -> Result<Owed, Error> {
-        let snapshot = self.unlocked.db.snapshot();
-        let reader = super::store_counters::Reader::snapshot(&snapshot);
-        let progress = source_summary::progress(|key| reader.get(key.as_bytes()))?;
-        worker.total(source_summary::owed_entries(&reader, &progress)?);
         let prefixes = selected_prefixes(selector);
         let (from, before) = (selector.received_from, selector.received_before);
-        let after = after.map(str::to_owned);
-        let keep = move |key: &str| {
-            let prefix = key.get(..source_summary::INDEX.len() + 65).unwrap_or(key);
-            after.as_deref().is_none_or(|after| key > after)
-                && prefixes
-                    .as_ref()
-                    .is_none_or(|list| list.iter().any(|wanted| wanted == prefix))
-                && source_summary::index_entry(prefix.as_bytes(), key.as_bytes())
-                    .is_ok_and(|(time, _)| time >= from && time < before)
-        };
-        let Some(owed) = source_summary::Completion::owed(
-            &reader,
-            &progress,
-            (self.owed_window(), Box::new(keep)),
-            &mut || worker.entry(),
-        )?
-        else {
-            return Ok(Owed::default());
+        let live = super::store_counters::Reader::db(&self.unlocked.db);
+        let owed = loop {
+            let snapshot = self.unlocked.db.snapshot();
+            let reader = super::store_counters::Reader::snapshot(&snapshot);
+            let progress = source_summary::progress(|key| reader.get(key.as_bytes()))?;
+            let base = source_summary::Base::read(&reader, &progress)?;
+            worker.total(source_summary::owed_entries(&reader, &progress)?);
+            let (prefixes, after) = (prefixes.clone(), after.map(str::to_owned));
+            let keep = move |key: &str| {
+                let prefix = key.get(..source_summary::INDEX.len() + 65).unwrap_or(key);
+                after.as_deref().is_none_or(|after| key > after)
+                    && prefixes
+                        .as_ref()
+                        .is_none_or(|list| list.iter().any(|wanted| wanted == prefix))
+                    && source_summary::index_entry(prefix.as_bytes(), key.as_bytes())
+                        .is_ok_and(|(time, _)| time >= from && time < before)
+            };
+            match source_summary::Completion::owed(
+                &reader,
+                &progress,
+                (self.owed_window(), Box::new(keep)),
+                &mut |entries| worker.entry(entries, |read| base.overtaken(&live, read)),
+            )? {
+                source_summary::Pass::Complete => return Ok(Owed::default()),
+                source_summary::Pass::Owed(owed) => break owed,
+                source_summary::Pass::Overtaken => worker.rebase(),
+            }
         };
         let bytes = owed
             .index

@@ -4352,9 +4352,9 @@ names = ['^(pin_read_stats|artifact_read_stats|source_read_stats|record_read_sta
 
 [[job]]
 id = "listing-build"
-summary = "One background build owner serves every listing that must first read what the unfinished source-summary migration owes: the first call registers and starts the build on its own thread with its own snapshot, each call waits at most five seconds, an unfinished build answers with no rows, its cursor and its progress, the cursor resumes the same build, and lease expiry or release cancels it (#158)."
+summary = "One background build owner serves every listing that must first read what the unfinished source-summary migration owes: the first call registers and starts the build on its own thread with its own snapshot, each call waits at most five seconds, an unfinished build answers with no rows, its cursor and its progress, the cursor resumes the same build, and lease expiry or release cancels it (#158). A build the running migration overtakes re-bases onto a fresh snapshot at its next check, judged by one owner, source_summary::Base::overtaken (#176)."
 home = "sparrow_core::storage::listing_build::Builds"
-entry_points = ["sparrow_core::storage::listing_build::Builds::start", "sparrow_core::storage::listing_build::Builds::poll", "sparrow_core::storage::listing_build::Waiter::wait", "sparrow_core::storage::source_read::Store::source_build_poll", "sparrow_core::storage::artifact_read::Store::artifact_build_poll", "sparrow_core::storage::artifact_read::Store::artifact_window"]
+entry_points = ["sparrow_core::storage::listing_build::Builds::start", "sparrow_core::storage::listing_build::Builds::poll", "sparrow_core::storage::listing_build::Waiter::wait", "sparrow_core::storage::listing_build::Worker::entry", "sparrow_core::storage::listing_build::Worker::rebase", "sparrow_core::storage::source_summary::Base::overtaken", "sparrow_core::storage::source_read::Store::source_build_poll", "sparrow_core::storage::artifact_read::Store::artifact_build_poll", "sparrow_core::storage::artifact_read::Store::artifact_window"]
 spec = "docs/interfaces.md: per-source counters and artifact index, listing builds."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []

@@ -573,27 +573,31 @@ written.
 
 Online store migrations rebuild derived rows while the daemon serves. The open
 applies the writer-format fence and seeds each migration's checkpoint durably,
-then serves. The joined maintenance worker runs one bounded page per admission,
+then serves. The joined maintenance worker runs the migrations in turn,
+`store-counters` first and `source-summary` second, since, until the source
+summary completes, every source and live artifact listing first reads what that
+migration still owes; each migration resumes from its own checkpoint, so the
+order can change between images. The worker runs one bounded page per admission,
 fairly with its other duties, and each page commits its rows and checkpoint
 atomically through the ordinary write path, so a restart resumes after the last
 committed page and a failed page is retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
-could differ: the schema 69 receipt-time fallback backfill is reported in
-SPARQL coverage while the view serves the facts it still owes, scoped SPARQL
-reads the owner index for the declarations already copied and walks the rest,
-the source listings add what the source-summary migration still owes to the stored rows,
+could differ: the schema 69 receipt-time fallback backfill is reported in SPARQL
+coverage while the view serves the facts it still owes, scoped SPARQL reads the
+owner index for the declarations already copied and walks the rest, the source
+listings add what the source-summary migration still owes to the stored rows,
 and record context walks the primary time index while a stale source timeline
 cache is rebuilt. Pending paths that may read much of the store run from a
 snapshot without the writer lock and check cancellation; their CPU is not
 capped, they spend no request or visit budget, and what they hold is charged as
-memory. No read refuses because a migration is unfinished. `status` reports
-each migration's progress. A query-only
-daemon runs no maintenance worker, so it serves on the pending paths. Writers
-come before pages: before a page the maintenance worker waits while an ingest,
-publication or RPC write is waiting for the writer lock, for at most the longer
-of 100 ms and the previous page's hold, so the migration keeps progressing
-without holding writers behind a run of pages. The worker polls that wait with
-its other duties, so it delays only the page.
+memory. No read refuses because a migration is unfinished. `status` reports each
+migration's progress. A query-only daemon runs no maintenance worker, so it
+serves on the pending paths. Writers come before pages: before a page the
+maintenance worker waits while an ingest, publication or RPC write is waiting
+for the writer lock, for at most the longer of 100 ms and the previous page's
+hold, so the migration keeps progressing without holding writers behind a run of
+pages. The worker polls that wait with its other duties, so it delays only the
+page.
 
 `status` and the migration report never take the writer lock. They read fixed
 `store-counter:` rows from a RocksDB snapshot: the record, retained-record,
@@ -638,7 +642,10 @@ counting passes over a snapshot, once per `sources` capture and once per window
 of owed rows a live artifact listing reaches, and answer as they will after it.
 Each pass runs as a listing build on its own thread: a call waits for it at most
 5 seconds, and until it finishes answers with no rows, the build's cursor and
-its progress, so no page outlasts a caller's deadline.
+its progress, so no page outlasts a caller's deadline. A build the running
+migration overtakes re-bases onto a fresh snapshot at its next 4,096-entry
+check and reads only what is still owed there, so a waiting listing ends no
+later than shortly after the migration does.
 
 Use PurRDF's governed prepared queries and fail-aware execution boundary.
 Storage faults refuse publication of an apparently successful prefix. Governor

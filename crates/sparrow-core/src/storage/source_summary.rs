@@ -32,7 +32,9 @@
 //!
 //! Until it completes, readers add a [`Completion`] to the stored rows: the migration's own
 //! counting passes run to the end over the reader's view without writing, so a listing
-//! answers exactly as it will once the migration is complete.
+//! answers exactly as it will once the migration is complete. A listing build that the
+//! running migration overtakes stops its pass and starts again from a newer view
+//! ([`Base::overtaken`]), which owes less.
 
 use super::store_counters::Reader;
 use super::{Error, Writer, integer, manifest_retire, parse, read_field};
@@ -718,14 +720,14 @@ pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
             after,
             (PAGE_ARTIFACTS, PAGE_RECORDS),
             (&mut batch, &mut deltas),
-            &mut || Ok(()),
+            &mut |_| Ok(true),
         )?,
         Progress::Records(after) => record_page(
             &reader,
             after,
             PAGE_RECORDS,
             (&mut batch, &mut deltas),
-            &mut || Ok(()),
+            &mut |_| Ok(true),
         )?,
     };
     merge(db, &mut batch, deltas)?;
@@ -776,6 +778,67 @@ pub(super) fn owed_entries(reader: &Reader<'_>, progress: &Progress) -> Result<O
 /// Which owed index rows a [`Completion`] keeps.
 pub(super) type Keep = Box<dyn Fn(&str) -> bool>;
 
+/// The `done` counter of the migration, `None` while the store counters seed.
+fn done(reader: &Reader<'_>) -> Result<Option<u64>, Error> {
+    use super::store_counters::{Counter, Positions, values};
+    if !Positions::read(|key| reader.get(key.as_bytes()))?.seeded() {
+        return Ok(None);
+    }
+    Ok(Some(values(reader)?[&Counter::SourceSummaryDone]))
+}
+
+/// Where the migration stood in the view a listing build's pass reads, so the build can tell
+/// when the running migration has overtaken it.
+pub(super) struct Base {
+    progress: Progress,
+    done: Option<u64>,
+}
+
+impl Base {
+    /// The migration at `progress` in the view `reader` reads. A fixed number of point reads.
+    pub(super) fn read(reader: &Reader<'_>, progress: &Progress) -> Result<Self, Error> {
+        Ok(Self {
+            progress: progress.clone(),
+            done: done(reader)?,
+        })
+    }
+
+    /// Whether the migration, as `live` reads it now, has overtaken a pass from this base
+    /// that has read `read` entries: it is complete, or its checkpoint has moved and it has
+    /// passed more entries since the base than the pass has read plus a lead of
+    /// [`super::listing_build::CHECK_EVERY`] entries, all in the pass's own unit (artifact
+    /// and record entries at or before the checkpoint, which is what `done` counts). Its
+    /// pages and the pass walk the same entries in the same order, so the migration is then
+    /// ahead of the pass and a newer view owes less than the pass has left. The lead keeps a
+    /// re-base from repeating at every check. Entries a write adds or removes at or before
+    /// the checkpoint move `done` too; that changes only when a re-base happens, never what
+    /// the build returns. A fixed number of point reads.
+    pub(super) fn overtaken(&self, live: &Reader<'_>, read: u64) -> Result<bool, Error> {
+        let now = progress(|key| live.get(key.as_bytes()))?;
+        if now == Progress::Complete {
+            return Ok(true);
+        }
+        if now == self.progress {
+            return Ok(false);
+        }
+        let (Some(base), Some(done)) = (self.done, done(live)?) else {
+            return Ok(false);
+        };
+        Ok(done.saturating_sub(base) > read.saturating_add(super::listing_build::CHECK_EVERY))
+    }
+}
+
+/// How a listing's owed pass ended.
+pub(super) enum Pass {
+    /// The migration is complete in the pass's view: nothing is owed.
+    Complete,
+    /// What the migration owes in the pass's view.
+    Owed(Completion),
+    /// The pass's `entry` stopped it: the running migration has overtaken it, so the caller
+    /// takes a newer view and runs the pass again.
+    Overtaken,
+}
+
 /// What the unfinished migration still owes, as one reader sees the store: the count
 /// changes per source and the per-source index rows its remaining pages would write.
 /// Stored rows plus this completion equal the rows the finished migration leaves for the
@@ -805,18 +868,21 @@ impl Rows for Completion {
 
 impl Completion {
     /// Complete the migration at `progress` over `reader` without writing, keeping the first
-    /// `rows` owed index rows `keep` selects; `None` once the migration is complete. The pass reads
-    /// the catalog entries the migration has not reached, one entry each, as its pages
-    /// would; `entry` runs before each artifact and record entry it examines, so a caller
-    /// can count the pass's progress in the migration's own units and stop it.
+    /// `rows` owed index rows `keep` selects. The pass reads the catalog entries the
+    /// migration has not reached, one entry each, as its pages would; `entry` runs for each
+    /// artifact and record entry it examines, given the catalog entries that step read (an
+    /// artifact's count also reads its records), so a caller can count the pass's progress
+    /// in the migration's own units, pace its checks by the entries read, and stop it: an
+    /// error ends the pass with that error, and `false` ends it as [`Pass::Overtaken`], with
+    /// nothing it counted kept.
     pub(super) fn owed(
         reader: &Reader<'_>,
         progress: &Progress,
         index: (usize, Keep),
-        entry: &mut dyn FnMut() -> Result<(), Error>,
-    ) -> Result<Option<Self>, Error> {
+        entry: &mut dyn FnMut(u64) -> Result<bool, Error>,
+    ) -> Result<Pass, Error> {
         if *progress == Progress::Complete {
-            return Ok(None);
+            return Ok(Pass::Complete);
         }
         let (rows, keep) = index;
         let mut completion = Self {
@@ -828,7 +894,16 @@ impl Completion {
         };
         let mut deltas = BTreeMap::new();
         let mut next = progress.clone();
+        let stopped = std::cell::Cell::new(false);
+        let mut step = |entries| {
+            let go = entry(entries)?;
+            stopped.set(!go);
+            Ok(go)
+        };
         loop {
+            if stopped.get() {
+                return Ok(Pass::Overtaken);
+            }
             next = match next {
                 Progress::Complete => break,
                 Progress::Artifacts(after) => artifact_page(
@@ -836,7 +911,7 @@ impl Completion {
                     after,
                     (PAGE_ARTIFACTS, PAGE_RECORDS),
                     (&mut completion, &mut deltas),
-                    entry,
+                    &mut step,
                 )?,
                 // One pass: a deleted parent's records are counted together, as the
                 // pages count them across their boundaries.
@@ -845,12 +920,15 @@ impl Completion {
                     after,
                     usize::MAX,
                     (&mut completion, &mut deltas),
-                    entry,
+                    &mut step,
                 )?,
             };
         }
+        if stopped.get() {
+            return Ok(Pass::Overtaken);
+        }
         completion.deltas = deltas;
-        Ok(Some(completion))
+        Ok(Pass::Owed(completion))
     }
 
     /// One source's counts after the migration: `stored` (absent when the source has no
@@ -889,7 +967,7 @@ fn artifact_page(
     after: Option<String>,
     limits: (usize, usize),
     (rows, deltas): (&mut impl Rows, &mut BTreeMap<String, Delta>),
-    entry: &mut dyn FnMut() -> Result<(), Error>,
+    entry: &mut dyn FnMut(u64) -> Result<bool, Error>,
 ) -> Result<Progress, Error> {
     let (mut artifacts, mut records) = (0, 0);
     let mut last = None;
@@ -902,13 +980,23 @@ fn artifact_page(
                 full = true;
                 return Ok(false);
             }
-            entry()?;
             let id = std::str::from_utf8(key)
                 .map_err(|_| failure("invalid artifact catalog key"))?
                 .to_owned();
             artifacts += 1;
-            records += count_artifact(reader, &id, bytes, rows, deltas)?;
+            let read = count_artifact(reader, &id, bytes, rows, deltas)?;
+            records += read;
+            // The artifact entry and the records its count read.
+            let read = u64::try_from(read)
+                .ok()
+                .and_then(|read| read.checked_add(1))
+                .ok_or_else(|| failure(format!("record count of artifact {id} overflows")))?;
             last = Some(id);
+            // A stopped pass ends here; its caller discards what it counted.
+            if !entry(read)? {
+                full = true;
+                return Ok(false);
+            }
             Ok(true)
         },
     )?;
@@ -994,7 +1082,7 @@ fn record_page(
     after: Option<String>,
     limit: usize,
     (rows, deltas): (&mut impl Rows, &mut BTreeMap<String, Delta>),
-    entry: &mut dyn FnMut() -> Result<(), Error>,
+    entry: &mut dyn FnMut(u64) -> Result<bool, Error>,
 ) -> Result<Progress, Error> {
     // Deleted parents counted by this page, with their row before it.
     let mut parents = BTreeMap::<String, (Option<Retained>, u64, String, u64)>::new();
@@ -1005,11 +1093,11 @@ fn record_page(
         RECORD_PREFIX,
         after.as_deref().map(str::as_bytes),
         |key, bytes| {
-            if records == limit {
+            // A stopped pass ends here; its caller discards what it counted.
+            if records == limit || !entry(1)? {
                 exhausted = false;
                 return Ok(false);
             }
-            entry()?;
             records += 1;
             let id = std::str::from_utf8(key)
                 .map_err(|_| failure("invalid record catalog key"))?

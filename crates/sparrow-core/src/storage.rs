@@ -2990,6 +2990,25 @@ impl Store {
         ])
     }
 
+    /// Dev-only: catalog entries every finished source, then artifact, listing build has
+    /// read, across its re-bases.
+    #[cfg(feature = "test-support")]
+    pub fn listing_build_entries_for_tests(&self) -> Result<[u64; 2], Error> {
+        let poisoned = || Error::new("STORAGE_FAILURE", "listing builds poisoned");
+        Ok([
+            self.unlocked
+                .source_builds
+                .lock()
+                .map_err(|_| poisoned())?
+                .entries(),
+            self.unlocked
+                .artifact_builds
+                .lock()
+                .map_err(|_| poisoned())?
+                .entries(),
+        ])
+    }
+
     /// Dev-only: drop every read handle and listing build whose lease ended by `now`, as
     /// the expiry pass does.
     #[cfg(feature = "test-support")]

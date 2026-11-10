@@ -967,8 +967,11 @@ prints each migration's `done`, `total` and `failure`, the watches and the
 ingest socket, starts `sparrow-ship.timer` (not the backup timer, below), and exits 0. The backfill continues online
 in the running daemon. Watch it with `sparrow /SPARROW/store/rpc.sock status`
 (`migrations`) and with `journalctl --user -u sparrow.service`, which logs a
-`sparrowd: migration` progress line every 64 pages and a completion line per
-migration.
+`sparrowd: migration` start line per migration, a progress line every 64
+pages and a completion line per migration, each with its pages and `done`; the
+progress and completion lines carry `elapsed_seconds` since that migration's
+first page, so the completion line gives each migration's own duration (see
+"Online store migrations" in the interfaces).
 
 `--help` gives the recovery for each failure point. A failure after the start
 leaves the `--to` daemon running with both timers stopped, and it may already

@@ -7,23 +7,27 @@
 //! (#149).
 //!
 //! Opening a store fences older writers and seeds every checkpoint in one synchronized
-//! batch, then serves. The maintenance worker runs one page per admission through the
-//! writer's ordinary commit, so a page shares the write path's durability latch, free-space
-//! floor and data-write admission, and commits its rows with its checkpoint atomically. A
-//! restart resumes after the last committed page. A page yields the writer to waiting
-//! writers first, for a bounded time (see [`super::writer_queue`]). Until a migration
-//! completes its readers take the pending path: scoped SPARQL reads the owner index for
-//! the copied declarations and walks the uncopied ones, the view serves the event fallback
-//! facts still owed, SPARQL coverage counts the selected record graphs that still lack
-//! their fallback facts, the source and artifact listings add what the source-summary
-//! migration still owes to the stored rows, record context and reclaimed-parent folds read
-//! the primary time index instead of a partial source timeline cache, and `status` answers
-//! from the seeding checkpoint in constant time, reporting `counts` as `pending` with the
-//! seeding's progress while the store counters seed. The extra reads run without the writer
-//! lock where they may be long, check cancellation, and are not charged to request or visit
-//! budgets; what they hold is charged as memory. No reader refuses because a migration is
-//! unfinished, and every listing, context and SPARQL answer equals the answer the finished
-//! migration gives for the same catalog.
+//! batch, then serves. The maintenance worker runs the migrations in
+//! [`Migration::RUN_ORDER`], the source summary directly after the counters, so the
+//! listings that pay for what it owes stop paying first (#176). Each migration resumes from
+//! its own checkpoint, so a store partway through under any order resumes correctly. The
+//! worker runs one page per admission through the writer's ordinary commit, so a page
+//! shares the write path's durability latch, free-space floor and data-write admission, and
+//! commits its rows with its checkpoint atomically. A restart resumes after the last
+//! committed page. A page yields the writer to waiting writers first, for a bounded time
+//! (see [`super::writer_queue`]). Until a migration completes its readers take the pending
+//! path: scoped SPARQL reads the owner index for the copied declarations and walks the
+//! uncopied ones, the view serves the event fallback facts still owed, SPARQL coverage
+//! counts the selected record graphs that still lack their fallback facts, the source and
+//! artifact listings add what the source-summary migration still owes to the stored rows,
+//! record context and reclaimed-parent folds read the primary time index instead of a
+//! partial source timeline cache, and `status` answers from the seeding checkpoint in
+//! constant time, reporting `counts` as `pending` with the seeding's progress while the
+//! store counters seed. The extra reads run without the writer lock where they may be long,
+//! check cancellation, and are not charged to request or visit budgets; what they hold is
+//! charged as memory. No reader refuses because a migration is unfinished, and every
+//! listing, context and SPARQL answer equals the answer the finished migration gives for
+//! the same catalog.
 //!
 //! Progress comes from the store counters ([`super::store_counters`]): a migration's
 //! `done` is its `done:` counter row, maintained with its checkpoint, and its `total` is
@@ -45,7 +49,7 @@ const EVENT_FALLBACK_PAGE: usize = 64;
 /// Longest latched failure text.
 const FAILURE_CHARS: usize = 1024;
 
-/// One online migration, in the order the maintenance worker runs them.
+/// One online migration, in the fixed order `status` reports them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Migration {
     /// The store counters `status` and migration progress read (#146). It runs first, so
@@ -63,13 +67,27 @@ pub enum Migration {
 }
 
 impl Migration {
-    /// Every migration, in run order: the counters first, then the index, since its pages
-    /// are few and cheap.
+    /// Every migration, in the order `status`, the latched failures and [`Migration::index`]
+    /// use. The maintenance worker runs them in its own run order: the counters, the source
+    /// summary, the owner index, the backfill, then the source timeline cache (#176).
     pub const ALL: [Self; 5] = [
         Self::StoreCounters,
         Self::OwnerGraphIndex,
         Self::EventFallbackRdf,
         Self::SourceSummary,
+        Self::SourceContext,
+    ];
+
+    /// The order the maintenance worker runs the migrations: the counters first, so the
+    /// others report from counters while they run, then the source summary, whose unfinished
+    /// state makes every `sources` and live `artifacts` listing read what it still owes
+    /// (#176), then the owner index, since its pages are few and cheap. The migrations are
+    /// independent: each reads and checkpoints its own keys.
+    pub(crate) const RUN_ORDER: [Self; 5] = [
+        Self::StoreCounters,
+        Self::SourceSummary,
+        Self::OwnerGraphIndex,
+        Self::EventFallbackRdf,
         Self::SourceContext,
     ];
 
@@ -270,13 +288,13 @@ pub(super) fn report(
 }
 
 impl Writer {
-    /// The first migration with work left, if any.
+    /// The first migration in run order with work left, if any.
     fn pending_migration(&self) -> Result<Option<Migration>, Error> {
         let positions = Positions::read(|key| Ok(self.db.get(key)?))?;
         if !positions.seeded() {
             return Ok(Some(Migration::StoreCounters));
         }
-        for migration in &Migration::ALL[1..] {
+        for migration in &Migration::RUN_ORDER[1..] {
             let complete = match migration {
                 Migration::StoreCounters => true,
                 Migration::OwnerGraphIndex => {
@@ -320,12 +338,12 @@ impl Writer {
 }
 
 impl Store {
-    /// Run one page of the first incomplete online migration and commit it with its
-    /// checkpoint; `None` when every migration is complete. It does not yield to waiting
-    /// writers itself: the caller runs [`Store::defer_migration_page`] immediately before
-    /// each call, apart from the writer, as the maintenance worker does. A failed page
-    /// commits nothing, latches its failure in [`Store::migrations`] and is retried by the
-    /// next call.
+    /// Run one page of the first incomplete online migration in the worker's run order and
+    /// commit it with its checkpoint; `None` when every migration is complete. It does not
+    /// yield to waiting writers itself: the caller runs [`Store::defer_migration_page`]
+    /// immediately before each call, apart from the writer, as the maintenance worker does.
+    /// A failed page commits nothing, latches its failure in [`Store::migrations`] and is
+    /// retried by the next call.
     pub fn migrate_step(&self) -> Result<Option<MigrationPage>, Error> {
         let writer = self.lock_uncounted()?;
         let started = std::time::Instant::now();

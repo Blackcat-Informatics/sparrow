@@ -624,36 +624,53 @@ small row for it. Until it completes, scoped SPARQL keeps the whole-store plan.
 ### Online store migrations (schema 69)
 
 Opening a store that owes the schema 69 migrations applies both writer fences
-and seeds both checkpoints in one synchronized batch, then serves; the open
-does not wait for either job. The joined maintenance worker runs them as one
-duty, `store-counters` first (see "Store counters"), then `owner-graph-index`,
-`event-fallback-rdf`, `source-summary` (see "Per-source counters and
-artifact index") and `source-context` (see "Single context capture admission"), one page
-per admission. It is selected fairly with buffered synchronization, pressure
+and seeds both checkpoints in one synchronized batch, then serves; the open does
+not wait for either job. The joined maintenance worker runs them as one duty,
+`store-counters` first (see "Store counters"), then `source-summary` (see
+"Per-source counters and artifact index"), `owner-graph-index`,
+`event-fallback-rdf` and `source-context` (see "Single context capture
+admission"), one page per admission. `source-summary` runs second because, until
+it completes, every `sources` and live `artifacts` listing first reads what the
+migration still owes (#176). The migrations are independent: each reads and
+checkpoints its own keys, so a store left part way through by an image that ran
+them in another order resumes each one from its own checkpoint. `status` lists
+them in a fixed order apart from the run order: `store-counters`,
+`owner-graph-index`, `event-fallback-rdf`, `source-summary`, `source-context`.
+The migration duty is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as pressure maintenance, import reclamation and
 retention are; buffered synchronization and the table rewrite still run there.
 Each page commits its rows and its checkpoint in one synchronized batch through
 the ordinary write path, so it is admitted against the data allowance and a
-failed write latches durability uncertainty as any write does; a restart
-resumes after the last committed page.
-While pages succeed the next one follows at once, except that writers come
-first: an ingest, a consume publication or an RPC write that is waiting for the
-writer lock takes it before the next page does. Before a page the worker waits
-while any writer is waiting, for at most the longer of 100 ms and the time the
-previous page held the writer, so the migration still progresses under a
-continuous stream of writers. The wait blocks on a condition the last waiting
-writer signals; nothing polls. It runs apart from the worker's other duties,
-which keep their own schedule, so it delays only the page. When that wait ended
-while another duty ran, or the page is the first after a retry, writers may
-have arrived since, so the worker waits again immediately before the page,
-inline. A failed page commits
-nothing, sets that migration's `failure` and is retried every 60 seconds until
-it succeeds. Nothing is skipped. The daemon logs
-`sparrowd: migration NAME progress pages=P done=D total=T watermark=W` every 64
-pages and `sparrowd: migration NAME complete pages=P done=D` when a migration
-finishes. Each line reports the counters the page's own batch updated and reads
-nothing else; `total` is `counting` while `store-counters` seeds.
+failed write latches durability uncertainty as any write does; a restart resumes
+after the last committed page. While pages succeed the next one follows at once,
+except that writers come first: an ingest, a consume publication or an RPC write
+that is waiting for the writer lock takes it before the next page does. Before a
+page the worker waits while any writer is waiting, for at most the longer of 100
+ms and the time the previous page held the writer, so the migration still
+progresses under a continuous stream of writers. The wait blocks on a condition
+the last waiting writer signals; nothing polls. It runs apart from the worker's
+other duties, which keep their own schedule, so it delays only the page. When
+that wait ended while another duty ran, or the page is the first after a retry,
+writers may have arrived since, so the worker waits again immediately before the
+page, inline. A failed page commits nothing, sets that migration's `failure` and
+is retried every 60 seconds until it succeeds. Nothing is skipped. The daemon
+logs `sparrowd: migration NAME start pages=1 done=D total=T` at a migration's
+first committed page of the session,
+`sparrowd: migration NAME progress pages=P done=D total=T watermark=W elapsed_seconds=S`
+every 64 pages, and
+`sparrowd: migration NAME complete pages=P done=D elapsed_seconds=S` when a
+migration finishes. Each line reports the counters the page's own batch updated
+and reads nothing else; `total` is `counting` while `store-counters` seeds.
+`pages` counts this session's committed pages of that migration, and
+`elapsed_seconds` runs from the start of the job that committed its first page
+of the session, so it includes the wait for writers before every later page. A
+wait the worker ran beside its other duties before that first page, at most the
+longer of 100 ms and the previous page's hold, is not counted. So the `complete`
+line of a migration that started in this session gives its whole duration, its
+page count and its final `done`; after a restart part way through, the lines
+cover only the remainder. The `start` line's `done` already includes that first
+page.
 
 Schema 70 adds two flags. `Status.countsPending` (CLI and MCP `counts`,
 `pending` or `exact`) is true while the `store-counters` migration seeds;
@@ -822,22 +839,22 @@ Opening a store written before these rows moves its format to a source summary
 writer family, `sparrow.store/242` to `/296`, which lifts each owner-graph
 family by 55 and keeps its log time, archive and intake switches, so older
 binaries refuse the store. The same synchronized batch seeds the checkpoint of
-the third online migration, `source-summary` (`source-summary-upgrade`), and
-the service answers at once. Rows found under an older writer identity are not
+the `source-summary` online migration (`source-summary-upgrade`), and the
+service answers at once. Rows found under an older writer identity are not
 trusted: that batch discards them and the migration recounts every source.
 
-The migration runs in the maintenance duty after `owner-graph-index` and
-`event-fallback-rdf`, with the same admission, failure, retry and journal rules
-(see "Online store migrations"). It has two phases. The first walks `artifact:`
-entries and counts each artifact from its entry and its `record_ids`, up to 512
-artifacts or 16,384 records per page, always counting one artifact whole. The
-second walks `record:` entries and counts the retained records of parents whose
-entry was already deleted. Each page commits its rows and its checkpoint in one
-synchronized batch, so a restart resumes after the last committed page. Writes
-during the migration keep exact every artifact the migration has passed or
-that the write creates; the migration reads the current state of the rest when
-it reaches them. `total` counts `artifact:` and `record:` entries, and `done`
-those at or before the watermark.
+The migration runs in the maintenance duty directly after `store-counters`,
+before `owner-graph-index` and `event-fallback-rdf`, with the same admission,
+failure, retry and journal rules (see "Online store migrations"). It has two
+phases. The first walks `artifact:` entries and counts each artifact from its
+entry and its `record_ids`, up to 512 artifacts or 16,384 records per page,
+always counting one artifact whole. The second walks `record:` entries and
+counts the retained records of parents whose entry was already deleted. Each
+page commits its rows and its checkpoint in one synchronized batch, so a restart
+resumes after the last committed page. Writes during the migration keep exact
+every artifact the migration has passed or that the write creates; the migration
+reads the current state of the rest when it reaches them. `total` counts
+`artifact:` and `record:` entries, and `done` those at or before the watermark.
 
 Readers while the migration is pending:
 
@@ -891,6 +908,23 @@ further fresh listing or window refuses with `RESOURCE_LIMIT`. Once the migratio
 is complete no listing builds. A build's thread keeps its own handle on the store,
 so closing the store does not cancel it until its lease ends (at most 60 seconds);
 the process exit ends it at once.
+
+The migration's own pages keep reading the same entries while a build runs. So
+each time the build has read another 4,096 catalog entries (an artifact's
+records count, though `read` counts the artifact once), when it checks its
+cancellation and lease, it also reads the migration's checkpoint and `done`
+counter (a few point reads). It re-bases when the migration has overtaken it:
+the migration is complete, or its checkpoint has moved and it has passed more
+entries since the build's snapshot than the build has read plus 4,096. A re-base
+drops the build's snapshot and the part of the pass it has read, takes a fresh
+snapshot (a `sources` build reads its registries again under the writer lock)
+and reads only what the migration owes there. Its `read` and `total` then count
+from the fresh snapshot, so `read` can go down. The build keeps its identity,
+cursor and lease, and its rows are those of the snapshot it ends on, so a source
+or artifact written before the re-base is included. A build started while the
+migration runs therefore delivers its rows no later than its next check after
+the migration completes, and a redundant pass stops competing with the
+migration's pages for CPU.
 
 The migration's duration on the live store is measured on a copy of the newest
 online backup, restored by `deploy/verify-backup.sh --measure-migration`, recorded
