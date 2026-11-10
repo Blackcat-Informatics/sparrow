@@ -12,22 +12,22 @@
 //! listings that pay for what it owes stop paying first (#176). Each migration resumes from
 //! its own checkpoint, so a store partway through under any order resumes correctly. The
 //! worker runs one page per admission through the writer's ordinary commit, so a page
-//! shares the write path's durability latch, free-space floor and data-write admission,
-//! and commits its rows with its checkpoint atomically. A restart resumes after the last
-//! committed page. A page yields the writer to waiting
-//! writers first, for a bounded time (see [`super::writer_queue`]). Until a migration
-//! completes its readers take the pending path: scoped SPARQL reads the owner index for
-//! the copied declarations and walks the uncopied ones, the view serves the event fallback
-//! facts still owed, SPARQL coverage counts the selected record graphs that still lack
-//! their fallback facts, the source and artifact listings add what the source-summary
-//! migration still owes to the stored rows, record context and reclaimed-parent folds read
-//! the primary time index instead of a partial source timeline cache, and `status` answers
-//! from the seeding checkpoint in constant time, reporting `counts` as `pending` with the
-//! seeding's progress while the store counters seed. The extra reads run without the writer
-//! lock where they may be long, check cancellation, and are not charged to request or visit
-//! budgets; what they hold is charged as memory. No reader refuses because a migration is
-//! unfinished, and every listing, context and SPARQL answer equals the answer the finished
-//! migration gives for the same catalog.
+//! shares the write path's durability latch, free-space floor and data-write admission, and
+//! commits its rows with its checkpoint atomically. A restart resumes after the last
+//! committed page. A page yields the writer to waiting writers first, for a bounded time
+//! (see [`super::writer_queue`]). Until a migration completes its readers take the pending
+//! path: scoped SPARQL reads the owner index for the copied declarations and walks the
+//! uncopied ones, the view serves the event fallback facts still owed, SPARQL coverage
+//! counts the selected record graphs that still lack their fallback facts, the source and
+//! artifact listings add what the source-summary migration still owes to the stored rows,
+//! record context and reclaimed-parent folds read the primary time index instead of a
+//! partial source timeline cache, and `status` answers from the seeding checkpoint in
+//! constant time, reporting `counts` as `pending` with the seeding's progress while the
+//! store counters seed. The extra reads run without the writer lock where they may be long,
+//! check cancellation, and are not charged to request or visit budgets; what they hold is
+//! charged as memory. No reader refuses because a migration is unfinished, and every
+//! listing, context and SPARQL answer equals the answer the finished migration gives for
+//! the same catalog.
 //!
 //! Progress comes from the store counters ([`super::store_counters`]): a migration's
 //! `done` is its `done:` counter row, maintained with its checkpoint, and its `total` is

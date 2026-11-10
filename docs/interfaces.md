@@ -635,8 +635,9 @@ completes (#176). The migrations are independent: each reads and checkpoints its
 own keys, so a store left part way through by an image that ran them in another
 order resumes each one from its own checkpoint. `status` lists them in a fixed
 order apart from the run order: `store-counters`, `owner-graph-index`,
-`event-fallback-rdf`, `source-summary`, `source-context`. It is selected fairly with buffered synchronization, pressure
-maintenance, import reclamation, retention and the table rewrite. Below the
+`event-fallback-rdf`, `source-summary`, `source-context`. It is selected fairly
+with buffered synchronization, pressure maintenance, import reclamation,
+retention and the table rewrite. Below the
 free-space floor it is skipped, as pressure maintenance, import reclamation and
 retention are; buffered synchronization and the table rewrite still run there.
 Each page commits its rows and its checkpoint in one synchronized batch through
@@ -846,16 +847,16 @@ trusted: that batch discards them and the migration recounts every source.
 
 The migration runs in the maintenance duty directly after `store-counters`,
 before `owner-graph-index` and `event-fallback-rdf`, with the same admission,
-failure, retry and journal rules (see "Online store migrations"). It has two phases. The first walks `artifact:`
-entries and counts each artifact from its entry and its `record_ids`, up to 512
-artifacts or 16,384 records per page, always counting one artifact whole. The
-second walks `record:` entries and counts the retained records of parents whose
-entry was already deleted. Each page commits its rows and its checkpoint in one
-synchronized batch, so a restart resumes after the last committed page. Writes
-during the migration keep exact every artifact the migration has passed or
-that the write creates; the migration reads the current state of the rest when
-it reaches them. `total` counts `artifact:` and `record:` entries, and `done`
-those at or before the watermark.
+failure, retry and journal rules (see "Online store migrations"). It has two
+phases. The first walks `artifact:` entries and counts each artifact from its
+entry and its `record_ids`, up to 512 artifacts or 16,384 records per page,
+always counting one artifact whole. The second walks `record:` entries and
+counts the retained records of parents whose entry was already deleted. Each
+page commits its rows and its checkpoint in one synchronized batch, so a restart
+resumes after the last committed page. Writes during the migration keep exact
+every artifact the migration has passed or that the write creates; the migration
+reads the current state of the rest when it reaches them. `total` counts
+`artifact:` and `record:` entries, and `done` those at or before the watermark.
 
 Readers while the migration is pending:
 
@@ -894,24 +895,7 @@ first page as usual. Otherwise it returns a page with no rows whose
 MCP `build`) reports `read`, the catalog entries the build has read, and
 `total`, the entries the migration still owed at its snapshot (`totalPending`,
 `counting` in CLI and MCP, while the store counters seed). Its `snapshot_id` is
-the build's.
-
-The migration's own pages keep reading the same entries while a build runs. So
-each time it has read another 4,096 catalog entries (an artifact's records
-count, though `read` counts the artifact once), when it checks its cancellation
-and lease, a build also reads the migration's checkpoint and `done` counter (a
-few point reads). It
-re-bases when the migration has overtaken it: the migration is complete, or its
-checkpoint has moved and it has passed more entries since the build's snapshot
-than the build has read plus 4,096. A re-base drops the build's snapshot and the
-part of the pass it has read, takes a fresh snapshot (a `sources` build reads
-its registries again under the writer lock) and reads only what the migration
-owes there. Its `read` and `total` then count from the fresh snapshot, so `read`
-can go down. The build keeps its identity, cursor and lease, and its rows are
-those of the snapshot it ends on, so a source or artifact written before the
-re-base is included. A build started while the migration runs therefore delivers
-its rows no later than its next check after the migration completes, and a
-redundant pass stops competing with the migration's pages for CPU. Following that cursor waits on the same build again and never
+the build's. Following that cursor waits on the same build again and never
 starts another; a capture's lease starts when its first page is delivered. A
 build's lease runs 60 seconds from the last call that followed its cursor, and
 `resultRelease` with its `snapshot_id` cancels it. An abandoned build is
@@ -926,6 +910,23 @@ further fresh listing or window refuses with `RESOURCE_LIMIT`. Once the migratio
 is complete no listing builds. A build's thread keeps its own handle on the store,
 so closing the store does not cancel it until its lease ends (at most 60 seconds);
 the process exit ends it at once.
+
+The migration's own pages keep reading the same entries while a build runs. So
+each time it has read another 4,096 catalog entries (an artifact's records
+count, though `read` counts the artifact once), when it checks its cancellation
+and lease, a build also reads the migration's checkpoint and `done` counter (a
+few point reads). It re-bases when the migration has overtaken it: the migration
+is complete, or its checkpoint has moved and it has passed more entries since
+the build's snapshot than the build has read plus 4,096. A re-base drops the
+build's snapshot and the part of the pass it has read, takes a fresh snapshot (a
+`sources` build reads its registries again under the writer lock) and reads only
+what the migration owes there. Its `read` and `total` then count from the fresh
+snapshot, so `read` can go down. The build keeps its identity, cursor and lease,
+and its rows are those of the snapshot it ends on, so a source or artifact
+written before the re-base is included. A build started while the migration runs
+therefore delivers its rows no later than its next check after the migration
+completes, and a redundant pass stops competing with the migration's pages for
+CPU.
 
 The migration's duration on the live store is measured on a copy of the newest
 online backup, restored by `deploy/verify-backup.sh --measure-migration`, recorded

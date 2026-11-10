@@ -576,28 +576,27 @@ applies the writer-format fence and seeds each migration's checkpoint durably,
 then serves. The joined maintenance worker runs the migrations in turn,
 `store-counters` first and `source-summary` second, since every source and live
 artifact listing pays for what it owes until it completes; each migration
-resumes from its own checkpoint, so the order can change between images. It
-runs one bounded page per admission, fairly with its other duties, and each
-page commits its rows and checkpoint atomically through the ordinary write path,
-so a restart resumes after the last committed page and a failed page is
-retried, never skipped. Readers take an
-explicit pending path until a migration completes and say so where the answer
-could differ: the schema 69 receipt-time fallback backfill is reported in
-SPARQL coverage while the view serves the facts it still owes, scoped SPARQL
-reads the owner index for the declarations already copied and walks the rest,
-the source listings add what the source-summary migration still owes to the stored rows,
-and record context walks the primary time index while a stale source timeline
-cache is rebuilt. Pending paths that may read much of the store run from a
-snapshot without the writer lock and check cancellation; their CPU is not
-capped, they spend no request or visit budget, and what they hold is charged as
-memory. No read refuses because a migration is unfinished. `status` reports
-each migration's progress. A query-only
-daemon runs no maintenance worker, so it serves on the pending paths. Writers
-come before pages: before a page the maintenance worker waits while an ingest,
-publication or RPC write is waiting for the writer lock, for at most the longer
-of 100 ms and the previous page's hold, so the migration keeps progressing
-without holding writers behind a run of pages. The worker polls that wait with
-its other duties, so it delays only the page.
+resumes from its own checkpoint, so the order can change between images. It runs
+one bounded page per admission, fairly with its other duties, and each page
+commits its rows and checkpoint atomically through the ordinary write path, so a
+restart resumes after the last committed page and a failed page is retried,
+never skipped. Readers take an explicit pending path until a migration completes
+and say so where the answer could differ: the schema 69 receipt-time fallback
+backfill is reported in SPARQL coverage while the view serves the facts it still
+owes, scoped SPARQL reads the owner index for the declarations already copied
+and walks the rest, the source listings add what the source-summary migration
+still owes to the stored rows, and record context walks the primary time index
+while a stale source timeline cache is rebuilt. Pending paths that may read much
+of the store run from a snapshot without the writer lock and check cancellation;
+their CPU is not capped, they spend no request or visit budget, and what they
+hold is charged as memory. No read refuses because a migration is unfinished.
+`status` reports each migration's progress. A query-only daemon runs no
+maintenance worker, so it serves on the pending paths. Writers come before
+pages: before a page the maintenance worker waits while an ingest, publication
+or RPC write is waiting for the writer lock, for at most the longer of 100 ms
+and the previous page's hold, so the migration keeps progressing without holding
+writers behind a run of pages. The worker polls that wait with its other duties,
+so it delays only the page.
 
 `status` and the migration report never take the writer lock. They read fixed
 `store-counter:` rows from a RocksDB snapshot: the record, retained-record,
