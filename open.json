@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 184,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50",
+  "branch": "paudley/184-replace-or-slow-the-sub-second-ticks-50",
+  "slug": "replace-or-slow-the-sub-second-ticks-50",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "48aed077d8bc4d91f061767d84b64ee55b6bca4e",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50",
+    "branch:paudley/184-replace-or-slow-the-sub-second-ticks-50",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:already present",
+    "stage:/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50",
+    "issue:/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-10T04:52:05-0600",
+  "seed_error": ""
+}
