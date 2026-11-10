@@ -764,9 +764,13 @@ fn passes() -> u64 {
 
 // These tests run the worker on a paused tokio clock, which advances only when every task
 // waits on a timer. A worker that slept on a tick would let the clock advance to each tick
-// and count a pass there; one blocked on events does neither. The candidate quiet clocks and
-// rescan deadlines are std instants, so each fixture stays below its first rescan (60
-// seconds) and holds no consume candidate.
+// and count a pass there; one blocked on events does neither. Each test acts at SETTLED, off
+// the old 50 ms grid, so a ticking worker would still be asleep and need the clock to
+// advance. The candidate quiet clocks and rescan deadlines are std instants, so each fixture
+// stays below its first rescan (60 seconds) and holds no consume candidate.
+
+/// Long enough for a fresh worker to cover its root, and not a multiple of 50 ms.
+const SETTLED: Duration = Duration::from_millis(1025);
 
 /// INVARIANT (#184): an idle watch worker blocks on its wake sources, so it runs at most
 /// one pass a second, where the 50 ms tick it replaced ran 20.
@@ -780,7 +784,7 @@ async fn an_idle_worker_wakes_at_most_once_a_second() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let task = tokio::task::spawn_local(run);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(SETTLED).await;
             assert!(worker.registry.snapshot().unwrap()[0].covered);
             let settled = passes();
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -804,7 +808,7 @@ async fn a_stop_request_ends_an_idle_worker_without_waiting_for_a_clock() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let task = tokio::task::spawn_local(run);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(SETTLED).await;
             let requested = tokio::time::Instant::now();
             worker.stop.send_replace(true);
             task.await.unwrap().unwrap();
@@ -825,7 +829,7 @@ async fn a_command_wakes_an_idle_worker_without_waiting_for_a_clock() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let task = tokio::task::spawn_local(run);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(SETTLED).await;
             let sent = tokio::time::Instant::now();
             let refused = worker
                 .controller
@@ -860,7 +864,7 @@ async fn a_released_permit_wakes_a_waiting_tail_drain() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let task = tokio::task::spawn_local(run);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(SETTLED).await;
             let state = worker.registry.snapshot().unwrap().pop().unwrap();
             assert!(state.tail_admission_waiting && state.tail_descriptors == 1);
             assert_eq!(state.tail_checkpoint_records, 0);

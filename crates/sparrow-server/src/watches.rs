@@ -778,10 +778,18 @@ impl Detector {
 
     /// The earliest instant this idle detector has work without a new event: its periodic
     /// rescan and, when CLAIMS admits new reservations, the end of its first candidate's
-    /// quiet interval.
+    /// quiet interval, or now when candidate capacity freed for deferred inputs.
     fn due(&self, claims: bool) -> Option<Instant> {
         if !self.enabled || !self.covered || !self.todo.is_empty() || self.scan.is_some() {
             return None;
+        }
+        // The deferred-capacity rescan in `run`, which a tail watch never needs.
+        if claims
+            && self.deferred
+            && matches!(self.owner, Owner::Consume(_))
+            && self.candidates.len() < self.config.max_candidates
+        {
+            return Some(Instant::now());
         }
         let quiet = Duration::from_millis(u64::from(self.config.quiet_ms));
         let ready = self
@@ -976,6 +984,8 @@ impl Wake {
 
 /// The state one worker wait reads and fills.
 struct Waiting<'a> {
+    store: &'a Store,
+    registry: &'a WatchRegistry,
     stop: &'a mut tokio::sync::watch::Receiver<bool>,
     control: &'a mut Control,
     /// A command the wait received, handled first by the next pass.
@@ -1008,6 +1018,11 @@ async fn pause(
     for detector in detectors.iter_mut().filter(|detector| detector.enabled) {
         detector.drain()?;
     }
+    // That drain may also have taken producer events from the pass: report what they
+    // changed, and run again for any work they made due.
+    waiting
+        .registry
+        .update(detectors, &waiting.store.consumption_pending()?)?;
     if detectors.iter().any(|detector| detector.busy(space_ok)) {
         tokio::task::yield_now().await;
         return Ok(());
@@ -1531,6 +1546,8 @@ async fn run(
         registry.update(&detectors, &pending)?;
         let busy = detectors.iter().any(|detector| detector.busy(space_ok));
         let waiting = Waiting {
+            store: &store,
+            registry: &registry,
             stop: &mut stop,
             control: &mut control,
             received: &mut received,
@@ -1611,6 +1628,9 @@ async fn run(
         }
         if let Some((watch, id, is_tail)) = work {
             if !is_tail {
+                // A permit the last wait acquired for a tail drain is not held through an
+                // ordinary connection or publication.
+                *waiting.permit = None;
                 // Replace a connection the lease would cut during this publication.
                 if client.as_ref().is_some_and(|(_, opened)| {
                     opened.elapsed() + PUBLICATION_DEADLINE > crate::transport::CONNECTION_LEASE
@@ -1656,9 +1676,6 @@ async fn run(
                     }
                 }
             } else {
-                // A permit the last wait acquired for a tail drain is not held through an
-                // ordinary publication.
-                *waiting.permit = None;
                 None
             };
             let detector = detectors
