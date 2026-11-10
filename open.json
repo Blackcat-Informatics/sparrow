@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 176,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/176-keep-the-source-summary-owed-completion",
+  "branch": "paudley/176-keep-the-source-summary-owed-completion",
+  "slug": "keep-the-source-summary-owed-completion",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/176-keep-the-source-summary-owed-completion/.stage/keep-the-source-summary-owed-completion",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "bce6adae2d5654ef8f0e13d2828d64de22e1464e",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/176-keep-the-source-summary-owed-completion",
+    "branch:paudley/176-keep-the-source-summary-owed-completion",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow caches into /home/paudley/Active/sparrow/.worktrees/176-keep-the-source-summary-owed-completion plus 0 dependency units from 0 other checkouts in 2.3s; 292 unchanged files keep their built mtimes; 0 other files take the seed time and rebuild; 21 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/176-keep-the-source-summary-owed-completion/.stage/keep-the-source-summary-owed-completion",
+    "issue:/home/paudley/Active/sparrow/.worktrees/176-keep-the-source-summary-owed-completion/.stage/keep-the-source-summary-owed-completion/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-10T06:03:07-0600",
+  "seed_error": ""
+}
