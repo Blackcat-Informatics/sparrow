@@ -19626,8 +19626,15 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     );
     // Every answer equals the fully migrated store's, with the late record's own too.
     let after = answers(&store);
-    for ((rows, _, coverage), (expected, _, migrated_coverage)) in after.iter().zip(&migrated) {
-        assert!(coverage.event_fallback_pending >= migrated_coverage.event_fallback_pending);
+    for (index, ((rows, _, coverage), (expected, _, migrated_coverage))) in
+        after.iter().zip(&migrated).enumerate()
+    {
+        // Only the wide scope gained a record (the late one); the migrations change no count.
+        let late = u64::from(index < queries.len());
+        assert_eq!(
+            coverage.event_fallback_pending,
+            migrated_coverage.event_fallback_pending + late
+        );
         // The late record joined the wide scope; its rows are compared on their own.
         assert!(
             expected.iter().all(|row| rows.contains(row)),
@@ -19727,6 +19734,65 @@ fn receipt_time_fallback_facts_are_derived_not_stored_and_a_pending_marker_store
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
     assert_eq!(graphs(&db), stored, "no record graph was rewritten");
+}
+
+/// INVARIANT (#193): a graph that already stores its fallback facts, as every graph the
+/// retired backfill or an earlier writer produced does, is served as stored and is never
+/// derived a second time. A store of 70 records part way through the retired backfill, with
+/// half its graphs storing the facts, a partial `event-fallback-rdf-upgrade` checkpoint and
+/// its `done:` counter row, opens without a rewrite and answers one row per record, the same
+/// rows as a store that derives them all, with coverage counting only the 35 graphs that do
+/// not store them.
+#[test]
+fn graphs_that_store_their_fallback_facts_are_served_once_and_not_derived() {
+    use sparrow_core::RdfGraphLayers;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = (0..70).map(|i| format!("stored {i}\n")).collect::<String>();
+    store
+        .ingest("stored", "stored", "log", input.as_bytes(), 5)
+        .unwrap();
+    let fallback = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?b WHERE { ?r sp:eventTimeBasis ?b }";
+    let times = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?t WHERE { ?r sp:eventTimeFallback ?t }";
+    let scope = record_page_scope("stored", 1000);
+    let answer = |store: &Store, query: &str| {
+        let (rows, _, coverage) = scoped_answer(store, &scope, RdfGraphLayers::ALL, query, 10);
+        let mut rows = rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        (rows, coverage.event_fallback_pending)
+    };
+    let derived = [answer(&store, fallback), answer(&store, times)];
+    assert_eq!((derived[0].0.len(), derived[0].1), (70, 70));
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let mut seen = 0_usize;
+    sparrow_core::store_event_fallback_rdf_for_legacy_fixture(&db, |_| {
+        seen += 1;
+        seen.is_multiple_of(2)
+    })
+    .unwrap();
+    assert_eq!(seen, 70);
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let names = store
+        .migrations()
+        .unwrap()
+        .iter()
+        .map(|m| m.name)
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&"event-fallback-rdf"), "{names:?}");
+    for (query, expected) in [fallback, times].into_iter().zip(&derived) {
+        let mixed = answer(&store, query);
+        assert_eq!(mixed.0, expected.0, "one row per record, none doubled");
+        assert_eq!(mixed.1, 35, "only graphs without stored facts are derived");
+    }
+    migrate(&store);
+    assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
+    assert_counts_match_recount(&store);
+    assert_eq!(answer(&store, fallback), (derived[0].0.clone(), 35));
 }
 
 /// The storage fixture with room for the 20,000-record listing stores.

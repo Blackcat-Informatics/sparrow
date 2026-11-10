@@ -598,8 +598,10 @@ the one reading path. Graphs that already carry the facts, from the backfill or
 an earlier writer, keep them and are served as stored; nothing is rewritten or
 deleted. The store format keeps its fallback writer family, `sparrow.store/132`
 to `/186`, which lifts each tracing, log time, archive and intake family by 55
-and keeps its switches, so older binaries still refuse the store rather than
-publish graphs and read them without the derivation. Opening a store that
+and keeps its switches, so binaries older than schema 69 still refuse the store
+rather than publish graphs without the facts. The switch is one-way: the schema 71
+image before #193 opens the store, does not derive the facts for graphs written
+without them, and so serves such graphs without the receipt-time facts. Opening a store that
 carries the backfill's checkpoint, finished or pending, applies no migration
 and rewrites nothing; the checkpoint and its counter row stay as inert keys.
 

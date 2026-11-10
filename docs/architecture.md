@@ -596,8 +596,9 @@ fairly with its other duties, and each page commits its rows and checkpoint
 atomically through the ordinary write path, so a restart resumes after the last
 committed page and a failed page is retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
-could differ: the schema 69 receipt-time fallback backfill is reported in SPARQL
-coverage while the view serves the facts it still owes, scoped SPARQL reads the
+could differ: the view derives the receipt-time fallback facts of every record graph that
+does not store them, permanently, and counts those graphs in SPARQL coverage;
+scoped SPARQL reads the
 owner index for the declarations already copied and walks the rest, the source
 listings add what the source-summary migration still owes to the stored rows,
 and record context walks the primary time index while a stale source timeline

@@ -107,6 +107,8 @@ pub use storage::source_time::{
     EventPlacement, EventTime, EventTimeBasis, SourceTimeProfile, TimeRepresentation,
 };
 pub use storage::space::SpaceFloor;
+#[cfg(feature = "test-support")]
+pub use storage::store_event_fallback_rdf_for_legacy_fixture;
 pub use storage::syslog::{
     SYSLOG_ELEMENTS, SYSLOG_MESSAGE_BYTES, SYSLOG_PARAMETERS, SyslogDialect, SyslogElement,
     SyslogField, SyslogParameter, SyslogSnapshot, syslog_profile_id,

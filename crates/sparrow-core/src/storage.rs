@@ -17,6 +17,8 @@ pub(crate) mod archive;
 mod artifact_rdf;
 pub(crate) mod backup;
 mod event_fallback_rdf;
+#[cfg(feature = "test-support")]
+pub use event_fallback_rdf::store_event_fallback_rdf_for_legacy_fixture;
 mod provenance_rdf;
 mod tracing_rdf;
 #[cfg(feature = "test-support")]
