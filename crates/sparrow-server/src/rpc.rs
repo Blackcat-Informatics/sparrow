@@ -1855,6 +1855,41 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn watch_claims(
+        self: Rc<Self>,
+        params: wire::sparrow::WatchClaimsParams,
+        mut results: wire::sparrow::WatchClaimsResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        let store = query.get_store_id()?.to_str()?;
+        let since = query.get_since()?.get_unix_millis();
+        let until = match query.get_until()?.which()? {
+            wire::optional_instant::Value(at) => Some(at?.get_unix_millis()),
+            wire::optional_instant::Absent(()) => None,
+        };
+        let result = match self.check_store(store) {
+            // The listing decodes up to 2048 journals: run it off the connection's event loop.
+            Ok(()) => {
+                self.work(move |store, as_of| {
+                    let until = until.unwrap_or(as_of);
+                    Ok((as_of, until, store.consumption_claims(since, until)?))
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok((as_of, until, claims)) => crate::watch_admin::encode_claims(
+                results.get().init_result().init_ok(),
+                store,
+                (as_of, since, until),
+                &claims,
+            ),
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
+
     async fn watch_claim_retire(
         self: Rc<Self>,
         params: wire::sparrow::WatchClaimRetireParams,

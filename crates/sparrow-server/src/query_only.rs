@@ -109,6 +109,7 @@ classify! {
         sparql_query: SparqlQueryParams, SparqlQueryResults;
         sparql_explain: SparqlExplainParams, SparqlExplainResults;
         correlate: CorrelateParams, CorrelateResults;
+        watch_claims: WatchClaimsParams, WatchClaimsResults;
     }
     writes {
         ingest: IngestParams, IngestResults;

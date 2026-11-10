@@ -179,6 +179,7 @@ decide! {
         sparql_explain: SparqlExplainParams, SparqlExplainResults;
         watch_claim_retire: WatchClaimRetireParams, WatchClaimRetireResults;
         backup: BackupParams, BackupResults;
+        watch_claims: WatchClaimsParams, WatchClaimsResults;
     }
 }
 

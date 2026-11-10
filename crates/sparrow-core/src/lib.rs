@@ -31,9 +31,9 @@ pub use storage::backup::{
 };
 pub use storage::catalog_lease::CatalogReadPage;
 pub use storage::consumption::{
-    ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, ConsumptionRetirement,
-    MAX_CONSUMPTION_JOURNALS, MAX_RETIRED_CONSUMPTION_CLAIMS, RetiredConsumption,
-    validate_consumption_path,
+    ClaimHistory, ClaimListing, ClaimState, ConsumptionDirectories, ConsumptionGeneration,
+    ConsumptionJournal, ConsumptionRetirement, MAX_CONSUMPTION_JOURNALS, MAX_LISTED_CLAIMS,
+    MAX_RETIRED_CONSUMPTION_CLAIMS, RetiredConsumption, validate_consumption_path,
 };
 pub use storage::context::{
     CONTEXT_CAPTURE_PROFILE, Context, ContextFrontier, ContextLimits, ContextSide,

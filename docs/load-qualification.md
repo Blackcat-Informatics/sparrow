@@ -443,3 +443,96 @@ newest online backup, which reports `backfill_seconds`, done/total progress and
 That measurement is pending: it has not been run on the newest backup, so no
 duration is recorded here. It is recorded in this section with the image, its
 sha256 and the backup it ran on once it runs.
+
+## Write stalls (issue 160)
+
+The live daemon (schema 68 image, two background jobs, two 8 MiB memtables per family)
+spent 35 percent of its life with writes stalled or stopped (issue 160). Its LOG on
+2026-11-09 shows 57 slowdowns and 19 stops from 01:00 to 04:40 (the issue's comment), and
+440 and 141 from 04:40 to 09:00 and 139 and 51 from 09:00 to 14:30 (coordination's count
+over all rotated logs), with level 0 at 20 to 24 files on the slowdown lines. The live
+stops were "2 immutable memtables (waiting for flush)": both write buffers were full
+while one flushed.
+
+The measurement uses a scratch store driven by a throwaway in-process driver at about the
+live key rate (17,000 to 19,000 RocksDB keys and 1.2 to 1.4 MB per second, against about
+15,000 keys and 1.35 MB live). A synthetic ingest makes about two times the live key rate
+per producer thread, so a store of the live 37.6 GB was out of reach; the base store
+holds 3.0 GB of table files. Driven at the live rate without compaction debt, the current options showed no
+slowdown or stop and 0.0 percent stall, which reproduces nothing of the live store. So
+each set starts from one reflinked copy of a debt store: the base plus 13 minutes of
+four-producer ingest with automatic compaction off and 256 MiB memtables, leaving 32
+level-0 files in the default family, 5.3 GB of estimated pending compaction against
+4.3 GB of table files, and 6.0 GB of write-ahead log not yet replayed (10.3 GB on disk).
+Each run replays that log when it opens the store. Each set then ran 12 minutes at the
+live rate, at nice 10, on the shared 32-core host, without the unit's CPU and I/O limits;
+the second table below repeats A and C under them. A status probe made the reads of the
+status RPC once a second throughout.
+
+Unconstrained (no CPU quota or I/O weight):
+
+| Set | Options | Stall % | Stops | Slowdowns | Pending start / end GB | Status max ms |
+|---|---|---|---|---|---|---|
+| A, current | 2 jobs, 8 MiB x 2 | 6.5 | 1 | 1 | 5.34 / 0.27 | 54 |
+| B | 4 jobs, 8 MiB x 4 | 9.2 | 1 | 1 | 5.34 / 0.00 | 78 |
+| C, chosen | 6 jobs, 2 subcompactions, 32 MiB x 4, low CPU priority | 0.1 | 0 | 3 | 5.34 / 0.00 | 164 |
+| D | C with idle I/O priority | 4.6 | 1 | 4 | 5.34 / 0.00 | 378 |
+| E | 8 jobs, 4 subcompactions, 64 MiB x 4, low CPU priority | 0.1 | 0 | 3 | 5.34 / 0.00 | 196 |
+
+Stall percent is RocksDB's cumulative stall over the run's uptime; the store took no
+writes before it opened, so it is stall the run's intake met. A stop is a "Stopping
+writes" line, here always at 36 level-0 files, not the live memtable stop. Under A and B
+that line came from the thread opening the store, while it replayed the debt store's
+write-ahead log into 8 MiB memtables, so level 0 was already at the stop trigger when
+intake began: A then blocked writes for 52 seconds in its second minute and B for 77
+seconds. With 32 MiB memtables (C, D, E) the replay ended at 33 or 34 files, a slowdown
+only. D then reached 36 files during the run: an idle I/O class for compaction slowed
+level-0 drain on the shared disk and stalled writes for 33 seconds, so only CPU priority
+is lowered. C and E both kept the run's stall at 0.1 percent with no stop; E uses two
+more background jobs, twice the subcompaction threads and twice the memtable memory for
+no measured gain, so C is chosen. Four write buffers instead of two give a flush three
+full memtables of slack instead of one, against the live stop's cause. The memtable ceiling rises from
+48 MiB (three families, two 8 MiB buffers) to 384 MiB (four 32 MiB buffers each), under
+the unit's 2 GB memory high mark. The harness ran at nice 10 with compaction at 19, as
+the live unit does (`Nice=10`). The stated target is no stops and at most 1 percent
+stall at the live rate.
+
+Under the unit's limits, A and C ran again with the same base, load and duration. The
+driver ran in a transient scope with the limits of the user unit, applied as
+`deploy/verify-backup.sh` applies them: `systemd-run --user --scope --nice=10 -p
+CPUQuota=100% -p IOWeight=20 -p MemoryHigh=2G -p MemoryMax=4G`, with no I/O class. Each
+run's scope reported `CPUQuotaPerSecUSec=1s`, `IOWeight=20`, `MemoryHigh` 2 GiB and
+`MemoryMax` 4 GiB 30 seconds in, with the driver in its cgroup at nice 10.
+
+| Set, unit limits | Stall % | Stops | Slowdowns | Pending start / end GB | Keys/s | Ingest p99 ms | Status max ms |
+|---|---|---|---|---|---|---|---|
+| A, current | 37.6 | 1 | 39 | 5.34 / 4.07 | 11,906 | 173,879 | 2,387 |
+| C, chosen | 7.0 | 1 | 4 | 5.34 / 0.27 | 17,626 | 32,131 | 12,410 |
+
+Under the unit's limits C stalls 7.0 percent with one stop during the debt drain, against
+37.6 percent for the default, and does not meet the target until the debt has drained.
+A's stop again came while the store replayed its log at open; C's came in the run, about
+90 seconds after open, and 58 of its 59 seconds of stall fall in that one stats interval.
+Every later interval (nine) shows 0.0 percent. The default never caught up: 4.07 GB was
+still pending at the end, intake fell to 11,906 keys per second against about 18,000, and
+its last interval was 96.7 percent stalled. The limits alone take the default from 6.5 to
+37.6 percent, so for the current options the unit's quota is the larger cause in this harness, whose
+synthetic producers share the one-core quota with the store; the CPU
+quota and I/O weight were applied together, so this does not separate them. The live
+backlog, about 41 GB pending, is about eight times the scratch debt, so stops are likely
+while the live store drains. Status slowed under the quota, to at most 12.4 seconds (two
+probes over 10 seconds), under the 60-second connection lease. The unit's `CPUQuota` and
+`IOWeight` are sized from measurement in issue 167; this change leaves the unit file as it
+is.
+
+A status probe made the status RPC's reads once a second. Over A's whole run, which
+includes its 52-second write block, its 719 probes answered within 54 ms, none over
+1 second, so status does not wait on a stalled write path. The slowest probe in the debt runs took 378 ms (D). In the
+baseline run without debt one probe of 900 took 1125 ms, with no stall in that run; the
+synthetic producers were CPU-bound there.
+
+The live 24-hour acceptance runs after the D147 switch. A one-off four-producer stress run
+of the current options logged 72 slowdowns, no stop and 0.5 percent stall, then hung:
+its producers failed on a full buffered-durability ledger and the driver did not stop its
+probe before failing. The hang was the driver's own fault; the run is kept as found. The scripts, logs and
+table are under `.stage/160/` in the main checkout.

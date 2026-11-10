@@ -311,7 +311,7 @@ totals. Every consumer of those counts says so rather than printing a partial
 number as a total: the closing line logs `unique_payload_chunks=pending`
 and `deploy/user-unit-upgrade.sh` prints `counts=` beside `live_records`.
 `tools/install-bin.sh` names the pair from `SCHEMA_VERSION`, so a
-schema 70 build installs as `sparrowd-schema70-REV` and `sparrow-schema70-REV`.
+schema 71 build installs as `sparrowd-schema71-REV` and `sparrow-schema71-REV`.
 
 ## Shipping finished files from producers that keep them
 
@@ -794,7 +794,7 @@ switch, must be built from a revision with `--private-intake` and
 
 ```bash
 deploy/verify-backup.sh --measure-migration --with-traffic --rehearse-rollback \
-    --image ~/.local/libexec/sparrow/sparrowd-schema70-REV \
+    --image ~/.local/libexec/sparrow/sparrowd-schema71-REV \
     /net/synology/archives/sparrow/sets/ID
 ```
 
@@ -811,13 +811,13 @@ it from one kept image pair to another and takes the named pre-upgrade backup
 online, before anything stops:
 
 ```bash
-deploy/user-unit-upgrade.sh --from sparrowd-schema68-2aa56a9 --to sparrowd-schema70-REV
+deploy/user-unit-upgrade.sh --from sparrowd-schema68-2aa56a9 --to sparrowd-schema71-REV
 ```
 
 The live service runs `sparrowd-schema68-2aa56a9` since the schema 69 rollback,
-so the switch goes from schema 68 straight to schema 70. After it, the daemon
-refuses schema 69 clients as well as schema 68 ones; switch every CLI and
-producer to the schema 70 pair with it.
+so the switch goes from schema 68 straight to schema 71. After it, the daemon
+refuses schema 68, 69 and 70 clients, since it admits only its own schema;
+switch every CLI and producer to the schema 71 pair with it.
 
 Both arguments name daemon images under `~/.local/libexec/sparrow`. Each CLI
 image is the daemon's name with `sparrowd-` replaced by `sparrow-`, and the

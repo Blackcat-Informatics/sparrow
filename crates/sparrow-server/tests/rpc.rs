@@ -4163,6 +4163,27 @@ async fn retire_claim_clears_only_an_unrecoverable_claim_and_lets_the_drain_reac
                     )
             })
             .await;
+            // `watch claims` names each stuck claim as pending, with the reason its latest
+            // attempt stayed pending and how long since it was first seen (issue 160).
+            let mut claims = cli(&socket, &["watch", "claims"]);
+            for _ in 0..100 {
+                let rows = claims["claims"].as_array().unwrap();
+                if rows.len() == 2 && rows.iter().all(|row| row["attempts"].as_u64() >= Some(1)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                claims = cli(&socket, &["watch", "claims"]);
+            }
+            assert_eq!(claims["pending"].as_u64(), Some(2), "{claims:?}");
+            for row in claims["claims"].as_array().unwrap() {
+                assert_eq!(row["state"].as_str(), Some("pending"), "{row:?}");
+                assert!(row["attempts"].as_u64() >= Some(1), "{row:?}");
+                assert!(row["last_pending_reason"].as_str().is_some(), "{row:?}");
+                assert!(
+                    row["first_seen"].as_str().is_some() && row["age_ms"].as_str().is_some(),
+                    "{row:?}"
+                );
+            }
             let retire = |claim: &str| {
                 Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
@@ -4282,6 +4303,13 @@ async fn retire_claim_clears_only_an_unrecoverable_claim_and_lets_the_drain_reac
             assert_eq!(watch["pending_claims"].as_u64(), Some(0), "{watch:?}");
             assert_eq!(watch["retired_claims"].as_array().unwrap().len(), 2);
             assert!(watch["failure"].is_null(), "{watch:?}");
+            // Both stuck claims went pending in the window and ended abandoned; none pends.
+            let claims = cli(
+                &socket,
+                &["watch", "claims", "--since", "2000-01-01T00:00:00Z"],
+            );
+            assert_eq!(claims["abandoned"].as_u64(), Some(2), "{claims:?}");
+            assert_eq!(claims["pending"].as_u64(), Some(0), "{claims:?}");
             let waiting = std::fs::read_dir(&root)
                 .unwrap()
                 .filter(|entry| entry.as_ref().unwrap().file_name() != ".sparrow-inflight")

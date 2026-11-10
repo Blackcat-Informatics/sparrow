@@ -426,6 +426,7 @@ impl ClaimRoot {
             // could silently adopt a write after the final readiness check.
             generation(expected)?,
             directories,
+            crate::now()?,
         )?)
     }
 

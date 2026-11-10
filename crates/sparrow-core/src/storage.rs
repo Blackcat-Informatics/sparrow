@@ -1455,7 +1455,7 @@ impl Store {
         let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
         let open_files = open_files::OpenFiles::from_process()?;
         let db = DB::open_cf_descriptors(
-            &table_options::database(open_files.max_open_files),
+            &table_options::database(open_files.max_open_files)?,
             path,
             table_options::descriptors(),
         )?;
