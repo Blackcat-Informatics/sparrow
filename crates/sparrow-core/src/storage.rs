@@ -2934,7 +2934,7 @@ impl Store {
     }
 
     /// Dev-only: make the next source or artifact listing call that finds its build finished
-    /// fail before it builds the page, as a cancelled or refused delivery does.
+    /// fail after its page is built and before the build is retired, as a failed delivery does.
     #[cfg(feature = "test-support")]
     pub fn fail_next_listing_delivery_for_tests(&self) -> Result<(), Error> {
         let poisoned = || Error::new("STORAGE_FAILURE", "listing builds poisoned");

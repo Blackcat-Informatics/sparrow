@@ -857,8 +857,9 @@ each further window of 32,768 owed rows its pages pass. CPU is not capped. What
 it holds is charged when a page holds it: the owed count changes to the `sources`
 capture, and the owed window, at 64 bytes plus the key per row, to each page of
 the listing; a window always fits that admission. While a build runs, before its
-page exists, its memory is bounded by the window and capture limits and is not yet
-charged to a request. No
+page exists, its memory is not yet charged to a request. An artifact window is bounded
+by its window; a `sources` build holds its count changes for the whole owed pass, and
+the capture admission is checked when the pass ends. No
 reader refuses because a migration is pending.
 
 #### Listing builds

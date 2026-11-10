@@ -19966,7 +19966,8 @@ fn a_source_listing_during_the_source_summary_migration_is_a_build_its_cursor_re
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    // The next call finds the build finished and fails before it builds the page.
+    // The next call finds the build finished and fails after its page is built, before the
+    // build is retired.
     store.fail_next_listing_delivery_for_tests().unwrap();
     let failed = store.source_read(&follow, now, &[]).unwrap_err();
     assert_eq!(failed.code, "CANCELLED", "{failed:?}");
@@ -20085,7 +20086,7 @@ fn a_live_artifact_listing_during_the_source_summary_migration_resumes_its_build
         .unwrap();
     open();
     // A build is retired only after its page is delivered: the first call that finds the
-    // build finished fails before it builds the page, and the retry on the same cursor
+    // build finished fails after its page is built and before the build is retired, and the retry on the same cursor
     // delivers the listing from the same build.
     store.fail_next_listing_delivery_for_tests().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -20109,6 +20110,14 @@ fn a_live_artifact_listing_during_the_source_summary_migration_resumes_its_build
         }
     };
     assert_eq!(failed.code, "CANCELLED", "{failed:?}");
+    let ended = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while store.listing_builds_for_tests().unwrap()[1].1 > 0 {
+        assert!(
+            std::time::Instant::now() < ended,
+            "the build thread kept running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(
         store.listing_builds_for_tests().unwrap()[1],
         (1, 0, 1),

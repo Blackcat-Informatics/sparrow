@@ -359,7 +359,8 @@ impl<C, T: Send + 'static> Builds<C, T> {
         self.hold = Some(hold);
     }
 
-    /// Dev-only: make the next call that has a finished build fail before it builds the page.
+    /// Dev-only: make the next call that has a finished build fail after its page is built and
+    /// before the build is retired.
     #[cfg(feature = "test-support")]
     pub(super) fn fail_next_delivery_for_tests(&mut self) {
         self.fail_delivery = true;
