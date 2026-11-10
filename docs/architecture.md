@@ -574,15 +574,15 @@ written.
 Online store migrations rebuild derived rows while the daemon serves. The open
 applies the writer-format fence and seeds each migration's checkpoint durably,
 then serves. The joined maintenance worker runs the migrations in turn,
-`store-counters` first and `source-summary` second, since until the source
-summary completes every source and live artifact listing first reads what it
-still owes; each migration resumes from its own checkpoint, so the order can
-change between images. The worker runs one bounded page per admission, fairly
-with its other duties, and each page commits its rows and checkpoint atomically
-through the ordinary write path, so a restart resumes after the last committed
-page and a failed page is retried, never skipped. Readers take an explicit
-pending path until a migration completes and say so where the answer could
-differ: the schema 69 receipt-time fallback backfill is reported in SPARQL
+`store-counters` first and `source-summary` second, since, until the source
+summary completes, every source and live artifact listing first reads what that
+migration still owes; each migration resumes from its own checkpoint, so the
+order can change between images. The worker runs one bounded page per admission,
+fairly with its other duties, and each page commits its rows and checkpoint
+atomically through the ordinary write path, so a restart resumes after the last
+committed page and a failed page is retried, never skipped. Readers take an
+explicit pending path until a migration completes and say so where the answer
+could differ: the schema 69 receipt-time fallback backfill is reported in SPARQL
 coverage while the view serves the facts it still owes, scoped SPARQL reads the
 owner index for the declarations already copied and walks the rest, the source
 listings add what the source-summary migration still owes to the stored rows,
