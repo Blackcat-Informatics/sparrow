@@ -19955,6 +19955,28 @@ fn a_source_listing_during_the_source_summary_migration_is_a_build_its_cursor_re
         .ingest("built-late", "built-late", "log", b"late\n", DAY + 9)
         .unwrap();
     open();
+    // A build is retired only after its page is delivered: a call that fails after the
+    // build has finished leaves it, and a retry on the same cursor resumes that build and
+    // delivers the same rows, instead of expiring or starting a second build.
+    let finished = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while store.listing_builds_for_tests().unwrap()[0].1 > 0 {
+        assert!(
+            std::time::Instant::now() < finished,
+            "the build never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let cancelled = sparrow_core::QueryCancellation::default();
+    cancelled.cancel();
+    let failed = store
+        .source_read_with_syslog_cancellable(&follow, now, &[], &[], &cancelled)
+        .unwrap_err();
+    assert_eq!(failed.code, "CANCELLED", "{failed:?}");
+    assert_eq!(
+        store.listing_builds_for_tests().unwrap()[0],
+        (1, 0, 1),
+        "the finished build waits for its page"
+    );
     let mut page = again;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while page.build.is_some() {
