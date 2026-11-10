@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/160-stop-write-stalls-size-rocksdb-flush",
+  "branch": "paudley/160-stop-write-stalls-size-rocksdb-flush",
+  "base_ref": "origin/main",
+  "head": "ea1a4b2b250e6e56fc1175b5fddf480ca5162a90",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/160-stop-write-stalls-size-rocksdb-flush/.stage/stop-write-stalls-size-rocksdb-flush/sync/20261109T204625-1e15d302377848988c641f3ff16c7fd5",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "3735c1e4bfa1e8e4188be465fbf40b9b84638e2b",
+  "merge_bases": [
+    "ea1a4b2b250e6e56fc1175b5fddf480ca5162a90"
+  ],
+  "commit": "3735c1e4bfa1e8e4188be465fbf40b9b84638e2b"
+}
