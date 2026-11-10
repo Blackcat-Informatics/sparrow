@@ -25,21 +25,28 @@ const MIGRATION_PROGRESS_PAGES: u64 = 64;
 pub(super) struct Worker {
     stop: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    /// Closes when the task ends, by return, panic or cancellation.
+    ended: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl Worker {
     pub(super) fn start(store: Store, flush: Duration) -> Self {
         let (stop, stopped) = watch::channel(false);
+        let (alive, ended) = tokio::sync::oneshot::channel::<()>();
         Self {
             stop,
-            task: Some(tokio::spawn(run(store, stopped, flush))),
+            task: Some(tokio::spawn(async move {
+                let _alive = alive;
+                run(store, stopped, flush).await
+            })),
+            ended,
         }
     }
 
-    pub(super) fn is_finished(&self) -> bool {
-        self.task
-            .as_ref()
-            .is_none_or(tokio::task::JoinHandle::is_finished)
+    /// Resolve when the task ends. Await it at most once.
+    pub(super) async fn ended(&mut self) {
+        // The task never sends: its sender closes as it ends, the only outcome.
+        let _ = (&mut self.ended).await;
     }
 
     pub(super) async fn shutdown(mut self) -> Result<(), String> {
@@ -533,13 +540,13 @@ mod tests {
             .unwrap()
             .open_store()
             .unwrap();
-        let worker = Worker::start(store, Duration::from_millis(1));
+        let mut worker = Worker::start(store, Duration::from_millis(1));
         let (mut consumer, mut syslog) = (None, None);
-        // A running worker: several health intervals pass without a failure.
+        // A running worker: a second passes without a failure.
         assert!(
             tokio::time::timeout(
-                crate::WORKER_HEALTH_INTERVAL * 5,
-                crate::worker_health(&mut consumer, &mut syslog, Some(&worker)),
+                Duration::from_secs(1),
+                crate::worker_health(&mut consumer, &mut syslog, Some(&mut worker)),
             )
             .await
             .is_err()
@@ -548,7 +555,7 @@ mod tests {
         worker.stop.send_replace(true);
         let failure = tokio::time::timeout(
             Duration::from_secs(10),
-            crate::worker_health(&mut consumer, &mut syslog, Some(&worker)),
+            crate::worker_health(&mut consumer, &mut syslog, Some(&mut worker)),
         )
         .await
         .unwrap();

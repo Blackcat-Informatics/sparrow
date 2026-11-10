@@ -168,6 +168,8 @@ enum Socket {
 pub struct SyslogWorker {
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<io::Result<()>>,
+    /// Closes when the task ends, by return, panic or cancellation.
+    ended: tokio::sync::oneshot::Receiver<()>,
 }
 impl SyslogWorker {
     /// Bind every configured socket before starting bounded ingestion tasks.
@@ -222,7 +224,9 @@ impl SyslogWorker {
             .map_err(|_| io::Error::other("syslog registry poisoned"))? = metrics;
         let (stop, receiver) = watch::channel(false);
         let shutdown = stop.clone();
+        let (alive, ended) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
+            let _alive = alive;
             let mut listeners = JoinSet::new();
             for (socket, metrics) in sockets {
                 listeners.spawn(listen(
@@ -236,11 +240,16 @@ impl SyslogWorker {
             }
             finish_tasks(Ok(()), &mut listeners, &shutdown).await
         });
-        Ok(Self { stop, task })
+        Ok(Self { stop, task, ended })
     }
-    /// Detect unexpected worker termination for the daemon health gate.
+    /// Whether the worker has terminated.
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
+    }
+    /// Resolve when the worker terminates, for the daemon health gate. Await it at most once.
+    pub async fn ended(&mut self) {
+        // The task never sends: its sender closes as it ends, the only outcome.
+        let _ = (&mut self.ended).await;
     }
     /// Stop admission and wait for every in-flight atomic publication.
     pub async fn shutdown(self) -> io::Result<()> {

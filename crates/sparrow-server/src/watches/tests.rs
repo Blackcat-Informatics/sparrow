@@ -5,6 +5,11 @@
 
 use super::*;
 
+thread_local! {
+    /// Worker passes run on this test thread, counted by `run`.
+    pub(super) static PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[test]
 fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
     let directory = tempfile::tempdir().unwrap();
@@ -676,4 +681,279 @@ fn refused_tail_attach_opens_the_file_once() {
         }
     }
     assert_eq!(opens, 1, "one refused attach is one open of the file");
+}
+
+/// One watch over a fresh root and store, with the handles a test drives its worker by.
+struct Worker {
+    _directory: tempfile::TempDir,
+    store: Store,
+    registry: WatchRegistry,
+    stop: tokio::sync::watch::Sender<bool>,
+    controller: watch_admin::WatchController,
+}
+
+/// Open one watch of CONTRACT over a root holding FILES and return its unstarted worker
+/// loop, which shares OPERATIONS as its operation budget.
+fn worker(
+    contract: crate::ProducerContract,
+    files: &[(&str, &[u8])],
+    operations: Arc<tokio::sync::Semaphore>,
+) -> (Worker, impl std::future::Future<Output = Result<(), Error>>) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("producer");
+    std::fs::create_dir(&root).unwrap();
+    for (name, bytes) in files {
+        std::fs::write(root.join(name), bytes).unwrap();
+    }
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let definition = ConsumeWatch {
+        id: "wake".into(),
+        root,
+        producer_contract: contract,
+        source: "wake".into(),
+        format: "log".into(),
+        quiet_ms: 30_000,
+        max_directories: 2,
+        max_candidates: 2,
+    };
+    let catalog = Catalog::load(&store, std::slice::from_ref(&definition)).unwrap();
+    let detectors = catalog
+        .watches()
+        .iter()
+        .cloned()
+        .map(|watch| Detector::open(store.clone(), watch, RootBinding::Stored).unwrap())
+        .collect();
+    let (controller, commands) = watch_admin::channel();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let registry = WatchRegistry::default();
+    let run = run(
+        store.clone(),
+        detectors,
+        data.join("rpc.sock"),
+        stopped,
+        registry.clone(),
+        catalog,
+        Control {
+            commands,
+            operations,
+            private: None,
+            outputs: crate::config::OutputPaths::default(),
+        },
+    );
+    (
+        Worker {
+            _directory: directory,
+            store,
+            registry,
+            stop,
+            controller,
+        },
+        run,
+    )
+}
+
+fn passes() -> u64 {
+    PASSES.with(std::cell::Cell::get)
+}
+
+// These tests run the worker on a paused tokio clock, which advances only when every task
+// waits on a timer. A worker that slept on a tick would let the clock advance to each tick
+// and count a pass there; one blocked on events does neither. Each test acts at SETTLED, off
+// the old 50 ms grid, so a ticking worker would still be asleep and need the clock to
+// advance. The candidate quiet clocks and rescan deadlines are std instants, so each fixture
+// stays below its first rescan (60 seconds) and holds no consume candidate.
+
+/// Long enough for a fresh worker to cover its root, and not a multiple of 50 ms.
+const SETTLED: Duration = Duration::from_millis(1025);
+
+/// INVARIANT (#184): an idle watch worker blocks on its wake sources, so it runs at most
+/// one pass a second, where the 50 ms tick it replaced ran 20.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_idle_worker_wakes_at_most_once_a_second() {
+    let (worker, run) = worker(
+        crate::ProducerContract::FinishedFiles,
+        &[],
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    );
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let task = tokio::task::spawn_local(run);
+            tokio::time::sleep(SETTLED).await;
+            assert!(worker.registry.snapshot().unwrap()[0].covered);
+            let settled = passes();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let idle = passes() - settled;
+            assert!(idle <= 30, "{idle} passes in 30 idle seconds");
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+/// INVARIANT (#184): a stop request wakes an idle worker at once; no clock has to pass, as
+/// the 50 ms stop poll needed.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_stop_request_ends_an_idle_worker_without_waiting_for_a_clock() {
+    let (worker, run) = worker(
+        crate::ProducerContract::FinishedFiles,
+        &[],
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    );
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let task = tokio::task::spawn_local(run);
+            tokio::time::sleep(SETTLED).await;
+            let requested = tokio::time::Instant::now();
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+            assert_eq!(tokio::time::Instant::now(), requested);
+        })
+        .await;
+}
+
+/// INVARIANT (#184): an administrative command wakes an idle worker at once, and its reply
+/// arrives with no clock passing.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_command_wakes_an_idle_worker_without_waiting_for_a_clock() {
+    let (worker, run) = worker(
+        crate::ProducerContract::FinishedFiles,
+        &[],
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    );
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let task = tokio::task::spawn_local(run);
+            tokio::time::sleep(SETTLED).await;
+            let sent = tokio::time::Instant::now();
+            let refused = worker
+                .controller
+                .retire_claim(watch_admin::ClaimRetirement {
+                    watch: "absent".into(),
+                    claim: "absent".into(),
+                    caller: "test".into(),
+                    reason: "wake".into(),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code, "NOT_FOUND");
+            assert_eq!(tokio::time::Instant::now(), sent);
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+/// INVARIANT (#184): a tail drain waiting for the shared operation budget runs as soon as a
+/// permit is released, not at the next tick; the input is captured within one millisecond
+/// of clock time.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_released_permit_wakes_a_waiting_tail_drain() {
+    let operations = Arc::new(tokio::sync::Semaphore::new(1));
+    let lease = operations.clone().try_acquire_owned().unwrap();
+    let (worker, run) = worker(
+        crate::ProducerContract::ActiveFilesRetain,
+        &[("current.log", b"n\n")],
+        operations,
+    );
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let task = tokio::task::spawn_local(run);
+            tokio::time::sleep(SETTLED).await;
+            let state = worker.registry.snapshot().unwrap().pop().unwrap();
+            assert!(state.tail_admission_waiting && state.tail_descriptors == 1);
+            assert_eq!(state.tail_checkpoint_records, 0);
+            drop(lease);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let state = worker.registry.snapshot().unwrap().pop().unwrap();
+            assert!(!state.tail_admission_waiting && state.failure.is_none());
+            assert_eq!(state.tail_checkpoint_records, 1);
+            assert_eq!(
+                worker
+                    .store
+                    .tail_generation(&state.tail_generation_ids[0])
+                    .unwrap()
+                    .offset,
+                2
+            );
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+/// INVARIANT (#184): the drain before a wait can take producer events from the pass. The
+/// worker reports what they changed, and freed candidate capacity for deferred inputs makes
+/// the deferred-capacity rescan due at once instead of at the next rescan or quiet deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn the_drain_before_a_wait_reports_and_wakes_for_what_it_found() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("producer");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("first.bin"), b"first\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut detectors = vec![
+        Detector::open(
+            store.clone(),
+            ManagedWatch {
+                definition: ConsumeWatch {
+                    id: "settle".into(),
+                    root: root.clone(),
+                    producer_contract: crate::ProducerContract::FinishedFiles,
+                    source: "settle".into(),
+                    format: "opaque".into(),
+                    quiet_ms: 30_000,
+                    max_directories: 2,
+                    max_candidates: 1,
+                },
+                revision: 1,
+                enabled: true,
+            },
+            RootBinding::Stored,
+        )
+        .unwrap(),
+    ];
+    detectors[0].scan_step().unwrap();
+    detectors[0].drain().unwrap();
+    assert!(detectors[0].covered && detectors[0].candidates.len() == 1);
+    // During a pass: a second input finds the capacity full, then the first one goes away.
+    std::fs::write(root.join("second.bin"), b"second\n").unwrap();
+    std::fs::remove_file(root.join("first.bin")).unwrap();
+
+    let registry = WatchRegistry::default();
+    let (_controller, commands) = watch_admin::channel();
+    let mut control = Control {
+        commands,
+        operations: Arc::new(tokio::sync::Semaphore::new(1)),
+        private: None,
+        outputs: crate::config::OutputPaths::default(),
+    };
+    // Stop is already requested, so the wait returns once it has settled.
+    let (_stop, mut stopped) = tokio::sync::watch::channel(true);
+    let waiting = Waiting {
+        store: &store,
+        registry: &registry,
+        stop: &mut stopped,
+        control: &mut control,
+        received: &mut None,
+        permit: &mut None,
+    };
+    pause(waiting, &mut detectors, true, false, true, Wake::default())
+        .await
+        .unwrap();
+    let status = registry.snapshot().unwrap().pop().unwrap();
+    assert!(status.deferred && status.candidates == 0);
+    assert!(detectors[0].due(true).unwrap() <= Instant::now());
+    assert!(detectors[0].due(false).unwrap() > Instant::now());
 }
