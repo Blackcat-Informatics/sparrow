@@ -13,6 +13,11 @@ pub const MAX_BUFFERED_WRITES: usize = 256;
 pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 /// Default intended periodic synchronization interval.
 pub const DEFAULT_FLUSH_INTERVAL_MS: u32 = 2000;
+/// Shortest accepted periodic synchronization interval. A flush that fires more than once
+/// a second adds fsync pressure for no durability a one second bound does not already give.
+pub const MIN_FLUSH_INTERVAL_MS: u32 = 1000;
+/// Longest accepted periodic synchronization interval.
+pub const MAX_FLUSH_INTERVAL_MS: u32 = 60_000;
 
 /// A synchronization fence, scoped to a persistent store and one opened session.
 #[derive(Clone, Debug, PartialEq, Eq)]

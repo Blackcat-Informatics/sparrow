@@ -47,7 +47,7 @@ pub use storage::diagnostic::{
 };
 pub use storage::durability::{
     DEFAULT_FLUSH_INTERVAL_MS, Durability, DurabilityStatus, DurabilityWatermark,
-    MAX_BUFFERED_BYTES, MAX_BUFFERED_WRITES,
+    MAX_BUFFERED_BYTES, MAX_BUFFERED_WRITES, MAX_FLUSH_INTERVAL_MS, MIN_FLUSH_INTERVAL_MS,
 };
 #[cfg(feature = "test-support")]
 pub use storage::eviction::RetirementBounds;

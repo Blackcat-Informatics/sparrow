@@ -34,10 +34,10 @@ follower=$!
 sleep 2
 systemctl --user stop "$unit"
 
-# Wait for the "Stopped" line to be spooled, at most 30 seconds.
-for _ in $(seq 60); do
+# Wait for the "Stopped" line to be spooled, at most 30 seconds, checking once a second.
+for _ in $(seq 30); do
     if cat -- "$spool"/katamari-manager-*.jsonl 2>/dev/null | grep -q '"message":"Stopped '; then break; fi
-    sleep 0.5
+    sleep 1
 done
 files=("$spool"/katamari-manager-*.jsonl)
 [[ -e ${files[0]} ]] || { echo "FAIL: no katamari-manager-*.jsonl in $spool"; exit 1; }

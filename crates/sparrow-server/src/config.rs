@@ -272,6 +272,19 @@ impl ServerConfig {
         if !(1..=64).contains(&config.max_concurrent_requests) {
             return Err("max_concurrent_requests must be 1..64".into());
         }
+        if !(sparrow_core::MIN_FLUSH_INTERVAL_MS..=sparrow_core::MAX_FLUSH_INTERVAL_MS)
+            .contains(&config.buffered_flush_interval_ms)
+        {
+            return Err(format!(
+                "buffered_flush_interval_ms = {} is outside {}..{}; the periodic flush never fires more than once a second. Set it to {} or more (default {})",
+                config.buffered_flush_interval_ms,
+                sparrow_core::MIN_FLUSH_INTERVAL_MS,
+                sparrow_core::MAX_FLUSH_INTERVAL_MS,
+                sparrow_core::MIN_FLUSH_INTERVAL_MS,
+                sparrow_core::DEFAULT_FLUSH_INTERVAL_MS
+            )
+            .into());
+        }
         if !(1..=256).contains(&config.max_rpc_connections) {
             return Err("max_rpc_connections must be 1..256".into());
         }
@@ -591,6 +604,32 @@ mod tests {
         let error = ServerConfig::read(&config).err().unwrap().to_string();
         assert!(error.contains("max_artifact_bytes was removed"), "{error}");
         assert!(error.contains("Delete the key"), "{error}");
+    }
+
+    /// INVARIANT: the periodic flush never fires more than once a second; a smaller or
+    /// zero interval refuses startup with a message naming the key and the minimum, and
+    /// the one second boundary itself is accepted.
+    #[test]
+    fn flush_interval_below_one_second_refuses_with_its_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        let with = |millis: u32| {
+            std::fs::write(
+                &config,
+                format!("buffered_flush_interval_ms = {millis}\n{base}"),
+            )
+            .unwrap();
+            ServerConfig::read(&config)
+        };
+        for millis in [0, 1, 999] {
+            let error = with(millis).err().unwrap().to_string();
+            assert!(error.contains("buffered_flush_interval_ms"), "{error}");
+            assert!(error.contains("1000"), "{error}");
+        }
+        assert_eq!(with(1000).unwrap().buffered_flush_interval_ms, 1000);
     }
 
     /// INVARIANT: the `[archive]` table is strict and lexically outside the store, and a

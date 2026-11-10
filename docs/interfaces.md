@@ -2942,7 +2942,7 @@ without a sync) and copies them. No memtable is flushed. The daemon then
 checks the file sizes of the new backup and purges the oldest backups beyond
 `backup_keep`. Table files are shared between backups, so every backup after
 the first copies only the tables written since. While a backup runs, RocksDB keeps
-the files that become obsolete until the copy ends. The held files do not count toward `physical_bytes`, the disk budget or eviction, so a backup never refuses a write or evicts evidence. A guard thread at the daemon's normal priority, which never touches the backup root, measures free space every 250 ms; once it falls below twice `min_free_bytes`, the guard re-enables file deletions, RocksDB deletes the held files at once, and the backup fails if it still needed one. A backup stalled on an unresponsive NAS therefore never brings ingest to the free-space floor. Records
+the files that become obsolete until the copy ends. The held files do not count toward `physical_bytes`, the disk budget or eviction, so a backup never refuses a write or evicts evidence. A guard thread at the daemon's normal priority, which never touches the backup root, measures free space every second; once it falls below twice `min_free_bytes`, the guard re-enables file deletions, RocksDB deletes the held files at once, and the backup fails if it still needed one. A backup stalled on an unresponsive NAS therefore never brings ingest to the free-space floor. Records
 accepted after the engine lists the files are not in the backup.
 
 `BACKUP_ROOT/STORE_ID` binds a root to one store; the operation refuses a root

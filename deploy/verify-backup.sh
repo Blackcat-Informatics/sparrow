@@ -523,7 +523,7 @@ await_status() {
     local pid=$1 log=$2 socket=$3 deadline=$((SECONDS + $4)) client=${5:-$cli} out
     until grep -q '^sparrowd: store=' -- "$log"; do
         kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)) || return 1
-        sleep 0.2
+        sleep 1
     done
     until out=$("$client" "$socket" status 2>/dev/null); do
         kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)) || return 1
@@ -1015,7 +1015,7 @@ deadline=$((SECONDS + READY_SECONDS))
 until grep -q '^sparrowd: store=' -- "$LOG"; do
     kill -0 "$PID" 2>/dev/null || fail open "the daemon exited before it answered on $SOCKET"
     ((SECONDS < deadline)) || fail open "the daemon did not answer within ${READY_SECONDS}s"
-    sleep 0.2
+    sleep 1
 done
 for attempt in 1 2 3; do
     if status=$("$cli" "$SOCKET" status 2>"$SCRATCH/status.err"); then

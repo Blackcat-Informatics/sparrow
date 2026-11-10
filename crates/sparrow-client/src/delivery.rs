@@ -36,8 +36,12 @@ pub struct DeliveryConfig {
     pub flush_interval: Duration,
     /// Deadline for one connection/discovery or ingestion attempt.
     pub rpc_timeout: Duration,
-    /// Delay between attempts of the same immutable pending batch.
+    /// Delay before the first retry of the same immutable pending batch. Each further
+    /// failed attempt doubles the delay up to [`Self::retry_max_interval`]; an accepted
+    /// batch restarts it here.
     pub retry_interval: Duration,
+    /// Longest delay between attempts of the same pending batch, at least `retry_interval`.
+    pub retry_max_interval: Duration,
 }
 impl DeliveryConfig {
     /// Default bounded queue, two-second batching, and finite RPC/retry deadlines.
@@ -61,7 +65,8 @@ impl DeliveryConfig {
             batch_bytes: 512 * 1024,
             flush_interval: Duration::from_secs(2),
             rpc_timeout: Duration::from_secs(5),
-            retry_interval: Duration::from_millis(250),
+            retry_interval: Duration::from_secs(1),
+            retry_max_interval: Duration::from_secs(30),
         }
     }
     fn validate(&self) -> Result<(), Error> {
@@ -72,9 +77,15 @@ impl DeliveryConfig {
             || !(MAX_EVENT_BYTES..=64 * 1024 * 1024).contains(&self.max_queued_bytes)
             || !(1..=MAX_EVENT_BATCH_EVENTS).contains(&self.batch_events)
             || !(MAX_EVENT_BYTES + 8192..=MAX_EVENT_BATCH_BYTES).contains(&self.batch_bytes)
-            || [self.flush_interval, self.rpc_timeout, self.retry_interval]
-                .iter()
-                .any(|duration| duration.is_zero() || *duration > Duration::from_secs(60))
+            || self.retry_max_interval < self.retry_interval
+            || [
+                self.flush_interval,
+                self.rpc_timeout,
+                self.retry_interval,
+                self.retry_max_interval,
+            ]
+            .iter()
+            .any(|duration| duration.is_zero() || *duration > Duration::from_secs(60))
         {
             return Err(Error::InvalidArgument(
                 "invalid delivery labels, queue/batch limits or timing bounds; durations require (0,60s]",
@@ -750,6 +761,33 @@ impl Shared {
     }
 }
 
+/// Delay before the next attempt of an unchanged pending batch: it starts at the configured
+/// retry interval and doubles after every use up to the configured maximum, so an outage costs
+/// one attempt per second at first and one per `retry_max_interval` at most, per client.
+struct Backoff {
+    initial: Duration,
+    max: Duration,
+    next: Duration,
+}
+impl Backoff {
+    fn new(config: &DeliveryConfig) -> Self {
+        Self {
+            initial: config.retry_interval,
+            max: config.retry_max_interval,
+            next: config.retry_interval,
+        }
+    }
+    /// The delay to wait now; the following one is doubled and capped.
+    fn take(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(self.max);
+        delay
+    }
+    fn reset(&mut self) {
+        self.next = self.initial;
+    }
+}
+
 enum Action {
     Wait(Option<Duration>),
     Send(Arc<EventBatch>),
@@ -757,6 +795,7 @@ enum Action {
 }
 async fn run(shared: &Shared) -> Result<(), Error> {
     let mut connection: Option<Client> = None;
+    let mut backoff = Backoff::new(&shared.config);
     loop {
         match shared.next()? {
             Action::Stop => return Ok(()),
@@ -789,7 +828,10 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                     },
                 };
                 match result {
-                    Ok(receipt) => shared.accepted(&batch, receipt)?,
+                    Ok(receipt) => {
+                        shared.accepted(&batch, receipt)?;
+                        backoff.reset();
+                    }
                     Err(error) => {
                         connection = None;
                         if !retryable(&error) {
@@ -797,7 +839,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         }
                         shared.retry(error)?;
                         tokio::select! { _ = shared.abort_wake.notified() => return Ok(()),
-                        _ = tokio::time::sleep(shared.config.retry_interval) => {} }
+                        _ = tokio::time::sleep(backoff.take()) => {} }
                     }
                 }
             }
@@ -841,6 +883,71 @@ mod tests {
             span: None,
             follows_from: None,
         }
+    }
+
+    /// INVARIANT: retries back off from the configured interval, double up to the maximum
+    /// and never exceed it, and an accepted batch restarts the sequence, so an outage does
+    /// not hold a client at a fast retry rate and a recovered daemon is not met with a stale
+    /// long delay.
+    #[test]
+    fn retry_backoff_doubles_to_its_maximum_and_restarts_after_acceptance() {
+        let mut config = DeliveryConfig::new("unused.sock", "test");
+        assert_eq!(config.retry_interval, Duration::from_secs(1));
+        config.retry_max_interval = Duration::from_secs(5);
+        let mut backoff = Backoff::new(&config);
+        let seen: Vec<_> = (0..5).map(|_| backoff.take().as_secs()).collect();
+        assert_eq!(seen, [1, 2, 4, 5, 5]);
+        backoff.reset();
+        assert_eq!(backoff.take(), Duration::from_secs(1));
+    }
+
+    /// INVARIANT: a maximum shorter than the first delay is refused rather than silently
+    /// capping the first retry, and the default maximum is within the shared 60 s bound.
+    #[test]
+    fn retry_maximum_below_the_first_delay_is_refused() {
+        let mut config = DeliveryConfig::new("unused.sock", "test");
+        config.validate().unwrap();
+        config.retry_max_interval = config.retry_interval - Duration::from_millis(1);
+        assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
+    }
+
+    /// INVARIANT: failed attempts keep retrying the one immutable pending batch with the same
+    /// request identity and report each retry in the delivery statistics.
+    #[test]
+    fn retries_keep_the_pending_identity_and_count_each_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test");
+        config.batch_events = 1;
+        config.retry_interval = Duration::from_millis(5);
+        config.retry_max_interval = Duration::from_millis(20);
+        let delivery = Delivery::start(config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(
+            delivery.try_send(event()),
+            Admission::Dropped {
+                reason: DropReason::Contended,
+                ..
+            }
+        ) {
+            assert!(Instant::now() < deadline, "admission remained contended");
+            std::thread::yield_now();
+        }
+        let first = loop {
+            if let Some(batch) = delivery.pending_batch().unwrap() {
+                break batch.request_id.clone();
+            }
+            assert!(Instant::now() < deadline, "no batch began");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        while delivery.stats().unwrap().retries < 3 {
+            assert!(Instant::now() < deadline, "retries were not reported");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(delivery.pending_batch().unwrap().unwrap().request_id, first);
+        assert!(matches!(
+            delivery.shutdown(Duration::from_millis(20)),
+            Err(FlushError::TimedOut(_))
+        ));
     }
 
     #[test]
