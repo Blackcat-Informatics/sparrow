@@ -4,7 +4,7 @@
 # Interim user unit (issue #168): spool systemd's own lines about katamari-stored.service, which
 # the default journal holds, beside the node's lines that katamari-journal-spool.service spools
 # from the katamari journal namespace. Install as ~/.config/systemd/user/katamari-manager-spool.service
-# (docs/deployment.md, "Katamari's manager lines").
+# (docs/deployment.md, "Katamari's journal in the spool").
 #
 # KATAMARI_MANAGER_SINCE backfills the first start only: it is ignored once the cursor file exists.
 # 16:12:47 on 2026-11-09 is when the namespace forwarder replaced the old default-journal one.

@@ -393,7 +393,7 @@ own to the default journal: starting and stopping, `Main process exited`,
 unit` and `Consumed ... memory peak`. Without the second unit those are in
 journald only, and rotation loses them (the OOM kill of 2026-11-09 18:37:07 was
 found there, not in Sparrow). The manager forwarder drops the unit's own
-process, so a record in a `katamari-manager-*` file is always the manager's.
+process, so a record in a `katamari-manager-*` file comes from the manager or from another journal entry that names the unit (a coredump, for example); `source` says which journal it came from, not which process.
 
 The manager lines use their own file prefix and cursor, never the node's.
 `sparrow-ship` keys a file by device, inode, size and modification time and
