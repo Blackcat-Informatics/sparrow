@@ -53,6 +53,22 @@ def fail(message):
     sys.exit(f"sparrow-ship: {message}")
 
 
+def refuse_overlap(path, source, config):
+    """Refuse a source directory that equals, contains or lies inside the shipper's own trees.
+
+    The shipper writes `intake_root` and `state_dir`; a source that overlaps either would
+    ship its own queue, ledgers or consumed items again on every run. Real paths are
+    compared, so a symlink cannot hide the overlap; the two output trees may not exist yet.
+    """
+    directory = Path(source["dir"]).resolve()
+    for key in ("intake_root", "state_dir"):
+        tree = Path(config[key]).resolve()
+        if directory == tree or directory.is_relative_to(tree) or tree.is_relative_to(directory):
+            fail(f"{path}: source {source['name']}: dir {source['dir']} (real path {directory}) "
+                 f"overlaps {key} {config[key]} (real path {tree}); a source directory may not "
+                 f"equal, contain or lie inside {key}. Move the source or change {key}")
+
+
 def load_config(path):
     with open(path, "rb") as handle:
         config = tomllib.load(handle)
@@ -75,6 +91,7 @@ def load_config(path):
         names.add(source["name"])
         if not Path(source["dir"]).is_dir():
             fail(f"source {source['name']}: {source['dir']} is not a readable directory")
+        refuse_overlap(path, source, config)
     if not names:
         fail(f"{path}: no [[source]] entries")
     return config

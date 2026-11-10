@@ -6349,6 +6349,42 @@ fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
     );
 }
 
+/// INVARIANT: the shipper refuses at configuration load, naming both paths, a source
+/// directory that equals, contains or lies inside `intake_root` or `state_dir`, including
+/// through a symlink, because it would otherwise ship its own queue and ledgers forever.
+#[test]
+fn shipper_refuses_a_source_overlapping_its_intake_or_state_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let (intake, state) = (dir.path().join("intake"), dir.path().join("ship"));
+    for tree in [&intake, &state] {
+        std::fs::create_dir_all(tree.join("inner")).unwrap();
+    }
+    std::os::unix::fs::symlink(&state, dir.path().join("alias")).unwrap();
+    let config = dir.path().join("ship.toml");
+    let refuses = |source: &Path, key: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                "intake_root = {intake:?}\nstate_dir = {state:?}\nmax_chunk_bytes = 1048576\n\
+                 max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+                 max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+                 [[source]]\nname = \"s\"\ndir = {source:?}\npattern = \"*.json\"\n\
+                 rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
+            ),
+        )
+        .unwrap();
+        let output = ship(&config);
+        let errors = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{source:?}");
+        assert!(errors.contains(&format!("overlaps {key}")), "{errors}");
+        assert!(errors.contains(&source.display().to_string()), "{errors}");
+    };
+    refuses(&intake, "intake_root");
+    refuses(&state.join("inner"), "state_dir");
+    refuses(dir.path(), "intake_root");
+    refuses(&dir.path().join("alias"), "state_dir");
+}
+
 /// INVARIANT: an artifact above the removed 16 MiB per-artifact limit ingests whole and
 /// reads back byte-exact. The shipper ships one single-object JSON file of 20 MiB whole,
 /// the consume watch publishes it, and the SDK stages an in-memory copy in bounded

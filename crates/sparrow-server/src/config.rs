@@ -255,6 +255,7 @@ impl ServerConfig {
         if let Some(archive) = &config.archive {
             archive.validate(&config.data_dir)?;
         }
+        config.validate_watch_roots_apart()?;
         crate::syslog_listener::validate(&config.syslog)?;
         if config.rpc_tcp_address.is_some() != config.rpc_tcp_secret_file.is_some() {
             return Err(
@@ -382,6 +383,38 @@ impl ServerConfig {
                 "ingest_socket_path must be in a directory outside data_dir that does not contain it"
                     .into(),
             );
+        }
+        Ok(())
+    }
+
+    /// Refuse a consume or tail root that overlaps a path the daemon itself writes: the store,
+    /// its socket, the ingest socket, the backup root or the archive. The configuration names
+    /// no log file, so these are the paths a root could swallow. Lexical, like the other
+    /// configuration checks; the runtime root open also compares canonical paths with the store.
+    fn validate_watch_roots_apart(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let own = [
+            ("data_dir", Some(&self.data_dir)),
+            ("socket_path", Some(&self.socket_path)),
+            ("ingest_socket_path", self.ingest_socket_path.as_ref()),
+            ("backup_root", self.backup_root.as_ref()),
+            (
+                "archive.dir",
+                self.archive.as_ref().map(|archive| &archive.dir),
+            ),
+        ];
+        for watch in &self.consume {
+            for (key, path) in own {
+                let Some(path) = path else { continue };
+                if path.starts_with(&watch.root) || watch.root.starts_with(path) {
+                    return Err(format!(
+                        "consume watch `{}` root {} overlaps {key} {}: a watch root must neither contain nor lie inside a path Sparrow writes itself; move one of them",
+                        watch.id,
+                        watch.root.display(),
+                        path.display()
+                    )
+                    .into());
+                }
+            }
         }
         Ok(())
     }
@@ -574,5 +607,59 @@ mod tests {
         drop(archiving.open_store().unwrap());
         let unconfigured = with("").unwrap();
         assert!(unconfigured.open_store().is_err());
+    }
+
+    /// INVARIANT: a consume or tail root that contains, or lies inside, any path the daemon
+    /// writes itself (store, sockets, backup root, archive) refuses configuration load and
+    /// names both paths, because the daemon would otherwise watch its own output.
+    #[test]
+    fn watch_root_overlapping_a_daemon_output_path_refuses_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        let watch = |root: &std::path::Path| {
+            format!(
+                "[[consume]]\nid = \"w\"\nroot = \"{}\"\nproducer_contract = \"finished_files\"\nsource = \"s\"\nformat = \"log\"\n",
+                root.display()
+            )
+        };
+        let with = |extra: &str| {
+            std::fs::write(&config, format!("{base}{extra}")).unwrap();
+            ServerConfig::read(&config)
+        };
+        let ingest = dir.path().join("run/ingest.sock");
+        let ingest_keys = format!(
+            "ingest_socket_path = \"{}\"\ningest_socket_gid = 1\n",
+            ingest.display()
+        );
+        let backup = dir.path().join("backup");
+        let archive = dir.path().join("nas");
+        let outputs = format!(
+            "{ingest_keys}backup_root = \"{}\"\n[archive]\ndir = \"{}\"\n",
+            backup.display(),
+            archive.display()
+        );
+        // Top-level keys must precede the tables, so the watch goes last.
+        for root in [
+            dir.path().to_path_buf(),
+            data.clone(),
+            dir.path().join("run"),
+            backup.join("inside"),
+            archive.clone(),
+        ] {
+            let error = with(&format!("{outputs}{}", watch(&root)))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("overlaps"), "{} {error}", root.display());
+            assert!(error.contains(&root.display().to_string()), "{error}");
+        }
+        with(&format!(
+            "{outputs}{}",
+            watch(&dir.path().join("intake/app"))
+        ))
+        .unwrap();
     }
 }
