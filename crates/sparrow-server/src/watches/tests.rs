@@ -587,3 +587,93 @@ fn private_intake_refuses_configured_roots_aliased_by_identity() {
         );
     }
 }
+
+/// INVARIANT: the daemon's own open of a tail file is never a reason to attach it again. When
+/// the store refuses an attach after the descriptor is open (here a CONFLICT: the file reuses
+/// the identity of a foreign active generation), the refusal's own IN_OPEN must not re-enter
+/// `attach`, or the watch reopens the file up to the event quantum per pass and then rescans.
+/// An independent kernel watch counts the opens one scan and one drain produce.
+#[test]
+fn refused_tail_attach_opens_the_file_once() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original");
+    let private = directory.path().join("private");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&private).unwrap();
+    let active = private.join("active.log");
+    std::fs::write(&active, b"first line\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let (root, file) = (
+        std::fs::metadata(&original).unwrap(),
+        std::fs::metadata(&active).unwrap(),
+    );
+    store
+        .tail_start(
+            &sparrow_core::TailStart {
+                request_id: "foreign-active".into(),
+                watch: "tail-refused".into(),
+                watch_revision: 1,
+                directories: sparrow_core::ConsumptionDirectories {
+                    root_device: root.dev(),
+                    root_inode: root.ino(),
+                    parent_device: root.dev(),
+                    parent_inode: root.ino(),
+                },
+                path: b"active.log".to_vec(),
+                source: "tail-refused".into(),
+                format: "log".into(),
+                device: file.dev(),
+                inode: file.ino(),
+            },
+            crate::now().unwrap(),
+        )
+        .unwrap();
+
+    let counter = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK).unwrap();
+    inotify::add_watch(&counter, &private, WatchFlags::OPEN).unwrap();
+    let mut detector = Detector::open(
+        store,
+        ManagedWatch {
+            definition: ConsumeWatch {
+                id: "tail-refused".into(),
+                root: private,
+                producer_contract: crate::ProducerContract::ActiveFilesRetain,
+                source: "tail-refused".into(),
+                format: "log".into(),
+                quiet_ms: 30_000,
+                max_directories: 2,
+                max_candidates: 2,
+            },
+            revision: 1,
+            enabled: true,
+        },
+        crate::consumption::RootBinding::Private,
+    )
+    .unwrap();
+    detector.scan_step().unwrap();
+    detector.drain().unwrap();
+    assert!(
+        detector.failure.is_some(),
+        "the store refused the attach, which is the condition under test"
+    );
+
+    let mut buffer = [MaybeUninit::uninit(); 4096];
+    let mut reader = inotify::Reader::new(counter, &mut buffer);
+    let mut opens = 0;
+    while let Ok(event) = reader.next() {
+        if event
+            .file_name()
+            .is_some_and(|name| name.to_bytes() == b"active.log")
+        {
+            opens += 1;
+        }
+    }
+    assert_eq!(opens, 1, "one refused attach is one open of the file");
+}
