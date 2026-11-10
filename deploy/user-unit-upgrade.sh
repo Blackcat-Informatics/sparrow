@@ -144,6 +144,10 @@ done
 # stays system: its unit helpers address SPARROW_UNIT, and it refuses user scope for
 # sparrow.service, so this script drives the user manager itself (USER_SYSTEMCTL).
 SPARROW_PREFIX=${SPARROW_PREFIX:-${HOME:?}/.local}
+export SPARROW_PREFIX
+# The user unit's state tree, as sparrow-backup.service passes it (%h/.local/state/sparrow/...).
+SPARROW_STATE=${SPARROW_STATE:-${HOME:?}/.local/state/sparrow}
+SPARROW_INTAKE=${SPARROW_INTAKE:-$SPARROW_STATE/intake}
 SPARROW_CONFIG=${SPARROW_CONFIG:-${HOME:?}/.config/sparrow/server.toml}
 # The user-unit pre-upgrade backup prints its own progress; lib.sh supplies the backup root.
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -253,7 +257,7 @@ the daemon first, or switch with --no-backup REASON" ;;
     esac
     log "pre-upgrade backup, online: the daemon keeps serving"
     PATH=$(dirname -- "$CLI_LINK"):$PATH "$LIBEXEC/sparrow-backup" "$SPARROW_CONFIG" \
-        "$SPARROW_INTAKE" "$CONFIG_DIR" "$CONFIG_DIR/ship.toml"
+        "$SPARROW_INTAKE" "$CONFIG_DIR" "$SPARROW_STATE/ship" "$SPARROW_STATE/ship-watches"
     fresh=''
     for dir in "$SPARROW_BACKUPS"/sets/*; do
         [[ -d $dir && ${dir##*/} =~ ^[0-9]+$ ]] || continue

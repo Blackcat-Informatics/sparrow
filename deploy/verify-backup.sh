@@ -1075,6 +1075,7 @@ for line in sys.stdin:
     : >"$bytes"
     for ((offset = 0; offset < length; offset += 1048576)); do
         size=$((length - offset < 1048576 ? length - offset : 1048576))
+        rm -f -- "$chunk" # bytes refuses to overwrite an existing file
         "$cli" "$SOCKET" bytes "$store" "$artifact" "$offset" "$size" "$chunk" >/dev/null \
             || fail artifact "reading $artifact at offset $offset failed"
         cat -- "$chunk" >>"$bytes"
