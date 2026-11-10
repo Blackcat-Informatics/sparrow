@@ -805,12 +805,12 @@ impl Base {
 
     /// Whether the migration, as `live` reads it now, has overtaken a pass from this base
     /// that has read `read` entries: it is complete, or its checkpoint has moved and it has
-    /// passed more entries since the base than the pass has read plus one build check
-    /// interval. Its pages and the pass walk the same entries in the same order, and `done`
-    /// counts them in the pass's unit (artifact and record entries at or before the
-    /// checkpoint), so the migration is then ahead of the pass and a newer view owes less
-    /// than the pass has left. The lead of one interval keeps a re-base from repeating at
-    /// every check. Entries a write adds or removes at or before the checkpoint move `done`
+    /// passed more entries since the base than the pass has read plus a lead of
+    /// [`super::listing_build::CHECK_EVERY`] entries, all in the pass's own unit (artifact
+    /// and record entries at or before the checkpoint, which is what `done` counts). Its
+    /// pages and the pass walk the same entries in the same order, so the migration is then
+    /// ahead of the pass and a newer view owes less than the pass has left. The lead keeps a
+    /// re-base from repeating at every check. Entries a write adds or removes at or before the checkpoint move `done`
     /// too; that changes only when a re-base happens, never what the build returns. A fixed
     /// number of point reads.
     pub(super) fn overtaken(&self, live: &Reader<'_>, read: u64) -> Result<bool, Error> {

@@ -20459,8 +20459,8 @@ fn a_source_listing_build_the_migration_overtakes_delivers_the_finished_rows_at_
 }
 
 /// INVARIANT (#176): a live `artifacts` window build re-bases once the running migration
-/// has passed more entries since its snapshot than the build has read plus one check
-/// interval, while the migration is still unfinished. It then reads only what the newer
+/// has passed more entries since its snapshot than the build has read plus a lead of 4,096,
+/// in the migration's own unit, while the migration is still unfinished. It then reads only what the newer
 /// snapshot owes, fewer entries than its first snapshot owed. Its selected artifacts were
 /// owed rows in the first snapshot and are stored rows in the newer one, and the listing it
 /// delivers equals the finished index's rows once the migration completes, with no artifact

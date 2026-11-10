@@ -111,7 +111,8 @@ impl Job {
                 .recompress_step(sparrow_server::now()?, RECOMPRESSION_SETTLE_SECONDS)
                 .map(|_| done),
             Self::Migrate { defer } => {
-                // The page's time includes its wait for writers, as the migration's does.
+                // The page's time includes the wait for writers this job runs inline; a wait
+                // that ran in the background beside other duties is not part of it.
                 let began = std::time::Instant::now();
                 if defer {
                     store.defer_migration_page();
