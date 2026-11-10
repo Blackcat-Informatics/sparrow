@@ -4,13 +4,19 @@
 //! Bounded descriptor-held active file capture through the one durable record pipeline.
 
 use crate::{ConsumeWatch, consumption::Error, source_file};
-use rustix::fs::OFlags;
+use rustix::fs::{
+    OFlags,
+    inotify::{self, CreateFlags, WatchFlags},
+};
 use sparrow_client::CompletedFileIdentity;
 use sparrow_core::{Store, TailFinishIntent, TailGeneration, TailStart};
 use std::{
     collections::BTreeMap,
     fs::File,
-    os::unix::{ffi::OsStrExt, fs::FileExt},
+    os::{
+        fd::{AsRawFd, BorrowedFd, OwnedFd},
+        unix::{ffi::OsStrExt, fs::FileExt},
+    },
     path::Path,
 };
 
@@ -21,6 +27,8 @@ struct Held {
     file: File,
     generation: TailGeneration,
     observed: CompletedFileIdentity,
+    /// This descriptor's watch in `TailRoot::appends`.
+    watch: i32,
 }
 
 pub(crate) struct TailRoot {
@@ -31,6 +39,13 @@ pub(crate) struct TailRoot {
     claim: std::cell::OnceCell<crate::consumption::ClaimRoot>,
     held: BTreeMap<(u64, u64), Held>,
     next: Option<(u64, u64)>,
+    /// One inotify watch per held descriptor, on the file itself: an append to a generation
+    /// whose name has left the watched directories (unlinked, or moved out of the root)
+    /// raises no directory event, but still raises this one.
+    appends: OwnedFd,
+    /// Consecutive drains that captured nothing. Drains rotate through the held
+    /// descriptors, so once this reaches their count every one is caught up.
+    idle: usize,
 }
 
 impl TailRoot {
@@ -70,7 +85,48 @@ impl TailRoot {
             claim: std::cell::OnceCell::new(),
             held: BTreeMap::new(),
             next: None,
+            appends: inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?,
+            idle: 0,
         })
+    }
+
+    /// Whether every held descriptor has been drained since its last change, so no drain
+    /// is due until an event reports new activity.
+    pub(crate) fn caught_up(&self) -> bool {
+        self.idle >= self.held.len()
+    }
+
+    /// The descriptor that becomes readable when a held file changes.
+    pub(crate) fn appends(&self) -> BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.appends.as_fd()
+    }
+
+    /// Consume queued held-file events; any of them makes every held descriptor due again.
+    pub(crate) fn take_appends(&mut self) -> Result<(), Error> {
+        let mut buffer = [0_u8; 4096];
+        // Bounded: events still queued keep the descriptor readable for the next wait.
+        for _ in 0..64 {
+            match rustix::io::read(&self.appends, &mut buffer) {
+                Ok(_) => self.idle = 0,
+                Err(error) if error == rustix::io::Errno::WOULDBLOCK => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop holding one descriptor and drop its file watch. The kernel has already dropped
+    /// the watch of a file that no longer exists, which `EINVAL` reports.
+    fn release(&mut self, key: (u64, u64)) -> Result<(), Error> {
+        let Some(held) = self.held.remove(&key) else {
+            return Ok(());
+        };
+        match inotify::remove_watch(&self.appends, held.watch) {
+            Ok(()) => Ok(()),
+            Err(error) if error == rustix::io::Errno::INVAL => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The held root's (device, inode), which every generation it may read declares.
@@ -132,6 +188,8 @@ impl TailRoot {
         }
         crate::consumption::identity(&intent.observed).require(&held.file)?;
         held.generation = self.store.tail_finish_start(intent, crate::now()?)?;
+        // The finished generation's final drain is due now.
+        self.idle = 0;
         Ok(held.generation.clone())
     }
 
@@ -141,6 +199,8 @@ impl TailRoot {
         config: &ConsumeWatch,
         revision: u64,
     ) -> Result<(), Error> {
+        // Activity on a path makes every held descriptor due for a drain.
+        self.idle = 0;
         let Some(expected) = self.observe(path)? else {
             return Ok(());
         };
@@ -241,12 +301,19 @@ impl TailRoot {
                 "pending completion no longer matches its original final descriptor observation; accepted checkpoint preserved",
             ));
         }
+        // inotify has no descriptor API; the kernel-owned alias names this exact file.
+        let watch = inotify::add_watch(
+            &self.appends,
+            format!("/proc/self/fd/{}", file.as_raw_fd()).as_str(),
+            WatchFlags::MODIFY | WatchFlags::ATTRIB,
+        )?;
         self.held.insert(
             key,
             Held {
                 file,
                 generation,
                 observed,
+                watch,
             },
         );
         Ok(())
@@ -263,6 +330,9 @@ impl TailRoot {
             return Ok(());
         };
         self.next = Some(key);
+        // Reset below when the checkpoint advances or a generation completes; a failure, an
+        // empty read or a partial record leaves nothing to capture before the next event.
+        self.idle = self.idle.saturating_add(1);
         let held = self
             .held
             .get_mut(&key)
@@ -283,7 +353,7 @@ impl TailRoot {
                 "identity_changed",
                 crate::now()?,
             )?;
-            self.held.remove(&key);
+            self.release(key)?;
             return Err(Error::State(
                 "producer changed a declared finished generation; accepted checkpoint preserved and completion refused",
             ));
@@ -324,7 +394,8 @@ impl TailRoot {
                     true,
                     crate::now()?,
                 )?;
-                self.held.remove(&key);
+                self.idle = 0;
+                self.release(key)?;
                 return Ok(());
             }
             held.observed = before;
@@ -341,7 +412,7 @@ impl TailRoot {
                 "identity_changed",
                 crate::now()?,
             )?;
-            self.held.remove(&key);
+            self.release(key)?;
             return Err(Error::State(
                 "producer changed a declared finished generation during capture; no captured bytes were published",
             ));
@@ -361,7 +432,7 @@ impl TailRoot {
                 },
                 crate::now()?,
             )?;
-            self.held.remove(&key);
+            self.release(key)?;
             return Err(Error::State(
                 "tail source changed without an append during capture; accepted checkpoint was preserved",
             ));
@@ -379,10 +450,13 @@ impl TailRoot {
             complete,
             crate::now()?,
         )?;
+        if complete || publication.source_end != held.generation.offset {
+            self.idle = 0;
+        }
         held.generation.offset = publication.source_end;
         held.observed = after;
         if complete {
-            self.held.remove(&key);
+            self.release(key)?;
             return Ok(());
         }
         if publication.artifact.is_none() && bytes.len() == READ_BYTES {

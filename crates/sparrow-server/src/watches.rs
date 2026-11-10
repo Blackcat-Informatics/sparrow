@@ -20,14 +20,11 @@ use std::{
     fs::File,
     mem::MaybeUninit,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -137,7 +134,11 @@ fn aliased(dir: &[(u64, u64)], private: Option<(u64, u64)>, configured: &[(u64, 
 
 const SCAN_QUANTUM: usize = 64;
 const EVENT_QUANTUM: usize = 4096;
-const TICK: Duration = Duration::from_millis(50);
+/// While free space is below the floor the worker rechecks it this often: no event reports
+/// space returning.
+const SPACE_RECHECK: Duration = Duration::from_secs(1);
+/// Interval between consume RPC connection attempts while a claim waits for a connection.
+const CONNECT_RETRY: Duration = Duration::from_secs(1);
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_CEILING: Duration = Duration::from_secs(15 * 60);
 /// Longest consume publication. Its connection must outlive it under the lease.
@@ -633,6 +634,9 @@ impl Detector {
     }
 
     fn drain(&mut self) -> Result<(), Error> {
+        if let Owner::Tail(owner) = &mut self.owner {
+            owner.take_appends()?;
+        }
         let mut buffer = [MaybeUninit::uninit(); 4096];
         // Use a duplicated descriptor so events can update the rest of this detector.
         let events = rustix::io::dup(&self.events)?;
@@ -751,12 +755,59 @@ impl Detector {
         }
         Ok(Some((path, expected)))
     }
+
+    /// Whether this detector has work the worker must run again for at once, without
+    /// waiting for an event: a scan in progress or, with space to write, a tail backlog
+    /// that holds a permit.
+    fn busy(&self, space_ok: bool) -> bool {
+        self.enabled
+            && (!self.covered
+                || !self.todo.is_empty()
+                || self.scan.is_some()
+                || (space_ok
+                    && !self.tail_admission_waiting
+                    && matches!(&self.owner, Owner::Tail(owner) if !owner.caught_up())))
+    }
+
+    /// Whether a tail backlog waits for the shared operation budget.
+    fn waits_for_permit(&self) -> bool {
+        self.enabled
+            && self.tail_admission_waiting
+            && matches!(&self.owner, Owner::Tail(owner) if !owner.caught_up())
+    }
+
+    /// The earliest instant this idle detector has work without a new event: its periodic
+    /// rescan and, when CLAIMS admits new reservations, the end of its first candidate's
+    /// quiet interval.
+    fn due(&self, claims: bool) -> Option<Instant> {
+        if !self.enabled || !self.covered || !self.todo.is_empty() || self.scan.is_some() {
+            return None;
+        }
+        let quiet = Duration::from_millis(u64::from(self.config.quiet_ms));
+        let ready = self
+            .candidates
+            .values()
+            .filter(|_| claims && matches!(self.owner, Owner::Consume(_)))
+            .map(|candidate| candidate.stable_since + quiet)
+            .min();
+        Some(ready.map_or(self.next_reconcile, |ready| ready.min(self.next_reconcile)))
+    }
+
+    /// The descriptors that become readable when this detector has events to drain.
+    fn descriptors(&self) -> impl Iterator<Item = BorrowedFd<'_>> {
+        std::iter::once(self.events.as_fd()).chain(match &self.owner {
+            Owner::Tail(owner) => Some(owner.appends()),
+            Owner::Consume(_) => None,
+        })
+    }
 }
 
 /// One owned worker, whose failure must be checked by the daemon owner.
 pub struct ConsumeWorker {
-    stop: Arc<AtomicBool>,
+    stop: tokio::sync::watch::Sender<bool>,
     thread: Option<JoinHandle<Result<(), String>>>,
+    /// Closes when the worker thread ends, by return or by panic.
+    ended: tokio::sync::oneshot::Receiver<()>,
     controller: watch_admin::WatchController,
 }
 
@@ -824,11 +875,13 @@ impl ConsumeWorker {
             catalog.persist(&store)?;
         }
         let (controller, commands) = watch_admin::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let (alive, ended) = tokio::sync::oneshot::channel();
         let thread = std::thread::Builder::new()
             .name("sparrow-consume".into())
             .spawn(move || {
+                // Dropped as the thread ends, which closes `ended`.
+                let _alive = alive;
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -856,6 +909,7 @@ impl ConsumeWorker {
         Ok(Self {
             stop,
             thread: Some(thread),
+            ended,
             controller,
         })
     }
@@ -870,9 +924,16 @@ impl ConsumeWorker {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
+    /// Resolve when the worker thread ends; the daemon then joins it through
+    /// [`Self::shutdown`] for its result. Await it at most once.
+    pub async fn ended(&mut self) {
+        // The thread never sends: its sender closes as it ends, the only outcome.
+        let _ = (&mut self.ended).await;
+    }
+
     /// Stop admission and await owned work while the daemon's RPC LocalSet still runs.
     pub async fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.stop.store(true, Ordering::Release);
+        self.stop.send_replace(true);
         let thread = self
             .thread
             .take()
@@ -886,14 +947,130 @@ impl ConsumeWorker {
 
 impl Drop for ConsumeWorker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.send_replace(true);
     }
 }
 
-async fn stopped(stop: &AtomicBool) {
-    while !stop.load(Ordering::Acquire) {
-        tokio::time::sleep(TICK).await;
+/// Resolve once stop is requested.
+async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    // An error means the sender is gone, which only the dropped worker owner does after
+    // requesting stop.
+    let _ = stop.wait_for(|stopped| *stopped).await;
+}
+
+/// What a worker with no work in hand waits for, besides stop, commands and readable
+/// inotify descriptors.
+#[derive(Default)]
+struct Wake {
+    /// The earliest deadline at which work is due without any event.
+    at: Option<Instant>,
+    /// A tail drain or tail claim waits for a shared operation permit.
+    permit: bool,
+}
+
+impl Wake {
+    fn by(&mut self, at: Instant) {
+        self.at = Some(self.at.map_or(at, |current| current.min(at)));
     }
+}
+
+/// The state one worker wait reads and fills.
+struct Waiting<'a> {
+    stop: &'a mut tokio::sync::watch::Receiver<bool>,
+    control: &'a mut Control,
+    /// A command the wait received, handled first by the next pass.
+    received: &'a mut Option<watch_admin::Command>,
+    /// A permit the wait acquired, used by the next pass.
+    permit: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// End one worker pass. A busy pass yields and runs again at once. An idle one blocks until
+/// stop, a command, a readable inotify descriptor, a freed permit it waits for, or its
+/// earliest deadline. Every journal writer runs on this worker (reservation in the pass;
+/// handoff, tail completion and retirement as commands; tail capture in the pass), so the
+/// pass that creates a pending claim also sees it: no other wake source is needed for one.
+async fn pause(
+    waiting: Waiting<'_>,
+    detectors: &mut [Detector],
+    space_ok: bool,
+    busy: bool,
+    claims: bool,
+    mut wake: Wake,
+) -> Result<(), Error> {
+    // Never hold the shared budget across a wait.
+    *waiting.permit = None;
+    if busy {
+        tokio::task::yield_now().await;
+        return Ok(());
+    }
+    // The pass's own opens and reads below the roots queue events. Consume them now, so
+    // they cannot end this wait and start a pass that queues more.
+    for detector in detectors.iter_mut().filter(|detector| detector.enabled) {
+        detector.drain()?;
+    }
+    if detectors.iter().any(|detector| detector.busy(space_ok)) {
+        tokio::task::yield_now().await;
+        return Ok(());
+    }
+    wake.permit = wake.permit || (space_ok && detectors.iter().any(Detector::waits_for_permit));
+    for at in detectors.iter().filter_map(|detector| detector.due(claims)) {
+        wake.by(at);
+    }
+    let events = detectors
+        .iter()
+        .filter(|detector| detector.enabled)
+        .flat_map(Detector::descriptors)
+        .map(|fd| tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE))
+        .collect::<Result<Vec<_>, _>>()?;
+    let readable = std::future::poll_fn(|context| {
+        for fd in &events {
+            if let std::task::Poll::Ready(ready) = fd.poll_read_ready(context) {
+                return std::task::Poll::Ready(ready.map(drop));
+            }
+        }
+        std::task::Poll::Pending
+    });
+    let (wants_permit, at) = (wake.permit, wake.at);
+    let operations = waiting.control.operations.clone();
+    let admitted = async move {
+        if wants_permit {
+            operations.acquire_owned().await
+        } else {
+            std::future::pending().await
+        }
+    };
+    let deadline = async {
+        match at {
+            Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = stopped(waiting.stop) => {}
+        command = waiting.control.commands.recv() => {
+            *waiting.received = Some(command.ok_or(Error::State(
+                "watch administration channel closed unexpectedly",
+            ))?);
+        }
+        ready = readable => ready?,
+        admitted = admitted => {
+            *waiting.permit = Some(admitted.map_err(|_| {
+                Error::State("tail operation budget closed unexpectedly")
+            })?);
+        }
+        () = deadline => {}
+    }
+    Ok(())
+}
+
+/// A held permit from the last wait, else one free now.
+fn admit(
+    operations: &Arc<tokio::sync::Semaphore>,
+    held: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+    held.take()
+        .map_or_else(|| operations.clone().try_acquire_owned(), Ok)
 }
 
 enum AdminFailure {
@@ -1193,7 +1370,7 @@ async fn run(
     store: Store,
     mut detectors: Vec<Detector>,
     socket: PathBuf,
-    stop: Arc<AtomicBool>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
     registry: WatchRegistry,
     mut catalog: Catalog,
     mut control: Control,
@@ -1203,9 +1380,18 @@ async fn run(
     // Next attempt and consecutive failures per pending claim.
     let mut retry = BTreeMap::<String, (Instant, u32)>::new();
     let mut connect_after = Instant::now();
-    while !stop.load(Ordering::Acquire) {
+    // A command or a permit the last wait received, for this pass.
+    let mut received = None;
+    let mut permit = None;
+    while !*stop.borrow() {
+        #[cfg(test)]
+        tests::PASSES.with(|passes| passes.set(passes.get() + 1));
+        let mut wake = Wake::default();
         // Below the free-space floor every write is refused: keep observing, write nothing.
         let space_ok = store.space_floor().shortfall()?.is_none();
+        if !space_ok {
+            wake.by(Instant::now() + SPACE_RECHECK);
+        }
         let pending = store.consumption_pending()?;
         if space_ok && catalog.retire(&pending) {
             catalog.persist(&store)?;
@@ -1217,7 +1403,10 @@ async fn run(
             });
         }
         for _ in 0..watch_admin::MAX_WATCH_COMMANDS {
-            let command = match control.commands.try_recv() {
+            let command = match received
+                .take()
+                .map_or_else(|| control.commands.try_recv(), Ok)
+            {
                 Ok(command) => command,
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -1308,7 +1497,12 @@ async fn run(
                 continue;
             }
             if let Owner::Tail(owner) = &mut detector.owner {
-                let _permit = match control.operations.try_acquire() {
+                // A caught-up owner has nothing to capture until an event, so needs no permit.
+                if owner.caught_up() {
+                    detector.tail_admission_waiting = false;
+                    continue;
+                }
+                let _permit = match admit(&control.operations, &mut permit) {
                     Ok(permit) => {
                         detector.tail_admission_waiting = false;
                         permit
@@ -1335,6 +1529,13 @@ async fn run(
         }
         let pending = store.consumption_pending()?;
         registry.update(&detectors, &pending)?;
+        let busy = detectors.iter().any(|detector| detector.busy(space_ok));
+        let waiting = Waiting {
+            stop: &mut stop,
+            control: &mut control,
+            received: &mut received,
+            permit: &mut permit,
+        };
         if !space_ok
             || detectors.is_empty()
             || (pending.is_empty()
@@ -1342,7 +1543,7 @@ async fn run(
                     .iter()
                     .all(|detector| matches!(detector.owner, Owner::Tail(_))))
         {
-            tokio::time::sleep(TICK).await;
+            pause(waiting, &mut detectors, space_ok, busy, false, wake).await?;
             continue;
         }
         retry.retain(|id, _| pending.iter().any(|journal| journal.import_id == *id));
@@ -1363,13 +1564,14 @@ async fn run(
                     journal.tail.is_some(),
                 )
             });
-        if work.is_none() && pending.len() < sparrow_core::MAX_CONSUMPTION_JOURNALS {
+        let claims = work.is_none() && pending.len() < sparrow_core::MAX_CONSUMPTION_JOURNALS;
+        if claims {
             for detector in &mut detectors {
                 if !detector.enabled {
                     continue;
                 }
                 if let Some((path, identity)) = detector.ready()? {
-                    if stop.load(Ordering::Acquire) {
+                    if *waiting.stop.borrow() {
                         break;
                     }
                     match detector.owner.claim()?.reserve(
@@ -1418,29 +1620,33 @@ async fn run(
                 if client.is_none() && Instant::now() >= connect_after {
                     let opened = Instant::now();
                     tokio::select! {
-                        _ = stopped(&stop) => break,
+                        () = stopped(waiting.stop) => break,
                         result = tokio::time::timeout(Duration::from_secs(10), Client::connect(&socket)) => {
                             match result {
                                 Ok(Ok(connected)) => client = Some((connected, opened)),
                                 Ok(Err(error)) => eprintln!("sparrowd: consume RPC discovery failed: {error}"),
                                 Err(_) => eprintln!("sparrowd: consume RPC discovery timed out; sources remain owned"),
                             }
-                            connect_after = Instant::now() + Duration::from_secs(1);
+                            connect_after = Instant::now() + CONNECT_RETRY;
                         }
                     }
                 }
                 if client.is_none() {
-                    let failures = retry.get(&id).map_or(0, |(_, failures)| *failures);
-                    retry.insert(id, (Instant::now() + TICK, failures));
-                    tokio::time::sleep(TICK).await;
+                    // Every other due claim waits behind this one, so only later retries
+                    // and the next connection attempt can bring new work.
+                    wake.by(connect_after);
+                    blocked(&retry, &mut wake);
+                    pause(waiting, &mut detectors, space_ok, busy, false, wake).await?;
                     continue;
                 }
             }
             let _permit = if is_tail {
-                match control.operations.try_acquire() {
+                match admit(&waiting.control.operations, waiting.permit) {
                     Ok(permit) => Some(permit),
                     Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        tokio::time::sleep(TICK).await;
+                        wake.permit = true;
+                        blocked(&retry, &mut wake);
+                        pause(waiting, &mut detectors, space_ok, busy, false, wake).await?;
                         continue;
                     }
                     Err(tokio::sync::TryAcquireError::Closed) => {
@@ -1450,6 +1656,9 @@ async fn run(
                     }
                 }
             } else {
+                // A permit the last wait acquired for a tail drain is not held through an
+                // ordinary publication.
+                *waiting.permit = None;
                 None
             };
             let detector = detectors
@@ -1482,7 +1691,7 @@ async fn run(
                 Ok::<_, Error>(())
             };
             let result = tokio::select! {
-                _ = stopped(&stop) => break,
+                () = stopped(waiting.stop) => break,
                 result = tokio::time::timeout(PUBLICATION_DEADLINE, operation) => result.unwrap_or(Err(Error::State("consume publication deadline expired; retain the original journal and retry"))),
             };
             if let Err(error) = result {
@@ -1528,8 +1737,22 @@ async fn run(
             {
                 detectors.rotate_left(index + 1);
             }
+            // Re-evaluate at once after a claim.
+            tokio::task::yield_now().await;
+            continue;
         }
-        tokio::time::sleep(TICK).await;
+        for (at, _) in retry.values() {
+            wake.by(*at);
+        }
+        pause(waiting, &mut detectors, space_ok, busy, claims, wake).await?;
     }
     Ok(())
+}
+
+/// Wake for the retries still to come while the due claim waits.
+fn blocked(retry: &BTreeMap<String, (Instant, u32)>, wake: &mut Wake) {
+    let now = Instant::now();
+    for (at, _) in retry.values().filter(|(at, _)| *at > now) {
+        wake.by(*at);
+    }
 }

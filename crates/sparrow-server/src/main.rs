@@ -63,46 +63,59 @@ fn restore_backup(
     Ok(())
 }
 
-/// How often the serving loop checks that every worker it started is still running.
-const WORKER_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// Watch the workers the daemon started and return the failure of the first that ends.
+/// Wait for the workers the daemon started and return the failure of the first that ends.
 /// Every worker runs until shutdown, so any end before it is a failure the daemon exits
 /// on. Every mode is covered: a normal daemon has all three workers, a no-intake daemon only
 /// maintenance, a query-only one none, so this never returns there.
 async fn worker_health(
     consumer: &mut Option<sparrow_server::watches::ConsumeWorker>,
     syslog: &mut Option<sparrow_server::syslog_listener::SyslogWorker>,
-    maintenance: Option<&maintenance::Worker>,
+    maintenance: Option<&mut maintenance::Worker>,
 ) -> Box<dyn std::error::Error> {
-    let mut tick = tokio::time::interval(WORKER_HEALTH_INTERVAL);
-    loop {
-        tick.tick().await;
-        if consumer
-            .as_ref()
-            .is_some_and(sparrow_server::watches::ConsumeWorker::is_finished)
-        {
+    enum Ended {
+        Consumer,
+        Syslog,
+        Maintenance,
+    }
+    // Each worker closes its end signal as it ends, so this waits without sampling.
+    let ended = tokio::select! {
+        () = async {
+            match consumer.as_mut() {
+                Some(worker) => worker.ended().await,
+                None => std::future::pending().await,
+            }
+        } => Ended::Consumer,
+        () = async {
+            match syslog.as_mut() {
+                Some(worker) => worker.ended().await,
+                None => std::future::pending().await,
+            }
+        } => Ended::Syslog,
+        () = async {
+            match maintenance {
+                Some(worker) => worker.ended().await,
+                None => std::future::pending().await,
+            }
+        } => Ended::Maintenance,
+    };
+    match ended {
+        Ended::Consumer => {
             if let Some(worker) = consumer.take()
                 && let Err(error) = worker.shutdown().await
             {
                 return error;
             }
-            return "completed-consumption worker terminated unexpectedly".into();
+            "completed-consumption worker terminated unexpectedly".into()
         }
-        if syslog
-            .as_ref()
-            .is_some_and(sparrow_server::syslog_listener::SyslogWorker::is_finished)
-        {
+        Ended::Syslog => {
             if let Some(worker) = syslog.take()
                 && let Err(error) = worker.shutdown().await
             {
                 return error.into();
             }
-            return "syslog intake worker terminated unexpectedly".into();
+            "syslog intake worker terminated unexpectedly".into()
         }
-        if maintenance.is_some_and(maintenance::Worker::is_finished) {
-            return "maintenance worker terminated unexpectedly".into();
-        }
+        Ended::Maintenance => "maintenance worker terminated unexpectedly".into(),
     }
 }
 
@@ -338,8 +351,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
         let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms))));
         let serving = async {
-        // Pinned once, so its interval and any worker shutdown it starts survive every turn.
-        let health = worker_health(&mut consumer, &mut syslog, maintenance.as_ref());
+        // Pinned once, so its waits and any worker shutdown it starts survive every turn.
+        let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());
         tokio::pin!(health);
         let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
         // Below the floor every write is refused, so admit no new connections.
