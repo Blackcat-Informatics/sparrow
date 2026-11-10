@@ -209,14 +209,14 @@ terminal, with its Unix socket removed. Never open two owners on one store.
 Verify store identity, schema/format, retained counts, watches, byte reads and
 saved mutation retries over Unix and TCP after adoption. Stop the new unit
 before reverting an image/configuration; reverting a binary alone cannot undo a
-store-format upgrade. A closed-store backup is a recovery artifact, and its
+store-format upgrade. An online backup is a recovery artifact, and its
 existence does not prove restoration has been exercised.
 
 ## Recovery qualification
 
-For isolated recovery qualification, copy a closed-store backup to a separate
-directory and copy the deployment configuration with `data_dir` and
-`socket_path` changed to that directory. Keep the backup immutable. The recovery
+For isolated recovery qualification, restore a backup into a separate empty
+directory with `sparrowd --restore-backup` ("Online backups") and copy the deployment configuration with `data_dir` and
+`socket_path` changed to that directory. Keep the backup immutable: the restore reads it and never changes it. The recovery
 example uses the existing configuration/store readers directly, without starting
 listeners, maintenance or saved watch workers:
 
@@ -308,13 +308,10 @@ migration, ahead of the others. Until it completes, `status` reports
 `counts=pending` and every migration's `total` as `counting`; `live_records`
 and the two unique counts then cover only the keys seeded so far and are not
 totals. Every consumer of those counts says so rather than printing a partial
-number as a total: the closing line logs `unique_payload_chunks=pending`,
-`sparrow-backup` records `live_records=pending` and
-`unique_payload_chunks=pending` in `SOURCE`, `deploy/verify-backup.sh` reports
-its payload chunk check as not verifiable (counts pending), and
-`deploy/user-unit-upgrade.sh` prints `counts=` beside `live_records`.
+number as a total: the closing line logs `unique_payload_chunks=pending`
+and `deploy/user-unit-upgrade.sh` prints `counts=` beside `live_records`.
 `tools/install-bin.sh` names the pair from `SCHEMA_VERSION`, so a
-schema 70 build installs as `sparrowd-schema70-REV` and `sparrow-schema70-REV`.
+schema 71 build installs as `sparrowd-schema71-REV` and `sparrow-schema71-REV`.
 
 ## Shipping finished files from producers that keep them
 
@@ -377,95 +374,215 @@ production slice, with `sparrow-ship.timer`.
 The timer runs five minutes after each completed run. Shipped data arrives when
 its producer finishes a file, not as it is written.
 
-## Closed-store backups
+## Katamari's journal in the spool
 
-Sparrow has no online checkpoint, so a consistent backup needs a closed store.
-`deploy/libexec/sparrow-backup` first copies, while the service still runs,
-what the daemon does not change: the image pair, the lexicon bundle, the server
-configuration and any extra paths. It then waits for the intake to drain, stops
-`sparrow.service` through its SIGINT drain, copies `data_dir` and the consume
-intake root, and starts the service again. It refuses to run when the
-service is not already active, so it never starts a service an operator
-stopped. Once it has stopped the service it restarts it after a failure or a
-SIGTERM, and the unit's `ExecStopPost` restarts it if the script is killed
-outright, guided by a marker in the runtime directory. On btrfs the copy is
-a reflink: it takes seconds at any store size and later writes never change
-it. The copy is synchronized after the
-service answers again, so the sync is outside the closed window. Only then is
-the backup renamed into place and the oldest beyond `KEEP` removed. The script refuses to
-run unless free space covers twice the store plus 10 GiB, in case extents are
-not shared. Each backup lists its sources in `SOURCE`, with the image the link names and
-the store's `live_records` before the stop and the `unique_payload_chunks` the
-stopped daemon logged in its closing line, taken only when the daemon exited 0.
-While the store counters seed (status `counts=pending`), either count is
-recorded as `pending` instead of a number, because it is not a total.
-The script reads the journal of the stopped invocation with
-`journalctl --invocation=`, which needs systemd 257 or newer. An image that
-predates the closing line (schema 66 and older) is recognised before the stop,
-from the line's text missing in the image. Its backup is still published, and
-records `payload_chunks=unrecorded (image predates the closing count)`. For an
-image that prints the line, a missing line or a nonzero exit fails the backup. It
-refuses when that image's schema number differs from the running daemon's
-`schema_version`, because then the link does not name the running image. The journal records the measured
-downtime and each phase's time: the drain wait, the copy before the stop, the
-stop, the closed copy, the restart until ready, and the sync. A lock prevents overlapping runs.
+Two interim user units on the operator's host spool `katamari-stored.service`
+into `~/.local/state/sparrow/katamari-journal/` as JSON Lines in ten-minute
+files, which the shipper source `katamari.stored` sends on. Their scripts and
+unit files are in the repository (`deploy/libexec/`, `deploy/systemd/user/`);
+the units run the copies under `~/.local/libexec/sparrow/`.
 
-`deploy/install.sh` installs it with `sparrow-backup.service`, a system unit
-that runs it as root, because it stops and starts the system unit and copies
-trees of several owners with their owners preserved; its writes are confined to
-the backup root.
+| Unit and script | Journal | Records | Files | Cursor |
+| --- | --- | --- | --- | --- |
+| `katamari-journal-spool` | the `katamari` namespace (`--namespace=katamari`), where the node logs since 2026-11-09 16:12:47 | the node's own lines (`event`, `vault`, `message` ...) | `katamari-stored-YYYYMMDDTHHMM.jsonl` | `katamari-journal-ns.cursor` |
+| `katamari-manager-spool` | the default journal (`--unit=katamari-stored.service`) | systemd's lines about the unit, each with `"source":"systemd-manager"` | `katamari-manager-YYYYMMDDTHHMM.jsonl` | `katamari-manager.cursor` |
+
+The namespace journal holds only the node's lines. systemd (PID 1) writes its
+own to the default journal: starting and stopping, `Main process exited`,
+`Failed with result`, `The kernel OOM killer killed some processes in this
+unit` and `Consumed ... memory peak`. Without the second unit those are in
+journald only, and rotation loses them (the OOM kill of 2026-11-09 18:37:07 was
+found there, not in Sparrow). The manager forwarder drops the unit's own
+process, so a record in a `katamari-manager-*` file comes from the manager or from another journal entry that names the unit (a coredump, for example); `source` says which journal it came from, not which process.
+
+The manager lines use their own file prefix and cursor, never the node's.
+`sparrow-ship` keys a file by device, inode, size and modification time and
+ships a changed file again whole, so appending to a bucket the other forwarder
+wrote would send it twice. A manager bucket can still be appended to after it
+shipped when a line arrives more than `settle_seconds` after the previous one in
+the same ten minutes; that file is then shipped again and its earlier lines
+appear twice. The bucket comes from the entry's own time, so a backfill lands
+in the buckets it belongs to.
+
+The shipper reads both prefixes through one source, because both go to the same
+consume root and watch. `~/.config/sparrow/ship.toml` needs the pattern
+widened, with no new watch and no change to the ledger (it keys each file):
+
+```toml
+[[source]]
+name = "katamari.stored"
+dir = "/home/paudley/.local/state/sparrow/katamari-journal"
+pattern = "katamari-*.jsonl"
+rule = "settled"
+format = "jsonl"
+settle_seconds = 120
+```
+
+Deploy (the operator; nothing here restarts the node or the namespace forwarder):
+
+1. `install -m 0755 deploy/libexec/katamari-manager-spool ~/.local/libexec/sparrow/` and
+   `install -m 0644 deploy/systemd/user/katamari-manager-spool.service ~/.config/systemd/user/`.
+2. Widen the `pattern` above in `~/.config/sparrow/ship.toml`.
+3. `systemctl --user daemon-reload && systemctl --user enable --now katamari-manager-spool.service`.
+   The unit sets `KATAMARI_MANAGER_SINCE`, which backfills the first start
+   from that time; it is ignored once the cursor file exists. The backfill is
+   one pass that spools everything since then, saves the cursor of the last
+   entry it saw, and follows from there.
+4. Check `journalctl --user -u katamari-manager-spool.service` is quiet, and that
+   `~/.local/state/sparrow/katamari-journal/katamari-manager-*.jsonl` holds the
+   lines (`Stopping Katamari store daemon...` and its five companions of
+   2026-11-09 18:36:36 to 18:37:10 are the first).
+
+`katamari-journal-spool` and its unit are copied into the repository unchanged
+in behavior (the license header, and a `umask` for `mkdir -m`, are the only
+edits). The live copies are not replaced by installing them.
+
+`tools/katamari-manager-spool-check.sh SCRATCH_DIR` is the recorded check
+(it needs a user manager and journal, so it is not in `make check`). It starts a
+transient user unit with `systemd-run --user`, follows it with the script
+(`KATAMARI_MANAGER_SCOPE=user` selects `--user-unit`) under its own cursor and a
+scratch spool, stops the unit, and asserts the `Stopping ...` and `Stopped ...`
+records are there with `source` set, the unit's own output is not, and the
+cursor was saved. It touches nothing but the scratch directory and its own unit.
+
+## Online backups
+
+Backups go to the NAS archive `/net/synology/archives/sparrow` (an NFSv4 mount
+of `192.168.1.1:/volume1/archives`) and nowhere else (Patrick, 2026-11-08:
+"Sparrow and katamaria are FORBIDDEN from backing up to local disks"). They are
+online. A backup never stops, pauses or drains the service, never takes a lock
+the daemon's writers or the shipper use, and never changes what ingestion does
+(Patrick, 2026-11-08: "Backup may not: stop the server, pause the server, or in
+any way perturb the ingestion."). There is no closed-store window.
+
+The daemon takes the backup of its own store with RocksDB's backup engine
+(docs/interfaces.md, "Online backup"). The operator or the nightly unit asks for
+it with `sparrow SOCKET backup`, which returns at once, and `sparrow SOCKET
+status` reports a `backup` object with the phase (`idle`, `running`, `complete`
+or `failed`), start and finish times, backup id, file and byte counts and any
+failure. The copy runs on one thread at nice 19 (and the lowest best-effort I/O
+priority, which the BFQ scheduler honors), and
+does not take the writer lock or flush the memtable. It copies the live table,
+manifest and write-ahead log files into `BACKUP_ROOT/engine`. Table files are
+shared between backups, so the first backup copies the whole store over the
+network and each later one only the tables written since. The engine keeps the
+newest `backup_keep` (default 3). While a backup runs, RocksDB keeps the files that
+become obsolete until the copy ends. The held files do not count toward `physical_bytes`, the disk budget or eviction, so a backup never refuses a write or evicts evidence. A guard thread at the daemon's normal priority, which never touches the backup root, measures free space every 250 ms; once it falls below twice `min_free_bytes`, the guard re-enables file deletions, RocksDB deletes the held files at once, and the backup fails if it still needed one. A backup stalled on an unresponsive NAS therefore never brings ingest to the free-space floor. One backup runs at a
+time; a second request is refused with `CONFLICT`. A daemon shutdown during a
+backup abandons it, and the engine discards the partial files at its next open.
+`BACKUP_ROOT/STORE_ID` binds the root to one store, and another store is
+refused.
+
+Configure it in `server.toml`:
+
+```toml
+backup_root = "/net/synology/archives/sparrow"
+backup_keep = 3
+```
+
+Startup refuses a relative root, one with `.` or `..`, and one inside or
+containing `data_dir`. It does not touch the root, so a daemon that starts while
+the NAS is down still serves. Every backup judges the root before it creates
+anything: it must be on `nfs`, `nfs4`, `cifs` or `smb3` and not on the store's
+filesystem (`/proc/self/mountinfo`, longest mount prefix). A local root makes
+the backup fail and creates nothing there. The root must exist, owned by the
+daemon's user; create it once on the NAS. `sparrow.service` grants it with
+`ReadWritePaths=-/net/synology/archives/sparrow` and the AppArmor profile names
+it.
+
+`sparrow-backup.service` runs `deploy/libexec/sparrow-backup SERVER_CONFIG
+INTAKE [EXTRA...]` daily between 04:00 and 04:15 local time:
+
+```text
+/usr/local/libexec/sparrow/sparrow-backup /etc/sparrow/server.toml /SPARROW/intake /etc/sparrow /SPARROW/ship
+```
+
+The unit has `RequiresMountsFor` the NAS root, `Nice=19` and
+`IOSchedulingClass=idle`, writes only to the NAS root, runs as root to read the
+trees it copies, and has no `ExecStopPost`, no `flock` and no stop or start of
+`sparrow.service`. It never stops or signals anything. The client:
+
+1. Refuses a backup root that is local before it asks the daemon, and holds
+   `BACKUP_ROOT/.lock`, the lock the image-switch scripts take, never the
+   shipper's.
+2. Asks the daemon for a backup and polls status every 10 seconds until it
+   completes or fails.
+3. Copies the image pair that runs the store (`images/`), the lexicon bundle
+   (`lexicons/`), the server configuration and each extra path (`config/NAME`)
+   and the intake (`intake/`) into `BACKUP_ROOT/sets/ID.partial`, where `ID` is
+   the engine's backup id.
+4. Writes `SOURCE` (`backup_id`, `store_id`, `schema_version`, `store_format`,
+   `image`, `cli`, `taken_utc`, `finished_utc`, `sets_copied_utc`,
+   `engine_files`, `engine_bytes`, `data_dir`, `intake`, `text_lexicon_dir`) and
+   `MANIFEST.b3`, the b3sum of every set file and every engine file the backup
+   references, with paths relative to the backup root. The hashes are read back
+   from the NAS after a sync with cached pages dropped.
+5. Renames the set into place and removes the sets whose engine backup the
+   engine purged.
+
+`taken_utc` is the instant the daemon started the backup. The set's files are
+copied after the store's backup point, so they may be newer than the store, and
+files consumed between the two are in neither. That loss window is the same as
+for any record accepted after the backup point: the shipper resends a shipped
+file whose original still exists, and a record a producer sent directly is lost
+unless the producer resends it. The first run copies the whole store, so budget
+the NAS for the store plus the changed tables of the later backups and one set
+of the files beside it for each kept backup. The unit's `TimeoutStartSec` is six
+hours.
+
+The interim user unit `~/.config/systemd/user/sparrow-backup.service` is not in
+the repository. It must carry these lines, and `~/.config/sparrow/server.toml`
+must set `backup_root` and `backup_keep`:
+
+```ini
+[Unit]
+RequiresMountsFor=/net/synology/archives/sparrow
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/bin
+ExecStart=%h/.local/libexec/sparrow/sparrow-backup %h/.config/sparrow/server.toml /SPARROW/intake %h/.config/sparrow /SPARROW/ship
+TimeoutStartSec=6h
+```
+
+`PATH` gives the client the `sparrow` CLI link. The unit has no `ExecStopPost`
+and no `flock`. An image without the online backup refuses to start with
+`backup_root` or `backup_keep` in its configuration, so add them immediately
+before the switch to an image that has it (`deploy/user-unit-upgrade.sh`
+refuses without them) and remove them before any rollback to an older image. Install the repository's `deploy/libexec/sparrow-backup` as
+`~/.local/libexec/sparrow/sparrow-backup`, then run
+`systemctl --user daemon-reload`.
+
+Verify a backup before relying on it: `deploy/verify-backup.sh
+BACKUP_ROOT/sets/ID` (`deploy/RECOVERY.md`, "Verify a backup") checks
+`MANIFEST.b3` against the NAS and the set's file list, restores engine backup
+`ID` with the image `SOURCE` records into a scratch copy below `SPARROW_VERIFY`
+(removed however the run ends), opens it with `sparrowd --query-only`, and
+checks the store identity, status, within the retention window a records window
+and one artifact's bytes. A backup counts as verified only after the script
+exits 0.
+
+To restore, run `sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID] EMPTY_DIR`
+with the image `SOURCE` records. It is offline, restores into an empty or absent
+directory only (never over a store) and checks every file's checksum. Then place
+the set's configuration, lexicons and intake and start the service with
+`deploy/start.sh --restored-from SET`; `deploy/RECOVERY.md`, "Restore from a
+backup", gives the commands and what the intake copy can leave behind. This
+whole-service procedure has not been exercised; the drill covers only reading a
+restored store.
 
 An unfinished consume claim binds the inode of its intake root and claimed
-file, which no restored copy can reproduce, so a backup must contain no
-unfinished claims. Before stopping the service the script lets consumption
-drain: it holds the shipper's lock, so no new files arrive, and waits until
-every intake root is empty and every watch's `pending_claims` is zero. It never
-moves files under the running daemon, because a reserved claim binds the file's
-identity, including its change time. If the roots have not drained within 30
-minutes the run fails without stopping the service; a file that never drains is
-itself a fault to investigate. A claim whose private source is missing never
-drains: status shows it in `pending_claims` with the watch failure "unpublished
-claimed source is missing". Once its bytes are confirmed lost, retire it with
-`sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID REASON` (schema 70 and
-newer; interfaces, "Retiring an unrecoverable claim"). It leaves
-`pending_claims`, stays listed as `retired-unrecoverable`, and the next backup
-drains. If its staged import had begun, the next reclaim pass frees that
-import's staged chunks and slot. The watch failure clears only if that claim
-caused it. A claim whose private source still exists or whose publication is
-recorded is refused; reconcile the private entry first, keeping its bytes. The shipper's global `max_pending_bytes` bounds
-the wait: with the example's 16 MiB budget and 1 MiB chunks, the roots hold at
-most 16 MiB, which drains in about eight minutes at the measured 30 seconds per
-MiB. A whole file larger than the budget is fed only when every consume root is
-empty, and then alone, so the wait then grows with that file.
-
-The unit keeps three daily copies under `/SPARROW/backups/`,
-taken between 04:00 and 04:15 local time. It also copies the shipper ledgers and
-watch definitions and holds the shipper's lock throughout, so the store, the
-files awaiting ingest and the ledgers all describe the same moment. Reflink copies share unchanged extents with the live
-store, but compaction rewrites files, so the copies gradually stop sharing.
-Budget up to three times the store size. A copy on the same disk protects
-against software faults and operator error, not disk loss.
-
-The NAS archive (`/net/synology/archives/sparrow`) is the off-host backup
-once its worker is deployed (Sparrow issues #15 to #17); the unit does not
-grant its path until then. To restore, stop `sparrow-backup.timer`, `sparrow-ship.timer` and
-`sparrow.service`. Move the damaged `data_dir`, the intake root directory and
-the shipper's `state_dir` aside rather than deleting them. Copy `BACKUP/store`
-to `data_dir`, `BACKUP/intake` to the intake root and `BACKUP/config/ship` to
-`state_dir`, each with `cp -a --reflink=auto`, and restore any needed
-configuration from `BACKUP/config`. Then start the service and both timers. The
-three must come from the same backup, so that the files awaiting ingest match
-the ledgers. The shipper then resends every file shipped after the backup whose
-original still exists. Records that producers sent directly after the backup
-are lost unless they resend them. This whole-service procedure has not been
-exercised; the drill covers only reading a restored store. `deploy/RECOVERY.md`,
-"Restore from a backup", gives the commands. Before replacing a live store,
-verify the backup with `deploy/verify-backup.sh BACKUP` (`deploy/RECOVERY.md`,
-"Verify a backup"). It opens a reflinked copy with `sparrowd --query-only`,
-which opens no watch root and refuses every write, and checks the store
-identity, status, the stored payload chunk count, and, within the retention window, a records window and one artifact's bytes. A backup counts as verified only after the script exits 0.
-While either the copy's or `SOURCE`'s counts are pending, the chunk count is not
-verifiable: the script runs every other check and exits 3, which is not verified.
+file, which no restored copy can reproduce, so a set's intake can hold a private
+claim entry the restored store does not journal, and a restored store can
+journal a claim whose private source is missing. A claim whose private source is
+missing never completes: status shows it in `pending_claims` with the watch
+failure "unpublished claimed source is missing". Once its bytes are confirmed
+lost, retire it with `sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID
+REASON` (schema 70 and newer; interfaces, "Retiring an unrecoverable claim").
+It leaves `pending_claims` and stays listed as `retired-unrecoverable`. If its
+staged import had begun, the next reclaim pass frees that import's staged chunks
+and slot. The watch failure clears only if that claim caused it. A claim whose
+private source still exists or whose publication is recorded is refused;
+reconcile the private entry first, keeping its bytes.
 
 ### Measure the online migration
 
@@ -474,7 +591,7 @@ the online migrations, the schema 69 pair, `source-summary` and, when the open
 found the source timeline cache stale, `source-context` ("Online store
 migrations", "Per-source counters and artifact index" and "Single context
 capture admission" in the interfaces)
-on a writable reflinked copy of the backup's store below `SPARROW_VERIFY`
+on a writable scratch copy restored from the backup below `SPARROW_VERIFY`
 (default `/SPARROW/verify`). The switch gate is a first open under 10 minutes
 measured this way. The copy has its own socket, and its scratch configuration
 takes the backup's budgets and lexicons as the verify mode's does, with no
@@ -489,7 +606,10 @@ nice level of the user unit that serves the live store. The script reads that
 level with `systemctl --user show` from `sparrow.service`, or from the unit
 `SPARROW_MEASURE_UNIT` names, and refuses to run when the unit is not loaded or
 reports no nice level: a copy measured at nice 0 does not predict a unit that
-runs at `Nice=10`.
+runs at `Nice=10`. The unit must also run under the default time-sharing
+policy (`CPUSchedulingPolicy=0`), and the daemon is started through
+`chrt --other 0`, so a caller under `SCHED_IDLE` does not hand that policy to
+the scope. The run fails `FAIL scope` unless the daemon reports class `TS`.
 
 The disk guard reads the free space of the filesystem holding
 `SPARROW_VERIFY`. The run refuses to start under 50 GB free, before anything
@@ -546,10 +666,208 @@ Each measurement is one `verify-backup: MEASURE` line on standard output:
 | `first_status_seconds=S` | Seconds from start to the first status answer |
 | `progress elapsed_seconds=S NAME=DONE/TOTAL ...` | Each migration's progress, every minute |
 | `free_space phase=start\|minute\|end path=P bytes=N gb=N` | Free space at start, every minute and at the end |
-| `scope=UNIT CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=N MemoryMax=N Nice=N` | The scope's limits as systemd applied them, and the daemon's nice level |
+| `scope=UNIT CPUQuotaPerSecUSec=1s IOWeight=20 MemoryHigh=N MemoryMax=N Nice=N Policy=TS` | The scope's limits as systemd applied them, and the daemon's nice level and scheduling class |
 | `backfill_seconds=S` | Seconds from start until every migration was complete |
 | `end_utc=TIME` | Clock time when every migration was complete |
 | `live_records=N counts=exact\|pending` | `live_records` and `counts` from the final status |
+
+### Measure the online migration with intake and traffic
+
+The schema 69 gate measured its backfill with no intake and no queries: 2,614
+pages in 7,914 s, about 3.0 s per page. Live on 2026-11-07, with intake,
+watches and queries, the same backfill ran at more than 16 s per page, status,
+records and sparql were cut off at 60 s, and katamari publications expired.
+`deploy/verify-backup.sh --measure-migration --with-traffic --image DAEMON
+BACKUP` measures the backfill the way the live store runs it. `BACKUP` is an
+online backup set, `BACKUP_ROOT/sets/ID`. The measured copy and the query-only
+prep copy are each restored from it with the image's `--restore-backup`, so
+the scratch filesystem needs twice the set's `engine_bytes` plus 10 GiB. The
+daemon runs under the same user scope, limits and nice level as above.
+
+- The image opens the copy with `sparrowd --private-intake DIR`. That is a
+  writable daemon with its watches and its own ingest socket, for a disposable
+  copy only. Every watch it opens or accepts is rebound to `DIR/NAME`, where
+  `NAME` is the final component of its stored root. The script creates each
+  root under the scratch directory, and the shipper's `intake_root/NAME`
+  layout feeds the same roots. The daemon refuses a `DIR` that is, holds or
+  lies under a watch's configured root, so a hand run on a live intake
+  directory is refused, and its catalog keeps naming the configured roots: a
+  watch mutation on the copy persists them, never the private ones. The mode
+  refuses `consume`, `syslog`, `rpc_tcp_address`, `archive` and `backup_root`
+  in its configuration (a copy never backs up); the ingest socket is
+  allowed and is the copy's own. Claims the copy journals for its original
+  roots never refuse the open and are never recovered: each recovery refuses a
+  claim bound to another root, and the watch reports it as its failure. The
+  startup line reports `query_only=false intake=private`. On the first status
+  answer the run fails (`FAIL private-intake`) unless every watch root is
+  under `DIR` and the ingest socket is the copy's. An image without
+  `--private-intake` in its usage line is refused before anything is restored.
+- Replay source: what the copy itself received in the hour before the
+  backup's `taken_utc`, so the replay needs no producer spool, reads no
+  producer directory, and covers every shipper rule. A `daily` file whose
+  modification time is its last append, after the window, and a `sealed`
+  segment whose manifest decides when it ships, are replayed as the store
+  received them, not by their file times. Every artifact received in the
+  window is read once, before the run, from a separate query-only prep copy,
+  a second restore of the set, so the measured open is still the copy's
+  first. An artifact whose source is
+  a watch's source replays into that watch's private root, released at its
+  recorded receipt offset. When `BACKUP/config/sparrow/ship.toml`, the set's
+  copy of `/etc/sparrow/ship.toml`, has a source named
+  after the root, as live, the item goes through a scratch producer directory
+  and `deploy/libexec/sparrow-ship` ships it into the root with a scratch
+  configuration, the live budgets and a scratch state, 300 s after each
+  completed run, as `sparrow-ship.timer` does. Each scratch source is
+  `settled` with no settle time, because what it replays is what the live
+  shipper already found finished. A watch with no shipper source has its item
+  placed in its root directly. Any other artifact, a direct producer's, is
+  re-sent over the copy's ingest socket at its recorded offset; live it
+  arrived over the ingest socket or TCP, and the copy has only the socket.
+  Syslog artifacts are skipped, since the mode refuses the listener. Both
+  replays loop over the window for the whole backfill, each later cycle under
+  new file names and request IDs. Nothing is read from or written to the live
+  intake roots, sockets, store, shipper state or producer directories; each
+  is a guarded path the scratch directory must not lie under.
+- Replay checks, before the measured open: the run fails (`FAIL prep`) when a
+  `ship.toml` source names no watch root (no watch root ends in that name),
+  when a `ship.toml` source's watch received nothing in the window, or when
+  the window holds nothing at all. `SPARROW_MEASURE_REPLAY_SECONDS` (3600 to
+  86400) widens the window for a source whose deliveries one hour does not
+  hold.
+- Traffic: `status`, `records` (received in the last hour, 100 rows) and
+  `sparql` (record sources received in the last hour, 100 rows) each start
+  every 30 seconds, from the first status answer until the backfill ends. A
+  call that outlasts its period skips the ticks it covered. A call still
+  running at the end finishes and is counted, and one still running after 600
+  seconds is killed and counted failed.
+
+The extra `MEASURE` lines:
+
+| Line | Meaning |
+| --- | --- |
+| `replay source=NAME via=ship\|direct\|socket artifacts=N bytes=N skipped=N` | Per source, what the window holds to replay: a watch root through the shipper or placed directly, or a socket source; `skipped` has no ingestible origin |
+| `replay watch_artifacts=N socket_artifacts=N window_from=T window_before=T` | The saved items in the window |
+| `prep_seconds=S` | Seconds spent preparing the replay, before the measured open |
+| `backup_live_records=N counts=exact source=backup-image\|prep-query-only` | The backup's own record count, before any replay (below); `backup_live_records=pending counts=pending source=none` when no exact count exists |
+| `pages migration=NAME pages=P seconds=S pages_per_second=R` | Each migration, from the previous completion, or the start, to its own; ` shared_poll=A,B shared_pages=P` follows when migrations were first seen complete at the same poll, and the rate is then theirs together |
+| `pages overall pages=P seconds=S pages_per_second=R` | Every page over the backfill seconds |
+| `replay_added=N since_utc=T` | Records the copy received since the load started, all of them replayed |
+| `live_records=N counts=exact\|pending` | The copy's record count at the end, replay included |
+| `watch_claims_completed=N` | Claims the copy's watches completed since the first status |
+| `watch_claims_refused=N` | Claim reservations the daemon refused (`reservation refused` lines in its log) |
+| `watch_intake watch=NAME via=ship\|direct\|none released=N due=N completed=N inflight_allowance_seconds=S` | Per watch: the items released to it, those released before the final status less its in-flight allowance (due), and the claims it completed since the first status; `via=none` is a watch the window gave nothing to replay, so its due count is 0 |
+| `rpc kind=KIND calls=N failed=N over_60s=N p50=S p95=S max=S` | Latency of `status`, `records`, `sparql` and the replayed `ingest` calls |
+| `replayed via=watch\|socket source=NAME released=N failed=N` | Per source, the items released into a root or the shipper, or sent to the socket |
+| `replay watch_items_released=N release_failures=N socket_ingests=N cycles=N ship_runs=N ship_failures=N ship_held_back=N ship_run_max_seconds=S` | What the replay did; `ship_held_back` counts the distinct items a shipper run left queued because the roots were over `max_pending_bytes` |
+| `publication_deadline_expiries=N` | Consume publications that hit their 45-second deadline, from the daemon's log |
+| `gate name=NAME value=V threshold=T margin=M verdict=PASS\|FAIL` | One line per gate threshold below; a positive margin passes |
+
+Page counts come from the daemon's `sparrowd: migration` lines, timed at the
+15-second status poll that first sees them, so a migration's seconds are
+accurate to one poll. The backfill ends at the first poll that sees every
+migration complete, and `backfill_seconds` keeps its meaning.
+
+`backup_live_records` is what a store of the backup's size holds, to compare
+with live's count. It is read before anything is replayed by the image the
+backup records (the set's `images/`), query-only on the prep copy: that image
+neither migrates nor expires, so its count is the store's as it was taken. A
+newer image can upgrade the prep copy and report its counts pending, so the
+backup's image opens it first. When that image is missing or also reports
+pending, the measured image's answer on the same prep copy, also query-only,
+counts if its counts are exact. Otherwise the line says pending: a count taken
+while the store counters seed covers only the records below the seeding
+watermark, so it is never printed as the backup's. The writable copy never
+supplies it, because its maintenance worker may run an expiry pass before its
+first answer.
+`replay_added` counts, page by page, the records received since the load
+started. No record of the backup was received that late, so all of them are
+the replay's. The final `live_records` includes them and lacks any backup
+record retention expired during the run.
+
+The gate thresholds, which the script enforces:
+
+- `first_status_seconds`: the first status answer within 600 seconds, the
+  switch's own gate.
+- `pages_per_second`: at least 0.125 migration pages per second over the
+  backfill, 8 seconds per page. The floor rejects the failed live backfill
+  (over 16 s per page). It is about 38 percent of the schema 69 copy without
+  traffic (0.33 pages per second), which leaves the writers, served first,
+  their share. At the floor a 2,614-page backfill ends within 5.8 hours,
+  inside one night before the 04:00 backup.
+- `rpc_calls_over_limit`: no call of 60 seconds or more, the connection lease
+  that cut calls off live. Its margin is 60 less the slowest call.
+- `rpc_calls_failed`: no failed call. A call that fails fast still means the
+  store did not serve it.
+- `traffic_answered`: `status`, `records` and `sparql` each answered at least
+  once, so a run without measured traffic cannot pass.
+- `publication_deadline_expiries`: none.
+- `replay_failures`: no item failed to release into the shipper or a root, no
+  shipper run failed, and no shipper run left an item queued because the roots
+  were over `max_pending_bytes`. This shows the replay delivered its items to
+  the roots, not that the watches consumed them; the next gates check that.
+- `watch_claims_refused`: no claim reservation refused by the daemon.
+- `watch_claims_completed`: at least one claim completed by the copy's
+  watches, so a run whose watch intake never reached the store cannot pass.
+- `watch_intake:NAME`, one per watch: the claims the watch completed since the
+  first status reach the items released to it before the final status less its
+  in-flight allowance. The allowance is the watch's `quiet_ms` from the copy's
+  status, plus the daemon's 45-second publication deadline (a compiled
+  constant, not configuration), plus, for a shipped watch, the ship interval
+  and the longest shipper run. A shipped part is within the shipper's split
+  limits and a direct item is one file, so one released item is at least one
+  claim. A tail watch's finished generations are claims too. A pending claim
+  the backup journals is not counted: its source is not in the empty private
+  root, so it cannot complete. Its margin is completed less due.
+- `socket_ingests_accepted`: at least one replayed socket ingest accepted
+  when any socket artifact was saved.
+
+When every gate passes the run exits 0. When the run completes and a gate
+fails it prints one `verify-backup: FAIL gate:` line per failed gate on
+standard error and exits 4. The failures of the plain mode still exit 1, and
+so do `FAIL prep`, when the replay cannot be prepared, `FAIL private-intake`,
+and `FAIL load`, when the load helper fails or exits before the backfill
+completes (it is checked at every poll). A load worker (one traffic kind, a
+replay or the shipper) that raises stops the helper, which exits 1, so the run
+never measures without that load. `SPARROW_MEASURE_GATE_FIRST_STATUS_SECONDS`,
+`SPARROW_MEASURE_GATE_RPC_SECONDS`,
+`SPARROW_MEASURE_GATE_PAGES_PER_SECOND` and
+`SPARROW_MEASURE_GATE_INFLIGHT_SECONDS`, a ceiling on each watch's in-flight
+allowance, may only tighten their gate.
+`SPARROW_MEASURE_REPLAY_SECONDS` may only widen the window, to a day.
+`SPARROW_MEASURE_SHIP_SECONDS` may only shorten the shipper interval, and
+`SPARROW_MEASURE_MIN_TRAFFIC_SECONDS` (up to 300) keeps the load running that
+long after the first status when the backfill ends sooner.
+
+`--rehearse-rollback` adds, after the measurement, the rollback rehearsal on
+the measured copy and scratch copies of it, with the measured image in every role and
+every watch rebound below the rehearsal's own directory (see "Claims after a
+rollback" below). A watch put on the copy feeds record batches through it, and
+`max_records` decides what each daemon can publish. A daemon claims a batch it
+cannot publish and stops, and a scratch copy of its stopped store stands in for
+the store a restore makes from a set taken at that point: the daemon takes
+online backups only to a network `backup_root`, so a scratch run cannot take
+one. A newer daemon publishes that batch, claims another it cannot publish,
+and stops. The restored daemon on the backup must refuse to start with
+"unrecognized private claim entry" (`PASS rehearsal-refusal`).
+`deploy/reconcile-inflight.sh inflight` must move the unknown entry back to
+its root under its batch name with the same inode (`PASS rehearsal-inflight`).
+After the restored daemon starts, `deploy/reconcile-inflight.sh missing` must
+re-ship the batch the newer store published and retire its claim
+(`PASS rehearsal-missing`). Any other outcome is `FAIL rehearsal`.
+
+The measurement target is an online set; a closed-store backup is never one
+(coordination, 2026-11-09). Before the D147 switch to online backups, the
+target is a set the online path takes from a test store with live intake, as
+the measurement's own test fixture builds it. After the switch it is the first
+real online set on the NAS. The `--image` image, the `--to` image of the
+switch, must be built from a revision with `--private-intake` and
+`--restore-backup`:
+
+```bash
+deploy/verify-backup.sh --measure-migration --with-traffic --rehearse-rollback \
+    --image ~/.local/libexec/sparrow/sparrowd-schema71-REV \
+    /net/synology/archives/sparrow/sets/ID
+```
 
 This deployment does not establish whole-corpus throughput, physical reclamation,
 restoration or full architecture acceptance. Current installed image and live
@@ -561,16 +879,16 @@ Until Sparrow issue #22 moves the live store to the system unit, it runs under
 the operator's old user unit, `sparrow.service` under `systemctl --user`. The
 system unit's scripts refuse that unit. `deploy/user-unit-upgrade.sh` switches
 it from one kept image pair to another and takes the named pre-upgrade backup
-in the stopped window:
+online, before anything stops:
 
 ```bash
-deploy/user-unit-upgrade.sh --from sparrowd-schema68-2aa56a9 --to sparrowd-schema70-REV
+deploy/user-unit-upgrade.sh --from sparrowd-schema68-2aa56a9 --to sparrowd-schema71-REV
 ```
 
 The live service runs `sparrowd-schema68-2aa56a9` since the schema 69 rollback,
-so the switch goes from schema 68 straight to schema 70. After it, the daemon
-refuses schema 69 clients as well as schema 68 ones; switch every CLI and
-producer to the schema 70 pair with it.
+so the switch goes from schema 68 straight to schema 71. After it, the daemon
+refuses schema 68, 69 and 70 clients, since it admits only its own schema;
+switch every CLI and producer to the schema 71 pair with it.
 
 Both arguments name daemon images under `~/.local/libexec/sparrow`. Each CLI
 image is the daemon's name with `sparrowd-` replaced by `sparrow-`, and the
@@ -587,22 +905,34 @@ Before anything changes it refuses unless all of these hold:
 - All four images are executable.
 - The `--to` pair matches `./bin` byte for byte.
 - The `--to` daemon carries `cap_net_bind_service`.
-- `server.toml` sets the ingest keys.
+- `server.toml` sets the ingest keys, and its `backup_root` equals
+  `SPARROW_BACKUPS` (default `/net/synology/archives/sparrow`): the backup never
+  goes to a local disk.
 - The store has copy-on-write off.
-- The backup directory is on the store's filesystem, which the reflink copy needs.
-- The store's filesystem has the store's size plus 10 GiB free.
 - No nightly backup is running.
 - The running daemon reports the `--from` schema.
+- Unless `--no-backup` is given, the running daemon reports a backup state other
+  than `unconfigured`.
 
 The capability is a prerequisite done by a human with root,
 `sudo setcap cap_net_bind_service=ep ~/.local/libexec/sparrow/IMAGE`; the
 script checks it with `getcap` and never runs `setcap`.
 
-It then stops both timers and waits for the shipper, stops the unit and checks
-that no `sparrowd` remains. Next it copies the closed store by reflink into a
-no-copy-on-write `pre-upgrade-FROM` and compares the file lists. The backup
-also keeps the old image pair, `server.toml`, `ship.toml` and a `SOURCE` file.
-Last, it switches the links and starts the unit.
+With the daemon still serving, it takes the pre-upgrade backup online through
+`sparrow-backup` and points `pre-upgrade-FROM` at the new set (a relative link
+to `sets/ID`), as `deploy/pre-upgrade-backup.sh` does for the system unit. Only
+then does it stop both timers and wait for the shipper, stop the unit, install
+the `LimitNOFILE` drop-in, switch the links and start the unit. Nothing stops
+for the backup; the unit stops only for the image switch itself.
+
+`--no-backup REASON` switches without a backup, for a running daemon that has no
+online backup (an image older than the backup operation, such as schema 68).
+`REASON` must not be empty, and the run logs it. Without the option, a daemon
+that lacks the backup makes the script refuse and name `--no-backup`. The script
+never takes a stopped copy instead, because no backup may stop the server. After
+`--no-backup` there is no store to restore the old format from, so a rollback
+can only go forward on `--to`. Take the first online backup as soon as status
+answers on the new image: `sparrow SOCKET backup`, and watch `status`.
 
 It waits up to 10 minutes, the switch gate, for the first status answer. The
 measured first open of schema 69 on a copy of the live store under the unit's
@@ -620,5 +950,63 @@ migration.
 `--help` gives the recovery for each failure point. A failure after the start
 leaves the `--to` daemon running with both timers stopped, and it may already
 have accepted ingest. The recovery goes forward first: wait for status, confirm
-the store identity and schema, then start the timers. A rollback restores the
-pre-upgrade backup and drops everything `--to` accepted.
+the store identity and schema, then start the timers. A rollback with a
+pre-upgrade backup stops the unit, points the links at `--from`, and restores
+into an empty `chattr +C` directory with an image that has the restore option:
+`TO --restore-backup BACKUPS ID STORE`, where `ID` is `backup_id` in
+`BACKUPS/pre-upgrade-FROM/SOURCE`. It drops everything accepted after the backup
+started. After `--no-backup` there is none: go forward. A rollback must then
+reconcile the consume claims, as below.
+
+### Claims after a rollback
+
+The schema 69 to 68 rollback of 2026-11-07 found two kinds of claim the
+restored store cannot settle by itself:
+
+1. The newer daemon claimed a file after the backup and moved it into its
+   root's `.sparrow-inflight/`. The restored catalog has no journal for it, so
+   the restored daemon exits at the end of each startup with "unrecognized
+   private claim entry; inspect and reconcile it without discarding its
+   bytes".
+2. The newer daemon published a file the backup still journals as claimed,
+   then removed it. The restored daemon reports "unpublished claimed source is
+   missing" for that claim and retries it every few seconds to 15 minutes,
+   and the watch reports that failure until the claim is retired. Recovery
+   needs the exact claimed file, inode and change time included, so no
+   recreated file can complete it.
+
+`deploy/reconcile-inflight.sh` handles both, asking the set-aside newer store
+what each claim was. Never delete an entry or a claim's bytes:
+
+1. Stop `sparrow.service` and both timers, set the newer store aside and
+   restore the backup, as `deploy/user-unit-upgrade.sh --help` describes. Keep
+   the set-aside store.
+2. Open the restored store with the old image and the set-aside store with the
+   newer image, each with `--query-only` on its own scratch configuration:
+   `query_only = true`, `data_dir`, a scratch `socket_path`,
+   `text_lexicon_dir` and the live budgets, with no `consume`, ingest socket,
+   TCP listener or archive. Query-only mode opens no root.
+3. `deploy/reconcile-inflight.sh inflight --restored OLD_CLI OLD_SOCKET
+   --newer NEW_CLI NEW_SOCKET`. For each consume root of the restored store,
+   it moves every entry of `ROOT/.sparrow-inflight/` that the restored
+   store's `ingest-get` does not know back to the root under the original
+   name the newer store records. The move is one link and unlink, so the
+   inode and bytes stay the same. It stops, moving nothing more, at an
+   entry neither store knows or whose original name is taken.
+4. Stop the restored query-only daemon and start `sparrow.service`.
+5. `deploy/reconcile-inflight.sh missing --restored OLD_CLI SOCKET --newer
+   NEW_CLI NEW_SOCKET`. For each watch whose failure names a claim with
+   "unpublished claimed source is missing", the newer store must record that
+   claim as published. Its artifact's bytes are read back from the newer
+   store and checked against the artifact's payload digest. They are then
+   renamed into the root as `NAME.reshipped.EXT`, a new file the watch
+   ingests, so the records the rollback dropped come back. Last, the claim is
+   retired with `sparrow SOCKET watch retire-claim` (schema 70 and newer). A
+   watch names one failing claim at a time, so rerun it until no watch
+   reports that failure. An old image without the command makes it exit 3
+   after re-shipping: the claim stays pending until a schema 70 image retires
+   it.
+6. Stop the newer query-only daemon and start both timers.
+
+`deploy/verify-backup.sh --rehearse-rollback` rehearses both cases on a copy
+(see "Measure the online migration with intake and traffic").

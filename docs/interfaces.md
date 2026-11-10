@@ -507,8 +507,7 @@ table rewrite reports `recompression` as `running`, but the rewrite never runs.
 The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
 at shutdown. Every daemon, query-only or not, logs
 `sparrowd: closed store=ID unique_payload_chunks=N` once its workers have stopped
-and its final flush has succeeded. A later shutdown error can still follow it, so
-`sparrow-backup` records that count only when the daemon then exited 0. Query captures use anonymous temporary files that leave no name
+and its final flush has succeeded. A later shutdown error can still follow it. Query captures use anonymous temporary files that leave no name
 behind.
 
 Schema 67 adds `Status.queryOnly`, true in this mode, and
@@ -530,6 +529,37 @@ with an error, as a normal daemon does. The startup line reports
 `query_only=false intake=false`. `deploy/verify-backup.sh --measure-migration`
 uses the mode; see [the deployment guide](deployment.md), "Measure the online
 migration".
+
+`sparrowd --config FILE --private-intake DIR` opens a disposable copy of a
+store writable with its maintenance worker and its watches. Every stored watch
+definition, and every definition `watchPut` accepts, is rebound to `DIR/NAME`,
+where `NAME` is the final component of its root, before any root opens; a root
+without a final component refuses the open, or the put with
+`INVALID_ARGUMENT`. So does a configured root that is `DIR`, lies under it or
+holds it: rebinding would then reach that root itself, or put the private
+roots inside a root another daemon consumes. Paths are compared canonically,
+and a configured root present on the host is also compared by device and
+inode with `DIR`, its ancestors and `DIR/NAME`, so a bind mount or other alias
+of the root is refused too. Two configured roots with one final component
+would share a private root, so they refuse the open, or the put with
+`INVALID_ARGUMENT`, naming both. Never point `DIR` at a live
+intake directory or its parent; the refusal covers the configured roots
+only, so use a fresh scratch directory. The rebinding is held in memory: a
+later watch mutation persists the configured roots, never the private ones,
+so the catalog keeps naming where its watches consume. A consume or
+tail claim bound to another root identity, such as the original root's, does
+not refuse the open in this mode and is never recovered: each recovery refuses
+a claim of another root, which becomes the watch's failure. An active tail
+generation of another root is never resumed, adopted or given a gap; a file
+under the private root that reuses its file identity is refused. The configuration
+may not set `consume`, `syslog`, `rpc_tcp_address`, `archive` or
+`backup_root`, and the refusal names the key; `ingest_socket_path` is allowed.
+A copy shares the live store's identity, so its online backup would land in
+the live backup root and purge its oldest sets. The mode cannot be
+combined with query-only mode. The startup line reports
+`query_only=false intake=private`. `deploy/verify-backup.sh --measure-migration
+--with-traffic` uses the mode; see [the deployment guide](deployment.md),
+"Measure the online migration with intake and traffic".
 
 ### Receipt-time event fallback (schema 69)
 
@@ -702,7 +732,12 @@ retired before this marker existed is marked at expiry's next visit to it, so it
 stops counting at the next expiry pass. This differs from the per-source `retained_records`, which count entries
 until they are deleted. `unique_payload_chunks` and `unique_json_projections` are the two row
 counts. `active_pins` reads the pin rows, which the pin caps bound, and
-`physical_bytes` measures the database directory, as before. A status read
+`physical_bytes` measures the database directory, except the files RocksDB
+no longer references (obsolete table and blob files and write-ahead logs below
+the oldest one recovery needs), which only an online backup holds for long. Flush and compaction
+output RocksDB does not reference yet is not counted either, so a large
+compaction can briefly occupy more than `disk_budget` on disk; the free-space
+floor still guards the filesystem. A status read
 therefore reads a fixed number of keys plus one per pin row, whatever the size
 of the store, seeding or not. The read handles each
 listing registry holds are counted from a ledger kept beside the registry and
@@ -857,7 +892,7 @@ so closing the store does not cancel it until its lease ends (at most 60 seconds
 the process exit ends it at once.
 
 The migration's duration on the live store is measured on a copy of the newest
-closed-store backup with `deploy/verify-backup.sh --measure-migration`, recorded
+online backup, restored by `deploy/verify-backup.sh --measure-migration`, recorded
 in [load qualification](load-qualification.md).
 
 ## 1. Common types and defaults
@@ -2330,6 +2365,8 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `keysList`, `valuesSearch`, `recordsSearch`, `recordsContext`, `sparqlQuery` | Shared native semantics, typed results, scope and query coverage; stored-text SPARQL relations remain required. |
 | `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume/tail administration; removal preserves existing claims and active tail generations guard definition changes/removal. |
 | `watchClaimRetire` | Administration (schema 70): retire one claim that can never complete, recording the authenticated caller, time and reason; see "Retiring an unrecoverable claim". |
+| `backup` | Administration (schema 70): start an online backup of the store into the configured `backup_root`; see "Online backup". |
+| `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim that went pending in a time window, with its history; see "Per-claim state listing". |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Schema 23 adds `discover`: store identity, schema version, native text/RDF profile
@@ -2839,14 +2876,122 @@ ownership journal supplies `removed_at`. Completed handoff lookup follows its
 existing finite retry lifetime. `watch_handoff_get` continues to certify the exact
 saved producer intent when that authority is needed.
 
+### Per-claim state listing (schema 71)
+
+Status reports only per-watch counts. `watchClaims` (CLI `watch claims
+[--since RFC3339] [--until RFC3339]`) lists claims one by one, so the zero-loss
+check after a write stall is one read: of the claims that went pending since T,
+how many completed, which are still pending and for how long, and whether any
+was abandoned. It is read-only: anonymous TCP and the ingest socket refuse it,
+and a query-only daemon serves it. The daemon reads its own store; the CLI
+never opens the store.
+
+Each claim journal keeps a history from schema 71 on: `first_seen`, the
+reservation time; `attempts`, one for each publication attempt that left the
+claim pending and one for the attempt that completed it; `last_attempt`; and
+`last_pending_at` with `last_pending_reason`, the time and error of the latest
+attempt that left it pending, such as the 45-second consume publication
+deadline. The reason is cut to 320 encoded bytes. The history moves with the
+journal when the claim completes or is retired. A journal reserved by an
+older binary has no `first_seen` and counts only the attempts made since.
+Reserving a source now refuses a journal that would leave less than 448
+bytes of its 8 KiB for this history.
+
+A claim is `pending` while it is in the active recovery set, `complete` once
+its publication and source removal are recorded, and `abandoned` once an
+administrator retired it unrecoverable. The listing returns every pending
+claim, every complete claim whose `last_pending_at` falls in the window, and
+every abandoned claim whose `last_pending_at` or retirement falls in it. A
+claim that completed on its first attempt never went pending and is not
+listed. A completed journal reserved before schema 71 has no history, so
+whether it went pending is unknown; it is listed when its completion falls in
+the window, so a window from before the upgrade can still show its claims
+complete. The window is inclusive Unix milliseconds; `--since` defaults to the
+epoch and `--until` to the daemon's current time. Completed claims are kept
+for the two-day retry window, so a window reaching further back can miss
+them. One snapshot is read without the writer lock. More than 2048 matching
+claims refuse with `RESOURCE_LIMIT` rather than return a partial list.
+
+The CLI prints `as_of`, `since`, `until`, the `listed`, `pending`,
+`complete` and `abandoned` counts, and `claims`. Each claim has `claim_id`,
+`watch`, `state`, `relative_path_hex`, `first_seen`, `age_ms` (from first
+seen to `as_of`, pending claims only), `attempts`, `last_attempt`,
+`last_pending_at`, `last_pending_reason` and `finished_at`, the completion or
+retirement time. Absent times are null.
+
+```sh
+sparrow SOCKET watch claims --since 2026-11-09T00:00:00Z
+```
+
+### Online backup
+
+`backup(storeId)` (CLI `sparrow SOCKET backup`, which takes the store id from
+discovery) starts one backup of the store into the daemon's `backup_root` and
+returns at once with the running `BackupStatus`; `status` reports the outcome.
+It is an administration operation: the ingest socket and anonymous TCP refuse
+it as they refuse other non-producer operations. Nothing is stopped, paused or
+drained. The backup runs on one thread named `sparrow-backup` at nice 19 (the
+kernel derives the lowest best-effort I/O priority from it, which the BFQ
+scheduler honors), and it holds a clone of the database handle the
+unlocked readers share, never the writer lock. RocksDB's `BackupEngine`,
+opened in `BACKUP_ROOT/engine` with one background operation and sync on,
+disables obsolete-file deletion for the copy, lists the live table, manifest
+and write-ahead log files (writing the log buffer to the operating system
+without a sync) and copies them. No memtable is flushed. The daemon then
+checks the file sizes of the new backup and purges the oldest backups beyond
+`backup_keep`. Table files are shared between backups, so every backup after
+the first copies only the tables written since. While a backup runs, RocksDB keeps
+the files that become obsolete until the copy ends. The held files do not count toward `physical_bytes`, the disk budget or eviction, so a backup never refuses a write or evicts evidence. A guard thread at the daemon's normal priority, which never touches the backup root, measures free space every 250 ms; once it falls below twice `min_free_bytes`, the guard re-enables file deletions, RocksDB deletes the held files at once, and the backup fails if it still needed one. A backup stalled on an unresponsive NAS therefore never brings ingest to the free-space floor. Records
+accepted after the engine lists the files are not in the backup.
+
+`BACKUP_ROOT/STORE_ID` binds a root to one store; the operation refuses a root
+that names another. A daemon that shuts down during a backup abandons it, and
+the engine discards the partial files at its next open of the root.
+
+Configuration keys in the server file:
+
+| Key | Contract |
+| --- | --- |
+| `backup_root` | Optional path. Startup checks only the path and refuses a relative one, one with `.` or `..`, and one inside or containing `data_dir`; it never touches the root, so a daemon that starts before the NAS is mounted still serves its intake. Every backup then judges the root on its own thread, before it creates anything and again on the canonical path: the filesystem must be `nfs`, `nfs4`, `cifs` or `smb3` and not the store's (device number), read from `/proc/self/mountinfo` by the longest mount prefix. A local root fails the backup (phase `failed`, `failure` naming the root and its filesystem type) and creates nothing there. Sparrow never backs up to a local disk. |
+| `backup_keep` | Backups the engine keeps; default 3, at least 1. |
+
+`Status.backup` is a `BackupStatus` with `phase` (`unconfigured`, `idle`,
+`running`, `complete` or `failed`), `root`, `keep`, `startedAt`, `finishedAt`,
+`backupId`, `files`, `bytes` and `failure`. The phase is `unconfigured` under
+`--no-intake` or `--query-only`, and without `backup_root`. `--private-intake`
+refuses to start with `backup_root` set, so its phase is always `unconfigured`. Times are Unix
+milliseconds, 0 until set; `backupId`, `files` and `bytes` are 0 until a backup
+completes. The state is the latest backup since the daemon started. CLI and MCP
+status render the object as `backup` with `phase`, `root`, `keep`,
+`started_at` and `finished_at` (RFC 3339 or null), `backup_id`, `files`,
+`bytes` (a decimal string) and `failure`; `sparrow SOCKET backup` prints the
+same object in the running state.
+
+Refusals:
+
+| Condition | Error |
+| --- | --- |
+| Query-only daemon | `READ_ONLY` (the write gate) |
+| `--no-intake` or `--private-intake` daemon (it serves a copy; `backup_root` refuses a private-intake startup) | `UNSUPPORTED` |
+| No `backup_root` configured | `UNSUPPORTED` |
+| A backup is already running | `CONFLICT` |
+| `storeId` is not this store | `STORE_MISMATCH` |
+| Ingest socket or anonymous TCP | Refused like other non-producer operations |
+
+Restore is offline: `sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID]
+EMPTY_DIR` restores the backup (the latest when the id is omitted) into an
+empty or absent directory, never into a store, and checks every file's
+checksum as it reads it. `deploy/libexec/sparrow-backup` wraps this operation
+for the nightly unit; see [the deployment guide](deployment.md), "Online
+backups".
+
 ### Retiring an unrecoverable claim
 
 A consume claim whose source moved into the private `.sparrow-inflight/`
 directory and then vanished before publication can never complete: recovery
 needs that exact claimed generation and never republishes a replacement. It
-stays in `pending_claims`, its watch's `failure` names the claim and reads
-"unpublished claimed source is missing", and `sparrow-backup`, which waits for zero pending claims,
-fails every night. `watchClaimRetire` (CLI `watch retire-claim WATCH_ID
+stays in `pending_claims` and its watch's `failure` names the claim and reads
+"unpublished claimed source is missing". `watchClaimRetire` (CLI `watch retire-claim WATCH_ID
 CLAIM_ID REASON`, MCP `watch_claim_retire`) lets an administrator retire such a
 claim. It is an admin operation: anonymous TCP and the ingest socket refuse it,
 and a query-only daemon refuses it as a write. The watch's own claim owner

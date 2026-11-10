@@ -23,16 +23,18 @@ lives.
 | `MANUAL.md` | Running the daemon by hand without systemd, with the unit's environment. |
 | `install.sh` | Idempotent install of everything below onto the host; prints what changed. |
 | `uninstall.sh` | Undoes `install.sh`'s host changes so the old user unit can serve `/SPARROW` again. |
-| `pre-upgrade-backup.sh` | Takes the named backup `restart.sh` requires before raising the schema. |
+| `pre-upgrade-backup.sh` | Runs one online backup and names it, as the backup `restart.sh` requires before raising the schema. |
 | `user-unit-upgrade.sh` | Switches the old user unit's image with its pre-upgrade backup, and installs its `LimitNOFILE` drop-in (`systemd/user/sparrow.service.d/limits.conf`), until #22 retires that unit. |
 | `start.sh`, `stop.sh`, `restart.sh` | The lifecycle scripts; `restart.sh --rollback` swaps back. |
 | `check.sh` | Post-deploy verification. |
 | `test-instance.sh` | A disposable unprivileged test instance for rehearsing the scripts. |
+| `verify-backup.sh` | Verifies an online backup set on a restored scratch copy, and measures the online migration on it (`--measure-migration`), with replayed intake and query traffic under `--with-traffic`. |
+| `reconcile-inflight.sh` | Reconciles consume claims after a rollback restores an older store (`docs/deployment.md`, "Claims after a rollback"). |
 | `lib.sh` | Code shared by the scripts above. |
-| `systemd/` | `sparrow.service`, `sparrow-ship.{service,timer}`, `sparrow-backup.{service,timer}`. |
+| `systemd/` | `sparrow.service`, `sparrow-ship.{service,timer}`, `sparrow-backup.{service,timer}`; under `user/`, the interim user units: the `LimitNOFILE` drop-in and `katamari-journal-spool.service` and `katamari-manager-spool.service`. |
 | `apparmor/sparrow` | The daemon's AppArmor profile, enforce mode. |
 | `config/` | Templates: server, shipper, watch, sysusers and tmpfiles configuration. |
-| `libexec/` | `sparrow-ship` (the shipper) and `sparrow-backup` (closed-store backups). |
+| `libexec/` | `sparrow-ship` (the shipper), `sparrow-backup` (the online backup client), `katamari-journal-spool` and `katamari-manager-spool` (the Katamari journal forwarders, `docs/deployment.md`, "Katamari's journal in the spool") and `sparrow-measure-load` (the replay and traffic load of `verify-backup.sh --with-traffic`). |
 | `evidence/` | Verification records for this deployment (security exposure, rehearsal, lifecycle, AppArmor, credentials). |
 
 The units are the source of truth. The scripts are thin wrappers over them
@@ -57,20 +59,31 @@ Patrick's decisions for this deployment, 2026-11-01:
   Fleet producers ingest through the ingest-only group socket of Sparrow
   issue #10 (Forgejo `fleet/sparrow`), never the private socket; this
   directory does not implement it.
-- The NAS archive (`/net/synology/archives/sparrow`) is the backup. Its worker
-  is not deployed and nothing here grants its path; Sparrow issues #15 to #17
-  add it.
+- The NAS archive (`/net/synology/archives/sparrow`) is the backup, and the
+  only one: Sparrow never backs up to a local disk (Patrick, 2026-11-08:
+  "Sparrow and katamaria are FORBIDDEN from backing up to local disks").
+  The daemon writes its online backups there (`backup_root` in `server.toml`),
+  and `sparrow-backup.service` adds the files beside the store. The client
+  refuses such a root before it asks the daemon, and the daemon fails the
+  backup, creating nothing there, if its root is not on a network filesystem
+  or shares the store's filesystem. Startup does not touch the root, so a
+  daemon that starts before the NAS is mounted still serves. No backup stops, pauses or drains the
+  service (Patrick, 2026-11-08: "Backup may not: stop the server, pause the
+  server, or in any way perturb the ingestion."). The daemon's archive worker, which will write
+  its own per-store directories under the same root, is not deployed; Sparrow
+  issues #15 to #17 add it.
 - Restarts of the live service are approved and announced by the coordination
   session.
 
 ## Layout
 
 Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"). `install.sh`
-sets the btrfs no-copy-on-write attribute on `/SPARROW/store` and `/SPARROW/backups` while they
-are empty, so every file created in them inherits it. `restart.sh` rewrites a closed store that
+sets the btrfs no-copy-on-write attribute on `/SPARROW/store` while it is empty, so every file
+created in it inherits it. `restart.sh` rewrites a closed store that
 still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keeps the original
-beside it as `store.cow-STAMP`; remove that copy once a backup of the converted store has verified. Every backup, verification and restore copy takes its source's
-attribute, because btrfs refuses a reflink between the two kinds of file. The store gives up
+beside it as `store.cow-STAMP`; remove that copy once a backup of the converted store has verified. Backups
+are RocksDB backup files on the NAS, and the verification and restore copies made from them go into a
+no-copy-on-write directory. The store gives up
 btrfs checksums and compression; its own digests and compression cover both.
 
 | Path | Owner, mode | Contents |
@@ -80,6 +93,7 @@ btrfs checksums and compression; its own digests and compression cover both.
 | `/usr/local/libexec/sparrow/sparrow` | link | The matching CLI image; `sparrow.previous` is the rollback. |
 | `/usr/local/bin/sparrow` | link | The CLI on `PATH`, through the link above. |
 | `/usr/local/libexec/sparrow/sparrow-ship`, `sparrow-backup` | root, 0755 | The timers' helpers, from `libexec/`. |
+| `/usr/local/libexec/sparrow/katamari-journal-spool`, `katamari-manager-spool` | root, 0755 | The forwarders' scripts, for the operator to copy to `~/.local/libexec/sparrow/`; their unit files are under `/usr/local/share/sparrow/user-units/`. |
 | `/usr/local/share/sparrow/lexicons-PURRDF_REV/` | root, 0755 | The five native CBOR lexicons; `PURRDF_REV` is the full PurRDF commit the images were built against. |
 | `/usr/local/share/doc/sparrow/deploy/` | root, 0644 | Copies of these documents and of `evidence/`. |
 | `/etc/sparrow/server.toml` | root:sparrow, 0640 | The daemon's configuration. |
@@ -90,7 +104,7 @@ btrfs checksums and compression; its own digests and compression cover both.
 | `/SPARROW/store` | sparrow, 0710, no copy-on-write (`C`) | The store and `rpc.sock` (0660). |
 | `/SPARROW/intake/NAME` | the operator who made it (plain `mkdir`; the cutover gives existing roots to `sparrow`), 0770, ACL `group:sparrow:rwx` | One consume root per watch. |
 | `/SPARROW/ship` | paudley:sparrow, 2700 | The shipper's queue, staging, ledgers and lock. |
-| `/SPARROW/backups` | root, 0700, no copy-on-write (`C`) | Closed-store backups: three daily `STAMP` copies, and the named `pre-upgrade-IMAGE` copies, which the rotation never prunes. |
+| `/net/synology/archives/sparrow` | on the NAS (NFSv4), 0700; create it before the first backup | Online backups: `engine/` (the RocksDB backup engine's files, shared between backups, the newest `backup_keep` kept), `STORE_ID`, `.lock`, `sets/ID` (the image pair, lexicons, configuration and intake beside engine backup `ID`, each with `SOURCE` and a `MANIFEST.b3`), and the `pre-upgrade-IMAGE` links to a set. Nothing local holds a backup. Create the root once, owned by the daemon's user. |
 | `/etc/systemd/system/sparrow*.{service,timer}` | root, 0644 | The units, from `systemd/`. |
 | `/etc/apparmor.d/sparrow` | root, 0644 | The profile, from `apparmor/`. |
 | `/etc/sysusers.d/sparrow.conf`, `/etc/tmpfiles.d/sparrow.conf` | root, 0644 | The user, group and layout, from `config/`. |
@@ -111,7 +125,8 @@ device as `/home`. Filling `/home` still fills `/SPARROW`
   `sparrow --secret-file PATH tcp://ADDRESS:518 COMMAND`. The operator's copy is
   `~/.config/sparrow/tcp.secret`.
 - `sparrow-backup` copies `/etc/sparrow`, so each backup under
-  `/SPARROW/backups` holds the secret; those directories are root-only.
+  `/net/synology/archives/sparrow` holds the secret; those directories are
+  mode 0700, and anyone with root on the NAS can read them.
 - Custody: the secret is generated on the host, never committed, never kept in
   this directory, and never passed on a command line. Rotating it means
   replacing the file, restarting the service and replacing every remote copy.
@@ -173,7 +188,8 @@ priority, but with OOM score adjustment -500: under the specification's
 OOM ranking (section B, 2026-11-02) a helper is less protected than the
 service it serves, so a host OOM caused by a copy job kills the job. They are
 bounded too: the shipper at 512 MiB, 64 tasks and half a CPU, the backup at
-1 GiB, 64 tasks and one CPU.
+1 GiB, 64 tasks and one CPU. The daemon's own backup thread runs at nice 19, with the lowest best-effort
+I/O priority under the BFQ scheduler.
 
 ## From a scratch clone to a running service
 
@@ -183,7 +199,7 @@ Commands prefixed with `sudo` need root.
 ### 1. Host prerequisites
 
 - Linux with systemd 256 or newer, AppArmor enabled (`aa-enabled` prints
-  `Yes`) and cgroup v2. btrfs is preferred, because images, backups and the
+  `Yes`) and cgroup v2. btrfs is preferred, because images and the
   shipper's copies are reflinks.
 - Packages: `git` 2.54 or newer (for `make install-hooks`), `tar`, `capnp` (Cap'n Proto compiler), `python3` 3.11 or
   newer, `util-linux` (`flock`, `setpriv`), `acl`, `apparmor`, a C/C++ compiler
@@ -260,7 +276,11 @@ sudo stat -c '%U %a' /etc/sparrow/tcp.secret
 
 Expect `root 600`. Then edit `/etc/sparrow/server.toml`: replace `REV` in
 `text_lexicon_dir` with the installed bundle's suffix (`ls
-/usr/local/share/sparrow`), and review the budgets. For a restored host, take
+/usr/local/share/sparrow`), and review the budgets. The template sets the online
+backup (`backup_root = "/net/synology/archives/sparrow"`, `backup_keep = 3`);
+create that directory on the NAS, owned by the daemon's user. Startup checks
+only the path; the daemon fails a backup whose root is not on a network
+filesystem or shares the store's (docs/interfaces.md, "Online backup"). For a restored host, take
 the configuration from the backup instead (RECOVERY.md, "Restore from a
 backup").
 
@@ -323,48 +343,55 @@ sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://SERVER_ADDRESS:518 stat
 
 ## Upgrades and rollback
 
-Build, then take a named closed-store backup of the store as the current image
+Build, then take a named online backup of the store as the current image
 left it, then switch images:
 
 ```bash
 git pull && make check && make install-bin
-sudo systemctl stop sparrow-ship.timer
 sudo deploy/pre-upgrade-backup.sh && sudo deploy/restart.sh && sudo deploy/check.sh
-sudo systemctl start sparrow-ship.timer
 ```
 
-`pre-upgrade-backup.sh` runs `sparrow-backup.service` once and stops at the
-first failure. While the daemon runs, the service copies the configuration
-and the image pair that last opened the store. It then stops the daemon
-through its drain, copies the store and intake, and starts it again. Its `SOURCE` records that image (`image=`), the
-store's identity, schema and format, and `taken_utc`. The script accepts only
-the backup this run took, with `taken_utc` at or after its own start and
-`image=` equal to the current image, and renames it to
-`/SPARROW/backups/pre-upgrade-CURRENT`, which the three-day rotation never
-prunes. It refuses if that name already exists, as it does after a restore of
-it: rename the old copy first, for example
-`sudo mv -T /SPARROW/backups/pre-upgrade-CURRENT /SPARROW/backups/pre-upgrade-CURRENT.retired-STAMP`.
-Remove a pre-upgrade copy by hand once the upgrade is settled.
+`pre-upgrade-backup.sh` refuses unless the daemon is running, then runs
+`sparrow-backup.service` once and stops at the first failure. Nothing is
+stopped, paused or drained: the client asks the running daemon to back up its
+store with RocksDB's backup engine into `backup_root` on the NAS, then copies
+the image pair that last opened the store, the lexicon bundle, the
+configuration and the intake beside it as `sets/ID`, and verifies the set
+against its `MANIFEST.b3` read back from the NAS. The set's `SOURCE` records
+that image (`image=`), the store's identity, schema and format, and
+`taken_utc`, the instant the daemon started the backup. The script accepts only
+the set this run took, with `taken_utc` at or after its own start and `image=`
+equal to the current image, and links
+`/net/synology/archives/sparrow/pre-upgrade-CURRENT` to it (a relative link,
+`sets/ID`). The engine keeps the newest `backup_keep` backups, so the link
+serves the upgrade it was taken for: after `backup_keep` more backups (three
+nightly runs by default) the engine purges that backup, the client removes its
+set and the link dangles, which ends the window for a rollback to the old
+format. Remove the link by hand once the upgrade is settled. It refuses if that name already exists, as it does after a restore of
+it: rename the old link first, for example
+`sudo mv -T /net/synology/archives/sparrow/pre-upgrade-CURRENT /net/synology/archives/sparrow/pre-upgrade-CURRENT.retired-STAMP`.
+The shipper keeps running throughout, and files consumed between the backup's
+start and the intake copy are in neither the store nor the set.
 
 `restart.sh` installs and verifies the newest pair while the old daemon still
 runs, records the store identity, stops through the drain, points the links at
 the new pair (the old pair becomes `.previous`), starts, and fails unless the
 store identity is unchanged. `sudo deploy/restart.sh --rev REV` selects another
 kept pair; `sudo deploy/restart.sh --rollback` swaps back to the previous pair.
-`start.sh` and `restart.sh` hold the backup's lock (`/SPARROW/backups/.lock`)
-while they run, and refuse while a backup holds it, so a backup and an image
-switch never interleave.
+`start.sh` and `restart.sh` hold the backup root's lock
+(`/net/synology/archives/sparrow/.lock`) while they run, and refuse while a
+backup holds it, so a backup client and an image switch never interleave.
 
 A newer image may upgrade the store's format, and an older image then refuses
 to open it. The scripts enforce this by the schema number in the image names
 (`sparrowd-schemaN-REV`), not by reading the store: `start.sh` and `restart.sh`
 refuse an image with a lower number than the current one, and refuse one with
-a higher number unless `/SPARROW/backups/pre-upgrade-CURRENT` exists, names
+a higher number unless `/net/synology/archives/sparrow/pre-upgrade-CURRENT` exists, names
 the current image and is fresh. Fresh means two things:
 
-- its `taken_utc` is at or after the time the image link was last set (every
-  start and restart sets it, a restore's start included), so a copy older
-  than a restore is refused;
+- its `taken_utc` (RFC 3339) is at or after the time the image link was last
+  set (every start and restart sets it, a restore's start included), so a copy
+  older than a restore is refused;
 - it was taken within the last 24 hours (`SPARROW_PRE_UPGRADE_MAX_HOURS`).
 
 The store's actual format is `store_format` in the daemon's
@@ -374,6 +401,44 @@ it (RECOVERY.md, "Restore from a backup").
 
 `sudo deploy/stop.sh` stops the service through the drain and reports what it
 still held.
+
+### Interim user unit
+
+While the live store runs under the operator's old user unit,
+`deploy/user-unit-upgrade.sh --from FROM --to TO` switches images and takes the
+pre-upgrade backup online first, while the daemon still serves, whenever the
+running daemon's status reports a backup state other than `unconfigured`.
+`--no-backup REASON` (a nonempty reason, which the run logs) skips it. Without
+the option, a daemon that lacks the backup makes the script refuse and name
+`--no-backup`. After `--no-backup` there is no store to restore the old format
+from, so a rollback can only go forward; take the first online backup as soon
+as `sparrow SOCKET status` answers on the new image.
+
+The user unit `~/.config/systemd/user/sparrow-backup.service` is not in the
+repository. It must carry these lines, with no `ExecStopPost` and no `flock`:
+
+```ini
+[Unit]
+RequiresMountsFor=/net/synology/archives/sparrow
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/bin
+ExecStart=%h/.local/libexec/sparrow/sparrow-backup %h/.config/sparrow/server.toml /SPARROW/intake %h/.config/sparrow /SPARROW/ship
+TimeoutStartSec=6h
+```
+
+`PATH` gives the client the `sparrow` CLI link. `~/.config/sparrow/server.toml`
+must set `backup_root = "/net/synology/archives/sparrow"` and `backup_keep`;
+the root must exist, owned by the daemon's user, before the first run. An image
+without the online backup refuses to start with these keys, so when the running
+image predates them (the `--no-backup` switch), add them immediately before
+`user-unit-upgrade.sh` runs: the running daemon does not reread its
+configuration, and the script refuses unless they are set, so the new image
+starts with its backup configured. Remove them before any rollback to an image
+without the online backup. Install
+the repository's `deploy/libexec/sparrow-backup` as
+`~/.local/libexec/sparrow/sparrow-backup`, then run
+`systemctl --user daemon-reload`.
 
 ## Moving a running service
 
@@ -405,14 +470,14 @@ Moving from the old user unit to this system unit adds a change of owner and
 of the consume roots' location. The acceptance steps of Sparrow issue #22,
 the cutover's tracking issue, give that cutover in full; in outline: drain, re-point each watch under
 `/SPARROW/intake` while the old unit still runs (the system unit cannot reach
-`/home`), stop the old unit and disable it, take the named pre-upgrade backup
-of the closed store with the old image recorded in its `SOURCE` (the
-issue's step 5a), move the shipper's state to
+`/home`), take the named pre-upgrade backup online from the running old unit with the old image
+recorded in its `SOURCE` (the issue's step 5a; a daemon that cannot back up
+online needs `--no-backup`, and the backup never stops it), stop the old unit and disable it, move the shipper's state to
 `/SPARROW/ship`, give `/SPARROW/store` and the roots to `sparrow` with
 `chown -R`, run `install.sh`, then `start.sh` and `check.sh --store-id`. The
 issue's revert goes back to the user unit: `uninstall.sh` removes the system
 units, the profile, the tmpfiles entry and the CLI link, and returns `/SPARROW`
-to the operator; then the step 5a backup's store replaces the cutover store.
+to the operator; then a restore of the step 5a backup, when one was taken, replaces the cutover store.
 
 ## Test instance
 

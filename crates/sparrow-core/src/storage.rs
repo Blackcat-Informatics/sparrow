@@ -15,6 +15,7 @@ use rocksdb::{DB, IteratorMode, WriteBatch, WriteOptions};
 
 pub(crate) mod archive;
 mod artifact_rdf;
+pub(crate) mod backup;
 mod event_fallback_rdf;
 mod provenance_rdf;
 mod tracing_rdf;
@@ -505,6 +506,8 @@ struct Unlocked {
     /// Source and artifact listings still reading what the source-summary migration owes.
     source_builds: Mutex<source_read::Builds>,
     artifact_builds: Mutex<artifact_read::Builds>,
+    /// The one online backup slot (#156); a backup never takes the writer lock.
+    backup: backup::Slot,
 }
 
 /// One database owner. Clones share a serialized catalog writer.
@@ -1353,15 +1356,24 @@ impl Writer {
     }
 }
 
+/// The bytes the store occupies: every file under the database directory except
+/// the ones RocksDB no longer references. Obsolete table and blob files and
+/// write-ahead logs normally vanish as soon as they become obsolete; an online
+/// backup holds them until its copy ends (#156), and they must not count against
+/// the disk budget, or a backup would refuse writes and evict evidence. Table and
+/// blob files therefore count at most the bytes every family's versions still
+/// reference, and logs below the oldest one recovery needs do not count. The
+/// filesystem's free-space floor, which sees the held files, is guarded by the
+/// backup itself (backup::start).
 pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
     /// RocksDB deletes obsolete WAL and SST files while the walk runs. A file
     /// removed between listing and inspection no longer occupies space, so it
     /// counts as zero; only a missing database directory is a failure.
-    fn directory(path: &Path, root: &Path) -> Result<u64, Error> {
-        let entries = match std::fs::read_dir(path) {
-            Ok(entries) => entries,
+    fn entries(path: &Path, root: &Path) -> Result<Vec<(std::ffi::OsString, u64)>, Error> {
+        let listing = match std::fs::read_dir(path) {
+            Ok(listing) => listing,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && path != root => {
-                return Ok(0);
+                return Ok(Vec::new());
             }
             Err(error) => {
                 return Err(Error::new(
@@ -1370,8 +1382,8 @@ pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
                 ));
             }
         };
-        let mut size = 0_u64;
-        for entry in entries {
+        let mut sizes = Vec::new();
+        for entry in listing {
             let entry = entry.map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
@@ -1384,17 +1396,64 @@ pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
                 }
             };
             let bytes = if metadata.is_dir() {
-                directory(&entry.path(), root)?
+                total(&entries(&entry.path(), root)?)?
             } else {
                 metadata.len()
             };
-            size = size
-                .checked_add(bytes)
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "disk accounting overflow"))?;
+            sizes.push((entry.file_name(), bytes));
         }
-        Ok(size)
+        Ok(sizes)
     }
-    directory(db.path(), db.path())
+    fn total(sizes: &[(std::ffi::OsString, u64)]) -> Result<u64, Error> {
+        sizes.iter().try_fold(0_u64, |sum, (_, bytes)| {
+            sum.checked_add(*bytes)
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "disk accounting overflow"))
+        })
+    }
+    let property = |family: &rocksdb::ColumnFamily, name: &str| {
+        db.property_int_value_cf(family, name)?.ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                format!("RocksDB reports no {name} property"),
+            )
+        })
+    };
+    let mut referenced = 0_u64;
+    // Every family the database has: a family it lacks holds no table to count.
+    for family in FAMILIES.iter().filter_map(|name| db.cf_handle(name)) {
+        for name in [
+            "rocksdb.total-sst-files-size",
+            "rocksdb.total-blob-file-size",
+        ] {
+            referenced = referenced.saturating_add(property(family, name)?);
+        }
+    }
+    let oldest_log = db
+        .property_int_value("rocksdb.min-log-number-to-keep")?
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "RocksDB reports no rocksdb.min-log-number-to-keep property",
+            )
+        })?;
+    let mut tables = 0_u64;
+    let mut other = Vec::new();
+    for (name, bytes) in entries(db.path(), db.path())? {
+        let text = name.to_string_lossy();
+        if text.ends_with(".sst") || text.ends_with(".blob") {
+            tables = tables.saturating_add(bytes);
+        } else if !text
+            .strip_suffix(".log")
+            .and_then(|number| number.parse::<u64>().ok())
+            .is_some_and(|number| number < oldest_log)
+        {
+            // Everything but an obsolete write-ahead log, which recovery no longer reads.
+            other.push((name, bytes));
+        }
+    }
+    total(&other)?
+        .checked_add(tables.min(referenced))
+        .ok_or_else(|| Error::new("STORAGE_FAILURE", "disk accounting overflow"))
 }
 
 /// Every column family. Flushes and native maintenance checks cover all of them:
@@ -1436,7 +1495,7 @@ impl Store {
         let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
         let open_files = open_files::OpenFiles::from_process()?;
         let db = DB::open_cf_descriptors(
-            &table_options::database(open_files.max_open_files),
+            &table_options::database(open_files.max_open_files)?,
             path,
             table_options::descriptors(),
         )?;
@@ -1600,6 +1659,7 @@ impl Store {
                 recompression: recompression.published(),
                 source_builds: Mutex::default(),
                 artifact_builds: Mutex::default(),
+                backup: backup::Slot::default(),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -1652,6 +1712,31 @@ impl Store {
     #[must_use]
     pub fn open_phases(&self) -> &[OpenPhase] {
         &self.open_phases
+    }
+
+    /// Start an online backup into `target` on its own thread and return at once (#156). It
+    /// clones the database handle the unlocked readers share and never takes the writer lock,
+    /// so ingest, maintenance and reads continue throughout. A request while a backup runs is
+    /// refused with `CONFLICT`.
+    pub fn backup_start(
+        &self,
+        target: &backup::BackupTarget,
+        now: u64,
+    ) -> Result<backup::BackupStatus, Error> {
+        backup::start(
+            &self.unlocked.backup,
+            Arc::clone(&self.unlocked.db),
+            self.space.clone(),
+            self.id.to_string(),
+            target,
+            now,
+        )
+    }
+
+    /// The latest online backup since the store opened, without the writer lock.
+    #[must_use]
+    pub fn backup_status(&self) -> backup::BackupStatus {
+        self.unlocked.backup.status()
     }
 
     /// Return the immutable identity validated at open, without waiting for a writer.

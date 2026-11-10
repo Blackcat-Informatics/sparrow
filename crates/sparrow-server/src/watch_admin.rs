@@ -46,6 +46,10 @@ struct State {
 pub(crate) struct Catalog {
     state: State,
     raw: Option<Vec<u8>>,
+    /// Under `sparrowd --private-intake`, each private root and the configured root it
+    /// replaced; persistence writes the configured one, so a disposable copy never rewrites
+    /// where its catalog's watches consume.
+    configured: std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>,
 }
 
 pub(crate) enum Action {
@@ -397,18 +401,105 @@ impl Catalog {
                 receipts: Vec::new(),
             }
         };
-        Ok(Self { state, raw })
+        Ok(Self {
+            state,
+            raw,
+            configured: std::collections::BTreeMap::new(),
+        })
     }
 
     pub(crate) fn watches(&self) -> &[ManagedWatch] {
         &self.state.watches
+    }
+    /// Rebind every definition in memory, as `sparrowd --private-intake` does before any root
+    /// opens; REBIND returns the configured root it replaced. A later mutation persists the
+    /// configured roots, never the rebound ones. Two configured roots with one final name
+    /// would share a private root and only one of them could be persisted, so that refuses
+    /// the open and names both.
+    pub(crate) fn rebind_roots(
+        &mut self,
+        mut rebind: impl FnMut(&mut ConsumeWatch) -> Result<std::path::PathBuf, Error>,
+    ) -> Result<(), Error> {
+        for watch in &mut self.state.watches {
+            let configured = rebind(&mut watch.definition)?;
+            let private = watch.definition.root.clone();
+            if let Some(other) = self.configured.get(&private)
+                && *other != configured
+            {
+                return Err(Error::PrivateRootShared {
+                    first: other.clone(),
+                    second: configured,
+                    private,
+                });
+            }
+            self.configured.insert(private, configured);
+        }
+        Ok(())
+    }
+    /// Refuse a put of watch ID whose rebound root PRIVATE another watch already holds for a
+    /// different configured root: the two would consume one private root, and persisting
+    /// would lose one configured root.
+    pub(crate) fn admit_private_root(
+        &self,
+        id: &str,
+        private: &std::path::Path,
+        configured: &std::path::Path,
+    ) -> Result<(), sparrow_core::Error> {
+        let held = self
+            .state
+            .watches
+            .iter()
+            .any(|watch| watch.definition.id != id && watch.definition.root == private);
+        match self.configured.get(private) {
+            Some(other) if held && other != configured => Err(failure(
+                "INVALID_ARGUMENT",
+                Error::PrivateRootShared {
+                    private: private.to_owned(),
+                    first: other.clone(),
+                    second: configured.to_owned(),
+                },
+            )),
+            _ => Ok(()),
+        }
+    }
+    /// Record that PRIVATE replaced CONFIGURED for a put; returns the previous record.
+    pub(crate) fn remember_root(
+        &mut self,
+        private: std::path::PathBuf,
+        configured: std::path::PathBuf,
+    ) -> Option<std::path::PathBuf> {
+        self.configured.insert(private, configured)
+    }
+    /// Put back the record [`Self::remember_root`] replaced, after a refused put.
+    pub(crate) fn restore_root(
+        &mut self,
+        private: std::path::PathBuf,
+        previous: Option<std::path::PathBuf>,
+    ) {
+        match previous {
+            Some(configured) => self.configured.insert(private, configured),
+            None => self.configured.remove(&private),
+        };
     }
     pub(crate) fn needs_initial_commit(&self) -> bool {
         self.raw.is_none()
     }
 
     pub(crate) fn persist(&mut self, store: &Store) -> Result<(), Error> {
-        let next = toml::to_string(&self.state)
+        let mut state = self.state.clone();
+        let State {
+            watches, receipts, ..
+        } = &mut state;
+        for definition in watches.iter_mut().map(|watch| &mut watch.definition).chain(
+            receipts
+                .iter_mut()
+                .map(|receipt| &mut receipt.watch.definition),
+        ) {
+            if let Some(configured) = self.configured.get(&definition.root) {
+                definition.root = configured.clone();
+            }
+        }
+        let next = toml::to_string(&state)
             .map_err(|error| failure("STORAGE_FAILURE", error))?
             .into_bytes();
         store.watch_registry_replace(self.raw.as_deref(), &next)?;
@@ -444,6 +535,7 @@ impl Catalog {
                 Self {
                     state: self.state.clone(),
                     raw: self.raw.clone(),
+                    configured: self.configured.clone(),
                 },
                 receipt.watch.clone(),
                 true,
@@ -522,6 +614,7 @@ impl Catalog {
             Self {
                 state,
                 raw: self.raw.clone(),
+                configured: self.configured.clone(),
             },
             watch,
             false,
@@ -537,5 +630,53 @@ impl Catalog {
                     .any(|journal| journal.watch == watch.definition.id)
         });
         before != self.state.watches.len()
+    }
+}
+
+fn encode_clock(mut out: crate::sparrow_capnp::optional_instant::Builder<'_>, clock: Option<u64>) {
+    match clock {
+        Some(at) => out.init_value().set_unix_millis(at),
+        None => out.set_absent(()),
+    }
+}
+
+/// One claim listing on the wire: the window it answers and every listed claim.
+pub(crate) fn encode_claims(
+    mut out: crate::sparrow_capnp::watch_claims::Builder<'_>,
+    store: &str,
+    window: (u64, u64, u64),
+    claims: &[sparrow_core::ClaimListing],
+) {
+    use crate::sparrow_capnp::ClaimState as Wire;
+    let (as_of, since, until) = window;
+    out.set_store_id(store);
+    out.reborrow().init_as_of().set_unix_millis(as_of);
+    out.reborrow().init_since().set_unix_millis(since);
+    out.reborrow().init_until().set_unix_millis(until);
+    let mut rows = out.init_claims(claims.len() as u32);
+    for (index, claim) in claims.iter().enumerate() {
+        let mut row = rows.reborrow().get(index as u32);
+        let journal = &claim.journal;
+        let history = &journal.history;
+        row.set_claim_id(&journal.import_id);
+        row.set_watch(&journal.watch);
+        row.set_state(match claim.state {
+            sparrow_core::ClaimState::Pending => Wire::Pending,
+            sparrow_core::ClaimState::Complete => Wire::Complete,
+            sparrow_core::ClaimState::Abandoned => Wire::Abandoned,
+        });
+        row.set_relative_path(&journal.relative_path);
+        encode_clock(row.reborrow().init_first_seen(), history.first_seen);
+        encode_clock(row.reborrow().init_last_attempt(), history.last_attempt_at);
+        row.set_attempts(history.attempts);
+        encode_clock(
+            row.reborrow().init_last_pending_at(),
+            history.last_pending_at,
+        );
+        match &history.last_pending_reason {
+            Some(reason) => row.reborrow().init_last_pending_reason().set_value(reason),
+            None => row.reborrow().init_last_pending_reason().set_absent(()),
+        }
+        encode_clock(row.init_finished_at(), claim.finished_at);
     }
 }

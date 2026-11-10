@@ -38,6 +38,12 @@ pub(crate) enum Input {
         claim: String,
         reason: String,
     },
+    /// Every pending claim, and every completed or abandoned claim that went pending within
+    /// `since..=until` (Unix milliseconds; an absent end means now).
+    Claims {
+        since: u64,
+        until: Option<u64>,
+    },
 }
 
 impl Input {
@@ -92,6 +98,22 @@ impl Input {
                 expected: decimal_u64(&Value::from(expected.clone()))
                     .map_err(|error| invalid(error.to_string()))?,
             }),
+            [operation, options @ ..] if operation == "claims" => {
+                let (mut since, mut until) = (0, None);
+                for pair in options.chunks(2) {
+                    let [flag, value] = pair else {
+                        return Err(invalid("watch claims options take one value each"));
+                    };
+                    let at =
+                        sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?;
+                    match flag.as_str() {
+                        "--since" => since = at,
+                        "--until" => until = Some(at),
+                        _ => return Err(invalid(format!("unknown watch claims option: {flag}"))),
+                    }
+                }
+                Ok(Self::Claims { since, until })
+            }
             [operation, watch, claim, reason] if operation == "retire-claim" => {
                 Ok(Self::RetireClaim {
                     store: None,
@@ -101,7 +123,7 @@ impl Input {
                 })
             }
             _ => Err(invalid(
-                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp | watch retire-claim WATCH_ID CLAIM_ID REASON; zero revision creates a watch",
+                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp | watch retire-claim WATCH_ID CLAIM_ID REASON | watch claims [--since RFC3339] [--until RFC3339]; zero revision creates a watch",
             )),
         }
     }
@@ -230,6 +252,21 @@ impl Input {
                     .with("phase", "prepared")
                     .into())
             }
+            Self::Claims { since, until } => {
+                let mut call = client.watch_claims_request();
+                let mut query = call.get().init_query();
+                query.set_store_id(&discovery.store_id);
+                query.reborrow().init_since().set_unix_millis(*since);
+                match until {
+                    Some(at) => query.init_until().init_value().set_unix_millis(*at),
+                    None => query.init_until().set_absent(()),
+                }
+                let response = call.send().promise.await?;
+                match response.get()?.get_result()?.which()? {
+                    wire::result::Ok(value) => claims(value?),
+                    wire::result::Error(error) => Err(failure(error?)),
+                }
+            }
             Self::List => {
                 let response = client.watch_list_request().send().promise.await?;
                 let list = match response.get()?.get_result()?.which()? {
@@ -315,6 +352,69 @@ fn mutation(result: wire::result::Reader<'_, wire::watch_mutation::Owned>) -> Re
         .with("request_id", receipt.get_request_id()?.to_str()?)
         .with("watch", info(receipt.get_watch()?)?)
         .with("durability", "durable")
+        .into())
+}
+
+/// An optional instant as RFC 3339 text through the shared [`super::instant`], or null.
+fn clock_text(value: wire::optional_instant::Reader<'_>) -> Result<Value> {
+    Ok(match value.which()? {
+        wire::optional_instant::Value(at) => super::instant(at?)?.into(),
+        wire::optional_instant::Absent(()) => Value::Null,
+    })
+}
+
+/// A claim listing as JSON: per-state counts, then each claim with its history. A pending
+/// claim's `age_ms` runs from its first-seen time to `as_of`.
+fn claims(value: wire::watch_claims::Reader<'_>) -> Result<Value> {
+    let as_of = value.get_as_of()?.get_unix_millis();
+    let mut counts = [0_u64; 3];
+    let mut rows = Vec::new();
+    for claim in value.get_claims()? {
+        let state = claim.get_state()?;
+        let (index, name) = match state {
+            wire::ClaimState::Pending => (0, "pending"),
+            wire::ClaimState::Complete => (1, "complete"),
+            wire::ClaimState::Abandoned => (2, "abandoned"),
+        };
+        counts[index] += 1;
+        let age = match claim.get_first_seen()?.which()? {
+            wire::optional_instant::Value(at) if state == wire::ClaimState::Pending => {
+                Value::from(as_of.saturating_sub(at?.get_unix_millis()).to_string())
+            }
+            _ => Value::Null,
+        };
+        let reason = match claim.get_last_pending_reason()?.which()? {
+            wire::optional_text::Value(reason) => Value::from(reason?.to_str()?),
+            wire::optional_text::Absent(()) => Value::Null,
+        };
+        rows.push(Value::from(
+            Object::new()
+                .with("claim_id", claim.get_claim_id()?.to_str()?)
+                .with("watch", claim.get_watch()?.to_str()?)
+                .with("state", name)
+                .with(
+                    "relative_path_hex",
+                    purrdf_hash::hex::encode(claim.get_relative_path()?),
+                )
+                .with("first_seen", clock_text(claim.get_first_seen()?)?)
+                .with("age_ms", age)
+                .with("attempts", u64::from(claim.get_attempts()))
+                .with("last_attempt", clock_text(claim.get_last_attempt()?)?)
+                .with("last_pending_at", clock_text(claim.get_last_pending_at()?)?)
+                .with("last_pending_reason", reason)
+                .with("finished_at", clock_text(claim.get_finished_at()?)?),
+        ));
+    }
+    Ok(Object::new()
+        .with("store_id", value.get_store_id()?.to_str()?)
+        .with("as_of", super::instant(value.get_as_of()?)?)
+        .with("since", super::instant(value.get_since()?)?)
+        .with("until", super::instant(value.get_until()?)?)
+        .with("listed", rows.len() as u64)
+        .with("pending", counts[0])
+        .with("complete", counts[1])
+        .with("abandoned", counts[2])
+        .with("claims", Value::from(rows))
         .into())
 }
 

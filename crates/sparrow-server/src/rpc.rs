@@ -94,6 +94,8 @@ pub struct Rpc {
     /// peer, or a CHAP-authenticated TCP peer. Absent, an admin operation that records its
     /// caller is refused.
     admin: Option<String>,
+    /// Whether this daemon takes online backups, and where (#156).
+    backup: crate::backup::Backup,
 }
 
 /// The full typed service and the ingest socket run no CHAP; only anonymous TCP does.
@@ -178,7 +180,23 @@ impl Rpc {
             intake: None,
             ingest_socket: None,
             admin: None,
+            backup: crate::backup::Backup::Unconfigured,
         }
+    }
+
+    /// Take online backups into `target` (#156).
+    #[must_use]
+    pub fn with_backup(mut self, target: sparrow_core::BackupTarget) -> Self {
+        self.backup = crate::backup::Backup::Configured(target);
+        self
+    }
+
+    /// Refuse online backups: a `--no-intake` or `--private-intake` daemon serves a copy of a
+    /// store.
+    #[must_use]
+    pub fn without_backup_for_copy(mut self) -> Self {
+        self.backup = crate::backup::Backup::Copy;
+        self
     }
 
     /// Serve reads only: every connection's service refuses writes with `READ_ONLY`.
@@ -1824,6 +1842,60 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn backup(
+        self: Rc<Self>,
+        params: wire::sparrow::BackupParams,
+        mut results: wire::sparrow::BackupResults,
+    ) -> capnp::Result<()> {
+        let store = params.get()?.get_store_id()?.to_str()?;
+        // Starting spawns the backup thread and returns; nothing here waits on the copy.
+        let result = self
+            .check_store(store)
+            .and_then(|()| self.backup.start(&self.store, now()?));
+        match result {
+            Ok(status) => self
+                .backup
+                .encode(results.get().init_result().init_ok(), &status),
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
+
+    async fn watch_claims(
+        self: Rc<Self>,
+        params: wire::sparrow::WatchClaimsParams,
+        mut results: wire::sparrow::WatchClaimsResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        let store = query.get_store_id()?.to_str()?;
+        let since = query.get_since()?.get_unix_millis();
+        let until = match query.get_until()?.which()? {
+            wire::optional_instant::Value(at) => Some(at?.get_unix_millis()),
+            wire::optional_instant::Absent(()) => None,
+        };
+        let result = match self.check_store(store) {
+            // The listing decodes up to 2048 journals: run it off the connection's event loop.
+            Ok(()) => {
+                self.work(move |store, as_of| {
+                    let until = until.unwrap_or(as_of);
+                    Ok((as_of, until, store.consumption_claims(since, until)?))
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok((as_of, until, claims)) => crate::watch_admin::encode_claims(
+                results.get().init_result().init_ok(),
+                store,
+                (as_of, since, until),
+                &claims,
+            ),
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
+
     async fn watch_claim_retire(
         self: Rc<Self>,
         params: wire::sparrow::WatchClaimRetireParams,
@@ -2920,6 +2992,8 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_query_only(self.query_only);
+                self.backup
+                    .encode(out.reborrow().init_backup(), &self.store.backup_status());
                 match &self.ingest_socket {
                     Some(socket) => socket.encode(out.reborrow().init_ingest_socket().init_value()),
                     None => out.reborrow().init_ingest_socket().set_absent(()),

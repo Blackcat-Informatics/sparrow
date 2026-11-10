@@ -1,0 +1,581 @@
+#!/usr/bin/python3 -I
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+"""Replay recorded intake into a store copy and time query traffic against it.
+
+`deploy/verify-backup.sh --measure-migration --with-traffic` runs this helper
+(docs/deployment.md, "Measure the online migration with intake and traffic").
+It only ever writes below its scratch directory and only talks to the copy's
+own sockets. It reads no producer directory: every replayed byte comes from the
+copy's own catalog, which recorded what live received in the window.
+
+Subcommands:
+
+prepare-replay  From a query-only daemon on a prep copy, read every artifact
+                the store received in the window and save its bytes. An
+                artifact whose source is a watch's source replays into that
+                watch's private root: through the shipper when the backup's
+                shipper configuration has a source named after the root, as
+                live received it, or placed directly otherwise. Any other
+                artifact is re-sent over the copy's ingest socket. Print the
+                per-source counts, write a scratch shipper configuration, and
+                fail when a shipper source has no watch root or nothing to
+                replay in the window, or when the window holds nothing.
+run             Until SIGTERM: release the saved watch intake and re-send the
+                saved socket artifacts at their recorded offsets (looping the
+                window), run the shipper SHIP_INTERVAL seconds after each
+                completed run as its timer does, and run status, records and
+                sparql at a fixed cadence. On SIGTERM no new call starts, calls
+                in flight finish, and it prints the MEASURE lines and writes a
+                JSON summary. A worker that raises stops every worker: the
+                helper prints its traceback and the MEASURE lines, then exits
+                1 before SIGTERM, so verify-backup fails the run with
+                `FAIL load` instead of measuring without that load.
+count-records   Print the number of records the copy received at or after an
+                instant, read page by page.
+gates           Print one gate line per switch-gate threshold with its margin,
+                one watch intake gate per watch among them, and exit 1 when
+                any fails.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import traceback
+from pathlib import Path
+
+PREFIX = "verify-backup: MEASURE"
+# The connection lease that cut status, records and sparql off live on 2026-11-07.
+LEASE_SECONDS = 60
+# A call still running after this is killed and counted failed and over the lease.
+CALL_CEILING_SECONDS = 600
+# Formats the ingest operation accepts; syslog arrives on its own listener.
+INGEST_FORMATS = ("jsonl", "log", "json", "markdown", "opaque")
+CHUNK = 1048576
+# The largest page the catalog reads serve.
+PAGE = 1000
+SHIP_KEYS = ("max_chunk_bytes", "max_chunk_lines", "max_files_per_run", "max_pending_bytes",
+             "max_queue_bytes")
+# The consume worker's publication deadline (crates/sparrow-server/src/watches.rs,
+# PUBLICATION_DEADLINE): a compiled constant of the daemon, in no configuration or status.
+PUBLICATION_DEADLINE_SECONDS = 45
+
+
+def fail(message):
+    sys.exit(f"sparrow-measure-load: {message}")
+
+
+def iso(seconds):
+    return datetime.datetime.fromtimestamp(seconds, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(text):
+    return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def cli_json(cli, socket, *args):
+    done = subprocess.run([cli, socket, *args], capture_output=True, text=True,
+                          timeout=CALL_CEILING_SECONDS, check=False)
+    if done.returncode != 0:
+        fail(f"{' '.join(args[:2])} failed: {done.stderr.strip()}")
+    return json.loads(done.stdout)
+
+
+def read_bytes(args, artifact, length, target):
+    with open(target, "wb") as out:
+        for offset in range(0, length, CHUNK):
+            chunk = target.with_suffix(".chunk")
+            cli_json(args.cli, args.socket, "bytes", args.store, artifact, str(offset),
+                     str(min(CHUNK, length - offset)), str(chunk))
+            out.write(chunk.read_bytes())
+            chunk.unlink()
+
+
+def prepare_replay(args):
+    work, intake = Path(args.work), Path(args.intake)
+    status = json.loads(Path(args.status).read_text())
+    with open(args.ship_config, "rb") as handle:
+        ship = tomllib.load(handle)
+    shipped = {source["name"]: source for source in ship.get("source", [])}
+    if not shipped:
+        fail(f"{args.ship_config} has no [[source]] entries")
+    # Each watch by its source; its private root is INTAKE/NAME, NAME its root's last component.
+    by_source, names = {}, set()
+    for watch in status["consume_watches"]:
+        name = os.path.basename(os.path.normpath(watch["root"]))
+        by_source[watch["definition"]["source"]] = name
+        names.add(name)
+        (intake / name).mkdir(parents=True, exist_ok=True)
+    unrooted = sorted(set(shipped) - names)
+    if unrooted:
+        fail(f"shipper source(s) {', '.join(unrooted)} name no watch root (a watch root's last "
+             f"component); their intake would reach no watch, so the replay would miss it")
+    saved = work / "replay"
+    saved.mkdir()
+    counts = {}
+    watch_rows, socket_rows, cursor = [], [], None
+    while True:
+        query = ["artifacts", args.store, "--received-from", iso(args.window_from),
+                 "--received-before", iso(args.window_before), "--page-size", str(PAGE)]
+        if cursor:
+            query += ["--cursor", cursor]
+        page = cli_json(args.cli, args.socket, *query)
+        for row in page["rows"]:
+            source, origin = row["source"], row["origin"]
+            name = by_source.get(source)
+            via = "socket" if name is None else "ship" if name in shipped else "direct"
+            entry = counts.setdefault((via, name or source),
+                                      {"artifacts": 0, "bytes": 0, "skipped": 0})
+            if origin is None or (via == "socket" and origin["format"] not in INGEST_FORMATS):
+                entry["skipped"] += 1
+                continue
+            length = int(origin["byte_length"])
+            index = len(watch_rows) + len(socket_rows)
+            form = origin["format"]
+            target = saved / f"replay-{index:06d}.{form}"
+            read_bytes(args, row["artifact_id"], length, target)
+            offset = parse_iso(origin["received_at"]) - args.window_from
+            if via == "socket":
+                socket_rows.append((offset, source, form, str(target)))
+            else:
+                watch_rows.append((offset, name, via, str(target)))
+            entry["artifacts"] += 1
+            entry["bytes"] += length
+        cursor = page["next_cursor"]
+        if not cursor:
+            break
+    for name in sorted(shipped):
+        counts.setdefault(("ship", name), {"artifacts": 0, "bytes": 0, "skipped": 0})
+    for (via, name), entry in sorted(counts.items(), key=lambda item: (item[0][0], item[0][1])):
+        print(f"{PREFIX} replay source={name} via={via} artifacts={entry['artifacts']} "
+              f"bytes={entry['bytes']} skipped={entry['skipped']}")
+    empty = sorted(name for (via, name), entry in counts.items()
+                   if via == "ship" and entry["artifacts"] == 0)
+    if empty:
+        fail(f"shipper source(s) {', '.join(empty)} have nothing to replay between "
+             f"{iso(args.window_from)} and {iso(args.window_before)}: the copy received no "
+             f"artifact of their watch then; widen the window with "
+             f"SPARROW_MEASURE_REPLAY_SECONDS to an interval that holds their delivery")
+    if not watch_rows and not socket_rows:
+        fail("the window holds nothing to replay")
+    for rows, path in ((watch_rows, "watch.tsv"), (socket_rows, "socket.tsv")):
+        rows.sort()
+        with open(work / path, "w") as out:
+            for row in rows:
+                out.write(f"{row[0]:.3f}\t" + "\t".join(row[1:]) + "\n")
+    for name in shipped:
+        (work / "producers" / name).mkdir(parents=True)
+    (work / "staging").mkdir()
+    # The live budgets, and one settled source per shipper source over a scratch directory: the
+    # replayed items are what the live shipper already found finished (whatever its rule),
+    # so they ship once they appear, split and budgeted as live.
+    lines = [f'intake_root = "{intake}"', f'state_dir = "{work / "ship"}"']
+    lines += [f"{key} = {ship[key]}" for key in SHIP_KEYS]
+    for name, source in shipped.items():
+        lines += ["", "[[source]]", f"name = {json.dumps(name)}",
+                  f"dir = {json.dumps(str(work / 'producers' / name))}", 'pattern = "*"',
+                  'rule = "settled"', f"format = {json.dumps(source['format'])}",
+                  "settle_seconds = 0"]
+    (work / "ship.toml").write_text("\n".join(lines) + "\n")
+    print(f"{PREFIX} replay watch_artifacts={len(watch_rows)} socket_artifacts={len(socket_rows)} "
+          f"window_from={iso(args.window_from)} window_before={iso(args.window_before)}")
+
+
+def count_records(args):
+    total = 0
+    page = cli_json(args.cli, args.socket, "records", "--received-from", iso(args.since),
+                    "--received-before", iso(time.time() + 1), "--page-size", str(PAGE))
+    snapshot = (page.get("page") or {}).get("snapshot_id")
+    while True:
+        total += len(page["rows"])
+        cursor = (page.get("page") or {}).get("next_cursor")
+        if not cursor:
+            break
+        page = cli_json(args.cli, args.socket, "result-next", args.store, cursor)
+    if snapshot:
+        cli_json(args.cli, args.socket, "result-release", args.store, snapshot)
+    print(total)
+
+
+class Calls:
+    """Thread-safe call timings per kind."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.kinds = {}
+
+    def add(self, kind, seconds, ok):
+        with self.lock:
+            self.kinds.setdefault(kind, []).append((seconds, ok))
+
+    def summary(self):
+        out = {}
+        with self.lock:
+            for kind, calls in self.kinds.items():
+                times = sorted(seconds for seconds, _ in calls)
+                rank = lambda q: times[max(0, -(-len(times) * q // 100) - 1)]  # noqa: E731
+                out[kind] = {
+                    "durations": times,
+                    "calls": len(calls),
+                    "failed": sum(not ok for _, ok in calls),
+                    "over_60s": sum(seconds >= LEASE_SECONDS for seconds, _ in calls),
+                    "p50": rank(50), "p95": rank(95), "max": times[-1],
+                }
+        return out
+
+
+def timed(calls, kind, command, log):
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   text=True)
+    except OSError as error:
+        calls.add(kind, 0.0, False)
+        log(f"{kind}: {error}")
+        return False
+    # A call in flight when the run ends still finishes and counts: its latency is real.
+    try:
+        _, err = process.communicate(timeout=CALL_CEILING_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        err = f"killed after {CALL_CEILING_SECONDS}s"
+    seconds = time.monotonic() - started
+    calls.add(kind, seconds, process.returncode == 0)
+    if process.returncode != 0:
+        log(f"{kind} failed after {seconds:.3f}s: {(err or '').strip()[:300]}")
+    return process.returncode == 0
+
+
+def wait_until(stop, deadline):
+    return not stop.wait(max(0.0, deadline - time.monotonic()))
+
+
+def traffic(args, kind, calls, stop, log):
+    work = Path(args.work)
+    period, tick = args.period, time.monotonic()
+    while wait_until(stop, tick):
+        now = time.time()
+        if kind == "status":
+            command = [args.cli, args.socket, "status"]
+        elif kind == "records":
+            command = [args.cli, args.socket, "records", "--received-from", iso(now - 3600),
+                       "--received-before", iso(now + 1), "--page-size", "100"]
+        else:
+            request = work / "sparql.json"
+            request.write_text(json.dumps({
+                "store_id": args.store,
+                "query": "PREFIX sp: <urn:sparrow:vocab:> SELECT ?record ?source "
+                         "WHERE { ?record sp:sourceName ?source } LIMIT 100",
+                "received_from": iso(now - 3600), "received_before": iso(now + 1),
+                "layers": {"metadata": True, "content": False, "diagnostic": False},
+            }))
+            command = [args.cli, args.socket, "sparql", str(request)]
+        timed(calls, kind, command, log)
+        tick += period
+        while tick < time.monotonic():
+            tick += period  # A call that outlasted its period skips the ticks it covered.
+
+
+def rows_of(path, width):
+    if not Path(path).exists():
+        return []
+    rows = []
+    for line in Path(path).read_text().splitlines():
+        fields = line.split("\t")
+        if len(fields) != width:
+            fail(f"{path}: malformed row {line!r}")
+        rows.append((float(fields[0]), *fields[1:]))
+    return rows
+
+
+def cycled(path, cycle):
+    """Cycle 0 keeps the recorded name; later cycles add .cN before the suffix."""
+    name = Path(path).name
+    if cycle == 0:
+        return name
+    stem, dot, suffix = name.rpartition(".")
+    return f"{stem}.c{cycle}.{suffix}" if dot else f"{name}.c{cycle}"
+
+
+def replay(rows, window, stop, action):
+    """Run ACTION(cycle, index, row) at each row's offset, looping the window."""
+    if not rows:
+        return
+    start, cycle = time.monotonic(), 0
+    while True:
+        for index, row in enumerate(rows):
+            if not wait_until(stop, start + cycle * window + row[0]):
+                return
+            action(cycle, index, row)
+        cycle += 1
+
+
+def run(args):
+    work, intake = Path(args.work), Path(args.intake)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    calls = Calls()
+    log_lock = threading.Lock()
+    counts = {"released": 0, "release_failures": 0, "socket_ingests": 0, "ship_runs": 0,
+              "ship_failures": 0, "cycles": 0, "ship_run_max_seconds": 0.0}
+    by_source = {}
+    # Each watch's released items by wall-clock time, how they reach it, and the shipper queue
+    # items a run left waiting because the roots were over their budget.
+    releases, watch_via, held = {}, {}, set()
+
+    def log(message):
+        with log_lock:
+            print(f"verify-backup: load: {message}", flush=True)
+
+    def tally(key, name, field):
+        with log_lock:
+            by_source.setdefault(key, {}).setdefault(name, {"released": 0, "failed": 0})
+            by_source[key][name][field] += 1
+
+    def release(cycle, _index, row):
+        _, name, via, path = row
+        # Through the shipper's scratch producer directory, or straight into the private root;
+        # either way the item appears whole, by a rename from a hidden or staging name.
+        final = (work / "producers" / name if via == "ship" else intake / name) / cycled(path, cycle)
+        staged = (work / "producers" / name / f".{final.name}" if via == "ship"
+                  else work / "staging" / final.name)
+        done = subprocess.run(["cp", "--reflink=auto", "--", path, str(staged)],
+                              capture_output=True, text=True, check=False)
+        error = done.stderr.strip() if done.returncode else None
+        if error is None:
+            try:
+                os.rename(staged, final)
+            except OSError as failure:
+                error = str(failure)
+        with log_lock:
+            counts["released"] += 1
+            counts["release_failures"] += error is not None
+            counts["cycles"] = max(counts["cycles"], cycle + 1)
+            watch_via[name] = via
+            if error is None:
+                releases.setdefault(name, []).append(time.time())
+        tally("watch", name, "failed" if error else "released")
+        if error:
+            log(f"releasing {path} into {final} failed: {error}")
+
+    def resend(cycle, index, row):
+        _, source, form, path = row
+        request = f"measure-replay-{cycle}-{index}"
+        ok = timed(calls, "ingest", [args.cli, args.ingest_socket, "ingest", request, source, form,
+                                     path], log)
+        with log_lock:
+            counts["socket_ingests"] += 1
+        tally("socket", source, "released" if ok else "failed")
+
+    def ship():
+        queue = work / "ship" / "queue"
+        with open(work / "ship.log", "a") as out:
+            while not stop.is_set():
+                started = time.monotonic()
+                done = subprocess.run([args.ship, str(work / "ship.toml")], stdout=out,
+                                      stderr=subprocess.STDOUT, check=False)
+                seconds = time.monotonic() - started
+                # A run feeds every queued item unless the roots' bytes would exceed
+                # max_pending_bytes; whatever it leaves queued is held back by a full root.
+                left = {f"{source.name}/{item.name}" for source in queue.iterdir()
+                        if source.is_dir() for item in source.iterdir()} if queue.is_dir() else set()
+                with log_lock:
+                    counts["ship_runs"] += 1
+                    counts["ship_failures"] += done.returncode != 0
+                    counts["ship_run_max_seconds"] = max(counts["ship_run_max_seconds"], seconds)
+                    held.update(left)
+                if left:
+                    log(f"sparrow-ship left {len(left)} item(s) queued: the roots are over max_pending_bytes")
+                if done.returncode != 0:
+                    log(f"sparrow-ship exited {done.returncode}; see its lines in ship.log")
+                stop.wait(args.ship_interval)
+
+    crashed = []
+
+    def worker(name, target, *target_args):
+        """A worker that raises must not leave the run measuring without its load: record it,
+        log its traceback and stop every worker, so the helper exits 1 early."""
+        def body():
+            try:
+                target(*target_args)
+            except BaseException:  # noqa: BLE001 - every failure must end the run, not the thread
+                with log_lock:
+                    crashed.append(name)
+                log(f"worker {name} failed:\n{traceback.format_exc().rstrip()}")
+                stop.set()
+        return threading.Thread(target=body, name=name, daemon=True)
+
+    threads = [worker(kind, traffic, args, kind, calls, stop, log)
+               for kind in ("status", "records", "sparql")]
+    watches = rows_of(work / "watch.tsv", 4)
+    sockets = rows_of(work / "socket.tsv", 4)
+    threads.append(worker("watch-replay", replay, watches, args.window, stop, release))
+    threads.append(worker("socket-replay", replay, sockets, args.window, stop, resend))
+    threads.append(worker("ship", ship))
+    for thread in threads:
+        thread.start()
+    while not stop.wait(1):
+        pass
+    for thread in threads:
+        thread.join(timeout=CALL_CEILING_SECONDS)
+    summary = {"kinds": calls.summary(), "socket_saved": len(sockets), "by_source": by_source,
+               "releases": releases, "watch_via": watch_via, "ship_held_back": len(held),
+               **counts}
+    for kind in ("status", "records", "sparql", "ingest"):
+        value = summary["kinds"].get(kind)
+        if value is None:
+            print(f"{PREFIX} rpc kind={kind} calls=0")
+            continue
+        print(f"{PREFIX} rpc kind={kind} calls={value['calls']} failed={value['failed']} "
+              f"over_60s={value['over_60s']} p50={value['p50']:.3f} p95={value['p95']:.3f} "
+              f"max={value['max']:.3f}")
+    for key in ("watch", "socket"):
+        for name, value in sorted(by_source.get(key, {}).items()):
+            print(f"{PREFIX} replayed via={key} source={name} released={value['released']} "
+                  f"failed={value['failed']}")
+    print(f"{PREFIX} replay watch_items_released={counts['released']} "
+          f"release_failures={counts['release_failures']} "
+          f"socket_ingests={counts['socket_ingests']} cycles={counts['cycles']} "
+          f"ship_runs={counts['ship_runs']} ship_failures={counts['ship_failures']} "
+          f"ship_held_back={len(held)} ship_run_max_seconds={counts['ship_run_max_seconds']:.3f}")
+    Path(args.summary).write_text(json.dumps(summary))
+    if crashed:
+        fail(f"worker(s) {', '.join(crashed)} failed; the run lacks their load (traceback above)")
+
+
+def watch_intake(args, summary):
+    """Total completed claims, and one gate row per watch: the claims it completed since the
+    first status must reach the items released to it before the final status less what may
+    legitimately still be in flight (its quiet interval, the publication deadline, and for a
+    shipped watch the ship interval and the longest shipper run). Claims are counted from the
+    first status: a pending claim the backup journals cannot complete, since its source is not
+    in the empty private root. A tail watch's finished generations are claims too."""
+    first = {os.path.basename(os.path.normpath(w["root"])): w
+             for w in json.loads(Path(args.first_status).read_text())["consume_watches"]}
+    final = json.loads(Path(args.final_status).read_text())["consume_watches"]
+    total, rows = 0, []
+    for watch in sorted(final, key=lambda w: w["root"]):
+        name = os.path.basename(os.path.normpath(watch["root"]))
+        before = first.get(name)
+        if before is None:
+            fail(f"watch {name} is in the final status but not the first")
+        completed = int(watch["completed_claims"]) - int(before["completed_claims"])
+        total += completed
+        via = summary["watch_via"].get(name, "none")
+        allowance = int(watch["definition"]["quiet_ms"]) / 1000 + PUBLICATION_DEADLINE_SECONDS
+        if via == "ship":
+            allowance += args.ship_interval + summary["ship_run_max_seconds"]
+        if args.inflight_limit >= 0:
+            allowance = min(allowance, args.inflight_limit)
+        cutoff = args.claims_at - allowance
+        released = summary["releases"].get(name, [])
+        due = sum(at <= cutoff for at in released)
+        print(f"{PREFIX} watch_intake watch={name} via={via} released={len(released)} "
+              f"due={due} completed={completed} inflight_allowance_seconds={allowance:.3f}")
+        rows.append((f"watch_intake:{name}", str(completed), f">={due}", str(completed - due),
+                     completed >= due))
+    return total, rows
+
+
+def gates(args):
+    summary = json.loads(Path(args.summary).read_text())
+    kinds = summary["kinds"]
+    rate = args.pages / args.backfill if args.backfill > 0 else 0.0
+    durations = [seconds for kind in kinds.values() for seconds in kind["durations"]]
+    slowest = max(durations, default=0.0)
+    slow = sum(seconds >= args.rpc_limit for seconds in durations)
+    failed = sum(kind["failed"] for kind in kinds.values())
+    unanswered = [kind for kind in ("status", "records", "sparql")
+                  if kinds.get(kind, {}).get("calls", 0) == 0]
+    replay_failures = (summary["release_failures"] + summary["ship_failures"]
+                       + summary["ship_held_back"])
+    ingested = sum(value["released"] for value in summary["by_source"].get("socket", {}).values())
+    saved = summary["socket_saved"]
+    claims, intake_rows = watch_intake(args, summary)
+    rows = [
+        ("first_status_seconds", f"{args.first:.3f}", f"<={args.first_limit:g}",
+         f"{args.first_limit - args.first:.3f}", args.first <= args.first_limit),
+        ("pages_per_second", f"{rate:.4f}", f">={args.pages_floor:g}",
+         f"{rate - args.pages_floor:.4f}", rate >= args.pages_floor),
+        ("rpc_calls_over_limit", f"{slow},max_seconds={slowest:.3f}",
+         f"0,each<{args.rpc_limit:g}s", f"{args.rpc_limit - slowest:.3f}s", slow == 0),
+        ("rpc_calls_failed", str(failed), "0", str(-failed), failed == 0),
+        ("traffic_answered", "unanswered=" + (",".join(unanswered) or "none"),
+         "status,records,sparql>=1", str(-len(unanswered)), not unanswered),
+        ("publication_deadline_expiries", str(args.expiries), "0", str(-args.expiries),
+         args.expiries == 0),
+        # The replay itself: an item that could not be released, a shipper run that failed, or
+        # an item a run left queued because the roots were full is intake the run did not
+        # deliver; a refused claim is intake a watch did not take; a run whose watches
+        # completed no claim, or whose saved socket artifacts were never accepted, measured no
+        # intake of that kind at all. The per-watch gates below check that the watches kept up.
+        ("replay_failures", f"release={summary['release_failures']},"
+         f"ship={summary['ship_failures']},held_back={summary['ship_held_back']}", "0",
+         str(-replay_failures), replay_failures == 0),
+        ("watch_claims_refused", str(args.refused), "0", str(-args.refused), args.refused == 0),
+        ("watch_claims_completed", str(claims), ">=1", str(claims - 1), claims >= 1),
+        ("socket_ingests_accepted", f"{ingested},saved={saved}",
+         ">=1" if saved else "none_saved", str(ingested - 1) if saved else "0",
+         ingested >= 1 or saved == 0),
+    ]
+    rows += intake_rows
+    passed = True
+    for name, value, threshold, margin, ok in rows:
+        print(f"{PREFIX} gate name={name} value={value} threshold={threshold} margin={margin} "
+              f"verdict={'PASS' if ok else 'FAIL'}")
+        if not ok:
+            print(f"verify-backup: FAIL gate: {name} is {value}, threshold {threshold}",
+                  file=sys.stderr)
+            passed = False
+    sys.exit(0 if passed else 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="sparrow-measure-load")
+    commands = parser.add_subparsers(dest="command", required=True)
+    prepare = commands.add_parser("prepare-replay")
+    for flag in ("--cli", "--socket", "--store", "--work", "--intake", "--status",
+                 "--ship-config"):
+        prepare.add_argument(flag, required=True)
+    prepare.add_argument("--window-from", type=float, required=True)
+    prepare.add_argument("--window-before", type=float, required=True)
+    counter = commands.add_parser("count-records")
+    for flag in ("--cli", "--socket", "--store"):
+        counter.add_argument(flag, required=True)
+    counter.add_argument("--since", type=float, required=True)
+    runner = commands.add_parser("run")
+    for flag in ("--work", "--intake", "--cli", "--socket", "--ingest-socket", "--store", "--ship",
+                 "--summary"):
+        runner.add_argument(flag, required=True)
+    runner.add_argument("--window", type=float, required=True)
+    runner.add_argument("--period", type=float, default=30)
+    runner.add_argument("--ship-interval", type=float, default=300)
+    gate = commands.add_parser("gates")
+    for flag in ("--summary", "--first-status", "--final-status"):
+        gate.add_argument(flag, required=True)
+    for flag in ("--first", "--first-limit", "--backfill", "--pages-floor", "--rpc-limit",
+                 "--claims-at", "--ship-interval"):
+        gate.add_argument(flag, type=float, required=True)
+    # The in-flight allowance may only be lowered; negative leaves it as derived.
+    gate.add_argument("--inflight-limit", type=float, default=-1)
+    for flag in ("--pages", "--expiries", "--refused"):
+        gate.add_argument(flag, type=int, required=True)
+    args = parser.parse_args()
+    if shutil.which("cp") is None:
+        fail("cp is missing")
+    {"prepare-replay": prepare_replay, "count-records": count_records, "run": run,
+     "gates": gates}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

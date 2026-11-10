@@ -13,17 +13,32 @@ Commands prefixed with `sudo` need root.
 
 | State | Location | Backed up by |
 | --- | --- | --- |
-| Store (catalog, bytes, indexes, WAL, watch catalog, consume journals) | `/SPARROW/store` | `sparrow-backup` (closed-store copy) |
-| Files waiting in consume roots | `/SPARROW/intake/NAME` | `sparrow-backup`, taken only when every root is empty |
+| Store (catalog, bytes, indexes, WAL, watch catalog, consume journals) | `/SPARROW/store` | The daemon's online backup (`sparrowd` writes it into `backup_root`, asked by `sparrow-backup`) |
+| Files waiting in consume roots | `/SPARROW/intake/NAME` | `sparrow-backup`, copied online, so it may hold files the store has not claimed |
 | Shipper queue, ledgers, lock | `/SPARROW/ship` | `sparrow-backup` |
 | Configuration, watch definitions, CHAP secret | `/etc/sparrow` | `sparrow-backup` |
 | Images and lexicons | `/usr/local/libexec/sparrow`, `/usr/local/share/sparrow` | Each backup's `images/` and `lexicons/` keep the pair that last opened its store and its bundle; everything else is rebuilt from the repository into `./bin` |
 | Units, profile, layout | `/etc/systemd/system`, `/etc/apparmor.d`, `/etc/{sysusers,tmpfiles}.d` | This directory (`install.sh`) |
 
-The closed-store backups in `/SPARROW/backups` share the store's disk, so they
-protect against software faults and operator error, not against losing the
-disk. The NAS archive, the off-host backup, is not deployed yet (Sparrow
-issues #15 to #17).
+The online backups live on the NAS, under
+`/net/synology/archives/sparrow` (an NFSv4 mount of the Synology), and nowhere
+else: Sparrow never backs up to a local disk (Patrick, 2026-11-08). No backup
+stops, pauses or drains the service. The daemon copies its store with RocksDB's
+backup engine into `engine/` there, and `sparrow-backup` copies the files beside
+the store into `sets/ID`, where `ID` is the engine's backup id. Table files are
+shared between backups, so every backup after the first copies only what is
+new, and the engine keeps the newest `backup_keep`. Each set's `MANIFEST.b3`
+holds the b3sum of its files and of the engine files its backup references,
+read back from the NAS before the set is renamed into place. The daemon's own
+archive worker, which will write per-store directories under the same root, is
+not deployed yet (Sparrow issues #15 to #17).
+
+The store in a backup is the store as of a point inside the daemon's copy. The
+set's files are copied after that point, so they may be newer than the store: a
+file the shipper or a producer put in the intake after it is in the set and not
+in the store, and a file the daemon consumed between the two is in neither. That
+is the same loss window as any record accepted after the backup point; "Restore
+from a backup" says what the shipper does about it.
 
 ## Verify health
 
@@ -77,8 +92,8 @@ every watch in `consume_watches` names a root that exists.
   connect, or the unit waits at startup with `waiting to open the store`.
 - Diagnose: `df -h /SPARROW /home`, then find what grew:
   `sudo du -xsh /home/* /SPARROW/* | sort -h | tail`.
-- Recover: free space on the filesystem (another program's files, old backups
-  in `/SPARROW/backups`, a read-only pre-move copy once approved). The daemon
+- Recover: free space on the filesystem (another program's files, a read-only
+  pre-move copy once approved). No backup is kept on it. The daemon
   resumes by itself within a second of crossing the floor; nothing needs a
   restart. Do not lower `min_free_bytes` to get past it.
 - Reversible: yes, unless the space came from deleting something.
@@ -157,7 +172,7 @@ every watch in `consume_watches` names a root that exists.
   `start.sh` and `restart.sh` therefore refuse an image whose schema number
   (`sparrowd-schemaN-REV`) is lower than the current image's, before stopping
   anything. Stay on the new image and fix forward, or restore the named
-  pre-upgrade backup `/SPARROW/backups/pre-upgrade-IMAGE` ("Restore from a
+  pre-upgrade backup `/net/synology/archives/sparrow/pre-upgrade-IMAGE` ("Restore from a
   backup"). `deploy/pre-upgrade-backup.sh` takes it, and `restart.sh` requires
   it before it raises the schema. It must be no older than the image link's
   last start and no older than 24 hours (README.md, "Upgrades and rollback")
@@ -204,98 +219,94 @@ every watch in `consume_watches` names a root that exists.
 
 ## NAS archive unavailable
 
-- Not applicable yet: the archive worker is not deployed, and neither the unit
-  nor the profile names the NAS, so a NAS outage does not affect the service.
-  Sparrow issues #15 to #17 add the archive and this entry's procedure.
+- Symptom: `sparrow-backup` fails with "backup root ... is on autofs (or
+  btrfs, or an unknown filesystem) ..., not a network filesystem", or the
+  daemon's backup ends `failed` (`sparrow SOCKET status`, `backup.failure`)
+  with an I/O error or naming a root whose filesystem is not a network one (the
+  daemon judges the root at every backup, not at startup, so a NAS that is down
+  at boot never stops ingestion), or a copy or read-back step of the client fails.
+- Effect: none on ingestion. The backup runs on its own lowest-priority
+  thread and takes no lock the daemon's writers use, so ingestion continues
+  while the NAS is down or slow. The client refuses a root on the wrong
+  filesystem before it asks the daemon for anything. A failed run leaves
+  `sets/ID.partial` on the NAS and possibly unreferenced engine files, which
+  the engine discards at its next open and the next run removes. While a backup
+  runs, RocksDB keeps the files that become obsolete, which a backup hung on a
+  dead mount would keep indefinitely. They do not count toward the disk budget
+  or eviction, and the daemon's guard deletes them once free space falls below
+  twice `min_free_bytes`, failing that backup; the store's disk use then shows
+  in `df` rather than in `physical_bytes`.
+- Diagnose: `findmnt -T /net/synology/archives/sparrow` must show `nfs4` from
+  `192.168.1.1:/volume1/archives`. `sparrow SOCKET status` shows the backup's
+  `phase`, `started_at` and `failure`.
+- Recover: restore the mount, then run the backup again. A daemon shutdown
+  during a backup abandons it. Never point the backup at a local directory
+  instead: the client refuses it before asking, the daemon fails the backup and
+  creates nothing there, and Patrick's ruling forbids it.
+- The daemon's archive worker is not deployed. The daemon unit and the profile
+  grant only the backup root. Sparrow issues #15 to #17 add the archive worker
+  and its procedure.
 
 ## Verify a backup
 
 A backup counts as verified only after `deploy/verify-backup.sh` passes on it.
 Run it as the operator, who must be able to read the backup and the live server
-configuration:
+configuration. `BACKUP` is a set, `BACKUP_ROOT/sets/ID` (or the
+`pre-upgrade-IMAGE` link to one):
 
 ```bash
-deploy/verify-backup.sh /SPARROW/backups/NAME; echo "exit=$?"
+deploy/verify-backup.sh /net/synology/archives/sparrow/sets/ID; echo "exit=$?"
 ```
 
 The script reads the live `data_dir` and `socket_path` from `SPARROW_CONFIG`
 (default `/etc/sparrow/server.toml`) and refuses to run when it cannot read
-them, since those are the paths a copy must never touch. It refuses a
-`BACKUP/store` that is a symbolic link or holds one: `sparrow-backup` copies no
-links, and a copied absolute link would lead the daemon out of the copy. It reflinks `BACKUP/store` into a scratch directory below
-`/SPARROW/verify/` (`SPARROW_VERIFY` overrides it), so the backup itself is
-never opened. Before it creates that directory, and again on the copy, it
-refuses any path that resolves under the live store, the live socket, the intake
-(`SPARROW_INTAKE`), the backup, or the `data_dir` and `intake` the backup itself
-records in `SOURCE` and its configuration copy. It writes a configuration for the copy with its own socket and
-the lexicon bundle the backup keeps, and starts the image in `BACKUP/images/`
-that `SOURCE` names with `--query-only`. In that mode the daemon opens no watch
-root, claims no file, runs no retention or eviction and refuses every write
-(docs/interfaces.md, "Query-only daemon"). Opening still rewrites some catalog
-rows and table files in the copy, which is why it works only on a disposable
-copy. The script then prints one line per check:
+them, since those are the paths a copy must never touch. It never opens the
+backup itself and never starts a daemon on the live store, socket or intake.
+
+1. It checks every file `MANIFEST.b3` lists, the set's files and the engine
+   files the backup references, against the NAS with `b3sum`, and compares the
+   set's file list with the manifest both ways.
+2. It restores engine backup `ID` into a scratch directory below
+   `/SPARROW/verify/` (`SPARROW_VERIFY` overrides it) with the image `SOURCE`
+   names, `sparrowd --restore-backup`, which checks every file's checksum as it
+   reads it. The scratch filesystem must have the backup's `engine_bytes` plus
+   10 GiB free. The scratch copy is not a backup: the script removes it however
+   the run ends. Before it creates the directory, it refuses any path that
+   resolves under the live store, the live socket, the intake
+   (`SPARROW_INTAKE`), the backup root, or the `data_dir` and `intake` the
+   set's `SOURCE` and configuration copy record.
+3. It writes a configuration for the copy with its own socket and the lexicon
+   bundle the set keeps, and starts that image with `--query-only`. In that mode
+   the daemon opens no watch root, claims no file, runs no retention or eviction
+   and refuses every write (docs/interfaces.md, "Query-only daemon"). Opening
+   still rewrites some catalog rows and table files in the copy, which is why it
+   works only on a disposable copy.
+
+It prints one line per check:
 
 | Check | Passes when |
 | --- | --- |
+| `manifest` | Every file `MANIFEST.b3` lists matches its b3sum on the NAS, and the set holds no other file |
+| `restore` | The backup restored from the root with every file's checksum checked |
 | `query-only` | Status and the startup line report `query_only`, and no stored watch root is open |
 | `store-id` | The copy's store identity equals `store_id` in `SOURCE` |
 | `status` | `pressure.phase` is `ready` and `durability.failure` is `null` |
-| `payload-chunks` | The copy's `unique_payload_chunks` equals the count `SOURCE` recorded; not verifiable while counts are pending (below) |
 | `records` | A `records` window over the hour before `taken_utc` returns rows |
 | `artifact` | The first row's artifact reads back to the BLAKE3 digest its catalog row records |
-| `shutdown` | The daemon exits 0 after SIGINT and logs its closing payload chunk count, or `pending` when the copy's counts are pending |
+| `shutdown` | The daemon exits cleanly after SIGINT and the copy is removed |
 
-It exits 1 at the first failed check, 2 on a usage error, 3 when every other
-check passed but the payload chunk count is not verifiable because counts are
-pending (below), and 0 only when every check passed. It always stops the daemon
-and removes the scratch copy.
+It exits 0 only when every check passed, 1 at the first failed check, and 2 on a
+usage error. It always stops the daemon and removes the scratch copy. A backup is
+not compared by record or payload count: the store is copied while it ingests,
+so no count taken at the live daemon describes the same instant.
 
-The count check uses stored payload chunks rather than live records. A record is
-live only until its retention deadline, measured by the reader's clock, so a
-copy verified later reports fewer live records than the backup recorded, even
-when it is intact. Payload chunks change only when evidence is retired, which a
-query-only daemon never does. `sparrow-backup` does not read the count while
-the service runs, when ingestion, expiry and eviction could still change it.
-After every worker has stopped and the final flush has succeeded, `sparrowd`
-logs `sparrowd: closed store=ID unique_payload_chunks=N`. `sparrow-backup`
-reads that line from the journal of the invocation it stopped, through
-`journalctl --invocation=`, which needs systemd 257 or newer. It records `N` only
-when that daemon then exited 0; `N` is exactly what the copied store holds. Before
-the stop, it reads the running image for the line's text. An image that prints the
-line and then exits nonzero, or never logs it (a SIGKILL, for example), fails the
-backup, and nothing is published. An image that predates the line (schema 66 and
-older) still gets a published backup, which records
-`payload_chunks=unrecorded (image predates the closing count)` instead of a count.
-So a pre-upgrade backup of an older image, and nightly backups after a restore to
-one, keep working. For the clock reason above, the `records` and
-`artifact` checks run only while the window is younger than the retention window
-the daemon reports (`retention_seconds`, 30 days). After that its records have
-expired, and the script prints that both were skipped.
-
-From schema 70, a store counts its records and payload chunks in counter rows
-that a newer image seeds online after an upgrade. Until seeding finishes, status
-reports `counts` as `pending`, and each count is exact only through the seeding
-watermark, not a total. The closing line then reads
-`sparrowd: closed store=ID unique_payload_chunks=pending`, and `SOURCE` records
-`unique_payload_chunks=pending` and `live_records=pending` rather than numbers.
-A pending count is never compared. When the copy's status reports
-`counts=pending` (for example `--image NEWER` on a backup of schema 69 or
-older, which upgrades the copy), or `SOURCE` records
-`unique_payload_chunks=pending`, the script prints
-`NOT VERIFIABLE payload-chunks: not verifiable (counts pending)` instead of
-passing or failing that check. It runs every other check, expects the closing
-line to say `pending` when the copy's counts were pending, and ends with
-`verified except payload-chunks: not verifiable (counts pending)` and exit 3,
-which is distinct from a failed check (1) and a usage error (2). Exit 3 is not
-verified: take a backup once the live counts are exact, or verify the copy with
-an image that opens it without an upgrade.
-
-A backup whose `SOURCE` has no `unique_payload_chunks` predates the count, or
-was taken from an image that predates it: the script skips that check, runs the others and still exits 1 as not verified. An
-image without query-only mode (schema 66 and older) is refused before it starts,
-because it would consume the live intake folders. Such a backup can be opened
-with a newer image instead, with `--image DAEMON`; the newer image may upgrade
-the disposable copy as it opens it.
+The `records` and `artifact` checks run only while the window is younger than the
+retention window the daemon reports (`retention_seconds`, 30 days), because a
+record expires by the reader's clock. After that the script prints that both
+were skipped. An image without query-only mode (schema 66 and older) is refused
+before it starts, because it would consume the live intake folders. Such a
+backup can be opened with a newer image instead, with `--image DAEMON`; the
+newer image may upgrade the disposable copy as it opens it.
 
 `--time-records` prints, after the checks, five elapsed times of the same
 `records` window, for comparing read latency on an older store format with the
@@ -306,14 +317,23 @@ exact command, so the live times can be taken the same way.
 
 ## Restore from a backup
 
-A backup `/SPARROW/backups/NAME` (a `STAMP`, or a named `pre-upgrade-IMAGE`)
-holds `store`, `intake` and `config` (the server configuration, `/etc/sparrow`
-with the secret, and `/SPARROW/ship`) from one moment, `images/` with the
-image pair that last opened the store, `lexicons/` with the bundle it read, and `SOURCE`, which names that image
-(`image=`) and the store's identity, schema, format and live record count
-(`pending` while the store counters seed).
-Restore only a backup that `deploy/verify-backup.sh` has passed ("Verify a
-backup").
+A set `/net/synology/archives/sparrow/sets/ID` (or a `pre-upgrade-IMAGE` link to
+one) holds `intake` and `config` (the server configuration as `server.toml`,
+`/etc/sparrow` as `sparrow` with the secret, and `/SPARROW/ship` as `ship`),
+`images/` with the image pair that last opened the store, `lexicons/` with the
+bundle it read, `SOURCE`, and `MANIFEST.b3`. `SOURCE` names the image (`image=`),
+the engine backup (`backup_id=`), the store's identity, schema and format,
+`taken_utc`, the data and intake paths and the engine's file and byte counts. The
+store itself is not in the set. It is engine backup `ID` in
+`BACKUP_ROOT/engine`, and `sparrowd --restore-backup` rebuilds it. Restore only a
+backup that `deploy/verify-backup.sh` has passed ("Verify a backup").
+
+`sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID] EMPTY_DIR` runs offline, with
+no daemon, socket or store open. It restores into an empty or absent directory
+and refuses a directory that holds anything, so it can never overwrite a store.
+It checks every file's checksum as it reads it. Without `BACKUP_ID` it restores
+the latest backup, which is not necessarily the one a set describes, so name the
+set's `backup_id`.
 
 ```bash
 sudo systemctl stop sparrow-backup.timer sparrow-ship.timer
@@ -321,34 +341,46 @@ sudo deploy/stop.sh
 sudo mv /SPARROW/store /SPARROW/store.damaged
 sudo mv /SPARROW/intake /SPARROW/intake.damaged
 sudo mv /SPARROW/ship /SPARROW/ship.damaged
+ROOT=/net/synology/archives/sparrow
+B=$ROOT/sets/SET
+IMAGE=$(sed -n 's/^image=//p' "$B/SOURCE")
+ID=$(sed -n 's/^backup_id=//p' "$B/SOURCE")
 sudo mkdir /SPARROW/store
-sudo deploy/copy-on-write.sh match /SPARROW/backups/NAME/store /SPARROW/store
-sudo cp -a --reflink=auto /SPARROW/backups/NAME/store/. /SPARROW/store/
-sudo cp -a --reflink=auto /SPARROW/backups/NAME/intake /SPARROW/intake
-sudo cp -a --reflink=auto /SPARROW/backups/NAME/config/ship /SPARROW/ship
+sudo chattr +C /SPARROW/store
+sudo "$B/images/$IMAGE" --restore-backup "$ROOT" "$ID" /SPARROW/store
+sudo cp -a "$B/intake" /SPARROW/intake
+sudo cp -a "$B/config/ship" /SPARROW/ship
+sudo sh -c "cd $ROOT && grep -E '^\\\\?[0-9a-f]{64}  sets/$ID/(intake|config)/' $B/MANIFEST.b3 | b3sum --check --quiet"
 sudo systemd-tmpfiles --create sparrow.conf
-sudo deploy/start.sh --restored-from /SPARROW/backups/NAME
+sudo deploy/start.sh --restored-from "$B"
 sudo deploy/check.sh --store-id STORE_ID
 sudo systemctl start sparrow-ship.timer sparrow-backup.timer
 ```
 
-The restored store takes the backup's copy-on-write attribute, because btrfs
-refuses a reflink between a copy-on-write file and a no-copy-on-write one and
-`--reflink=auto` would then copy every byte. A backup taken before copy-on-write
-was switched off restores a store that still has it, and the next
-`deploy/restart.sh` rewrites that store without it while it is closed.
+The restored store directory has copy-on-write off before anything is written
+into it, so every restored file inherits that ("COW off everywhere"). The
+`b3sum --check` line reads the restored intake and configuration back from the
+set and prints nothing when every file matches its manifest line; any output, or
+a nonzero exit, means the copy is damaged, so copy again before starting. It
+checks only the files of the set: `--restore-backup` has already checked the
+store's files. Replace `SET` in `B` with the set's number; `ID` is read from its
+`SOURCE`.
 
-`start.sh --restored-from` starts exactly the image `SOURCE` names, taken from
-`/usr/local/libexec/sparrow`, `./bin` or the backup's `images/`, and fails
-unless the daemon reports the store identity `SOURCE` records. Never start a
-restored store with plain `start.sh`: it picks the newest image, which may
-upgrade the restored store and lose the way back again. `STORE_ID` is the
-identity recorded before the failure. Restore
-`/etc/sparrow` from `BACKUP/config/sparrow` only if it was lost; on a fresh
-host it always was, so run this before `deploy/start.sh`:
+`start.sh --restored-from` takes the set directory, reads `image=` and
+`store_id=` from its `SOURCE`, and starts exactly that image, taken from
+`/usr/local/libexec/sparrow`, `./bin` or the set's `images/`. It fails unless the
+daemon reports the store identity `SOURCE` records. It does not restore or move
+the store: it expects `data_dir` to be restored already, and it refuses while a
+backup client holds `/net/synology/archives/sparrow/.lock`. It needs
+`BACKUP/SOURCE` and `BACKUP/images/`, which a set has and the bare backup root
+does not, so pass the set, never the root. Never start a restored store with
+plain `start.sh`: it picks the newest image, which may upgrade the restored store
+and lose the way back again. `STORE_ID` is the identity recorded before the
+failure. Restore `/etc/sparrow` from `BACKUP/config/sparrow` only if it was lost;
+on a fresh host it always was, so run this before `deploy/start.sh`:
 
 ```bash
-sudo cp -a --reflink=auto /SPARROW/backups/NAME/config/sparrow/. /etc/sparrow/
+sudo cp -a /net/synology/archives/sparrow/sets/ID/config/sparrow/. /etc/sparrow/
 sudo stat -c '%U %a' /etc/sparrow/tcp.secret
 ls /usr/local/share/sparrow
 grep text_lexicon_dir /etc/sparrow/server.toml
@@ -356,29 +388,52 @@ grep text_lexicon_dir /etc/sparrow/server.toml
 
 Expect `root 600`, and a `text_lexicon_dir` naming a bundle installed on this
 host: the same PurRDF revision, or the open is refused ("Refused open"). If
-`install.sh` installed a different bundle, install the backup's:
-`sudo cp -a --no-preserve=ownership /SPARROW/backups/NAME/lexicons/. /usr/local/share/sparrow/`. The shipper
-then resends every file shipped after the backup whose original still exists;
-records producers sent directly after the backup are lost unless they resend
-them. On a fresh host, follow README.md steps 1 to 3 first, then this
-procedure with the backup copied onto the host. The store part of this
-procedure (a backup by `sparrow-backup`, a schema raise, then the restored
-store started with `--restored-from` on the recorded image) was exercised on a
-test instance ([evidence/lifecycle.md](evidence/lifecycle.md)); the whole
-system-unit restore has not been.
+`install.sh` installed a different bundle, install the set's:
+`sudo cp -a --no-preserve=ownership /net/synology/archives/sparrow/sets/ID/lexicons/. /usr/local/share/sparrow/`.
 
-A restored `pre-upgrade-IMAGE` copy is older than the start that used it, so
-the schema guard refuses it before the next upgrade. Rename it
-(`.retired-STAMP`) and take a new one with `sudo deploy/pre-upgrade-backup.sh`.
+The intake and the store are not from the same instant. The set's intake is
+copied online after the store's backup point, and the daemon consumes into the
+store while it is copied. A restored intake can therefore hold a file the store
+already ingested before the backup point (it is ingested again), and a file
+consumed between the backup point and the copy is in neither. An intake root's
+`.sparrow-inflight/` can also hold a private claim entry the restored store does
+not journal; the daemon then refuses to start with "unrecognized private claim
+entry" (or "private claim directory exceeds its bounded journal registry"). Move
+each such entry out of the intake root, keeping its bytes, never delete it, and
+start again. A claim the restored store journals whose private source is missing
+never completes: `pending_claims` shows it and the watch failure reads
+"unpublished claimed source is missing". Once its bytes are confirmed lost,
+retire it with `sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON"`
+(docs/interfaces.md, "Retiring an unrecoverable claim").
+
+The shipper then resends every file shipped after the backup whose original
+still exists; records producers sent directly after the backup are lost unless
+they resend them. On a fresh host, follow README.md steps 1 to 3 first, then this
+procedure with the NAS mounted. The recorded test-instance run
+([evidence/lifecycle.md](evidence/lifecycle.md)) restored a store with
+`start.sh --restored-from` on the recorded image, but from the earlier
+closed-store backup; neither the online backup's restore (`--restore-backup`,
+the set's intake and configuration) nor the whole system-unit restore has been
+exercised on a host.
+
+A restored `pre-upgrade-IMAGE` link is older than the start that used it, so the
+schema guard refuses it before the next upgrade. Rename it (`.retired-STAMP`)
+and take a new one with `sudo deploy/pre-upgrade-backup.sh`.
 
 ## Revert the cutover to the user unit
 
 - When: the system unit cannot serve after the cutover of Sparrow issue #22,
   and the operator's old user unit must serve `/SPARROW` again.
-- Needs: the issue's step 5a backup,
-  `/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97`, taken from the
-  closed store before `install.sh` ran, and the user units, disabled but not
-  removed.
+- Needs: the issue's step 5a backup and the user units, disabled but not
+  removed. The step 5a copy,
+  `/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97`, was a closed
+  copy on the local disk, and was deleted on 2026-11-08 with every local backup
+  (Patrick's ruling forbids them). A revert now needs an online backup set on
+  the NAS, taken while a daemon with the backup operation served the store
+  (`/net/synology/archives/sparrow/pre-upgrade-IMAGE`, or a `sets/ID`); set `B`
+  to it. The commands below restore its store with the image its `SOURCE`
+  names. A schema 62 daemon has no backup operation, so the issue's original
+  step 5a cannot be repeated online.
 - Before the cutover (`stat`, 2026-11-02), `/SPARROW` was `paudley:root` 0700
   with no ACL entries, `/SPARROW/store` was `paudley:paudley` 0700, and
   nothing else existed under `/SPARROW`.
@@ -396,8 +451,8 @@ the schema guard refuses it before the next upgrade. Rename it
 
 It checks first, changing nothing, that no Sparrow system unit is active and
 that the sysusers file names exactly one operator. It leaves `/etc/sparrow`,
-the `sparrow` user and group, the installed images, `/SPARROW/ship` and
-`/SPARROW/backups` in place, and says so. Once `/SPARROW` is paudley's again,
+the `sparrow` user and group, the installed images, `/SPARROW/ship` and the
+backups on the NAS in place, and says so. Once `/SPARROW` is paudley's again,
 the user manager does not need the `sparrow` group.
 
 Optionally, drain a system unit that still serves. This only lets it consume
@@ -425,19 +480,22 @@ again after one: each step skips once it is done.
 (
 set -euo pipefail
 OLD="$HOME/.local/bin/sparrow /SPARROW/store/rpc.sock"
-B=/SPARROW/backups/pre-upgrade-sparrowd-schema62-600ee97
-sudo grep -x image=sparrowd-schema62-600ee97 "$B/SOURCE"
+B=/net/synology/archives/sparrow/pre-upgrade-IMAGE
+IMAGE=$(sudo sed -n 's/^image=//p' "$B/SOURCE")
+[ -n "$IMAGE" ]
+SET=$(readlink -f "$B")
+ROOT=${SET%/sets/*}
+ID=$(sudo sed -n 's/^backup_id=//p' "$B/SOURCE")
 # Names this revert in the marker each set-aside writes, so a .cutover left by anything else
 # (an earlier revert from another backup, or a hand move) is refused, not taken as done.
 MARK="revert from $B taken_utc=$(sudo sed -n 's/^taken_utc=//p' "$B/SOURCE")"
 # Before install.sh has run, and after uninstall.sh, there is no system unit to stop.
 if [ -e /etc/systemd/system/sparrow.service ]; then
     sudo systemctl stop sparrow-ship.timer sparrow-backup.timer
-    # A helper run already under way finishes on its own: never stop sparrow-backup.service
-    # mid-run, because its ExecStopPost starts the daemon again. Both helpers are oneshot units,
-    # "activating" while they run and "deactivating" during ExecStopPost, never "active", so
-    # test the state rather than is-active's exit status. The backup's drain wait alone may
-    # take 30 minutes, so wait up to 60, then stop here.
+    # A helper run already under way finishes on its own. Both helpers are oneshot units,
+    # "activating" while they run, never "active", so test the state rather than is-active's
+    # exit status. A backup copies over the network and can take a long time, so wait up to
+    # 60 minutes, then stop here.
     waited=0
     while :; do
         busy=
@@ -470,8 +528,12 @@ for part in store intake; do
     if [ ! -e "/SPARROW/$part" ]; then
         sudo rm -rf "/SPARROW/$part.restoring"
         sudo mkdir "/SPARROW/$part.restoring"
-        sudo deploy/copy-on-write.sh match "$B/$part" "/SPARROW/$part.restoring"
-        sudo cp -a --reflink=always "$B/$part/." "/SPARROW/$part.restoring/"
+        sudo chattr +C "/SPARROW/$part.restoring"
+        if [ "$part" = store ]; then
+            sudo "$B/images/$IMAGE" --restore-backup "$ROOT" "$ID" "/SPARROW/$part.restoring"
+        else
+            sudo cp -a "$B/$part/." "/SPARROW/$part.restoring/"
+        fi
         sudo mv -T "/SPARROW/$part.restoring" "/SPARROW/$part"
     fi
 done
@@ -489,7 +551,7 @@ sed -i -e 's|^intake_root = .*|intake_root = "/SPARROW/intake"|' \
     -e 's|^state_dir = .*|state_dir = "/SPARROW/ship.user"|' ~/.config/sparrow/ship.toml
 grep -qx 'intake_root = "/SPARROW/intake"' ~/.config/sparrow/ship.toml
 grep -qx 'state_dir = "/SPARROW/ship.user"' ~/.config/sparrow/ship.toml
-# The old backup timer stays disabled: its unit drains the old intake root (see below).
+# The old backup timer stays disabled: its unit names the old intake root (see below).
 systemctl --user enable --now sparrow.service sparrow-ship.timer
 for i in $(seq 60); do $OLD status >/dev/null 2>&1 && break; sleep 2; done
 $OLD status | jq -r .store_id
@@ -520,14 +582,15 @@ the backup's `SOURCE` names.
   exists. `/SPARROW/ship` does not exist before `install.sh` runs, and is
   empty until the issue's step 7.
 - The backup timer. The old user `sparrow-backup.timer` stays disabled. Its
-  unit passes `~/.local/state/sparrow/intake` as the intake root, so its drain
-  check would ignore files waiting under `/SPARROW/intake`; it had also failed
-  before the cutover. Re-enable it only after its intake argument names
+  unit passes `~/.local/state/sparrow/intake` as the intake root, so it would
+  copy the wrong tree; it must also carry the online lines of README.md,
+  "Interim user unit". Re-enable it only after its intake argument names
   `/SPARROW/intake`. Until then, the step 5a backup and
   `/SPARROW/store.cutover` are the copies.
 - The intake. The system unit's roots go aside as `/SPARROW/intake.cutover`,
-  and the step 5a roots replace them. Those are empty, hold no claims, and
-  agree with the restored store. Kept roots could hold files claimed under
+  and the set's intake replaces them. It was copied online, so it can hold
+  waiting files and private claim entries the restored store does not journal
+  ("Restore from a backup" says what to do). Kept roots could hold files claimed under
   `.sparrow-inflight/` and journaled only in the system store. The restored
   store does not know those claims, so its daemon refuses to start. It
   reports "unrecognized private claim entry", or "private claim directory
@@ -602,21 +665,20 @@ Each remaining item and why it stays:
 | --- | --- | --- |
 | all | `RootDirectory=`/`RootImage=` | The daemon and helpers use the host's libraries; `ProtectSystem=strict` makes the host read-only to them instead. |
 | all | `RestrictAddressFamilies=~AF_UNIX` | The private socket and the journal are Unix sockets. |
-| all | `PrivateUsers=` | The daemon's port 518 needs the bind capability in the host's user namespace, and every unit reads or writes files whose real owners must stay mapped (the store, the roots, the producers' files, the backup's preserved owners). |
+| all | `PrivateUsers=` | The daemon's port 518 needs the bind capability in the host's user namespace, and every unit reads or writes files whose real owners must stay mapped (the store, the roots, the producers' files). |
 | all | `DeviceAllow=char-rtc:r` | Added by `ProtectClock=yes` itself; read-only clock access. |
 | `sparrow` | `PrivateNetwork=`, `RestrictAddressFamilies=~AF_(INET\|INET6)`, `IPAddressDeny=` | The public Cap'n Proto listener on 0.0.0.0:518 serves remote agents on any trusted network; CHAP guards it. |
 | `sparrow` | `AmbientCapabilities=`, `CAP_NET_BIND_SERVICE` | Binding port 518, Patrick's ruling of 2026-11-01; the bounding set holds nothing else. |
 | `sparrow` | `RestrictSUIDSGID=` | systemd implements it with a seccomp rule that cannot inspect `openat2`'s mode, so it refuses `openat2` outright, and the daemon needs `openat2` to open files beneath a consume root without following symlinks (measured, [evidence/lifecycle.md](evidence/lifecycle.md)). `NoNewPrivileges=yes` makes a setuid file inert, and the daemon creates every file with a fixed mode. |
 | `ship` | `ProtectHome=read-only` | It reads the producers' directories under `/home/paudley`. |
-| `backup` | `User=` root, `CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_*`, `@privileged` (`@chown`) | It stops and starts the system unit and copies trees owned by `sparrow`, `paudley` and root with their owners preserved. Its writes are confined to `/SPARROW/backups`. |
+| `backup` | `User=` root, `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` | It reads trees owned by `sparrow`, `paudley` and root and preserves no owners. It stops and signals nothing. Its writes are confined to the NAS backup root `/net/synology/archives/sparrow`. |
 
 Hardening settings the specification lists that the units do not use, and why:
 `StateDirectory=`, `RuntimeDirectory=`, `CacheDirectory=` and `LogsDirectory=`
 on `sparrow.service`, because the store is `/SPARROW/store` by ruling, the
-daemon keeps no runtime or cache files and it logs to the journal (the backup
-unit does use `RuntimeDirectory=` for its marker); `WatchdogSec=`, because the
+daemon keeps no runtime or cache files and it logs to the journal; `WatchdogSec=`, because the
 daemon does not implement the systemd notification protocol (`Type=exec`).
 
 The two timers' services are not confined by AppArmor: they are Python
-programs that run `cp`, `sync`, `systemctl` and the CLI, and their profiles are
+programs that run `rsync`, `b3sum`, `sync` and the CLI, and their profiles are
 follow-up work. Their systemd sandboxes confine their writes.

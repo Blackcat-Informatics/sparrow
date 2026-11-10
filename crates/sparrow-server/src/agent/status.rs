@@ -153,6 +153,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("recompression", recompression(value.get_recompression()?)?)
         .with("migrations", migrations(value.get_migrations()?)?)
         .with("query_only", value.get_query_only())
+        .with("backup", super::backup::render(value.get_backup()?)?)
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)

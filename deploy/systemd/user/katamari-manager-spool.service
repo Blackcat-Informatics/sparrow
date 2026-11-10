@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# Interim user unit (issue #168): spool systemd's own lines about katamari-stored.service, which
+# the default journal holds, beside the node's lines that katamari-journal-spool.service spools
+# from the katamari journal namespace. Install as ~/.config/systemd/user/katamari-manager-spool.service
+# (docs/deployment.md, "Katamari's journal in the spool").
+#
+# KATAMARI_MANAGER_SINCE backfills the first start only: it is ignored once the cursor file exists.
+# 16:12:47 on 2026-11-09 is when the namespace forwarder replaced the old default-journal one.
+
+[Unit]
+Description=Spool systemd's lines about katamari-stored as JSON Lines for sparrow-ship
+
+[Service]
+Environment="KATAMARI_MANAGER_SINCE=2026-11-09 16:12:47"
+ExecStartPre=/usr/bin/find %S/sparrow/katamari-journal -name 'katamari-manager-*.jsonl' -mtime +3 -delete
+ExecStart=%h/.local/libexec/sparrow/katamari-manager-spool katamari-stored.service %S/sparrow/katamari-journal %S/sparrow/katamari-manager.cursor
+Restart=always
+RestartSec=10
+Nice=10
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

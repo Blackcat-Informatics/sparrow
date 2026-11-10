@@ -11,7 +11,7 @@
 #   SPARROW_PREFIX    images, CLI link and lexicons         /usr/local
 #   SPARROW_CONFIG    the daemon's configuration            /etc/sparrow/server.toml
 #   SPARROW_BIN       the kept images (make install-bin)    <repository>/bin
-#   SPARROW_BACKUPS   closed-store backups                  /SPARROW/backups
+#   SPARROW_BACKUPS   the online backup root, on the NAS    /net/synology/archives/sparrow
 #   SPARROW_INTAKE    the watched intake tree                /SPARROW/intake
 #   SPARROW_PRE_UPGRADE_MAX_HOURS  the oldest pre-upgrade backup accepted        24
 
@@ -22,7 +22,7 @@ SPARROW_SCOPE=${SPARROW_SCOPE:-system}
 SPARROW_PREFIX=${SPARROW_PREFIX:-/usr/local}
 SPARROW_CONFIG=${SPARROW_CONFIG:-/etc/sparrow/server.toml}
 SPARROW_BIN=${SPARROW_BIN:-$REPO_DIR/bin}
-SPARROW_BACKUPS=${SPARROW_BACKUPS:-/SPARROW/backups}
+SPARROW_BACKUPS=${SPARROW_BACKUPS:-/net/synology/archives/sparrow}
 SPARROW_INTAKE=${SPARROW_INTAKE:-/SPARROW/intake}
 LIBEXEC=$SPARROW_PREFIX/libexec/sparrow
 CLI_LINK=$SPARROW_PREFIX/bin/sparrow
@@ -234,11 +234,10 @@ require_pre_upgrade_backup() {
     grep -qx "image=$current" "$backup/SOURCE" 2>/dev/null || die "${daemon##*/} raises the schema \
 from $old to $new; take the named pre-upgrade backup first: sudo deploy/pre-upgrade-backup.sh \
 (README.md, \"Upgrades and rollback\")"
+    # The RFC 3339 instant the daemon started the online backup (sparrow-backup's taken_utc).
     taken=$(sed -n 's/^taken_utc=//p' "$backup/SOURCE")
-    [[ $taken =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$ ]] \
+    taken_at=$(date -u -d "$taken" +%s 2>/dev/null) && [[ -n $taken ]] \
         || die "$backup/SOURCE records no taken_utc; retire it and take a new one with deploy/pre-upgrade-backup.sh"
-    taken_at=$(date -u -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} \
-${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s)
     # The link's own time (no -L): when start.sh or restart.sh last pointed it at the image.
     linked_at=$(stat -c %Y -- "$LIBEXEC/sparrowd")
     ((taken_at >= linked_at)) || die "$backup was taken at $taken, before $current was last started \
@@ -265,8 +264,8 @@ select_current() {
 }
 
 # Hold the backup's lock for the rest of the script, so a backup and an image switch cannot
-# interleave: the backup records the image the link names, and stops and starts the unit itself.
-# Refuses rather than waits, because a backup can hold the daemon stopped for minutes.
+# interleave: the backup records the image the link names. Refuses rather than waits, because an
+# online backup can run for as long as its copy to the NAS takes.
 hold_backup_lock() {
     # No backup directory yet means no backup has ever run, so none can be running.
     [[ -d $SPARROW_BACKUPS ]] || return 0
@@ -306,6 +305,14 @@ status_json() {
 # One field of status_json's output.
 status_field() {
     python3 -I -c 'import json,sys; v=json.load(sys.stdin); [v := v[k] for k in sys.argv[1:]]; print(v)' "$@"
+}
+
+# Field of a JSON document on stdin, by key path (a list index is a number); an object, a
+# list, a boolean or null prints as JSON.
+json_field() {
+    python3 -I -c 'import json,sys; v=json.load(sys.stdin)
+for k in sys.argv[1:]: v=v[int(k)] if isinstance(v,list) else v[k]
+print(json.dumps(v) if isinstance(v,(dict,list,bool)) or v is None else v)' "$@"
 }
 
 # Wait until the started daemon answers status on its socket, or the unit fails.

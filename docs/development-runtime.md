@@ -88,7 +88,8 @@ causes:
   reconnects before a claim whose 45-second deadline would outlast its
   connection's lease.
 
-The first [closed-store backup](deployment.md#closed-store-backups),
+The first closed-store backup (since replaced by
+[online backups](deployment.md#online-backups) on the NAS),
 `~/.local/share/sparrow/backups/20261028T015748Z`, cost 3.0 seconds of service
 downtime. The daemon restarted with the same store, and CHAP status over the LAN
 succeeded. A restore drill copied that backup to a disposable directory and ran

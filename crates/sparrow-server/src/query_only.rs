@@ -109,6 +109,7 @@ classify! {
         sparql_query: SparqlQueryParams, SparqlQueryResults;
         sparql_explain: SparqlExplainParams, SparqlExplainResults;
         correlate: CorrelateParams, CorrelateResults;
+        watch_claims: WatchClaimsParams, WatchClaimsResults;
     }
     writes {
         ingest: IngestParams, IngestResults;
@@ -131,5 +132,7 @@ classify! {
         source_time_define: SourceTimeDefineParams, SourceTimeDefineResults;
         diagnostic_define: DiagnosticDefineParams, DiagnosticDefineResults;
         watch_claim_retire: WatchClaimRetireParams, WatchClaimRetireResults;
+        // Writes nothing to the store, but a query-only daemon takes no backup (#156).
+        backup: BackupParams, BackupResults;
     }
 }

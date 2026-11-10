@@ -4163,6 +4163,27 @@ async fn retire_claim_clears_only_an_unrecoverable_claim_and_lets_the_drain_reac
                     )
             })
             .await;
+            // `watch claims` names each stuck claim as pending, with the reason its latest
+            // attempt stayed pending and how long since it was first seen (issue 160).
+            let mut claims = cli(&socket, &["watch", "claims"]);
+            for _ in 0..100 {
+                let rows = claims["claims"].as_array().unwrap();
+                if rows.len() == 2 && rows.iter().all(|row| row["attempts"].as_u64() >= Some(1)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                claims = cli(&socket, &["watch", "claims"]);
+            }
+            assert_eq!(claims["pending"].as_u64(), Some(2), "{claims:?}");
+            for row in claims["claims"].as_array().unwrap() {
+                assert_eq!(row["state"].as_str(), Some("pending"), "{row:?}");
+                assert!(row["attempts"].as_u64() >= Some(1), "{row:?}");
+                assert!(row["last_pending_reason"].as_str().is_some(), "{row:?}");
+                assert!(
+                    row["first_seen"].as_str().is_some() && row["age_ms"].as_str().is_some(),
+                    "{row:?}"
+                );
+            }
             let retire = |claim: &str| {
                 Command::new(env!("CARGO_BIN_EXE_sparrow"))
                     .arg(&socket)
@@ -4282,6 +4303,13 @@ async fn retire_claim_clears_only_an_unrecoverable_claim_and_lets_the_drain_reac
             assert_eq!(watch["pending_claims"].as_u64(), Some(0), "{watch:?}");
             assert_eq!(watch["retired_claims"].as_array().unwrap().len(), 2);
             assert!(watch["failure"].is_null(), "{watch:?}");
+            // Both stuck claims went pending in the window and ended abandoned; none pends.
+            let claims = cli(
+                &socket,
+                &["watch", "claims", "--since", "2000-01-01T00:00:00Z"],
+            );
+            assert_eq!(claims["abandoned"].as_u64(), Some(2), "{claims:?}");
+            assert_eq!(claims["pending"].as_u64(), Some(0), "{claims:?}");
             let waiting = std::fs::read_dir(&root)
                 .unwrap()
                 .filter(|entry| entry.as_ref().unwrap().file_name() != ".sparrow-inflight")
@@ -4678,9 +4706,11 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
         .await;
 }
 
-/// INVARIANT: query-only and no-intake modes start no intake, public listener or archive, so
-/// a configuration that names one refuses startup with the conflicting key, whether a flag or
-/// the `query_only` key selects the mode, before any store or socket is created.
+/// INVARIANT: query-only, no-intake and private-intake modes start no configured consume root,
+/// public listener or archive (the first two no ingest socket either, the last no online
+/// backup, since a copy shares the live store's identity), so a configuration that
+/// names one refuses startup with the conflicting key, whether a flag or the `query_only` key
+/// selects the mode, before any store or socket is created.
 #[test]
 fn query_only_and_no_intake_refuse_conflicting_configuration() {
     let dir = tempfile::tempdir().unwrap();
@@ -4689,18 +4719,18 @@ fn query_only_and_no_intake_refuse_conflicting_configuration() {
     let config = write_server_config(dir.path(), &data, &socket);
     let base = std::fs::read_to_string(&config).unwrap();
     // `flag` selects the mode on the command line; without one the `query_only` key does.
-    let refused = |extra: &str, flag: Option<&str>, key: &str| {
+    let refused = |extra: &str, flags: &[&str], key: &str| {
         std::fs::write(&config, format!("{base}{extra}")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_sparrowd"));
         command.arg("--config").arg(&config);
-        command.args(flag);
+        command.args(flags);
         let output = command.admitted_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{extra}");
-        let mode = if flag == Some("--no-intake") {
-            "--no-intake"
-        } else {
-            "query_only"
+        let mode = match flags.first() {
+            Some(&"--no-intake") => "--no-intake",
+            Some(&"--private-intake") => "--private-intake",
+            _ => "query_only",
         };
         assert!(
             stderr.contains(&format!("{mode} refuses the configured `{key}`")),
@@ -4713,17 +4743,17 @@ fn query_only_and_no_intake_refuse_conflicting_configuration() {
     let consume = toml::to_string(&watch_definition(&root, "completed", 0, 16, 16)).unwrap();
     refused(
         &format!("\n[[consume]]\n{consume}"),
-        Some("--query-only"),
+        &["--query-only"],
         "consume",
     );
     refused(
         &format!("query_only = true\n\n[[consume]]\n{consume}"),
-        None,
+        &[],
         "consume",
     );
     refused(
         &format!("\n[[consume]]\n{consume}"),
-        Some("--no-intake"),
+        &["--no-intake"],
         "consume",
     );
     let secret = dir.path().join("tcp.secret");
@@ -4732,8 +4762,22 @@ fn query_only_and_no_intake_refuse_conflicting_configuration() {
         "rpc_tcp_address = \"127.0.0.1:9\"\nrpc_tcp_secret_file = \"{}\"\n",
         secret.display()
     );
-    refused(&tcp, Some("--query-only"), "rpc_tcp_address");
-    refused(&tcp, Some("--no-intake"), "rpc_tcp_address");
+    refused(&tcp, &["--query-only"], "rpc_tcp_address");
+    refused(&tcp, &["--no-intake"], "rpc_tcp_address");
+    let private = root.to_str().unwrap();
+    refused(
+        &format!("\n[[consume]]\n{consume}"),
+        &["--private-intake", private],
+        "consume",
+    );
+    refused(&tcp, &["--private-intake", private], "rpc_tcp_address");
+    // A copy shares the live store's identity: its backup would land in the live root.
+    let backups = dir.path().join("backups");
+    refused(
+        &format!("backup_root = \"{}\"\n", backups.display()),
+        &["--private-intake", private],
+        "backup_root",
+    );
 }
 
 /// Run deploy/verify-backup.sh with a scratch root and the given live configuration.
@@ -4763,13 +4807,124 @@ fn verify_backup_with(
     .env("SPARROW_VERIFY", verify)
     .env("SPARROW_CONFIG", live)
     .envs(env.iter().copied())
-    .admitted_output()
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    // A run lasts tens of seconds: hold PROCESS_START only across the spawn, so other tests'
+    // process starts, and the connections they hold open meanwhile, never wait out a run.
+    .admitted_spawn()
+    .unwrap()
+    .wait_with_output()
     .unwrap();
     (
         output.status.code(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// The environment for `verify-backup.sh --measure-migration`: test doubles of `systemctl` and
+/// `systemd-run` first on PATH, so the run needs no user manager and no loaded unit, and
+/// SPARROW_MEASURE_UNIT naming the doubles' unit. The `systemd-run` double sets the requested
+/// nice level and records the scope properties it was given, which the `systemctl` double
+/// reports for the scope as systemd would apply them; the unit reports Nice=10 under the
+/// time-sharing policy, as sparrow.service does. The `df` double reports 60 GB available (or
+/// `SPARROW_TEST_DF_AVAIL_BYTES`), above the 50 GB start and 40 GB abort floors, so a run
+/// needs no 50 GB scratch filesystem while the floors themselves stay as production has them.
+/// Production keeps the real tools: the script itself is unchanged and still checks every
+/// reported value. `chrt --other 0` runs for real: a runner under SCHED_IDLE needs
+/// RLIMIT_NICE of at least 20 minus that nice level (10), or the measured daemon fails to
+/// start.
+fn measure_env(dir: &Path) -> Vec<(String, String)> {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = dir.join("systemd-doubles");
+    std::fs::create_dir_all(stubs.join("state")).unwrap();
+    let doubles = [
+        (
+            "systemd-run",
+            r#"#!/usr/bin/python3 -I
+import os, pathlib, sys
+args, props, nice, unit = sys.argv[1:], [], None, None
+while args and args[0] != "--":
+    arg = args.pop(0)
+    if arg.startswith("--nice="): nice = int(arg.split("=", 1)[1])
+    elif arg.startswith("--unit="): unit = arg.split("=", 1)[1]
+    elif arg == "-p": props.append(args.pop(0))
+    elif arg not in ("--user", "--scope", "--quiet", "--collect"): sys.exit(f"systemd-run double: unsupported {arg}")
+if not args or unit is None or nice is None: sys.exit("systemd-run double: needs --unit, --nice and -- COMMAND")
+size = {"G": 1 << 30, "M": 1 << 20}
+applied = []
+for prop in props:
+    key, value = prop.split("=", 1)
+    if key == "CPUQuota": applied.append("CPUQuotaPerSecUSec=%gs" % (int(value.rstrip("%")) / 100))
+    elif value[-1] in size: applied.append("%s=%d" % (key, int(value[:-1]) * size[value[-1]]))
+    else: applied.append(prop)
+pathlib.Path(__file__).parent.joinpath("state", unit + ".scope").write_text("\n".join(applied) + "\n")
+os.setpriority(os.PRIO_PROCESS, 0, nice)
+os.execvp(args[1], args[1:])
+"#,
+        ),
+        (
+            "systemctl",
+            r#"#!/usr/bin/python3 -I
+import pathlib, sys
+args = sys.argv[1:]
+if args[:2] != ["--user", "show"] or len(args) < 3: sys.exit(f"systemctl double: unsupported {args}")
+unit, rest = args[2], args[3:]
+value_only = "--value" in rest
+wanted = [rest[i + 1] for i, arg in enumerate(rest) if arg == "-p"]
+if unit.endswith(".scope"):
+    known = dict(line.split("=", 1) for line in pathlib.Path(__file__).parent.joinpath("state", unit).read_text().split())
+else:
+    known = {"LoadState": "loaded", "Nice": "10", "CPUSchedulingPolicy": "0"}
+for key in wanted:
+    print(known.get(key, "") if value_only else "%s=%s" % (key, known.get(key, "")))
+"#,
+        ),
+        (
+            "df",
+            r#"#!/usr/bin/python3 -I
+import os, sys
+args = sys.argv[1:]
+if args[:3] != ["-B1", "--output=avail", "--"] or len(args) != 4: sys.exit(f"df double: unsupported {args}")
+if not os.path.exists(args[3]): sys.exit(f"df double: {args[3]}: No such file or directory")
+print("Avail")
+print(os.environ.get("SPARROW_TEST_DF_AVAIL_BYTES", "60000000000"))
+"#,
+        ),
+    ];
+    for (name, body) in doubles {
+        let path = stubs.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    vec![
+        (
+            "PATH".into(),
+            format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()),
+        ),
+        (
+            "SPARROW_MEASURE_UNIT".into(),
+            "sparrow-measure-double.service".into(),
+        ),
+    ]
+}
+
+/// [`verify_backup_with`] under [`measure_env`], with EXTRA environment.
+fn verify_backup_measured(
+    backup: &Path,
+    verify: &Path,
+    live: &Path,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
+    let owned = measure_env(verify.parent().unwrap());
+    let mut env: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    env.extend_from_slice(extra);
+    verify_backup_with(backup, verify, live, args, &env)
 }
 
 /// A live configuration for verify-backup's guard, and a backup of a two-record store.
@@ -4782,13 +4937,30 @@ fn backup_fixture(
     std::path::PathBuf,
     String,
 ) {
+    backup_fixture_with(dir, false, |_, _, _| {})
+}
+
+/// As [`backup_fixture`], with PREPARE run on the open store (its data_dir and the backup's
+/// instant given) before the online backup is taken, and, when OWED, the store counters
+/// removed before the backup, so a copy restored from the set owes their migration pages.
+fn backup_fixture_with(
+    dir: &Path,
+    owed: bool,
+    prepare: impl FnOnce(&sparrow_core::Store, &Path, u64),
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
     let live_data = dir.join("live").join("store");
     std::fs::create_dir_all(&live_data).unwrap();
     let live = write_server_config(&dir.join("live"), &live_data, &live_data.join("rpc.sock"));
-    let backup = dir.join("backup");
-    let data = backup.join("store");
-    std::fs::create_dir_all(backup.join("config")).unwrap();
-    let config = write_server_config(&backup.join("config"), &data, &data.join("rpc.sock"));
+    // The backed-up store, an engine backup of it, and its set, as sparrow-backup lays them out.
+    let source = dir.join("source");
+    let data = source.join("store");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = write_server_config(&source, &data, &data.join("rpc.sock"));
     let store = sparrow_server::ServerConfig::read(&config)
         .unwrap()
         .open_store()
@@ -4804,29 +4976,79 @@ fn backup_fixture(
         )
         .unwrap();
     let identity = store.store_id().unwrap();
-    let chunks = store.status(now).unwrap()["unique_payload_chunks"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    prepare(&store, &data, now);
+    let store = if owed {
+        drop(store);
+        let db = sparrow_test_support::catalog_db(&data).unwrap();
+        sparrow_core::remove_store_counters_for_legacy_fixture(&db).unwrap();
+        drop(db);
+        sparrow_server::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap()
+    } else {
+        store
+    };
+    let root = dir.join("backups");
+    let target = sparrow_core::BackupTarget::local_for_test(root.clone(), 2, &data).unwrap();
+    store.backup_start(&target, now).unwrap();
+    let status = loop {
+        let status = store.backup_status();
+        if status.phase != sparrow_core::BackupPhase::Running {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(
+        status.phase,
+        sparrow_core::BackupPhase::Complete,
+        "{status:?}"
+    );
     drop(store);
+    let backup = root.join("sets").join(status.backup_id.to_string());
+    std::fs::create_dir_all(backup.join("config")).unwrap();
+    std::fs::copy(&config, backup.join("config").join("server.toml")).unwrap();
     std::fs::write(
         backup.join("SOURCE"),
         format!(
-            "taken_utc={}\nimage=sparrowd-test\nstore_id={identity}\nunique_payload_chunks={chunks}\ntext_lexicon_dir={}\n",
+            "taken_utc={}\nbackup_id={}\nimage=sparrowd-test\nstore_id={identity}\nengine_bytes={}\ntext_lexicon_dir={}\n",
             sparrow_core::format_instant(now + 1000).unwrap(),
+            status.backup_id,
+            status.bytes,
             sparrow_test_support::text_lexicon_dir().display()
         ),
     )
     .unwrap();
+    write_backup_manifest(&backup);
     (live, live_data, backup, identity)
 }
 
-/// INVARIANT: deploy/verify-backup.sh passes a matching backup end to end on a reflinked copy,
-/// still passes on its clock-independent chunk count once the backup has aged out of
-/// retention, and fails, removing its scratch copy, when SOURCE names another store.
+/// Write the manifest sparrow-backup writes for the set BACKUP_ROOT/sets/ID: every file of the
+/// set and every engine file the backup's metadata lists, relative to the backup root. A test
+/// that edits a set file on purpose rewrites it, so only the edit under test can fail it.
+fn write_backup_manifest(backup: &Path) {
+    let id = backup.file_name().unwrap().to_str().unwrap();
+    let root = backup.parent().unwrap().parent().unwrap();
+    let manifest = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -o pipefail; {{ find sets/{id} -type f ! -name MANIFEST.b3; echo engine/meta/{id}; \
+             sed -nE 's#^((private|shared|shared_checksum)/[^ ]+).*#engine/\\1#p' engine/meta/{id}; }} \
+             | xargs -d '\\n' b3sum -- >sets/{id}/MANIFEST.b3"
+        ))
+        .current_dir(root)
+        .admitted_output()
+        .unwrap();
+    assert!(manifest.status.success(), "{manifest:?}");
+}
+
+/// INVARIANT (issue #156): deploy/verify-backup.sh passes a matching online backup end to end,
+/// checking its manifest against the backup root and restoring it into a scratch copy, still
+/// passes once the backup has aged out of retention, and fails, removing its scratch copy, when
+/// SOURCE names another store or a file differs from the manifest.
 #[test]
 fn verify_backup_fails_on_wrong_store_id() {
-    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
+    // The script's scratch copy stays below the cargo target directory and is removed.
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (live, _, backup, identity) = backup_fixture(dir.path());
     let verify = dir.path().join("verify");
@@ -4834,10 +5056,11 @@ fn verify_backup_fails_on_wrong_store_id() {
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     for check in [
+        "manifest",
+        "restore",
         "query-only",
         "store-id",
         "status",
-        "payload-chunks",
         "records",
         "artifact",
         "shutdown",
@@ -4853,7 +5076,7 @@ fn verify_backup_fails_on_wrong_store_id() {
         "the scratch copy is removed"
     );
     // Once the backup's newest hour is older than retention, its records have expired by the
-    // reader's clock; the chunk count still holds, and the window checks are skipped.
+    // reader's clock; the window checks are skipped.
     let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
     let taken = source.lines().next().unwrap().to_owned();
     let aged =
@@ -4864,95 +5087,29 @@ fn verify_backup_fails_on_wrong_store_id() {
         source.replace(&taken, &format!("taken_utc={aged}")),
     )
     .unwrap();
+    write_backup_manifest(&backup);
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
-    assert!(stdout.contains("PASS payload-chunks:"), "{stdout}");
+    assert!(stdout.contains("PASS restore:"), "{stdout}");
     assert!(stdout.contains("SKIP records:"), "{stdout}");
     std::fs::write(
         backup.join("SOURCE"),
         source.replace(&identity, "store:00000000000000000000000000000000"),
     )
     .unwrap();
+    write_backup_manifest(&backup);
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("FAIL store-id:"), "{stderr}");
     assert!(!stdout.contains("PASS records"), "{stdout}");
-    assert_eq!(
-        std::fs::read_dir(&verify).unwrap().count(),
-        0,
-        "the scratch copy is removed"
-    );
-}
-
-/// INVARIANT: verify-backup.sh never compares a pending count. When SOURCE recorded
-/// `unique_payload_chunks=pending`, or the copy's store counters are still seeding (a store
-/// written before #146 that the image upgrades), it reports the payload-chunks check as not
-/// verifiable rather than passing or failing it, still runs and passes every other check,
-/// expects the closing line to say pending for a pending copy, and exits 3, not 0.
-#[test]
-fn verify_backup_reports_pending_counts_as_not_verifiable() {
-    // The script reflinks with --reflink=always, which the tmpfs temporary directory refuses.
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (live, _, backup, _) = backup_fixture(dir.path());
-    let verify = dir.path().join("verify");
-    let image = ["--image", env!("CARGO_BIN_EXE_sparrowd")];
-    let source = std::fs::read_to_string(backup.join("SOURCE")).unwrap();
-    let recorded = source
-        .lines()
-        .find(|line| line.starts_with("unique_payload_chunks="))
-        .unwrap()
-        .to_owned();
-    let others = ["query-only", "store-id", "status", "records", "artifact"];
-    let unverifiable = "NOT VERIFIABLE payload-chunks: not verifiable (counts pending)";
-    let summary = "verified except payload-chunks: not verifiable (counts pending)";
-
-    // SOURCE pending, copy exact: the live daemon logged no total, so nothing is compared.
-    std::fs::write(
-        backup.join("SOURCE"),
-        source.replace(&recorded, "unique_payload_chunks=pending"),
-    )
-    .unwrap();
-    let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
-    assert_eq!(code, Some(3), "not verified: {stdout}{stderr}");
-    assert!(stdout.contains(unverifiable), "{stdout}");
-    assert!(!stdout.contains("PASS payload-chunks"), "{stdout}");
-    assert!(stdout.contains(summary), "{stdout}");
-    for check in others {
-        assert!(
-            stdout.contains(&format!("PASS {check}:")),
-            "{check}: {stdout}"
-        );
-    }
-    assert!(
-        stdout.contains(&format!(
-            "PASS shutdown: the daemon stopped cleanly and logged {recorded};"
-        )),
-        "an exact copy still logs its count: {stdout}"
-    );
-
-    // SOURCE numeric, copy pending: the copy's count covers only the seeded keys.
     std::fs::write(backup.join("SOURCE"), &source).unwrap();
-    let db = sparrow_test_support::catalog_db(&backup.join("store")).unwrap();
-    sparrow_core::remove_store_counters_for_legacy_fixture(&db).unwrap();
-    drop(db);
+    write_backup_manifest(&backup);
+    let mut changed = std::fs::read(backup.join("config").join("server.toml")).unwrap();
+    changed.extend_from_slice(b"\n");
+    std::fs::write(backup.join("config").join("server.toml"), changed).unwrap();
     let (code, stdout, stderr) = verify_backup(&backup, &verify, &live, &image);
-    assert_eq!(code, Some(3), "not verified: {stdout}{stderr}");
-    assert!(stdout.contains(unverifiable), "{stdout}");
-    assert!(!stdout.contains("PASS payload-chunks"), "{stdout}");
-    assert!(!stderr.contains("FAIL"), "{stderr}");
-    assert!(stdout.contains(summary), "{stdout}");
-    for check in others {
-        assert!(
-            stdout.contains(&format!("PASS {check}:")),
-            "{check}: {stdout}"
-        );
-    }
-    assert!(
-        stdout.contains(
-            "PASS shutdown: the daemon stopped cleanly and logged unique_payload_chunks=pending"
-        ),
-        "{stdout}"
-    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("FAIL manifest:"), "{stderr}");
     assert_eq!(
         std::fs::read_dir(&verify).unwrap().count(),
         0,
@@ -4961,54 +5118,14 @@ fn verify_backup_reports_pending_counts_as_not_verifiable() {
 }
 
 /// INVARIANT: verify-backup.sh never starts a daemon that could reach the live store or the
-/// live intake: it refuses a backup whose store is or holds a link (here, to the live
-/// data_dir), and it refuses the backup's own image when that image has no query-only mode,
-/// without running it with a configuration.
+/// live intake: it refuses the backup's own image when that image has no query-only mode,
+/// without running it with a configuration, before any scratch directory exists.
 #[test]
-fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
+fn verify_backup_refuses_an_image_without_query_only() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (live, live_data, backup, _) = backup_fixture(dir.path());
+    let (live, _, backup, _) = backup_fixture(dir.path());
     let verify = dir.path().join("verify");
-
-    let linked = dir.path().join("linked");
-    std::fs::create_dir_all(&linked).unwrap();
-    std::fs::copy(backup.join("SOURCE"), linked.join("SOURCE")).unwrap();
-    std::os::unix::fs::symlink(&live_data, linked.join("store")).unwrap();
-    let (code, stdout, stderr) = verify_backup(
-        &linked,
-        &verify,
-        &live,
-        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
-    );
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("store is a symbolic link"), "{stderr}");
-    assert!(
-        !verify.exists(),
-        "refused before any scratch directory exists"
-    );
-    assert_eq!(
-        std::fs::read_dir(&live_data).unwrap().count(),
-        0,
-        "the live store is untouched"
-    );
-
-    // A link inside the store is refused too, even one that stays inside the backup.
-    let inner = backup.join("store").join("inner-link");
-    std::os::unix::fs::symlink(backup.join("SOURCE"), &inner).unwrap();
-    let (code, stdout, stderr) = verify_backup(
-        &backup,
-        &verify,
-        &live,
-        &["--image", env!("CARGO_BIN_EXE_sparrowd")],
-    );
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("holds the symbolic link"), "{stderr}");
-    assert!(
-        !verify.exists(),
-        "refused before any scratch directory exists"
-    );
-    std::fs::remove_file(&inner).unwrap();
 
     // The backup's own pre-query-only image: it prints the old usage line, and marks any run
     // that passes it arguments.
@@ -5042,7 +5159,9 @@ fn verify_backup_refuses_a_linked_store_and_an_image_without_query_only() {
 
 /// INVARIANT: the migration measurement's disk guard refuses to start below its free-space
 /// floor, and refuses an override that would lower a floor, before any scratch copy exists or
-/// any daemon starts.
+/// any daemon starts. With --with-traffic the set is restored twice (the measured copy and the
+/// query-only prep copy), so a set whose single restore fits but whose two do not is refused
+/// before anything is restored.
 #[test]
 fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -5053,17 +5172,18 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
         "--image",
         env!("CARGO_BIN_EXE_sparrowd"),
     ];
-    // No filesystem has an exabyte free, so raising the start floor that far always refuses.
-    let (code, stdout, stderr) = verify_backup_with(
+    // Just under the default 50 GB start floor, as the df double reports it.
+    let (code, stdout, stderr) = verify_backup_measured(
         &backup,
         &verify,
         &live,
         &args,
-        &[("SPARROW_MEASURE_MIN_FREE_GB", "1000000000")],
+        &[("SPARROW_TEST_DF_AVAIL_BYTES", "49999999999")],
     );
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(
-        stdout.contains("verify-backup: MEASURE free_space phase=start "),
+        stdout.contains("verify-backup: MEASURE free_space phase=start ")
+            && stdout.contains(" bytes=49999999999 gb=49"),
         "{stdout}"
     );
     assert!(
@@ -5074,7 +5194,7 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
         !verify.exists(),
         "refused before any scratch directory exists"
     );
-    let (code, stdout, stderr) = verify_backup_with(
+    let (code, stdout, stderr) = verify_backup_measured(
         &backup,
         &verify,
         &live,
@@ -5087,9 +5207,566 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
         !verify.exists(),
         "refused before any scratch directory exists"
     );
+
+    // 26 GB of engine files: one restore and 10 GiB fit the double's 60 GB, two do not.
+    let (live, _, backup, _, _) = traffic_fixture(&dir.path().join("traffic"), true, false, 1000);
+    let source = backup.join("SOURCE");
+    let resized = std::fs::read_to_string(&source)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.starts_with("engine_bytes=") {
+                "engine_bytes=26000000000".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&source, format!("{resized}\n")).unwrap();
+    write_backup_manifest(&backup);
+    let (code, stdout, stderr) = verify_backup_measured(
+        &backup,
+        &verify,
+        &live,
+        &[
+            "--measure-migration",
+            "--with-traffic",
+            "--image",
+            env!("CARGO_BIN_EXE_sparrowd"),
+        ],
+        &[],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("2 time(s) needs 52000000000 bytes plus 10 GiB"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("PASS restore:"),
+        "nothing was restored: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch directory is removed"
+    );
 }
 
-/// INVARIANT: deploy/user-unit-upgrade.sh refuses a trailing --to without a value, a daemon
+/// An online backup set for the traffic measurement, taken by `backup_start` from a test store
+/// with live intake: the two-record fixture plus, before the backup, a stored watch catalog
+/// naming a "live" consume root with quiet interval QUIET_MS, a claim journaled against that
+/// root whose file sits in its `.sparrow-inflight/`, one direct producer artifact received one
+/// second into the hour before `taken_utc` and, with WATCH_INTAKE, one artifact of the watch's
+/// source received two seconds into it; with OWED the store counters are removed before the
+/// backup, so the restored copy runs migration pages and its counts are pending. The set holds
+/// the image pair in `images/` and, as sparrow-backup copies /etc/sparrow, a
+/// `config/sparrow/ship.toml` whose source, named after the watch root, is a "live" producer
+/// directory holding one file. Returns the live configuration, live data_dir, the set, the
+/// live consume root and the live producer file.
+fn traffic_fixture(
+    dir: &Path,
+    watch_intake: bool,
+    owed: bool,
+    quiet_ms: u32,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let intake = dir.join("live").join("intake");
+    let live_root = intake.join("replayed");
+    let producers = dir.join("live").join("producer");
+    for path in [&live_root, &producers] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let mut window_start = 0;
+    let (live, live_data, backup, _) = backup_fixture_with(dir, owed, |store, data, now| {
+        // backup_fixture records taken_utc one second after NOW.
+        window_start = now + 1000 - 3_600_000;
+        store
+            .ingest(
+                "direct-producer",
+                "replay",
+                "jsonl",
+                b"{\"direct\":1}\n",
+                window_start + 1000,
+            )
+            .unwrap();
+        if watch_intake {
+            // What the watch received in the window, as the live shipper fed its root.
+            store
+                .ingest(
+                    "watch-intake",
+                    "consume-acceptance",
+                    "jsonl",
+                    b"{\"watch\":1}\n",
+                    window_start + 2000,
+                )
+                .unwrap();
+        }
+        // The stored catalog names the live root, as the live store's names its roots; the
+        // worker persists it before it starts and is stopped at once.
+        let worker = sparrow_server::watches::ConsumeWorker::start(
+            store.clone(),
+            &[watch_definition(&live_root, "replayed", quiet_ms, 16, 16)],
+            data.join("seed.sock"),
+            sparrow_server::watches::WatchRegistry::default(),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(worker.shutdown())
+            .unwrap();
+        // A claim journaled against the live root, its file moved into the live root's
+        // .sparrow-inflight/, as the 2026-11-07 pre-upgrade backup held one: a private-intake
+        // copy must open over it and never touch it.
+        let pending = live_root.join("pending.jsonl");
+        std::fs::write(&pending, b"{\"pending\":1}\n").unwrap();
+        let owner =
+            sparrow_server::consumption::ClaimRoot::open(store.clone(), "replayed", &live_root)
+                .unwrap();
+        let journal = owner
+            .reserve(
+                Path::new("pending.jsonl"),
+                sparrow_client::CompletedFileIdentity::capture(
+                    &std::fs::metadata(&pending).unwrap(),
+                ),
+                "consume-acceptance",
+                "jsonl",
+            )
+            .unwrap();
+        assert!(matches!(
+            owner
+                .recover(&journal.import_id, sparrow_server::now().unwrap())
+                .unwrap(),
+            sparrow_server::consumption::Recovery::Claimed(_)
+        ));
+    });
+    // The image pair SOURCE names, as sparrow-backup copies it into the set.
+    let images = backup.join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_sparrowd"), images.join("sparrowd-test"))
+        .unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_sparrow"), images.join("sparrow-test")).unwrap();
+    let produced = producers.join("replayed-1.jsonl");
+    std::fs::write(&produced, b"{\"produced\":1}\n{\"produced\":2}\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&produced)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(window_start + 1000))
+        .unwrap();
+    let etc = backup.join("config").join("sparrow");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::write(
+        etc.join("ship.toml"),
+        format!(
+            "intake_root = \"{}\"\nstate_dir = \"{}\"\nmax_chunk_bytes = 1048576\nmax_chunk_lines = 50000\nmax_files_per_run = 64\nmax_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n[[source]]\nname = \"replayed\"\ndir = \"{}\"\npattern = \"*.jsonl\"\nrule = \"settled\"\nformat = \"jsonl\"\nsettle_seconds = 1\n",
+            intake.display(),
+            dir.join("live").join("ship").display(),
+            producers.display()
+        ),
+    )
+    .unwrap();
+    // The set's files changed, so its manifest is written again, as sparrow-backup writes it
+    // last.
+    write_backup_manifest(&backup);
+    (live, live_data, backup, live_root, produced)
+}
+
+/// Every entry below PATH with its size and modification time, for an untouched-tree check.
+fn tree_snapshot(path: &Path) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime)> {
+    let mut entries = Vec::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            }
+            entries.push((entry.path(), metadata.len(), metadata.modified().unwrap()));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// The value of KEY=VALUE in the MEASURE line that starts with PREFIX.
+fn measure_value(stdout: &str, prefix: &str, key: &str) -> u64 {
+    stdout
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no line {prefix}: {stdout}"))
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("no {key} in {prefix}: {stdout}"))
+        .parse()
+        .unwrap()
+}
+
+/// INVARIANT: `verify-backup.sh --measure-migration --with-traffic --rehearse-rollback` opens
+/// the copy with every watch on a private root and its own ingest socket, replays what the copy
+/// received in the hour before the backup (the watch's intake through the shipper, the direct
+/// producer artifact over the socket), times status, records and sparql, reports the backup's
+/// own record count apart from what the replay added (pending, never partial, while the copy's
+/// counts seed), passes every gate (exit 0), the watch completing the item due within the
+/// run, and rehearses both rollback findings: the claim the
+/// restored store does not know goes back to its root with its inode, and the claim the newer
+/// store published after the backup is re-shipped and retired. The live consume root, the live
+/// producer file, the live store and the live shipper state are never touched.
+#[test]
+fn verify_backup_traffic_measurement_replays_privately_and_rehearses_the_rollback() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, live_data, backup, live_root, produced) =
+        traffic_fixture(dir.path(), true, true, 1000);
+    let verify = dir.path().join("verify");
+    let live_root_before = tree_snapshot(&live_root);
+    let produced_before = (
+        std::fs::read(&produced).unwrap(),
+        std::fs::metadata(&produced).unwrap().modified().unwrap(),
+    );
+    let (code, stdout, stderr) = verify_backup_measured(
+        &backup,
+        &verify,
+        &live,
+        &[
+            "--measure-migration",
+            "--with-traffic",
+            "--rehearse-rollback",
+            "--image",
+            env!("CARGO_BIN_EXE_sparrowd"),
+        ],
+        &[
+            // Long enough that the watch item, released 2 s in, is due: its allowance is the
+            // 1 s quiet interval, the 45 s publication deadline, the 3 s ship interval and
+            // the longest shipper run.
+            ("SPARROW_MEASURE_MIN_TRAFFIC_SECONDS", "60"),
+            ("SPARROW_MEASURE_SHIP_SECONDS", "3"),
+        ],
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    for check in [
+        "private-intake",
+        "migrate",
+        "shutdown",
+        "rehearsal-refusal",
+        "rehearsal-inflight",
+        "rehearsal-missing",
+    ] {
+        assert!(
+            stdout.contains(&format!("PASS {check}:")),
+            "{check}: {stdout}"
+        );
+    }
+    for gate in [
+        "first_status_seconds",
+        "pages_per_second",
+        "rpc_calls_over_limit",
+        "rpc_calls_failed",
+        "traffic_answered",
+        "publication_deadline_expiries",
+        "replay_failures",
+        "watch_claims_refused",
+        "watch_claims_completed",
+        "watch_intake:replayed",
+        "socket_ingests_accepted",
+    ] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.contains(&format!("gate name={gate} "))
+                    && line.ends_with("verdict=PASS")),
+            "{gate}: {stdout}"
+        );
+    }
+    for kind in ["status", "records", "sparql", "ingest"] {
+        assert!(
+            measure_value(
+                &stdout,
+                &format!("verify-backup: MEASURE rpc kind={kind} "),
+                "calls"
+            ) >= 1,
+            "{kind}: {stdout}"
+        );
+    }
+    for (source, via) in [("replayed", "ship"), ("replay", "socket")] {
+        let prepared = format!("verify-backup: MEASURE replay source={source} via={via} ");
+        assert_eq!(
+            measure_value(&stdout, &prepared, "artifacts"),
+            1,
+            "{stdout}"
+        );
+    }
+    let replay = "verify-backup: MEASURE replay watch_items_released=";
+    assert!(measure_value(&stdout, replay, "watch_items_released") >= 1);
+    assert_eq!(measure_value(&stdout, replay, "release_failures"), 0);
+    assert!(measure_value(&stdout, replay, "socket_ingests") >= 1);
+    assert!(measure_value(&stdout, replay, "ship_runs") >= 1);
+    assert_eq!(measure_value(&stdout, replay, "ship_failures"), 0);
+    assert_eq!(measure_value(&stdout, replay, "ship_held_back"), 0);
+    let intake = "verify-backup: MEASURE watch_intake watch=replayed via=ship ";
+    assert!(measure_value(&stdout, intake, "due") >= 1, "{stdout}");
+    assert!(
+        measure_value(&stdout, intake, "completed") >= measure_value(&stdout, intake, "due"),
+        "{stdout}"
+    );
+    // Both query-only images read the owed counts as pending, and the writable copy, whose
+    // maintenance may expire records before its first answer, never counts: pending.
+    assert!(
+        stdout.contains(
+            "verify-backup: MEASURE backup_live_records=pending counts=pending source=none\n"
+        ),
+        "{stdout}"
+    );
+    // The watch's record through the shipper and the direct producer's over the socket.
+    assert!(
+        measure_value(
+            &stdout,
+            "verify-backup: MEASURE replay_added=",
+            "replay_added"
+        ) >= 2
+    );
+    assert!(
+        measure_value(
+            &stdout,
+            "verify-backup: MEASURE watch_claims_completed=",
+            "watch_claims_completed"
+        ) >= 1
+    );
+    assert!(
+        stdout.contains("verify-backup: MEASURE pages overall "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("verify-backup: MEASURE pages migration=store-counters "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("verify-backup: MEASURE live_records="),
+        "{stdout}"
+    );
+    assert_eq!(
+        tree_snapshot(&live_root),
+        live_root_before,
+        "the live root is untouched"
+    );
+    assert_eq!(
+        (
+            std::fs::read(&produced).unwrap(),
+            std::fs::metadata(&produced).unwrap().modified().unwrap()
+        ),
+        produced_before,
+        "the producer's file is untouched: the replay reads the copy's catalog, never a producer directory"
+    );
+    assert_eq!(
+        std::fs::read_dir(&live_data).unwrap().count(),
+        0,
+        "the live store is untouched"
+    );
+    assert!(
+        !dir.path().join("live").join("ship").exists(),
+        "the live shipper state is untouched"
+    );
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+}
+
+/// INVARIANT: the traffic measurement's exit status reflects the switch gate: a run that
+/// completes with a first status over the limit, a pages-per-second rate under the floor, a
+/// call at or over the RPC limit, a publication deadline expiry or a refused claim the daemon
+/// logged, or a watch that did not complete an item released before the final status less
+/// its in-flight allowance exits 4 with one FAIL gate line each. The backup's own record count is the exact count its image
+/// reads before any replay. Each limit may only be tightened, and a run is refused before any
+/// copy when the image has no --private-intake or the backup has no ship.toml.
+#[test]
+fn verify_backup_traffic_measurement_fails_on_each_gate_breach() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, _, backup, _, _) = traffic_fixture(dir.path(), true, false, 600_000);
+    let verify = dir.path().join("verify");
+    // The real image, wrapped to log one publication deadline expiry and one refused claim as
+    // the consume worker does.
+    let images = dir.path().join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    let wrapped = images.join("sparrowd-gate");
+    std::fs::write(
+        &wrapped,
+        format!(
+            "#!/bin/sh\necho 'sparrowd: watch=replayed claim=import:00 pending: consume publication deadline expired; retain the original journal and retry' >&2\necho 'sparrowd: watch=replayed reservation refused for \"gate.jsonl\": gate' >&2\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_sparrowd")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapped, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_sparrow"), images.join("sparrow-gate")).unwrap();
+    let args = [
+        "--measure-migration",
+        "--with-traffic",
+        "--image",
+        wrapped.to_str().unwrap(),
+    ];
+    let (code, stdout, stderr) = verify_backup_measured(
+        &backup,
+        &verify,
+        &live,
+        &args,
+        &[
+            ("SPARROW_MEASURE_GATE_FIRST_STATUS_SECONDS", "0"),
+            ("SPARROW_MEASURE_GATE_RPC_SECONDS", "0"),
+            ("SPARROW_MEASURE_GATE_PAGES_PER_SECOND", "1000000"),
+            // The watch's 600 s quiet interval holds its item past the run, and no in-flight
+            // allowance is granted, so the item released 2 s in is due and not completed.
+            ("SPARROW_MEASURE_GATE_INFLIGHT_SECONDS", "0"),
+            // No migration is owed, so the backfill ends at the first poll; the load still
+            // runs long enough for every traffic kind to be timed.
+            ("SPARROW_MEASURE_MIN_TRAFFIC_SECONDS", "5"),
+        ],
+    );
+    assert_eq!(code, Some(4), "{stdout}{stderr}");
+    for gate in [
+        "first_status_seconds",
+        "pages_per_second",
+        "rpc_calls_over_limit",
+        "publication_deadline_expiries",
+        "watch_claims_refused",
+        "watch_intake:replayed",
+    ] {
+        assert!(
+            stderr.contains(&format!("FAIL gate: {gate} ")),
+            "{gate}: {stderr}"
+        );
+    }
+    assert!(
+        stdout.contains("MEASURE publication_deadline_expiries=1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("MEASURE watch_claims_refused=1"),
+        "{stdout}"
+    );
+    let intake = "verify-backup: MEASURE watch_intake watch=replayed via=ship ";
+    assert_eq!(measure_value(&stdout, intake, "due"), 1, "{stdout}");
+    assert_eq!(measure_value(&stdout, intake, "completed"), 0, "{stdout}");
+    // Four backup records: the fixture's two, and the direct producer's and the watch's
+    // artifacts in the window.
+    assert!(
+        stdout.contains(
+            "verify-backup: MEASURE backup_live_records=4 counts=exact source=backup-image"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+
+    // A loosened limit is a usage error.
+    for (key, value) in [
+        ("SPARROW_MEASURE_GATE_RPC_SECONDS", "61"),
+        ("SPARROW_MEASURE_REPLAY_SECONDS", "3599"),
+        ("SPARROW_MEASURE_GATE_INFLIGHT_SECONDS", "-1"),
+    ] {
+        let (code, _, stderr) =
+            verify_backup_measured(&backup, &verify, &live, &args, &[(key, value)]);
+        assert_eq!(code, Some(2), "{key}: {stderr}");
+    }
+    // An image without --private-intake would open the live roots: refused before any copy.
+    let old = images.join("sparrowd-old");
+    std::fs::write(
+        &old,
+        "#!/bin/sh\necho 'usage: sparrowd --config FILE.toml [--query-only | --no-intake] | sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID] EMPTY_DIR' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_sparrow"), images.join("sparrow-old")).unwrap();
+    let (code, _, stderr) = verify_backup_measured(
+        &backup,
+        &verify,
+        &live,
+        &[
+            "--measure-migration",
+            "--with-traffic",
+            "--image",
+            old.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("has no --private-intake mode"), "{stderr}");
+    std::fs::remove_file(backup.join("config").join("sparrow").join("ship.toml")).unwrap();
+    write_backup_manifest(&backup);
+    let (code, _, stderr) = verify_backup_measured(&backup, &verify, &live, &args, &[]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("ship.toml is missing"), "{stderr}");
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "nothing was copied"
+    );
+}
+
+/// INVARIANT: a traffic measurement whose replay would carry no watch intake never passes: a
+/// shipper source whose watch received nothing in the window, or a shipper source that names no
+/// watch root, fails the run (exit 1, FAIL prep) before the measured open, printing the
+/// per-source counts, and the scratch copy is removed.
+#[test]
+fn verify_backup_traffic_measurement_refuses_an_empty_or_unrooted_replay() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (live, _, backup, _, _) = traffic_fixture(dir.path(), false, false, 1000);
+    let verify = dir.path().join("verify");
+    let args = [
+        "--measure-migration",
+        "--with-traffic",
+        "--image",
+        env!("CARGO_BIN_EXE_sparrowd"),
+    ];
+    let (code, stdout, stderr) = verify_backup_measured(&backup, &verify, &live, &args, &[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("verify-backup: MEASURE replay source=replayed via=ship artifacts=0 "),
+        "{stdout}"
+    );
+    assert!(stderr.contains("have nothing to replay"), "{stderr}");
+    assert!(stderr.contains("FAIL prep:"), "{stderr}");
+    assert!(
+        !stdout.contains("MEASURE first_status_seconds="),
+        "nothing was measured: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+
+    let ship = backup.join("config").join("sparrow").join("ship.toml");
+    let renamed = std::fs::read_to_string(&ship)
+        .unwrap()
+        .replace("name = \"replayed\"", "name = \"unrooted\"");
+    std::fs::write(&ship, renamed).unwrap();
+    write_backup_manifest(&backup);
+    let (code, stdout, stderr) = verify_backup_measured(&backup, &verify, &live, &args, &[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("unrooted name no watch root"), "{stderr}");
+    assert_eq!(
+        std::fs::read_dir(&verify).unwrap().count(),
+        0,
+        "the scratch copy is removed"
+    );
+}
+
+/// INVARIANT: deploy/user-unit-upgrade.sh refuses a trailing --to without a value, --no-backup
+/// with an empty reason, a daemon
 /// link that does not name --from, a drop-in for the unit other than the repository's
 /// limits.conf (issue #148: the window installs only that file), and a --to daemon without
 /// cap_net_bind_service before it changes anything: no backup is started, the links and the
@@ -5162,6 +5839,14 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
         "{stderr}"
     );
     unchanged(from);
+    // Skipping the pre-upgrade backup needs a stated reason (#156, coordination D147).
+    let (code, stdout, stderr) = run(&["--from", from, "--to", to, "--no-backup", " "]);
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("--no-backup needs a nonempty REASON"),
+        "{stderr}"
+    );
+    unchanged(from);
 
     std::fs::remove_file(&link).unwrap();
     symlink("sparrowd-schema67-ccccccc", &link).unwrap();
@@ -5198,6 +5883,120 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(stderr.contains("lacks cap_net_bind_service"), "{stderr}");
     unchanged(from);
+}
+
+/// INVARIANT (issue #156; Patrick, 2026-11-08: Sparrow never backs up to a local disk):
+/// deploy/libexec/sparrow-backup refuses a backup_root on a local filesystem before it asks the
+/// daemon for anything or creates anything: the socket named does not exist, so a refusal that
+/// came after its first daemon call would name the socket instead, and an absent root is not
+/// created.
+#[test]
+fn backup_client_refuses_a_local_backup_root_before_asking_the_daemon() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (data, intake) = (dir.path().join("store"), dir.path().join("intake"));
+    for path in [&data, &intake] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let config = write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+    let root = dir.path().join("backups");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("backup_root = {root:?}\n"));
+    std::fs::write(&config, text).unwrap();
+    let output = Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/libexec/sparrow-backup"
+    ))
+    .arg(&config)
+    .arg(&intake)
+    .env("SPARROW_PREFIX", dir.path())
+    .admitted_output()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("not a network filesystem") && !stderr.contains("rpc.sock"),
+        "{stderr}"
+    );
+    assert!(!root.exists());
+}
+
+/// INVARIANT (issue #156; Patrick, 2026-11-08: Sparrow never backs up to a local disk): through
+/// the daemon's own entry points, a daemon without backup_root reports the backup phase
+/// unconfigured and refuses `sparrow SOCKET backup` with UNSUPPORTED; a daemon whose backup_root
+/// is on a local disk starts the backup, returns the running state at once, then reports it
+/// failed in status, naming the root and its filesystem, without creating the root, and keeps
+/// serving. The fields asserted are the ones deploy/libexec/sparrow-backup reads.
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_backup_refuses_a_local_root_and_reports_it_in_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let backup = |socket: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            .arg(socket)
+            .arg("backup")
+            .admitted_output()
+            .unwrap()
+    };
+
+    let plain = dir.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let socket = plain.join("store").join("rpc.sock");
+    let config = write_server_config(&plain, &plain.join("store"), &socket);
+    let daemon = start(&config, &socket).await;
+    assert_eq!(
+        cli(&socket, &["status"])["backup"]["phase"].as_str(),
+        Some("unconfigured")
+    );
+    let refused = backup(&socket);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("UNSUPPORTED"), "{stderr}");
+    drop(daemon);
+
+    let local = dir.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    let socket = local.join("store").join("rpc.sock");
+    let config = write_server_config(&local, &local.join("store"), &socket);
+    let root = local.join("backups");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("backup_root = {root:?}\nbackup_keep = 2\n"));
+    std::fs::write(&config, text).unwrap();
+    let _daemon = start(&config, &socket).await;
+    let started = backup(&socket);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let running =
+        purrdf_lex::json::read_slice(&started.stdout, purrdf_lex::json::Limits::default()).unwrap();
+    assert_eq!(running["phase"].as_str(), Some("running"));
+    assert_eq!(running["root"].as_str(), root.to_str());
+    assert_eq!(running["keep"].as_u64(), Some(2));
+    assert!(running["started_at"].as_str().is_some(), "{running:?}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let status = cli(&socket, &["status"]);
+        if status["backup"]["phase"].as_str() != Some("running") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the backup never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let state = &status["backup"];
+    assert_eq!(state["phase"].as_str(), Some("failed"), "{state:?}");
+    assert_eq!(state["started_at"], running["started_at"]);
+    assert!(state["finished_at"].as_str().is_some(), "{state:?}");
+    assert_eq!(state["backup_id"].as_u64(), Some(0));
+    let failure = state["failure"].as_str().unwrap();
+    assert!(
+        failure.contains(&format!("backup_root {} is on ", root.display()))
+            && failure.contains("not a network filesystem"),
+        "{failure}"
+    );
+    assert!(!root.exists(), "a local backup root was created");
+    for field in ["store_id", "schema_version", "store_format"] {
+        assert!(!status[field].is_null(), "status lacks {field}");
+    }
 }
 
 /// INVARIANT (issue #148): a daemon whose soft open-file limit leaves no room for the table
@@ -5699,7 +6498,11 @@ async fn configured_consumer_recovers_confirmed_journal_and_reports_late_write_w
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            append_consume_config(&config, &root, 10_000, 16, 4);
+            // The replacement written below at the confirmed claim's name is a new candidate.
+            // At the 600-second maximum quiet interval it cannot become claimable within this
+            // test's 30-second waits, so the assertions see it unclaimed however slowly the
+            // daemon starts, without depending on the order of startup and a short interval.
+            append_consume_config(&config, &root, 600_000, 16, 4);
             let (confirmed, blocked) = {
                 let store = ServerConfig::read(&config).unwrap().open_store().unwrap();
                 let owner = ClaimRoot::open(store.clone(), "completed", &root).unwrap();
@@ -5744,6 +6547,7 @@ async fn configured_consumer_recovers_confirmed_journal_and_reports_late_write_w
             watch_until(client.capability(), |watch| {
                 watch.get_completed_claims() == 1
                     && watch.get_pending_claims() == 1
+                    && watch.get_candidates() == 1
                     && matches!(
                         watch.get_failure().unwrap().which().unwrap(),
                         wire::optional_text::Value(_)

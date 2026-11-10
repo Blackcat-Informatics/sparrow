@@ -5996,6 +5996,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
                 changed: (10, 30),
             },
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     assert_eq!(
@@ -6080,6 +6081,7 @@ fn consumption_retire_moves_only_an_unpublished_claim_out_of_pending() {
                 "log",
                 generation(inode),
                 CONSUMPTION_DIRECTORIES,
+                1_000,
             )
             .unwrap()
     };
@@ -6161,6 +6163,139 @@ fn consumption_retire_moves_only_an_unpublished_claim_out_of_pending() {
     assert_eq!(store.consumption_pending().unwrap().len(), 1);
 }
 
+/// INVARIANT (issue 160): the zero-loss check after a write stall reads each claim's final
+/// state, not an inference. A claim's history (first seen, attempts, last attempt, last
+/// pending time and reason) is durable in its journal and follows it into completion and
+/// retirement. The listing returns every pending claim, and a completed or abandoned claim
+/// only when it went pending inside the window; a claim that completed at once is absent.
+#[test]
+fn claim_listing_reports_each_claims_final_state_and_history() {
+    use sparrow_core::{ClaimState, ConsumptionGeneration};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"one\n";
+    let generation = |inode| ConsumptionGeneration {
+        device: 1,
+        inode,
+        byte_length: input.len() as u64,
+        modified: (10, 20),
+        changed: (10, 30),
+    };
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    // Reserve, claim and publish; `stalls` attempts are left pending before completion.
+    let complete = |path: &[u8], inode, stalls: &[u64], done: u64| {
+        let claim = store
+            .consumption_reserve(
+                "watch",
+                path,
+                "source",
+                "log",
+                generation(inode),
+                CONSUMPTION_DIRECTORIES,
+                1_000,
+            )
+            .unwrap();
+        store
+            .consumption_claimed(&claim.import_id, generation(inode))
+            .unwrap();
+        for at in stalls {
+            store
+                .consumption_attempt_pending(&claim.import_id, "deadline expired", *at)
+                .unwrap();
+        }
+        let manifest = store
+            .import_begin(&claim.request_id, "source", "log", 4, &digest, DAY)
+            .unwrap();
+        store.import_append(&manifest.id, 0, input, DAY).unwrap();
+        store.import_seal(&manifest.id, DAY).unwrap();
+        store.import_prepare_layout(&manifest.id, DAY).unwrap();
+        store.import_prepare_record(&manifest.id, 0, DAY).unwrap();
+        let artifact = store.import_publish(&manifest.id, DAY).unwrap();
+        store
+            .consumption_removed(&claim.import_id, &artifact.id, &generation(inode), done)
+            .unwrap();
+        claim.import_id
+    };
+    let at_once = complete(b"once.log", 2, &[], 5_000);
+    let stalled = complete(b"stalled.log", 3, &[2_000, 3_000], 6_000);
+    let early = complete(b"early.log", 4, &[1_500], 6_000);
+    let stuck = store
+        .consumption_reserve(
+            "watch",
+            b"stuck.log",
+            "source",
+            "log",
+            generation(5),
+            CONSUMPTION_DIRECTORIES,
+            1_000,
+        )
+        .unwrap();
+    store
+        .consumption_attempt_pending(&stuck.import_id, "deadline expired", 4_000)
+        .unwrap();
+    store
+        .consumption_claimed(&stuck.import_id, generation(5))
+        .unwrap();
+    let lost = store
+        .consumption_reserve(
+            "watch",
+            b"lost.log",
+            "source",
+            "log",
+            generation(6),
+            CONSUMPTION_DIRECTORIES,
+            1_000,
+        )
+        .unwrap();
+    store
+        .consumption_claimed(&lost.import_id, generation(6))
+        .unwrap();
+    store
+        .consumption_retire(&lost.import_id, "watch", "admin", "source deleted", 7_000)
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+
+    let listed = store.consumption_claims(2_000, 8_000).unwrap();
+    let by_id = |id: &str| listed.iter().find(|claim| claim.journal.import_id == id);
+    assert!(by_id(&at_once).is_none(), "never pending, never listed");
+    assert!(by_id(&early).is_none(), "went pending before the window");
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    let stalled = by_id(&stalled).unwrap();
+    assert_eq!(stalled.state, ClaimState::Complete);
+    assert_eq!(stalled.finished_at, Some(6_000));
+    let history = &stalled.journal.history;
+    assert_eq!(history.first_seen, Some(1_000));
+    assert_eq!(
+        history.attempts, 3,
+        "two pending attempts and the completing one"
+    );
+    assert_eq!(history.last_attempt_at, Some(6_000));
+    assert_eq!(history.last_pending_at, Some(3_000));
+    assert_eq!(
+        history.last_pending_reason.as_deref(),
+        Some("deadline expired")
+    );
+    let stuck = by_id(&stuck.import_id).unwrap();
+    assert_eq!(stuck.state, ClaimState::Pending);
+    assert_eq!(stuck.finished_at, None);
+    assert_eq!(stuck.journal.history.attempts, 1);
+    let lost = by_id(&lost.import_id).unwrap();
+    assert_eq!(lost.state, ClaimState::Abandoned);
+    assert_eq!(lost.finished_at, Some(7_000));
+    // A pending claim is listed whatever the window; the others fall outside this one.
+    let later = store.consumption_claims(9_000, 10_000).unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].state, ClaimState::Pending);
+    assert_eq!(
+        store.consumption_claims(2, 1).unwrap_err().code,
+        "INVALID_ARGUMENT"
+    );
+}
+
 /// INVARIANT (review 3 D1): a retired claim whose consumption import had begun does not keep
 /// that import forever. The retirement ends its staging lease in the same batch, and the
 /// ordinary reclaim pass frees its staged chunks and its import slot, so a 16th staged import
@@ -6192,6 +6327,7 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
             "log",
             generation.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     store
@@ -6284,6 +6420,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
             "log",
             observed.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     assert_eq!(
@@ -6298,7 +6435,8 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
                 "source",
                 "log",
                 observed.clone(),
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap(),
         reserved
@@ -6722,7 +6860,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                     "source",
                     "log",
                     observed.clone(),
-                    CONSUMPTION_DIRECTORIES
+                    CONSUMPTION_DIRECTORIES,
+                    1_000
                 )
                 .unwrap_err()
                 .code,
@@ -6737,6 +6876,7 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
             "log",
             observed.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     assert_eq!(
@@ -6747,7 +6887,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "other",
                 "log",
                 observed.clone(),
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap_err()
             .code,
@@ -6781,6 +6922,7 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "log",
                 observed.clone(),
                 CONSUMPTION_DIRECTORIES,
+                1_000,
             )
             .unwrap();
     }
@@ -6792,7 +6934,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "source",
                 "log",
                 observed.clone(),
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap_err()
             .code,
@@ -6806,7 +6949,8 @@ fn consumption_reservations_refuse_generation_changes_traversal_and_capacity() {
                 "source",
                 "log",
                 observed,
-                CONSUMPTION_DIRECTORIES
+                CONSUMPTION_DIRECTORIES,
+                1_000
             )
             .unwrap()
             .import_id,
@@ -6847,6 +6991,7 @@ fn consumption_missing_publication_receipt_is_a_hard_failure_without_republicati
             "log",
             observation.clone(),
             CONSUMPTION_DIRECTORIES,
+            1_000,
         )
         .unwrap();
     store
@@ -21129,4 +21274,215 @@ fn source_summary_migration_serves_at_once_and_listings_answer_finished_counts()
         listed_artifacts(&store, "pending-source", 2),
         [(artifact.id, 2, true)]
     );
+}
+
+/// Latency percentile of `samples`, in microseconds.
+fn percentile(samples: &mut [u128], fraction: f64) -> u128 {
+    samples.sort_unstable();
+    let rank = ((samples.len() as f64 - 1.0) * fraction).round() as usize;
+    samples[rank]
+}
+
+/// INVARIANT (issue #156; Patrick, 2026-11-08: "Backup may not: stop the server, pause the
+/// server, or in any way perturb the ingestion"): an online backup completes while a writer
+/// keeps ingesting through it; no ingest is refused, ingest latency during the backup stays
+/// within a modest bound of the latency before it, a second request while it runs is refused
+/// with CONFLICT, the live store afterwards holds exactly the records the writer committed, and
+/// the backup restores into a fresh directory whose store opens with every record committed
+/// before the backup started and no record the writer did not commit.
+///
+/// The latency bound is p50 and p95 during the backup at most four times their baseline plus
+/// 100 ms. A backup that took the writer lock or paused ingest for its copy would stall writes
+/// for the whole copy of the 32 MiB store, which the bound is far below on any disk; the factor
+/// and the additive slack absorb fsync and scheduler noise on a shared host, where the backup's
+/// own synchronized copies compete with the writer's synchronized WAL writes for one disk.
+#[test]
+fn online_backup_runs_beside_continuous_ingest_and_restores_a_consistent_store() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    const NOW: u64 = 1_800_000_000_000;
+    const BASELINE: usize = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("store");
+    // Room for the 32 MiB load beside the fixture's other admission limits.
+    let config = Config {
+        disk_budget: 1 << 30,
+        ..config()
+    };
+    let store = Store::open(&live, config.clone()).unwrap();
+    // A 32 MiB store, so the copy takes long enough to overlap many writes.
+    let mut committed: Vec<String> = Vec::new();
+    // Long lines keep the record count, and so the indexing time, small.
+    let line = format!("{}\n", "x".repeat(4095));
+    for index in 0..64 {
+        let bytes = line.repeat(128);
+        let artifact = store
+            .ingest(
+                &format!("preload-{index}"),
+                "backup-load",
+                "log",
+                bytes.as_bytes(),
+                NOW,
+            )
+            .unwrap();
+        committed.extend(artifact.record_ids);
+    }
+    let committed = Arc::new(Mutex::new(committed));
+    // 0 before the backup, 1 while it runs, 2 after it, 3 to stop.
+    let phase = Arc::new(AtomicU8::new(0));
+    let writer = {
+        let (store, committed, phase) = (store.clone(), committed.clone(), phase.clone());
+        std::thread::spawn(move || {
+            let mut latencies: [Vec<u128>; 3] = Default::default();
+            let mut refusals = Vec::new();
+            for index in 0.. {
+                let current = phase.load(Ordering::SeqCst);
+                if current == 3 {
+                    break;
+                }
+                let started = Instant::now();
+                match store.ingest(
+                    &format!("live-{index}"),
+                    "backup-live",
+                    "log",
+                    b"event\n",
+                    NOW + 1,
+                ) {
+                    Ok(artifact) => {
+                        latencies[usize::from(current)].push(started.elapsed().as_micros());
+                        committed.lock().unwrap().extend(artifact.record_ids);
+                    }
+                    Err(error) => refusals.push(format!("{}: {}", error.code, error.message)),
+                }
+            }
+            (latencies, refusals)
+        })
+    };
+    let wait_for = |count: usize| {
+        while committed.lock().unwrap().len() < count {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let preloaded = committed.lock().unwrap().len();
+    wait_for(preloaded + BASELINE);
+    let before: Vec<String> = committed.lock().unwrap().clone();
+    let root = dir.path().join("backups");
+    let target = sparrow_core::BackupTarget::local_for_test(root.clone(), 2, &live).unwrap();
+    phase.store(1, Ordering::SeqCst);
+    let running = store.backup_start(&target, NOW + 2).unwrap();
+    assert_eq!(running.phase, sparrow_core::BackupPhase::Running);
+    let second = store.backup_start(&target, NOW + 3).unwrap_err();
+    assert_eq!(second.code, "CONFLICT", "{}", second.message);
+    let status = loop {
+        let status = store.backup_status();
+        if status.phase != sparrow_core::BackupPhase::Running {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    phase.store(2, Ordering::SeqCst);
+    let during = committed.lock().unwrap().len();
+    wait_for(during + BASELINE);
+    phase.store(3, Ordering::SeqCst);
+    let ([mut baseline, mut overlapped, mut after], refusals) = writer.join().unwrap();
+    assert_eq!(
+        status.phase,
+        sparrow_core::BackupPhase::Complete,
+        "{status:?}"
+    );
+    assert!(
+        status.backup_id >= 1 && status.files > 0 && status.bytes > 0,
+        "{status:?}"
+    );
+    assert!(
+        refusals.is_empty(),
+        "ingest refused during the backup: {refusals:?}"
+    );
+    assert!(
+        overlapped.len() >= 5,
+        "only {} writes overlapped the backup",
+        overlapped.len()
+    );
+    let (p50, p95) = (
+        percentile(&mut baseline, 0.5),
+        percentile(&mut baseline, 0.95),
+    );
+    let (during_p50, during_p95) = (
+        percentile(&mut overlapped, 0.5),
+        percentile(&mut overlapped, 0.95),
+    );
+    let after_p95 = percentile(&mut after, 0.95);
+    eprintln!(
+        "ingest latency us: before p50={p50} p95={p95}; during p50={during_p50} p95={during_p95} max={} n={}; after p95={after_p95}",
+        overlapped.last().unwrap(),
+        overlapped.len()
+    );
+    assert!(
+        during_p50 <= 4 * p50 + 100_000,
+        "p50 {during_p50}us against {p50}us"
+    );
+    assert!(
+        during_p95 <= 4 * p95 + 100_000,
+        "p95 {during_p95}us against {p95}us"
+    );
+    let committed = committed.lock().unwrap().clone();
+    let live_records = |store: &Store| -> usize {
+        let status = store.status(NOW + 10).unwrap();
+        assert_eq!(status["counts"].as_str(), Some("exact"));
+        status["live_records"].as_str().unwrap().parse().unwrap()
+    };
+    assert_eq!(live_records(&store), committed.len());
+    drop(store);
+    let restored_dir = dir.path().join("restored");
+    assert_eq!(
+        sparrow_core::restore_backup(&root, None, &restored_dir).unwrap(),
+        status.backup_id
+    );
+    let restored = Store::open(&restored_dir, config).unwrap();
+    for id in &before {
+        restored.record(id).unwrap();
+    }
+    let count = live_records(&restored);
+    assert!(
+        (before.len()..=committed.len()).contains(&count),
+        "restored {count} records; {} committed before the backup, {} in all",
+        before.len(),
+        committed.len()
+    );
+}
+
+/// INVARIANT (issue #156; Patrick, 2026-11-08: "Sparrow and katamaria are FORBIDDEN from backing
+/// up to local disks"): a backup whose root is on a local filesystem fails, naming the root and
+/// its filesystem type, before it creates anything there, and the store keeps serving: the
+/// failure never reaches ingest.
+#[test]
+fn backup_to_a_local_disk_fails_before_creating_anything_and_ingest_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("store");
+    let store = Store::open(&live, config()).unwrap();
+    store
+        .ingest("before", "local-backup", "log", b"one\n", 1)
+        .unwrap();
+    let root = dir.path().join("backups");
+    let target = sparrow_core::BackupTarget::new(root.clone(), 1, &live).unwrap();
+    store.backup_start(&target, 2).unwrap();
+    let status = loop {
+        let status = store.backup_status();
+        if status.phase != sparrow_core::BackupPhase::Running {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(status.phase, sparrow_core::BackupPhase::Failed);
+    let failure = status.failure.unwrap();
+    assert!(
+        failure.contains(&format!("backup_root {} is on ", root.display()))
+            && failure.contains("not a network filesystem"),
+        "{failure}"
+    );
+    assert!(!root.exists());
+    store
+        .ingest("after", "local-backup", "log", b"two\n", 3)
+        .unwrap();
 }

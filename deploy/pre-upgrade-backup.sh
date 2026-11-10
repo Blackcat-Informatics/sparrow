@@ -3,10 +3,12 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
 # Take the named pre-upgrade backup that start.sh and restart.sh require before an image that
-# raises the schema (README.md, "Upgrades and rollback"). It runs one closed-store backup now and
-# renames that run's own backup to SPARROW_BACKUPS/pre-upgrade-CURRENT, where CURRENT is the image
-# the links name. It stops at the first failure, refuses an existing pre-upgrade-CURRENT, and
-# accepts only a backup whose taken_utc is from this run and whose image= is CURRENT.
+# raises the schema (README.md, "Upgrades and rollback"). It runs one online backup now (the
+# daemon keeps serving; nothing is stopped) and points SPARROW_BACKUPS/pre-upgrade-CURRENT, where
+# CURRENT is the image the links name, at that run's set sets/ID. It stops at the first failure,
+# refuses an existing pre-upgrade-CURRENT, and accepts only a set whose taken_utc is from this run
+# and whose image= is CURRENT. The engine keeps backup_keep backups, so the link is good for the
+# upgrade it was taken for: start.sh and restart.sh accept it for PRE_UPGRADE_MAX_HOURS.
 #
 # Run as root. In user scope (a test instance, deploy/test-instance.sh) it runs the backup helper
 # directly with the test instance's paths instead of starting sparrow-backup.service.
@@ -34,43 +36,41 @@ if [[ -e $target ]]; then
     die "$target already exists (taken_utc=${taken:-unknown}); a new pre-upgrade backup never reuses it. \
 Retire it first: mv -T $target $target.retired-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
-unit_active || die "$SPARROW_UNIT is not running; the backup drains and restarts a running daemon"
+unit_active || die "$SPARROW_UNIT is not running; the running daemon takes the online backup"
 
-# Stamps are fixed-width UTC (YYYYMMDDTHHMMSSZ), so they compare as strings.
-started=$(date -u +%Y%m%dT%H%M%SZ)
+started=$(date -u +%s)
 note "backing up the store as $current left it (started $started)"
 if [[ $SPARROW_SCOPE == system ]]; then
     # Type=oneshot: start returns once the backup has finished, and fails if it failed.
     systemctl start sparrow-backup.service
 else
-    runtime=$(mktemp -d)
-    trap 'rm -rf -- "$runtime"' EXIT
     config_dir=$(dirname -- "$SPARROW_CONFIG")
     cli_dir=$(dirname -- "$CLI_LINK")
-    RUNTIME_DIRECTORY=$runtime PATH=$cli_dir:$PATH python3 -I "$LIBEXEC/sparrow-backup" \
-        "$SPARROW_CONFIG" "$SPARROW_BACKUPS" 3 "$SPARROW_INTAKE" "$config_dir"
+    PATH=$cli_dir:$PATH python3 -I "$LIBEXEC/sparrow-backup" \
+        "$SPARROW_CONFIG" "$SPARROW_INTAKE" "$config_dir"
 fi
 
-# This run's backup: the newest STAMP directory taken at or after the start. An older one, left by
-# an earlier run, never qualifies.
+# This run's set: the newest sets/ID taken at or after the start. An older one, left by an
+# earlier run, never qualifies.
 shopt -s nullglob
 fresh=
-for dir in "$SPARROW_BACKUPS"/2*Z; do
-    [[ -d $dir && ${dir##*/} =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
+for dir in "$SPARROW_BACKUPS"/sets/*; do
+    [[ -d $dir && ${dir##*/} =~ ^[0-9]+$ ]] || continue
     taken=$(sed -n 's/^taken_utc=//p' "$dir/SOURCE")
-    if [[ -n $taken && ! $taken < $started ]]; then fresh=$dir; fi
+    taken_at=$(date -u -d "$taken" +%s 2>/dev/null) || continue
+    # The daemon's clock stamps the start to the second, after this script read its own.
+    if ((taken_at + 1 >= started)); then fresh=$dir; fi
 done
-[[ -n $fresh ]] || die "the backup left no backup taken at or after $started in $SPARROW_BACKUPS; \
+[[ -n $fresh ]] || die "the backup left no set taken at or after $(date -u -d "@$started" +%FT%TZ) in $SPARROW_BACKUPS; \
 read its log (journalctl -u sparrow-backup.service) before upgrading"
 grep -qx "image=$current" "$fresh/SOURCE" \
     || die "$fresh does not record image=$current; the image changed during the backup"
 now=$(readlink -- "$LIBEXEC/sparrowd")
 [[ $now == "$current" ]] || die "the image link moved from $current to $now during the backup"
 
-# Under the backup's lock, so the rotation cannot remove the directory while it is renamed. The
-# rename takes it out of the three-backup rotation, which never prunes pre-upgrade-* names.
-flock -w 60 "$SPARROW_BACKUPS/.lock" mv -T -n -- "$fresh" "$target"
-[[ ! -e $fresh && -d $target ]] || die "$target appeared during the backup; $fresh is left in place"
+# A relative link, so the backup root can move or be mounted elsewhere for a restore.
+ln -s -- "sets/${fresh##*/}" "$target" || die "$target appeared during the backup"
+[[ -d $target ]] || die "$target does not lead to $fresh"
 sync -- "$SPARROW_BACKUPS"
 source_lines=$(grep -E '^(taken_utc|image|store_id|schema_version|store_format)=' "$target/SOURCE")
 mapfile -t source_lines <<<"$source_lines"

@@ -355,6 +355,7 @@ impl Store {
             format,
             intent.observed.clone(),
             directories,
+            now,
         )?;
         if let Some(id) = &intent.tail_generation_id {
             let tail = self.tail_generation(id)?;
