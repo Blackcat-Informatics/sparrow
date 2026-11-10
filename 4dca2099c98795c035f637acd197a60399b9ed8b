@@ -1,0 +1,24 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 4dca2099c98795c035f637acd197a60399b9ed8b
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 182
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/182
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: afbdf950140c021d3819fd08245911d476daf015
+GhpRsq-Head-Ref: paudley/180-refuse-overlapping-watch-roots-and
+GhpRsq-Head-OID: 4dca2099c98795c035f637acd197a60399b9ed8b
+GhpRsq-Result-Tree: 0e734423e7a7f0c2d1be9cbbb213dcec667dc5b4
+GhpRsq-Result-Commit: c82bfa49e38f5113b387c4aad03ab99ef666ae26
+GhpRsq-Parent-Hashes: 4dca2099c98795c035f637acd197a60399b9ed8b
+GhpRsq-Squash-Notes-SHA256: 92d61f0893767a87e8d77da47efd2c6636a0db80d20976ce0dac4b3962ea43cc
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: d5878e15de19d8a99b40d5ff7bb4147de886c681
+GhpRsq-Stage-Commit: 30292ea98fcdf9bdc276dbb797f2ac47aa429871
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/30292ea98fcdf9bdc276dbb797f2ac47aa429871
+GhpRsq-Stage-Ref: refs/ghprsq/pr/182/stage
+GhpRsq-Stage-Files: 8
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/30292ea98fcdf9bdc276dbb797f2ac47aa429871
