@@ -276,11 +276,12 @@ impl ServerConfig {
             .contains(&config.buffered_flush_interval_ms)
         {
             return Err(format!(
-                "buffered_flush_interval_ms = {} is outside {}..{}; the periodic flush never fires more than once a second. Set it to {} or more (default {})",
+                "buffered_flush_interval_ms = {} is outside {}..{}; the periodic flush never fires more than once a second. Use a value from {} to {} milliseconds (default {})",
                 config.buffered_flush_interval_ms,
                 sparrow_core::MIN_FLUSH_INTERVAL_MS,
                 sparrow_core::MAX_FLUSH_INTERVAL_MS,
                 sparrow_core::MIN_FLUSH_INTERVAL_MS,
+                sparrow_core::MAX_FLUSH_INTERVAL_MS,
                 sparrow_core::DEFAULT_FLUSH_INTERVAL_MS
             )
             .into());

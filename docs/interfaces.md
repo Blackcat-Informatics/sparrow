@@ -2237,7 +2237,7 @@ work remains descriptor-owned and reports admission waiting; no checkpoint is
 advanced while waiting.
 
 Each watch retains bounded opened regular files across rename/replacement and
-drains one descriptor per worker tick in round-robin order. One capture reads
+drains one descriptor per worker pass in round-robin order. One capture reads
 at most 1 MiB; a line exceeding that window produces a visible failure and
 preserves the source/checkpoint. Complete
 prefixes use the one shared durable record pipeline. Idle and close events keep

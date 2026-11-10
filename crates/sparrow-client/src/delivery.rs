@@ -88,7 +88,7 @@ impl DeliveryConfig {
             .any(|duration| duration.is_zero() || *duration > Duration::from_secs(60))
         {
             return Err(Error::InvalidArgument(
-                "invalid delivery labels, queue/batch limits or timing bounds; durations require (0,60s]",
+                "invalid delivery labels, queue/batch limits or timing bounds; durations require (0,60s] and retry_max_interval >= retry_interval",
             ));
         }
         Ok(())

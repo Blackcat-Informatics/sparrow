@@ -4619,7 +4619,7 @@ handoff bypasses the discovery quiet timer; it does not weaken generation checks
 Admission uses the existing bounded worker control queue and atomic storage
 reservation. It does not hold a publication RPC semaphore while awaiting the
 worker. Every queued catalog mutation refreshes pending ownership, including
-handoffs admitted earlier in that same tick. The same worker then performs
+handoffs admitted earlier in that same worker pass. The same worker then performs
 atomic private claim, SDK upload, durable publication and synchronized removal.
 An admission receipt says `reserved`; progress can advance through `claimed`,
 `published` and `removed`. Admission does not certify publication or deletion.
@@ -4875,7 +4875,7 @@ without opening the candidate or generating a self-induced `IN_OPEN`. The SDK's
 Symlinks, FIFOs, devices and sockets are excluded. Native `statat` handles unknown
 directory-entry types without assuming that they are regular files.
 
-Scans advance by 64 entries per 50 ms worker tick. Candidate and rename maps,
+Scans advance by 64 entries per worker pass. Candidate and rename maps,
 directory descriptors and scan queues have explicit capacities. Candidate
 saturation preserves excess files, exposes `deferred`, and schedules a new scan
 as capacity becomes available. The scanner can finish coverage while candidate
