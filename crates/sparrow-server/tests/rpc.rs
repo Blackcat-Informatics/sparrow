@@ -3890,6 +3890,51 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
     }).await;
 }
 
+/// INVARIANT: a `watch put` whose root lies inside a path the daemon writes (here the
+/// backup root) is refused naming both paths, because live watches come from the stored
+/// catalog and `server.toml` only seeds it; a root beside those paths is still accepted.
+#[tokio::test(flavor = "current_thread")]
+async fn watch_put_refuses_a_root_inside_a_daemon_output_path() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let backup = dir.path().join("backup");
+            let inside = backup.join("inside");
+            let beside = dir.path().join("beside");
+            std::fs::create_dir_all(&inside).unwrap();
+            std::fs::create_dir(&beside).unwrap();
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!("backup_root = {backup:?}\n"));
+            std::fs::write(&config, text).unwrap();
+            let _daemon = start(&config, &socket).await;
+            let put = |root: &Path, request: &str| {
+                let file = dir.path().join(format!("{request}.toml"));
+                let definition = watch_definition(root, request, 30_000, 16, 16);
+                std::fs::write(&file, toml::to_string(&definition).unwrap()).unwrap();
+                Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                    .args(endpoint_args(&socket))
+                    .args(["watch", "put", request, "0", file.to_str().unwrap()])
+                    .admitted_output()
+                    .unwrap()
+            };
+            let refused = put(&inside, "inside");
+            let errors = String::from_utf8_lossy(&refused.stderr);
+            assert!(!refused.status.success(), "{errors}");
+            assert!(errors.contains("overlaps backup_root"), "{errors}");
+            assert!(errors.contains(&inside.display().to_string()), "{errors}");
+            let accepted = put(&beside, "beside");
+            assert!(
+                accepted.status.success(),
+                "{}",
+                String::from_utf8_lossy(&accepted.stderr)
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect_removed_authority()
 {

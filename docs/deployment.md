@@ -316,11 +316,6 @@ schema 71 build installs as `sparrowd-schema71-REV` and `sparrow-schema71-REV`.
 ## Shipping finished files from producers that keep them
 
 A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
-`sparrowd` refuses, when it loads `server.toml`, a consume or tail watch root that
-equals, contains or lies inside `data_dir`, `socket_path`, `ingest_socket_path`,
-`backup_root` or `archive.dir`, naming the watch and both paths. The check is
-lexical. `server.toml` names no log file, so the daemon cannot check where its
-standard error is redirected; keep any such file outside every watch root.
 `deploy/libexec/sparrow-ship` copies finished files from such directories
 into a private queue under its `state_dir`, then feeds queued items into
 Sparrow-owned roots. It only reads the originals. Each `[[source]]` in its
@@ -330,12 +325,6 @@ root `intake_root/NAME`, the source directory, a glob and one finishing rule:
 - `daily`: dated files; the newest name may still be appended to.
 - `sealed`: rotated segments, finished once `NAME.manifest.json` exists.
 - `settled`: written-once documents, finished after a quiet period.
-
-`sparrow-ship` refuses a configuration at load, before it reads or writes anything,
-when a source `dir` equals, contains or lies inside `intake_root` or `state_dir`. It
-compares real paths, so a symlink does not hide the overlap, and the error names the
-source, both paths and the key. Such a source would ship the shipper's own queue,
-ledgers and intake items again on every run.
 
 Every rule also requires `settle_seconds` without modification. Small files are
 reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
@@ -356,6 +345,19 @@ nested JSON: on 2026-10-27, under a host load average near 45, 17 KiB-per-line
 records took 1.5 seconds for 0.95 MB, 19 seconds for 2.2 MB and 47 seconds for
 4.4 MB. The example's 1 MiB `max_chunk_bytes` keeps such chunks well inside the
 deadline.
+
+`sparrow-ship` refuses its configuration at load, before it reads or writes anything,
+when a source `dir` equals, contains or lies inside `intake_root` or `state_dir`. It
+compares real paths, so a symlink does not hide the overlap, and the error names the
+source, both paths and the key. Such a source would ship the shipper's own queue,
+ledgers and intake items again on every run.
+
+`sparrowd` refuses a consume or tail watch root that equals, contains or lies inside
+`data_dir`, `socket_path`, `ingest_socket_path`, `backup_root` or `archive.dir`, naming
+the watch and both paths. It applies the rule to the `consume` seeds in `server.toml`
+when it loads them, to the stored catalog at startup, and to every `watch put`. The
+check is lexical. `server.toml` names no log file, so the daemon cannot check where its
+standard error is redirected; keep any such file outside every watch root.
 
 Each file is staged completely and checked against the original's size and
 identity before any part of it is queued. Its copies or chunks then enter the

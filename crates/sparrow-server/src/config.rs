@@ -83,6 +83,37 @@ pub struct ServerConfig {
     pub backup_keep: u32,
 }
 
+/// Paths the daemon writes, by configuration key. `server.toml` names no log file, so these are
+/// the paths a watch root could swallow. Checks are lexical, like the other configuration
+/// checks; the runtime root open also compares canonical paths with the store.
+#[derive(Clone, Debug, Default)]
+pub struct OutputPaths(Vec<(&'static str, PathBuf)>);
+
+impl OutputPaths {
+    /// Refuse the first watch whose root contains, equals or lies inside an output path,
+    /// naming the watch, the key and both paths. Applied to the seed entries in `server.toml`,
+    /// to the stored catalog at startup and to every `watch put`.
+    pub fn refuse_overlap(
+        &self,
+        watches: &[ConsumeWatch],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for watch in watches {
+            for (key, path) in &self.0 {
+                if path.starts_with(&watch.root) || watch.root.starts_with(path) {
+                    return Err(format!(
+                        "watch `{}` root {} overlaps {key} {}: a watch root must neither contain nor lie inside a path Sparrow writes itself; move one of them",
+                        watch.id,
+                        watch.root.display(),
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Archive-before-delete destination and segment policy; unknown fields are errors.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -255,7 +286,7 @@ impl ServerConfig {
         if let Some(archive) = &config.archive {
             archive.validate(&config.data_dir)?;
         }
-        config.validate_watch_roots_apart()?;
+        config.output_paths().refuse_overlap(&config.consume)?;
         crate::syslog_listener::validate(&config.syslog)?;
         if config.rpc_tcp_address.is_some() != config.rpc_tcp_secret_file.is_some() {
             return Err(
@@ -387,36 +418,25 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// Refuse a consume or tail root that overlaps a path the daemon itself writes: the store,
-    /// its socket, the ingest socket, the backup root or the archive. The configuration names
-    /// no log file, so these are the paths a root could swallow. Lexical, like the other
-    /// configuration checks; the runtime root open also compares canonical paths with the store.
-    fn validate_watch_roots_apart(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let own = [
-            ("data_dir", Some(&self.data_dir)),
-            ("socket_path", Some(&self.socket_path)),
-            ("ingest_socket_path", self.ingest_socket_path.as_ref()),
-            ("backup_root", self.backup_root.as_ref()),
-            (
-                "archive.dir",
-                self.archive.as_ref().map(|archive| &archive.dir),
-            ),
-        ];
-        for watch in &self.consume {
-            for (key, path) in own {
-                let Some(path) = path else { continue };
-                if path.starts_with(&watch.root) || watch.root.starts_with(path) {
-                    return Err(format!(
-                        "consume watch `{}` root {} overlaps {key} {}: a watch root must neither contain nor lie inside a path Sparrow writes itself; move one of them",
-                        watch.id,
-                        watch.root.display(),
-                        path.display()
-                    )
-                    .into());
-                }
-            }
-        }
-        Ok(())
+    /// The paths the daemon itself writes: no watch root may contain or lie inside one.
+    #[must_use]
+    pub fn output_paths(&self) -> OutputPaths {
+        let optional = |key, path: Option<&PathBuf>| path.map(|path| (key, path.clone()));
+        OutputPaths(
+            [
+                Some(("data_dir", self.data_dir.clone())),
+                Some(("socket_path", self.socket_path.clone())),
+                optional("ingest_socket_path", self.ingest_socket_path.as_ref()),
+                optional("backup_root", self.backup_root.as_ref()),
+                optional(
+                    "archive.dir",
+                    self.archive.as_ref().map(|archive| &archive.dir),
+                ),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        )
     }
 
     /// Read the configured TCP CHAP secret; a configured but unusable file is an error.

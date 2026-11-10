@@ -208,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             watches.clone(),
             operations.clone(),
             private,
+            config.output_paths(),
         )?;
         (watches, Some(consumer))
     };
