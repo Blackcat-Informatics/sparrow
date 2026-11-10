@@ -296,6 +296,10 @@ struct Shared {
     /// Signalled by every flush or shutdown so a waiting retry delay ends at once. Kept apart
     /// from `wake`, which each admitted event signals and would otherwise cut the backoff short.
     retry_wake: tokio::sync::Notify,
+    /// Flush and shutdown calls currently waiting. A `retry_wake` signal ends a retry delay only
+    /// while this is nonzero, so a signal left by a barrier that already returned cannot shorten
+    /// the first delay of a later outage.
+    barriers_waiting: AtomicUsize,
     abort_wake: tokio::sync::Notify,
     owners: AtomicUsize,
     offered: AtomicU64,
@@ -368,6 +372,7 @@ impl Delivery {
             changed: Condvar::new(),
             wake: tokio::sync::Notify::new(),
             retry_wake: tokio::sync::Notify::new(),
+            barriers_waiting: AtomicUsize::new(0),
             abort_wake: tokio::sync::Notify::new(),
             owners: AtomicUsize::new(1),
             offered: AtomicU64::new(0),
@@ -511,6 +516,7 @@ impl Delivery {
                 return Err(FlushError::Unavailable("producer barrier state poisoned"));
             }
         };
+        let _waiting = BarrierWaiting::enter(&self.shared.barriers_waiting);
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(FlushError::Unavailable(
@@ -566,6 +572,20 @@ impl Delivery {
                 .map_err(|_| FlushError::Unavailable("producer barrier wait poisoned"))?;
             state = next;
         }
+    }
+}
+
+/// Counts a flush or shutdown for as long as it waits, on every return path.
+struct BarrierWaiting<'a>(&'a AtomicUsize);
+impl<'a> BarrierWaiting<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+impl Drop for BarrierWaiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -827,19 +847,29 @@ impl Backoff {
 }
 
 /// Wait out one retry delay as an event wait. It ends early when a flush or shutdown signals
-/// `barrier` (the next attempt then runs at once; the backoff sequence is unchanged) and
-/// returns true when `abort` reports last-owner cancellation. A permit left by a barrier that
-/// arrived during the attempt just before also ends the delay immediately, which is what that
-/// barrier asked for. Barriers are caller-driven, so this adds no timer.
+/// `barrier` while one is still waiting (`waiting` nonzero): the next attempt then runs at once
+/// and the backoff sequence is unchanged. A signal with no barrier waiting is a leftover of a
+/// call that already returned and is ignored, so it cannot shorten a later outage's first delay.
+/// Returns true when `abort` reports last-owner cancellation. Barriers are caller-driven, so
+/// this adds no timer.
 async fn wait_out_retry_delay(
     abort: &tokio::sync::Notify,
     barrier: &tokio::sync::Notify,
+    waiting: &AtomicUsize,
     delay: Duration,
 ) -> bool {
-    tokio::select! {
-        _ = abort.notified() => true,
-        _ = barrier.notified() => false,
-        _ = tokio::time::sleep(delay) => false,
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = abort.notified() => return true,
+            _ = &mut sleep => return false,
+            _ = barrier.notified() => {
+                if waiting.load(Ordering::SeqCst) > 0 {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -896,6 +926,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         if wait_out_retry_delay(
                             &shared.abort_wake,
                             &shared.retry_wake,
+                            &shared.barriers_waiting,
                             backoff.take(),
                         )
                         .await
@@ -1005,18 +1036,20 @@ mod tests {
         fast.validate().unwrap();
     }
 
-    /// INVARIANT: a flush or shutdown ends a retry backoff delay at once. On a paused clock
-    /// the delay's virtual elapsed time is the proof: a 30 s delay with a barrier signal ends
-    /// in no virtual time, while the same delay without one runs its full 30 s, so the bound
-    /// does not depend on the delay and no real sleep is involved.
+    /// INVARIANT: a flush or shutdown ends a retry backoff delay at once, and only while it
+    /// waits. On a paused clock the delay's virtual elapsed time is the proof: a 30 s delay
+    /// with a waiting barrier ends in no virtual time, while the same delay without one, or
+    /// with only a leftover signal from a barrier that already returned, runs its full 30 s.
+    /// No real sleep is involved.
     #[tokio::test(start_paused = true)]
-    async fn a_barrier_signal_ends_the_retry_delay_at_once() {
+    async fn a_waiting_barrier_ends_the_retry_delay_at_once_and_a_leftover_signal_does_not() {
         let abort = tokio::sync::Notify::new();
         let barrier = tokio::sync::Notify::new();
+        let waiting = AtomicUsize::new(0);
         let delay = Duration::from_secs(30);
 
         let started = tokio::time::Instant::now();
-        assert!(!wait_out_retry_delay(&abort, &barrier, delay).await);
+        assert!(!wait_out_retry_delay(&abort, &barrier, &waiting, delay).await);
         assert_eq!(
             started.elapsed(),
             delay,
@@ -1025,11 +1058,67 @@ mod tests {
 
         barrier.notify_one();
         let started = tokio::time::Instant::now();
-        assert!(!wait_out_retry_delay(&abort, &barrier, delay).await);
+        assert!(!wait_out_retry_delay(&abort, &barrier, &waiting, delay).await);
+        assert_eq!(
+            started.elapsed(),
+            delay,
+            "a leftover signal must not skip the delay"
+        );
+
+        let _barrier_waiting = BarrierWaiting::enter(&waiting);
+        barrier.notify_one();
+        let started = tokio::time::Instant::now();
+        assert!(!wait_out_retry_delay(&abort, &barrier, &waiting, delay).await);
         assert!(started.elapsed() < Duration::from_secs(1));
 
         abort.notify_one();
-        assert!(wait_out_retry_delay(&abort, &barrier, delay).await);
+        assert!(wait_out_retry_delay(&abort, &barrier, &waiting, delay).await);
+    }
+
+    /// INVARIANT (#187): a flush or shutdown issued during a real backoff delay ends it. The
+    /// retry interval is a production-valid 30 s; after each barrier the worker has retried
+    /// again within a real-time bound far below that, so the bound does not depend on the delay.
+    /// Barriers time out against the absent daemon, which is irrelevant to the wake.
+    #[test]
+    fn flush_and_shutdown_during_a_backoff_delay_retry_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test");
+        config.batch_events = 1;
+        config.retry_interval = Duration::from_secs(30);
+        config.retry_max_interval = Duration::from_secs(30);
+        let delivery = Delivery::start(config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(
+            delivery.try_send(event()),
+            Admission::Dropped {
+                reason: DropReason::Contended,
+                ..
+            }
+        ) {
+            assert!(Instant::now() < deadline, "admission remained contended");
+            std::thread::yield_now();
+        }
+        while delivery.stats().unwrap().retries < 1 {
+            assert!(Instant::now() < deadline, "no retry began");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The worker is now in (or entering) a 30 s delay.
+        assert!(matches!(
+            delivery.flush(Duration::from_millis(500)),
+            Err(FlushError::TimedOut(_))
+        ));
+        assert!(
+            delivery.stats().unwrap().retries >= 2,
+            "flush did not end the delay"
+        );
+        assert!(matches!(
+            delivery.shutdown(Duration::from_millis(500)),
+            Err(FlushError::TimedOut(_))
+        ));
+        assert!(
+            delivery.stats().unwrap().retries >= 3,
+            "shutdown did not end the delay"
+        );
     }
 
     /// INVARIANT: the real flush and shutdown paths signal the retry wait. The worker of an
