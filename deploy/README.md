@@ -414,6 +414,18 @@ the option, a daemon that lacks the backup makes the script refuse and name
 from, so a rollback can only go forward; take the first online backup as soon
 as `sparrow SOCKET status` answers on the new image.
 
+The script starts only `sparrow-ship.timer` again. It leaves
+`sparrow-backup.timer` stopped, because the installed `sparrow-backup.service`
+may still be the old closed-store form until the online lines below are
+installed. After the switch: install those lines, take the first online backup
+(`sparrow SOCKET backup`, or run `sparrow-backup`), run
+`deploy/verify-backup.sh SET`, and only after it exits 0 run
+`systemctl --user start sparrow-backup.timer`. If the shipper or the backup is
+still running when the script has stopped the timers, it starts again only the
+timers that were active before (the backup timer only if it was running) and
+changes nothing else. `tools/user-unit-upgrade-timers-check.sh` records both
+behaviors against a stubbed `systemctl`.
+
 The user unit `~/.config/systemd/user/sparrow-backup.service` is not in the
 repository. It must carry these lines, with no `ExecStopPost` and no `flock`:
 

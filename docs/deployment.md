@@ -925,6 +925,16 @@ then does it stop both timers and wait for the shipper, stop the unit, install
 the `LimitNOFILE` drop-in, switch the links and start the unit. Nothing stops
 for the backup; the unit stops only for the image switch itself.
 
+At the end it starts `sparrow-ship.timer` only. `sparrow-backup.timer` stays
+stopped, because it restarts only after a first online backup has been verified
+and the installed `sparrow-backup.service` may still be the old closed-store
+form. The run prints the steps: take the first online backup, run
+`deploy/verify-backup.sh SET`, and only after it exits 0 run
+`systemctl --user start sparrow-backup.timer`. If the shipper or the backup is
+still running after the timers stop, the script starts again only the timers
+that were active before (the backup timer only if it was running) and changes
+nothing else.
+
 `--no-backup REASON` switches without a backup, for a running daemon that has no
 online backup (an image older than the backup operation, such as schema 68).
 `REASON` must not be empty, and the run logs it. Without the option, a daemon
@@ -941,7 +951,7 @@ limits answered in 117.2 seconds (`verify-backup.sh --measure-migration`,
 disk-budget maintenance, not the migrations. After the first answer it fails
 unless the store identity is unchanged and the schema is the `--to` schema. It
 prints each migration's `done`, `total` and `failure`, the watches and the
-ingest socket, starts the timers, and exits 0. The backfill continues online
+ingest socket, starts `sparrow-ship.timer` (not the backup timer, below), and exits 0. The backfill continues online
 in the running daemon. Watch it with `sparrow /SPARROW/store/rpc.sock status`
 (`migrations`) and with `journalctl --user -u sparrow.service`, which logs a
 `sparrowd: migration` progress line every 64 pages and a completion line per
@@ -950,7 +960,8 @@ migration.
 `--help` gives the recovery for each failure point. A failure after the start
 leaves the `--to` daemon running with both timers stopped, and it may already
 have accepted ingest. The recovery goes forward first: wait for status, confirm
-the store identity and schema, then start the timers. A rollback with a
+the store identity and schema, then start `sparrow-ship.timer`; start
+`sparrow-backup.timer` only after a first online backup verifies. A rollback with a
 pre-upgrade backup stops the unit, points the links at `--from`, and restores
 into an empty `chattr +C` directory with an image that has the restore option:
 `TO --restore-backup BACKUPS ID STORE`, where `ID` is `backup_id` in
@@ -1006,7 +1017,9 @@ what each claim was. Never delete an entry or a claim's bytes:
    reports that failure. An old image without the command makes it exit 3
    after re-shipping: the claim stays pending until a schema 70 image retires
    it.
-6. Stop the newer query-only daemon and start both timers.
+6. Stop the newer query-only daemon and start `sparrow-ship.timer`. Start
+   `sparrow-backup.timer` only after a first online backup of the restored store
+   verifies (`deploy/verify-backup.sh` exits 0).
 
 `deploy/verify-backup.sh --rehearse-rollback` rehearses both cases on a copy
 (see "Measure the online migration with intake and traffic").
