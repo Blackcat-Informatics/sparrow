@@ -432,53 +432,68 @@ impl Writer {
     }
 
     pub(super) fn validate_event_record(&self, record: &Record) -> Result<(), Error> {
-        self.validate_diagnostic_record(record)?;
-        if let Some(snapshot) = &record.syslog {
-            return snapshot.validate_record(record);
-        }
-        let profile_id = match &record.event_time {
-            EventTime::Known { profile_id, .. } => Some(profile_id),
-            EventTime::Unknown { profile_id, .. } => profile_id.as_ref(),
-        };
-        if let Some(id) = profile_id {
-            let profile = self.time_profile(&record.source)?.ok_or_else(|| {
-                Error::new("STORAGE_FAILURE", "record source time profile missing")
-            })?;
-            if profile.id != *id {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "record source time profile disagrees with immutable binding",
-                ));
-            }
-        }
-        Ok(())
+        validate_event_record(&super::store_counters::Reader::db(&self.db), record)
     }
     pub(super) fn time_profile(&self, source: &str) -> Result<Option<SourceTimeProfile>, Error> {
-        let Some(bytes) = self.db.get(source_key(source))? else {
-            return Ok(None);
-        };
-        let profile = SourceTimeProfile::decode(&parse(&bytes)?)?;
-        if profile.log_capture.is_some()
-            && !super::writer_format::has_log_time(
-                &self
-                    .db
-                    .get("store_format")?
-                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?,
-            )
-        {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "log time mapping lacks its writer fence",
-            ));
-        }
-        if profile.source != source {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "source binding identity mismatch",
-            ));
-        }
-        Ok(Some(profile))
+        time_profile(&super::store_counters::Reader::db(&self.db), source)
     }
+}
+
+/// Check a record's captured event time and diagnostics against its source's immutable
+/// bindings, read from `reader` (the database under the writer, or a reader's snapshot).
+pub(super) fn validate_event_record(
+    reader: &super::store_counters::Reader<'_>,
+    record: &Record,
+) -> Result<(), Error> {
+    super::diagnostic::validate_diagnostic_record(reader, record)?;
+    if let Some(snapshot) = &record.syslog {
+        return snapshot.validate_record(record);
+    }
+    let profile_id = match &record.event_time {
+        EventTime::Known { profile_id, .. } => Some(profile_id),
+        EventTime::Unknown { profile_id, .. } => profile_id.as_ref(),
+    };
+    if let Some(id) = profile_id {
+        let profile = time_profile(reader, &record.source)?
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "record source time profile missing"))?;
+        if profile.id != *id {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "record source time profile disagrees with immutable binding",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A source's bound time profile, read from `reader`.
+pub(super) fn time_profile(
+    reader: &super::store_counters::Reader<'_>,
+    source: &str,
+) -> Result<Option<SourceTimeProfile>, Error> {
+    let Some(bytes) = reader.get(source_key(source).as_bytes())? else {
+        return Ok(None);
+    };
+    let profile = SourceTimeProfile::decode(&parse(&bytes)?)?;
+    if profile.log_capture.is_some()
+        && !super::writer_format::has_log_time(
+            &reader
+                .get(b"store_format")?
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?,
+        )
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "log time mapping lacks its writer fence",
+        ));
+    }
+    if profile.source != source {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "source binding identity mismatch",
+        ));
+    }
+    Ok(Some(profile))
 }
 
 impl Store {

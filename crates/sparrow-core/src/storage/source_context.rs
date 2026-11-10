@@ -3,6 +3,7 @@
 
 //! Generation-marked source timeline cache over the authoritative record/time catalog.
 
+use super::store_counters::Reader;
 use super::{Error, Record, Writer, catalog_upgrade, integer, parse, read_field, store_counters};
 use rocksdb::{DB, WriteBatch};
 use std::collections::BTreeMap;
@@ -33,7 +34,7 @@ const JOB: catalog_upgrade::Job = catalog_upgrade::Job {
     publish,
 };
 
-pub(super) fn prefix(source: &str) -> String {
+fn prefix(source: &str) -> String {
     hashed_prefix(&super::source_summary::source_hash(source))
 }
 
@@ -114,7 +115,8 @@ fn publish(
 ///
 /// The reset is one range deletion of the whole family, never a point tombstone per key,
 /// and it seeds the `source-context` online migration, which the maintenance worker pages
-/// through the writer. Until it completes [`ready`] refuses context reads retryably.
+/// through the writer. Until it completes, [`Timeline::walk`] serves every reader from the primary
+/// time index.
 pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
     let checkpoint = db.get(CHECKPOINT)?;
     let intact = db.get_pinned(GENERATION_KEY)?.as_deref() == Some(GENERATION)
@@ -138,7 +140,7 @@ pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
 /// Stage one rebuild page with its checkpoint, and whether the rebuild is complete after
 /// it; `None` when it was already complete or latched a failure. A page that finds corrupt
 /// record metadata latches the failure durably instead, so the worker stops retrying and
-/// context reads refuse until a reopen resets the cache.
+/// readers keep reading the primary time index until a reopen resets the cache.
 pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
     if db.get_pinned(FAILURE)?.is_some() {
         return Ok(None);
@@ -189,21 +191,104 @@ fn catalog_failure(error: Error) -> Error {
     }
 }
 
-pub(super) fn ready(writer: &Writer) -> Result<(), Error> {
-    if writer.db.get_pinned(FAILURE)?.is_some() {
-        return Err(Error::new(
-            "STORAGE_FAILURE",
-            "source context reconstruction found corrupt record metadata; repair the authoritative catalog and reopen before requesting context",
-        ));
-    }
-    match watermark(|key| Ok(writer.db.get(key)?))? {
-        None => Ok(()),
-        Some(watermark) => Err(Error::new(
-            "INDEX_NOT_READY",
-            format!(
-                "context reads the source timeline cache, which the online migration source-context is still rebuilding (watermark {watermark}); retry once status.migrations reports it complete"
-            ),
-        )),
+/// Whether the cache is complete: its rebuild finished without a latched failure. Until it
+/// is, [`Timeline::walk`] reads the authoritative primary time index instead, so a reader never
+/// waits for the rebuild and never sees a partial timeline.
+pub(super) fn cached(db: &DB) -> Result<bool, Error> {
+    Ok(db.get_pinned(FAILURE)?.is_none() && catalog_upgrade::progress(db, &JOB)?.complete)
+}
+
+/// The state one source-timeline walk reads: the database under the writer or a snapshot,
+/// whether its cache is complete ([`cached`] for that state), and the caller's cancellation.
+pub(super) struct Timeline<'a> {
+    pub reader: &'a Reader<'a>,
+    pub cached: bool,
+    pub cancellation: &'a crate::QueryCancellation,
+}
+
+impl Timeline<'_> {
+    /// Walk the receipt timeline of the source whose key hash is `hash`, ordered by
+    /// `(received_at, record ID)`, from `received_at` and `after` (exclusive; `None` starts
+    /// forward at the first record accepted at `received_at`, or in reverse at the last one
+    /// accepted before it) in `direction`, stopping at the first entry whose receipt time is
+    /// outside `bounds`. `visit` receives each retained record's receipt time and ID and
+    /// returns whether to continue.
+    ///
+    /// This is the one timeline every source-local reader uses. A complete cache yields the
+    /// source's entries directly. Otherwise the walk reads the primary `time:` index, which
+    /// holds every retained record of every source, and skips records of other sources by
+    /// their catalog headers without charging the caller; it yields exactly the entries the
+    /// rebuilt cache will hold, in the same order. The bounds stop both reads, so a skipped
+    /// run of other sources' records never extends past the caller's receipt interval.
+    /// Cancellation is checked every 4,096 entries read; a caller that may skip many
+    /// entries reads from a snapshot without the writer lock (see [`super::context`]).
+    pub(super) fn walk(
+        &self,
+        hash: &str,
+        position: (u64, Option<&str>),
+        bounds: impl std::ops::RangeBounds<u64>,
+        direction: rocksdb::Direction,
+        mut visit: impl FnMut(u64, &str) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        let Timeline {
+            reader,
+            cached,
+            cancellation,
+        } = *self;
+        let (received_at, after) = position;
+        let family = if cached {
+            hashed_prefix(hash)
+        } else {
+            "time:".to_owned()
+        };
+        let start = format!("{family}{received_at:020}:{}", after.unwrap_or(""));
+        let invalid = || Error::new("STORAGE_FAILURE", "invalid source timeline entry");
+        let mut read = 0_u64;
+        reader.iterate(start.as_bytes(), direction, |key, value| {
+            if read.is_multiple_of(4096) {
+                cancellation.checkpoint()?;
+            }
+            read += 1;
+            if !key.starts_with(family.as_bytes()) {
+                return Ok(false);
+            }
+            if after.is_some() && key == start.as_bytes() {
+                return Ok(true);
+            }
+            let rest = &key[family.len()..];
+            let time = rest
+                .get(..20)
+                .and_then(|time| std::str::from_utf8(time).ok())
+                .and_then(|time| time.parse::<u64>().ok())
+                .ok_or_else(invalid)?;
+            if !bounds.contains(&time) {
+                return Ok(false);
+            }
+            let id = rest
+                .get(21..)
+                .and_then(|id| std::str::from_utf8(id).ok())
+                .filter(|id| rest[20] == b':' && value == id.as_bytes())
+                .ok_or_else(|| {
+                    Error::new(
+                        "STORAGE_FAILURE",
+                        "source timeline entry value disagrees with its key",
+                    )
+                })?;
+            let selected = cached || {
+                let bytes = reader.get(id.as_bytes())?.ok_or_else(|| {
+                    Error::new("STORAGE_FAILURE", "time index references a missing record")
+                })?;
+                let header = decode(&bytes)?;
+                if header.id != id || header.received_at != time {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "time index does not match its record",
+                    ));
+                }
+                super::source_summary::source_hash(&header.source) == hash
+            };
+            Ok(!selected || visit(time, id)?)
+        })
     }
 }
 
@@ -343,26 +428,23 @@ pub(super) fn update(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Erro
     Ok(())
 }
 
-pub(super) fn indexed(
-    writer: &Writer,
+/// Read one record [`Timeline::walk`] yielded from `reader`, charged to `remaining`, after checking
+/// its primary time index entry and that it belongs to `source`.
+pub(super) fn record(
+    reader: &Reader<'_>,
     source: &str,
-    name: &[u8],
-    id: &[u8],
+    received_at: u64,
+    id: &str,
     remaining: &mut usize,
 ) -> Result<Record, Error> {
-    let prefix = prefix(source);
-    let suffix = name
-        .strip_prefix(prefix.as_bytes())
-        .ok_or_else(|| Error::new("STORAGE_FAILURE", "context index source prefix disagrees"))?;
-    let mut primary = b"time:".to_vec();
-    primary.extend_from_slice(suffix);
-    if writer.db.get_pinned(&primary)?.as_deref() != Some(id) {
+    let primary = format!("time:{received_at:020}:{id}");
+    if reader.get(primary.as_bytes())?.as_deref() != Some(id.as_bytes()) {
         return Err(Error::new(
             "STORAGE_FAILURE",
             "source context index disagrees with primary time index",
         ));
     }
-    let record = writer.time_record(&primary, id, remaining)?;
+    let record = super::time_record(reader, primary.as_bytes(), id.as_bytes(), remaining)?;
     if record.source != source {
         return Err(Error::new(
             "STORAGE_FAILURE",

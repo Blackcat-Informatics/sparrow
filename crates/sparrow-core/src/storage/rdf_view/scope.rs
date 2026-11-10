@@ -114,9 +114,9 @@ pub struct RdfScopeCoverage {
     /// Known declared diagnostic values among selected occurrences, by dimension.
     pub diagnostic_known: std::collections::BTreeMap<crate::DiagnosticDimension, u64>,
     /// Selected record metadata graphs the online event fallback backfill has not yet
-    /// rebuilt: they lack `eventTimeFallback` and `eventTimeBasis` until it does. Raw
-    /// SPARQL counts them; a correlation, whose recipe reads only `eventTime` and
-    /// `receivedAt`, does not.
+    /// rebuilt. The view serves the `eventTimeFallback` and `eventTimeBasis` facts the
+    /// backfill owes them, so the answer is the one the finished backfill gives; this only
+    /// reports how many graphs were served that way.
     pub event_fallback_pending: u64,
 }
 
@@ -184,7 +184,7 @@ impl StoredRdfView<'_> {
         } else if !scope.diagnostics.is_empty() {
             coverage.artifact_diagnostic_unknown += 1;
             if scope.require_complete_index {
-                return Err(self.budget.fail(Error::new("INDEX_NOT_READY","selected recordless artifact has no diagnostic record; omit diagnostic filters or select records")));
+                return Err(self.budget.fail(Error::new("EVIDENCE_INCOMPLETE","selected recordless artifact has no diagnostic record; omit diagnostic filters or select records")));
             }
             return Ok(());
         }
@@ -241,12 +241,7 @@ impl StoredRdfView<'_> {
                 && self.fallback_pending(&record.id)?
             {
                 coverage.event_fallback_pending += 1;
-                if strict {
-                    return Err(self.budget.fail(Error::new(
-                        "INDEX_NOT_READY",
-                        "the event fallback migration is pending for a selected record graph; retry after it completes or omit the complete-index requirement",
-                    )));
-                }
+                self.owe_fallback(record)?;
             }
         }
         if layers.diagnostic
@@ -283,7 +278,7 @@ impl StoredRdfView<'_> {
                 coverage.content_failed += 1;
                 if strict {
                     return Err(self.budget.fail(Error::new(
-                        "INDEX_NOT_READY",
+                        "EVIDENCE_INCOMPLETE",
                         "selected record RDF projection failed; inspect its diagnostic",
                     )));
                 }
@@ -355,7 +350,7 @@ impl Store {
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new_cancellable(&db, limits, &[], cancellation.clone())?;
-        view.scoped = scope.restricts_membership() && view.owner_index;
+        view.scoped = scope.restricts_membership();
         if correlation.is_some() {
             // The correlation recipe never reads the backfilled facts.
             view.fallback = None;

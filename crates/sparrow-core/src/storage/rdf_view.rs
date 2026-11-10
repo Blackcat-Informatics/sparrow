@@ -115,9 +115,14 @@ pub struct StoredRdfView<'a> {
     /// Membership narrower than the whole live store: patterns are evaluated per graph
     /// of `owners`, enumerated from the owner-to-graph index, so cost follows the scope.
     scoped: bool,
-    /// The owner-to-graph index build is complete in this snapshot. Until it is, every
-    /// scope keeps the whole-store plan, which reads only declarations every writer kept.
-    owner_index: bool,
+    /// While the owner-to-graph index build is pending in this snapshot, the first graph
+    /// declaration key it has not copied, and whether that key itself is uncopied. Every
+    /// declaration through the build's frontier, and every one written since its fence, has
+    /// its `rdf:o:` mirror; the declarations after the frontier are read directly.
+    owner_pending: Option<(Vec<u8>, bool)>,
+    /// The scope's graphs, enumerated once per view: every graph iteration shares them,
+    /// so a query's patterns do not each re-walk the declarations.
+    owned_graphs: std::sync::OnceLock<Option<std::sync::Arc<OwnedGraphSet>>>,
     /// Present while the event fallback backfill is incomplete in this snapshot.
     fallback: Option<FallbackPending>,
     budget: Arc<Budget>,
@@ -128,12 +133,24 @@ pub struct StoredRdfView<'a> {
     text_scope: Option<text_relations::TextScope>,
 }
 
-/// An incomplete event fallback backfill as one snapshot sees it.
+/// An incomplete event fallback backfill as one snapshot sees it, and the facts it still
+/// owes the selected record graphs. The view serves those facts with the stored rows, so a
+/// read during the backfill answers exactly as it will once the backfill is complete.
 struct FallbackPending {
     /// Last examined record graph owner; graphs at or before it are migrated.
     after: Option<String>,
     /// Dictionary identities of `eventTime` and `eventTimeFallback`, when interned.
     predicates: [Option<u64>; 2],
+    /// The first dictionary ordinal the snapshot has not allocated: `rdf:next` holds the
+    /// last allocated one, so every stored term's ordinal is below this, and owed terms the
+    /// dictionary lacks take ordinals from here.
+    next: u64,
+    /// Owed terms the dictionary lacks, by ordinal from `next`, with their canonical bytes.
+    terms: Vec<(Vec<u8>, ProjectionTerm)>,
+    /// Owed fallback facts of selected record graphs the backfill has not reached, each in
+    /// its record's metadata graph.
+    quads: Vec<QuadIds<GlobalTermId>>,
+    _reservation: Option<Reservation>,
 }
 
 /// Owned native term carrier whose strings live through this admitted guard.
@@ -251,7 +268,8 @@ impl<'a> StoredRdfView<'a> {
             reverse: rdf_index::reverse_family(db).map_err(|e| budget.fail(e))?,
             owners: BTreeSet::new(),
             scoped: false,
-            owner_index: false,
+            owner_pending: None,
+            owned_graphs: std::sync::OnceLock::new(),
             fallback: None,
             budget,
             _scope: scope,
@@ -310,9 +328,13 @@ impl<'a> StoredRdfView<'a> {
         };
         let owner = read(rdf_index::OWNER_GRAPH_UPGRADE)?;
         let checkpoint = read(super::event_fallback_rdf::CHECKPOINT)?;
-        self.owner_index = rdf_index::owner_graph_progress(|_| Ok(owner))
+        let next = read("rdf:next")?;
+        self.owner_pending = rdf_index::owner_graph_progress(|_| Ok(owner))
             .map_err(|error| self.budget.fail(error))?
-            .is_none();
+            .map(|after| match after {
+                None => (rdf_index::graph_key(0, 0), true),
+                Some((graph, owner)) => (rdf_index::graph_key(graph, owner), false),
+            });
         let Some(after) = super::event_fallback_rdf::decode_frontier(checkpoint.as_deref())
             .map_err(|error| self.budget.fail(error))?
         else {
@@ -323,10 +345,164 @@ impl<'a> StoredRdfView<'a> {
             .iter_mut()
             .zip(super::event_fallback_rdf::event_time_predicates())
         {
-            *slot = self.term_id_by_value(&predicate)?.map(ordinal);
+            *slot = self.term_id_in(&predicate, false)?.map(ordinal);
         }
-        self.fallback = Some(FallbackPending { after, predicates });
+        let next = next
+            .as_deref()
+            .map(<[u8; 8]>::try_from)
+            .transpose()
+            .ok()
+            .flatten()
+            .map(u64::from_be_bytes)
+            .and_then(|last| last.checked_add(1))
+            .ok_or_else(|| {
+                self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "RDF dictionary allocation counter missing or invalid",
+                ))
+            })?;
+        self.fallback = Some(FallbackPending {
+            after,
+            predicates,
+            next,
+            terms: Vec::new(),
+            quads: Vec::new(),
+            _reservation: None,
+        });
         Ok(())
+    }
+
+    /// Serve the fallback facts the backfill will add to `record`'s metadata graph, derived
+    /// by the backfill's own law from the record's receipt time.
+    fn owe_fallback(&mut self, record: &Record) -> Result<(), ReadError> {
+        use purrdf::TermFactory;
+        let fail = |budget: &Budget, error: Error| budget.fail(error);
+        let mut builder = purrdf::RdfDatasetBuilder::new();
+        let subject_value = TermValue::iri(rdf_index::entity_iri(&record.id));
+        let facts = builder
+            .intern_value(&subject_value)
+            .map_err(Error::from)
+            .and_then(|subject| {
+                rdf_index::fallback_metadata(
+                    &mut builder,
+                    subject,
+                    crate::EventPlacement::receipt(record.received_at),
+                )
+            })
+            .and_then(|()| rdf_index::metadata_dataset(builder))
+            .map_err(|error| fail(&self.budget, error))?;
+        let graph = self
+            .term_id_in(&TermValue::iri(rdf_index::graph_iri(&record.id)), false)?
+            .ok_or_else(|| {
+                fail(
+                    &self.budget,
+                    Error::new("STORAGE_FAILURE", "record RDF graph owner missing"),
+                )
+            })?;
+        let subject = self.term_id_in(&subject_value, false)?.ok_or_else(|| {
+            fail(
+                &self.budget,
+                Error::new("STORAGE_FAILURE", "record RDF graph subject missing"),
+            )
+        })?;
+        for quad in facts.quads() {
+            let [p, o] = [quad.p, quad.o].map(|id| {
+                facts
+                    .term_value(id)
+                    .map_err(|e| fail(&self.budget, Error::new("STORAGE_FAILURE", e.to_string())))
+            });
+            let p = self.owe_term(&p?)?;
+            let o = self.owe_term(&o?)?;
+            let pending = self.fallback.as_mut().ok_or_else(|| {
+                fail(
+                    &self.budget,
+                    Error::new("STORAGE_FAILURE", "event fallback state lost"),
+                )
+            })?;
+            match &mut pending._reservation {
+                Some(reservation) => reservation.grow(64)?,
+                None => pending._reservation = Some(self.budget.reserve(64)?),
+            }
+            pending.quads.push(QuadIds {
+                s: subject,
+                p,
+                o,
+                g: Some(graph),
+            });
+        }
+        Ok(())
+    }
+
+    /// The identity of an owed fact's term: its dictionary identity, or an ordinal from the
+    /// snapshot's next dictionary ordinal when the dictionary lacks it.
+    fn owe_term(&mut self, value: &TermValue) -> Result<GlobalTermId, ReadError> {
+        if let Some(id) = self.term_id_in(value, false)? {
+            return Ok(id);
+        }
+        if let TermValue::Literal { datatype, .. } = value {
+            self.owe_term(&TermValue::iri(datatype.clone()))?;
+        }
+        let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
+        let term = ProjectionTerm::from_term_value(value, limits).map_err(|e| {
+            self.budget
+                .fail(Error::new("STORAGE_FAILURE", e.to_string()))
+        })?;
+        let bytes = term.to_canonical_json(limits).map_err(|e| {
+            self.budget
+                .fail(Error::new("STORAGE_FAILURE", e.to_string()))
+        })?;
+        let charge = bytes.len() as u64 * 2 + 256;
+        let budget = &self.budget;
+        let pending = self.fallback.as_mut().ok_or_else(|| {
+            budget.fail(Error::new("STORAGE_FAILURE", "event fallback state lost"))
+        })?;
+        match &mut pending._reservation {
+            Some(reservation) => reservation.grow(charge)?,
+            None => pending._reservation = Some(budget.reserve(charge)?),
+        }
+        pending.terms.push((bytes, term));
+        global(pending.next + pending.terms.len() as u64 - 1).map_err(|e| budget.fail(e))
+    }
+
+    /// The owed fallback facts matching `pattern` and `graph`, with the graph semantics of
+    /// the stored rows: a metadata graph is named, and the default graph is their union.
+    fn owed_rows(
+        &self,
+        pattern: [Option<GlobalTermId>; 3],
+        graph: GraphMatch<GlobalTermId>,
+    ) -> impl Iterator<Item = QuadIds<GlobalTermId>> + '_ {
+        self.fallback
+            .iter()
+            .flat_map(|pending| pending.quads.iter())
+            .filter(move |quad| {
+                pattern[0].is_none_or(|id| id == quad.s)
+                    && pattern[1].is_none_or(|id| id == quad.p)
+                    && pattern[2].is_none_or(|id| id == quad.o)
+            })
+            .flat_map(move |quad| {
+                let named = match graph {
+                    GraphMatch::Named(id) => quad.g == Some(id),
+                    GraphMatch::Any => true,
+                    GraphMatch::Default => false,
+                };
+                let union = matches!(graph, GraphMatch::Any | GraphMatch::Default);
+                [
+                    named.then_some(*quad),
+                    union.then_some(QuadIds { g: None, ..*quad }),
+                ]
+                .into_iter()
+                .flatten()
+            })
+    }
+
+    /// An owed term by its ordinal, when it is one.
+    fn owed_term(&self, id: GlobalTermId) -> Option<&ProjectionTerm> {
+        let pending = self.fallback.as_ref()?;
+        let index = ordinal(id).checked_sub(pending.next)?;
+        pending
+            .terms
+            .get(usize::try_from(index).ok()?)
+            .map(|(_, term)| term)
     }
 
     /// Whether a record's metadata graph still lacks the fallback facts the event fallback
@@ -339,11 +515,17 @@ impl<'a> StoredRdfView<'a> {
         if pending.after.as_deref().is_some_and(|after| id <= after) {
             return Ok(false);
         }
+        // Uncharged to the request budget, as the rest of what the backfill owes: the reads
+        // exist only while it is pending. Decoding is still reserved.
         let key = format!("rdf:graph:{id}");
-        let bytes = self.catalog_point(key.as_bytes())?.ok_or_else(|| {
-            self.budget
-                .fail(Error::new("STORAGE_FAILURE", "record RDF graph missing"))
-        })?;
+        let bytes = self
+            .snapshot
+            .get_pinned(key.as_bytes())
+            .map_err(|error| self.budget.fail(error.into()))?
+            .ok_or_else(|| {
+                self.budget
+                    .fail(Error::new("STORAGE_FAILURE", "record RDF graph missing"))
+            })?;
         let _decode = self
             .budget
             .reserve((bytes.len() as u64).saturating_mul(64))?;
@@ -352,7 +534,7 @@ impl<'a> StoredRdfView<'a> {
             .map_err(|error| self.budget.fail(error))?;
         drop(bytes);
         let subject = self
-            .term_id_by_value(&TermValue::iri(rdf_index::entity_iri(id)))?
+            .term_id_in(&TermValue::iri(rdf_index::entity_iri(id)), false)?
             .map(ordinal);
         Ok(!super::event_fallback_rdf::carries_event_time(
             &rows,
@@ -371,7 +553,7 @@ impl<'a> StoredRdfView<'a> {
         key: &[u8],
         maximum: u64,
     ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
-        self.point_in(None, key, maximum)
+        self.point_in(None, key, maximum, true)
     }
 
     /// A record row grows with its record's chunk count. New layouts cap that at
@@ -389,17 +571,27 @@ impl<'a> StoredRdfView<'a> {
         Ok(bytes)
     }
 
-    fn reverse_point(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
-        self.point_in(Some(self.reverse), key, 8)
+    fn reverse_point(
+        &self,
+        key: &[u8],
+        charged: bool,
+    ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
+        self.point_in(Some(self.reverse), key, 8, charged)
     }
 
+    /// One bounded point read. `charged` reads spend the request budget; the reads that
+    /// serve what a pending migration owes do not, so a scope near its budget answers
+    /// during the migration as it does after it (#158).
     fn point_in(
         &self,
         family: Option<&rocksdb::ColumnFamily>,
         key: &[u8],
         maximum: u64,
+        charged: bool,
     ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
-        self.budget.request(key.len() as u64 + maximum, false)?;
+        if charged {
+            self.budget.request(key.len() as u64 + maximum, false)?;
+        }
         let bytes = match family {
             Some(family) => self.snapshot.get_pinned_cf(family, key),
             None => self.snapshot.get_pinned(key),
@@ -418,14 +610,50 @@ impl<'a> StoredRdfView<'a> {
     }
 
     fn lookup(&self, value: &ProjectionTerm) -> Result<Option<GlobalTermId>, ReadError> {
+        self.lookup_in(value, true)
+    }
+
+    /// [`DatasetView::term_id_by_value`], spending the request budget only when `charged`.
+    fn term_id_in(
+        &self,
+        value: &TermValue,
+        charged: bool,
+    ) -> Result<Option<GlobalTermId>, ReadError> {
+        let mut remaining = 65536;
+        input_capacity(value, 0, &mut remaining).map_err(|e| self.budget.fail(e))?;
+        let _reservation = self.budget.reserve((65536 - remaining) * 256 + 4096)?;
+        let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
+        let term = ProjectionTerm::from_term_value(value, limits).map_err(|e| {
+            self.budget
+                .fail(Error::new("INVALID_ARGUMENT", e.to_string()))
+        })?;
+        self.lookup_in(&term, charged)
+    }
+
+    /// [`Self::lookup`], spending the request budget only when `charged`.
+    fn lookup_in(
+        &self,
+        value: &ProjectionTerm,
+        charged: bool,
+    ) -> Result<Option<GlobalTermId>, ReadError> {
         let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
         let bytes = value.to_canonical_json(limits).map_err(|e| {
             self.budget
                 .fail(Error::new("INVALID_ARGUMENT", e.to_string()))
         })?;
         let key = rdf_index::reverse_key(&bytes);
-        let Some(stored) = self.reverse_point(key.as_bytes())? else {
-            return Ok(None);
+        let Some(stored) = self.reverse_point(key.as_bytes(), charged)? else {
+            let owed = self.fallback.as_ref().and_then(|pending| {
+                pending
+                    .terms
+                    .iter()
+                    .position(|(owed, _)| *owed == bytes)
+                    .map(|index| pending.next + index as u64)
+            });
+            return owed
+                .map(global)
+                .transpose()
+                .map_err(|e| self.budget.fail(e));
         };
         let id = stored
             .as_ref()
@@ -438,7 +666,7 @@ impl<'a> StoredRdfView<'a> {
                 ))
             })?;
         let global = global(id).map_err(|e| self.budget.fail(e))?;
-        let forward = self.verified_forward(global)?;
+        let forward = self.verified_forward_in(global, charged)?;
         if forward.bytes.as_ref() != bytes.as_slice() {
             return Err(self.budget.fail(Error::new(
                 "STORAGE_FAILURE",
@@ -449,16 +677,25 @@ impl<'a> StoredRdfView<'a> {
     }
 
     fn verified_forward(&self, id: GlobalTermId) -> Result<EncodedGuard<'_>, ReadError> {
+        self.verified_forward_in(id, true)
+    }
+
+    /// [`Self::verified_forward`], spending the request budget only when `charged`.
+    fn verified_forward_in(
+        &self,
+        id: GlobalTermId,
+        charged: bool,
+    ) -> Result<EncodedGuard<'_>, ReadError> {
         let reservation = self.budget.reserve(self.max_encoded + 1024)?;
         let key = rdf_index::term_key(ordinal(id));
         let bytes = self
-            .point(key.as_bytes(), self.max_encoded)?
+            .point_in(None, key.as_bytes(), self.max_encoded, charged)?
             .ok_or_else(|| {
                 self.budget
                     .fail(Error::new("STORAGE_FAILURE", "RDF term missing or foreign"))
             })?;
         let reverse = rdf_index::reverse_key(&bytes);
-        let stored = self.reverse_point(reverse.as_bytes())?;
+        let stored = self.reverse_point(reverse.as_bytes(), charged)?;
         if stored.as_deref() != Some(ordinal(id).to_be_bytes().as_slice()) {
             return Err(self.budget.fail(Error::new(
                 "STORAGE_FAILURE",
@@ -499,7 +736,10 @@ impl<'a> StoredRdfView<'a> {
             );
             cursor(plan.0, GraphMatch::Default, true)
         });
-        first.chain(union.into_iter().flatten())
+        let owed = (stream == 0).then(|| self.owed_rows(pattern, graph));
+        first
+            .chain(union.into_iter().flatten())
+            .chain(owed.into_iter().flatten())
     }
 
     fn physical_rows(
@@ -560,7 +800,23 @@ impl<'a> StoredRdfView<'a> {
     }
 
     /// Distinct graphs declared by this view's owners, in global graph order.
-    fn owner_graphs(&self) -> Result<(BTreeSet<u64>, Reservation), ReadError> {
+    fn owner_graphs(&self) -> Option<std::sync::Arc<OwnedGraphSet>> {
+        self.owned_graphs
+            .get_or_init(|| {
+                self.enumerate_owner_graphs()
+                    .ok()
+                    .map(|(graphs, reservation)| {
+                        std::sync::Arc::new(OwnedGraphSet {
+                            graphs: graphs.into_iter().collect(),
+                            _reservation: reservation,
+                        })
+                    })
+            })
+            .clone()
+    }
+
+    /// One enumeration of the scope's graphs; a failure is recorded in the budget.
+    fn enumerate_owner_graphs(&self) -> Result<(BTreeSet<u64>, Reservation), ReadError> {
         let mut reservation = self.budget.reserve(4096)?;
         let mut graphs = BTreeSet::new();
         for owner in &self.owners {
@@ -599,7 +855,65 @@ impl<'a> StoredRdfView<'a> {
                 }
             }
         }
+        if let Some((start, inclusive)) = &self.owner_pending {
+            self.uncopied_owner_graphs(start, *inclusive, &mut graphs, &mut reservation)?;
+        }
         Ok((graphs, reservation))
+    }
+
+    /// Add the graphs of this view's owners among the declarations the pending owner index
+    /// build has not copied, from `start`. The walk is the build's own remaining work and
+    /// shrinks as it advances; it answers exactly instead of refusing, so its rows are not
+    /// charged to the request budget (#158). It checks cancellation and the read lease every
+    /// 4,096 rows and charges the graphs it keeps.
+    fn uncopied_owner_graphs(
+        &self,
+        start: &[u8],
+        inclusive: bool,
+        graphs: &mut BTreeSet<u64>,
+        reservation: &mut Reservation,
+    ) -> Result<(), ReadError> {
+        let prefix = &start[..6];
+        let rows = self
+            .snapshot
+            .iterator(IteratorMode::From(start, Direction::Forward));
+        for (index, row) in rows.enumerate() {
+            if index % 4096 == 0
+                && let (Some(error), _) = self.budget.checkpoint()
+            {
+                return Err(error);
+            }
+            let (key, value) = row.map_err(|e| self.budget.fail(e.into()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if !inclusive && *key == *start {
+                continue;
+            }
+            let suffix = &key[prefix.len()..];
+            let [graph, owner] = suffix
+                .as_chunks::<8>()
+                .0
+                .try_into()
+                .ok()
+                .filter(|_| suffix.len() == 16 && value.is_empty())
+                .ok_or_else(|| {
+                    self.budget.fail(Error::new(
+                        "STORAGE_FAILURE",
+                        "invalid RDF graph declaration",
+                    ))
+                })?;
+            let (graph, owner) = (u64::from_be_bytes(graph), u64::from_be_bytes(owner));
+            if graph == 0 || owner == 0 {
+                return Err(self
+                    .budget
+                    .fail(Error::new("STORAGE_FAILURE", "zero RDF graph declaration")));
+            }
+            if self.owners.contains(&owner) && graphs.insert(graph) {
+                reservation.grow(64)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -699,25 +1013,32 @@ struct GraphIter<'a> {
 enum OwnedGraphs {
     Pending,
     Ready {
-        graphs: std::collections::btree_set::IntoIter<u64>,
-        _reservation: Reservation,
+        set: std::sync::Arc<OwnedGraphSet>,
+        next: usize,
     },
+}
+
+/// The graphs of a scope in global graph order, with the reservation that charges them.
+struct OwnedGraphSet {
+    graphs: Vec<u64>,
+    _reservation: Reservation,
 }
 
 impl GraphIter<'_> {
     fn next_owned(&mut self) -> Option<GlobalTermId> {
         let owned = self.owned.as_mut()?;
         if matches!(owned, OwnedGraphs::Pending) {
-            let (graphs, reservation) = self.view.owner_graphs().ok()?;
             *owned = OwnedGraphs::Ready {
-                graphs: graphs.into_iter(),
-                _reservation: reservation,
+                set: self.view.owner_graphs()?,
+                next: 0,
             };
         }
-        let OwnedGraphs::Ready { graphs, .. } = owned else {
+        let OwnedGraphs::Ready { set, next } = owned else {
             unreachable!("owner graphs were enumerated above")
         };
-        let graph = match global(graphs.next()?) {
+        let graph = *set.graphs.get(*next)?;
+        *next += 1;
+        let graph = match global(graph) {
             Ok(id) => id,
             Err(e) => {
                 self.view.budget.fail(e);
@@ -820,12 +1141,17 @@ impl DatasetView for StoredRdfView<'_> {
         let reservation = self
             .budget
             .reserve(self.max_owned_term_bytes().expect("persisted bound"))?;
-        let bytes = self.verified_forward(id)?;
-        let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
-        let value = ProjectionTerm::from_canonical_json(&bytes.bytes, limits).map_err(|e| {
-            self.budget
-                .fail(Error::new("STORAGE_FAILURE", e.to_string()))
-        })?;
+        let value = match self.owed_term(id) {
+            Some(term) => term.clone(),
+            None => {
+                let bytes = self.verified_forward(id)?;
+                let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
+                ProjectionTerm::from_canonical_json(&bytes.bytes, limits).map_err(|e| {
+                    self.budget
+                        .fail(Error::new("STORAGE_FAILURE", e.to_string()))
+                })?
+            }
+        };
         let mut links = [None; 3];
         match &value {
             ProjectionTerm::Literal { datatype, .. } => {
@@ -865,16 +1191,9 @@ impl DatasetView for StoredRdfView<'_> {
         })
     }
     fn term_id_by_value(&self, value: &TermValue) -> Result<Option<GlobalTermId>, ReadError> {
-        let mut remaining = 65536;
-        input_capacity(value, 0, &mut remaining).map_err(|e| self.budget.fail(e))?;
-        let _reservation = self.budget.reserve((65536 - remaining) * 256 + 4096)?;
-        let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
-        let term = ProjectionTerm::from_term_value(value, limits).map_err(|e| {
-            self.budget
-                .fail(Error::new("INVALID_ARGUMENT", e.to_string()))
-        })?;
-        self.lookup(&term)
+        self.term_id_in(value, true)
     }
+
     fn capabilities(&self) -> RdfStoreCapabilities {
         RdfStoreCapabilities {
             named_graphs: true,
@@ -940,6 +1259,10 @@ impl DatasetView for StoredRdfView<'_> {
     }
     fn term_count(&self) -> u64 {
         self.terms
+            + self
+                .fallback
+                .as_ref()
+                .map_or(0, |pending| pending.terms.len() as u64)
     }
     fn reifier_quads(&self) -> impl Iterator<Item = QuadIds<GlobalTermId>> + '_ {
         self.rows(1, 0, [None; 3], GraphMatch::Any)
@@ -1008,7 +1331,7 @@ impl Store {
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new(&db, limits, &[])?;
-        view.scoped = view.owner_index;
+        view.scoped = true;
         let mut scope_bytes = 4096 + ids.len() as u64 * 2048;
         Arc::get_mut(&mut view._scope)
             .expect("scope capture precedes owned query admission")

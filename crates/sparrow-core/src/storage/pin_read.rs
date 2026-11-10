@@ -437,10 +437,10 @@ mod tests {
         snapshot.bytes = snapshot.capacity();
         assert!(!snapshot.alive(0));
         let mut reads = Reads::default();
-        reads.snapshots.insert(snapshot.id.clone(), snapshot);
+        reads.insert_for_tests(snapshot);
         assert!(reads.capacity() > 0);
         reads.purge(0);
-        assert!(reads.snapshots.is_empty());
+        assert!(reads.is_empty());
         assert_eq!(reads.capacity(), 0);
     }
 }

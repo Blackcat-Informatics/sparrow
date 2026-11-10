@@ -85,7 +85,7 @@ impl<Outcome> ScopedSparqlResult<Outcome> {
     /// Independent requested-index coverage; this never changes native answer certainty.
     pub fn index_coverage_complete(&self) -> bool {
         self.correlation.as_ref().map_or_else(
-            || self.coverage.complete() && self.coverage.event_fallback_pending == 0,
+            || self.coverage.complete(),
             |capture| capture.complete(&self.coverage),
         ) && self
             .text
@@ -205,7 +205,7 @@ impl Store {
             cancellation,
             |view, coverage| {
                 if read.scope.require_complete_index && correlation.is_some_and(|capture| !capture.complete(coverage)) {
-                    return Err(view.budget.fail(Error::new("INDEX_NOT_READY", "correlation requires known diagnostic interpretations and ready event-time projections throughout its selected scope")));
+                    return Err(view.budget.fail(Error::new("EVIDENCE_INCOMPLETE", "correlation requires known diagnostic interpretations and event-time profiles that do not depend on a failed JSON projection throughout its selected scope")));
                 }
                 let scope_admission = view
                     .budget

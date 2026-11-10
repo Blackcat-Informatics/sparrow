@@ -8,7 +8,11 @@ use purrdf_lex::json::{Object, Value};
 
 pub(super) fn receipt(value: wire::catalog_read_receipt::Reader<'_>) -> Result<Object> {
     let next = optional_value(value.get_next_cursor()?)?;
-    Ok(Object::new()
+    let object = match build(value)? {
+        Some(build) => Object::new().with("build", build),
+        None => Object::new(),
+    };
+    Ok(object
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("snapshot_id", value.get_snapshot_id()?.to_str()?)
         .with("as_of", instant(value.get_as_of()?)?)
@@ -33,6 +37,28 @@ pub(super) fn receipt(value: wire::catalog_read_receipt::Reader<'_>) -> Result<O
                 .with("page_bytes", sparrow_core::PIN_READ_PAGE_BYTES as u64),
         )
         .with("stop_reason", Value::Null))
+}
+
+/// A listing build's progress, absent on a page that carries its capture's rows (#158). A
+/// page with a build has no rows; `next_cursor` resumes the same build.
+fn build(value: wire::catalog_read_receipt::Reader<'_>) -> Result<Option<Value>> {
+    if !value.has_build() {
+        return Ok(None);
+    }
+    let build = value.get_build()?;
+    Ok(Some(
+        Object::new()
+            .with("read", build.get_read().to_string())
+            .with(
+                "total",
+                if build.get_total_pending() {
+                    "counting".to_owned()
+                } else {
+                    build.get_total().to_string()
+                },
+            )
+            .into(),
+    ))
 }
 
 /// Pagination metadata is separate from the query's semantic certainty and coverage.

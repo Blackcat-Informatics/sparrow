@@ -85,7 +85,7 @@ impl Store {
     pub fn expire_bounded(&self, now: u64, limits: EvictionLimits) -> Result<ExpiryReport, Error> {
         limits.validate()?;
         self.import_reclaim(now)?;
-        self.read_lease_stats(now)?;
+        self.purge_read_leases(now)?;
         self.lock()?.expire_bounded(now, limits)
     }
 
