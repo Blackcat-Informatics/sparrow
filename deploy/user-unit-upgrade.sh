@@ -32,7 +32,7 @@ remove them before any rollback to such an image); the store has copy-on-write o
 but an identical limits.conf (deploy/systemd/user/sparrow.service.d); no nightly backup is
 running; the running daemon reports the --from schema; and, without --no-backup, the running
 daemon reports an online backup configured (its status has a backup state other than
-unconfigured). Then, with the daemon serving, it takes the named pre-upgrade backup online
+unconfigured), and the intake, ship and ship-watches directories exist. Then, with the daemon serving, it takes the named pre-upgrade backup online
 (SPARROW_PREFIX/libexec/sparrow/sparrow-backup: the daemon copies its store into backup_root and
 the script records the set beside it) and points BACKUPS/pre-upgrade-FROM at that set. Only then
 does it stop both timers and wait for the shipper, stop the unit, install limits.conf
@@ -67,7 +67,7 @@ Environment (defaults are the user-unit layout):
                    (data_dir) and sockets are read from it       ~/.config/sparrow/server.toml
   SPARROW_BACKUPS  the online backup root (server.toml backup_root), on the NAS
                                                                  /net/synology/archives/sparrow
-  SPARROW_STATE    the user unit's state tree: ship and ship-watches    ~/.local/state/sparrow
+  SPARROW_STATE    the state tree holding ship and ship-watches  ~/.local/state/sparrow
   SPARROW_INTAKE   the intake tree the backup set keeps          ~/.local/state/sparrow/intake
   SPARROW_BIN      the kept images the --to pair must match      <repository>/bin
 

@@ -5,14 +5,16 @@
 # Recorded check for deploy/user-unit-upgrade.sh (issue #175): the script must never start
 # sparrow-backup.timer at the end of a switch, because that timer restarts only after a first online
 # backup verifies (deploy/verify-backup.sh exits 0); and on its early-abort path it must start again
-# only the timers that were active before it stopped them.
+# only the timers that were active before it stopped them. It also covers the pre-upgrade backup
+# (issue #195): without --no-backup the script exports SPARROW_PREFIX and passes sparrow-backup the
+# arguments sparrow-backup.service passes.
 #
 # It runs the real script end to end in a scratch world: a fake HOME with kept images, links,
 # configuration and a status-answering CLI, and stub systemctl, getcap, lsattr, ps and sleep first
 # on PATH. The stub systemctl keeps timer state in files and logs every call, so the assertions read
 # what the script asked of the user manager. Nothing here reaches a real unit, timer, store or
-# daemon. It stays out of `make check` (it needs python3 and runs the whole script three times); run
-# it after any change to the script's timer handling.
+# daemon. It stays out of `make check` (it needs python3 and runs the whole script four times); run
+# it after any change to the script's timer or backup handling.
 #
 # Usage: tools/user-unit-upgrade-timers-check.sh SCRATCH_DIR   (absolute; created if absent, never emptied)
 # Prints "PASS" and exits 0, or names the failed assertion and exits 1.
@@ -139,7 +141,6 @@ run "$w" STUB_SHIP_BUSY=1
     || fail "abort path started a timer that was not active before"
 ! grep -q 'sparrow-backup.timer' <<<"$(starts "$w")" || fail "abort path started sparrow-backup.timer: $(starts "$w")"
 echo "ok   abort, backup timer stopped before: starts $(starts "$w" | tr '\n' ';')"
-echo PASS
 
 # 4. Without --no-backup the script takes its pre-upgrade backup (issue #195): it exports
 #    SPARROW_PREFIX and passes sparrow-backup the arguments sparrow-backup.service passes, all
@@ -162,3 +163,5 @@ expected=$(printf '%s\n' "prefix=$w/home/.local" "arg=$w/home/.config/sparrow/se
 [[ $(cat "$w/client") == "$expected" ]] || fail "sparrow-backup received: $(cat "$w/client")"
 [[ -L $w/backups/pre-upgrade-sparrowd-schema68-aaa ]] || fail "backup path did not link the pre-upgrade set"
 echo "ok   backup: sparrow-backup got the user service's arguments and SPARROW_PREFIX"
+
+echo PASS
