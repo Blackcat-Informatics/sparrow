@@ -8,13 +8,21 @@
 //! artifact's entry and its records, and stops at its page, so its charge follows the
 //! page rather than the store. Explicit selections remain one bounded immutable capture.
 
-use super::{Catalog, Error, Record, Store, Writer, catalog_lease, random_id, source_summary};
+use super::{
+    Catalog, Error, Record, Store, Writer, catalog_lease, listing_build, random_id, source_summary,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
 use super::catalog_lease::{CAPTURE_BYTES, CaptureAdmission, ENTRY_BYTES, MAX_ITEMS, SCAN_BYTES};
+
+/// Charged bytes of one owed index row beyond its key: its share of the ordered set.
+const OWED_ROW_BYTES: usize = 64;
+/// Owed index rows one window holds. Keys are at most a few hundred bytes, so a full window
+/// is charged well inside the page admission.
+const OWED_WINDOW: usize = 32_768;
 pub(super) use super::catalog_lease::{HANDLE_BYTES, MAX_HANDLES};
 
 /// Artifact metadata filter, bound into every continuation.
@@ -163,6 +171,21 @@ pub struct ArtifactPageBody {
     offset: usize,
     /// Index position after this page's rows, while the live listing continues.
     resume: Option<Position>,
+    /// The index rows the source-summary migration owed when the live listing began.
+    owed: Owed,
+}
+
+/// A window of the per-source index rows the unfinished source-summary migration owes within
+/// a live listing's selection: the first [`OWED_WINDOW`] after the listing's position, read
+/// from a snapshot without the writer lock, and their charged bytes. The pages of a listing
+/// share one window and charge it to their admission; it is not handle bytes, which bound
+/// one page's rows. `through` is the window's last row when more owed rows follow it: a page
+/// stops before any row after it, and the next page reads the next window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Owed {
+    rows: std::sync::Arc<BTreeSet<String>>,
+    bytes: usize,
+    through: Option<String>,
 }
 
 impl ArtifactPageBody {
@@ -178,7 +201,7 @@ impl ArtifactPageBody {
 /// records than one page admits spans pages. The partial row is boxed so a page result
 /// carries one pointer for it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Position {
+pub(super) struct Position {
     after: Option<String>,
     partial: Option<Box<Partial>>,
 }
@@ -190,8 +213,21 @@ struct Partial {
     key: String,
     received_at: u64,
     id: String,
+    /// Listed from the owed rows rather than the stored index: an artifact retired since
+    /// the listing began is then absent from the finished index too, and is skipped.
+    owed: bool,
     consumed: Consumed,
     summary: Option<ArtifactSummary>,
+}
+
+/// The next row a live page lists.
+enum Listed {
+    /// An index row: its key, receipt time, artifact identity and whether it is owed.
+    Row(String, u64, String, bool),
+    /// The next row lies after the owed window's end.
+    Window,
+    /// No row follows.
+    End,
 }
 
 /// Records consumed by a partial fold.
@@ -201,8 +237,8 @@ enum Consumed {
     Start,
     /// This many identities of the artifact entry's record manifest.
     Listed(u64),
-    /// A deleted parent's records, read from the source's record receipt index at the
-    /// parent's receipt; the last record row consumed.
+    /// A deleted parent's records, read from the source's receipt timeline at the parent's
+    /// receipt; the ID of the last record consumed.
     Indexed(Option<String>),
 }
 
@@ -244,6 +280,7 @@ impl catalog_lease::PageBody for ArtifactPageBody {
             receipt_walk: self.receipt_walk,
             offset: self.offset,
             resume: self.resume.clone(),
+            owed: self.owed.clone(),
         })
     }
     fn offset(&self) -> usize {
@@ -287,19 +324,22 @@ impl Store {
             ));
         }
         cancellation.checkpoint()?;
-        let mut reads = self
-            .artifact_reads
-            .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
-        reads.purge(now);
-        cancellation.checkpoint()?;
+        let binding = (&query.selector, query.page_size, query.scan_budget);
         if let Some(cursor) = &query.cursor {
             let parsed = catalog_lease::Cursor::parse(cursor)?;
-            let binding = (&query.selector, query.page_size, query.scan_budget);
-            if let Some(page) =
-                self.artifact_next(&mut reads, &parsed, Some(binding), now, cancellation)?
-            {
-                return Ok(page);
+            if listing_build::is_build(&parsed, BUILD) {
+                return self.artifact_build_poll(&parsed, Some(binding), now, cancellation);
+            }
+            let mut reads = self.artifact_reads()?;
+            reads.purge(now);
+            cancellation.checkpoint()?;
+            match self.artifact_next(&mut reads, &parsed, Some(binding), now, cancellation)? {
+                Some(Next::Page(page)) => return Ok(page),
+                Some(Next::Window(pending)) => {
+                    drop(reads);
+                    return self.artifact_window(pending, now, cancellation);
+                }
+                None => {}
             }
             return reads.resume(
                 &query.selector,
@@ -310,15 +350,18 @@ impl Store {
             );
         }
         if query.selector.selection == crate::QuerySelection::Live {
-            let page = Continued {
-                selector: &query.selector,
+            let pending = Pending {
+                selector: query.selector.clone(),
                 page_size: query.page_size,
                 scan_budget: query.scan_budget,
                 start: Position::default(),
                 offset: 0,
             };
-            return self.artifact_page(&mut reads, page, now, cancellation);
+            return self.artifact_window(pending, now, cancellation);
         }
+        let mut reads = self.artifact_reads()?;
+        reads.purge(now);
+        cancellation.checkpoint()?;
         let started = Instant::now();
         let expires_at = now
             .checked_add(catalog_lease::LEASE_MS)
@@ -362,6 +405,31 @@ impl Store {
     }
 }
 
+/// A live listing page that must first read a window of the rows the source-summary
+/// migration owes: where it starts and the rows earlier pages delivered. It is the context a
+/// listing build keeps for the page it serves once it finishes.
+#[derive(Clone)]
+pub(super) struct Pending {
+    selector: ArtifactSelector,
+    page_size: usize,
+    scan_budget: usize,
+    start: Position,
+    offset: usize,
+}
+
+/// What a continuation cursor leads to.
+pub(super) enum Next {
+    /// The next page, read.
+    Page(ArtifactReadPage),
+    /// A page that first needs the next window of owed rows.
+    Window(Pending),
+}
+
+/// Artifact listing builds, each computing one window of owed index rows.
+pub(super) type Builds = listing_build::Builds<Pending, Owed>;
+/// Identity kind of an artifact listing build.
+pub(super) const BUILD: &str = "artifact-build";
+
 /// One live listing page request, fresh or continuing a previous page's handle.
 struct Continued<'a> {
     selector: &'a ArtifactSelector,
@@ -369,13 +437,79 @@ struct Continued<'a> {
     scan_budget: usize,
     start: Position,
     offset: usize,
+    owed: Owed,
 }
 
 impl Store {
+    /// The next window of index rows the unfinished source-summary migration owes within
+    /// `selector`'s sources and receipt bounds after `after`, in key order; empty once it is
+    /// complete. A live listing reads a window from a snapshot without the writer lock, when
+    /// it starts and whenever its pages pass the window's end, and merges it with the stored
+    /// rows, so it lists exactly the artifacts the finished index will. Rows outside the
+    /// window cannot be missed: a row the migration copies is stored, and an artifact written
+    /// meanwhile is indexed by its own write. The pass runs to the end of what the migration
+    /// owes, so its time follows the unmigrated remainder; CPU is not capped. It runs as a
+    /// listing build: `worker` counts each catalog entry it reads and stops it once the
+    /// build is cancelled or its lease ends.
+    fn owed_index_rows(
+        &self,
+        selector: &ArtifactSelector,
+        after: Option<&str>,
+        worker: &listing_build::Worker<Owed>,
+    ) -> Result<Owed, Error> {
+        let snapshot = self.unlocked.db.snapshot();
+        let reader = super::store_counters::Reader::snapshot(&snapshot);
+        let progress = source_summary::progress(|key| reader.get(key.as_bytes()))?;
+        worker.total(source_summary::owed_entries(&reader, &progress)?);
+        let prefixes = selected_prefixes(selector);
+        let (from, before) = (selector.received_from, selector.received_before);
+        let after = after.map(str::to_owned);
+        let keep = move |key: &str| {
+            let prefix = key.get(..source_summary::INDEX.len() + 65).unwrap_or(key);
+            after.as_deref().is_none_or(|after| key > after)
+                && prefixes
+                    .as_ref()
+                    .is_none_or(|list| list.iter().any(|wanted| wanted == prefix))
+                && source_summary::index_entry(prefix.as_bytes(), key.as_bytes())
+                    .is_ok_and(|(time, _)| time >= from && time < before)
+        };
+        let Some(owed) = source_summary::Completion::owed(
+            &reader,
+            &progress,
+            (self.owed_window(), Box::new(keep)),
+            &mut || worker.entry(),
+        )?
+        else {
+            return Ok(Owed::default());
+        };
+        let bytes = owed
+            .index
+            .iter()
+            .map(|key| OWED_ROW_BYTES + key.len())
+            .sum();
+        let through = owed.truncated.then(|| owed.index.last().cloned()).flatten();
+        Ok(Owed {
+            rows: std::sync::Arc::new(owed.index),
+            bytes,
+            through,
+        })
+    }
+
+    /// Owed index rows one listing window holds.
+    fn owed_window(&self) -> usize {
+        #[cfg(feature = "test-support")]
+        if let rows @ 1.. = self.owed_window.load(std::sync::atomic::Ordering::SeqCst) {
+            return rows;
+        }
+        OWED_WINDOW
+    }
+
     /// Read the next live page when `cursor` continues past its handle's rows.
     /// Other cursors are replayed by the shared lease owner, so this returns `None`.
     /// The continued handle stays live: its owner retires it once the new page
-    /// has been delivered, so an abandoned or failed continuation keeps the cursor.
+    /// has been delivered, so an abandoned or failed continuation keeps the cursor. A page
+    /// past its window's end returns [`Next::Window`], so the caller can release the
+    /// registry before it reads the next window.
     pub(super) fn artifact_next(
         &self,
         reads: &mut Reads,
@@ -383,7 +517,7 @@ impl Store {
         binding: Option<(&ArtifactSelector, usize, usize)>,
         now: u64,
         cancellation: &crate::QueryCancellation,
-    ) -> Result<Option<ArtifactReadPage>, Error> {
+    ) -> Result<Option<Next>, Error> {
         let Some(snapshot) = reads.continuation(cursor, now)? else {
             return Ok(None);
         };
@@ -394,14 +528,196 @@ impl Store {
         let start = snapshot.body.resume.clone().ok_or_else(|| {
             Error::new("STORAGE_FAILURE", "artifact continuation lost its position")
         })?;
+        let (page_size, scan_budget) = (snapshot.page_size, snapshot.scan_budget);
+        let offset = snapshot.body.offset + snapshot.body.artifacts.len();
+        let owed = snapshot.body.owed.clone();
+        // The previous page passed its window's end: the next window is read before the
+        // page takes the writer.
+        if let Some(through) = &owed.through
+            && start.partial.is_none()
+            && start.after.as_deref() >= Some(through.as_str())
+        {
+            return Ok(Some(Next::Window(Pending {
+                selector,
+                page_size,
+                scan_budget,
+                start,
+                offset,
+            })));
+        }
         let page = Continued {
             selector: &selector,
-            page_size: snapshot.page_size,
-            scan_budget: snapshot.scan_budget,
+            page_size,
+            scan_budget,
             start,
-            offset: snapshot.body.offset + snapshot.body.artifacts.len(),
+            offset,
+            owed,
         };
-        self.artifact_page(reads, page, now, cancellation).map(Some)
+        self.artifact_page(reads, page, now, cancellation)
+            .map(|page| Some(Next::Page(page)))
+    }
+
+    pub(super) fn artifact_reads(&self) -> Result<std::sync::MutexGuard<'_, Reads>, Error> {
+        self.artifact_reads
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))
+    }
+
+    pub(super) fn artifact_builds(&self) -> Result<std::sync::MutexGuard<'_, Builds>, Error> {
+        self.unlocked
+            .artifact_builds
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "artifact listing builds poisoned"))
+    }
+
+    /// Serve a live page that needs the window of owed rows after its position. Once the
+    /// source-summary migration is complete nothing is owed and the page is read at once;
+    /// otherwise the window is read by a listing build (#158).
+    pub(super) fn artifact_window(
+        &self,
+        pending: Pending,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<ArtifactReadPage, Error> {
+        let complete = source_summary::progress(|key| {
+            self.unlocked.db.get(key.as_bytes()).map_err(Error::from)
+        })? == source_summary::Progress::Complete;
+        if complete {
+            return self.artifact_pending_page(pending, Owed::default(), now, cancellation);
+        }
+        let (id, waiter, wait) = {
+            let store = self.clone();
+            let (selector, after) = (pending.selector.clone(), pending.start.after.clone());
+            let mut builds = self.artifact_builds()?;
+            let (id, waiter) = builds.start(BUILD, pending, now, move |worker| {
+                store.owed_index_rows(&selector, after.as_deref(), worker)
+            })?;
+            (id, waiter, builds.wait())
+        };
+        let page = self.artifact_build_page(&id, &waiter, wait, now, cancellation);
+        if page.is_err() {
+            // The caller never learns this build's cursor: nothing can reach it.
+            self.artifact_builds()?.remove(&id);
+        }
+        page
+    }
+
+    /// Follow a build cursor, binding it to the caller's selector and limits when given.
+    pub(super) fn artifact_build_poll(
+        &self,
+        cursor: &catalog_lease::Cursor<'_>,
+        binding: Option<(&ArtifactSelector, usize, usize)>,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<ArtifactReadPage, Error> {
+        if cursor.start() != 0 {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "cursor is not a listing build position",
+            ));
+        }
+        let (waiter, wait) = {
+            let mut builds = self.artifact_builds()?;
+            let (pending, waiter) = builds.poll(cursor.id(), now)?;
+            if let Some((selector, page_size, scan_budget)) = binding
+                && (&pending.selector != selector
+                    || pending.page_size != page_size
+                    || pending.scan_budget != scan_budget)
+            {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "cursor requires its original operation, selector and limits",
+                ));
+            }
+            (waiter, builds.wait())
+        };
+        self.artifact_build_page(cursor.id(), &waiter, wait, now, cancellation)
+    }
+
+    /// Wait for an owed-window build, at most `wait`: the page it serves once finished,
+    /// otherwise a page with no rows, its cursor and its progress.
+    fn artifact_build_page(
+        &self,
+        id: &str,
+        waiter: &listing_build::Waiter<Owed>,
+        wait: std::time::Duration,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<ArtifactReadPage, Error> {
+        let finished = waiter.wait(wait, cancellation)?;
+        let mut builds = self.artifact_builds()?;
+        let Some(result) = finished else {
+            let (Some(pending), Some(lease_expires_at)) =
+                (builds.context(id), builds.expires_at(id))
+            else {
+                return Err(Error::new("RESULT_EXPIRED", "listing build lease ended"));
+            };
+            return Ok(catalog_lease::CatalogReadPage {
+                store_id: self.id.to_string(),
+                snapshot_id: id.to_owned(),
+                as_of: now,
+                lease_expires_at,
+                total_items: pending.offset,
+                page_start: pending.offset,
+                next_cursor: Some(format!("{id}/0")),
+                page_size: pending.page_size,
+                scan_budget: pending.scan_budget,
+                scanned: 0,
+                build: Some(waiter.progress()),
+                body: ArtifactPageBody {
+                    artifacts: Vec::new(),
+                    diagnostic_coverage: crate::DiagnosticCoverage::default(),
+                    receipt_walk: true,
+                    offset: pending.offset,
+                    resume: None,
+                    owed: Owed::default(),
+                },
+            });
+        };
+        let owed = match result {
+            Ok(owed) => owed,
+            Err(error) => {
+                builds.remove(id);
+                return Err(error);
+            }
+        };
+        let pending = builds.context(id).cloned().ok_or_else(|| {
+            Error::new(
+                "RESULT_EXPIRED",
+                "listing build lease ended before its page",
+            )
+        })?;
+        drop(builds);
+        // The build is retired only once its page exists, so a failed or cancelled call
+        // leaves the finished window for the next call on the same cursor.
+        let page = self.artifact_pending_page(pending, owed, now, cancellation)?;
+        #[cfg(feature = "test-support")]
+        if self.artifact_builds()?.take_delivery_failure_for_tests() {
+            return Err(Error::new("CANCELLED", "test: the page was not delivered"));
+        }
+        self.artifact_builds()?.remove(id);
+        Ok(page)
+    }
+
+    fn artifact_pending_page(
+        &self,
+        pending: Pending,
+        owed: Owed,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<ArtifactReadPage, Error> {
+        let mut reads = self.artifact_reads()?;
+        reads.purge(now);
+        cancellation.checkpoint()?;
+        let page = Continued {
+            selector: &pending.selector,
+            page_size: pending.page_size,
+            scan_budget: pending.scan_budget,
+            start: pending.start,
+            offset: pending.offset,
+            owed,
+        };
+        self.artifact_page(&mut reads, page, now, cancellation)
     }
 
     /// Read and publish one live page under its own lease.
@@ -418,10 +734,17 @@ impl Store {
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "artifact read deadline overflow"))?;
         crate::format_instant(now)?;
         crate::format_instant(expires_at)?;
+        // The owed window stays resident while the page reads, so it is charged to it. A
+        // window is bounded well inside the admission.
+        let mut remaining = SCAN_BYTES.checked_sub(page.owed.bytes).ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "artifact listing owed window exceeds its admission",
+            )
+        })?;
         let writer = self.lock()?;
         cancellation.checkpoint()?;
         let mut scanned = 0;
-        let mut remaining = SCAN_BYTES;
         let mut admission = CaptureAdmission {
             cancellation,
             started,
@@ -434,9 +757,11 @@ impl Store {
             page.start,
             page.page_size,
             now,
+            &page.owed,
             &mut admission,
         )?;
         body.offset = page.offset;
+        body.owed = page.owed;
         let snapshot = catalog_lease::Snapshot {
             bytes: 0,
             id: random_id("artifact-read")?,
@@ -700,29 +1025,29 @@ impl Writer {
             receipt_walk: false,
             offset: 0,
             resume: None,
+            owed: Owed::default(),
         })
     }
 
     /// Read one live page from the per-source artifact index from `start`. Stop at the page
     /// size, or when the page's admission runs out after it consumed a catalog entry, and
     /// return the position to continue from. A page that cannot consume one catalog entry
-    /// refuses by naming the row. Refuses while the per-source index is being seeded.
+    /// refuses by naming the row. While the per-source index is being seeded, the listing's
+    /// `owed` window is merged with the stored rows, and the page stops before any row after
+    /// the window's end.
     fn artifact_index_page(
         &self,
         selector: &ArtifactSelector,
         start: Position,
         page_size: usize,
         now: u64,
+        owed: &Owed,
         admission: &mut CaptureAdmission<'_>,
     ) -> Result<ArtifactPageBody, Error> {
-        source_summary::ready(
-            &source_summary::progress(|key| Ok(self.db.get(key)?))?,
-            "the artifact listing",
-        )?;
         let limit = page_size.min(<ArtifactPageBody as catalog_lease::PageBody>::PAGE_ITEMS);
+        let prefixes = selected_prefixes(selector);
         let protected = self.artifact_protected(now, admission)?;
         let scope = selector.scope();
-        let prefixes = selected_prefixes(selector);
         let mut position = start;
         let mut artifacts = Vec::new();
         let mut diagnostic_coverage = crate::DiagnosticCoverage::default();
@@ -730,26 +1055,36 @@ impl Writer {
         let resume = loop {
             if artifacts.len() == limit {
                 let more = position.partial.is_some()
-                    || self
-                        .next_index_row(prefixes.as_deref(), position.after.as_deref(), selector)?
-                        .is_some();
+                    || !matches!(
+                        self.next_listed_row(
+                            prefixes.as_deref(),
+                            position.after.as_deref(),
+                            selector,
+                            owed,
+                        )?,
+                        Listed::End
+                    );
                 break more.then_some(position);
             }
             let mut row = match position.partial.take() {
                 Some(row) => *row,
                 None => {
-                    let Some((key, received_at, id)) = self.next_index_row(
+                    let (key, received_at, id, owed) = match self.next_listed_row(
                         prefixes.as_deref(),
                         position.after.as_deref(),
                         selector,
-                    )?
-                    else {
-                        break None;
+                        owed,
+                    )? {
+                        Listed::Row(key, received_at, id, owed) => (key, received_at, id, owed),
+                        // The next page reads the next window.
+                        Listed::Window => break Some(position),
+                        Listed::End => break None,
                     };
                     Partial {
                         key,
                         received_at,
                         id,
+                        owed,
                         consumed: Consumed::Start,
                         summary: None,
                     }
@@ -758,6 +1093,11 @@ impl Writer {
             match self.fold_index_row(&mut row, &scope, now, &protected, admission) {
                 Ok(()) => {
                     progressed = true;
+                    if row.owed && row.summary.is_none() {
+                        // Retired since the listing began: the finished index omits it.
+                        position.after = Some(row.key);
+                        continue;
+                    }
                     let summary = row.summary.ok_or_else(|| {
                         Error::new(
                             "STORAGE_FAILURE",
@@ -795,7 +1135,61 @@ impl Writer {
             receipt_walk: true,
             offset: 0,
             resume,
+            owed: Owed::default(),
         })
+    }
+
+    /// The next listed row after `after`: the lesser of the next stored index row and the
+    /// next owed one in the window, and whether it is owed. A row the migration copied since
+    /// the window was read is stored, so it is listed once. A row after the window's end
+    /// waits for the next window, since an owed row may precede it.
+    fn next_listed_row(
+        &self,
+        prefixes: Option<&[String]>,
+        after: Option<&str>,
+        selector: &ArtifactSelector,
+        window: &Owed,
+    ) -> Result<Listed, Error> {
+        let next = self.next_window_row(prefixes, after, selector, &window.rows)?;
+        Ok(match (next, &window.through) {
+            (Some(row), Some(through)) if row.0 > *through => Listed::Window,
+            (None, Some(_)) => Listed::Window,
+            (Some((key, time, id, owed)), _) => Listed::Row(key, time, id, owed),
+            (None, None) => Listed::End,
+        })
+    }
+
+    /// The lesser of the next stored index row after `after` and the next row of `owed`.
+    fn next_window_row(
+        &self,
+        prefixes: Option<&[String]>,
+        after: Option<&str>,
+        selector: &ArtifactSelector,
+        owed: &BTreeSet<String>,
+    ) -> Result<Option<(String, u64, String, bool)>, Error> {
+        let stored = self
+            .next_index_row(prefixes, after, selector)?
+            .map(|(key, time, id)| (key, time, id, false));
+        let pending = match after {
+            Some(after) => owed
+                .range::<str, _>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next(),
+            None => owed.first(),
+        };
+        let Some(pending) = pending.filter(|key| {
+            stored
+                .as_ref()
+                .is_none_or(|(stored, _, _, _)| key.as_str() < stored.as_str())
+        }) else {
+            return Ok(stored);
+        };
+        let prefix = pending
+            .get(..source_summary::INDEX.len() + 65)
+            .ok_or_else(|| {
+                Error::new("STORAGE_FAILURE", "invalid per-source artifact index key")
+            })?;
+        let (time, id) = source_summary::index_entry(prefix.as_bytes(), pending.as_bytes())?;
+        Ok(Some((pending.clone(), time, id.to_owned(), true)))
     }
 
     /// The next per-source index row after `after` within the selected sources and the
@@ -943,10 +1337,7 @@ impl Writer {
                     row.summary = Some(summary);
                     row.consumed = Consumed::Listed(0);
                 }
-                None => {
-                    super::source_context::ready(self)?;
-                    row.consumed = Consumed::Indexed(None);
-                }
+                None => row.consumed = Consumed::Indexed(None),
             }
         }
         loop {
@@ -978,49 +1369,32 @@ impl Writer {
                     }
                 }
                 Consumed::Indexed(after) => {
-                    let prefix = format!(
-                        "{}{:020}:",
-                        super::source_context::hashed_prefix(&hash),
-                        row.received_at
-                    );
-                    let mut iterator = self.db.raw_iterator();
-                    match &after {
-                        Some(after) => {
-                            iterator.seek(after);
-                            if iterator.valid() && iterator.key() == Some(after.as_bytes()) {
-                                iterator.next();
-                            }
-                        }
-                        None => iterator.seek(&prefix),
-                    }
-                    if !iterator.valid() {
-                        iterator.status()?;
+                    let mut next = None;
+                    // One receipt instant: the walk is bounded by the records accepted
+                    // then, so it runs under the writer like the rest of the page.
+                    let reader = super::store_counters::Reader::db(&self.db);
+                    let timeline = super::source_context::Timeline {
+                        reader: &reader,
+                        cached: super::source_context::cached(&self.db)?,
+                        cancellation: admission.cancellation,
+                    };
+                    timeline.walk(
+                        &hash,
+                        (row.received_at, after.as_deref()),
+                        row.received_at..=row.received_at,
+                        rocksdb::Direction::Forward,
+                        |_, id| {
+                            next = Some(id.to_owned());
+                            Ok(false)
+                        },
+                    )?;
+                    let Some(id) = next else {
                         return Ok(());
-                    }
-                    let key = iterator.key().ok_or_else(|| {
-                        Error::new("STORAGE_FAILURE", "context index key missing")
-                    })?;
-                    if !key.starts_with(prefix.as_bytes()) {
-                        return Ok(());
-                    }
-                    let key = String::from_utf8(key.to_vec())
-                        .map_err(|_| Error::new("STORAGE_FAILURE", "invalid context index key"))?;
-                    let id = iterator
-                        .value()
-                        .and_then(|id| std::str::from_utf8(id).ok())
-                        .filter(|id| key.ends_with(id))
-                        .ok_or_else(|| {
-                            Error::new(
-                                "STORAGE_FAILURE",
-                                "source context index value disagrees with its key",
-                            )
-                        })?
-                        .to_owned();
-                    drop(iterator);
+                    };
                     self.fold_index_record(
                         row, &hash, &id, false, scope, now, protected, admission,
                     )?;
-                    row.consumed = Consumed::Indexed(Some(key));
+                    row.consumed = Consumed::Indexed(Some(id));
                 }
             }
         }
@@ -1238,7 +1612,7 @@ fn artifact_eligible(
         }
         None if scope.received_from == 0 && scope.received_before == u64::MAX => Ok(true),
         None => Err(Error::new(
-            "INDEX_NOT_READY",
+            "EVIDENCE_INCOMPLETE",
             "original artifact receipt time is unknown after parent reclamation; omit the receipt filter or select retained records",
         )),
     }

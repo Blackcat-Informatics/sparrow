@@ -3,7 +3,9 @@
 
 //! Immutable discovery of intake keys, retained provenance and durable mappings.
 
-use super::{Catalog, Error, Store, catalog_lease, diagnostic, random_id, source_time};
+use super::{
+    Catalog, Error, Store, catalog_lease, diagnostic, listing_build, random_id, source_time,
+};
 use catalog_lease::{CAPTURE_BYTES, HANDLE_BYTES, LEASE_MS, MAX_HANDLES, MAX_ITEMS, SCAN_BYTES};
 use std::{collections::BTreeMap, time::Instant};
 
@@ -210,6 +212,12 @@ impl catalog_lease::PageBody for SourcePageBody {
 /// Complete source capture receipt and bounded page.
 pub type SourceReadPage = catalog_lease::CatalogReadPage<SourcePageBody>;
 pub(super) type Reads = catalog_lease::Reads<SourceSelector, SourcePageBody>;
+/// One finished source capture, ready to publish.
+pub(super) type Captured = catalog_lease::Snapshot<SourceSelector, SourcePageBody>;
+/// Source listing builds: each keeps the selector and limits its cursor binds.
+pub(super) type Builds = listing_build::Builds<(SourceSelector, usize, usize), Captured>;
+/// Identity kind of a source listing build.
+pub(super) const BUILD: &str = "source-build";
 
 /// Test hook run while a source listing reads its snapshot without the writer lock.
 #[cfg(feature = "test-support")]
@@ -315,13 +323,15 @@ impl Store {
             ));
         }
         cancellation.checkpoint()?;
-        let mut reads = self
-            .source_reads
-            .lock()
-            .map_err(|_| Error::new("STORAGE_FAILURE", "source read registry poisoned"))?;
-        reads.purge(now);
-        cancellation.checkpoint()?;
         if let Some(cursor) = &query.cursor {
+            let parsed = catalog_lease::Cursor::parse(cursor)?;
+            if listing_build::is_build(&parsed, BUILD) {
+                let binding = (&query.selector, query.page_size, query.scan_budget);
+                return self.source_build_poll(&parsed, Some(binding), now, cancellation);
+            }
+            let mut reads = self.source_reads()?;
+            reads.purge(now);
+            cancellation.checkpoint()?;
             return reads.resume(
                 &query.selector,
                 cursor,
@@ -330,12 +340,176 @@ impl Store {
                 now,
             );
         }
-        let started = Instant::now();
+        crate::format_instant(now)?;
+        crate::format_instant(
+            now.checked_add(LEASE_MS)
+                .ok_or_else(|| Error::new("INVALID_ARGUMENT", "source read deadline overflow"))?,
+        )?;
+        let pending = super::source_summary::progress(|key| {
+            self.unlocked.db.get(key.as_bytes()).map_err(Error::from)
+        })? != super::source_summary::Progress::Complete;
+        if !pending {
+            let snapshot =
+                self.source_capture(query, now, (configured, intakes), cancellation, None)?;
+            return self.publish_sources(snapshot, now, cancellation);
+        }
+        // The source-summary migration is unfinished: the capture reads what it owes, which
+        // costs the unmigrated part of the store, so it runs as a build (#158).
+        let (id, waiter, wait) = {
+            let store = self.clone();
+            let (query, configured, intakes) =
+                (query.clone(), configured.to_vec(), intakes.to_vec());
+            let mut builds = self.source_builds()?;
+            let context = (query.selector.clone(), query.page_size, query.scan_budget);
+            let (id, waiter) = builds.start(BUILD, context, now, move |worker| {
+                store.source_capture(
+                    &query,
+                    now,
+                    (&configured, &intakes),
+                    &worker.cancellation(),
+                    Some(worker),
+                )
+            })?;
+            (id, waiter, builds.wait())
+        };
+        let page = self.source_build_page(&id, &waiter, wait, now, cancellation);
+        if page.is_err() {
+            // The caller never learns this build's cursor: nothing can reach it.
+            self.source_builds()?.remove(&id);
+        }
+        page
+    }
+
+    /// Follow a build cursor, binding it to the caller's selector and limits when given.
+    pub(super) fn source_build_poll(
+        &self,
+        cursor: &catalog_lease::Cursor<'_>,
+        binding: Option<(&SourceSelector, usize, usize)>,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<SourceReadPage, Error> {
+        if cursor.start() != 0 {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "cursor is not a listing build position",
+            ));
+        }
+        let (waiter, wait) = {
+            let mut builds = self.source_builds()?;
+            let ((selector, page_size, scan_budget), waiter) = builds.poll(cursor.id(), now)?;
+            if binding.is_some_and(|binding| binding != (selector, *page_size, *scan_budget)) {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "cursor requires its original operation, selector and limits",
+                ));
+            }
+            (waiter, builds.wait())
+        };
+        self.source_build_page(cursor.id(), &waiter, wait, now, cancellation)
+    }
+
+    fn source_reads(&self) -> Result<std::sync::MutexGuard<'_, Reads>, Error> {
+        self.source_reads
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "source read registry poisoned"))
+    }
+
+    pub(super) fn source_builds(&self) -> Result<std::sync::MutexGuard<'_, Builds>, Error> {
+        self.unlocked
+            .source_builds
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "source listing builds poisoned"))
+    }
+
+    /// Wait for a source listing build, at most `wait`: its first page once it has finished,
+    /// otherwise a page with no rows, its cursor and its progress.
+    fn source_build_page(
+        &self,
+        id: &str,
+        waiter: &listing_build::Waiter<Captured>,
+        wait: std::time::Duration,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<SourceReadPage, Error> {
+        let Some(result) = waiter.wait(wait, cancellation)? else {
+            let builds = self.source_builds()?;
+            let (Some((_, page_size, scan_budget)), Some(lease_expires_at)) =
+                (builds.context(id), builds.expires_at(id))
+            else {
+                return Err(Error::new("RESULT_EXPIRED", "listing build lease ended"));
+            };
+            return Ok(catalog_lease::CatalogReadPage {
+                store_id: self.id.to_string(),
+                snapshot_id: id.to_owned(),
+                as_of: now,
+                lease_expires_at,
+                total_items: 0,
+                page_start: 0,
+                next_cursor: Some(format!("{id}/0")),
+                page_size: *page_size,
+                scan_budget: *scan_budget,
+                scanned: 0,
+                build: Some(waiter.progress()),
+                body: SourcePageBody {
+                    sources: Vec::new(),
+                },
+            });
+        };
+        let mut snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.source_builds()?.remove(id);
+                return Err(error);
+            }
+        };
+        // The capture's lease starts when its first page is delivered.
+        snapshot.expires_at = now
+            .checked_add(LEASE_MS)
+            .ok_or_else(|| Error::new("INVALID_ARGUMENT", "source read deadline overflow"))?;
+        snapshot.started = Instant::now();
+        // The build is retired only once its first page exists: a call that fails to publish
+        // it leaves the finished build for the next call on the same cursor.
+        let page = self.publish_sources(snapshot, now, cancellation)?;
+        #[cfg(feature = "test-support")]
+        if self.source_builds()?.take_delivery_failure_for_tests() {
+            return Err(Error::new("CANCELLED", "test: the page was not delivered"));
+        }
+        self.source_builds()?.remove(id);
+        Ok(page)
+    }
+
+    fn publish_sources(
+        &self,
+        snapshot: Captured,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<SourceReadPage, Error> {
+        let mut reads = self.source_reads()?;
+        reads.purge(now);
+        reads.publish(
+            snapshot,
+            now,
+            CAPTURE_BYTES,
+            HANDLE_BYTES,
+            MAX_HANDLES,
+            cancellation,
+        )
+    }
+
+    /// Capture every source row from one snapshot, including what the unfinished
+    /// source-summary migration owes. Run as a build, it reports to `worker` each catalog
+    /// entry the owed pass reads and how many it reads in all.
+    fn source_capture(
+        &self,
+        query: &SourceRead,
+        now: u64,
+        (configured, intakes): (&[SourceWatchBinding], &[SourceSyslogBinding]),
+        cancellation: &crate::QueryCancellation,
+        worker: Option<&listing_build::Worker<Captured>>,
+    ) -> Result<Captured, Error> {
         let expires_at = now
             .checked_add(LEASE_MS)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "source read deadline overflow"))?;
-        crate::format_instant(now)?;
-        crate::format_instant(expires_at)?;
         // The registries are single bounded rows; read them, and take the snapshot every
         // other row is read from, at one instant under the writer lock. The lock is then
         // released, so a listing never holds back ingestion while it reads.
@@ -361,15 +535,43 @@ impl Store {
         let db = writer.db.clone();
         let view = db.snapshot();
         drop(writer);
+        // While the source-summary migration is unfinished, the stored rows plus what its
+        // remaining pages owe, read from the same snapshot, are the finished counts.
+        let reader = super::store_counters::Reader::snapshot(&view);
+        let summary = super::source_summary::progress(|key| reader.get(key.as_bytes()))?;
+        if let Some(worker) = worker {
+            worker.total(super::source_summary::owed_entries(&reader, &summary)?);
+        }
         #[cfg(feature = "test-support")]
         self.source_read_paused()?;
-        let read = |key: &str| Ok::<_, Error>(view.get(key)?);
-        super::source_summary::ready(
-            &super::source_summary::progress(read)?,
-            "the source listing",
+        let owed = super::source_summary::Completion::owed(
+            &reader,
+            &summary,
+            (0, Box::new(|_| false)),
+            &mut || {
+                cancellation.checkpoint()?;
+                worker.map_or(Ok(()), listing_build::Worker::entry)
+            },
         )?;
+        // The capture's own admission time runs from here, after the owed pass.
+        let started = Instant::now();
+        let finished = |source: &str, stored: Option<super::source_summary::Counts>| match &owed {
+            Some(owed) => owed.counts(source, stored),
+            None => Ok(stored),
+        };
         let mut scanned = 0;
-        let mut remaining = SCAN_BYTES;
+        // The owed changes stay resident while the capture reads, so they are charged to it.
+        let owed_bytes = owed
+            .as_ref()
+            .map_or(0, super::source_summary::Completion::bytes);
+        let mut remaining = SCAN_BYTES.checked_sub(owed_bytes).ok_or_else(|| {
+            Error::new(
+                "RESOURCE_LIMIT",
+                format!(
+                    "the per-source counts the source-summary migration still owes take {owed_bytes} bytes, over the {SCAN_BYTES}-byte listing admission"
+                ),
+            )
+        })?;
         let mut admission = catalog_lease::CaptureAdmission {
             cancellation,
             started,
@@ -400,9 +602,17 @@ impl Store {
             // One point read.
             Some(source) => {
                 let key = super::source_summary::summary_key(source);
-                if let Some(bytes) = view.get(&key)? {
-                    admission.entry(bytes.len())?;
-                    let counts = super::source_summary::Counts::decode(key.as_bytes(), &bytes)?;
+                let stored = match view.get(&key)? {
+                    Some(bytes) => {
+                        admission.entry(bytes.len())?;
+                        Some(super::source_summary::Counts::decode(
+                            key.as_bytes(),
+                            &bytes,
+                        )?)
+                    }
+                    None => None,
+                };
+                if let Some(counts) = finished(source, stored)? {
                     count(&mut rows, &mut capacity, counts)?;
                 }
             }
@@ -423,10 +633,24 @@ impl Store {
                     })?;
                     admission.entry(bytes.len())?;
                     let counts = super::source_summary::Counts::decode(key, bytes)?;
-                    count(&mut rows, &mut capacity, counts)?;
+                    let source = counts.source.clone();
+                    if let Some(counts) = finished(&source, Some(counts))? {
+                        count(&mut rows, &mut capacity, counts)?;
+                    }
                     iterator.next();
                 }
                 iterator.status()?;
+                drop(iterator);
+                // Sources the migration has not reached yet have no stored row.
+                for source in owed.iter().flat_map(|owed| owed.sources()) {
+                    let key = super::source_summary::summary_key(source);
+                    if view.get(&key)?.is_none()
+                        && let Some(counts) = finished(source, None)?
+                    {
+                        admission.entry(0)?;
+                        count(&mut rows, &mut capacity, counts)?;
+                    }
+                }
             }
         }
         if configured.len() > 8 {
@@ -690,13 +914,6 @@ impl Store {
             },
         };
         drop(view);
-        reads.publish(
-            snapshot,
-            now,
-            CAPTURE_BYTES,
-            HANDLE_BYTES,
-            MAX_HANDLES,
-            cancellation,
-        )
+        Ok(snapshot)
     }
 }

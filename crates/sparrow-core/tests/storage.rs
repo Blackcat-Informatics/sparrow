@@ -201,7 +201,7 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         correlate_failed(sparrow_core::CorrelationClock::Event)
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     assert!(correlate_failed(sparrow_core::CorrelationClock::Received).is_ok());
     let pin = store
@@ -1498,9 +1498,11 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     );
 }
 
-/// INVARIANT: temporal reads never load a record outside their half-open interval, so
-/// corrupt metadata outside it does not fail them; the source timeline rebuild that meets
-/// that metadata latches a durable failure, stops paging and refuses context.
+/// INVARIANT (#158): temporal reads never load a record outside their half-open interval,
+/// so corrupt metadata outside it does not fail them; the source timeline rebuild that
+/// meets that metadata latches a durable failure and stops paging, and context keeps
+/// answering from the primary time index, stopping at the interval before the corrupt
+/// neighbors.
 #[test]
 fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
     use sparrow_core::{JsonQuery, QueryScope, QuerySelection, RecordQuery};
@@ -1548,15 +1550,13 @@ fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
     };
     let query = RecordQuery::default();
     let rows = store.records_query(&scope, &query, 40).unwrap();
-    let context_error = store
-        .records_context(&inside.record_ids[0], &scope, 0, 0, 40)
-        .unwrap_err();
-    assert_eq!(context_error.code, "STORAGE_FAILURE");
-    assert!(
-        context_error
-            .message
-            .contains("repair the authoritative catalog and reopen")
-    );
+    let context = store
+        .records_context(&inside.record_ids[0], &scope, 1, 1, 40)
+        .unwrap();
+    for side in [&context.before, &context.after] {
+        assert!(side.records.is_empty() && side.visited == 0, "{side:?}");
+        assert_eq!(side.frontier, sparrow_core::ContextFrontier::ScopeBoundary);
+    }
     assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
     assert_eq!(
         rows["rows"][0]["record_id"].as_str(),
@@ -3481,7 +3481,7 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
             .records_context(&legacy.record_ids[0], &scope, 0, 0, 3)
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     scope.require_complete_index = true;
     assert_eq!(
@@ -3489,25 +3489,25 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
             .json_query(&scope, &JsonQuery::Keys { path: None }, 3)
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     assert_eq!(
         store.text_query(&scope, "needle", 3).unwrap_err().code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     assert_eq!(
         store
             .records_query(&scope, &RecordQuery::default(), 3)
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     assert_eq!(
         store
             .records_context(&artifact.record_ids[0], &scope, 10, 10, 3)
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     scope.require_complete_index = false;
     assert_eq!(
@@ -3522,7 +3522,7 @@ fn diagnostic_partial_scope_keeps_proven_rows_unknown_counts_and_strict_failures
             )
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     // A certainly excluded record does not contaminate scope with its unknown host.
     scope.selection = QuerySelection::Evidence(vec![artifact.record_ids[3].clone()]);
@@ -3786,7 +3786,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() 
             .json_query(&scope, &JsonQuery::Keys { path: None }, 2)
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     scope.received_from = 3;
     scope.received_before = 4;
@@ -3811,7 +3811,7 @@ fn diagnostic_scopes_preserve_native_evidence_and_refuse_uncertain_membership() 
     );
     assert_eq!(
         store.text_query(&scope, "needle", 4).unwrap_err().code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     let pin = store
         .pin("diag-pin", "case", &artifact.record_ids[..1], 40, 4)
@@ -8031,7 +8031,7 @@ fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_by
     };
     assert_eq!(
         store.records_query(&scope, &strict, 3).unwrap_err().code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     for (index, expected) in input.chunks(1024 * 1024).enumerate() {
         assert_eq!(
@@ -11243,7 +11243,7 @@ fn stored_rdf_layers_select_native_graph_owners_and_keep_failure_and_retention_b
             .with_rdf_records(&broken.record_ids, 3, RdfReadLimits::default(), |_| ())
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     assert_eq!(
         store
@@ -11891,7 +11891,7 @@ fn stored_rdf_reads_refuse_exhaustion_and_failed_projection_without_prefixes() {
             .with_rdf_records(&malformed.record_ids, 1, Default::default(), |_| ())
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
 }
 
@@ -12626,10 +12626,11 @@ fn reopening_an_intact_context_cache_does_no_rebuild() {
     assert!(db.get(b"source-context-v1:planted").unwrap().is_some());
 }
 
-/// INVARIANT (#149): a cache without its generation marker, as a preceding binary's
+/// INVARIANT (#149, #158): a cache without its generation marker, as a preceding binary's
 /// interrupted clear leaves it, is reset at open and rebuilt online. Until the rebuild
-/// completes, context refuses retryably with `INDEX_NOT_READY` rather than answer from the
-/// partial cache; afterwards stale entries are gone and missing ones are restored.
+/// completes, context reads the primary time index and answers with exactly the neighbors
+/// the rebuilt cache gives, never refusing and never reading the partial cache; afterwards
+/// stale entries are gone and missing ones are restored.
 #[test]
 fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
     use sparrow_core::Migration;
@@ -12661,11 +12662,9 @@ fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
         .unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
-    let refused = store
+    let during = store
         .records_context(&anchor.record_ids[0], &context_scope(), 1, 1, 3)
-        .unwrap_err();
-    assert_eq!(refused.code, "INDEX_NOT_READY", "{refused:?}");
-    assert!(refused.message.contains("source-context"), "{refused:?}");
+        .unwrap();
     let pending = store.migrations().unwrap()[Migration::SourceContext.index()].clone();
     assert_eq!(
         (pending.done, pending.total, pending.watermark.as_deref()),
@@ -12681,6 +12680,22 @@ fn context_rebuild_discards_stale_derivatives_and_restores_missing_entries() {
     assert!(context.before.records.is_empty());
     assert_eq!(context.after.records[0].id, neighbor.record_ids[0]);
     assert_eq!(context.after.visited, 1);
+    for (rebuilt, served) in [
+        (&context.before, &during.before),
+        (&context.after, &during.after),
+    ] {
+        let ids = |side: &sparrow_core::ContextSide| {
+            side.records
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(served), ids(rebuilt));
+        assert_eq!(
+            (served.visited, served.retired, served.frontier),
+            (rebuilt.visited, rebuilt.retired, rebuilt.frontier)
+        );
+    }
     assert_eq!(
         store.bytes(&neighbor.record_ids[0], 0, 9, 3).unwrap(),
         b"neighbor\n"
@@ -13875,7 +13890,7 @@ fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
     query.require_complete_index = true;
     assert_eq!(
         store.records_query(&scope, &query, 3).unwrap_err().code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     query.require_complete_index = false;
     scope.scan_budget = 2;
@@ -14082,7 +14097,7 @@ fn event_intervals_place_unknowns_at_receipt_sort_source_time_and_keep_retention
     query.require_complete_index = true;
     assert_eq!(
         store.records_query(&scope, &query, 100).unwrap_err().code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     query.require_complete_index = false;
     query.event_interval = Some(EventInterval {
@@ -14593,7 +14608,7 @@ fn artifact_diagnostic_filters_preserve_unknown_counts_and_original_receipt_scop
     query.selector.require_complete_index = true;
     assert_eq!(
         store.artifact_read(&query, 20).unwrap_err().code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     query.selector.received_from = 12;
     assert!(
@@ -15729,7 +15744,7 @@ fn rdf_scope_reports_content_and_unknown_diagnostic_coverage_independently() {
             )
             .unwrap_err()
             .code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     let metadata = RdfGraphLayers {
         metadata: true,
@@ -17604,7 +17619,7 @@ text_relations: None,
             |_, _| panic!("strict unknown capture must not execute"),
         )
         .unwrap_err();
-    assert_eq!(error.code, "INDEX_NOT_READY");
+    assert_eq!(error.code, "EVIDENCE_INCOMPLETE");
     scope.source = Some("other".into());
     assert!(run(&scope, RdfGraphLayers::ALL, 30).0.complete());
 }
@@ -18489,7 +18504,7 @@ fn native_correlation_recipes_bind_selectors_preserve_occurrences_and_report_unk
     scope.require_complete_index = true;
     assert_eq!(
         run(&scope, &selector, Relation::TraceId).unwrap_err().code,
-        "INDEX_NOT_READY"
+        "EVIDENCE_INCOMPLETE"
     );
     scope.selection = sparrow_core::QuerySelection::Evidence(vec![
         a.record_ids[0].clone(),
@@ -19420,10 +19435,13 @@ fn scoped_sparql_cost_is_independent_of_store_size() {
     );
 }
 
-/// INVARIANT: the first schema 69 open fences older writers and serves at once, before
-/// either online migration runs: status reports both pending, scoped SPARQL answers equal
-/// the store-wide plan's, and coverage names the record graphs still awaiting their
-/// fallback facts. An ingest during the migration writes its index rows and facts at once.
+/// INVARIANT (#158): the first schema 69 open fences older writers and serves at once,
+/// before either online migration runs: status reports both pending, scoped SPARQL answers
+/// equal the store-wide plan's and the fully migrated store's, because the view serves the
+/// fallback facts still owed to unmigrated record graphs (coverage counts them), and a
+/// strict read answers the same rows instead of refusing, and no scoped read spends more of
+/// the request budget than the migrated store's. An ingest during the migration writes its
+/// index rows and facts at once.
 /// Direct `Store::migrate_step` pages (the maintenance worker's unit of work, driven here
 /// one at a time) then finish both jobs, a restart between them resumes, and the answers
 /// equal the fully migrated store's, now through the owner index.
@@ -19496,40 +19514,43 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
         assert_eq!(migration.watermark.as_deref(), Some("start"));
         assert_eq!(migration.failure, None);
     }
-    // A scoped read keeps the whole-store plan and equals the whole live store's answer.
+    // Unordered rows compare as multisets: rebuilt graphs take new dictionary identities.
+    let set = |rows: &[Vec<Option<purrdf::TermValue>>]| {
+        let mut rows = rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    // A scoped read reads its graphs from the mirror and the uncopied declarations, and
+    // equals the whole live store's answer filtered to the scope.
     let during = answers(&store);
     let mut whole = wide.clone();
     whole.source = None;
     for (query, (rows, _, coverage)) in queries.iter().zip(&during) {
         let (expected, _, _) = scoped_answer(&store, &whole, RdfGraphLayers::ALL, query, 6);
         assert_eq!(rows, &expected, "{query}");
-        // Every unmigrated record graph lacks its facts, and the answer says so.
+        // Every unmigrated record graph is served its owed facts, and coverage counts it.
         assert!(coverage.event_fallback_pending > 0, "{coverage:?}");
     }
-    assert!(during[2].0.len() < migrated[2].0.len());
-    assert!(during[5].0.is_empty() && during[5].2.event_fallback_pending == 1);
-    // A strict read refuses rather than answering without the pending facts.
+    // Every answer equals the fully migrated store's, within the request budget it spent:
+    // what the pending migrations owe (uncopied declarations, owed fallback facts and the
+    // term lookups behind them) is not charged, so a scope that fits after the migrations
+    // fits during them.
+    for ((rows, requests, _), (expected, migrated_requests, _)) in during.iter().zip(&migrated) {
+        assert_eq!(set(rows), set(expected));
+        assert!(
+            requests <= migrated_requests,
+            "{requests} > {migrated_requests}"
+        );
+    }
+    assert!(during[5].0.len() == 1 && during[5].2.event_fallback_pending == 1);
+    // A strict read answers the same rows: no fact it selects is missing.
     let mut strict = one.clone();
     strict.require_complete_index = true;
-    let refused = store
-        .sparql_query(
-            &sparrow_core::SparqlRead {
-                text_relations: None,
-                scope: &strict,
-                layers: RdfGraphLayers::ALL,
-                request: purrdf::SparqlRequest {
-                    query: fallback,
-                    base_iri: None,
-                    substitutions: &[],
-                },
-                governors: &purrdf::sparql::QueryGovernors::METERED.with_fuel(10_000_000),
-                limits: sparrow_core::RdfReadLimits::default(),
-            },
-            6,
-            &sparrow_core::QueryCancellation::default(),
-        )
-        .unwrap_err();
-    assert_eq!(refused.code, "INDEX_NOT_READY");
+    let (strict_rows, _, _) = scoped_answer(&store, &strict, RdfGraphLayers::ALL, fallback, 6);
+    assert_eq!(set(&strict_rows), set(&migrated[5].0));
     // An ingest during the migration writes its index rows and fallback facts at once.
     let late = store
         .ingest("graphs-late", "graphs", "log", b"late line\n", 5)
@@ -19547,7 +19568,6 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
             .collect::<Vec<_>>()
     };
     let late_during = late_answers(&store);
-    let pending_cost = scoped_rows(&store, &one, RdfGraphLayers::ALL, queries[0], 6).1;
 
     // The counters seed first; then one page builds the whole index, and a restart
     // resumes with the backfill.
@@ -19584,15 +19604,6 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
             "{rows:?} {expected:?}"
         );
     }
-    // Rebuilt graphs take new dictionary identities, so unordered rows compare as sets.
-    let set = |rows: &[Vec<Option<purrdf::TermValue>>]| {
-        let mut rows = rows
-            .iter()
-            .map(|row| format!("{row:?}"))
-            .collect::<Vec<_>>();
-        rows.sort_unstable();
-        rows
-    };
     for (rows, (expected, _, _)) in after[queries.len()..]
         .iter()
         .zip(&migrated[queries.len()..])
@@ -19602,9 +19613,6 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     for (rows, expected) in late_answers(&store).iter().zip(&late_during) {
         assert_eq!(set(rows), set(expected));
     }
-    // The completed index bounds the one-record scope by its own graphs.
-    let indexed_cost = scoped_rows(&store, &one, RdfGraphLayers::ALL, queries[0], 6).1;
-    assert!(indexed_cost < pending_cost, "{indexed_cost} {pending_cost}");
     // Publication reuses the prepared graph, which the backfill already rebuilt.
     let published = store.import_publish(&staged.id, 6).unwrap();
     let mut staged_scope = one.clone();
@@ -19679,6 +19687,457 @@ fn listed_counts(store: &Store, source: &str, now: u64) -> Option<(usize, usize,
             row.fragment_parents,
         )
     })
+}
+
+/// INVARIANT (#158): a live artifact listing paged while the source-summary migration
+/// copies its rows and expiry retires artifacts between its pages lists exactly what the
+/// finished index lists from its position on. Owed windows of five rows make the pages cross
+/// window ends; a row the migration copies after its window was read is listed once, and an
+/// owed artifact that expiry deletes after its window was read is skipped.
+#[test]
+fn a_live_listing_across_migration_pages_and_expiry_lists_the_finished_index() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    // Each source holds two artifacts past their deadline, which no listing shows but the
+    // migration still owes rows for until expiry runs; a day past the deadline, expiry
+    // deletes their entries and records at once. Four more outlive the test.
+    let (early, late) = (DAY, 20 * DAY);
+    let mut kept = Vec::new();
+    for source in ["paged-a", "paged-b"] {
+        for index in 0..6_u64 {
+            let at = if index < 2 {
+                early + index
+            } else {
+                late + index
+            };
+            let artifact = store
+                .ingest(&format!("{source}-{index}"), source, "log", b"line\n", at)
+                .unwrap();
+            if index >= 2 {
+                kept.push((source, artifact.id));
+            }
+        }
+    }
+    let before = early + 1 + sparrow_core::RETENTION_MS + DAY - 10_000;
+    let after = before + 20_000;
+    let rows = |page: &sparrow_core::ArtifactReadPage| {
+        page.body
+            .artifacts
+            .iter()
+            .map(|row| {
+                (
+                    row.source.clone(),
+                    row.id.clone(),
+                    row.retained_records,
+                    row.complete_bytes_available,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let everything = |store: &Store, now| {
+        let page = store
+            .artifact_read(
+                &ArtifactRead {
+                    selector: ArtifactSelector::default(),
+                    page_size: 1000,
+                    scan_budget: 100_000,
+                    cursor: None,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(page.next_cursor.is_none());
+        rows(&page)
+    };
+    let migrated = everything(&store, before);
+    assert_eq!(migrated.len(), 8, "the expired artifacts are not listed");
+    let first = migrated[0].0.clone();
+    let firsts = migrated.iter().filter(|row| row.0 == first).count();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.set_owed_window_for_tests(5);
+    let step = |store: &Store| {
+        store.migrate_step().unwrap();
+    };
+
+    let read = |cursor: Option<String>, now| {
+        store
+            .artifact_read(
+                &ArtifactRead {
+                    selector: ArtifactSelector::default(),
+                    page_size: 1,
+                    scan_budget: 100_000,
+                    cursor,
+                },
+                now,
+            )
+            .unwrap()
+    };
+    // One row per page, with a migration page between pages, through the first source.
+    let mut page = read(None, before);
+    let mut listed = rows(&page);
+    while listed.len() < firsts {
+        step(&store);
+        let cursor = page
+            .next_cursor
+            .clone()
+            .expect("the first source continues");
+        let previous = std::mem::replace(&mut page, read(Some(cursor), before));
+        // As the daemon does once the next page is delivered, so handles stay within the cap.
+        store
+            .result_release(&previous.store_id, &previous.snapshot_id, before)
+            .unwrap();
+        listed.extend(rows(&page));
+    }
+    assert_eq!(
+        listed,
+        migrated[..firsts],
+        "the first source as the migrated index lists it"
+    );
+    assert!(listed.iter().all(|row| row.0 == first));
+
+    // Expiry deletes both sources' expired artifacts, including those the second source's
+    // owed rows in the held window name; the rest of the listing skips those rows.
+    let summary = &store.migrations().unwrap()[sparrow_core::Migration::SourceSummary.index()];
+    assert!(!summary.complete() && summary.done == 0, "{summary:?}");
+    // A day past their deadline, expiry deletes their entries and records at once, so their
+    // owed rows in the held window name nothing.
+    store.expire(after).unwrap();
+    let mut rest = Vec::new();
+    while let Some(cursor) = page.next_cursor.clone() {
+        step(&store);
+        let previous = std::mem::replace(&mut page, read(Some(cursor), after));
+        store
+            .result_release(&previous.store_id, &previous.snapshot_id, after)
+            .unwrap();
+        rest.extend(rows(&page));
+    }
+    // The source-summary migration copied rows while the listing held windows.
+    let summary = &store.migrations().unwrap()[sparrow_core::Migration::SourceSummary.index()];
+    assert!(summary.done > 0, "{summary:?}");
+    while store.migrate_step().unwrap().is_some() {}
+    let finished = everything(&store, after);
+    let second = finished
+        .iter()
+        .filter(|row| row.0 != first)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(rest, second);
+    let mut expected = kept
+        .iter()
+        .filter(|(source, _)| *source != first)
+        .map(|(_, id)| id.clone())
+        .collect::<Vec<_>>();
+    let mut ids = rest.iter().map(|row| row.1.clone()).collect::<Vec<_>>();
+    expected.sort();
+    ids.sort();
+    assert_eq!(
+        ids, expected,
+        "only the surviving artifacts of the second source"
+    );
+}
+
+/// A gate a test closes to hold listing builds after they take their snapshot.
+fn hold_listing_builds(store: &Store) -> impl Fn() {
+    let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    store
+        .hold_listing_builds_for_tests(1, {
+            let gate = gate.clone();
+            move || {
+                let (open, ready) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = ready.wait(open).unwrap();
+                }
+            }
+        })
+        .unwrap();
+    move || {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+}
+
+/// INVARIANT (#158): while the source-summary migration is unfinished, a `sources` listing
+/// is a build. The first call registers it and starts it at once, and returns within its
+/// five-second budget. A page the build has not finished for has no rows, carries the
+/// build's cursor and its progress (entries read of what the migration owes). Following the
+/// cursor resumes the same build, never a new one, and its rows are the counts of the build's
+/// own snapshot as the finished migration gives them: a source written after it is absent.
+/// A build whose cursor is abandoned is dropped at its lease expiry and its thread ends.
+#[test]
+fn a_source_listing_during_the_source_summary_migration_is_a_build_its_cursor_resumes() {
+    use sparrow_core::{Migration, SourceRead, SourceReadPage};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for (index, source) in ["built-a", "built-a", "built-b"].into_iter().enumerate() {
+        store
+            .ingest(
+                &format!("built-{index}"),
+                source,
+                "log",
+                b"one\ntwo\n",
+                DAY + index as u64,
+            )
+            .unwrap();
+    }
+    let counts = |page: &SourceReadPage| {
+        page.body
+            .sources
+            .iter()
+            .map(|row| {
+                (
+                    row.source_id.clone(),
+                    row.retained_records,
+                    row.complete_artifacts,
+                    row.fragment_parents,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let all = SourceRead {
+        page_size: 1000,
+        ..Default::default()
+    };
+    let now = 2 * DAY;
+    let migrated = counts(&store.source_read(&all, now, &[]).unwrap());
+    assert_eq!(migrated.len(), 2, "{migrated:?}");
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    // Seed the store counters first, so the build knows what the migration owes.
+    while !store.migrations().unwrap()[Migration::StoreCounters.index()].complete() {
+        store.migrate_step().unwrap();
+    }
+    let summary = store.migrations().unwrap()[Migration::SourceSummary.index()].clone();
+    let owed = summary.total.map(|total| total - summary.done);
+    assert!(owed.is_some_and(|owed| owed > 0), "{summary:?}");
+    let open = hold_listing_builds(&store);
+
+    // At the production budget, the first call answers within five seconds.
+    let started = std::time::Instant::now();
+    let first = store.source_read(&all, now, &[]).unwrap();
+    let waited = started.elapsed();
+    assert!(waited < std::time::Duration::from_secs(6), "{waited:?}");
+    assert_eq!(
+        store.listing_builds_for_tests().unwrap()[0],
+        (1, 1, 1),
+        "the first call registered the build and started it"
+    );
+    assert!(first.body.sources.is_empty());
+    let cursor = first.next_cursor.clone().expect("the build's cursor");
+    let progress = first.build.expect("the build's progress");
+    assert_eq!(progress.total, owed, "{progress:?}");
+    assert_eq!(
+        progress.read, 1,
+        "the held build has read one entry: {progress:?}"
+    );
+
+    // Following the cursor while the build is held resumes it.
+    store
+        .set_listing_build_wait_for_tests(std::time::Duration::from_millis(100))
+        .unwrap();
+    let follow = SourceRead {
+        cursor: Some(cursor.clone()),
+        ..all.clone()
+    };
+    let again = store.source_read(&follow, now, &[]).unwrap();
+    assert!(again.body.sources.is_empty() && again.build.is_some());
+    assert_eq!(again.next_cursor.as_deref(), Some(cursor.as_str()));
+    // A source written after the build's snapshot is not in its rows.
+    store
+        .ingest("built-late", "built-late", "log", b"late\n", DAY + 9)
+        .unwrap();
+    open();
+    // A build is retired only after its page is delivered: a call that fails after the
+    // build has finished leaves it, and a retry on the same cursor resumes that build and
+    // delivers the same rows, instead of expiring or starting a second build.
+    let finished = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while store.listing_builds_for_tests().unwrap()[0].1 > 0 {
+        assert!(
+            std::time::Instant::now() < finished,
+            "the build never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The next call finds the build finished and fails after its page is built, before the
+    // build is retired.
+    store.fail_next_listing_delivery_for_tests().unwrap();
+    let failed = store.source_read(&follow, now, &[]).unwrap_err();
+    assert_eq!(failed.code, "CANCELLED", "{failed:?}");
+    assert_eq!(
+        store.listing_builds_for_tests().unwrap()[0],
+        (1, 0, 1),
+        "the finished build waits for its page"
+    );
+    let mut page = again;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while page.build.is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build never finished"
+        );
+        assert_eq!(page.next_cursor.as_deref(), Some(cursor.as_str()));
+        let started = std::time::Instant::now();
+        page = store.source_read(&follow, now, &[]).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+    assert_eq!(counts(&page), migrated, "the build's snapshot, as migrated");
+    assert_eq!(
+        store.listing_builds_for_tests().unwrap()[0],
+        (0, 0, 1),
+        "one build, delivered and never restarted"
+    );
+
+    // An abandoned build ends at its lease expiry.
+    let open = hold_listing_builds(&store);
+    let abandoned = store.source_read(&all, now, &[]).unwrap();
+    assert!(abandoned.build.is_some());
+    assert_eq!(store.listing_builds_for_tests().unwrap()[0], (1, 1, 2));
+    let expired = now + 60_000;
+    store.purge_read_leases_for_tests(expired).unwrap();
+    assert_eq!(store.listing_builds_for_tests().unwrap()[0].0, 0);
+    open();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while store.listing_builds_for_tests().unwrap()[0].1 > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build's thread kept running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let follow = SourceRead {
+        cursor: abandoned.next_cursor,
+        ..all
+    };
+    assert_eq!(
+        store.source_read(&follow, expired, &[]).unwrap_err().code,
+        "RESULT_EXPIRED"
+    );
+}
+
+/// INVARIANT (#158): while the source-summary migration is unfinished, a fresh live artifact
+/// listing reads its window of owed rows as a build. Its first page has no rows and carries
+/// the build's cursor and progress; following the cursor resumes the same build, and the
+/// listing then lists what the finished index lists, an artifact written meanwhile included.
+#[test]
+fn a_live_artifact_listing_during_the_source_summary_migration_resumes_its_build() {
+    use sparrow_core::{ArtifactRead, ArtifactReadPage};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for index in 0..3_u64 {
+        store
+            .ingest(
+                &format!("window-{index}"),
+                "window",
+                "log",
+                b"line\n",
+                DAY + index,
+            )
+            .unwrap();
+    }
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let seeding = sparrow_core::Migration::StoreCounters.index();
+    while !store.migrations().unwrap()[seeding].complete() {
+        store.migrate_step().unwrap();
+    }
+    store
+        .set_listing_build_wait_for_tests(std::time::Duration::from_millis(100))
+        .unwrap();
+    let open = hold_listing_builds(&store);
+    let rows = |page: &ArtifactReadPage| {
+        page.body
+            .artifacts
+            .iter()
+            .map(|row| (row.source.clone(), row.id.clone(), row.retained_records))
+            .collect::<Vec<_>>()
+    };
+    let now = 2 * DAY;
+    let read = |cursor: Option<String>| {
+        store
+            .artifact_read(
+                &ArtifactRead {
+                    page_size: 1000,
+                    scan_budget: 100_000,
+                    cursor,
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap()
+    };
+    let first = read(None);
+    assert!(first.body.artifacts.is_empty());
+    let cursor = first.next_cursor.clone().expect("the build's cursor");
+    assert!(first.build.is_some_and(|build| build.total.is_some()));
+    assert_eq!(store.listing_builds_for_tests().unwrap()[1], (1, 1, 1));
+    store
+        .ingest("window-late", "window", "log", b"late\n", DAY + 9)
+        .unwrap();
+    open();
+    // A build is retired only after its page is delivered: the first call that finds the
+    // build finished fails after its page is built and before the build is retired, and the retry on the same cursor
+    // delivers the listing from the same build.
+    store.fail_next_listing_delivery_for_tests().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let failed = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build never finished"
+        );
+        let polled = store.artifact_read(
+            &ArtifactRead {
+                page_size: 1000,
+                scan_budget: 100_000,
+                cursor: Some(cursor.clone()),
+                ..Default::default()
+            },
+            now,
+        );
+        match polled {
+            Err(error) => break error,
+            Ok(page) => assert!(page.build.is_some()),
+        }
+    };
+    assert_eq!(failed.code, "CANCELLED", "{failed:?}");
+    let ended = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while store.listing_builds_for_tests().unwrap()[1].1 > 0 {
+        assert!(
+            std::time::Instant::now() < ended,
+            "the build thread kept running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        store.listing_builds_for_tests().unwrap()[1],
+        (1, 0, 1),
+        "the finished build waits for its page"
+    );
+    let mut page = first;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while page.build.is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build never finished"
+        );
+        page = read(Some(cursor.clone()));
+    }
+    assert!(page.next_cursor.is_none());
+    let listed = rows(&page);
+    assert_eq!(store.listing_builds_for_tests().unwrap()[1], (0, 0, 1));
+    while store.migrate_step().unwrap().is_some() {}
+    assert_eq!(listed, rows(&read(None)), "the finished index");
+    assert_eq!(listed.len(), 4, "{listed:?}");
 }
 
 fn listed_artifacts(store: &Store, source: &str, now: u64) -> Vec<(String, usize, bool)> {
@@ -19953,12 +20412,14 @@ fn ingest_lines(store: &Store, request: &str, records: usize, now: u64) {
     }
 }
 
-/// INVARIANT (#146): what the status RPC reads, status and the migration report from one
-/// snapshot, reads a fixed number of keys while the `store-counters` migration seeds a
+/// INVARIANT (#146, #158): what the status RPC reads, status and the migration report from
+/// one snapshot, reads a fixed number of keys while the `store-counters` migration seeds a
 /// store of 20,000 records, the same after 5,000 more records, and the same once seeded,
 /// and takes no writer lock: it answers while a migration page holds the writer. While
 /// seeding, `counts` is pending and every migration total is counting; once seeded, the
-/// counts are exact totals and equal a recount.
+/// counts are exact totals and equal a recount. Listings waiting for the held writer keep
+/// their read registries locked; status counts read handles without those locks, so it
+/// still answers (the live status hang of #158).
 #[test]
 fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
     use sparrow_core::Migration;
@@ -20035,6 +20496,33 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
         assert!(waiting.elapsed() < std::time::Duration::from_secs(60));
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let listings = [
+        std::thread::spawn({
+            let store = store.clone();
+            move || {
+                use sparrow_core::{ArtifactRead, ArtifactSelector};
+                let read = ArtifactRead {
+                    selector: ArtifactSelector {
+                        source: Some("bulk".into()),
+                        ..Default::default()
+                    },
+                    page_size: 1000,
+                    scan_budget: 100_000,
+                    ..Default::default()
+                };
+                // The first page: one 2,000-record artifact can fill a page's admission, so
+                // it answers with rows or with the position to continue from.
+                let page = store.artifact_read(&read, 6).unwrap();
+                page.body.artifacts.len() + usize::from(page.next_cursor.is_some())
+            }
+        }),
+        std::thread::spawn({
+            let store = store.clone();
+            move || listed_counts(&store, "bulk", 6).map_or(0, |(records, _, _)| records)
+        }),
+    ];
+    // Long enough for both listings to lock their registries and wait for the writer.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let started = std::time::Instant::now();
     let (_, _, held_keys) = store.status_with_key_reads_for_tests(5).unwrap();
     // The rest of what the status RPC reads takes no writer lock either.
@@ -20050,6 +20538,12 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
     assert!(answered < hold, "status waited {answered:?} for the writer");
     assert_eq!(held_keys, keys);
     assert_eq!(page.join().unwrap().migration, Migration::EventFallbackRdf);
+    for listing in listings {
+        assert!(
+            listing.join().unwrap() > 0,
+            "a waiting listing answered empty"
+        );
+    }
     store.hold_migration_pages_for_tests(None).unwrap();
     while store.migrate_step().unwrap().is_some() {}
     assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
@@ -20558,13 +21052,260 @@ fn source_index_migration_seeds_exact_counters_and_fences_older_writers() {
     );
 }
 
-/// INVARIANT: a store opened with the source summary migration pending serves at once;
-/// while it runs, `sources` and `artifacts` refuse with INDEX_NOT_READY naming the
-/// migration instead of presenting partial counts, record reads are served, and once the
-/// migration completes both listings answer with counts equal to a full recount.
+/// One step's answers to every listing and query kind, reduced to the rows they publish.
+#[derive(Debug, PartialEq)]
+struct OnlineAnswers {
+    context: [(Vec<String>, u64, sparrow_core::ContextFrontier); 2],
+    sources: Vec<(String, usize, usize, usize)>,
+    artifacts: Vec<(String, usize, bool)>,
+    records: Vec<String>,
+    sparql: Vec<Vec<String>>,
+}
+
+/// Every query kind over the records received before `bound`, read at `now`. Every call
+/// must answer: a refusal fails the test.
+fn online_answers(store: &Store, anchor: &str, bound: u64, now: u64) -> OnlineAnswers {
+    use sparrow_core::{ArtifactRead, ArtifactSelector, RdfGraphLayers, RecordQuery, SourceRead};
+    store.status(now).unwrap();
+    let mut scope = context_scope();
+    scope.received_before = bound;
+    let context = store.records_context(anchor, &scope, 3, 3, now).unwrap();
+    let side = |side: &sparrow_core::ContextSide| {
+        (
+            side.records.iter().map(|r| r.id.clone()).collect(),
+            side.visited,
+            side.frontier,
+        )
+    };
+    let mut sources = store
+        .source_read(&SourceRead::default(), now, &[])
+        .unwrap()
+        .body
+        .sources
+        .iter()
+        .map(|row| {
+            (
+                row.source_id.clone(),
+                row.retained_records,
+                row.complete_artifacts,
+                row.fragment_parents,
+            )
+        })
+        .collect::<Vec<_>>();
+    sources.sort();
+    // Small pages, so owed index rows merge with stored ones across continuations.
+    let mut read = ArtifactRead {
+        selector: ArtifactSelector {
+            received_before: bound,
+            ..Default::default()
+        },
+        page_size: 3,
+        scan_budget: 100_000,
+        cursor: None,
+    };
+    let mut artifacts = Vec::new();
+    let mut previous = None;
+    loop {
+        let page = store.artifact_read(&read, now).unwrap();
+        // The client retires a continued handle once its next page is delivered.
+        if let Some(id) = previous.replace(page.snapshot_id.clone()) {
+            assert!(store.result_release(&page.store_id, &id, now).unwrap());
+        }
+        artifacts.extend(page.body.artifacts.iter().map(|row| {
+            (
+                row.id.clone(),
+                row.retained_records,
+                row.complete_bytes_available,
+            )
+        }));
+        match page.next_cursor {
+            Some(cursor) => read.cursor = Some(cursor),
+            None => break,
+        }
+    }
+    let mut wide = record_page_scope("online-a", 1000);
+    wide.source = None;
+    wide.received_before = bound;
+    let records = store
+        .records_query(&wide, &RecordQuery::default(), now)
+        .unwrap()["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["record_id"].as_str().unwrap().to_owned())
+        .collect();
+    // A graph-enumerating query merges one cursor per selected graph and each cursor walks
+    // the selected graphs again, so its request cost grows with the square of the scope:
+    // one record keeps it far inside the default request budget, before and after the
+    // migrations alike.
+    let mut one = record_page_scope("online-a", 1000);
+    one.source = None;
+    one.selection = sparrow_core::QuerySelection::Evidence(vec![anchor.to_owned()]);
+    // And a source scope, whose graphs come from the owner index or, while it is built,
+    // from its mirror rows and the declarations it has not copied.
+    let mut solo = record_page_scope("online-c", 1000);
+    // The receipt walk charges the catalog entry of every artifact in the interval, of any
+    // source, so the interval ends before the flow artifacts, which grow with the steps.
+    solo.received_before = 31 * DAY + 13;
+    let queries = [
+        "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?b WHERE { ?r sp:eventTimeBasis ?b }",
+        "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
+    ];
+    let sparql = [&one, &solo]
+        .into_iter()
+        .flat_map(|scope| queries.iter().map(move |query| (scope, query)))
+        .map(|(scope, query)| {
+            let mut rows = scoped_answer(store, scope, RdfGraphLayers::ALL, query, now)
+                .0
+                .iter()
+                .map(|row| format!("{row:?}"))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        })
+        .collect();
+    OnlineAnswers {
+        context: [side(&context.before), side(&context.after)],
+        sources,
+        artifacts,
+        records,
+        sparql,
+    }
+}
+
+/// INVARIANT (#158): while the source-context rebuild, the source-summary backfill and the
+/// schema 69 owner index and event fallback backfill run, with intake still flowing, every
+/// status call, record context, source and artifact listing, records query and SPARQL query
+/// answers, and each answer equals the same query once every migration is complete, for
+/// the records received before it. No read is refused or partial because a migration is
+/// unfinished. Context is anchored on a one-record artifact whose same-source neighbors lie
+/// beyond runs of other sources' records, so the time-index timeline must skip them; a
+/// reclaimed parent with a pinned surviving record makes the live listing read its records
+/// through the timeline and the backfill count it in its record phase.
 #[test]
-fn source_summary_migration_serves_at_once_and_listings_wait_for_it() {
-    use sparrow_core::{ArtifactRead, ArtifactSelector, Migration, SourceRead};
+fn every_read_answers_completely_while_online_migrations_run_and_intake_flows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    // A parent reclaimed by expiry while a pin keeps one of its records.
+    let parent = store
+        .ingest("online-parent", "online-b", "jsonl", b"{}\n{}\n", 0)
+        .unwrap();
+    store
+        .pin("online-pin", "parent", &parent.record_ids[..1], 40, 0)
+        .unwrap();
+    let base = 31 * DAY;
+    store.expire(base).unwrap();
+    assert!(store.artifact(&parent.id).is_err());
+    let mut solos = Vec::new();
+    // Enough records for several pages of the record-paged migrations. Each instant holds a
+    // 50-record artifact of one dense source and a one-record artifact of `online-c`.
+    for index in 0..12_u64 {
+        let source = if index % 2 == 0 {
+            "online-a"
+        } else {
+            "online-b"
+        };
+        let lines = (0..50)
+            .map(|line| format!("{{\"n\":{line}}}\n"))
+            .collect::<String>();
+        let at = base + index + 1;
+        store
+            .ingest(
+                &format!("online-{index}"),
+                source,
+                "jsonl",
+                lines.as_bytes(),
+                at,
+            )
+            .unwrap();
+        solos.push(
+            store
+                .ingest(
+                    &format!("online-solo-{index}"),
+                    "online-c",
+                    "jsonl",
+                    b"{\"solo\":1}\n",
+                    at,
+                )
+                .unwrap(),
+        );
+    }
+    let anchor = solos[5].record_ids[0].clone();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    sparrow_test_support::stale_source_context_cache(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(store.migrations().unwrap().iter().all(|m| !m.complete()));
+    let mut steps = Vec::new();
+    let mut now = base + 100;
+    loop {
+        steps.push((now, online_answers(&store, &anchor, now, now)));
+        // Intake keeps flowing into a queried source between pages.
+        store
+            .ingest(
+                &format!("online-flow-{now}"),
+                "online-a",
+                "log",
+                b"flow\n",
+                now,
+            )
+            .unwrap();
+        // Each step reads at a fresh instant: every read lease of the last one has expired.
+        now += 100_000;
+        if store.migrate_step().unwrap().is_none() {
+            break;
+        }
+    }
+    assert!(steps.len() > 10, "{} steps", steps.len());
+    assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
+    // The fixture reached the paths it is for: context found neighbors on both sides across
+    // other sources' records, and the listing and counts carry the reclaimed parent.
+    let first = &steps[0].1;
+    assert_eq!(
+        first.context.each_ref().map(|side| side.0.len()),
+        [3, 3],
+        "{first:?}"
+    );
+    assert!(
+        first
+            .artifacts
+            .iter()
+            .any(|row| row.0 == parent.id && row.1 == 1 && !row.2),
+        "{first:?}"
+    );
+    assert!(
+        first
+            .sources
+            .iter()
+            .any(|row| row.0 == "online-b" && row.3 == 1),
+        "{first:?}"
+    );
+    let flows = steps.len();
+    for (index, (bound, during)) in steps.iter().enumerate() {
+        // A fresh instant per comparison, as during the migration.
+        let mut after = online_answers(&store, &anchor, *bound, now + index as u64 * 100_000);
+        // The source listing is not receipt-bounded: remove the later flow records.
+        let later = flows - index;
+        for row in &mut after.sources {
+            if row.0 == "online-a" {
+                row.1 -= later;
+                row.2 -= later;
+            }
+        }
+        assert_eq!(during, &after, "step {index}");
+    }
+}
+
+/// INVARIANT (#158): a store opened with the source summary migration pending serves at
+/// once; while it runs, `sources` and `artifacts` answer with the counts and rows the
+/// finished migration gives, never refusing and never presenting partial counts, and once
+/// it completes both listings answer the same, equal to a full recount.
+#[test]
+fn source_summary_migration_serves_at_once_and_listings_answer_finished_counts() {
+    use sparrow_core::Migration;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let artifact = store
@@ -20580,29 +21321,11 @@ fn source_summary_migration_serves_at_once_and_listings_wait_for_it() {
         store.record(&artifact.record_ids[0]).unwrap().id,
         artifact.record_ids[0]
     );
-    let sources = store
-        .source_read(&SourceRead::default(), 2, &[])
-        .unwrap_err();
-    let artifacts = store
-        .artifact_read(
-            &ArtifactRead {
-                selector: ArtifactSelector {
-                    source: Some("pending-source".into()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            2,
-        )
-        .unwrap_err();
-    for error in [sources, artifacts] {
-        assert_eq!(error.code, "INDEX_NOT_READY");
-        assert!(
-            error.message.contains("source-summary"),
-            "{}",
-            error.message
-        );
-    }
+    assert_eq!(listed_counts(&store, "pending-source", 2), Some((2, 1, 0)));
+    assert_eq!(
+        listed_artifacts(&store, "pending-source", 2),
+        [(artifact.id.clone(), 2, true)]
+    );
     while store.migrate_step().unwrap().is_some() {}
     assert_counts_match_recount(&store);
     assert_eq!(listed_counts(&store, "pending-source", 2), Some((2, 1, 0)));

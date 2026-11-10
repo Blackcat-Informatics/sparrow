@@ -70,6 +70,11 @@ impl Store {
         release!(artifact_reads, "artifact read registry poisoned");
         release!(source_reads, "source read registry poisoned");
         release!(pin_reads, "pin read registry poisoned");
+        if self.source_builds()?.release(snapshot_id, now)
+            || self.artifact_builds()?.release(snapshot_id, now)
+        {
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -82,6 +87,17 @@ impl Store {
             ));
         }
         let cursor = catalog_lease::Cursor::parse(cursor)?;
+        let cancellation = crate::QueryCancellation::default();
+        if super::listing_build::is_build(&cursor, super::artifact_read::BUILD) {
+            return self
+                .artifact_build_poll(&cursor, None, now, &cancellation)
+                .map(ResultPage::Artifacts);
+        }
+        if super::listing_build::is_build(&cursor, super::source_read::BUILD) {
+            return self
+                .source_build_poll(&cursor, None, now, &cancellation)
+                .map(ResultPage::Sources);
+        }
         {
             let mut reads = self.sparql_reads.lock().map_err(|_| {
                 Error::new("STORAGE_FAILURE", "native query read registry poisoned")
@@ -117,9 +133,17 @@ impl Store {
                 .lock()
                 .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
             reads.purge(now);
-            let cancellation = crate::QueryCancellation::default();
-            if let Some(page) = self.artifact_next(&mut reads, &cursor, None, now, &cancellation)? {
-                return Ok(ResultPage::Artifacts(page));
+            match self.artifact_next(&mut reads, &cursor, None, now, &cancellation)? {
+                Some(super::artifact_read::Next::Page(page)) => {
+                    return Ok(ResultPage::Artifacts(page));
+                }
+                Some(super::artifact_read::Next::Window(pending)) => {
+                    drop(reads);
+                    return self
+                        .artifact_window(pending, now, &cancellation)
+                        .map(ResultPage::Artifacts);
+                }
+                None => {}
             }
             if let Some((_, page)) = reads.resume_captured(&cursor, now)? {
                 return Ok(ResultPage::Artifacts(page));

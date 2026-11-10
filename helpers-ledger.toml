@@ -157,9 +157,9 @@ names = ['^(copy_fallback_upgrade_pager|decode_metadata_graph_elsewhere|append_f
 
 [[job]]
 id = "source-summary-counters"
-summary = "One WriteBatch observer, called in Writer::apply for every catalog write, adds the exact per-source counter, artifact retained-count and per-source artifact index row changes for the batch's artifact, artifact-retirement and record changes; negative or missing counters refuse with STORAGE_FAILURE naming the source, never clamped. One online migration, fenced and seeded at open behind the source summary writer families and paged by the maintenance worker, seeds the rows from existing artifact and record entries. Source keys use the one BLAKE3 source-key hash shared with the source context, source time and diagnostic indexes; it and the source context observer fold batches through the one durability::observe_batch."
+summary = "One WriteBatch observer, called in Writer::apply for every catalog write, adds the exact per-source counter, artifact retained-count and per-source artifact index row changes for the batch's artifact, artifact-retirement and record changes; negative or missing counters refuse with STORAGE_FAILURE naming the source, never clamped. One online migration, fenced and seeded at open behind the source summary writer families and paged by the maintenance worker, seeds the rows from existing artifact and record entries; until it completes, readers add a Completion that runs the migration's own counting passes to the end over a snapshot without the writer lock through the one Rows sink, once per sources capture and once per bounded window of owed rows a live artifact listing reaches, charging what it holds to the page admission, so listings answer as after it. Source keys use the one BLAKE3 source-key hash shared with the source context, source time and diagnostic indexes; it and the source context observer fold batches through the one durability::observe_batch."
 home = "sparrow_core::storage::source_summary::apply"
-entry_points = ["sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::source_summary::page", "sparrow_core::storage::source_summary::fence", "sparrow_core::storage::source_summary::counts", "sparrow_core::storage::source_summary::ready", "sparrow_core::storage::source_summary::source_hash", "sparrow_core::storage::writer_format::enable_source_summary", "sparrow_core::storage::artifact_read::Writer::artifact_index_page"]
+entry_points = ["sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::source_summary::page", "sparrow_core::storage::source_summary::fence", "sparrow_core::storage::source_summary::counts", "sparrow_core::storage::source_summary::Completion::owed", "sparrow_core::storage::artifact_read::Store::owed_index_rows", "sparrow_core::storage::source_summary::source_hash", "sparrow_core::storage::writer_format::enable_source_summary", "sparrow_core::storage::artifact_read::Writer::artifact_index_page"]
 spec = "docs/interfaces.md: per-source counters and artifact index (store format); docs/architecture.md section 7."
 vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/maintenance.rs"]
 bench = []
@@ -199,9 +199,9 @@ names = ['^(yield_to_writers_by_polling|fair_writer_mutex|spin_until_writers_dra
 
 [[job]]
 id = "observed-writer-state"
-summary = "Durability, pressure and table rewrite state stay writer-local and may be held across commits; a mutable borrow publishes a small Observe::View copy when it ends, and status reads only that copy, so status never waits for a pressure pass, rewrite step or commit."
+summary = "Durability, pressure and table rewrite state stay writer-local and may be held across commits; a mutable borrow publishes a small Observe::View copy when it ends, and status reads only that copy, so status never waits for a pressure pass, rewrite step or commit. Read-lease handle counts come from each registry's ledger, mirrored on every registry change and locked only to copy rows, so status never waits for a registry a listing holds while it waits for the writer."
 home = "sparrow_core::storage::writer_queue::Observed::borrow_mut"
-entry_points = ["sparrow_core::storage::writer_queue::Published::read", "sparrow_core::storage::Store::durability_status", "sparrow_core::storage::Store::pressure_status", "sparrow_core::storage::Store::recompression_status"]
+entry_points = ["sparrow_core::storage::writer_queue::Published::read", "sparrow_core::storage::Store::durability_status", "sparrow_core::storage::Store::pressure_status", "sparrow_core::storage::Store::recompression_status", "sparrow_core::storage::catalog_lease::read_stats"]
 spec = "docs/interfaces.md: store counters (store format); docs/architecture.md section 7."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -213,7 +213,7 @@ names = ['^(status_reads_writer_state_under_lock|clone_whole_durability_ledger)$
 
 [[job]]
 id = "owner-graph-index"
-summary = "One RDF writer puts and deletes every rdf:g graph declaration together with its rdf:o owner-to-graph mirror in the same batch. One online migration, fenced and seeded at open and paged by the maintenance worker, builds the mirror from existing declaration keys in resumable pages behind the owner-graph writer families, covering privately prepared graphs. Scoped views enumerate graphs from the mirror and merge graph-leading twins of the store-wide plan through the one ScopedRows heap."
+summary = "One RDF writer puts and deletes every rdf:g graph declaration together with its rdf:o owner-to-graph mirror in the same batch. One online migration, fenced and seeded at open and paged by the maintenance worker, builds the mirror from existing declaration keys in resumable pages behind the owner-graph writer families, covering privately prepared graphs. Scoped views enumerate graphs from the mirror, plus, while the migration is unfinished, the declarations past its frontier filtered to the view's owners (uncharged to the request budget, with cancellation), and merge graph-leading twins of the store-wide plan through the one ScopedRows heap."
 home = "sparrow_core::storage::rdf_index::owner_graph_key"
 entry_points = ["sparrow_core::storage::rdf_index::fence_owner_graphs", "sparrow_core::storage::rdf_index::owner_graph_page", "sparrow_core::storage::writer_format::enable_owner_graphs", "sparrow_core::storage::rdf_view::StoredRdfView::owner_graphs", "sparrow_core::storage::rdf_view::sparse::ScopedRows::new", "sparrow_core::query::QueryScope::restricts_membership"]
 spec = "docs/interfaces.md: owner-to-graph index (store format); docs/architecture.md section 7."
@@ -367,9 +367,9 @@ names = ['^(stream_record_summary|snapshot_record_summary)$']
 
 [[job]]
 id = "source-context-timeline-cache"
-summary = "One derived source timeline is maintained atomically with authoritative record/time publication; an open resets it with one range deletion only when its generation marker shows it stale, and the source-context online migration rebuilds it through the shared bounded catalog pager while context refuses INDEX_NOT_READY; context uses one indexed reader, never a global-scan fallback."
+summary = "One derived source timeline is maintained atomically with authoritative record/time publication; an open resets it with one range deletion only when its generation marker shows it stale, and the source-context online migration rebuilds it through the shared bounded catalog pager. Every source-local reader walks the one timeline, source_context::Timeline::walk, over the database under the writer or a snapshot, which reads the cache once it is complete and the authoritative primary time index, filtered to the source, until then; there is no second reader or separate fallback."
 home = "sparrow_core::storage::source_context::update"
-entry_points = ["sparrow_core::storage::source_context::fence", "sparrow_core::storage::source_context::page", "sparrow_core::storage::source_context::ready", "sparrow_core::storage::source_context::indexed", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::source_context::hashed_prefix", "sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::context::Store::records_context"]
+entry_points = ["sparrow_core::storage::source_context::fence", "sparrow_core::storage::source_context::page", "sparrow_core::storage::source_context::cached", "sparrow_core::storage::source_context::Timeline::walk", "sparrow_core::storage::source_context::record", "sparrow_core::storage::source_context::decode", "sparrow_core::storage::source_context::key_parts", "sparrow_core::storage::source_context::prefix", "sparrow_core::storage::source_context::hashed_prefix", "sparrow_core::storage::durability::observe_batch", "sparrow_core::storage::context::Store::records_context", "sparrow_core::storage::context::Store::records_context_cancellable"]
 spec = "docs/interfaces.md: source-indexed context capture."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2065,9 +2065,9 @@ names = ['^(drop_artifact_chunks|release_manifest_chunks)$']
 
 [[job]]
 id = "time-index-record-certification"
-summary = "Validate chronological index identity and catalog agreement once for context and eviction."
-home = "sparrow_core::storage::Writer::time_record"
-entry_points = []
+summary = "Validate chronological index identity and catalog agreement once for context and eviction, over the database under the writer or a snapshot; the Writer method delegates."
+home = "sparrow_core::storage::time_record"
+entry_points = ["sparrow_core::storage::Writer::time_record"]
 spec = "docs/development-runtime.md: oldest-unpinned logical retirement."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2792,9 +2792,9 @@ names = ['^(capture_buffered_diagnostics|capture_staged_diagnostics)$']
 
 [[job]]
 id = "diagnostic-scope-predicate"
-summary = "All query surfaces share certain match/exclusion and unknown diagnostic membership, with strict refusal when requested."
-home = "sparrow_core::storage::Writer::matches_diagnostic_scope"
-entry_points = []
+summary = "All query surfaces share certain match/exclusion and unknown diagnostic membership, with strict refusal when requested, reading bindings from the database under the writer or a snapshot; the Writer method delegates."
+home = "sparrow_core::storage::diagnostic::matches_diagnostic_scope"
+entry_points = ["sparrow_core::storage::Writer::matches_diagnostic_scope"]
 spec = "docs/interfaces.md: schema 21 diagnostic filters."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2850,7 +2850,7 @@ names = ['^(parse_cli_diagnostic_mapping|parse_mcp_diagnostic_mapping)$']
 id = "immutable-diagnostic-profile"
 summary = "One durable source mapping owner preserves identical retries and refuses reinterpretation."
 home = "sparrow_core::Store::define_diagnostic_profile"
-entry_points = ["sparrow_core::storage::diagnostic::DiagnosticProfile::new", "sparrow_core::storage::Writer::validate_diagnostic_record"]
+entry_points = ["sparrow_core::storage::diagnostic::DiagnosticProfile::new", "sparrow_core::storage::diagnostic::validate_diagnostic_record"]
 spec = "docs/interfaces.md: schema 21 immutable diagnostic mappings."
 vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -4349,6 +4349,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(pin_read_stats|artifact_read_stats|source_read_stats|record_read_stats|sparql_read_stats)$']
+
+[[job]]
+id = "listing-build"
+summary = "One background build owner serves every listing that must first read what the unfinished source-summary migration owes: the first call registers and starts the build on its own thread with its own snapshot, each call waits at most five seconds, an unfinished build answers with no rows, its cursor and its progress, the cursor resumes the same build, and lease expiry or release cancels it (#158)."
+home = "sparrow_core::storage::listing_build::Builds"
+entry_points = ["sparrow_core::storage::listing_build::Builds::start", "sparrow_core::storage::listing_build::Builds::poll", "sparrow_core::storage::listing_build::Waiter::wait", "sparrow_core::storage::source_read::Store::source_build_poll", "sparrow_core::storage::artifact_read::Store::artifact_build_poll", "sparrow_core::storage::artifact_read::Store::artifact_window"]
+spec = "docs/interfaces.md: per-source counters and artifact index, listing builds."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
 
 [[job]]
 id = "typed-native-term-forest"

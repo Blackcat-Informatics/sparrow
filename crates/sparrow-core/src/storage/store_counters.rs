@@ -449,6 +449,29 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// Visit keys from `start` in `direction` (in reverse, from the last key at or before
+    /// it), until `visit` returns `false` or the keys end.
+    pub(super) fn iterate(
+        &self,
+        start: &[u8],
+        direction: Direction,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        let mode = IteratorMode::From(start, direction);
+        let iterator = match self.source {
+            Source::Db(db) => db.iterator(mode),
+            Source::Snapshot(snapshot) => snapshot.iterator(mode),
+        };
+        for row in iterator {
+            let (key, value) = row?;
+            self.keys.set(self.keys.get() + 1);
+            if !visit(&key, &value)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Visit the keys under `prefix` after `after` (exclusive) in order, until `visit`
     /// returns `false`.
     pub(super) fn scan(

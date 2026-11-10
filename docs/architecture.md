@@ -569,8 +569,15 @@ atomically through the ordinary write path, so a restart resumes after the last
 committed page and a failed page is retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
 could differ: the schema 69 receipt-time fallback backfill is reported in
-SPARQL coverage, the source listings refuse while their counters are seeded,
-and record context refuses while a stale source timeline cache is rebuilt. `status` reports each migration's progress. A query-only
+SPARQL coverage while the view serves the facts it still owes, scoped SPARQL
+reads the owner index for the declarations already copied and walks the rest,
+the source listings add what the source-summary migration still owes to the stored rows,
+and record context walks the primary time index while a stale source timeline
+cache is rebuilt. Pending paths that may read much of the store run from a
+snapshot without the writer lock and check cancellation; their CPU is not
+capped, they spend no request or visit budget, and what they hold is charged as
+memory. No read refuses because a migration is unfinished. `status` reports
+each migration's progress. A query-only
 daemon runs no maintenance worker, so it serves on the pending paths. Writers
 come before pages: before a page the maintenance worker waits while an ingest,
 publication or RPC write is waiting for the writer lock, for at most the longer
@@ -590,9 +597,12 @@ record retired in the batch that retires its evidence, so a record past its
 deadline counts only until that expiry pass, or while the archive gate holds it. The first online migration,
 `store-counters`, seeds the rows of an older store in pages that only advance
 its checkpoint; until it completes, those readers report the counts as pending,
-exact through its watermark, and recount nothing. Pressure, rewrite and
-durability state reach status as a small copy the writer publishes when a change
-ends, so status never waits for a pass that holds that state across commits.
+exact through its watermark, and recount nothing, so status costs the same at
+any store size. Pressure, rewrite and durability state reach status as a small
+copy the writer publishes when a change ends, so status never waits for a pass
+that holds that state across commits. Read-lease handle counts come from a ledger beside
+each listing registry, so status never waits for a registry that a listing holds
+while it waits for the writer.
 
 Source and artifact discovery read three derived catalog row families instead of
 the record catalog:
@@ -613,7 +623,12 @@ write. `sources` reads one counter row per source from a snapshot taken under
 the writer lock and released before reading, and the live artifact listing walks
 the index of the selected sources, so neither costs the size of the store. The
 online `source-summary` migration seeds the rows of an older store; until it
-completes both listings refuse with `INDEX_NOT_READY`.
+completes both listings add what the migration still owes, computed by its own
+counting passes over a snapshot, once per `sources` capture and once per window
+of owed rows a live artifact listing reaches, and answer as they will after it.
+Each pass runs as a listing build on its own thread: a call waits for it at most
+5 seconds, and until it finishes answers with no rows, the build's cursor and
+its progress, so no page outlasts a caller's deadline.
 
 Use PurRDF's governed prepared queries and fail-aware execution boundary.
 Storage faults refuse publication of an apparently successful prefix. Governor

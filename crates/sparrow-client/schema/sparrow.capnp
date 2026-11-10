@@ -579,7 +579,13 @@ struct CatalogReadReceipt {
   storeId @0 :Text; snapshotId @1 :Text; asOf @2 :Instant; leaseExpiresAt @3 :Instant;
   totalItems @4 :UInt64; pageStart @5 :UInt64; nextCursor @6 :OptionalText;
   pageSize @7 :UInt32; scanBudget @8 :UInt32; scanned @9 :UInt64;
+  # #158: set on a listing page that answers before its build has read what an unfinished
+  # online migration owes. The page has no rows and nextCursor resumes the same build.
+  build @10 :CatalogBuild;
 }
+# How far a listing build has read: catalog entries read of the entries the migration still
+# owed at the build's snapshot. totalPending while the store counters seed (total is 0).
+struct CatalogBuild { read @0 :UInt64; total @1 :UInt64; totalPending @2 :Bool; }
 struct PinMembers { pin @0 :PinSummary; members @1 :List(Evidence); }
 struct PinReadPage {
   receipt @0 :CatalogReadReceipt;
