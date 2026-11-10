@@ -15,8 +15,8 @@
 #   * its own file names, SPOOL_DIR/katamari-manager-YYYYMMDDTHHMM.jsonl, so a bucket the other forwarder
 #     wrote is never appended to (sparrow-ship keys a file by device, inode, size and mtime and ships a
 #     changed file again whole);
-#   * every record carries "source":"systemd-manager", and the unit's own lines are dropped, so a record
-#     in these files is always the manager's.
+#   * every record carries "source":"systemd-manager", and the unit's own process lines are dropped, so a record
+#     in these files is the manager's or another entry that names the unit (a coredump, for example).
 # The bucket comes from the entry's own timestamp, so a backfill lands in the right files.
 #
 # Environment:
