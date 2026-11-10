@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# Follow the DEFAULT journal for the lines the service manager writes about one unit ("Stopping ...",
+# "Main process exited", "The kernel OOM killer killed some processes in this unit", "Consumed ... memory
+# peak") and spool them as JSON Lines in ten-minute files for sparrow-ship (issue #168).
+#
+# Usage: katamari-manager-spool UNIT SPOOL_DIR CURSOR_FILE
+#
+# A unit that logs to its own journal namespace writes its own lines there (katamari-journal-spool follows
+# that), while systemd writes its lines about the unit to the default journal; this script holds those.
+# Its three differences from katamari-journal-spool, each on purpose:
+#   * its own cursor file, given by the caller and never the namespace forwarder's;
+#   * its own file names, SPOOL_DIR/katamari-manager-YYYYMMDDTHHMM.jsonl, so a bucket the other forwarder
+#     wrote is never appended to (sparrow-ship keys a file by device, inode, size and mtime and ships a
+#     changed file again whole);
+#   * every record carries "source":"systemd-manager", and the unit's own lines are dropped, so a record
+#     in these files is always the manager's.
+# The bucket comes from the entry's own timestamp, so a backfill lands in the right files.
+#
+# Environment:
+#   KATAMARI_MANAGER_SINCE  A journalctl --since time. Used only while CURSOR_FILE does not exist, to
+#                           backfill the first run; with a cursor, the run resumes after it.
+#   KATAMARI_MANAGER_SCOPE  "system" (default) selects with --unit; "user" follows the user journal
+#                           with --user-unit, for the throwaway-unit check in docs/deployment.md.
+set -euo pipefail
+unit=${1:?unit} dir=${2:?spool dir} cursor=${3:?cursor file}
+scope=${KATAMARI_MANAGER_SCOPE:-system}
+case $scope in
+    system) select=(--unit="$unit") ;;
+    user) select=(--user-unit="$unit") ;;
+    *) printf 'katamari-manager-spool: KATAMARI_MANAGER_SCOPE must be system or user, not %s\n' "$scope" >&2; exit 2 ;;
+esac
+(umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
+
+# JSON entries on stdin, spooled into SPOOL_DIR.
+spool() {
+    jq -r --unbuffered --arg unit "$unit" '
+# Keep only what the manager wrote: drop the unit'"'"'s own process, whichever scope it ran in.
+select(._SYSTEMD_UNIT != $unit and ._SYSTEMD_USER_UNIT != $unit)
+| (.MESSAGE | if type == "string" then . else tostring end) as $m
+| (.__REALTIME_TIMESTAMP | tonumber) as $us
+| {
+    source: "systemd-manager",
+    priority: ((.PRIORITY // "6") | tonumber),
+    realtime_usec: $us,
+    time: ($us / 1000000 | todate),
+    unit: $unit,
+    manager: (._COMM // null),
+    message: $m
+  }
+| with_entries(select(.value != null))
+| ((($us / 1000000 | floor) / 600 | floor) * 600 | strftime("%Y%m%dT%H%M")) as $bucket
+| "\($bucket)\t\(tojson)"' |
+        while IFS=$'\t' read -r bucket line; do
+            printf '%s\n' "$line" >> "$dir/katamari-manager-$bucket.jsonl"
+        done
+}
+
+# journalctl refuses --since together with a cursor, so the backfill is its own pass: spool everything
+# since the given time, then start the cursor at the last entry that pass saw (or at the journal's
+# newest entry, when it saw none) and follow from there.
+if [[ ! -e $cursor && -n ${KATAMARI_MANAGER_SINCE:-} ]]; then
+    seen=$(mktemp -- "$cursor.backfill.XXXXXX")
+    journalctl "${select[@]}" --since="$KATAMARI_MANAGER_SINCE" --output=json --no-pager > "$seen"
+    spool < "$seen"
+    last=$(tail -n 1 -- "$seen" | jq -r '.__CURSOR // empty')
+    if [[ -z $last ]]; then
+        last=$(journalctl --lines=1 --output=json --no-pager | jq -r '.__CURSOR // empty')
+    fi
+    [[ -n $last ]] || { printf 'katamari-manager-spool: cannot find a journal cursor to start from\n' >&2; exit 1; }
+    printf '%s\n' "$last" > "$cursor"
+    rm -f -- "${seen:?}"
+fi
+journalctl "${select[@]}" --output=json --cursor-file="$cursor" --follow --lines=all --no-pager | spool

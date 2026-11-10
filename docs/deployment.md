@@ -374,6 +374,77 @@ production slice, with `sparrow-ship.timer`.
 The timer runs five minutes after each completed run. Shipped data arrives when
 its producer finishes a file, not as it is written.
 
+## Katamari's journal in the spool
+
+Two interim user units on the operator's host spool `katamari-stored.service`
+into `~/.local/state/sparrow/katamari-journal/` as JSON Lines in ten-minute
+files, which the shipper source `katamari.stored` sends on. Their scripts and
+unit files are in the repository (`deploy/libexec/`, `deploy/systemd/user/`);
+the units run the copies under `~/.local/libexec/sparrow/`.
+
+| Unit and script | Journal | Records | Files | Cursor |
+| --- | --- | --- | --- | --- |
+| `katamari-journal-spool` | the `katamari` namespace (`--namespace=katamari`), where the node logs since 2026-11-09 16:12:47 | the node's own lines (`event`, `vault`, `message` ...) | `katamari-stored-YYYYMMDDTHHMM.jsonl` | `katamari-journal-ns.cursor` |
+| `katamari-manager-spool` | the default journal (`--unit=katamari-stored.service`) | systemd's lines about the unit, each with `"source":"systemd-manager"` | `katamari-manager-YYYYMMDDTHHMM.jsonl` | `katamari-manager.cursor` |
+
+The namespace journal holds only the node's lines. systemd (PID 1) writes its
+own to the default journal: starting and stopping, `Main process exited`,
+`Failed with result`, `The kernel OOM killer killed some processes in this
+unit` and `Consumed ... memory peak`. Without the second unit those are in
+journald only, and rotation loses them (the OOM kill of 2026-11-09 18:37:07 was
+found there, not in Sparrow). The manager forwarder drops the unit's own
+process, so a record in a `katamari-manager-*` file is always the manager's.
+
+The manager lines use their own file prefix and cursor, never the node's.
+`sparrow-ship` keys a file by device, inode, size and modification time and
+ships a changed file again whole, so appending to a bucket the other forwarder
+wrote would send it twice. A manager bucket can still be appended to after it
+shipped when a line arrives more than `settle_seconds` after the previous one in
+the same ten minutes; that file is then shipped again and its earlier lines
+appear twice. The bucket comes from the entry's own time, so a backfill lands
+in the buckets it belongs to.
+
+The shipper reads both prefixes through one source, because both go to the same
+consume root and watch. `~/.config/sparrow/ship.toml` needs the pattern
+widened, with no new watch and no change to the ledger (it keys each file):
+
+```toml
+[[source]]
+name = "katamari.stored"
+dir = "/home/paudley/.local/state/sparrow/katamari-journal"
+pattern = "katamari-*.jsonl"
+rule = "settled"
+format = "jsonl"
+settle_seconds = 120
+```
+
+Deploy (the operator; nothing here restarts the node or the namespace forwarder):
+
+1. `install -m 0755 deploy/libexec/katamari-manager-spool ~/.local/libexec/sparrow/` and
+   `install -m 0644 deploy/systemd/user/katamari-manager-spool.service ~/.config/systemd/user/`.
+2. Widen the `pattern` above in `~/.config/sparrow/ship.toml`.
+3. `systemctl --user daemon-reload && systemctl --user enable --now katamari-manager-spool.service`.
+   The unit sets `KATAMARI_MANAGER_SINCE`, which backfills the first start
+   from that time; it is ignored once the cursor file exists. The backfill is
+   one pass that spools everything since then, saves the cursor of the last
+   entry it saw, and follows from there.
+4. Check `journalctl --user -u katamari-manager-spool.service` is quiet, and that
+   `~/.local/state/sparrow/katamari-journal/katamari-manager-*.jsonl` holds the
+   lines (`Stopping Katamari store daemon...` and its five companions of
+   2026-11-09 18:36:36 to 18:37:10 are the first).
+
+`katamari-journal-spool` and its unit are copied into the repository unchanged
+in behavior (the license header, and a `umask` for `mkdir -m`, are the only
+edits). The live copies are not replaced by installing them.
+
+`tools/katamari-manager-spool-check.sh SCRATCH_DIR` is the recorded check
+(it needs a user manager and journal, so it is not in `make check`). It starts a
+transient user unit with `systemd-run --user`, follows it with the script
+(`KATAMARI_MANAGER_SCOPE=user` selects `--user-unit`) under its own cursor and a
+scratch spool, stops the unit, and asserts the `Stopping ...` and `Stopped ...`
+records are there with `source` set, the unit's own output is not, and the
+cursor was saved. It touches nothing but the scratch directory and its own unit.
+
 ## Online backups
 
 Backups go to the NAS archive `/net/synology/archives/sparrow` (an NFSv4 mount

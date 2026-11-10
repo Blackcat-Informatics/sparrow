@@ -163,8 +163,13 @@ if ((PROFILE_CHANGED)); then
 fi
 
 # 6. Helpers run by the timers.
-for helper in sparrow-ship sparrow-backup; do
+for helper in sparrow-ship sparrow-backup katamari-journal-spool katamari-manager-spool; do
     if put "$DEPLOY_DIR/libexec/$helper" "$PREFIX/libexec/sparrow/$helper" 0755; then :; fi
+done
+# The Katamari journal forwarders run as interim user units (docs/deployment.md, "Katamari's journal
+# in the spool"); the system install only holds their unit files for the operator to copy.
+for unit in "$DEPLOY_DIR"/systemd/user/katamari-*.service; do
+    if put "$unit" "$PREFIX/share/sparrow/user-units/${unit##*/}" 0644; then :; fi
 done
 
 # 7. The image pair, under its own names; the stable links only when none exist yet.
