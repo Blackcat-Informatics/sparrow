@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 11e4c4c11fb5ae43765467dbf08c064c2528b79b
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 189
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/189
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: f76cf72c260f4d277f89eb3d1549f5b519ab5ad3
+GhpRsq-Head-Ref: paudley/173-watch-claims-until-misses-claims-whose
+GhpRsq-Head-OID: 11e4c4c11fb5ae43765467dbf08c064c2528b79b
+GhpRsq-Result-Tree: d1d6958a657ebecde1536f912c960298d01cd7a6
+GhpRsq-Result-Commit: bce6adae2d5654ef8f0e13d2828d64de22e1464e
+GhpRsq-Parent-Hashes: 11e4c4c11fb5ae43765467dbf08c064c2528b79b
+GhpRsq-Squash-Notes-SHA256: 639ee0ede5305608d3b8c790a7709122eb540c4805a4098f20f3b1965c681c50
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: e28ba3a3ab9116d1c129555725707a2c8f2c336c
+GhpRsq-Stage-Commit: 0c1181a657f68b9d378104c419d764783b4d352c
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/0c1181a657f68b9d378104c419d764783b4d352c
+GhpRsq-Stage-Ref: refs/ghprsq/pr/189/stage
+GhpRsq-Stage-Files: 9
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/0c1181a657f68b9d378104c419d764783b4d352c
