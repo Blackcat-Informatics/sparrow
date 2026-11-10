@@ -819,9 +819,11 @@ has not reached once, so its cost shrinks as the migration advances. It runs
 from a snapshot without the writer lock, as a listing build: once per `sources`
 capture, and for a live `artifacts` listing once when it starts and again for
 each further window of 32,768 owed rows its pages pass. CPU is not capped. What
-it holds is charged to the admission of each page that holds it: the owed count
-changes to the `sources` capture, and the owed window, at 64 bytes plus the key
-per row, to each page of the listing; a window always fits that admission. No
+it holds is charged when a page holds it: the owed count changes to the `sources`
+capture, and the owed window, at 64 bytes plus the key per row, to each page of
+the listing; a window always fits that admission. While a build runs, before its
+page exists, its memory is bounded by the window and capture limits and is not yet
+charged to a request. No
 reader refuses because a migration is pending.
 
 #### Listing builds
@@ -843,9 +845,16 @@ starts another; a capture's lease starts when its first page is delivered. A
 build's lease runs 60 seconds from the last call that followed its cursor, and
 `resultRelease` with its `snapshot_id` cancels it. An abandoned build is
 dropped when its lease ends, at the latest at the next expiry pass, which
-cancels its thread and drops its snapshot. At most eight builds of each listing
-run at a time; a further fresh listing refuses with `RESOURCE_LIMIT`. Once the
-migration is complete no listing builds.
+cancels its thread and drops its snapshot. A finished build stays until the page
+built from it has been delivered, so a call that fails or is cancelled while its
+page waits for the writer is retried on the same cursor. A page with `build` has
+no rows and is not a result: `total_items` of a `sources` build page is 0 and does
+not mean an empty catalog, so a client follows `next_cursor`. At most eight builds
+of each listing run at a time, counting a live `artifacts` window continuation; a
+further fresh listing or window refuses with `RESOURCE_LIMIT`. Once the migration
+is complete no listing builds. A build's thread keeps its own handle on the store,
+so closing the store does not cancel it until its lease ends (at most 60 seconds);
+the process exit ends it at once.
 
 The migration's duration on the live store is measured on a copy of the newest
 closed-store backup with `deploy/verify-backup.sh --measure-migration`, recorded

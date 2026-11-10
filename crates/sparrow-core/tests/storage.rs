@@ -19700,7 +19700,7 @@ fn a_live_listing_across_migration_pages_and_expiry_lists_the_finished_index() {
 fn hold_listing_builds(store: &Store) -> impl Fn() {
     let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     store
-        .pause_source_reads_for_tests({
+        .hold_listing_builds_for_tests(1, {
             let gate = gate.clone();
             move || {
                 let (open, ready) = &*gate;
@@ -19789,7 +19789,10 @@ fn a_source_listing_during_the_source_summary_migration_is_a_build_its_cursor_re
     let cursor = first.next_cursor.clone().expect("the build's cursor");
     let progress = first.build.expect("the build's progress");
     assert_eq!(progress.total, owed, "{progress:?}");
-    assert!(progress.read <= progress.total.unwrap(), "{progress:?}");
+    assert_eq!(
+        progress.read, 1,
+        "the held build has read one entry: {progress:?}"
+    );
 
     // Following the cursor while the build is held resumes it.
     store

@@ -226,8 +226,7 @@ pub(super) type Pause = std::sync::Arc<dyn Fn() + Send + Sync>;
 #[cfg(feature = "test-support")]
 impl Store {
     /// Run `pause` in every later source listing after it has taken its snapshot and released
-    /// the writer lock, and before it reads any row, and in every later artifact listing
-    /// build after it has taken its snapshot. Acceptance tests only.
+    /// the writer lock, and before it reads any row. Acceptance tests only.
     pub fn pause_source_reads_for_tests(
         &self,
         pause: impl Fn() + Send + Sync + 'static,
@@ -240,7 +239,7 @@ impl Store {
         Ok(())
     }
 
-    pub(super) fn source_read_paused(&self) -> Result<(), Error> {
+    fn source_read_paused(&self) -> Result<(), Error> {
         let pause = self
             .source_read_pause
             .lock()
@@ -451,14 +450,23 @@ impl Store {
                 },
             });
         };
-        self.source_builds()?.remove(id);
-        let mut snapshot = result?;
+        let mut snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.source_builds()?.remove(id);
+                return Err(error);
+            }
+        };
         // The capture's lease starts when its first page is delivered.
         snapshot.expires_at = now
             .checked_add(LEASE_MS)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "source read deadline overflow"))?;
         snapshot.started = Instant::now();
-        self.publish_sources(snapshot, now, cancellation)
+        // The build is retired only once its first page exists: a call that fails to publish
+        // it leaves the finished build for the next call on the same cursor.
+        let page = self.publish_sources(snapshot, now, cancellation)?;
+        self.source_builds()?.remove(id);
+        Ok(page)
     }
 
     fn publish_sources(

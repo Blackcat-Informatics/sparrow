@@ -141,6 +141,7 @@ impl<B> CatalogReadPage<B> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Snapshot<S, B> {
     pub bytes: usize,
     pub id: String,

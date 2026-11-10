@@ -47,9 +47,14 @@ pub struct BuildProgress {
 
 enum State<T> {
     Running,
+    /// Kept until the build is retired, so a call that fails to deliver its first page
+    /// leaves it for the next call on the same cursor.
     Done(Result<T, Error>),
-    Delivered,
 }
+
+/// Dev-only: hold a build's thread once it has read this many entries.
+#[cfg(feature = "test-support")]
+pub(super) type Hold = (u64, Arc<dyn Fn() + Send + Sync>);
 
 struct Shared<T> {
     state: Mutex<State<T>>,
@@ -60,6 +65,8 @@ struct Shared<T> {
     cancellation: QueryCancellation,
     /// When a call last waited on the build: its lease runs from then.
     polled: Mutex<Instant>,
+    #[cfg(feature = "test-support")]
+    hold: Option<Hold>,
 }
 
 impl<T> Shared<T> {
@@ -83,6 +90,12 @@ impl<T> Worker<T> {
     /// is cancelled or its lease has ended.
     pub(super) fn entry(&self) -> Result<(), Error> {
         let read = self.0.read.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(feature = "test-support")]
+        if let Some((at, hold)) = &self.0.hold
+            && read == *at
+        {
+            hold();
+        }
         if read.is_multiple_of(CHECK_EVERY) {
             self.checkpoint()?;
         }
@@ -139,9 +152,10 @@ impl<C, T> Drop for Build<C, T> {
 /// A call's view of one build, used without the registry lock.
 pub(super) struct Waiter<T>(Arc<Shared<T>>);
 
-impl<T> Waiter<T> {
+impl<T: Clone> Waiter<T> {
     /// Wait until the build finishes, at most `budget`, refusing if the caller cancels.
-    /// `Some` holds the build's result, taken by this call; `None` means it still runs.
+    /// `Some` holds a copy of the build's result, which stays with the build until it is
+    /// retired; `None` means it still runs.
     pub(super) fn wait(
         &self,
         budget: Duration,
@@ -150,15 +164,12 @@ impl<T> Waiter<T> {
         let deadline = Instant::now() + budget;
         let mut state = lock(&self.0.state);
         loop {
-            match std::mem::replace(&mut *state, State::Delivered) {
-                State::Done(result) => return Ok(Some(result)),
-                State::Delivered => {
-                    return Err(Error::new(
-                        "CONFLICT",
-                        "another call already took this listing build's first page",
-                    ));
+            match &*state {
+                State::Done(Ok(result)) => return Ok(Some(Ok(result.clone()))),
+                State::Done(Err(error)) => {
+                    return Ok(Some(Err(Error::new(error.code, error.message.clone()))));
                 }
-                State::Running => *state = State::Running,
+                State::Running => {}
             }
             cancellation.checkpoint()?;
             let now = Instant::now();
@@ -174,7 +185,9 @@ impl<T> Waiter<T> {
                 .0;
         }
     }
+}
 
+impl<T> Waiter<T> {
     pub(super) fn progress(&self) -> BuildProgress {
         self.0.progress()
     }
@@ -195,6 +208,8 @@ pub(super) struct Builds<C, T> {
     running: Arc<AtomicUsize>,
     started: u64,
     wait: Duration,
+    #[cfg(feature = "test-support")]
+    hold: Option<Hold>,
 }
 
 impl<C, T> Default for Builds<C, T> {
@@ -204,6 +219,8 @@ impl<C, T> Default for Builds<C, T> {
             running: Arc::default(),
             started: 0,
             wait: BUILD_WAIT,
+            #[cfg(feature = "test-support")]
+            hold: None,
         }
     }
 }
@@ -241,6 +258,8 @@ impl<C, T: Send + 'static> Builds<C, T> {
             total: AtomicU64::new(0),
             cancellation: QueryCancellation::default(),
             polled: Mutex::new(Instant::now()),
+            #[cfg(feature = "test-support")]
+            hold: self.hold.clone(),
         });
         let worker = Worker(Arc::clone(&shared));
         self.running.fetch_add(1, Ordering::SeqCst);
@@ -249,7 +268,15 @@ impl<C, T: Send + 'static> Builds<C, T> {
             .name("sparrow-listing-build".into())
             .spawn(move || {
                 let _running = running;
-                let result = work(&worker);
+                // A panic is a failed build, not one that never finishes.
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&worker)))
+                        .unwrap_or_else(|_| {
+                            Err(Error::new(
+                                "STORAGE_FAILURE",
+                                "listing build failed: its thread panicked",
+                            ))
+                        });
                 *lock(&worker.0.state) = State::Done(result);
                 worker.0.ready.notify_all();
             })
@@ -319,6 +346,13 @@ impl<C, T: Send + 'static> Builds<C, T> {
     #[cfg(feature = "test-support")]
     pub(super) fn set_wait_for_tests(&mut self, wait: Duration) {
         self.wait = wait;
+    }
+
+    /// Dev-only: hold every later build's thread with `hold.1` once it has read `hold.0`
+    /// entries.
+    #[cfg(feature = "test-support")]
+    pub(super) fn hold_for_tests(&mut self, hold: Hold) {
+        self.hold = Some(hold);
     }
 
     /// Registered builds, threads still running, and builds ever started.

@@ -2825,6 +2825,29 @@ impl Store {
         assert!(joined.is_err() && self.inner.is_poisoned());
     }
 
+    /// Dev-only: hold every later listing build's thread with `hold` once it has read `entry`
+    /// entries, so a test can observe a running build's progress.
+    #[cfg(feature = "test-support")]
+    pub fn hold_listing_builds_for_tests(
+        &self,
+        entry: u64,
+        hold: impl Fn() + Send + Sync + 'static,
+    ) -> Result<(), Error> {
+        let poisoned = || Error::new("STORAGE_FAILURE", "listing builds poisoned");
+        let hold: listing_build::Hold = (entry, std::sync::Arc::new(hold));
+        self.unlocked
+            .source_builds
+            .lock()
+            .map_err(|_| poisoned())?
+            .hold_for_tests(hold.clone());
+        self.unlocked
+            .artifact_builds
+            .lock()
+            .map_err(|_| poisoned())?
+            .hold_for_tests(hold);
+        Ok(())
+    }
+
     /// Dev-only: make every source and artifact listing call wait at most `wait` for its
     /// build before it answers with the build's cursor.
     #[cfg(feature = "test-support")]

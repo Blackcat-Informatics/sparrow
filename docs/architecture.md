@@ -555,7 +555,7 @@ explicit pending path until a migration completes and say so where the answer
 could differ: the schema 69 receipt-time fallback backfill is reported in
 SPARQL coverage while the view serves the facts it still owes, scoped SPARQL
 reads the owner index for the declarations already copied and walks the rest,
-the source listings add what the counter seeding still owes to the stored rows,
+the source listings add what the source-summary migration still owes to the stored rows,
 and record context walks the primary time index while a stale source timeline
 cache is rebuilt. Pending paths that may read much of the store run from a
 snapshot without the writer lock and check cancellation; their CPU is not

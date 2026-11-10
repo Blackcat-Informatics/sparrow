@@ -461,8 +461,6 @@ impl Store {
         let reader = super::store_counters::Reader::snapshot(&snapshot);
         let progress = source_summary::progress(|key| reader.get(key.as_bytes()))?;
         worker.total(source_summary::owed_entries(&reader, &progress)?);
-        #[cfg(feature = "test-support")]
-        self.source_read_paused()?;
         let prefixes = selected_prefixes(selector);
         let (from, before) = (selector.received_from, selector.received_before);
         let after = after.map(str::to_owned);
@@ -671,15 +669,25 @@ impl Store {
                 },
             });
         };
+        let owed = match result {
+            Ok(owed) => owed,
+            Err(error) => {
+                builds.remove(id);
+                return Err(error);
+            }
+        };
         let pending = builds.context(id).cloned().ok_or_else(|| {
             Error::new(
                 "RESULT_EXPIRED",
                 "listing build lease ended before its page",
             )
         })?;
-        builds.remove(id);
         drop(builds);
-        self.artifact_pending_page(pending, result?, now, cancellation)
+        // The build is retired only once its page exists, so a failed or cancelled call
+        // leaves the finished window for the next call on the same cursor.
+        let page = self.artifact_pending_page(pending, owed, now, cancellation)?;
+        self.artifact_builds()?.remove(id);
+        Ok(page)
     }
 
     fn artifact_pending_page(
