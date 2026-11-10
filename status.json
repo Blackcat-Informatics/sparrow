@@ -1,0 +1,80 @@
+{
+  "issue": 184,
+  "pr_number": 185,
+  "branch": "paudley/184-replace-or-slow-the-sub-second-ticks-50",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50",
+  "observed_at": "2026-11-10T10:50:21.163120+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/184-replace-or-slow-the-sub-second-ticks-50/.stage/replace-or-slow-the-sub-second-ticks-50/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 185,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Wait on events in the watch worker and the worker health gate",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/185",
+    "baseRefName": "main",
+    "baseRefOid": "c82bfa49e38f5113b387c4aad03ab99ef666ae26",
+    "headRefName": "paudley/184-replace-or-slow-the-sub-second-ticks-50",
+    "headRefOid": "4954964431ca0af4937103c17dc895048cf8abbb",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/79/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "4954964431ca0af4937103c17dc895048cf8abbb",
+    "branch": "paudley/184-replace-or-slow-the-sub-second-ticks-50",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 185,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #185 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "missing_artifacts": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

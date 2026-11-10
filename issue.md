@@ -1,0 +1,90 @@
+# Issue #184: Replace or slow the sub-second ticks (50 ms watch worker tick and others) (REQUIRED, Patrick's design rule)
+
+State: open   Repo: fleet/sparrow   Forge: forgejo
+
+## Body
+
+## Source
+
+Patrick's design rule, relayed by coordination 2026-11-10: loops or timers that fire more than once a second are avoided unless absolutely needed; nothing here needs that responsiveness. New code follows it now. This issue lists the existing ones (inventory by a sonnet read-only auditor at main 44b76c3, `.stage/subsecond-ticks.md`; I spot-checked `watches.rs:140` (`const TICK` = 50 ms) and `watches.rs:1330` (the idle `sleep(TICK)`), not the other rows).
+
+Counts (auditor): EVENT 5, SLOW 5, KEEP 7, TEST-ONLY 9 grouped rows. The four 50 ms uses of `TICK` in `watches.rs` plus the 200 ms `worker_health` tick in `main.rs` are the production wakeups to replace with events; the SLOW rows move to one second or slower; KEEP rows are bounded waits or already slow. The report recommends one shared fix for the watch worker: wait on the inotify descriptors, the command channel, a stop notification and a pending-claim wake, with a fallback of one second or more for the free-space check; and a 1000 ms minimum for `buffered_flush_interval_ms` in `config.rs` (default 2000, no lower bound today).
+
+## Inventory (full table from the report)
+
+## Production loops, timers and ticks under one second
+
+| # | file:line | Purpose | Period and kind | Caller and real frequency | Would an event or a cadence of one second or slower serve? | Verdict |
+|---|---|---|---|---|---|---|
+| 1 | crates/sparrow-server/src/watches.rs:140 (`TICK` = 50 ms) and :1330 (idle sleep) | Idle arm of the watch worker loop (`while !stop`, :1192). It rereads `space_floor().shortfall()`, `consumption_pending()` (a store read), the command channel via `try_recv`, then `detector.drain()` for each detector. | 50 ms fixed tick, 20 per second. | Always, whenever a watch worker exists. Every iteration touches the store even when nothing has happened. | Yes, an event. The inotify descriptors are already non-blocking fds that can go into tokio `AsyncFd` (or `spawn_blocking` with `poll`). The command channel already has an async `recv`. `consumption_pending` can wake on a `Notify` from the writer. A 1 s space check covers the rest, as `SPACE_CHECK_INTERVAL` does in main.rs. | EVENT |
+| 2 | watches.rs:1517 | Tail of the same loop, after a completed claim or a loop pass. | 50 ms fixed tick. | Always when the worker is running. It is the same cadence as row 1; it sleeps even right after doing work. | Yes, an event. After work the loop should re-evaluate at once, and when idle it should block on the wake sources in row 1. | EVENT |
+| 3 | watches.rs:1419-1420 | No RPC client yet. It records `retry = now + TICK` and sleeps. | 50 ms fixed; `connect_after` (:1413) throttles the connect attempts to 1 s, but the loop around them spins at 20 per second. | Only when a consume claim is pending and the loopback client is missing: daemon start, connect failure, or a client replaced at the lease. | A cadence of one second or slower serves. The next connect cannot happen before `connect_after` (1 s), so waking every 50 ms in between does nothing. Sleep until `connect_after`. | SLOW |
+| 4 | watches.rs:1425-1428 | A tail claim finds `operations.try_acquire()` with no permits and sleeps one tick. | 50 ms fixed retry. | Only when the operation budget is exhausted (a query or maintenance holds all permits). | Yes, an event. `Semaphore::acquire` is async and wakes the moment a permit frees; no tick is needed. | EVENT |
+| 5 | watches.rs:882-886 (`stopped()`), used at :1406 and :1470 | An async "stop requested" future that polls an `AtomicBool`. It is a `select!` arm during the 10 s connect and the 45 s publication. | 50 ms fixed poll. | Only while a connect or a consume publication is in flight. | Yes, an event. The stop flag is only set in `ConsumeWorker::drop` (:878). A `tokio::sync::Notify` or `watch` channel, set at the same place, wakes the select instantly. | EVENT |
+| 6 | crates/sparrow-server/src/main.rs:67 and :78 (`WORKER_HEALTH_INTERVAL` 200 ms) | `worker_health` checks `is_finished()` on the consumer, syslog and maintenance workers. | 200 ms fixed tick, 5 per second. | Always (every serving daemon, even one with nothing to check). | Yes, an event. Each worker already holds a `JoinHandle` that can be awaited in the `select!`, which wakes the instant a worker ends. A 1 s tick would also serve because the daemon exits and systemd restarts it. | EVENT |
+| 7 | crates/sparrow-core/src/storage/backup.rs:372 and :442 (`GUARD_INTERVAL` 250 ms) | Free-space guard while a backup copies. | 250 ms `recv_timeout`. The channel receive also wakes at once on stop, so the timeout is a polling period that wakes the thread to measure space. | Only while a backup runs (daily 04:00 timer, up to hours). | A cadence of one second or slower serves. The other free-space guards in the daemon run at 1 s (`SPACE_CHECK_INTERVAL`, maintenance `pressure`), and the guard measures a slow-moving quantity. There is no event source for filesystem free space. | SLOW |
+| 8 | crates/sparrow-client/src/delivery.rs:64 (`retry_interval` 250 ms), used at :800 | Client delivery loop pause after a failed RPC, before it resends the same batch. | 250 ms fixed. It is not exponential. | Only while the daemon is unreachable or the RPC fails; it repeats at 4 per second for as long as the outage lasts, in every client process. | A cadence of one second or slower serves, ideally with a growing backoff. A client that cannot reach the daemon gains nothing from four attempts a second, and the sleep is interrupted by `abort_wake` anyway. | SLOW |
+| 9 | crates/sparrow-server/src/maintenance.rs:172-174, :338 of main.rs (`buffered_flush_interval_ms`, default 2000, `DEFAULT_FLUSH_INTERVAL_MS`) | The buffered-durability flush interval. | Operator-configured and unvalidated (config.rs:34 has no lower bound). The default is 2000 ms, so it is not sub-second in production. A value of 0 would make `tokio::time::interval` panic. Tests use 1 ms. | Always at the configured period. | A cadence of one second or slower serves; the default already does. Recommend a validated minimum of 1000 ms so a configuration cannot cause a sub-second tick. | KEEP (default 2 s); add a floor in config |
+| 10 | maintenance.rs:216 and :305 (`tokio::task::yield_now`) | Cooperative yield between maintenance jobs. Line 216 is the arm that continues a paged expiry traversal back to back. | No period. It is not a timer. Line 216 spins through expiry pages until the traversal ends. | Line 305 once per maintenance job. Line 216 only during a paged expiry sweep (every 60 s); it is bounded because `continuation` clears when the traversal finishes. | Not applicable. Each pass runs a bounded `spawn_blocking` job, so this is a fairness yield. An error clears `continuation`, so a failing job cannot busy-loop (comment :294). | KEEP (bounded work, fairness) |
+| 11 | crates/sparrow-core/src/storage/writer_queue.rs:19 and :83 (`MIN_DEFERRAL` 100 ms) | Condvar `wait_timeout` that lets a migration page wait for queued writers. | At most 100 ms (or the last page's hold time). The timeout only bounds a blocking wait; the wait is woken by `notify_all` when the writers drain. | Only while a migration page is being deferred. | Not a polling loop. It is a condvar wait that already wakes on the event (`Arrival::drop`); the timeout is an upper bound on the page delay. | KEEP (bounded wait, not polling) |
+| 12 | crates/sparrow-server/src/local_endpoint.rs:62-63 (250 ms) | `tokio::time::timeout` on a liveness `connect` to a stale socket path. | 250 ms single timeout, once. | Only at startup, only when the socket path is already bound. | Not a polling loop. A one-shot deadline that bounds a blocking call. | KEEP (bounded wait, not polling) |
+| 13 | crates/sparrow-server/src/syslog_listener.rs:501 (`read_timeout_ms`, 1..=60000; the tests set 1000) | Per-frame read timeout on a syslog connection. | Operator-configured 1 ms to 60 s. A deadline per frame, not a tick. | Only on an open syslog connection while a frame is partly received. | Not a polling loop. It bounds a blocking read and causes no wakeups to do work. | KEEP (bounded wait, not polling) |
+| 14 | crates/sparrow-core/src/storage/catalog_lease.rs:13, :54, :181; pin_read.rs:265; record_spool.rs:144; artifact_read.rs:1129; rdf_view/budget.rs:56 (`LEASE_MS` = 60 000, `lease_ms`) | Query and scan lease deadlines compared with `Instant::elapsed`. | 60 s deadline. A deadline check inside a bounded scan, not a timer. The `from_millis` form reads sub-second but the value is 60 s. | Only inside a scan or query. | Not a polling loop. | KEEP (deadline, not polling) |
+| 15 | crates/sparrow-server/src/watches.rs:445-446 (`rescan_interval`, at least 60 s) and :141-154 (`RETRY_FIRST` 5 s, doubling to 15 min) | Periodic consume rescan; claim publication retry backoff. | 60 s or more; 5 s to 15 min. Not sub-second; listed because they were named in the grep. | Always (rescan); only after a failed publication (retry). | Already slow and bounded. | KEEP (slow) |
+| 16 | deploy/verify-backup.sh:526 and :1018 (`sleep 0.2`) | Wait for the restored daemon's `sparrowd: store=` log line. | 200 ms fixed poll, bounded by a deadline. | Only when an operator or cron runs backup verification (the verify step after each backup); it runs for as long as the store takes to open (seconds to minutes). | Yes, a cadence of one second or slower serves. The wait is for a daemon start and the following loops in the same script already use `sleep 1`. | SLOW |
+| 17 | tools/katamari-manager-spool-check.sh:40 (`sleep 0.5`, up to 60 times) | Wait for the "Stopped" line to be spooled, in a manual tool check. | 500 ms fixed, 30 s ceiling. | Only when a developer runs the check by hand; it is not in the Makefile gate. | Yes, a cadence of one second or slower serves; the wait is for a journal follower to catch up. | SLOW |
+
+## Test-only hits (cfg(test), `tests/`, `test-support`, feature `test-support`)
+
+| file:line | What | Period | Verdict |
+|---|---|---|---|
+| crates/sparrow-server/src/maintenance.rs:347, 359, 385, 387, 405, 412, 496, 497, 504, 536, 579 | Test workers started with a 1 ms flush; poll-until-true loops with 10, 20 and 50 ms sleeps | 1 to 50 ms | TEST-ONLY |
+| crates/sparrow-server/src/shutdown.rs:112, 170 | `yield_now` inside a biased `select!` to prove a drain is still pending | no period | TEST-ONLY |
+| crates/sparrow-server/tests/rpc.rs: 555, 580, 710, 853, 983, 2134, 2142, 2149, 2296, 2309, 2425, 3570, 3643, 3745, 4681, 4997, 5980, 6130, 6243, 6275, 6605, 6624, 6852, 6883, 7482, 8054, 8080, 8144, 8172, 8360, 8402, 8556, 8844, 8928, 11265, 11280, 11354, 11378; configs at 1433-1434, 8040, 8312-8313, 8351, 8391, 8466 | Wait-until-state polls and short client retry/flush configurations in integration tests | 1 to 600 ms | TEST-ONLY |
+| crates/sparrow-core/tests/storage.rs: 5228, 19082, 20036, 20135, 20700, 20718, 20811 | Thread sleeps while waiting on a store state | 1 to 250 ms | TEST-ONLY |
+| crates/sparrow-client/src/delivery.rs: 906, 913, 925, 949, 956, 970, 981 (inside `#[cfg(test)]` starting :828) | `yield_now` and 1 ms sleep spin loops while a test fills the queue; 20 ms shutdown timeout | spin or 1 ms | TEST-ONLY |
+| crates/sparrow-client/src/imports.rs:473, 487; logging.rs:535 | 1 s receive timeout, 10 ms mtime separation, 1 ms flush timeout in tests | 1 to 1000 ms | TEST-ONLY |
+| crates/sparrow-test-support/src/crash.rs:100 (5 ms), :49 (30 s hold) | Dev-only crash harness polling for a marker | 5 ms | TEST-ONLY |
+| crates/sparrow-core/src/storage/migration.rs:309 | `thread::sleep(hold)` behind `#[cfg(feature = "test-support")]` to hold a migration page | test-set | TEST-ONLY |
+| crates/sparrow-core/src/storage/pin_read.rs:431 | `Instant::now() - from_millis(LEASE_MS + 1)` builds an expired lease; no wait | none | TEST-ONLY |
+
+## Reviewed and not sub-second (excluded)
+
+- Exactly 1 s: maintenance.rs:175-176 (`pressure`, `reclaim`), main.rs:15, :162, :343 and syslog_listener.rs:415 (free-space checks), watches.rs:1413 (`connect_after`), client imports.rs:92 (reconnect, 30 s bound). These fire once a second, not more.
+- 5 s `recompress`, 60 s `expiry` and `migrate` (maintenance.rs:15-21). systemd units: `RestartSec=10` (sparrow.service, katamari-journal-spool.service, katamari-manager-spool.service), `OnUnitInactiveSec=5min` (sparrow-ship.timer), `OnCalendar` 04:00 (backup timer), and `TimeoutStartSec` values of 30 min and 6 h used as limits, not polling. No unit has a sub-second timer or restart.
+- Shell and Python waits of 1, 2, 5, 10 s (deploy/lib.sh:329, verify-backup.sh, user-unit-upgrade.sh, libexec/sparrow-backup POLL_SECONDS 10). Python `timeout=` values in sparrow-measure-load are subprocess ceilings.
+- helper-census `poll(&mut cx)` (main.rs:648, :702) is a manual future poll that drives a single `block_on`, not a time loop. No `park_timeout`, `epoll_wait`, `poll_timeout` or `spin_loop` was found.
+
+## Notes
+
+- The known 50 ms worker tick is rows 1 to 5: one `TICK` constant with five uses. They share one fix: wait on the inotify descriptors, the command channel, a stop notification and a pending-claim wake, with a fallback of 1 s or more for the free-space check. Rows 4 and 5 are small fixes on their own.
+- Per .stage/r106-watches.md row 4, the tick does not stat the filesystem; the 20 per second cost is the store reads (`space_floor`, `consumption_pending`) and `drain`, not file I/O.
+
+## Counts per verdict
+
+- EVENT: **5** (rows 1, 2, 4, 5, 6)
+- SLOW: **5** (rows 3, 7, 8, 16, 17)
+- KEEP: **7** (rows 9 with a recommended floor, 10, 11, 12, 13, 14, 15; rows 11 to 14 are bounded waits, not polling)
+- TEST-ONLY: **9** grouped rows (about 100 individual hits)
+
+## Done when
+
+Each EVENT and SLOW row is changed (or reclassified KEEP with a recorded reason), with a test per behavior change; the 50 ms watch-worker tick has no remaining periodic wakeup under one second when the watch is idle; the report is re-run and its counts for EVENT and SLOW are zero.
+
+## Waits on
+
+Nothing; taken in my own order after the current coding lane (#158). Not a prerequisite of the D147 image. Nothing waits on Patrick.
+
+
+## Comments (1)
+
+### paudley — 2026-11-10T07:49:07Z
+
+Ruling (Patrick, relayed by coordination 2026-11-10): everything on this list is to be corrected as the coding lane becomes free, without interrupting the lane in progress. Remove busy waiting and needless sampling: code that wakes on a clock to ask whether something has happened, or samples faster than anything needs. A wait is an event the thread blocks on. A row stays sub-second only where this issue shows, with file and line, that an event or a wait of a second or longer cannot do the work.
+
+Consequence for the table: every EVENT and SLOW row is changed. Each KEEP row must carry its file:line reason here (a bounded wait woken by an event, a one-shot timeout, a lease deadline, an operator-configured read timeout); a KEEP without that reason is changed. Order in the coding lane: after #158 (PR #169) and #180 (PR #182), then this issue. It is one PR if the watch-worker change is small enough to review, otherwise the watch worker (rows 1 to 5, `watches.rs`) is its own PR first.
+
+
+## Coverage
+
+- forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only
