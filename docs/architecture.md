@@ -158,7 +158,8 @@ RocksDB starts only while level-0 files or pending compaction bytes call for a s
 an idle store runs one. A level-0 compaction may split into two threads. Compaction
 threads run at the lowest CPU priority, so on a host shared with other services they
 yield to intake. The stated target is no hard stops and at most 1 percent of the time
-stalled at the live write rate; the measurement is in
+stalled at the live write rate. Under the unit's one-core CPU quota the measured store
+met it only once its compaction backlog had drained; the measurement is in
 [load qualification](load-qualification.md#write-stalls-issue-160).
 
 ### 4.2 Deduplication and compression

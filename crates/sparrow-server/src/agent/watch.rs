@@ -355,18 +355,11 @@ fn mutation(result: wire::result::Reader<'_, wire::watch_mutation::Owned>) -> Re
         .into())
 }
 
-fn clock(value: wire::optional_instant::Reader<'_>) -> Result<Option<u64>> {
+/// An optional instant as RFC 3339 text through the shared [`super::instant`], or null.
+fn clock_text(value: wire::optional_instant::Reader<'_>) -> Result<Value> {
     Ok(match value.which()? {
-        wire::optional_instant::Value(at) => Some(at?.get_unix_millis()),
-        wire::optional_instant::Absent(()) => None,
-    })
-}
-
-fn clock_text(clock: Option<u64>) -> Result<Value> {
-    clock.map_or(Ok(Value::Null), |at| {
-        sparrow_core::format_instant(at)
-            .map(Value::from)
-            .map_err(|e| invalid(e.to_string()))
+        wire::optional_instant::Value(at) => super::instant(at?)?.into(),
+        wire::optional_instant::Absent(()) => Value::Null,
     })
 }
 
@@ -384,11 +377,12 @@ fn claims(value: wire::watch_claims::Reader<'_>) -> Result<Value> {
             wire::ClaimState::Abandoned => (2, "abandoned"),
         };
         counts[index] += 1;
-        let first_seen = clock(claim.get_first_seen()?)?;
-        let age = first_seen
-            .filter(|_| state == wire::ClaimState::Pending)
-            .map(|at| Value::from(as_of.saturating_sub(at).to_string()))
-            .unwrap_or(Value::Null);
+        let age = match claim.get_first_seen()?.which()? {
+            wire::optional_instant::Value(at) if state == wire::ClaimState::Pending => {
+                Value::from(as_of.saturating_sub(at?.get_unix_millis()).to_string())
+            }
+            _ => Value::Null,
+        };
         let reason = match claim.get_last_pending_reason()?.which()? {
             wire::optional_text::Value(reason) => Value::from(reason?.to_str()?),
             wire::optional_text::Absent(()) => Value::Null,
@@ -402,19 +396,13 @@ fn claims(value: wire::watch_claims::Reader<'_>) -> Result<Value> {
                     "relative_path_hex",
                     purrdf_hash::hex::encode(claim.get_relative_path()?),
                 )
-                .with("first_seen", clock_text(first_seen)?)
+                .with("first_seen", clock_text(claim.get_first_seen()?)?)
                 .with("age_ms", age)
                 .with("attempts", u64::from(claim.get_attempts()))
-                .with(
-                    "last_attempt",
-                    clock_text(clock(claim.get_last_attempt()?)?)?,
-                )
-                .with(
-                    "last_pending_at",
-                    clock_text(clock(claim.get_last_pending_at()?)?)?,
-                )
+                .with("last_attempt", clock_text(claim.get_last_attempt()?)?)
+                .with("last_pending_at", clock_text(claim.get_last_pending_at()?)?)
                 .with("last_pending_reason", reason)
-                .with("finished_at", clock_text(clock(claim.get_finished_at()?)?)?),
+                .with("finished_at", clock_text(claim.get_finished_at()?)?),
         ));
     }
     Ok(Object::new()
