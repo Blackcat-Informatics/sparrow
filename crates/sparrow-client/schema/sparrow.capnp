@@ -794,7 +794,8 @@ interface Sparrow {
   # and return at once; status reports its progress. Refused while one runs (CONFLICT).
   backup @53 (storeId :Text) -> (result :Result(BackupStatus));
   # Schema 71: read-only per-claim states; every pending claim and every completed or
-  # abandoned claim that went pending within the window.
+  # abandoned claim whose pending span (reservation to latest pending attempt) overlaps the
+  # window; an abandoned claim is also listed when retired inside it.
   watchClaims @54 (query :WatchClaimsQuery) -> (result :Result(WatchClaims));
 }
 

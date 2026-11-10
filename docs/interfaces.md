@@ -2367,7 +2367,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume/tail administration; removal preserves existing claims and active tail generations guard definition changes/removal. |
 | `watchClaimRetire` | Administration (schema 70): retire one claim that can never complete, recording the authenticated caller, time and reason; see "Retiring an unrecoverable claim". |
 | `backup` | Administration (schema 70): start an online backup of the store into the configured `backup_root`; see "Online backup". |
-| `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim that went pending in a time window, with its history; see "Per-claim state listing". |
+| `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim whose pending span overlaps a time window, with its history; see "Per-claim state listing". |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Schema 23 adds `discover`: store identity, schema version, native text/RDF profile
@@ -2881,8 +2881,8 @@ saved producer intent when that authority is needed.
 
 Status reports only per-watch counts. `watchClaims` (CLI `watch claims
 [--since RFC3339] [--until RFC3339]`) lists claims one by one, so the zero-loss
-check after a write stall is one read: of the claims that went pending since T,
-how many completed, which are still pending and for how long, and whether any
+check after a write stall is one read: of the claims that were pending at some
+point since T, how many completed, which are still pending and for how long, and whether any
 was abandoned. It is read-only: anonymous TCP and the ingest socket refuse it,
 and a query-only daemon serves it. The daemon reads its own store; the CLI
 never opens the store.
@@ -2894,15 +2894,20 @@ claim pending and one for the attempt that completed it; `last_attempt`; and
 attempt that left it pending, such as the 45-second consume publication
 deadline. The reason is cut to 320 encoded bytes. The history moves with the
 journal when the claim completes or is retired. A journal reserved by an
-older binary has no `first_seen` and counts only the attempts made since.
+older binary has no `first_seen`; its span is its latest pending attempt alone.
 Reserving a source now refuses a journal that would leave less than 448
 bytes of its 8 KiB for this history.
 
 A claim is `pending` while it is in the active recovery set, `complete` once
 its publication and source removal are recorded, and `abandoned` once an
 administrator retired it unrecoverable. The listing returns every pending
-claim, every complete claim whose `last_pending_at` falls in the window, and
-every abandoned claim whose `last_pending_at` or retirement falls in it. A
+claim, and every complete or abandoned claim whose pending span overlaps the
+window. The span runs from `first_seen` to `last_pending_at`, the only times the
+journal keeps for pending attempts, so a claim with any pending attempt in the
+window is listed even when a later attempt falls after it. A claim that pended
+only before and after the window is listed too, because the intermediate
+attempt times are not kept. An abandoned claim is also listed when its
+retirement falls in the window. A
 claim that completed on its first attempt never went pending and is not
 listed. A completed journal reserved before schema 71 has no history, so
 whether it went pending is unknown; it is listed when its completion falls in
