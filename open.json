@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 168,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/168-hold-systemd-s-own-lines-about-katamari",
+  "branch": "paudley/168-hold-systemd-s-own-lines-about-katamari",
+  "slug": "hold-systemd-s-own-lines-about-katamari",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/168-hold-systemd-s-own-lines-about-katamari/.stage/hold-systemd-s-own-lines-about-katamari",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "23c3509278097a2ccce583acbaf9cb0b91f26cbe",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/168-hold-systemd-s-own-lines-about-katamari",
+    "branch:paudley/168-hold-systemd-s-own-lines-about-katamari",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/160-stop-write-stalls-size-rocksdb-flush caches into /home/paudley/Active/sparrow/.worktrees/168-hold-systemd-s-own-lines-about-katamari plus 5 dependency units from 1 other checkouts in 6.3s; 265 unchanged files keep their built mtimes; 20 other files take the seed time and rebuild; 58 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/168-hold-systemd-s-own-lines-about-katamari/.stage/hold-systemd-s-own-lines-about-katamari",
+    "issue:/home/paudley/Active/sparrow/.worktrees/168-hold-systemd-s-own-lines-about-katamari/.stage/hold-systemd-s-own-lines-about-katamari/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-09T18:44:37-0600",
+  "seed_error": ""
+}
