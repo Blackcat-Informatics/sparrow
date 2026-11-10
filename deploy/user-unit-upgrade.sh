@@ -93,7 +93,8 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
   directory with an image that has --restore-backup (TO does): TO --restore-backup BACKUPS ID
   STORE, where ID is backup_id in BACKUPS/pre-upgrade-FROM/SOURCE. That drops everything
   accepted after the backup started; then start sparrow.service and sparrow-ship.timer. Start
-  sparrow-backup.timer only after a first online backup of the restored store verifies (deploy/verify-backup.sh SET exits 0).
+  sparrow-backup.timer only after a first online backup of the restored store verifies
+  (deploy/verify-backup.sh SET exits 0).
 - Claims after a rollback or restore (docs/deployment.md, "Claims after a rollback"). Keep the
   set-aside TO store: it records every claim TO made. Before starting sparrow.service on the
   restored store, open the restored store with the FROM image and the set-aside store with the
@@ -358,7 +359,7 @@ if ((NO_BACKUP)); then
 fi
 log "sparrow-backup.timer is NOT started. Install the online sparrow-backup.service lines (deploy/README.md, \"Interim user unit\"), then:"
 printf '  1. take the first online backup: %s %s backup (watch the backup state in status), or run sparrow-backup\n' "$CLI_LINK" "$SOCKET"
-printf '  2. deploy/verify-backup.sh SET   (SET is the new set, %s/sets/ID)\n' "$SPARROW_BACKUPS"
+printf '  2. SPARROW_CONFIG=%s deploy/verify-backup.sh SET   (SET is the new set, %s/sets/ID)\n' "$SPARROW_CONFIG" "$SPARROW_BACKUPS"
 printf '  3. only after step 2 exits 0: systemctl --user start sparrow-backup.timer\n'
 log "switched to $TO. Any online backfill continues in the running daemon; watch it with:"
 printf '  %s %s status   (migrations: done/total, failure)\n' "$CLI_LINK" "$SOCKET"
