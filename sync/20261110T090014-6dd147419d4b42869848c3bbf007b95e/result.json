@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/180-refuse-overlapping-watch-roots-and",
+  "branch": "paudley/180-refuse-overlapping-watch-roots-and",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "4ea50276dd28007e2cc6008663bed4f147b89aa3",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/180-refuse-overlapping-watch-roots-and/.stage/refuse-overlapping-watch-roots-and/sync/20261110T090014-6dd147419d4b42869848c3bbf007b95e",
+  "conflicts": [],
+  "status": "completed",
+  "base": "afbdf950140c021d3819fd08245911d476daf015",
+  "merge_bases": [
+    "44b76c318e347d166b9296055e1fe8cfb21f8520"
+  ],
+  "merge_index": "9431239ee2510462fea126b98f8b9567443826709d385d4ee64b9eefab0d8b0c",
+  "candidate_tree": "0e734423e7a7f0c2d1be9cbbb213dcec667dc5b4",
+  "candidate_patch": "candidate-b0837f5e16f24368945bccbeca833f11.patch",
+  "validation_records": [],
+  "commit": "4dca2099c98795c035f637acd197a60399b9ed8b",
+  "tree": "0e734423e7a7f0c2d1be9cbbb213dcec667dc5b4"
+}
