@@ -6167,7 +6167,7 @@ fn consumption_retire_moves_only_an_unpublished_claim_out_of_pending() {
 /// state, not an inference. A claim's history (first seen, attempts, last attempt, last
 /// pending time and reason) is durable in its journal and follows it into completion and
 /// retirement. The listing returns every pending claim, and a completed or abandoned claim
-/// only when it went pending inside the window; a claim that completed at once is absent.
+/// only when its pending span overlaps the window; a claim that completed at once is absent.
 #[test]
 fn claim_listing_reports_each_claims_final_state_and_history() {
     use sparrow_core::{ClaimState, ConsumptionGeneration};
@@ -6294,6 +6294,66 @@ fn claim_listing_reports_each_claims_final_state_and_history() {
         store.consumption_claims(2, 1).unwrap_err().code,
         "INVALID_ARGUMENT"
     );
+}
+
+/// INVARIANT (issue 173): a bounded window must not lose a claim that pended inside it just
+/// because a later attempt fell after it. The journal keeps only `first_seen` and the latest
+/// pending time, so a claim qualifies when that span overlaps the window. A claim reserved
+/// at 04:10 that pends at 04:11 and 04:50 and is retired at 05:10 is listed abandoned for
+/// 01:00..=04:40 (its latest attempt is outside, its 04:11 attempt inside), is not listed
+/// for a window ending 04:00 (before the claim existed), and stays listed for an open-ended
+/// `since` window (until = now). Times are minutes since midnight in milliseconds.
+#[test]
+fn claim_listing_keeps_a_claim_whose_latest_pending_attempt_is_after_the_window() {
+    use sparrow_core::{ClaimState, ConsumptionGeneration};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let minute = |h: u64, m: u64| (h * 60 + m) * 60_000;
+    let generation = ConsumptionGeneration {
+        device: 1,
+        inode: 7,
+        byte_length: 4,
+        modified: (10, 20),
+        changed: (10, 30),
+    };
+    let claim = store
+        .consumption_reserve(
+            "watch",
+            b"late.log",
+            "source",
+            "log",
+            generation.clone(),
+            CONSUMPTION_DIRECTORIES,
+            minute(4, 10),
+        )
+        .unwrap();
+    store
+        .consumption_claimed(&claim.import_id, generation)
+        .unwrap();
+    for at in [minute(4, 11), minute(4, 50)] {
+        store
+            .consumption_attempt_pending(&claim.import_id, "deadline expired", at)
+            .unwrap();
+    }
+    store
+        .consumption_retire(
+            &claim.import_id,
+            "watch",
+            "admin",
+            "source deleted",
+            minute(5, 10),
+        )
+        .unwrap();
+
+    let listed = |since, until| store.consumption_claims(since, until).unwrap();
+    let hit = listed(minute(1, 0), minute(4, 40));
+    assert_eq!(hit.len(), 1, "{hit:?}");
+    assert_eq!(hit[0].state, ClaimState::Abandoned);
+    assert_eq!(hit[0].finished_at, Some(minute(5, 10)));
+    assert!(listed(minute(1, 0), minute(4, 0)).is_empty());
+    assert_eq!(listed(minute(1, 0), minute(23, 0)).len(), 1);
+    assert_eq!(listed(minute(4, 45), minute(23, 0)).len(), 1);
+    assert!(listed(minute(5, 11), minute(23, 0)).is_empty());
 }
 
 /// INVARIANT (review 3 D1): a retired claim whose consumption import had begun does not keep

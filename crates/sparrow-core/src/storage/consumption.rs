@@ -9,6 +9,7 @@ use super::{
 };
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
+use std::ops::RangeInclusive;
 
 /// Maximum simultaneously active source-ownership journals in one store.
 pub const MAX_CONSUMPTION_JOURNALS: usize = 16;
@@ -1124,9 +1125,12 @@ impl Store {
         Ok(journal)
     }
 
-    /// Every claim that is pending now, and every completed or abandoned claim that went
-    /// pending (an attempt left it pending, or it was retired) within `since..=until` Unix
-    /// milliseconds, read from one snapshot without the writer lock. Completed claims are
+    /// Every claim that is pending now, and every completed or abandoned claim whose pending
+    /// span overlaps `since..=until` Unix milliseconds (an abandoned claim also when it was
+    /// retired inside the window), read from one snapshot without the writer lock. The span
+    /// runs from the claim's reservation to its latest pending attempt, because the store
+    /// keeps no earlier attempt times; a claim with an attempt in the window always
+    /// overlaps it, and one that pended only before and after the window may too. Completed claims are
     /// kept for the two-day retry window. More than [`MAX_LISTED_CLAIMS`] matches refuse,
     /// so the caller narrows the window rather than receiving a partial list.
     pub fn consumption_claims(&self, since: u64, until: u64) -> Result<Vec<ClaimListing>, Error> {
@@ -1137,7 +1141,7 @@ impl Store {
             ));
         }
         self.refuse_poisoned()?;
-        let within = |clock: Option<u64>| clock.is_some_and(|at| (since..=until).contains(&at));
+        let window = since..=until;
         let snapshot = self.unlocked.db.snapshot();
         let mut claims = Vec::new();
         for (prefix, state) in [
@@ -1176,7 +1180,7 @@ impl Store {
                 if journal.import_id.as_bytes() != id {
                     return Err(Error::new("STORAGE_FAILURE", "claim record key mismatch"));
                 }
-                if !listed_in(state, &journal.history, finished_at, &within) {
+                if !listed_in(state, &journal.history, finished_at, &window) {
                     continue;
                 }
                 if claims.len() >= MAX_LISTED_CLAIMS {
@@ -1203,23 +1207,30 @@ impl Store {
 }
 
 /// Whether one claim belongs in a listing window. Pending claims always do. A complete or
-/// abandoned claim does when it went pending in the window, and an abandoned one also when it
-/// was retired there. A journal reserved before schema 71 has no history, so whether it went
-/// pending is unknown; it is listed when it finished in the window, so a window from before
-/// the upgrade can still show its claims complete.
+/// abandoned claim does when its pending span overlaps the window: the span runs from
+/// `first_seen` (the reservation) to `last_pending_at`, the only attempt times the journal
+/// keeps, so a claim with any pending attempt in the window overlaps it. A claim that never
+/// pended has no span. A journal reserved before schema 71 has no `first_seen`, so its span
+/// is its latest pending attempt alone. An abandoned claim is also listed when it was
+/// retired in the window. A completed journal with no history at all (reserved before
+/// schema 71, so whether it went pending is unknown) is listed when it finished in the
+/// window, so a window from before the upgrade can still show its claims complete.
 fn listed_in(
     state: ClaimState,
     history: &ClaimHistory,
     finished_at: Option<u64>,
-    within: &impl Fn(Option<u64>) -> bool,
+    window: &RangeInclusive<u64>,
 ) -> bool {
     let unrecorded = history.first_seen.is_none() && history.last_pending_at.is_none();
+    let finished = finished_at.is_some_and(|at| window.contains(&at));
+    let spans = history.last_pending_at.is_some_and(|last| {
+        let first = history.first_seen.map_or(last, |seen| seen.min(last));
+        first <= *window.end() && last >= *window.start()
+    });
     match state {
         ClaimState::Pending => true,
-        ClaimState::Complete => {
-            within(history.last_pending_at) || (unrecorded && within(finished_at))
-        }
-        ClaimState::Abandoned => within(history.last_pending_at) || within(finished_at),
+        ClaimState::Complete => spans || (unrecorded && finished),
+        ClaimState::Abandoned => spans || finished,
     }
 }
 
@@ -1308,14 +1319,14 @@ mod tests {
         );
     }
 
-    /// INVARIANT (issue 160): the zero-loss check lists, for a window, every claim that went
-    /// pending in it. A completed journal from before schema 71 has no pending time, so it is
+    /// INVARIANT (issue 160): the zero-loss check lists, for a window, every claim whose
+    /// pending span overlaps it. A completed journal from before schema 71 has no pending time, so it is
     /// listed by its completion time; otherwise claims pending in the incident windows before
     /// the upgrade could never be shown complete. A recorded claim that completed without
     /// going pending stays out.
     #[test]
     fn a_completed_claim_without_history_is_listed_by_its_completion_time() {
-        let within = |clock: Option<u64>| clock.is_some_and(|at| (2_000..=3_000).contains(&at));
+        let within = 2_000..=3_000;
         let unrecorded = ClaimHistory::default();
         assert!(listed_in(
             ClaimState::Complete,

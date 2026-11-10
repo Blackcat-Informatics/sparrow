@@ -38,8 +38,9 @@ pub(crate) enum Input {
         claim: String,
         reason: String,
     },
-    /// Every pending claim, and every completed or abandoned claim that went pending within
-    /// `since..=until` (Unix milliseconds; an absent end means now).
+    /// Every pending claim, and every completed or abandoned claim whose pending span
+    /// (reservation to latest pending attempt) overlaps `since..=until` (Unix milliseconds;
+    /// an absent end means now); an abandoned claim is also listed when retired inside it.
     Claims {
         since: u64,
         until: Option<u64>,
