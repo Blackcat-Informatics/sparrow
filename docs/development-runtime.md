@@ -4619,7 +4619,7 @@ handoff bypasses the discovery quiet timer; it does not weaken generation checks
 Admission uses the existing bounded worker control queue and atomic storage
 reservation. It does not hold a publication RPC semaphore while awaiting the
 worker. Every queued catalog mutation refreshes pending ownership, including
-handoffs admitted earlier in that same tick. The same worker then performs
+handoffs admitted earlier in that same worker pass. The same worker then performs
 atomic private claim, SDK upload, durable publication and synchronized removal.
 An admission receipt says `reserved`; progress can advance through `claimed`,
 `published` and `removed`. Admission does not certify publication or deletion.
@@ -4875,7 +4875,7 @@ without opening the candidate or generating a self-induced `IN_OPEN`. The SDK's
 Symlinks, FIFOs, devices and sockets are excluded. Native `statat` handles unknown
 directory-entry types without assuming that they are regular files.
 
-Scans advance by 64 entries per 50 ms worker tick. Candidate and rename maps,
+Scans advance by 64 entries per worker pass. Candidate and rename maps,
 directory descriptors and scan queues have explicit capacities. Candidate
 saturation preserves excess files, exposes `deferred`, and schedules a new scan
 as capacity becomes available. The scanner can finish coverage while candidate
@@ -5093,7 +5093,8 @@ constructed; the tracing layer below bounds capture before queue admission.
 
 Defaults are 1024 queued/in-flight events, 4 MiB conservative event charge,
 128 events/512 KiB per batch, two-second intended batching, five-second RPC
-deadlines and 250 ms retry delay. Setup validates finite upper/lower bounds;
+deadlines and a retry delay that starts at one second and doubles to 30 seconds
+(restarting after an accepted batch). Setup validates finite upper/lower bounds;
 these are configurable. Queue and immutable pending-batch ownership stay charged
 until a matching durable receipt. Retryable Unix-socket/transport/daemon errors
 preserve exactly the same request ID, instance, sequences, timestamps and values.
@@ -5234,7 +5235,8 @@ refuses receipt certification until the store is reopened. Native WAL is shared
 across families; see [RocksDB WAL](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-(WAL)).
 
 The default intended periodic sync interval is 2000 ms, configurable through
-`buffered_flush_interval_ms` from 1 to 60000. It is not a disk latency guarantee.
+`buffered_flush_interval_ms` from 1000 to 60000; a smaller value refuses startup, so the
+periodic flush never fires more than once a second. It is not a disk latency guarantee.
 CLI/MCP status advertises accepted/durable sequences, session, pending writes,
 batch bytes, oldest age, interval, lag and failure. Reopening first synchronizes
 recovered data and starts a fresh session. Older-session and future fences are

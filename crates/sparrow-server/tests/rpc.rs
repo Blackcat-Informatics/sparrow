@@ -1432,6 +1432,7 @@ async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_re
             settings.batch_events = 1;
             settings.rpc_timeout = Duration::from_millis(100);
             settings.retry_interval = Duration::from_millis(20);
+            settings.retry_max_interval = settings.retry_interval;
             let delivery = sparrow_client::Delivery::start(settings).unwrap();
             assert_eq!(
                 admit(&delivery, delivery_event("queued before TCP listener")).await,
@@ -8212,7 +8213,7 @@ async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identit
         drop(client);
         drop(daemon); // owned test process is killed/reaped, not gracefully flushed.
         std::fs::remove_file(&socket).unwrap();
-        std::fs::write(&config, format!("{original}\nbuffered_flush_interval_ms = 25\n")).unwrap();
+        std::fs::write(&config, format!("{original}\nbuffered_flush_interval_ms = 1000\n")).unwrap();
         let restarted = start(&config, &socket).await;
         let recovered = sparrow_client::Client::connect(&socket).await.unwrap();
         assert_eq!(recovered.artifact(&first.id).await.unwrap(), durable);
@@ -8221,7 +8222,7 @@ async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identit
         let next = recovered.ingest_with_durability("periodic", "buffered-sdk", wire::Format::Log,
             b"automatic WAL boundary\n", wire::Durability::Buffered).await.unwrap();
         assert_eq!(next.durability, wire::Durability::Buffered);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             if recovered.artifact(&next.id).await.unwrap().durability == wire::Durability::Durable { break; }
             assert!(Instant::now() < deadline, "periodic synchronization did not cover buffered acceptance");
@@ -8395,6 +8396,7 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
             config.batch_events = 1;
             config.rpc_timeout = Duration::from_millis(150);
             config.retry_interval = Duration::from_millis(20);
+            config.retry_max_interval = config.retry_interval;
             let delivery = sparrow_client::Delivery::start(config).unwrap();
             let sequence = admit(&delivery, delivery_event("lost reply recovery")).await;
             let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
@@ -8473,6 +8475,7 @@ async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recover
             delivery_config.max_queued_events = 2;
             delivery_config.batch_events = 1;
             delivery_config.retry_interval = Duration::from_millis(25);
+            delivery_config.retry_max_interval = delivery_config.retry_interval;
             let delivery = sparrow_client::Delivery::start(delivery_config).unwrap();
             admit(&delivery, delivery_event("before service start one")).await;
             admit(&delivery, delivery_event("before service start two")).await;
@@ -8547,7 +8550,7 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
         let proxy_socket = dir.path().join("relay.sock");
         let (state, proxy) = relay(&proxy_socket, first_backend.client.clone());
         let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery");
-        config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150); config.retry_interval = Duration::from_millis(100);
+        config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150); config.retry_interval = Duration::from_millis(100); config.retry_max_interval = config.retry_interval;
         let delivery = sparrow_client::Delivery::start(config).unwrap();
         admit(&delivery, delivery_event("unknown accepted delivery")).await;
         tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified()).await.unwrap();

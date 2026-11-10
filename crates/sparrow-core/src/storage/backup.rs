@@ -369,7 +369,14 @@ fn failure(context: &str, error: impl std::fmt::Display) -> Error {
 }
 
 /// How often the guard measures free space while a backup runs.
-const GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+///
+/// One second is enough because the guard acts at twice `min_free_bytes` and ingest only
+/// stops at `min_free_bytes`: the margin between the two is `min_free_bytes` itself (4 GiB by
+/// default), which the filesystem would need about a second of sustained writes at several
+/// GiB per second to cross. The guard's only job is releasing held files before the floor, so
+/// a faster measurement buys nothing. The same `recv_timeout` still returns the instant the
+/// backup drops the stop sender, so the interval never delays the end of a backup.
+const GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Start a backup of `db` into `target` on its own thread and return at once.
 ///

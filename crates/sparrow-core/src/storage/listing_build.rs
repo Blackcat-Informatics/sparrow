@@ -30,6 +30,9 @@ use std::{
 /// Well inside the 30-second MCP tool deadline and the 60-second connection lease.
 pub(super) const BUILD_WAIT: Duration = Duration::from_millis(5_000);
 
+/// Longest a waiting listing call goes without checking its cancellation.
+const CANCEL_CHECK: Duration = Duration::from_secs(1);
+
 /// Entries a build reads between checks of its cancellation and lease.
 const CHECK_EVERY: u64 = 4_096;
 
@@ -176,7 +179,11 @@ impl<T: Clone> Waiter<T> {
             if now >= deadline {
                 return Ok(None);
             }
-            let slice = (deadline - now).min(Duration::from_millis(50));
+            // The build's completion wakes this wait at once (`notify_all`); the slice only
+            // bounds how long a caller's cancellation, which has no wake of its own, goes
+            // unnoticed. One second is enough: the build runs on regardless, and the caller
+            // that cancelled is already gone.
+            let slice = (deadline - now).min(CANCEL_CHECK);
             state = self
                 .0
                 .ready

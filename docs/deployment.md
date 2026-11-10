@@ -480,7 +480,7 @@ manifest and write-ahead log files into `BACKUP_ROOT/engine`. Table files are
 shared between backups, so the first backup copies the whole store over the
 network and each later one only the tables written since. The engine keeps the
 newest `backup_keep` (default 3). While a backup runs, RocksDB keeps the files that
-become obsolete until the copy ends. The held files do not count toward `physical_bytes`, the disk budget or eviction, so a backup never refuses a write or evicts evidence. A guard thread at the daemon's normal priority, which never touches the backup root, measures free space every 250 ms; once it falls below twice `min_free_bytes`, the guard re-enables file deletions, RocksDB deletes the held files at once, and the backup fails if it still needed one. A backup stalled on an unresponsive NAS therefore never brings ingest to the free-space floor. One backup runs at a
+become obsolete until the copy ends. The held files do not count toward `physical_bytes`, the disk budget or eviction, so a backup never refuses a write or evicts evidence. A guard thread at the daemon's normal priority, which never touches the backup root, measures free space every second; once it falls below twice `min_free_bytes`, the guard re-enables file deletions, RocksDB deletes the held files at once, and the backup fails if it still needed one. A backup stalled on an unresponsive NAS therefore never brings ingest to the free-space floor. One backup runs at a
 time; a second request is refused with `CONFLICT`. A daemon shutdown during a
 backup abandons it, and the engine discards the partial files at its next open.
 `BACKUP_ROOT/STORE_ID` binds the root to one store, and another store is

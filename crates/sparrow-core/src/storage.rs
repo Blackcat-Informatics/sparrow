@@ -325,7 +325,7 @@ impl From<purrdf_lex::allocation::StorageError> for Error {
 /// Explicit, bounded storage admission configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Intended WAL synchronization interval, 1..=60000 milliseconds.
+    /// Intended WAL synchronization interval, 1000..=60000 milliseconds.
     pub buffered_flush_interval_ms: u32,
     /// Physical database budget including maintenance reserve.
     pub disk_budget: u64,
@@ -345,10 +345,12 @@ pub struct Config {
 
 impl Config {
     fn validate(&self) -> Result<(), Error> {
-        if !(1..=60000).contains(&self.buffered_flush_interval_ms) {
+        if !(durability::MIN_FLUSH_INTERVAL_MS..=durability::MAX_FLUSH_INTERVAL_MS)
+            .contains(&self.buffered_flush_interval_ms)
+        {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "buffered_flush_interval_ms must be 1..60000",
+                "buffered_flush_interval_ms must be 1000..60000",
             ));
         }
         if self.maintenance_reserve < 1024 * 1024
