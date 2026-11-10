@@ -27,7 +27,13 @@ tracing-subscriber.workspace = true
 [build-dependencies]
 capnpc.workspace = true
 
+[features]
+# Test-only sub-second delivery timing; enabled by the daemon's integration tests, never by
+# a production build.
+test-timing = []
+
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 sparrow-test-support = { path = "../sparrow-test-support" }
 

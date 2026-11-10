@@ -35,6 +35,8 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+# Sub-second delivery timing for tests only; the production dependency above cannot reach it.
+sparrow-client = { path = "../sparrow-client", features = ["test-timing"] }
 sparrow-test-support = { path = "../sparrow-test-support" }
 # The paused clock proves the watch worker's waits are events, not ticks.
 tokio = { workspace = true, features = ["test-util"] }

@@ -162,8 +162,9 @@ One joined worker owns retention, pressure and periodic buffered synchronization
 It admits exactly one native job at a time, awaiting complete blocking execution
 before selecting the next duty. Existing finite storage pass limits remain in
 force. RPC and intake retain their request budget independently, as with the
-previous serial maintenance path. Socket acceptance, worker health checks and
-SIGINT selection continue on the serving loop.
+previous serial maintenance path. Socket acceptance, SIGINT selection and the
+wait for each worker's end signal continue on the serving loop; no worker health
+check runs on a cadence.
 
 Expiry retains its bounded pass limits and resumes an explicit continuation
 after yielding, without waiting one second between every pass. The next

@@ -42,7 +42,15 @@ pub struct DeliveryConfig {
     pub retry_interval: Duration,
     /// Longest delay between attempts of the same pending batch, at least `retry_interval`.
     pub retry_max_interval: Duration,
+    /// Shortest accepted `flush_interval` and `retry_interval`. Production configuration
+    /// always carries [`MIN_INTERVAL`]; only the test-timing constructor lowers it.
+    interval_floor: Duration,
 }
+
+/// Floor for the batching and retry intervals: no client loop or timer fires more often than
+/// once a second, matching the server's refusal of a buffered flush interval below 1000 ms.
+const MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 impl DeliveryConfig {
     /// Default bounded queue, two-second batching, and finite RPC/retry deadlines.
     pub fn new(socket: impl Into<PathBuf>, source: impl Into<String>) -> Self {
@@ -67,7 +75,28 @@ impl DeliveryConfig {
             rpc_timeout: Duration::from_secs(5),
             retry_interval: Duration::from_secs(1),
             retry_max_interval: Duration::from_secs(30),
+            interval_floor: MIN_INTERVAL,
         }
+    }
+
+    /// Sub-second batching and retry intervals for tests that must not wait whole seconds.
+    /// Production configuration cannot reach this: the constructor exists only in this
+    /// crate's own tests and under the `test-timing` feature, which only the daemon's
+    /// integration tests enable. The 60 s bound and `retry_max_interval >= retry_interval`
+    /// still apply, and zero is still refused.
+    #[cfg(any(test, feature = "test-timing"))]
+    #[must_use]
+    pub fn with_test_timing(
+        mut self,
+        flush_interval: Duration,
+        retry_interval: Duration,
+        retry_max_interval: Duration,
+    ) -> Self {
+        self.interval_floor = Duration::ZERO;
+        self.flush_interval = flush_interval;
+        self.retry_interval = retry_interval;
+        self.retry_max_interval = retry_max_interval;
+        self
     }
     fn validate(&self) -> Result<(), Error> {
         self.endpoint.validate()?;
@@ -86,9 +115,11 @@ impl DeliveryConfig {
             ]
             .iter()
             .any(|duration| duration.is_zero() || *duration > Duration::from_secs(60))
+            || self.flush_interval < self.interval_floor
+            || self.retry_interval < self.interval_floor
         {
             return Err(Error::InvalidArgument(
-                "invalid delivery labels, queue/batch limits or timing bounds; durations require (0,60s] and retry_max_interval >= retry_interval",
+                "invalid delivery labels, queue/batch limits or timing bounds; durations require (0,60s], flush_interval and retry_interval at least 1s, and retry_max_interval >= retry_interval",
             ));
         }
         Ok(())
@@ -262,6 +293,9 @@ struct Shared {
     control: Mutex<()>,
     changed: Condvar,
     wake: tokio::sync::Notify,
+    /// Signalled by every flush or shutdown so a waiting retry delay ends at once. Kept apart
+    /// from `wake`, which each admitted event signals and would otherwise cut the backoff short.
+    retry_wake: tokio::sync::Notify,
     abort_wake: tokio::sync::Notify,
     owners: AtomicUsize,
     offered: AtomicU64,
@@ -333,6 +367,7 @@ impl Delivery {
             control: Mutex::new(()),
             changed: Condvar::new(),
             wake: tokio::sync::Notify::new(),
+            retry_wake: tokio::sync::Notify::new(),
             abort_wake: tokio::sync::Notify::new(),
             owners: AtomicUsize::new(1),
             offered: AtomicU64::new(0),
@@ -491,6 +526,9 @@ impl Delivery {
         let dropped = self.shared.drop_total();
         state.force_through = state.force_through.max(target);
         self.shared.wake.notify_one();
+        // A flush or shutdown asks for delivery now: end any retry delay so the pending batch
+        // is attempted at once instead of after up to `retry_max_interval`.
+        self.shared.retry_wake.notify_one();
         loop {
             if self.shared.exhausted.load(Ordering::SeqCst) {
                 return Err(FlushError::Unavailable(
@@ -788,6 +826,23 @@ impl Backoff {
     }
 }
 
+/// Wait out one retry delay as an event wait. It ends early when a flush or shutdown signals
+/// `barrier` (the next attempt then runs at once; the backoff sequence is unchanged) and
+/// returns true when `abort` reports last-owner cancellation. A permit left by a barrier that
+/// arrived during the attempt just before also ends the delay immediately, which is what that
+/// barrier asked for. Barriers are caller-driven, so this adds no timer.
+async fn wait_out_retry_delay(
+    abort: &tokio::sync::Notify,
+    barrier: &tokio::sync::Notify,
+    delay: Duration,
+) -> bool {
+    tokio::select! {
+        _ = abort.notified() => true,
+        _ = barrier.notified() => false,
+        _ = tokio::time::sleep(delay) => false,
+    }
+}
+
 enum Action {
     Wait(Option<Duration>),
     Send(Arc<EventBatch>),
@@ -838,8 +893,15 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                             return Err(error);
                         }
                         shared.retry(error)?;
-                        tokio::select! { _ = shared.abort_wake.notified() => return Ok(()),
-                        _ = tokio::time::sleep(backoff.take()) => {} }
+                        if wait_out_retry_delay(
+                            &shared.abort_wake,
+                            &shared.retry_wake,
+                            backoff.take(),
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -911,6 +973,94 @@ mod tests {
         assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
     }
 
+    /// INVARIANT: production delivery intervals have a 1 s floor, so no client loop ticks
+    /// faster than once a second; the defaults stay valid, the error names the key and floor,
+    /// and only the test-timing constructor can go lower.
+    #[test]
+    fn sub_second_flush_and_retry_intervals_are_refused() {
+        let base = DeliveryConfig::new("unused.sock", "test");
+        base.validate().unwrap();
+        let mut at_floor = base.clone();
+        at_floor.flush_interval = MIN_INTERVAL;
+        at_floor.retry_interval = MIN_INTERVAL;
+        at_floor.validate().unwrap();
+        for key in ["flush_interval", "retry_interval"] {
+            let mut config = base.clone();
+            let short = MIN_INTERVAL - Duration::from_millis(1);
+            if key == "flush_interval" {
+                config.flush_interval = short;
+            } else {
+                config.retry_interval = short;
+            }
+            let Err(Error::InvalidArgument(message)) = config.validate() else {
+                panic!("{key} below 1 s was accepted");
+            };
+            assert!(message.contains(key) && message.contains("1s"), "{message}");
+        }
+        let fast = base.with_test_timing(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        fast.validate().unwrap();
+    }
+
+    /// INVARIANT: a flush or shutdown ends a retry backoff delay at once. On a paused clock
+    /// the delay's virtual elapsed time is the proof: a 30 s delay with a barrier signal ends
+    /// in no virtual time, while the same delay without one runs its full 30 s, so the bound
+    /// does not depend on the delay and no real sleep is involved.
+    #[tokio::test(start_paused = true)]
+    async fn a_barrier_signal_ends_the_retry_delay_at_once() {
+        let abort = tokio::sync::Notify::new();
+        let barrier = tokio::sync::Notify::new();
+        let delay = Duration::from_secs(30);
+
+        let started = tokio::time::Instant::now();
+        assert!(!wait_out_retry_delay(&abort, &barrier, delay).await);
+        assert_eq!(
+            started.elapsed(),
+            delay,
+            "an unsignalled delay runs in full"
+        );
+
+        barrier.notify_one();
+        let started = tokio::time::Instant::now();
+        assert!(!wait_out_retry_delay(&abort, &barrier, delay).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        abort.notify_one();
+        assert!(wait_out_retry_delay(&abort, &barrier, delay).await);
+    }
+
+    /// INVARIANT: the real flush and shutdown paths signal the retry wait. The worker of an
+    /// empty producer never waits on it, so the permit a barrier leaves is observable without
+    /// a race.
+    #[test]
+    fn flush_and_shutdown_signal_the_retry_wait() {
+        use futures::FutureExt;
+        let dir = tempfile::tempdir().unwrap();
+        let delivery =
+            Delivery::start(DeliveryConfig::new(dir.path().join("missing.sock"), "test")).unwrap();
+        delivery.flush(Duration::from_secs(2)).unwrap();
+        assert!(
+            delivery
+                .shared
+                .retry_wake
+                .notified()
+                .now_or_never()
+                .is_some()
+        );
+        delivery.shutdown(Duration::from_secs(2)).unwrap();
+        assert!(
+            delivery
+                .shared
+                .retry_wake
+                .notified()
+                .now_or_never()
+                .is_some()
+        );
+    }
+
     /// INVARIANT: failed attempts keep retrying the one immutable pending batch with the same
     /// request identity and report each retry in the delivery statistics.
     #[test]
@@ -918,8 +1068,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test");
         config.batch_events = 1;
-        config.retry_interval = Duration::from_millis(5);
-        config.retry_max_interval = Duration::from_millis(20);
+        // Sub-second retry intervals are refused in production; this test needs fast retries.
+        config = config.with_test_timing(
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        );
         let delivery = Delivery::start(config).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while matches!(
