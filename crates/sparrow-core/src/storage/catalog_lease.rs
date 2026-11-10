@@ -111,6 +111,9 @@ pub struct CatalogReadPage<B> {
     pub scan_budget: usize,
     /// Catalog entries inspected during capture.
     pub scanned: usize,
+    /// Set on a page that answers before its capture's build has finished: the page has no
+    /// rows, `next_cursor` resumes the same build, and this is how far it has read (#158).
+    pub build: Option<super::listing_build::BuildProgress>,
     /// Captured rows and metadata.
     pub body: B,
 }
@@ -132,6 +135,7 @@ impl<B> CatalogReadPage<B> {
             page_size: self.page_size,
             scan_budget: self.scan_budget,
             scanned: self.scanned,
+            build: self.build,
             body: map(self.body)?,
         })
     }
@@ -219,23 +223,43 @@ impl<S: Selector, B: PageBody> Snapshot<S, B> {
             page_size: self.page_size,
             scan_budget: self.scan_budget,
             scanned: self.scanned,
+            build: None,
             body: self.body.page(start, end)?,
         })
     }
 }
 
-/// One lock/expiry/accounting path for every captured read registry.
-pub(super) fn read_stats<S: Selector, B: PageBody>(
-    registry: &std::sync::Mutex<Reads<S, B>>,
-    now: u64,
-    poisoned: &'static str,
-) -> Result<(usize, usize), Error> {
-    let mut reads = registry
-        .lock()
-        .map_err(|_| Error::new("STORAGE_FAILURE", poisoned))?;
-    reads.purge(now);
-    Ok((reads.snapshots.len(), reads.capacity()))
+/// Live handles and their bytes at `now`, from a registry's ledger. The ledger's lock is
+/// held only to copy a few rows, never while a page reads, so `status` answers while a
+/// listing waits for a stalled writer with its registry locked (#158).
+pub(super) fn read_stats(ledger: &Ledger, now: u64) -> (usize, usize) {
+    let rows = lock_whole(ledger);
+    let lease = Duration::from_millis(LEASE_MS);
+    rows.values()
+        .filter(|row| now < row.expires_at && row.started.elapsed() < lease)
+        .fold((0, 0), |(handles, bytes), row| {
+            (handles + 1, bytes + row.bytes)
+        })
 }
+
+/// Lock a value every change replaces whole, such as a ledger, which each change rewrites
+/// from its registry, or a listing build's state: a panic part-way through one leaves
+/// nothing the next change does not replace, so poison carries no meaning.
+pub(super) fn lock_whole<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One published handle's lease and size, as [`read_stats`] counts it.
+pub(super) struct LedgerRow {
+    expires_at: u64,
+    started: Instant,
+    bytes: usize,
+}
+
+/// A registry's handles, mirrored under their own short-held lock.
+pub(super) type Ledger = std::sync::Arc<std::sync::Mutex<BTreeMap<String, LedgerRow>>>;
 
 pub(super) struct Cursor<'a> {
     id: &'a str,
@@ -258,28 +282,77 @@ impl<'a> Cursor<'a> {
             .map_err(|_| Error::new("INVALID_ARGUMENT", "invalid catalog page position"))?;
         Ok(Self { id, start })
     }
+
+    /// The handle or build the cursor names.
+    pub(super) fn id(&self) -> &'a str {
+        self.id
+    }
+
+    /// The position the cursor continues from.
+    pub(super) fn start(&self) -> usize {
+        self.start
+    }
 }
 
 pub(super) struct Reads<S, B> {
-    pub snapshots: BTreeMap<String, Snapshot<S, B>>,
+    snapshots: BTreeMap<String, Snapshot<S, B>>,
+    ledger: Ledger,
 }
 
 impl<S, B> Default for Reads<S, B> {
     fn default() -> Self {
         Self {
             snapshots: BTreeMap::new(),
+            ledger: Ledger::default(),
         }
+    }
+}
+
+impl<S, B> Reads<S, B> {
+    /// The ledger `status` reads instead of locking this registry.
+    pub(super) fn ledger(&self) -> Ledger {
+        std::sync::Arc::clone(&self.ledger)
+    }
+
+    /// Mirror the handle set into the ledger after a change.
+    fn mirror(&self) {
+        let mut rows = lock_whole(&self.ledger);
+        rows.clear();
+        rows.extend(self.snapshots.iter().map(|(id, snapshot)| {
+            (
+                id.clone(),
+                LedgerRow {
+                    expires_at: snapshot.expires_at,
+                    started: snapshot.started,
+                    bytes: snapshot.bytes,
+                },
+            )
+        }));
     }
 }
 
 impl<S: Selector, B: PageBody> Reads<S, B> {
     pub(super) fn release(&mut self, id: &str, now: u64) -> bool {
         self.purge(now);
-        self.snapshots.remove(id).is_some()
+        let released = self.snapshots.remove(id).is_some();
+        self.mirror();
+        released
     }
 
     pub(super) fn purge(&mut self, now: u64) {
         self.snapshots.retain(|_, value| value.alive(now));
+        self.mirror();
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_for_tests(&mut self, snapshot: Snapshot<S, B>) {
+        self.snapshots.insert(snapshot.id.clone(), snapshot);
+        self.mirror();
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.snapshots.is_empty()
     }
     pub(super) fn capacity(&self) -> usize {
         self.snapshots.values().map(|snapshot| snapshot.bytes).sum()
@@ -376,9 +449,11 @@ impl<S: Selector, B: PageBody> Reads<S, B> {
                 ));
             }
             self.snapshots.insert(snapshot.id.clone(), snapshot);
+            self.mirror();
         }
         if let Err(error) = cancellation.checkpoint() {
             self.snapshots.remove(&page.snapshot_id);
+            self.mirror();
             return Err(error);
         }
         Ok(page)
@@ -435,6 +510,6 @@ mod tests {
             .unwrap();
         assert_eq!(error.code, "CANCELLED");
         assert_eq!(reads.capacity(), 0);
-        assert!(reads.snapshots.is_empty());
+        assert!(reads.is_empty());
     }
 }

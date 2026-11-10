@@ -41,6 +41,7 @@ pub(crate) mod import;
 mod ingest;
 pub(crate) mod ingest_status;
 pub(crate) mod intake;
+pub(crate) mod listing_build;
 pub(crate) mod log_time;
 mod manifest_retire;
 pub(crate) mod migration;
@@ -501,6 +502,9 @@ struct Unlocked {
     durability: writer_queue::Published<durability::View>,
     pressure: writer_queue::Published<pressure::PressureStatus>,
     recompression: writer_queue::Published<recompression::RecompressionStatus>,
+    /// Source and artifact listings still reading what the source-summary migration owes.
+    source_builds: Mutex<source_read::Builds>,
+    artifact_builds: Mutex<artifact_read::Builds>,
 }
 
 /// One database owner. Clones share a serialized catalog writer.
@@ -517,9 +521,16 @@ pub struct Store {
     source_reads: Arc<Mutex<source_read::Reads>>,
     record_reads: Arc<Mutex<record_read::Reads>>,
     sparql_reads: Arc<Mutex<rdf_view::pages::Reads>>,
+    /// Each read registry's handle ledger, in pin, artifact, source, record, SPARQL order.
+    /// `status` counts handles here, so it never waits on a registry a listing holds while
+    /// it waits for the writer.
+    lease_ledgers: Arc<[catalog_lease::Ledger; 5]>,
     /// Runs while a source listing reads its snapshot without the writer lock.
     #[cfg(feature = "test-support")]
     source_read_pause: Arc<Mutex<Option<source_read::Pause>>>,
+    /// Owed index rows one artifact listing window holds, when a test lowers it.
+    #[cfg(feature = "test-support")]
+    owed_window: Arc<std::sync::atomic::AtomicUsize>,
     open_phases: Arc<[OpenPhase]>,
 }
 
@@ -644,6 +655,61 @@ fn integer(value: &Value, name: &'static str) -> Result<u64, Error> {
                 .ok_or_else(|| DecodeError::invalid_value(value, "decimal u64 string"))
         })?,
     )
+}
+
+/// Whether `record` is retained at `now`: not evicted, and unexpired or protected.
+fn live_record(record: &Record, now: u64, protected: &BTreeSet<String>) -> bool {
+    !record.evicted
+        && (now < record.expires_at
+            || protected.contains(&record.id)
+            || protected.contains(&record.artifact_id))
+}
+
+/// One record catalog entry by ID from `reader`, admitted against `remaining` before it is
+/// decoded; `NOT_FOUND` when absent.
+fn record_entry(
+    reader: &store_counters::Reader<'_>,
+    id: &str,
+    remaining: &mut usize,
+) -> Result<Record, Error> {
+    let bytes = reader
+        .get(id.as_bytes())?
+        .ok_or_else(|| Error::new("NOT_FOUND", format!("unknown evidence {id}")))?;
+    Writer::charge_catalog_shape(remaining, &bytes)?;
+    Record::decode(&parse(&bytes)?)
+}
+
+/// The record a primary `time:` index entry names, read from `reader` and checked against
+/// the entry.
+fn time_record(
+    reader: &store_counters::Reader<'_>,
+    key: &[u8],
+    value: &[u8],
+    remaining: &mut usize,
+) -> Result<Record, Error> {
+    let id = std::str::from_utf8(value)
+        .map_err(|e| Error::new("STORAGE_FAILURE", format!("invalid time index: {e}")))?;
+    if !id.starts_with("record:") || id.len() <= "record:".len() || id.len() > 128 {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "time index requires a bounded record identity",
+        ));
+    }
+    let record = record_entry(reader, id, remaining).map_err(|error| {
+        if error.code == "NOT_FOUND" {
+            Error::new("STORAGE_FAILURE", "time index references a missing record")
+        } else {
+            error
+        }
+    })?;
+    if record.id != id || key != format!("time:{:020}:{}", record.received_at, record.id).as_bytes()
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "time index does not match its record",
+        ));
+    }
+    Ok(record)
 }
 
 trait Catalog: Sized {
@@ -1117,30 +1183,7 @@ impl Writer {
         value: &[u8],
         remaining: &mut usize,
     ) -> Result<Record, Error> {
-        let id = std::str::from_utf8(value)
-            .map_err(|e| Error::new("STORAGE_FAILURE", format!("invalid time index: {e}")))?;
-        if !id.starts_with("record:") || id.len() <= "record:".len() || id.len() > 128 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "time index requires a bounded record identity",
-            ));
-        }
-        let record: Record = self.get_limited(id, remaining).map_err(|error| {
-            if error.code == "NOT_FOUND" {
-                Error::new("STORAGE_FAILURE", "time index references a missing record")
-            } else {
-                error
-            }
-        })?;
-        if record.id != id
-            || key != format!("time:{:020}:{}", record.received_at, record.id).as_bytes()
-        {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "time index does not match its record",
-            ));
-        }
-        Ok(record)
+        time_record(&store_counters::Reader::db(&self.db), key, value, remaining)
     }
 
     fn retry(&self, key: &str, now: u64) -> Result<Option<Value>, Error> {
@@ -1275,10 +1318,7 @@ impl Writer {
     }
 
     fn live_record(&self, record: &Record, now: u64, protected: &BTreeSet<String>) -> bool {
-        !record.evicted
-            && (now < record.expires_at
-                || protected.contains(&record.id)
-                || protected.contains(&record.artifact_id))
+        live_record(record, now, protected)
     }
 
     fn live_artifact(&self, artifact: &Artifact, now: u64, protected: &BTreeSet<String>) -> bool {
@@ -1538,6 +1578,13 @@ impl Store {
         timer.lap("state");
         let db = Arc::new(db);
         let query_staging = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (pin_reads, artifact_reads, source_reads, record_reads, sparql_reads) = (
+            pin_read::Reads::default(),
+            artifact_read::Reads::default(),
+            source_read::Reads::default(),
+            record_read::Reads::default(),
+            rdf_view::pages::Reads::default(),
+        );
         let mut store = Self {
             id: Arc::from(id.as_str()),
             open_files,
@@ -1551,6 +1598,8 @@ impl Store {
                 durability: durability.published(),
                 pressure: pressure.published(),
                 recompression: recompression.published(),
+                source_builds: Mutex::default(),
+                artifact_builds: Mutex::default(),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -1569,14 +1618,23 @@ impl Store {
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
                 retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
             })),
-            pin_reads: Arc::new(Mutex::new(pin_read::Reads::default())),
+            lease_ledgers: Arc::new([
+                pin_reads.ledger(),
+                artifact_reads.ledger(),
+                source_reads.ledger(),
+                record_reads.ledger(),
+                sparql_reads.ledger(),
+            ]),
+            pin_reads: Arc::new(Mutex::new(pin_reads)),
             rdf_read: Arc::new(Mutex::new(())),
-            artifact_reads: Arc::new(Mutex::new(artifact_read::Reads::default())),
-            source_reads: Arc::new(Mutex::new(source_read::Reads::default())),
-            record_reads: Arc::new(Mutex::new(record_read::Reads::default())),
-            sparql_reads: Arc::new(Mutex::new(rdf_view::pages::Reads::default())),
+            artifact_reads: Arc::new(Mutex::new(artifact_reads)),
+            source_reads: Arc::new(Mutex::new(source_reads)),
+            record_reads: Arc::new(Mutex::new(record_reads)),
+            sparql_reads: Arc::new(Mutex::new(sparql_reads)),
             #[cfg(feature = "test-support")]
             source_read_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-support")]
+            owed_window: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             open_phases: Arc::new([]),
         };
         let writer = store.lock()?;
@@ -2053,7 +2111,7 @@ impl Store {
                 failed += 1;
                 if scope.require_complete_index {
                     return Err(Error::new(
-                        "INDEX_NOT_READY",
+                        "EVIDENCE_INCOMPLETE",
                         "selected JSON projection unavailable",
                     ));
                 }
@@ -2539,30 +2597,47 @@ impl Store {
         .into())
     }
 
-    fn read_lease_stats(&self, now: u64) -> Result<ReadLeaseStats, Error> {
-        Ok(ReadLeaseStats {
-            pin: catalog_lease::read_stats(&self.pin_reads, now, "pin read registry poisoned")?,
-            artifact: catalog_lease::read_stats(
-                &self.artifact_reads,
-                now,
-                "artifact read registry poisoned",
-            )?,
-            source: catalog_lease::read_stats(
-                &self.source_reads,
-                now,
-                "source read registry poisoned",
-            )?,
-            record: catalog_lease::read_stats(
-                &self.record_reads,
-                now,
-                "query read registry poisoned",
-            )?,
-            sparql: catalog_lease::read_stats(
-                &self.sparql_reads,
-                now,
-                "native query read registry poisoned",
-            )?,
-        })
+    /// Drop every expired read handle, so an expiry pass frees their snapshots.
+    fn purge_read_leases(&self, now: u64) -> Result<(), Error> {
+        fn purge<S: catalog_lease::Selector, B: catalog_lease::PageBody>(
+            registry: &Mutex<catalog_lease::Reads<S, B>>,
+            now: u64,
+        ) -> Result<(), Error> {
+            registry
+                .lock()
+                .map_err(|_| Error::new("STORAGE_FAILURE", "read registry poisoned"))?
+                .purge(now);
+            Ok(())
+        }
+        purge(&self.pin_reads, now)?;
+        purge(&self.artifact_reads, now)?;
+        purge(&self.source_reads, now)?;
+        purge(&self.record_reads, now)?;
+        purge(&self.sparql_reads, now)?;
+        // An abandoned listing build ends here at the latest: dropping it cancels its thread,
+        // which then drops its snapshot.
+        self.unlocked
+            .source_builds
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "source listing builds poisoned"))?
+            .purge(now);
+        self.unlocked
+            .artifact_builds
+            .lock()
+            .map_err(|_| Error::new("STORAGE_FAILURE", "artifact listing builds poisoned"))?
+            .purge(now);
+        Ok(())
+    }
+
+    fn read_lease_stats(&self, now: u64) -> ReadLeaseStats {
+        let [pin, artifact, source, record, sparql] = &*self.lease_ledgers;
+        ReadLeaseStats {
+            pin: catalog_lease::read_stats(pin, now),
+            artifact: catalog_lease::read_stats(artifact, now),
+            source: catalog_lease::read_stats(source, now),
+            record: catalog_lease::read_stats(record, now),
+            sparql: catalog_lease::read_stats(sparql, now),
+        }
     }
 
     /// Count stored payload chunks, the `unique_payload_chunks` of status, from its counter
@@ -2587,7 +2662,7 @@ impl Store {
     /// in progress does not delay it, and it refuses once that lock is poisoned. `counts` is
     /// `pending` while the store counters seed;
     /// `live_records`, `unique_payload_chunks` and `unique_json_projections` are then exact
-    /// only through the seeding watermark, not totals.
+    /// only through the seeding watermark, not totals. Its cost does not grow with the store.
     pub fn status(&self, now: u64) -> Result<Value, Error> {
         self.status_report(now).map(|(status, _)| status)
     }
@@ -2615,7 +2690,7 @@ impl Store {
             source: (source_handles, source_bytes),
             record: (record_handles, record_bytes),
             sparql: (sparql_handles, sparql_bytes),
-        } = self.read_lease_stats(now)?;
+        } = self.read_lease_stats(now);
         let snapshot = self.unlocked.db.snapshot();
         let reader = store_counters::Reader::snapshot(&snapshot);
         let positions = store_counters::Positions::read(|key| reader.get(key.as_bytes()))?;
@@ -2748,6 +2823,58 @@ impl Store {
                 .join()
         });
         assert!(joined.is_err() && self.inner.is_poisoned());
+    }
+
+    /// Dev-only: make every source and artifact listing call wait at most `wait` for its
+    /// build before it answers with the build's cursor.
+    #[cfg(feature = "test-support")]
+    pub fn set_listing_build_wait_for_tests(&self, wait: std::time::Duration) -> Result<(), Error> {
+        let poisoned = || Error::new("STORAGE_FAILURE", "listing builds poisoned");
+        self.unlocked
+            .source_builds
+            .lock()
+            .map_err(|_| poisoned())?
+            .set_wait_for_tests(wait);
+        self.unlocked
+            .artifact_builds
+            .lock()
+            .map_err(|_| poisoned())?
+            .set_wait_for_tests(wait);
+        Ok(())
+    }
+
+    /// Dev-only: source then artifact listing builds, each as registered builds, threads
+    /// still running and builds ever started.
+    #[cfg(feature = "test-support")]
+    pub fn listing_builds_for_tests(&self) -> Result<[(usize, usize, u64); 2], Error> {
+        let poisoned = || Error::new("STORAGE_FAILURE", "listing builds poisoned");
+        Ok([
+            self.unlocked
+                .source_builds
+                .lock()
+                .map_err(|_| poisoned())?
+                .census(),
+            self.unlocked
+                .artifact_builds
+                .lock()
+                .map_err(|_| poisoned())?
+                .census(),
+        ])
+    }
+
+    /// Dev-only: drop every read handle and listing build whose lease ended by `now`, as
+    /// the expiry pass does.
+    #[cfg(feature = "test-support")]
+    pub fn purge_read_leases_for_tests(&self, now: u64) -> Result<(), Error> {
+        self.purge_read_leases(now)
+    }
+
+    /// Dev-only: hold at most `rows` owed index rows in one artifact listing window, so a
+    /// small store crosses window ends; 0 restores the production window.
+    #[cfg(feature = "test-support")]
+    pub fn set_owed_window_for_tests(&self, rows: usize) {
+        self.owed_window
+            .store(rows, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Dev-only: make every migration page hold the writer this long before it commits.

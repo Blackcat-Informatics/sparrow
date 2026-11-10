@@ -110,7 +110,7 @@ pub(super) fn qualify_from_projection<B: AsRef<[u8]>>(
             coverage.failed += 1;
             if require_complete {
                 return Err(Error::new(
-                    "INDEX_NOT_READY",
+                    "EVIDENCE_INCOMPLETE",
                     "selected JSON projection failed",
                 ));
             }
@@ -127,7 +127,7 @@ pub(super) fn qualify_from_projection<B: AsRef<[u8]>>(
     coverage.decoding_failures += failures;
     if require_complete && failures > 0 {
         return Err(Error::new(
-            "INDEX_NOT_READY",
+            "EVIDENCE_INCOMPLETE",
             "selected JSON projection has unavailable decoded strings",
         ));
     }

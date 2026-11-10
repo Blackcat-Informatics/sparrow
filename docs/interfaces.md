@@ -351,8 +351,14 @@ Continuation:
   parent's index row, at the parent's receipt time, with no origin. The index
   keeps that receipt time, so receipt filtering finds it.
 - While the online `source-summary` migration is seeding the index, a live
-  listing refuses with `INDEX_NOT_READY` naming the migration (see "Per-source
-  counters and artifact index").
+  listing also lists the rows the migration still owes, so it answers as it will
+  after the migration (see "Per-source counters and artifact index"). The listing
+  reads those rows from a snapshot without the writer lock, a window of 32,768
+  rows after its position at a time: when it starts, and when a continuation
+  passes the window's end. Each window is read by a listing build (see "Listing
+  builds"). A page stops before any row after the window, so no owed row is
+  skipped. A row the migration has copied since is listed once, and an artifact
+  retired since is skipped, as the finished index omits it.
 
 For live listings only, this section supersedes four groups of statements. The
 first is the replay and "never creates another handle" statements under
@@ -626,8 +632,11 @@ Schema 70 adds two flags. `Status.countsPending` (CLI and MCP `counts`,
 exactly the keys through the `store-counters` watermark, and each migration's
 `done` counts its entries through both its own and the seeding watermark; none
 of them is a total. A pending `total` is 0 on the wire and `counting` in CLI and
-MCP. A query-only daemon never runs a page, so its counts stay pending until a
-writable daemon seeds them.
+MCP. The `store-counters` migration's `done` and `watermark` report the seeding's
+progress. Status answers from the seeding checkpoint and never counts the
+unseeded keys, so its cost is the same at any store size (#158). A query-only
+daemon never runs a page, so its counts stay pending until a writable daemon
+seeds them.
 
 `Status.migrations` (CLI and MCP `migrations`) lists every migration with
 `name`, `done` and `total` (decimal strings), `watermark` and `failure`. `total`
@@ -648,18 +657,20 @@ Readers are explicit while a migration is pending:
 
 | Reader | Pending | Complete |
 | --- | --- | --- |
-| Scoped SPARQL (selection, pin, or a source, time or diagnostic filter) | The whole-store plan over every graph declaration, filtered to the scope's owners; the same rows | The owner-to-graph index, at the cost of the scope |
+| Scoped SPARQL (selection, pin, or a source, time or diagnostic filter) | The owner-to-graph index for the declarations the migration has copied, plus the declarations past its frontier, filtered to the scope's owners; the same rows. The uncopied declarations are walked without charging the request budget, checking cancellation every 4,096 rows, and each kept graph is charged to the view's reservation | The owner-to-graph index, at the cost of the scope |
 | Whole-live-store SPARQL | The whole-store plan | The whole-store plan |
-| Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph is beyond the backfill watermark and lacks `eventTimeFallback` is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`); the answer's `complete` is false, and a request with `require_complete_index` refuses with `INDEX_NOT_READY`. A correlation reads only `eventTime` and `receivedAt`, so it neither counts nor refuses | Zero; no refusal |
+| Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph is beyond the backfill watermark and lacks `eventTimeFallback` is served the `eventTimeFallback` and `eventTimeBasis` facts the backfill owes it, derived by the backfill's own law from the record's receipt time, and is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`). The answer equals the migrated store's; strict reads answer the same way | Zero |
 | New graphs written during the migration | Owner-to-graph rows and fallback facts in the same batch | The same |
 | Catalog event time (intervals, sorting, correlation clocks, `event_time_fallback`) | Derived from each record's `received_at`; independent of the RDF rewrite | The same |
-| Record context (`recordsContext`, CLI `context`, MCP `records_context`), and a live `artifacts` listing row that reads its parent records through the cache | Refuses with `INDEX_NOT_READY` naming the `source-context` migration and its watermark; never answers from the partial cache | Walks the source timeline cache |
+| Record context (`recordsContext`, CLI `context`, MCP `records_context`), and a live `artifacts` listing row that reads its parent records through the cache | Walks the primary `time:` index and keeps the source's records, never the partial cache; the same neighbors, visits and frontier. Context reads from a snapshot without the writer lock and checks cancellation every 4,096 entries; skipped entries of other sources are not charged | Walks the source timeline cache |
 
 While the backfill is pending, each candidate record (a selected record without
 a source event time whose graph is beyond the backfill watermark) costs an
-extra manifest point read and a subject lookup, both charged to the request
-budget; a record at or before the watermark costs nothing extra. A large metadata scope can therefore refuse
-with `RESOURCE_LIMIT` during the migration and succeed after it.
+extra manifest point read and a subject lookup, and each owed fact its term
+lookups. None of these reads is charged to the request budget, so a metadata
+scope near its budget answers during the migration as after it; the owed facts
+and terms are charged to the view's reservation as it holds them. A record at
+or before the watermark costs nothing extra.
 
 These fields were added within schema 69, before its first deployment. The
 schema 70 flags below were added after it.
@@ -693,7 +704,10 @@ until they are deleted. `unique_payload_chunks` and `unique_json_projections` ar
 counts. `active_pins` reads the pin rows, which the pin caps bound, and
 `physical_bytes` measures the database directory, as before. A status read
 therefore reads a fixed number of keys plus one per pin row, whatever the size
-of the store, seeding or not. The durability, pressure and table rewrite state
+of the store, seeding or not. The read handles each
+listing registry holds are counted from a ledger kept beside the registry and
+locked only to copy its rows, never while a page reads, so a listing that waits
+for the writer while holding its registry does not delay status. The durability, pressure and table rewrite state
 the same reply carries is kept by the writer to itself, which may hold it
 across commits; when a change ends the writer publishes a small copy, and status
 reads only that copy. A status reply therefore waits for no migration page,
@@ -794,15 +808,44 @@ Readers while the migration is pending:
 
 | Reader | Pending | Complete |
 | --- | --- | --- |
-| `sources` (`sourcesList`, CLI `sources`, MCP `sources_list`) | Refuses with `INDEX_NOT_READY` naming the `source-summary` migration and its watermark | Reads the counter rows |
-| Live `artifacts` listing | Refuses with `INDEX_NOT_READY` the same way | Walks the per-source index |
+| `sources` (`sourcesList`, CLI `sources`, MCP `sources_list`) | A listing build adds the counts the migration still owes to the counter rows of the same snapshot | Reads the counter rows |
+| Live `artifacts` listing | Merges a window of the index rows the migration owes, each read by a listing build, with the stored rows, page by page | Walks the per-source index |
 | Explicit artifact selections, record reads, SPARQL, search | Served; they do not read these rows | The same |
 
-The listings refuse rather than mark their counts incomplete because
-`SourceSummary` and the live artifact page have no coverage field for the
-counters, and adding one would change the wire schema, which this format
-change does not do. Strict reads refuse in the same way while the schema 69
-migrations are pending.
+What the migration owes is computed by running its own counting passes to the
+end over the reader's view without writing, so a listing during the migration
+equals the listing after it. The pass reads each catalog entry the migration
+has not reached once, so its cost shrinks as the migration advances. It runs
+from a snapshot without the writer lock, as a listing build: once per `sources`
+capture, and for a live `artifacts` listing once when it starts and again for
+each further window of 32,768 owed rows its pages pass. CPU is not capped. What
+it holds is charged to the admission of each page that holds it: the owed count
+changes to the `sources` capture, and the owed window, at 64 bytes plus the key
+per row, to each page of the listing; a window always fits that admission. No
+reader refuses because a migration is pending.
+
+#### Listing builds
+
+On the live store the pass costs the unmigrated part of the store, which can
+take longer than a caller's deadline (30 seconds for an MCP tool call, and the
+60-second connection lease for every RPC connection). So the first call
+registers the capture's build and starts it at once on its own thread, which
+takes and holds its own snapshot; the writer lock is held only while a `sources`
+build reads its registries and takes that snapshot. Each call then waits for the
+build for at most 5 seconds. If the build has finished, the call returns its
+first page as usual. Otherwise it returns a page with no rows whose
+`next_cursor` names the build, and whose `CatalogReadReceipt.build` (CLI and
+MCP `build`) reports `read`, the catalog entries the build has read, and
+`total`, the entries the migration still owed at its snapshot (`totalPending`,
+`counting` in CLI and MCP, while the store counters seed). Its `snapshot_id` is
+the build's. Following that cursor waits on the same build again and never
+starts another; a capture's lease starts when its first page is delivered. A
+build's lease runs 60 seconds from the last call that followed its cursor, and
+`resultRelease` with its `snapshot_id` cancels it. An abandoned build is
+dropped when its lease ends, at the latest at the next expiry pass, which
+cancels its thread and drops its snapshot. At most eight builds of each listing
+run at a time; a further fresh listing refuses with `RESOURCE_LIMIT`. Once the
+migration is complete no listing builds.
 
 The migration's duration on the live store is measured on a copy of the newest
 closed-store backup with `deploy/verify-backup.sh --measure-migration`, recorded
@@ -964,10 +1007,10 @@ reasons: `log_no_match`, `log_capture_missing`, `log_invalid_utf8`,
 `invalid_instant`, `log_input_unavailable` and `log_wrong_format`. Raw bytes remain
 authoritative. Syslog retains its protocol timestamp interpretation. Event-time
 queries place unknown clocks at receipt time, marked with basis `receipt`, and
-report their count. Strict index readiness does not promise every clock is known;
-a source time that depends on a failed JSON projection is not ready, so strict
-event-time reads and strict event-clock correlation refuse it with
-`INDEX_NOT_READY`.
+report their count. Strict index completeness does not promise every clock is known;
+a source time that depends on a failed JSON projection is incomplete evidence, so
+strict event-time reads and strict event-clock correlation refuse it with
+`EVIDENCE_INCOMPLETE`.
 
 Patterns admit at most 4096 UTF-8 bytes. Compilation has finite native ceilings
 of 100,000 steps, 16,384 nodes and 65,536 construction slots. Each match has
@@ -1088,7 +1131,7 @@ erase totals obtained from a complete membership scan.
 
 Every surface accepts `require_complete_index=true` (CLI
 `--require-complete-index true`). Unknown diagnostic membership then refuses
-with `INDEX_NOT_READY`, without successful rows; JSON discovery also refuses
+with `EVIDENCE_INCOMPLETE`, without successful rows; JSON discovery also refuses
 unavailable applicable projections. Context anchors must be proven members even
 in default mode; uncertain neighbors remain visible in coverage. Operational
 storage failures always refuse with no successful prefix. Membership references
@@ -1519,15 +1562,22 @@ order; their first deletion batch removes the marker, so a cache such an image
 touched, or left half cleared, is reset at the next open. The `source-context`
 online migration then rebuilds the cache with the shared bounded catalog pager,
 one page per maintenance admission, while the daemon serves. Until it
-completes, context reads refuse with `INDEX_NOT_READY`. A query-only daemon
-runs no page, so on a stale cache its context reads refuse until a writable
-daemon completes the rebuild. Selected entries must agree with the primary time index and the
+completes, context reads walk the primary `time:` index instead and return the
+neighbors the rebuilt cache will give. Context captures its scope, protection
+and membership under the writer lock, then releases it and reads the anchor and
+both directions from a snapshot taken with it, so a walk that skips many other
+sources' entries holds back no write; it checks cancellation every 4,096
+entries. Receipt bounds stop each direction before its visit budget, so a
+direction that leaves the receipt interval reports the scope boundary. A query-only daemon runs no page, so on a
+stale cache its context reads keep using the time index until a writable daemon
+completes the rebuild. Selected entries must agree with the primary time index and the
 record's source; disagreement refuses the capture without a global scan fallback.
 Corrupt record metadata found during reconstruction latches a durable failure:
-the migration stops paging, `Status.migrations` reports the failure, and every
-context capture refuses with an actionable storage failure until catalog repair
-and a reopen, which resets the cache and rebuilds it. It does not publish a
-partial timeline or prevent unrelated evidence reads. Other page failures, such
+the migration stops paging, `Status.migrations` reports the failure, and
+context keeps walking the primary `time:` index until catalog repair and a
+reopen, which resets the cache and rebuilds it. A context read that reaches the
+corrupt record itself refuses with a storage failure. The failure does not
+publish a partial timeline or prevent unrelated evidence reads. Other page failures, such
 as storage I/O or admission, are retried like any migration page. The daemon
 prints the wall time of each open phase once at startup as
 `sparrowd: store_open_ms rocksdb=N identity=N upgrades=N migration_fence=N archive=N wal_sync=N state=N registries=N total=N`
@@ -1660,7 +1710,7 @@ does not leave it incomplete. An event clock does require that no selected
 record's source time depends on a failed JSON projection, the same readiness law
 as a strict records read.
 Strict `require_complete_index=true` refuses an incomplete interpretation with
-`INDEX_NOT_READY`. In permissive mode, available relationships retain their native
+`EVIDENCE_INCOMPLETE`. In permissive mode, available relationships retain their native
 certainty while incomplete coverage prevents an empty result proving absence.
 Governor at-most results remain candidates and unknown outcomes expose no rows.
 Raw SPARQL keeps its existing readiness law and has `correlation=null`.
@@ -1846,7 +1896,7 @@ artifact and pin selections use the shared membership owner and do not expand an
 empty artifact into a fabricated record. Source filters precede diagnostic
 coverage. An otherwise eligible empty artifact cannot satisfy record diagnostic
 filters: permissive reads exclude it and count `artifact_diagnostic_unknown`;
-strict reads refuse `INDEX_NOT_READY`. Metadata layer exclusion removes its graph.
+strict reads refuse `EVIDENCE_INCOMPLETE`. Metadata layer exclusion removes its graph.
 
 Graph coverage keeps `known_selected_records` unchanged and separately reports
 `artifacts_visited`, `known_selected_artifacts` and
@@ -2334,7 +2384,7 @@ a continuing live page the rows delivered so far, with `matching_artifacts` null
 (schema 66);
 `matching_artifacts` is null and `answer_certainty` is incomplete when diagnostic
 membership is unknown. CLI `--require-complete-index` and MCP
-`require_complete_index=true` refuse with `INDEX_NOT_READY` on applicable unknown
+`require_complete_index=true` refuse with `EVIDENCE_INCOMPLETE` on applicable unknown
 mappings. No prefix or handle is published on refusal. CLI and MCP share scope
 decoding, typed coverage encoding and rendering.
 
@@ -2550,7 +2600,7 @@ own lease instead. Summaries carry original artifact
 metadata in an explicit optional union, complete-byte availability at capture
 time and exact retained record count. Reclaimed parent catalogs return absent
 origin metadata while surviving records retain parent ID/source. Receipt-time
-filtering on an applicable unknown origin refuses with `INDEX_NOT_READY`.
+filtering on an applicable unknown origin refuses with `EVIDENCE_INCOMPLETE`.
 Complete-byte availability is an observation at `as_of`; byte reads independently
 check current retention. All counts render as decimal strings in agent output.
 
@@ -3156,7 +3206,7 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 | `EVIDENCE_UNAVAILABLE` | Known expired, evicted, or incomplete complete-file representation. |
 | `PIN_NOT_ACTIVE` | Expired/released collection cannot be renewed or used as an active scope. |
 | `CONFLICT` | Retry identity reuse, revision mismatch, or conflicting source generation. |
-| `INDEX_NOT_READY` | Required projection coverage is unavailable, with pending/failed diagnostics. |
+| `EVIDENCE_INCOMPLETE` | A `require_complete_index` read selected evidence whose interpretation is permanently unknown or failed at ingest (a failed projection, unknown captured diagnostics, a recordless artifact under a diagnostic filter, a reclaimed parent's unknown origin). Not retryable; no online migration causes it. |
 | `RESULT_EXPIRED` | Bounded snapshot/result lease ended. |
 | `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. Native certified governor outcomes retain their read receipts. |
 | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |

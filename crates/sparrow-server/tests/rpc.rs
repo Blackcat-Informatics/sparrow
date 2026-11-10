@@ -3272,7 +3272,7 @@ async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
             assert_eq!(coverage["diagnostic_scope"]["unknown"].as_str(),Some(if tool=="records_context" {"1"} else {"2"}));
             assert_eq!(cli_result["receipt"]["certainty"].as_str(),Some("incomplete"));
             let strict=mcp.tool(request_id,tool,input.with("require_complete_index",true).into()).await;request_id+=1;
-            assert_eq!(strict["structuredContent"]["error"]["code"].as_str(),Some("INDEX_NOT_READY"));
+            assert_eq!(strict["structuredContent"]["error"]["code"].as_str(),Some("EVIDENCE_INCOMPLETE"));
             args.extend(["--require-complete-index","true"]);
             let refused=Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args(&args).admitted_output().unwrap();
             assert!(!refused.status.success() && refused.stdout.is_empty());
@@ -4587,6 +4587,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             let status = cli(&copy_socket, &["status"]);
             // A query-only open fences and serves, but never runs a migration page, so the
             // store counters stay pending: counted through the seeding start, not totals.
+            // Status answers from the seeding checkpoint, in constant time (#158).
             assert_eq!(status["counts"].as_str(), Some("pending"));
             assert_eq!(status["live_records"].as_str(), Some("0"));
             let migrations = status["migrations"].as_array().unwrap();
@@ -4601,7 +4602,8 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 assert_eq!(migration["watermark"].as_str(), Some("start"));
                 assert!(migration["failure"].is_null());
             }
-            // A SPARQL answer over the unmigrated record graph says the backfill is pending.
+            // A SPARQL answer over the unmigrated record graph counts the graph served the
+            // facts the backfill still owes.
             let request = purrdf_lex::json::Object::new()
                 .with("store_id", store.as_str())
                 .with("query", "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1")
@@ -4626,7 +4628,8 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 Some("1"),
                 "{coverage:?}"
             );
-            assert_eq!(coverage["complete"].as_bool(), Some(false), "{coverage:?}");
+            // The view serves the facts the backfill owes, so the answer is complete (#158).
+            assert_eq!(coverage["complete"].as_bool(), Some(true), "{coverage:?}");
             drop(client);
             drop(query);
 
@@ -9795,7 +9798,7 @@ async fn mcp_exercise(
         .await;
     assert_eq!(
         strict["result"]["structuredContent"]["error"]["code"].as_str(),
-        Some("INDEX_NOT_READY")
+        Some("EVIDENCE_INCOMPLETE")
     );
     let invalid_time = mcp
         .call(
@@ -11008,7 +11011,7 @@ async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_sco
             assert_eq!(strict["isError"].as_bool(), Some(true));
             assert_eq!(
                 strict["structuredContent"]["error"]["code"].as_str(),
-                Some("INDEX_NOT_READY")
+                Some("EVIDENCE_INCOMPLETE")
             );
             let mut partials = 0;
             for (index, fuel) in [0_u64, 1, 3, 10, 25].into_iter().enumerate() {
@@ -11572,7 +11575,7 @@ async fn stored_text_graph_relations_preserve_corpus_spans_and_explanations_over
         sparrow_client::release_result(client.capability(), &store, result["snapshot_id"].as_str().unwrap()).await.unwrap();
         let response = mcp.tool(8, "sparql_query", incomplete.with("require_complete_index", true).into()).await;
         assert_eq!(response["isError"].as_bool(), Some(true), "{response:?}");
-        assert_eq!(response["structuredContent"]["error"]["code"].as_str(), Some("INDEX_NOT_READY"));
+        assert_eq!(response["structuredContent"]["error"]["code"].as_str(), Some("EVIDENCE_INCOMPLETE"));
         for invalid in [
             Object::new().with("ranked_iri", "urn:same").with("spans_iri", "urn:same"),
             Object::new().with("ranked_iri", "relative").with("spans_iri", "urn:spans"),
@@ -11829,7 +11832,7 @@ async fn artifact_diagnostic_scope_reports_unknown_membership_through_cli_and_mc
                 .admitted_output()
                 .unwrap();
             assert!(!output.status.success() && output.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("INDEX_NOT_READY"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("EVIDENCE_INCOMPLETE"));
             let excluded = cli(
                 &socket,
                 &[

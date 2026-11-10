@@ -55,7 +55,7 @@ pub(super) fn text_metadata(
     }
     if strict && failed {
         return Err(Error::new(
-            "INDEX_NOT_READY",
+            "EVIDENCE_INCOMPLETE",
             "selected text projection unavailable",
         ));
     }
@@ -563,7 +563,7 @@ impl Store {
                     && matches!(&record.event_time, crate::EventTime::Unknown { reason, .. } if reason == "projection_failed")
                 {
                     return Err(Error::new(
-                        "INDEX_NOT_READY",
+                        "EVIDENCE_INCOMPLETE",
                         "selected source-time profile depends on a failed JSON projection",
                     ));
                 }

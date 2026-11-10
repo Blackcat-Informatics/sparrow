@@ -72,11 +72,11 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "sources_list",
-        "Page an immutable capture of exact intake keys, retained occurrence counts from per-source counter rows, mapping IDs, producer and receiver windows, file-generation checkpoint IDs and configured watch/syslog listener bindings; continuity remains explicitly unknown.",
+        "Page an immutable capture of exact intake keys, retained occurrence counts from per-source counter rows, mapping IDs, producer and receiver windows, file-generation checkpoint IDs and configured watch/syslog listener bindings; continuity remains explicitly unknown. While the source-summary migration runs, a page may have no rows and a build object (read and total entries): the capture is still being built, and next_cursor resumes it.",
     ),
     (
         "artifacts_list",
-        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads pages of the per-source index, ordered by source key, then original receipt, then ID, that count delivered rows until the last page. In the live listing, original receipt-time filters find reclaimed parents at their indexed receipt, without origin metadata; an explicit scope still refuses a receipt filter that meets a parent with no origin. The live listing refuses INDEX_NOT_READY while the source-summary migration seeds the index, or while the source-context migration rebuilds the source timeline cache a reclaimed parent's records are read through.",
+        "Page eligible complete artifacts and surviving parent provenance: an explicit scope pages one immutable capture, and a live listing reads pages of the per-source index, ordered by source key, then original receipt, then ID, that count delivered rows until the last page. In the live listing, original receipt-time filters find reclaimed parents at their indexed receipt, without origin metadata; an explicit scope still refuses a receipt filter that meets a parent with no origin. While an online migration seeds the index or rebuilds the source timeline cache, the live listing adds the rows the migration still owes and reads reclaimed parents' records from the primary time index, so it lists the same rows as after the migration; a page may then have no rows and a build object (read and total entries) while its window of owed rows is read, and next_cursor resumes it.",
     ),
     (
         "diagnostic_define",
@@ -136,7 +136,7 @@ const TOOLS: &[(&str, &str)] = &[
     ),
     (
         "records_context",
-        "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity. Refuses INDEX_NOT_READY while the source-context migration rebuilds the source timeline cache.",
+        "Fetch retained same-source neighbors ordered by acceptance time and record ID; reports observed retirement gaps and unknown producer continuity. While the source-context migration rebuilds the source timeline cache, reads the primary time index instead and returns the same neighbors.",
     ),
     (
         "rdf_inspect",

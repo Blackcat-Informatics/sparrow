@@ -29,7 +29,12 @@
 //! write during the migration maintains the rows of every artifact the migration has
 //! already counted, or that the write itself creates, and leaves the others for the
 //! migration, which reads their state when it reaches them.
+//!
+//! Until it completes, readers add a [`Completion`] to the stored rows: the migration's own
+//! counting passes run to the end over the reader's view without writing, so a listing
+//! answers exactly as it will once the migration is complete.
 
+use super::store_counters::Reader;
 use super::{Error, Writer, integer, manifest_retire, parse, read_field};
 use purrdf_lex::json::{self, Object};
 use rocksdb::{DB, WriteBatch};
@@ -158,6 +163,30 @@ fn shift(source: &str, name: &str, value: u64, change: i64) -> Result<u64, Error
     })
 }
 
+/// `counts` with `delta` applied; a count below 0 refuses by naming the source.
+fn shifted(mut counts: Counts, delta: &Delta) -> Result<Counts, Error> {
+    let source = counts.source.clone();
+    counts.retained_records = shift(
+        &source,
+        "retained_records",
+        counts.retained_records,
+        delta.retained_records,
+    )?;
+    counts.complete_artifacts = shift(
+        &source,
+        "complete_artifacts",
+        counts.complete_artifacts,
+        delta.complete_artifacts,
+    )?;
+    counts.fragment_parents = shift(
+        &source,
+        "fragment_parents",
+        counts.fragment_parents,
+        delta.fragment_parents,
+    )?;
+    Ok(counts)
+}
+
 /// Read one source's summary row from a database or snapshot reader.
 pub(super) fn counts(
     read: impl FnOnce(&str) -> Result<Option<Vec<u8>>, Error>,
@@ -183,7 +212,7 @@ fn merge(db: &DB, batch: &mut WriteBatch, deltas: BTreeMap<String, Delta>) -> Re
             continue;
         }
         let stored = counts(|key| Ok(db.get(key)?), &source)?;
-        let mut next = match stored {
+        let next = match stored {
             Some(counts) => counts,
             None => {
                 if delta.counted_before || super::any_key(db, index_prefix(&source).as_bytes())? {
@@ -197,24 +226,7 @@ fn merge(db: &DB, batch: &mut WriteBatch, deltas: BTreeMap<String, Delta>) -> Re
                 }
             }
         };
-        next.retained_records = shift(
-            &source,
-            "retained_records",
-            next.retained_records,
-            delta.retained_records,
-        )?;
-        next.complete_artifacts = shift(
-            &source,
-            "complete_artifacts",
-            next.complete_artifacts,
-            delta.complete_artifacts,
-        )?;
-        next.fragment_parents = shift(
-            &source,
-            "fragment_parents",
-            next.fragment_parents,
-            delta.fragment_parents,
-        )?;
+        let next = shifted(next, &delta)?;
         if next.is_empty() {
             batch.delete(summary_key(&source));
         } else {
@@ -250,8 +262,8 @@ struct Retained {
 }
 
 impl Retained {
-    fn read(db: &DB, id: &str) -> Result<Option<Self>, Error> {
-        let Some(bytes) = db.get_pinned(retained_key(id))? else {
+    fn read(reader: &Reader<'_>, id: &str) -> Result<Option<Self>, Error> {
+        let Some(bytes) = reader.get(retained_key(id).as_bytes())? else {
             return Ok(None);
         };
         let (count, mode) = bytes
@@ -347,19 +359,6 @@ pub(super) fn progress(
         Some((1, rest)) => Ok(Progress::Artifacts(after(rest)?)),
         Some((2, rest)) => Ok(Progress::Records(after(rest)?)),
         _ => Err(invalid()),
-    }
-}
-
-/// Refuse a listing that would read counters or index rows the migration has not finished.
-pub(super) fn ready(progress: &Progress, operation: &str) -> Result<(), Error> {
-    match progress.watermark() {
-        None => Ok(()),
-        Some(watermark) => Err(Error::new(
-            "INDEX_NOT_READY",
-            format!(
-                "{operation} reads the per-source counters and artifact index, which the online migration source-summary is still seeding (watermark {watermark}); retry once status.migrations reports it complete"
-            ),
-        )),
     }
 }
 
@@ -612,7 +611,7 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
         let complete_after = after
             .as_ref()
             .is_some_and(|state| !state.evicted && !retired_after);
-        let row = Retained::read(db, &id)?;
+        let row = Retained::read(&Reader::db(db), &id)?;
         let created = before.is_none() && after.is_some();
         let Some((source, received_at)) = change.identity else {
             // Neither an entry nor a record: a retirement state of an artifact already gone.
@@ -709,77 +708,227 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
 /// Stage one migration page: counted rows and the advanced checkpoint in one batch, and
 /// whether the migration is complete after it. `None` when it was already complete.
 pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
+    let reader = Reader::db(db);
     let mut batch = WriteBatch::default();
     let mut deltas = BTreeMap::<String, Delta>::new();
-    let next = match progress(|key| Ok(db.get(key)?))? {
+    let next = match progress(|key| reader.get(key.as_bytes()))? {
         Progress::Complete => return Ok(None),
-        Progress::Artifacts(after) => artifact_page(db, after, &mut batch, &mut deltas)?,
-        Progress::Records(after) => record_page(db, after, &mut batch, &mut deltas)?,
+        Progress::Artifacts(after) => artifact_page(
+            &reader,
+            after,
+            (PAGE_ARTIFACTS, PAGE_RECORDS),
+            (&mut batch, &mut deltas),
+            &mut || Ok(()),
+        )?,
+        Progress::Records(after) => record_page(
+            &reader,
+            after,
+            PAGE_RECORDS,
+            (&mut batch, &mut deltas),
+            &mut || Ok(()),
+        )?,
     };
     merge(db, &mut batch, deltas)?;
     batch.put(CHECKPOINT, next.encode());
     Ok(Some((batch, next == Progress::Complete)))
 }
 
-/// One catalog key and its value.
-type Entry = Result<(Box<[u8]>, Box<[u8]>), Error>;
+/// Where a counting pass puts the rows it counts: a migration page's batch, or the
+/// in-memory completion a reader takes while the migration is unfinished.
+trait Rows {
+    /// One artifact's retained record count.
+    fn retained(&mut self, id: &str, row: Retained);
+    /// One per-source artifact index row.
+    fn index(&mut self, key: String);
+}
 
-/// Keys under `prefix` after `after`, in order.
-fn entries_after<'a>(
-    db: &'a DB,
-    prefix: &'a [u8],
-    after: Option<&'a str>,
-) -> impl Iterator<Item = Entry> + 'a {
-    let start = after.map_or(prefix, str::as_bytes);
-    db.iterator(rocksdb::IteratorMode::From(
-        start,
-        rocksdb::Direction::Forward,
+impl Rows for WriteBatch {
+    fn retained(&mut self, id: &str, row: Retained) {
+        self.put(retained_key(id), row.encode());
+    }
+    fn index(&mut self, key: String) {
+        self.put(key, []);
+    }
+}
+
+/// The catalog entries a [`Completion`] over `reader` reads, in the migration's own unit
+/// (artifact and record entries it has not passed), or `None` while the store counters
+/// seed and no total is known. Zero once the migration is complete. A fixed number of
+/// point reads.
+pub(super) fn owed_entries(reader: &Reader<'_>, progress: &Progress) -> Result<Option<u64>, Error> {
+    use super::store_counters::{Counter, Positions, values};
+    if *progress == Progress::Complete {
+        return Ok(Some(0));
+    }
+    let positions = Positions::read(|key| reader.get(key.as_bytes()))?;
+    if !positions.seeded() {
+        return Ok(None);
+    }
+    let rows = values(reader)?;
+    let total = rows[&Counter::Artifacts]
+        .checked_add(rows[&Counter::Records])
+        .ok_or_else(|| failure("source-summary population overflow"))?;
+    Ok(Some(
+        total.saturating_sub(rows[&Counter::SourceSummaryDone]),
     ))
-    .map(|row| row.map_err(Error::from))
-    .take_while(move |row| {
-        row.as_ref()
-            .map_or(true, |(key, _)| key.starts_with(prefix))
-    })
-    .filter(move |row| {
-        row.as_ref().map_or(true, |(key, _)| {
-            after.is_none_or(|after| **key != *after.as_bytes())
-        })
-    })
+}
+
+/// Which owed index rows a [`Completion`] keeps.
+pub(super) type Keep = Box<dyn Fn(&str) -> bool>;
+
+/// What the unfinished migration still owes, as one reader sees the store: the count
+/// changes per source and the per-source index rows its remaining pages would write.
+/// Stored rows plus this completion equal the rows the finished migration leaves for the
+/// same catalog, because it runs the migration's own counting passes to the end.
+pub(super) struct Completion {
+    deltas: BTreeMap<String, Delta>,
+    keep: Keep,
+    /// The first owed index rows `keep` selected, at most `rows` of them, in key order.
+    pub(super) index: std::collections::BTreeSet<String>,
+    rows: usize,
+    /// Whether `keep` selected more than `rows` rows, so rows after the last kept one exist.
+    pub(super) truncated: bool,
+}
+
+impl Rows for Completion {
+    fn retained(&mut self, _: &str, _: Retained) {}
+    fn index(&mut self, key: String) {
+        if (self.keep)(&key) {
+            self.index.insert(key);
+            if self.index.len() > self.rows {
+                self.index.pop_last();
+                self.truncated = true;
+            }
+        }
+    }
+}
+
+impl Completion {
+    /// Complete the migration at `progress` over `reader` without writing, keeping the first
+    /// `rows` owed index rows `keep` selects; `None` once the migration is complete. The pass reads
+    /// the catalog entries the migration has not reached, one entry each, as its pages
+    /// would; `entry` runs before each artifact and record entry it examines, so a caller
+    /// can count the pass's progress in the migration's own units and stop it.
+    pub(super) fn owed(
+        reader: &Reader<'_>,
+        progress: &Progress,
+        index: (usize, Keep),
+        entry: &mut dyn FnMut() -> Result<(), Error>,
+    ) -> Result<Option<Self>, Error> {
+        if *progress == Progress::Complete {
+            return Ok(None);
+        }
+        let (rows, keep) = index;
+        let mut completion = Self {
+            deltas: BTreeMap::new(),
+            keep,
+            index: std::collections::BTreeSet::new(),
+            rows,
+            truncated: false,
+        };
+        let mut deltas = BTreeMap::new();
+        let mut next = progress.clone();
+        loop {
+            next = match next {
+                Progress::Complete => break,
+                Progress::Artifacts(after) => artifact_page(
+                    reader,
+                    after,
+                    (PAGE_ARTIFACTS, PAGE_RECORDS),
+                    (&mut completion, &mut deltas),
+                    entry,
+                )?,
+                // One pass: a deleted parent's records are counted together, as the
+                // pages count them across their boundaries.
+                Progress::Records(after) => record_page(
+                    reader,
+                    after,
+                    usize::MAX,
+                    (&mut completion, &mut deltas),
+                    entry,
+                )?,
+            };
+        }
+        completion.deltas = deltas;
+        Ok(Some(completion))
+    }
+
+    /// One source's counts after the migration: `stored` (absent when the source has no
+    /// row) with the owed changes applied; `None` when every count is 0.
+    pub(super) fn counts(
+        &self,
+        source: &str,
+        stored: Option<Counts>,
+    ) -> Result<Option<Counts>, Error> {
+        let mut next = stored.unwrap_or_else(|| Counts {
+            source: source.to_owned(),
+            ..Counts::default()
+        });
+        if let Some(delta) = self.deltas.get(source) {
+            next = shifted(next, delta)?;
+        }
+        Ok((!next.is_empty()).then_some(next))
+    }
+
+    /// Bytes the owed count changes hold while a reader applies them.
+    pub(super) fn bytes(&self) -> usize {
+        self.deltas
+            .keys()
+            .map(|source| source.capacity() + 64 + std::mem::size_of::<Delta>())
+            .sum()
+    }
+
+    /// Sources with owed changes, in order.
+    pub(super) fn sources(&self) -> impl Iterator<Item = &str> {
+        self.deltas.keys().map(String::as_str)
+    }
 }
 
 fn artifact_page(
-    db: &DB,
+    reader: &Reader<'_>,
     after: Option<String>,
-    batch: &mut WriteBatch,
-    deltas: &mut BTreeMap<String, Delta>,
+    limits: (usize, usize),
+    (rows, deltas): (&mut impl Rows, &mut BTreeMap<String, Delta>),
+    entry: &mut dyn FnMut() -> Result<(), Error>,
 ) -> Result<Progress, Error> {
     let (mut artifacts, mut records) = (0, 0);
     let mut last = None;
-    for row in entries_after(db, ARTIFACT_PREFIX, after.as_deref()) {
-        if artifacts == PAGE_ARTIFACTS || records >= PAGE_RECORDS {
-            return Ok(Progress::Artifacts(last.or_else(|| after.clone())));
-        }
-        let (key, bytes) = row?;
-        let id = std::str::from_utf8(&key)
-            .map_err(|_| failure("invalid artifact catalog key"))?
-            .to_owned();
-        artifacts += 1;
-        records += count_artifact(db, &id, &bytes, batch, deltas)?;
-        last = Some(id);
-    }
-    Ok(Progress::Records(None))
+    let mut full = false;
+    reader.scan(
+        ARTIFACT_PREFIX,
+        after.as_deref().map(str::as_bytes),
+        |key, bytes| {
+            if artifacts == limits.0 || records >= limits.1 {
+                full = true;
+                return Ok(false);
+            }
+            entry()?;
+            let id = std::str::from_utf8(key)
+                .map_err(|_| failure("invalid artifact catalog key"))?
+                .to_owned();
+            artifacts += 1;
+            records += count_artifact(reader, &id, bytes, rows, deltas)?;
+            last = Some(id);
+            Ok(true)
+        },
+    )?;
+    Ok(if full {
+        Progress::Artifacts(last.or(after))
+    } else {
+        Progress::Records(None)
+    })
 }
 
 /// Count one artifact with its records unless a write already counted it; returns the
 /// record entries read.
 fn count_artifact(
-    db: &DB,
+    reader: &Reader<'_>,
     id: &str,
     bytes: &[u8],
-    batch: &mut WriteBatch,
+    rows: &mut impl Rows,
     deltas: &mut BTreeMap<String, Delta>,
 ) -> Result<usize, Error> {
-    match Retained::read(db, id)? {
+    match Retained::read(reader, id)? {
         Some(Retained {
             mode: Mode::Full, ..
         }) => return Ok(0),
@@ -797,8 +946,8 @@ fn count_artifact(
             "artifact catalog entry {id} names another identity"
         )));
     }
-    let retired = db
-        .get_pinned(format!("artifact-retirement:{id}"))?
+    let retired = reader
+        .get(format!("artifact-retirement:{id}").as_bytes())?
         .map(|bytes| manifest_retire::evicted_flag(&bytes))
         .transpose()?
         .unwrap_or(false);
@@ -808,7 +957,7 @@ fn count_artifact(
     let ids = header.record_ids(bytes, &mut remaining, 0, usize::MAX)?;
     let mut retained = 0_u64;
     for record in &ids {
-        let Some(bytes) = db.get_pinned(record)? else {
+        let Some(bytes) = reader.get(record.as_bytes())? else {
             continue;
         };
         let state = record_state(record, &bytes)?;
@@ -823,15 +972,14 @@ fn count_artifact(
         retained += u64::from(state.retained);
     }
     if complete || retained > 0 {
-        batch.put(
-            retained_key(id),
+        rows.retained(
+            id,
             Retained {
                 count: retained,
                 mode: Mode::Full,
-            }
-            .encode(),
+            },
         );
-        batch.put(index_key(&source, received_at, id), []);
+        rows.index(index_key(&source, received_at, id));
         let delta = deltas.entry(source).or_default();
         delta.retained_records += i64::try_from(retained)
             .map_err(|_| failure(format!("retained records of artifact {id} overflow")))?;
@@ -842,63 +990,70 @@ fn count_artifact(
 }
 
 fn record_page(
-    db: &DB,
+    reader: &Reader<'_>,
     after: Option<String>,
-    batch: &mut WriteBatch,
-    deltas: &mut BTreeMap<String, Delta>,
+    limit: usize,
+    (rows, deltas): (&mut impl Rows, &mut BTreeMap<String, Delta>),
+    entry: &mut dyn FnMut() -> Result<(), Error>,
 ) -> Result<Progress, Error> {
     // Deleted parents counted by this page, with their row before it.
     let mut parents = BTreeMap::<String, (Option<Retained>, u64, String, u64)>::new();
     let mut last = None;
+    let mut records = 0;
     let mut exhausted = true;
-    for (records, row) in entries_after(db, RECORD_PREFIX, after.as_deref()).enumerate() {
-        if records == PAGE_RECORDS {
-            exhausted = false;
-            break;
-        }
-        let (key, bytes) = row?;
-        let id = std::str::from_utf8(&key)
-            .map_err(|_| failure("invalid record catalog key"))?
-            .to_owned();
-        let state = record_state(&id, &bytes)?;
-        last = Some(id);
-        if !state.retained || db.get_pinned(&state.artifact)?.is_some() {
-            continue;
-        }
-        let parent = match parents.entry(state.artifact.clone()) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let row = Retained::read(db, &state.artifact)?;
-                entry.insert((row, 0, state.source.clone(), state.received_at))
+    reader.scan(
+        RECORD_PREFIX,
+        after.as_deref().map(str::as_bytes),
+        |key, bytes| {
+            if records == limit {
+                exhausted = false;
+                return Ok(false);
             }
-        };
-        if parent.0.is_some_and(|row| row.mode == Mode::Full) {
-            continue;
-        }
-        let mut known = Some((parent.2.clone(), parent.3));
-        agree(
-            &state.artifact,
-            &mut known,
-            &state.source,
-            state.received_at,
-        )?;
-        parent.1 += 1;
-    }
+            entry()?;
+            records += 1;
+            let id = std::str::from_utf8(key)
+                .map_err(|_| failure("invalid record catalog key"))?
+                .to_owned();
+            let state = record_state(&id, bytes)?;
+            last = Some(id);
+            if !state.retained || reader.get(state.artifact.as_bytes())?.is_some() {
+                return Ok(true);
+            }
+            let parent = match parents.entry(state.artifact.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let row = Retained::read(reader, &state.artifact)?;
+                    entry.insert((row, 0, state.source.clone(), state.received_at))
+                }
+            };
+            if parent.0.is_some_and(|row| row.mode == Mode::Full) {
+                return Ok(true);
+            }
+            let mut known = Some((parent.2.clone(), parent.3));
+            agree(
+                &state.artifact,
+                &mut known,
+                &state.source,
+                state.received_at,
+            )?;
+            parent.1 += 1;
+            Ok(true)
+        },
+    )?;
     for (id, (row, added, source, received_at)) in parents {
         if added == 0 {
             continue;
         }
         let before = row.map_or(0, |row| row.count);
-        batch.put(
-            retained_key(&id),
+        rows.retained(
+            &id,
             Retained {
                 count: before + added,
                 mode: Mode::Partial,
-            }
-            .encode(),
+            },
         );
         if before == 0 {
-            batch.put(index_key(&source, received_at, &id), []);
+            rows.index(index_key(&source, received_at, &id));
         }
         let delta = deltas.entry(source).or_default();
         delta.counted_before |= before > 0;

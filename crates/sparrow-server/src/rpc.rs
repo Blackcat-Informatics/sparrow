@@ -34,6 +34,12 @@ fn catalog_receipt<B>(
     out.set_page_size(page.page_size as u32);
     out.set_scan_budget(page.scan_budget as u32);
     out.set_scanned(page.scanned as u64);
+    if let Some(build) = page.build {
+        let mut out = out.reborrow().init_build();
+        out.set_read(build.read);
+        out.set_total(build.total.unwrap_or(0));
+        out.set_total_pending(build.total.is_none());
+    }
     sparrow_client::encode_optional(
         out.init_next_cursor(),
         page.next_cursor.as_deref(),
@@ -153,8 +159,8 @@ impl<B> Drop for QueryReply<B> {
 
 /// A `result_next` page: a guarded live artifact continuation, or a replay.
 enum Next {
-    Artifacts(QueryReply<sparrow_core::ArtifactPageBody>),
-    Replay(sparrow_core::ResultPage),
+    Artifacts(Box<QueryReply<sparrow_core::ArtifactPageBody>>),
+    Replay(Box<sparrow_core::ResultPage>),
 }
 
 impl Rpc {
@@ -2435,8 +2441,16 @@ impl wire::sparrow::Server for Rpc {
         let ordering = input.get_ordering().map_err(invalid);
         let found = match (reference, ordering) {
             (Ok(id), Ok(wire::ContextOrder::ReceivedAtRecordId)) => {
-                self.work(move |store, now| store.records_context(&id, &scope?, before, after, now))
-                    .await
+                self.read_work(move |store, now, cancellation| {
+                    store.records_context_cancellable(
+                        &id,
+                        &scope?,
+                        (before, after),
+                        now,
+                        &cancellation,
+                    )
+                })
+                .await
             }
             (Err(error), _) | (_, Err(error)) => Err(error),
         };
@@ -3806,9 +3820,9 @@ impl wire::sparrow::Server for Rpc {
             .read_work(move |store, now, _| {
                 Ok(match store.result_next(&store_id, &cursor, now)? {
                     sparrow_core::ResultPage::Artifacts(page) => {
-                        Next::Artifacts(QueryReply::new(page, store, Some(&cursor)))
+                        Next::Artifacts(Box::new(QueryReply::new(page, store, Some(&cursor))))
                     }
-                    page => Next::Replay(page),
+                    page => Next::Replay(Box::new(page)),
                 })
             })
             .await
@@ -3823,7 +3837,7 @@ impl wire::sparrow::Server for Rpc {
             }
             Ok(Next::Replay(page)) => {
                 let out = results.get().init_result().init_ok();
-                match page {
+                match *page {
                     sparrow_core::ResultPage::Records(page) => records_page(
                         out.init_records(),
                         &page,

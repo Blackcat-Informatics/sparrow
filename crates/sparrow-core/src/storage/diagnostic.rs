@@ -547,74 +547,103 @@ impl Writer {
         coverage: &mut DiagnosticCoverage,
         strict: bool,
     ) -> Result<bool, Error> {
-        self.validate_diagnostic_record(record)?;
-        coverage.evaluated += 1;
-        let mut matched = true;
-        let mut unknown = None;
-        for (dimension, alternatives) in &scope.diagnostics {
-            match record.diagnostics.fields.get(dimension) {
-                Some(DiagnosticValue::Known { value, .. }) => {
-                    matched &= alternatives.ids().iter().any(|wanted| wanted == value)
-                }
-                _ => unknown = Some(dimension),
-            }
-        }
-        if !matched {
-            coverage.excluded += 1;
-            return Ok(false);
-        }
-        if let Some(dimension) = unknown {
-            if strict {
-                return Err(Error::new(
-                    "INDEX_NOT_READY",
-                    format!(
-                        "{} diagnostic scope cannot be certified for record {}; inspect its captured diagnostics or narrow scope",
-                        dimension.name(),
-                        record.id
-                    ),
-                ));
-            }
-            coverage.unknown += 1;
-            return Ok(false);
-        }
-        coverage.matched += 1;
-        Ok(true)
+        matches_diagnostic_scope(
+            &super::store_counters::Reader::db(&self.db),
+            scope,
+            record,
+            coverage,
+            strict,
+        )
     }
 
     pub(super) fn diagnostic_profile(
         &self,
         source: &str,
     ) -> Result<Option<DiagnosticProfile>, Error> {
-        let Some(bytes) = self.db.get(source_key(source))? else {
-            return Ok(None);
-        };
-        let profile = DiagnosticProfile::decode(&parse(&bytes)?)?;
-        if profile.source != source {
+        diagnostic_profile(&super::store_counters::Reader::db(&self.db), source)
+    }
+}
+
+/// Whether `record` matches the scope's diagnostic filters, counting it in `coverage`;
+/// bindings are read from `reader` (the database under the writer, or a snapshot).
+pub(super) fn matches_diagnostic_scope(
+    reader: &super::store_counters::Reader<'_>,
+    scope: &crate::QueryScope,
+    record: &Record,
+    coverage: &mut DiagnosticCoverage,
+    strict: bool,
+) -> Result<bool, Error> {
+    validate_diagnostic_record(reader, record)?;
+    coverage.evaluated += 1;
+    let mut matched = true;
+    let mut unknown = None;
+    for (dimension, alternatives) in &scope.diagnostics {
+        match record.diagnostics.fields.get(dimension) {
+            Some(DiagnosticValue::Known { value, .. }) => {
+                matched &= alternatives.ids().iter().any(|wanted| wanted == value)
+            }
+            _ => unknown = Some(dimension),
+        }
+    }
+    if !matched {
+        coverage.excluded += 1;
+        return Ok(false);
+    }
+    if let Some(dimension) = unknown {
+        if strict {
             return Err(Error::new(
-                "STORAGE_FAILURE",
-                "diagnostic source binding mismatch",
+                "EVIDENCE_INCOMPLETE",
+                format!(
+                    "{} diagnostic scope cannot be certified for record {}; inspect its captured diagnostics or narrow scope",
+                    dimension.name(),
+                    record.id
+                ),
             ));
         }
-        Ok(Some(profile))
+        coverage.unknown += 1;
+        return Ok(false);
     }
+    coverage.matched += 1;
+    Ok(true)
+}
 
-    pub(super) fn validate_diagnostic_record(&self, record: &Record) -> Result<(), Error> {
-        if let Some(snapshot) = &record.syslog {
-            return snapshot.validate_record(record);
-        }
-        if let Some(id) = &record.diagnostics.profile_id {
-            let profile = self.diagnostic_profile(&record.source)?.ok_or_else(|| {
-                Error::new("STORAGE_FAILURE", "captured diagnostic profile missing")
-            })?;
-            if profile.id != *id || !profile.mappings.keys().eq(record.diagnostics.fields.keys()) {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "captured diagnostic mapping disagrees with immutable binding",
-                ));
-            }
-        }
-        Ok(())
+/// A source's bound diagnostic profile, read from `reader`.
+pub(super) fn diagnostic_profile(
+    reader: &super::store_counters::Reader<'_>,
+    source: &str,
+) -> Result<Option<DiagnosticProfile>, Error> {
+    let Some(bytes) = reader.get(source_key(source).as_bytes())? else {
+        return Ok(None);
+    };
+    let profile = DiagnosticProfile::decode(&parse(&bytes)?)?;
+    if profile.source != source {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "diagnostic source binding mismatch",
+        ));
     }
+    Ok(Some(profile))
+}
+
+/// Check a record's captured diagnostics against its source's immutable binding.
+pub(super) fn validate_diagnostic_record(
+    reader: &super::store_counters::Reader<'_>,
+    record: &Record,
+) -> Result<(), Error> {
+    if let Some(snapshot) = &record.syslog {
+        return snapshot.validate_record(record);
+    }
+    if let Some(id) = &record.diagnostics.profile_id {
+        let profile = diagnostic_profile(reader, &record.source)?
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "captured diagnostic profile missing"))?;
+        if profile.id != *id || !profile.mappings.keys().eq(record.diagnostics.fields.keys()) {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "captured diagnostic mapping disagrees with immutable binding",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Store {

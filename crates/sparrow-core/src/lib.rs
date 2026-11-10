@@ -61,6 +61,7 @@ pub use storage::ingest_status::{
     IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus,
 };
 pub use storage::intake::{INGEST_SOCKET, Intake, PeerCredential, admit_import};
+pub use storage::listing_build::BuildProgress;
 pub use storage::log_time::LogTimeCapture;
 pub use storage::migration::{Migration, MigrationPage, MigrationStatus};
 pub use storage::open_files::OpenFiles;
