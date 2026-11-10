@@ -700,8 +700,16 @@ impl Detector {
             if flags.contains(ReadFlags::DELETE) {
                 self.candidates.remove(&relative);
             }
-            if flags.intersects(
+            // An open adds no bytes. For a completed-file watch it restarts the quiet clock; for
+            // a tail watch it is only ever the daemon's own descriptor open in `attach`, and
+            // reacting to it would reopen a refused file on every event.
+            let activity = if matches!(self.owner, Owner::Tail(_)) {
+                ReadFlags::empty()
+            } else {
                 ReadFlags::OPEN
+            };
+            if flags.intersects(
+                activity
                     | ReadFlags::MODIFY
                     | ReadFlags::ATTRIB
                     | ReadFlags::CREATE
