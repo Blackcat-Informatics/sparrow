@@ -5631,7 +5631,10 @@ Ingestion acknowledges only after the atomic RocksDB write is synchronized. A
 connection failure before acknowledgement leaves delivery unknown; retry with
 the same request identity. Ingestion and pin/create/renew/release receipts last 48 hours.
 Expired evidence metadata has a one-day tombstone window, except live pinned
-records. Retention maintenance runs every 30 seconds.
+records. The maintenance worker runs expiry with a 60-second pause after each
+complete traversal, pressure maintenance and import reclamation every second,
+the table rewrite step every 5 seconds, and buffered synchronization at the
+configured interval.
 
 ## Storage and queries
 

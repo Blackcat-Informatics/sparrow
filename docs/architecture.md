@@ -596,7 +596,8 @@ serves on the pending paths. Writers come before pages: before a page the
 maintenance worker waits while an ingest, publication or RPC write is waiting
 for the writer lock, for at most the longer of 100 ms and the previous page's
 hold, so the migration keeps progressing without holding writers behind a run of
-pages. The worker polls that wait with its other duties, so it delays only the
+pages. That wait is a condition-variable wait in a blocking task, which the
+worker awaits among its other duties and nothing polls, so it delays only the
 page.
 
 `status` and the migration report never take the writer lock. They read fixed

@@ -1431,8 +1431,12 @@ async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_re
             let mut settings = sparrow_client::DeliveryConfig::tcp(address, "tcp-logging");
             settings.batch_events = 1;
             settings.rpc_timeout = Duration::from_millis(100);
-            settings.retry_interval = Duration::from_millis(20);
-            settings.retry_max_interval = settings.retry_interval;
+            // Production refuses sub-second intervals; this outage test needs fast retries.
+            let settings = settings.with_test_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            );
             let delivery = sparrow_client::Delivery::start(settings).unwrap();
             assert_eq!(
                 admit(&delivery, delivery_event("queued before TCP listener")).await,
@@ -8121,10 +8125,14 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
             assert_eq!(committed.durability, wire::Durability::Durable);
             *state.mutate_published_file.borrow_mut() = None;
             state.corrupt_receipt.set(true);
-            let delivery = sparrow_client::Delivery::start(sparrow_client::DeliveryConfig {
-                flush_interval: Duration::from_millis(10),
-                ..sparrow_client::DeliveryConfig::new(proxy_socket, "pending-receipt")
-            })
+            // Production refuses a sub-second flush interval; this test needs a prompt batch.
+            let fast = sparrow_client::DeliveryConfig::new(proxy_socket, "pending-receipt");
+            let (retry, retry_max) = (fast.retry_interval, fast.retry_max_interval);
+            let delivery = sparrow_client::Delivery::start(fast.with_test_timing(
+                Duration::from_millis(10),
+                retry,
+                retry_max,
+            ))
             .unwrap();
             admit(&delivery, delivery_event("must retain unknown body")).await;
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -8395,8 +8403,12 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
                 sparrow_client::DeliveryConfig::new(&proxy_socket, "delivery-lost-reply");
             config.batch_events = 1;
             config.rpc_timeout = Duration::from_millis(150);
-            config.retry_interval = Duration::from_millis(20);
-            config.retry_max_interval = config.retry_interval;
+            // Production refuses sub-second intervals; this recovery test needs fast retries.
+            let config = config.with_test_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            );
             let delivery = sparrow_client::Delivery::start(config).unwrap();
             let sequence = admit(&delivery, delivery_event("lost reply recovery")).await;
             let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
@@ -8431,10 +8443,14 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
                 rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
                 1
             );
-            let mut timed_config =
-                sparrow_client::DeliveryConfig::new(&socket, "delivery-lost-reply");
+            let timed_config = sparrow_client::DeliveryConfig::new(&socket, "delivery-lost-reply");
             assert_eq!(timed_config.flush_interval, Duration::from_secs(2));
-            timed_config.flush_interval = Duration::from_millis(50);
+            // Production refuses a sub-second flush interval; this test needs prompt batching.
+            let timed_config = timed_config.with_test_timing(
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+            );
             let timed = sparrow_client::Delivery::start(timed_config).unwrap();
             admit(&timed, delivery_event("lost reply recovery")).await;
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -8474,8 +8490,12 @@ async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recover
                 sparrow_client::DeliveryConfig::new(&socket, "delivery-outage");
             delivery_config.max_queued_events = 2;
             delivery_config.batch_events = 1;
-            delivery_config.retry_interval = Duration::from_millis(25);
-            delivery_config.retry_max_interval = delivery_config.retry_interval;
+            // Production refuses sub-second intervals; this outage test needs fast retries.
+            let delivery_config = delivery_config.with_test_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(25),
+                Duration::from_millis(25),
+            );
             let delivery = sparrow_client::Delivery::start(delivery_config).unwrap();
             admit(&delivery, delivery_event("before service start one")).await;
             admit(&delivery, delivery_event("before service start two")).await;
@@ -8550,7 +8570,9 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
         let proxy_socket = dir.path().join("relay.sock");
         let (state, proxy) = relay(&proxy_socket, first_backend.client.clone());
         let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery");
-        config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150); config.retry_interval = Duration::from_millis(100); config.retry_max_interval = config.retry_interval;
+        config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150);
+        // Production refuses sub-second intervals; this test needs fast retries.
+        let config = config.with_test_timing(Duration::from_secs(2), Duration::from_millis(100), Duration::from_millis(100));
         let delivery = sparrow_client::Delivery::start(config).unwrap();
         admit(&delivery, delivery_event("unknown accepted delivery")).await;
         tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified()).await.unwrap();

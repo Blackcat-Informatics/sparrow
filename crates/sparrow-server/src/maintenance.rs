@@ -30,6 +30,11 @@ pub(super) struct Worker {
 }
 
 impl Worker {
+    /// `flush` is the buffered synchronization interval. The only production caller passes
+    /// `buffered_flush_interval_ms`, which storage configuration validation bounds to
+    /// 1000..60000 ms, so no production timer here fires more than once a second. No floor is
+    /// enforced at this entry because this module's tests pass 1 ms to reach the flush duty
+    /// without waiting whole seconds; they are the only exception.
     pub(super) fn start(store: Store, flush: Duration) -> Self {
         let (stop, stopped) = watch::channel(false);
         let (alive, ended) = tokio::sync::oneshot::channel::<()>();
