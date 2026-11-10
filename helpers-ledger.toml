@@ -142,20 +142,6 @@ fingerprints = []
 names = ['^(copy_tracing_upgrade_pager|append_unowned_tracing_graph)$']
 
 [[job]]
-id = "event-fallback-rdf-backfill"
-summary = "One online migration, fenced and seeded at open and paged by the maintenance worker, moves older writers out with the fallback families and adds eventTimeFallback/eventTimeBasis to every retained record metadata graph without eventTime, published or privately prepared, deriving the receipt placement from the graph's own receivedAt. It reuses the shared catalog pager, the shared stored-metadata loader and the one fallback metadata builder; stored records are not read."
-home = "sparrow_core::storage::event_fallback_rdf::page"
-entry_points = ["sparrow_core::storage::event_fallback_rdf::publish", "sparrow_core::storage::rdf_index::stored_metadata", "sparrow_core::storage::rdf_index::fallback_metadata", "sparrow_core::storage::writer_format::enable_event_fallback"]
-spec = "docs/interfaces.md: receipt-time event fallback (schema 69)."
-vectors = ["crates/sparrow-core/src/storage/writer_format.rs", "crates/sparrow-core/tests/storage.rs"]
-bench = []
-enforced = true
-[job.forbidden]
-constants = []
-fingerprints = []
-names = ['^(copy_fallback_upgrade_pager|decode_metadata_graph_elsewhere|append_fallback_triples_elsewhere)$']
-
-[[job]]
 id = "source-summary-counters"
 summary = "One WriteBatch observer, called in Writer::apply for every catalog write, adds the exact per-source counter, artifact retained-count and per-source artifact index row changes for the batch's artifact, artifact-retirement and record changes; negative or missing counters refuse with STORAGE_FAILURE naming the source, never clamped. One online migration, fenced and seeded at open behind the source summary writer families and paged by the maintenance worker, seeds the rows from existing artifact and record entries; until it completes, readers add a Completion that runs the migration's own counting passes to the end over a snapshot without the writer lock through the one Rows sink, once per sources capture and once per bounded window of owed rows a live artifact listing reaches, charging what it holds to the page admission, so listings answer as after it. Source keys use the one BLAKE3 source-key hash shared with the source context, source time and diagnostic indexes; it and the source context observer fold batches through the one durability::observe_batch."
 home = "sparrow_core::storage::source_summary::apply"

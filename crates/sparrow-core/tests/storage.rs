@@ -449,28 +449,6 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     let staged = stage_fixture(&store, "fallback-staged", "log", b"staged\n");
     let prepared = store.import_prepare_record(&staged.id, 0, 4).unwrap();
     assert_eq!(prepared.prepared_records, staged.layout_records);
-    let private_rows = |db: &rocksdb::DB| {
-        db.prefix_iterator(b"rdf:graph:record:")
-            .map(Result::unwrap)
-            .take_while(|(key, _)| key.starts_with(b"rdf:graph:record:"))
-            .filter(|(key, _)| db.get(&key[b"rdf:graph:".len()..]).unwrap().is_none())
-            .map(|(_, bytes)| {
-                purrdf_lex::json::read_slice(&bytes, purrdf_lex::json::Limits::DEFAULT).unwrap()
-                    ["rows"]
-                    .as_array()
-                    .unwrap()
-                    .len()
-            })
-            .collect::<Vec<_>>()
-    };
-    let plain_rows = |db: &rocksdb::DB| {
-        let manifest = purrdf_lex::json::read_slice(
-            &db.get(format!("rdf:graph:{plain_id}")).unwrap().unwrap(),
-            purrdf_lex::json::Limits::DEFAULT,
-        )
-        .unwrap();
-        manifest["rows"].as_array().unwrap().len()
-    };
     let pin = store
         .pin("tracing-pin", "tracing", &[a.record_ids[0].clone()], 40, 4)
         .unwrap();
@@ -559,13 +537,6 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     db.delete("tracing-rdf-upgrade").unwrap();
     db.delete("tracing-rdf:profile").unwrap();
     db.delete("event-fallback-rdf-upgrade").unwrap();
-    // Recreate the graphs a writer before schema 69 published, without fallback facts.
-    let current_rows = plain_rows(&db);
-    let current_private = private_rows(&db);
-    assert_eq!(current_private.len(), 1);
-    sparrow_core::remove_event_fallback_rdf_for_legacy_fixture(&db).unwrap();
-    assert_eq!(plain_rows(&db), current_rows - 2);
-    assert_eq!(private_rows(&db), [current_private[0] - 2]);
     let projection = purrdf_lex::json::read_slice(
         &db.get(&a.record_ids[0]).unwrap().unwrap(),
         purrdf_lex::json::Limits::DEFAULT,
@@ -591,7 +562,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
         Some("sparrow.store/297")
     );
     assert!(migrate(&store) > 0);
-    // The fallback backfill restored the receipt-time facts and wrote no source eventTime.
+    // The reader derived the receipt-time facts and wrote no source eventTime.
     let fallback_times = store
         .with_rdf_records(std::slice::from_ref(&plain_id), 6, RdfReadLimits::default(), |view| {
             purrdf::sparql::NativeSparqlEngine::new()
@@ -19496,14 +19467,14 @@ fn scoped_sparql_cost_is_independent_of_store_size() {
 }
 
 /// INVARIANT (#158): the first schema 69 open fences older writers and serves at once,
-/// before either online migration runs: status reports both pending, scoped SPARQL answers
-/// equal the store-wide plan's and the fully migrated store's, because the view serves the
-/// fallback facts still owed to unmigrated record graphs (coverage counts them), and a
-/// strict read answers the same rows instead of refusing, and no scoped read spends more of
-/// the request budget than the migrated store's. An ingest during the migration writes its
-/// index rows and facts at once.
+/// before the online migrations run: status reports them pending, scoped SPARQL answers
+/// equal the store-wide plan's and the fully migrated store's, and a strict read answers
+/// the same rows instead of refusing, and no scoped read spends more of the request budget
+/// than the migrated store's. Receipt-time fallback facts are never stored (#193): the view
+/// derives them for every record graph, before and after the migrations, and coverage
+/// counts them. An ingest during the migration writes its index rows at once.
 /// Direct `Store::migrate_step` pages (the maintenance worker's unit of work, driven here
-/// one at a time) then finish both jobs, a restart between them resumes, and the answers
+/// one at a time) then finish the jobs, a restart between them resumes, and the answers
 /// equal the fully migrated store's, now through the owner index.
 #[test]
 fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_them() {
@@ -19556,7 +19527,6 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
         [
             "store-counters",
             "owner-graph-index",
-            "event-fallback-rdf",
             "source-summary",
             "source-context"
         ]
@@ -19564,9 +19534,9 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     // The per-source counters and the source timeline cache were not part of schema 69
     // and stay complete; the store counters are reseeded because the fixture rewrote
     // checkpoints offline.
-    assert!(pending[3..].iter().all(|m| m.complete()), "{pending:?}");
+    assert!(pending[2..].iter().all(|m| m.complete()), "{pending:?}");
     assert!(!pending[0].complete(), "{pending:?}");
-    for migration in &pending[1..3] {
+    for migration in &pending[1..2] {
         assert!(!migration.complete(), "{migration:?}");
         assert_eq!(migration.done, 0, "{migration:?}");
         // Totals count while the store counters seed.
@@ -19591,13 +19561,13 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     for (query, (rows, _, coverage)) in queries.iter().zip(&during) {
         let (expected, _, _) = scoped_answer(&store, &whole, RdfGraphLayers::ALL, query, 6);
         assert_eq!(rows, &expected, "{query}");
-        // Every unmigrated record graph is served its owed facts, and coverage counts it.
+        // Every record graph is served its derived facts, and coverage counts it.
         assert!(coverage.event_fallback_pending > 0, "{coverage:?}");
     }
     // Every answer equals the fully migrated store's, within the request budget it spent:
-    // what the pending migrations owe (uncopied declarations, owed fallback facts and the
-    // term lookups behind them) is not charged, so a scope that fits after the migrations
-    // fits during them.
+    // what the pending migrations owe (uncopied declarations) and the derived fallback facts
+    // with the term lookups behind them are not charged, so a scope that fits after the
+    // migrations fits during them.
     for ((rows, requests, _), (expected, migrated_requests, _)) in during.iter().zip(&migrated) {
         assert_eq!(set(rows), set(expected));
         assert!(
@@ -19611,7 +19581,8 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     strict.require_complete_index = true;
     let (strict_rows, _, _) = scoped_answer(&store, &strict, RdfGraphLayers::ALL, fallback, 6);
     assert_eq!(set(&strict_rows), set(&migrated[5].0));
-    // An ingest during the migration writes its index rows and fallback facts at once.
+    // An ingest during the migration writes its index rows and no fallback facts: the view
+    // derives them.
     let late = store
         .ingest("graphs-late", "graphs", "log", b"late line\n", 5)
         .unwrap();
@@ -19620,7 +19591,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     let (late_rows, _, late_coverage) =
         scoped_answer(&store, &late_scope, RdfGraphLayers::ALL, fallback, 6);
     assert_eq!(late_rows.len(), 1, "{late_rows:?}");
-    assert_eq!(late_coverage.event_fallback_pending, 0);
+    assert_eq!(late_coverage.event_fallback_pending, 1);
     let late_answers = |store: &Store| {
         queries
             .iter()
@@ -19630,7 +19601,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     let late_during = late_answers(&store);
 
     // The counters seed first; then one page builds the whole index, and a restart
-    // resumes with the backfill.
+    // resumes with the source summary.
     let mut page = store.migrate_step().unwrap().unwrap();
     while page.migration == sparrow_core::Migration::StoreCounters {
         page = store.migrate_step().unwrap().unwrap();
@@ -19646,8 +19617,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     let store = Store::open(dir.path(), config()).unwrap();
     let resumed = store.migrations().unwrap();
     assert!(resumed[1].complete(), "{resumed:?}");
-    assert!(!resumed[2].complete(), "{resumed:?}");
-    assert!(migrate(&store) > 0);
+    migrate(&store);
     let done = store.migrations().unwrap();
     assert!(
         done.iter()
@@ -19656,8 +19626,15 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     );
     // Every answer equals the fully migrated store's, with the late record's own too.
     let after = answers(&store);
-    for ((rows, _, coverage), (expected, _, _)) in after.iter().zip(&migrated) {
-        assert_eq!(coverage.event_fallback_pending, 0);
+    for (index, ((rows, _, coverage), (expected, _, migrated_coverage))) in
+        after.iter().zip(&migrated).enumerate()
+    {
+        // Only the wide scope gained a record (the late one); the migrations change no count.
+        let late = u64::from(index < queries.len());
+        assert_eq!(
+            coverage.event_fallback_pending,
+            migrated_coverage.event_fallback_pending + late
+        );
         // The late record joined the wide scope; its rows are compared on their own.
         assert!(
             expected.iter().all(|row| rows.contains(row)),
@@ -19673,13 +19650,13 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     for (rows, expected) in late_answers(&store).iter().zip(&late_during) {
         assert_eq!(set(rows), set(expected));
     }
-    // Publication reuses the prepared graph, which the backfill already rebuilt.
+    // Publication reuses the prepared graph, which carries no fallback facts: they are derived.
     let published = store.import_publish(&staged.id, 6).unwrap();
     let mut staged_scope = one.clone();
     staged_scope.selection = QuerySelection::Evidence(published.record_ids.clone());
     let (rows, _, coverage) =
         scoped_answer(&store, &staged_scope, RdfGraphLayers::ALL, fallback, 6);
-    assert_eq!((rows.len(), coverage.event_fallback_pending), (1, 0));
+    assert_eq!((rows.len(), coverage.event_fallback_pending), (1, 1));
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
     let (declared, mirrored) = owner_graph_rows(&db);
@@ -19691,6 +19668,131 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
         Store::open(dir.path(), config()).err().unwrap().code,
         "STORAGE_FAILURE"
     );
+}
+
+/// INVARIANT (#193): ingest stores no receipt-time fallback triples and the reader derives
+/// them for every record graph, so a store of 70 plain log records answers the fallback
+/// query with one row each and coverage counts all 70 as derived. A store that carries the
+/// retired backfill's pending marker opens without a rewrite: the store format is unchanged,
+/// no migration of that name is reported, every migration completes without touching a
+/// record graph, the counters equal a recount, and every answer is the same.
+#[test]
+fn receipt_time_fallback_facts_are_derived_not_stored_and_a_pending_marker_store_opens() {
+    use sparrow_core::RdfGraphLayers;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = (0..70).map(|i| format!("derive {i}\n")).collect::<String>();
+    store
+        .ingest("derive", "derive", "log", input.as_bytes(), 5)
+        .unwrap();
+    let fallback = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?b WHERE { ?r sp:eventTimeBasis ?b }";
+    let scope = record_page_scope("derive", 1000);
+    let answer = |store: &Store| {
+        let (rows, _, coverage) = scoped_answer(store, &scope, RdfGraphLayers::ALL, fallback, 10);
+        let mut rows = rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        (rows, coverage.event_fallback_pending)
+    };
+    let before = answer(&store);
+    assert_eq!((before.0.len(), before.1), (70, 70));
+    let format = store.properties().unwrap()["store_format"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let graphs = |db: &rocksdb::DB| {
+        db.prefix_iterator(b"rdf:graph:record:")
+            .map(Result::unwrap)
+            .take_while(|(key, _)| key.starts_with(b"rdf:graph:record:"))
+            .collect::<Vec<_>>()
+    };
+    let stored = graphs(&db);
+    assert_eq!(stored.len(), 70);
+    sparrow_test_support::pending_event_fallback_marker(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        Some(format.as_str())
+    );
+    let names = store
+        .migrations()
+        .unwrap()
+        .iter()
+        .map(|m| m.name)
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&"event-fallback-rdf"), "{names:?}");
+    assert_eq!(answer(&store), before);
+    migrate(&store);
+    assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
+    assert_counts_match_recount(&store);
+    assert_eq!(answer(&store), before);
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    assert_eq!(graphs(&db), stored, "no record graph was rewritten");
+}
+
+/// INVARIANT (#193): a graph that already stores its fallback facts, as every graph the
+/// retired backfill or an earlier writer produced does, is served as stored and is never
+/// derived a second time. A store of 70 records part way through the retired backfill, with
+/// half its graphs storing the facts, a partial `event-fallback-rdf-upgrade` checkpoint and
+/// its `done:` counter row, opens without a rewrite and answers one row per record, the same
+/// rows as a store that derives them all, with coverage counting only the 35 graphs that do
+/// not store them.
+#[test]
+fn graphs_that_store_their_fallback_facts_are_served_once_and_not_derived() {
+    use sparrow_core::RdfGraphLayers;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = (0..70).map(|i| format!("stored {i}\n")).collect::<String>();
+    store
+        .ingest("stored", "stored", "log", input.as_bytes(), 5)
+        .unwrap();
+    let fallback = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?b WHERE { ?r sp:eventTimeBasis ?b }";
+    let times = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?r ?t WHERE { ?r sp:eventTimeFallback ?t }";
+    let scope = record_page_scope("stored", 1000);
+    let answer = |store: &Store, query: &str| {
+        let (rows, _, coverage) = scoped_answer(store, &scope, RdfGraphLayers::ALL, query, 10);
+        let mut rows = rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        (rows, coverage.event_fallback_pending)
+    };
+    let derived = [answer(&store, fallback), answer(&store, times)];
+    assert_eq!((derived[0].0.len(), derived[0].1), (70, 70));
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let mut seen = 0_usize;
+    sparrow_core::store_event_fallback_rdf_for_legacy_fixture(&db, |_| {
+        seen += 1;
+        seen.is_multiple_of(2)
+    })
+    .unwrap();
+    assert_eq!(seen, 70);
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let names = store
+        .migrations()
+        .unwrap()
+        .iter()
+        .map(|m| m.name)
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&"event-fallback-rdf"), "{names:?}");
+    for (query, expected) in [fallback, times].into_iter().zip(&derived) {
+        let mixed = answer(&store, query);
+        assert_eq!(mixed.0, expected.0, "one row per record, none doubled");
+        assert_eq!(mixed.1, 35, "only graphs without stored facts are derived");
+    }
+    migrate(&store);
+    assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
+    assert_counts_match_recount(&store);
+    assert_eq!(answer(&store, fallback), (derived[0].0.clone(), 35));
 }
 
 /// The storage fixture with room for the 20,000-record listing stores.
@@ -20242,7 +20344,6 @@ fn the_worker_runs_the_source_summary_migration_directly_after_the_store_counter
             Migration::StoreCounters,
             Migration::SourceSummary,
             Migration::OwnerGraphIndex,
-            Migration::EventFallbackRdf,
             Migration::SourceContext,
         ]
     );
@@ -20250,20 +20351,17 @@ fn the_worker_runs_the_source_summary_migration_directly_after_the_store_counter
 }
 
 /// INVARIANT (#176): each migration resumes from its own checkpoint, whichever order ran
-/// it. A store an older image left part way through the backfill with `source-summary` not
-/// started runs the source summary to the end next while the backfill's watermark holds; a
-/// restart with the source summary done and the backfill still pending, the state the new
-/// order leaves and an older image would also continue from, resumes the backfill at that
-/// watermark. Once every migration completes, the per-source counters equal a recount, the
-/// owner index mirrors every declaration, and the listings and fallback facts equal those
-/// of the store before the migrations were owed.
+/// it. A store an older image left with the owner index done and `source-summary` not
+/// started runs the source summary to the end next while the owner index stays complete.
+/// Once every migration completes, the per-source counters equal a recount, the owner index
+/// mirrors every declaration, and the listings and fallback facts equal those of the store
+/// before the migrations were owed.
 #[test]
 fn a_store_part_way_through_its_migrations_under_either_order_resumes_to_the_finished_rows() {
     use sparrow_core::{Migration, RdfGraphLayers};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     owner_graph_fixture(&store);
-    // More record graphs than one backfill page rebuilds.
     let input = (0..200)
         .map(|i| format!("resume {i}\n"))
         .collect::<String>();
@@ -20274,7 +20372,6 @@ fn a_store_part_way_through_its_migrations_under_either_order_resumes_to_the_fin
     let scope = record_page_scope("resume", 1000);
     let finished = |store: &Store| {
         let (rows, _, coverage) = scoped_answer(store, &scope, RdfGraphLayers::ALL, fallback, 10);
-        // Rebuilt graphs take new dictionary identities, so rows compare as multisets.
         let mut rows = rows
             .iter()
             .map(|row| format!("{row:?}"))
@@ -20294,18 +20391,18 @@ fn a_store_part_way_through_its_migrations_under_either_order_resumes_to_the_fin
     let db = catalog_db(dir.path()).unwrap();
     sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
     drop(db);
-    // With the source summary complete, the old and new orders agree: the counters, the
-    // owner index, then the backfill, stopped after its first page.
+    // With the source summary complete, the old and new orders agree: the counters, then the
+    // owner index.
     let store = Store::open(dir.path(), config()).unwrap();
-    let held = loop {
+    loop {
         let page = store.migrate_step().unwrap().unwrap();
-        if page.migration == Migration::EventFallbackRdf {
-            assert!(!page.complete, "{page:?}");
-            break page.watermark;
+        if page.migration == Migration::OwnerGraphIndex {
+            assert!(page.complete, "{page:?}");
+            break;
         }
-    };
+    }
     drop(store);
-    // An older image's run order reached the backfill before the source summary.
+    // An older image's run order reached the owner index before the source summary.
     let db = catalog_db(dir.path()).unwrap();
     sparrow_test_support::pending_source_summary_migration(&db).unwrap();
     drop(db);
@@ -20314,7 +20411,6 @@ fn a_store_part_way_through_its_migrations_under_either_order_resumes_to_the_fin
         store.migrations().unwrap()[migration.index()].clone()
     };
     assert!(status(&store, Migration::OwnerGraphIndex).complete());
-    assert_eq!(status(&store, Migration::EventFallbackRdf).watermark, held);
     assert!(!status(&store, Migration::SourceSummary).complete());
     let mut page = store.migrate_step().unwrap().unwrap();
     while page.migration == Migration::StoreCounters {
@@ -20327,16 +20423,10 @@ fn a_store_part_way_through_its_migrations_under_either_order_resumes_to_the_fin
         }
         page = store.migrate_step().unwrap().unwrap();
     }
-    assert_eq!(status(&store, Migration::EventFallbackRdf).watermark, held);
+    assert!(status(&store, Migration::OwnerGraphIndex).complete());
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
     assert!(status(&store, Migration::SourceSummary).complete());
-    let backfill = status(&store, Migration::EventFallbackRdf);
-    assert_eq!(backfill.watermark, held);
-    assert!(backfill.done > 0, "{backfill:?}");
-    let page = store.migrate_step().unwrap().unwrap();
-    assert_eq!(page.migration, Migration::EventFallbackRdf);
-    assert!(page.done > backfill.done, "{page:?} {backfill:?}");
     migrate(&store);
     let done = store.migrations().unwrap();
     assert!(
@@ -20864,6 +20954,7 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
     sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+    sparrow_test_support::stale_source_context_cache(&db).unwrap();
     drop(db);
     let store = Store::open(dir.path(), large_config()).unwrap();
     let live = |status: &purrdf_lex::json::Value| {
@@ -20905,7 +20996,7 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
 
     while store.migrate_step().unwrap().unwrap().migration == Migration::StoreCounters {}
     assert_counts_match_recount(&store);
-    // Run the backfill one page so it is part way.
+    // Run the source timeline rebuild one page so it is part way.
     store.migrate_step().unwrap().unwrap();
     let (status, migrations, keys) = store.status_with_key_reads_for_tests(4).unwrap();
     assert_eq!(status["counts"].as_str(), Some("exact"));
@@ -20914,7 +21005,7 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
         keys, seeding_keys,
         "seeded status reads other keys than seeding status"
     );
-    let fallback = &migrations[Migration::EventFallbackRdf.index()];
+    let fallback = &migrations[Migration::SourceContext.index()];
     assert!(
         !fallback.complete() && fallback.done > 0 && fallback.total.is_some(),
         "{migrations:?}"
@@ -20972,7 +21063,7 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
     );
     assert!(answered < hold, "status waited {answered:?} for the writer");
     assert_eq!(held_keys, keys);
-    assert_eq!(page.join().unwrap().migration, Migration::EventFallbackRdf);
+    assert_eq!(page.join().unwrap().migration, Migration::SourceContext);
     for listing in listings {
         assert!(
             listing.join().unwrap() > 0,
@@ -21025,6 +21116,8 @@ fn a_waiting_publication_commits_within_one_page_while_a_migration_pages() {
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
     sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+    sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+    sparrow_test_support::stale_source_context_cache(&db).unwrap();
     drop(db);
     let store = Store::open(dir.path(), large_config()).unwrap();
     while store.migrate_step().unwrap().unwrap().migration == Migration::StoreCounters {}

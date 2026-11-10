@@ -30,7 +30,7 @@
 //! its bound covers. Until seeding completes, readers report the rows as pending: exact
 //! through the seeding watermark, never a total. Nothing recounts at run time.
 
-use super::{Error, event_fallback_rdf, rdf_index, read_field, source_context, source_summary};
+use super::{Error, rdf_index, read_field, source_context, source_summary};
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
 use source_summary::failure;
 use std::cmp::Ordering;
@@ -68,7 +68,6 @@ enum Follows {
     /// Every key of the prefix.
     Population,
     OwnerGraphIndex,
-    EventFallbackRdf,
     SourceSummaryArtifacts,
     SourceSummaryRecords,
     SourceContext,
@@ -91,13 +90,12 @@ pub(super) enum Counter {
     PayloadChunks,
     JsonProjections,
     OwnerGraphIndexDone,
-    EventFallbackRdfDone,
     SourceSummaryDone,
     SourceContextDone,
 }
 
 impl Counter {
-    pub(super) const ALL: [Self; 11] = [
+    pub(super) const ALL: [Self; 10] = [
         Self::Records,
         Self::RetainedRecords,
         Self::Artifacts,
@@ -106,7 +104,6 @@ impl Counter {
         Self::PayloadChunks,
         Self::JsonProjections,
         Self::OwnerGraphIndexDone,
-        Self::EventFallbackRdfDone,
         Self::SourceSummaryDone,
         Self::SourceContextDone,
     ];
@@ -121,7 +118,6 @@ impl Counter {
             Self::PayloadChunks => "payload-chunks",
             Self::JsonProjections => "json-projections",
             Self::OwnerGraphIndexDone => "done:owner-graph-index",
-            Self::EventFallbackRdfDone => "done:event-fallback-rdf",
             Self::SourceSummaryDone => "done:source-summary",
             Self::SourceContextDone => "done:source-context",
         }
@@ -134,7 +130,7 @@ impl Counter {
     fn terms(self) -> &'static [Term] {
         use Filter::{Any, Retained};
         use Follows::{
-            EventFallbackRdf, OwnerGraphIndex, Population, SourceContext, SourceSummaryArtifacts,
+            OwnerGraphIndex, Population, SourceContext, SourceSummaryArtifacts,
             SourceSummaryRecords,
         };
         match self {
@@ -177,11 +173,6 @@ impl Counter {
                 prefix: GRAPH,
                 filter: Any,
                 follows: OwnerGraphIndex,
-            }],
-            Self::EventFallbackRdfDone => &[Term {
-                prefix: RECORD_GRAPH,
-                filter: Any,
-                follows: EventFallbackRdf,
             }],
             Self::SourceSummaryDone => &[
                 Term {
@@ -327,7 +318,6 @@ fn hex_key(key: &[u8]) -> String {
 pub(super) struct Positions {
     seed: Seed,
     owner: Bound,
-    fallback: Bound,
     summary: (Bound, Bound),
     context: Bound,
 }
@@ -336,7 +326,6 @@ pub(super) struct Positions {
 fn checkpoint_key(name: &[u8]) -> bool {
     name == CHECKPOINT.as_bytes()
         || name == rdf_index::OWNER_GRAPH_UPGRADE.as_bytes()
-        || name == event_fallback_rdf::CHECKPOINT.as_bytes()
         || name == source_summary::CHECKPOINT.as_bytes()
         || name == source_context::CHECKPOINT.as_bytes()
 }
@@ -350,14 +339,6 @@ impl Positions {
             None => Bound::Everything,
             Some(after) => {
                 Bound::after(after.map(|(graph, owner)| rdf_index::graph_key(graph, owner)))
-            }
-        };
-        let fallback = match event_fallback_rdf::decode_frontier(
-            read(event_fallback_rdf::CHECKPOINT)?.as_deref(),
-        )? {
-            None => Bound::Everything,
-            Some(after) => {
-                Bound::after(after.map(|owner| format!("provenance-rdf:{owner}").into_bytes()))
             }
         };
         let summary = match source_summary::progress(&mut read)? {
@@ -379,7 +360,6 @@ impl Positions {
         Ok(Self {
             seed,
             owner,
-            fallback,
             summary,
             context,
         })
@@ -401,7 +381,6 @@ impl Positions {
         let follows = match term.follows {
             Follows::Population => Bound::Everything,
             Follows::OwnerGraphIndex => self.owner.clone(),
-            Follows::EventFallbackRdf => self.fallback.clone(),
             Follows::SourceSummaryArtifacts => self.summary.0.clone(),
             Follows::SourceSummaryRecords => self.summary.1.clone(),
             Follows::SourceContext => self.context.clone(),

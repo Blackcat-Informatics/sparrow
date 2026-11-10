@@ -442,11 +442,6 @@ impl<'a> RdfWrite<'a> {
         })
     }
 
-    /// The identity of a term this batch staged or the dictionary holds, without staging it.
-    pub(super) fn known(&mut self, value: &TermValue) -> Result<Option<u64>, Error> {
-        self.lookup(&encoded(value)?)
-    }
-
     fn lookup(&mut self, bytes: &[u8]) -> Result<Option<u64>, Error> {
         if let Some(id) = self.terms.get(bytes).or_else(|| self.stored.get(bytes)) {
             return Ok(Some(*id));
@@ -904,19 +899,19 @@ pub(super) fn stored_metadata(
     })
 }
 
-/// Event-time facts of one record: `eventTime` and its profile for a source instant, or
-/// the distinct receipt-time fallback facts.
+/// Event-time facts of one record: `eventTime` and its profile for a source instant. A
+/// record without one stores nothing: readers derive its receipt-time fallback facts
+/// ([`fallback_metadata`]) from its receipt time, so ingest writes no fallback triples.
 pub(super) fn event_time_metadata(
     builder: &mut purrdf::RdfDatasetBuilder,
     subject: purrdf::ir::TermId,
     record: &Record,
 ) -> Result<(), Error> {
     use crate::RDF_VOCABULARY_NAMESPACE as NS;
-    // `eventTime` carries only a source instant. A receipt-time fallback uses its own
-    // predicate and basis so a query can never mistake one for the other.
+    // `eventTime` carries only a source instant.
     let placement = record.event_time.placement(record.received_at);
     let crate::EventTime::Known { profile_id, .. } = &record.event_time else {
-        return fallback_metadata(builder, subject, placement);
+        return Ok(());
     };
     let predicate = builder.intern_iri(&format!("{NS}eventTime"))?;
     let object = builder.intern_literal(date_time(placement.millis)?)?;
@@ -1266,15 +1261,10 @@ pub(super) fn metadata(
     metadata_dataset(builder)
 }
 
-/// Mark both online migrations complete in a bare test database, as on a current store.
+/// Mark the owner graph migration complete in a bare test database, as on a current store.
 #[cfg(test)]
 pub(super) fn complete_test_migrations(db: &DB) {
     db.put(OWNER_GRAPH_UPGRADE, [0]).unwrap();
-    db.put(
-        super::event_fallback_rdf::CHECKPOINT,
-        br#"{"after":null,"complete":true}"#,
-    )
-    .unwrap();
 }
 
 /// Bare test database with the column families RDF writes require.

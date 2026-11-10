@@ -17,12 +17,12 @@ pub(crate) mod archive;
 mod artifact_rdf;
 pub(crate) mod backup;
 mod event_fallback_rdf;
+#[cfg(feature = "test-support")]
+pub use event_fallback_rdf::store_event_fallback_rdf_for_legacy_fixture;
 mod provenance_rdf;
 mod tracing_rdf;
 #[cfg(feature = "test-support")]
 pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
-#[cfg(feature = "test-support")]
-pub use event_fallback_rdf::remove_event_fallback_rdf_for_legacy_fixture;
 #[cfg(feature = "test-support")]
 pub use source_summary::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
 #[cfg(feature = "test-support")]

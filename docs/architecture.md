@@ -27,6 +27,20 @@ and unstructured logs, live syslog, file/API imports, completed-file consumption
 active-log tailing, named pins, MCP, CLI, and a Rust logging client. These ship in
 the milestones below rather than as one undifferentiated implementation.
 
+Sparrow is a low-assurance, high-throughput, searchable, centralized log store, a
+radical improvement over scattered log files. It optimizes only for speed and
+storage efficiency. A mechanism that costs speed or space without preventing a
+loss a logging store cannot tolerate is removed or relaxed, and Sparrow owes no
+more durability, privacy or tamper-evidence than the plain log files it
+replaces. The Katamari/Sparrow razor decides where data lives: whatever needs
+long-term storage, privacy, encryption, validation or resilience goes to
+Katamari, at a high and justified bar, and everything else goes to Sparrow. The
+razor may cut one body of data into sets and subsets, each placed by its own
+need. Nothing irreplaceable may have its only copy in Sparrow. Worked examples:
+anonymous intake is allowed because it is the fastest path; deduplication and
+compression matter because efficient storage is a primary goal; signatures and
+integrity come after all other concerns and never on the hot path.
+
 There is one global 30-day retention policy. Per-class retention, replication,
 distributed queries, embeddings, an embedded language model, and a human
 dashboard are outside the first version. Agents perform reasoning using evidence
@@ -582,8 +596,9 @@ fairly with its other duties, and each page commits its rows and checkpoint
 atomically through the ordinary write path, so a restart resumes after the last
 committed page and a failed page is retried, never skipped. Readers take an
 explicit pending path until a migration completes and say so where the answer
-could differ: the schema 69 receipt-time fallback backfill is reported in SPARQL
-coverage while the view serves the facts it still owes, scoped SPARQL reads the
+could differ: the view derives the receipt-time fallback facts of every record graph that
+does not store them, permanently, and counts those graphs in SPARQL coverage;
+scoped SPARQL reads the
 owner index for the declarations already copied and walks the rest, the source
 listings add what the source-summary migration still owes to the stored rows,
 and record context walks the primary time index while a stale source timeline

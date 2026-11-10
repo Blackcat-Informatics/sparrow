@@ -297,7 +297,7 @@ or the free-space floor. The rewrite resumes after a restart, and a running
 job is aborted when the store closes, so shutdown does not wait for it.
 
 The first open of a store written before schema 69 serves at once and runs the
-owner-to-graph index build and the receipt-time fallback backfill in the
+owner-to-graph index build and the other online migrations in the
 background (see "Online store migrations" in the interfaces). `status` reports
 them under `migrations` with `done`, `total`, `watermark` and any `failure`, and
 the journal logs a progress line every 64 pages and a completion line per
@@ -653,9 +653,8 @@ on standard error. These are every failure of the mode:
   after the first status. A failing page already ends the run as
   `FAIL migrate`, so this catches stops that set no failure, such as the
   daemon pausing writes below its own free-space floor. The worker retries a
-  failed page every 60 seconds. The live step-1 open averaged about 0.9 s per
-  64-graph page (34 minutes over 2,360 pages, an average not measured page by
-  page), so a healthy backfill moves at every poll. Ten retry intervals
+  failed page every 60 seconds. A healthy migration page commits well inside a
+  poll, so a healthy migration moves at every poll. Ten retry intervals
   without movement mean the migration has stopped, and 600 seconds is also
   the switch gate's whole 10-minute budget.
 - `FAIL disk`: free space fell under the abort floor, or `df` could not read

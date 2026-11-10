@@ -586,26 +586,24 @@ An event-time records read reports top-level `event_time_fallback` as a decimal
 string. Correlation profile `sparrow-correlation/2` and the RDF vocabulary below
 carry the same law.
 
-The RDF fallback triples are written with each new record metadata graph. A store
-last written before schema 69 backfills them online (see "Online store
-migrations"): a resumable job (`event-fallback-rdf-upgrade`, through the shared
-catalog upgrade pager) rebuilds
-every retained record metadata graph that has no `eventTime`, adding
-`eventTimeFallback` (the graph's own `receivedAt`) and `eventTimeBasis` and
-nothing else. It reads only the graph, so a graph prepared by an unfinished
-staged import, which has no public record yet, is covered too, and its later
-publication carries the facts. Stored records are not read or changed. Each
-maintenance page examines up to 64 graphs, rebuilding those that need facts
-through one RDF writer, and commits them with its checkpoint in one synchronized
-write, ending sooner at 16 MiB of stored graph manifests or of page batch, so it
-holds the writer briefly and an interrupted backfill resumes after its last
-committed page. A graph whose manifest rows already give its record `eventTime`
-or `eventTimeFallback` is skipped from those rows and the dictionary identities,
-without decoding its terms. Before the job starts, the store format moves to a fallback writer
-family, `sparrow.store/132` to `/186`, which lifts each tracing, log time,
-archive and intake family by 55 and keeps its switches, so older binaries refuse
-the store rather than publish graphs without the fallback facts. The fence moves
-when the store opens, and the service answers at once while the backfill runs.
+Receipt-time fallback triples are derived at read time and are not stored (#193).
+A reader serves `eventTimeFallback` (the record's `received_at`) and
+`eventTimeBasis` from each selected record metadata graph that has no source
+`eventTime` and whose stored rows lack `eventTimeFallback`, so a graph written
+without them answers exactly as one that stores them. Ingest writes none. The
+online backfill that once rewrote every retained record graph to store them
+(`event-fallback-rdf-upgrade`, #20) is removed: it cost about 190 key writes per
+graph and the compaction debt behind them, and the derivation it duplicated is
+the one reading path. Graphs that already carry the facts, from the backfill or
+an earlier writer, keep them and are served as stored; nothing is rewritten or
+deleted. The store format keeps its fallback writer family, `sparrow.store/132`
+to `/186`, which lifts each tracing, log time, archive and intake family by 55
+and keeps its switches, so binaries older than schema 69 still refuse the store
+rather than publish graphs without the facts. The switch is one-way: the schema 71
+image before #193 opens the store, does not derive the facts for graphs written
+without them, and so serves such graphs without the receipt-time facts. Opening a store that
+carries the backfill's checkpoint, finished or pending, applies no migration
+and rewrites nothing; the checkpoint and its counter row stay as inert keys.
 
 ### Owner-to-graph index (store format)
 
@@ -624,19 +622,19 @@ small row for it. Until it completes, scoped SPARQL keeps the whole-store plan.
 
 ### Online store migrations (schema 69)
 
-Opening a store that owes the schema 69 migrations applies both writer fences
-and seeds both checkpoints in one synchronized batch, then serves; the open does
-not wait for either job. The joined maintenance worker runs them as one duty,
+Opening a store that owes the schema 69 migrations applies the writer fences
+and seeds the checkpoints in one synchronized batch, then serves; the open does
+not wait for any job. The joined maintenance worker runs them as one duty,
 `store-counters` first (see "Store counters"), then `source-summary` (see
-"Per-source counters and artifact index"), `owner-graph-index`,
-`event-fallback-rdf` and `source-context` (see "Single context capture
+"Per-source counters and artifact index"), `owner-graph-index`
+and `source-context` (see "Single context capture
 admission"), one page per admission. `source-summary` runs second because, until
 it completes, every `sources` and live `artifacts` listing first reads what the
 migration still owes (#176). The migrations are independent: each reads and
 checkpoints its own keys, so a store left part way through by an image that ran
 them in another order resumes each one from its own checkpoint. `status` lists
 them in a fixed order apart from the run order: `store-counters`,
-`owner-graph-index`, `event-fallback-rdf`, `source-summary`, `source-context`.
+`owner-graph-index`, `source-summary`, `source-context`.
 The migration duty is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as pressure maintenance, import reclamation and
@@ -690,7 +688,6 @@ seeds them.
 `name`, `done` and `total` (decimal strings), `watermark` and `failure`. `total`
 counts the migration's source entries now in the store: every counted key for
 `store-counters`, graph declarations for `owner-graph-index`, record metadata
-graphs (counted by their provenance markers) for `event-fallback-rdf`,
 `artifact:` and `record:` entries for `source-summary`, `record:` entries for
 `source-context`. `done` counts those at
 or before the watermark, so it moves with ingest and retirement as well as with
@@ -707,18 +704,16 @@ Readers are explicit while a migration is pending:
 | --- | --- | --- |
 | Scoped SPARQL (selection, pin, or a source, time or diagnostic filter) | The owner-to-graph index for the declarations the migration has copied, plus the declarations past its frontier, filtered to the scope's owners; the same rows. The uncopied declarations are walked without charging the request budget, checking cancellation every 4,096 rows, and each kept graph is charged to the view's reservation | The owner-to-graph index, at the cost of the scope |
 | Whole-live-store SPARQL | The whole-store plan | The whole-store plan |
-| Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph is beyond the backfill watermark and lacks `eventTimeFallback` is served the `eventTimeFallback` and `eventTimeBasis` facts the backfill owes it, derived by the backfill's own law from the record's receipt time, and is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`). The answer equals the migrated store's; strict reads answer the same way | Zero |
-| New graphs written during the migration | Owner-to-graph rows and fallback facts in the same batch | The same |
+| Record metadata graphs in a SPARQL scope | A selected record without a source event time whose graph lacks `eventTimeFallback` is served the `eventTimeFallback` and `eventTimeBasis` facts derived from the record's receipt time, and is counted in `SparqlCoverage.eventFallbackPending` (CLI and MCP `coverage.event_fallback_pending`). Strict reads answer the same way | The same: derivation is permanent, so the count is the number of selected receipt-time graphs without stored facts, not pending work, and it does not fall to zero |
+| New graphs written during the migration | Owner-to-graph rows; no fallback facts | The same |
 | Catalog event time (intervals, sorting, correlation clocks, `event_time_fallback`) | Derived from each record's `received_at`; independent of the RDF rewrite | The same |
 | Record context (`recordsContext`, CLI `context`, MCP `records_context`), and a live `artifacts` listing row that reads its parent records through the cache | Walks the primary `time:` index and keeps the source's records, never the partial cache; the same neighbors, visits and frontier. Context reads from a snapshot without the writer lock and checks cancellation every 4,096 entries; skipped entries of other sources are not charged | Walks the source timeline cache |
 
-While the backfill is pending, each candidate record (a selected record without
-a source event time whose graph is beyond the backfill watermark) costs an
-extra manifest point read and a subject lookup, and each owed fact its term
+Each candidate record (a selected record without a source event time) costs an
+extra manifest point read and a subject lookup, and each derived fact its term
 lookups. None of these reads is charged to the request budget, so a metadata
-scope near its budget answers during the migration as after it; the owed facts
-and terms are charged to the view's reservation as it holds them. A record at
-or before the watermark costs nothing extra.
+scope near its budget answers as it would with stored facts; the derived facts
+and terms are charged to the view's reservation as they are held.
 
 These fields were added within schema 69, before its first deployment. The
 schema 70 flags below were added after it.
@@ -736,7 +731,7 @@ big-endian 64-bit count, from one RocksDB snapshot:
 | `graph-declarations` | `rdf:g:` graph declarations |
 | `record-graphs` | `provenance-rdf:record:` markers, one per record metadata graph |
 | `payload-chunks`, `json-projections` | `ref:` and `projection-ref:` rows |
-| `done:owner-graph-index`, `done:event-fallback-rdf`, `done:source-summary`, `done:source-context` | The migration's source entries at or before its checkpoint |
+| `done:owner-graph-index`, `done:source-summary`, `done:source-context` | The migration's source entries at or before its checkpoint |
 
 Status `live_records` is `retained-records` and keeps its deadline meaning:
 records neither evicted nor retired by expiry. Expiry marks a record `retired`
@@ -845,7 +840,7 @@ service answers at once. Rows found under an older writer identity are not
 trusted: that batch discards them and the migration recounts every source.
 
 The migration runs in the maintenance duty directly after `store-counters`,
-before `owner-graph-index` and `event-fallback-rdf`, with the same admission,
+before `owner-graph-index`, with the same admission,
 failure, retry and journal rules (see "Online store migrations"). It has two
 phases. The first walks `artifact:` entries and counts each artifact from its
 entry and its `record_ids`, up to 512 artifacts or 16,384 records per page,

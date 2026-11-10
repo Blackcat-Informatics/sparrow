@@ -152,9 +152,9 @@ POLL_SECONDS=15
 # Seconds the migrations' done/total may stay unchanged after the first status before the run
 # fails as stalled. A failing page already ends the run as FAIL migrate, so this catches stops
 # that set no failure, such as the daemon pausing writes below its free-space floor. The worker
-# retries a failed page every 60 seconds, and the live step-1 open averaged about 0.9 s per
-# 64-graph page (34 minutes over 2,360 pages), so a healthy backfill moves every poll; ten retry
-# intervals without movement is a stopped migration, and also the switch gate's whole budget.
+# retries a failed page every 60 seconds, and a healthy migration page commits well inside a
+# poll, so a healthy migration moves every poll; ten retry intervals without movement is a
+# stopped migration, and also the switch gate's whole budget.
 STALL_SECONDS=600
 # The scope limits as systemd reports them once applied (deploy/systemd/sparrow.service). The
 # measured daemon also runs at the nice level of the user unit that serves the live store, read

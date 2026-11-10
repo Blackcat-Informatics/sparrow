@@ -180,13 +180,11 @@ pub fn stale_source_context_cache(db: &rocksdb::DB) -> Result<(), rocksdb::Error
 }
 
 /// Return a closed current store to the state its first schema 69 open leaves before any
-/// online migration page: writers fenced, the owner-to-graph index empty with its build at
-/// the start, and every record metadata graph without its receipt-time fallback facts, with
-/// the backfill at the start. Graph declarations and records are unchanged.
+/// online migration page: the owner-to-graph index empty with its build at the start. Record
+/// graphs are unchanged, and none stores receipt-time fallback facts, as for every new graph.
 pub fn pending_schema_69_migrations(db: &rocksdb::DB) -> Result<(), Box<dyn std::error::Error>> {
-    // The checkpoints below are rewritten offline, so the store counters are reseeded too.
+    // The checkpoint below is rewritten offline, so the store counters are reseeded too.
     sparrow_core::remove_store_counters_for_legacy_fixture(db)?;
-    sparrow_core::remove_event_fallback_rdf_for_legacy_fixture(db)?;
     let mut batch = rocksdb::WriteBatch::default();
     for row in db.prefix_iterator(b"rdf:o:") {
         let (key, _) = row?;
@@ -196,12 +194,18 @@ pub fn pending_schema_69_migrations(db: &rocksdb::DB) -> Result<(), Box<dyn std:
         batch.delete(key);
     }
     batch.put("owner-graph-index-upgrade", [1]);
-    batch.put(
-        "event-fallback-rdf-upgrade",
-        br#"{"after":null,"complete":false}"#,
-    );
     db.write(batch)?;
     Ok(())
+}
+
+/// Leave the pending marker of the retired event fallback backfill (#20, removed by #193) on
+/// a closed store: its checkpoint at the start, as an image that had not run a page left it.
+/// The next open must serve the store as it is, without a rewrite.
+pub fn pending_event_fallback_marker(db: &rocksdb::DB) -> Result<(), rocksdb::Error> {
+    db.put(
+        "event-fallback-rdf-upgrade",
+        br#"{"after":null,"complete":false}"#,
+    )
 }
 
 /// Remove the per-source counters, retained counts and artifact index, and lower the writer

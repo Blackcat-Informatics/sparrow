@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 //! Online store migrations: the store counter seeding (#146), the owner-to-graph index
-//! build (#13), the receipt-time event fallback backfill of record metadata graphs (#20),
-//! the per-source counters and artifact index (#14), and the source-context cache rebuild
-//! (#149).
+//! build (#13), the per-source counters and artifact index (#14), and the source-context
+//! cache rebuild (#149). The receipt-time event fallback backfill of record metadata
+//! graphs (#20) is retired: readers derive those facts (see [`super::event_fallback_rdf`]).
 //!
 //! Opening a store fences older writers and seeds every checkpoint in one synchronized
 //! batch, then serves. The maintenance worker runs the migrations in
@@ -17,8 +17,7 @@
 //! committed page. A page yields the writer to waiting writers first, for a bounded time
 //! (see [`super::writer_queue`]). Until a migration completes its readers take the pending
 //! path: scoped SPARQL reads the owner index for the copied declarations and walks the
-//! uncopied ones, the view serves the event fallback facts still owed, SPARQL coverage
-//! counts the selected record graphs that still lack their fallback facts, the source and
+//! uncopied ones, the source and
 //! artifact listings add what the source-summary migration still owes to the stored rows,
 //! record context and reclaimed-parent folds read the primary time index instead of a
 //! partial source timeline cache, and `status` answers from the seeding checkpoint in
@@ -35,17 +34,13 @@
 
 use super::store_counters::{self, Counter, Positions, Reader};
 use super::{
-    Error, Store, Writer, catalog_upgrade, event_fallback_rdf, rdf_index, source_context,
-    source_summary, writer_format,
+    Error, Store, Writer, catalog_upgrade, rdf_index, source_context, source_summary, writer_format,
 };
 use rocksdb::{DB, WriteBatch};
 
 /// Graph declarations one owner index page copies. A page reads only declaration keys and
 /// writes one small row for each, so it holds the writer for a fraction of a second.
 const OWNER_GRAPH_PAGE: usize = 65536;
-/// Record graphs one fallback page examines. A rebuilt graph is decoded and rewritten, so
-/// this bounds how long a page holds the writer, below the backfill's own 16 MiB bounds.
-const EVENT_FALLBACK_PAGE: usize = 64;
 /// Longest latched failure text.
 const FAILURE_CHARS: usize = 1024;
 
@@ -57,8 +52,6 @@ pub enum Migration {
     StoreCounters,
     /// The owner-to-graph index that bounds scoped SPARQL by its scope (#13).
     OwnerGraphIndex,
-    /// Receipt-time `eventTimeFallback` and `eventTimeBasis` on record graphs (#20).
-    EventFallbackRdf,
     /// Per-source counters, retained record counts and the per-source artifact index (#14).
     SourceSummary,
     /// The source timeline cache record context reads, rebuilt only when the open found it
@@ -69,11 +62,10 @@ pub enum Migration {
 impl Migration {
     /// Every migration, in the order `status`, the latched failures and [`Migration::index`]
     /// use. The maintenance worker runs them in its own run order: the counters, the source
-    /// summary, the owner index, the backfill, then the source timeline cache (#176).
-    pub const ALL: [Self; 5] = [
+    /// summary, the owner index, then the source timeline cache (#176).
+    pub const ALL: [Self; 4] = [
         Self::StoreCounters,
         Self::OwnerGraphIndex,
-        Self::EventFallbackRdf,
         Self::SourceSummary,
         Self::SourceContext,
     ];
@@ -83,11 +75,10 @@ impl Migration {
     /// state makes every `sources` and live `artifacts` listing read what it still owes
     /// (#176), then the owner index, since its pages are few and cheap. The migrations are
     /// independent: each reads and checkpoints its own keys.
-    pub(crate) const RUN_ORDER: [Self; 5] = [
+    pub(crate) const RUN_ORDER: [Self; 4] = [
         Self::StoreCounters,
         Self::SourceSummary,
         Self::OwnerGraphIndex,
-        Self::EventFallbackRdf,
         Self::SourceContext,
     ];
 
@@ -97,7 +88,6 @@ impl Migration {
         match self {
             Self::StoreCounters => "store-counters",
             Self::OwnerGraphIndex => "owner-graph-index",
-            Self::EventFallbackRdf => "event-fallback-rdf",
             Self::SourceSummary => "source-summary",
             Self::SourceContext => "source-context",
         }
@@ -121,7 +111,6 @@ impl Migration {
                 Counter::JsonProjections,
             ],
             Self::OwnerGraphIndex => &[Counter::GraphDeclarations],
-            Self::EventFallbackRdf => &[Counter::RecordGraphs],
             Self::SourceSummary => &[Counter::Artifacts, Counter::Records],
             Self::SourceContext => &[Counter::Records],
         }
@@ -179,15 +168,18 @@ pub(super) type Failures = std::sync::Mutex<[Option<String>; Migration::ALL.len(
 
 /// Fence older writers, seed every migration this store has not started and reset a stale
 /// source-context cache, in one synchronized batch, then validate every checkpoint. A
-/// fenced store without its migration state refuses rather than serving a partial index,
-/// backfill or counter.
+/// fenced store without its migration state refuses rather than serving a partial index
+/// or counter. The event fallback fence is only the writer format identity: it seeds no
+/// work, and a store that still carries the retired backfill's checkpoint opens as it is,
+/// the checkpoint and its counter row left inert.
 pub(super) fn fence(db: &DB) -> Result<(), Error> {
     let mut format = db
         .get("store_format")?
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
     let mut batch = WriteBatch::default();
     if !writer_format::has_event_fallback(&format) {
-        format = event_fallback_rdf::fence(db, &format, &mut batch)?;
+        format = writer_format::enable_event_fallback(&format)?.to_vec();
+        batch.put("store_format", &format);
     }
     if !writer_format::has_owner_graphs(&format) {
         format = rdf_index::fence_owner_graphs(db, &format, &mut batch)?.to_vec();
@@ -251,15 +243,6 @@ pub(super) fn report(
                         },
                     ),
                 ),
-                Migration::EventFallbackRdf => (
-                    values[&Counter::EventFallbackRdfDone],
-                    event_fallback_rdf::decode_frontier(
-                        reader
-                            .get(event_fallback_rdf::CHECKPOINT.as_bytes())?
-                            .as_deref(),
-                    )?
-                    .map(|after| after.unwrap_or_else(|| "start".to_owned())),
-                ),
                 Migration::SourceSummary => (
                     values[&Counter::SourceSummaryDone],
                     source_summary::progress(|key| reader.get(key.as_bytes()))?.watermark(),
@@ -300,7 +283,6 @@ impl Writer {
                 Migration::OwnerGraphIndex => {
                     rdf_index::owner_graph_progress(|key| Ok(self.db.get(key)?))?.is_none()
                 }
-                Migration::EventFallbackRdf => event_fallback_rdf::frontier(&self.db)?.is_none(),
                 Migration::SourceSummary => {
                     source_summary::progress(|key| Ok(self.db.get(key)?))?
                         .watermark()
@@ -321,7 +303,6 @@ impl Writer {
         let staged = match migration {
             Migration::StoreCounters => store_counters::page(&self.db)?,
             Migration::OwnerGraphIndex => rdf_index::owner_graph_page(&self.db, OWNER_GRAPH_PAGE)?,
-            Migration::EventFallbackRdf => event_fallback_rdf::page(&self.db, EVENT_FALLBACK_PAGE)?,
             Migration::SourceSummary => source_summary::page(&self.db)?,
             Migration::SourceContext => source_context::page(&self.db)?,
         };
@@ -420,7 +401,7 @@ mod tests {
 
     /// INVARIANT: a page that fails commits nothing: `status` reports its failure with the
     /// migration's done count and watermark unchanged, and the next page that succeeds
-    /// clears the failure and advances the watermark. Nothing is skipped.
+    /// clears the failure and completes the migration. Nothing is skipped.
     #[test]
     fn a_failed_page_is_reported_with_its_watermark_held_until_the_next_good_page_clears_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -432,43 +413,35 @@ mod tests {
             .unwrap();
         drop(store);
         let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
-        sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+        sparrow_test_support::pending_source_summary_migration(&db).unwrap();
         drop(db);
         let store = Store::open(dir.path(), config.clone()).unwrap();
-        let fallback = |store: &Store| {
-            store.migrations().unwrap()[Migration::EventFallbackRdf.index()].clone()
-        };
-        let mut page = store.migrate_step().unwrap().unwrap();
-        while page.migration == Migration::StoreCounters {
-            page = store.migrate_step().unwrap().unwrap();
+        let summary =
+            |store: &Store| store.migrations().unwrap()[Migration::SourceSummary.index()].clone();
+        // The counters seed first; the source summary then has not committed a page.
+        while store.migrations().unwrap()[Migration::StoreCounters.index()]
+            .watermark
+            .is_some()
+        {
+            store.migrate_step().unwrap().unwrap();
         }
-        assert_eq!(page.migration, Migration::OwnerGraphIndex);
-        // One good page of 64 graphs moves the backfill off its start.
-        let page = store.migrate_step().unwrap().unwrap();
-        assert_eq!(page.migration, Migration::EventFallbackRdf);
-        assert!(!page.complete);
-        let held = fallback(&store);
-        let after = held.watermark.clone().unwrap();
-        assert_ne!(after, "start");
-        // Corrupt the next graph the backfill would read, in the open store.
+        let held = summary(&store);
+        assert!(!held.complete(), "{held:?}");
+        // Corrupt the artifact entry the page would read, in the open store.
         let (key, saved) = {
             let writer = store.lock().unwrap();
-            let start = format!("rdf:graph:{after}");
             let (key, saved) = writer
                 .db
-                .iterator(rocksdb::IteratorMode::From(
-                    start.as_bytes(),
-                    rocksdb::Direction::Forward,
-                ))
+                .prefix_iterator(b"artifact:")
                 .map(Result::unwrap)
-                .find(|(key, _)| **key != *start.as_bytes())
+                .next()
                 .unwrap();
-            assert!(key.starts_with(b"rdf:graph:record:"));
+            assert!(key.starts_with(b"artifact:"));
             writer.db.put(&key, b"{}").unwrap();
             (key, saved)
         };
         assert!(store.migrate_step().is_err());
-        let failed = fallback(&store);
+        let failed = summary(&store);
         assert!(failed.failure.is_some(), "{failed:?}");
         assert_eq!(
             (failed.done, &failed.watermark),
@@ -477,10 +450,9 @@ mod tests {
         // The worker's retry finds the same page; once it can succeed, it does.
         assert!(store.migrate_step().is_err());
         store.lock().unwrap().db.put(&key, &saved).unwrap();
-        store.migrate_step().unwrap().unwrap();
-        let cleared = fallback(&store);
+        while store.migrate_step().unwrap().is_some() {}
+        let cleared = summary(&store);
         assert_eq!(cleared.failure, None);
-        assert!(cleared.done > held.done, "{cleared:?}");
-        assert_ne!(cleared.watermark, held.watermark);
+        assert!(cleared.complete(), "{cleared:?}");
     }
 }

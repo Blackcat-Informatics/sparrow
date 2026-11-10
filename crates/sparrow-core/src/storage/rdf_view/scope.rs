@@ -113,10 +113,11 @@ pub struct RdfScopeCoverage {
     pub event_time_projection_failed: u64,
     /// Known declared diagnostic values among selected occurrences, by dimension.
     pub diagnostic_known: std::collections::BTreeMap<crate::DiagnosticDimension, u64>,
-    /// Selected record metadata graphs the online event fallback backfill has not yet
-    /// rebuilt. The view serves the `eventTimeFallback` and `eventTimeBasis` facts the
-    /// backfill owes them, so the answer is the one the finished backfill gives; this only
-    /// reports how many graphs were served that way.
+    /// Selected record metadata graphs without a source event time whose stored rows lack
+    /// `eventTimeFallback`. The view derives the `eventTimeFallback` and `eventTimeBasis`
+    /// facts from the record's receipt time, and this counts the graphs served that way.
+    /// It is a permanent read-time count, not pending work: new graphs never store the
+    /// facts, so it does not fall to zero.
     pub event_fallback_pending: u64,
 }
 
