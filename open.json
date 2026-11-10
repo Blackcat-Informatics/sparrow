@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 179,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/179-tail-watch-self-triggers-on-the-daemon",
+  "branch": "paudley/179-tail-watch-self-triggers-on-the-daemon",
+  "slug": "tail-watch-self-triggers-on-the-daemon",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/179-tail-watch-self-triggers-on-the-daemon/.stage/tail-watch-self-triggers-on-the-daemon",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "cf221fa14d76cc35ebc75a2fdfaa3e907929c2fa",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/179-tail-watch-self-triggers-on-the-daemon",
+    "branch:paudley/179-tail-watch-self-triggers-on-the-daemon",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/158-serve-every-query-and-status-call caches into /home/paudley/Active/sparrow/.worktrees/179-tail-watch-self-triggers-on-the-daemon plus 5 dependency units from 1 other checkouts in 4.3s; 257 unchanged files keep their built mtimes; 34 other files take the seed time and rebuild; 61 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/179-tail-watch-self-triggers-on-the-daemon/.stage/tail-watch-self-triggers-on-the-daemon",
+    "issue:/home/paudley/Active/sparrow/.worktrees/179-tail-watch-self-triggers-on-the-daemon/.stage/tail-watch-self-triggers-on-the-daemon/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-09T22:11:21-0600",
+  "seed_error": ""
+}
