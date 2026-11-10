@@ -210,6 +210,8 @@ pub(super) struct Builds<C, T> {
     wait: Duration,
     #[cfg(feature = "test-support")]
     hold: Option<Hold>,
+    #[cfg(feature = "test-support")]
+    fail_delivery: bool,
 }
 
 impl<C, T> Default for Builds<C, T> {
@@ -221,6 +223,8 @@ impl<C, T> Default for Builds<C, T> {
             wait: BUILD_WAIT,
             #[cfg(feature = "test-support")]
             hold: None,
+            #[cfg(feature = "test-support")]
+            fail_delivery: false,
         }
     }
 }
@@ -353,6 +357,18 @@ impl<C, T: Send + 'static> Builds<C, T> {
     #[cfg(feature = "test-support")]
     pub(super) fn hold_for_tests(&mut self, hold: Hold) {
         self.hold = Some(hold);
+    }
+
+    /// Dev-only: make the next call that has a finished build fail before it builds the page.
+    #[cfg(feature = "test-support")]
+    pub(super) fn fail_next_delivery_for_tests(&mut self) {
+        self.fail_delivery = true;
+    }
+
+    /// Dev-only: whether a delivery failure was requested; clears the request.
+    #[cfg(feature = "test-support")]
+    pub(super) fn take_delivery_failure_for_tests(&mut self) -> bool {
+        std::mem::take(&mut self.fail_delivery)
     }
 
     /// Registered builds, threads still running, and builds ever started.

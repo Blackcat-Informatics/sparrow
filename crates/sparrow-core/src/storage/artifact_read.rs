@@ -594,7 +594,12 @@ impl Store {
             })?;
             (id, waiter, builds.wait())
         };
-        self.artifact_build_page(&id, &waiter, wait, now, cancellation)
+        let page = self.artifact_build_page(&id, &waiter, wait, now, cancellation);
+        if page.is_err() {
+            // The caller never learns this build's cursor: nothing can reach it.
+            self.artifact_builds()?.remove(&id);
+        }
+        page
     }
 
     /// Follow a build cursor, binding it to the caller's selector and limits when given.
@@ -669,6 +674,10 @@ impl Store {
                 },
             });
         };
+        #[cfg(feature = "test-support")]
+        if builds.take_delivery_failure_for_tests() {
+            return Err(Error::new("CANCELLED", "test: the page was not delivered"));
+        }
         let owed = match result {
             Ok(owed) => owed,
             Err(error) => {

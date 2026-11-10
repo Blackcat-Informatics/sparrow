@@ -19966,11 +19966,9 @@ fn a_source_listing_during_the_source_summary_migration_is_a_build_its_cursor_re
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let cancelled = sparrow_core::QueryCancellation::default();
-    cancelled.cancel();
-    let failed = store
-        .source_read_with_syslog_cancellable(&follow, now, &[], &[], &cancelled)
-        .unwrap_err();
+    // The next call finds the build finished and fails before it builds the page.
+    store.fail_next_listing_delivery_for_tests().unwrap();
+    let failed = store.source_read(&follow, now, &[]).unwrap_err();
     assert_eq!(failed.code, "CANCELLED", "{failed:?}");
     assert_eq!(
         store.listing_builds_for_tests().unwrap()[0],
@@ -20086,6 +20084,36 @@ fn a_live_artifact_listing_during_the_source_summary_migration_resumes_its_build
         .ingest("window-late", "window", "log", b"late\n", DAY + 9)
         .unwrap();
     open();
+    // A build is retired only after its page is delivered: the first call that finds the
+    // build finished fails before it builds the page, and the retry on the same cursor
+    // delivers the listing from the same build.
+    store.fail_next_listing_delivery_for_tests().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let failed = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build never finished"
+        );
+        let polled = store.artifact_read(
+            &ArtifactRead {
+                page_size: 1000,
+                scan_budget: 100_000,
+                cursor: Some(cursor.clone()),
+                ..Default::default()
+            },
+            now,
+        );
+        match polled {
+            Err(error) => break error,
+            Ok(page) => assert!(page.build.is_some()),
+        }
+    };
+    assert_eq!(failed.code, "CANCELLED", "{failed:?}");
+    assert_eq!(
+        store.listing_builds_for_tests().unwrap()[1],
+        (1, 0, 1),
+        "the finished build waits for its page"
+    );
     let mut page = first;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while page.build.is_some() {
