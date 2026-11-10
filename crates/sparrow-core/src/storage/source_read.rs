@@ -455,10 +455,6 @@ impl Store {
                 },
             });
         };
-        #[cfg(feature = "test-support")]
-        if self.source_builds()?.take_delivery_failure_for_tests() {
-            return Err(Error::new("CANCELLED", "test: the page was not delivered"));
-        }
         let mut snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -474,6 +470,10 @@ impl Store {
         // The build is retired only once its first page exists: a call that fails to publish
         // it leaves the finished build for the next call on the same cursor.
         let page = self.publish_sources(snapshot, now, cancellation)?;
+        #[cfg(feature = "test-support")]
+        if self.source_builds()?.take_delivery_failure_for_tests() {
+            return Err(Error::new("CANCELLED", "test: the page was not delivered"));
+        }
         self.source_builds()?.remove(id);
         Ok(page)
     }

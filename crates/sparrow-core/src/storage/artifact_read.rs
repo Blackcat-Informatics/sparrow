@@ -674,10 +674,6 @@ impl Store {
                 },
             });
         };
-        #[cfg(feature = "test-support")]
-        if builds.take_delivery_failure_for_tests() {
-            return Err(Error::new("CANCELLED", "test: the page was not delivered"));
-        }
         let owed = match result {
             Ok(owed) => owed,
             Err(error) => {
@@ -695,6 +691,10 @@ impl Store {
         // The build is retired only once its page exists, so a failed or cancelled call
         // leaves the finished window for the next call on the same cursor.
         let page = self.artifact_pending_page(pending, owed, now, cancellation)?;
+        #[cfg(feature = "test-support")]
+        if self.artifact_builds()?.take_delivery_failure_for_tests() {
+            return Err(Error::new("CANCELLED", "test: the page was not delivered"));
+        }
         self.artifact_builds()?.remove(id);
         Ok(page)
     }
