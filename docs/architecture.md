@@ -27,6 +27,20 @@ and unstructured logs, live syslog, file/API imports, completed-file consumption
 active-log tailing, named pins, MCP, CLI, and a Rust logging client. These ship in
 the milestones below rather than as one undifferentiated implementation.
 
+Sparrow is a low-assurance, high-throughput, searchable, centralized log store, a
+radical improvement over scattered log files. It optimizes only for speed and
+storage efficiency. A mechanism that costs speed or space without preventing a
+loss a logging store cannot tolerate is removed or relaxed, and Sparrow owes no
+more durability, privacy or tamper-evidence than the plain log files it
+replaces. The Katamari/Sparrow razor decides where data lives: whatever needs
+long-term storage, privacy, encryption, validation or resilience goes to
+Katamari, at a high and justified bar, and everything else goes to Sparrow. The
+razor may cut one body of data into sets and subsets, each placed by its own
+need. Nothing irreplaceable may have its only copy in Sparrow. Worked examples:
+anonymous intake is allowed because it is the fastest path; deduplication and
+compression matter because efficient storage is a primary goal; signatures and
+integrity come after all other concerns and never on the hot path.
+
 There is one global 30-day retention policy. Per-class retention, replication,
 distributed queries, embeddings, an embedded language model, and a human
 dashboard are outside the first version. Agents perform reasoning using evidence

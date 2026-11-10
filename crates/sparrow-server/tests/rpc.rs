@@ -4553,7 +4553,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 .status()
                 .unwrap();
             assert!(status.success());
-            // The copy owes both schema 69 migrations, the source summary migration and a
+            // The copy owes the schema 69 owner index migration, the source summary migration and a
             // source timeline rebuild, which only a maintenance worker runs.
             let db = sparrow_test_support::catalog_db(&copied).unwrap();
             sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
@@ -4669,7 +4669,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             assert_eq!(status["counts"].as_str(), Some("pending"));
             assert_eq!(status["live_records"].as_str(), Some("0"));
             let migrations = status["migrations"].as_array().unwrap();
-            assert_eq!(migrations.len(), 5, "{migrations:?}");
+            assert_eq!(migrations.len(), 4, "{migrations:?}");
             for migration in migrations {
                 assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
                 assert_eq!(
@@ -4706,7 +4706,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 Some("1"),
                 "{coverage:?}"
             );
-            // The view serves the facts the backfill owes, so the answer is complete (#158).
+            // The view derives the fallback facts, so the answer is complete (#158).
             assert_eq!(coverage["complete"].as_bool(), Some(true), "{coverage:?}");
             drop(client);
             drop(query);
@@ -4743,9 +4743,10 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             assert_eq!(watches.len(), 1, "the stored watch is reported");
             assert_eq!(watches[0]["directories"].as_u64(), Some(0), "{watches:?}");
             let answer = cli(&copy_socket, &["sparql", request_file.to_str().unwrap()]);
+            // The derivation is permanent (#193): the count does not fall once migrations end.
             assert_eq!(
                 answer["coverage"]["event_fallback_pending"].as_str(),
-                Some("0")
+                Some("1")
             );
             assert_eq!(
                 std::fs::read(&waiting).unwrap(),

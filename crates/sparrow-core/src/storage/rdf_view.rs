@@ -123,7 +123,7 @@ pub struct StoredRdfView<'a> {
     /// The scope's graphs, enumerated once per view: every graph iteration shares them,
     /// so a query's patterns do not each re-walk the declarations.
     owned_graphs: std::sync::OnceLock<Option<std::sync::Arc<OwnedGraphSet>>>,
-    /// Present while the event fallback backfill is incomplete in this snapshot.
+    /// The receipt-time fallback facts this view derives for record graphs that lack them.
     fallback: Option<FallbackPending>,
     budget: Arc<Budget>,
     _scope: Arc<Reservation>,
@@ -133,12 +133,9 @@ pub struct StoredRdfView<'a> {
     text_scope: Option<text_relations::TextScope>,
 }
 
-/// An incomplete event fallback backfill as one snapshot sees it, and the facts it still
-/// owes the selected record graphs. The view serves those facts with the stored rows, so a
-/// read during the backfill answers exactly as it will once the backfill is complete.
+/// The receipt-time fallback facts one snapshot derives for selected record graphs that do
+/// not store them. The view serves those facts with the stored rows; ingest stores none.
 struct FallbackPending {
-    /// Last examined record graph owner; graphs at or before it are migrated.
-    after: Option<String>,
     /// Dictionary identities of `eventTime` and `eventTimeFallback`, when interned.
     predicates: [Option<u64>; 2],
     /// The first dictionary ordinal the snapshot has not allocated: `rdf:next` holds the
@@ -147,8 +144,8 @@ struct FallbackPending {
     next: u64,
     /// Owed terms the dictionary lacks, by ordinal from `next`, with their canonical bytes.
     terms: Vec<(Vec<u8>, ProjectionTerm)>,
-    /// Owed fallback facts of selected record graphs the backfill has not reached, each in
-    /// its record's metadata graph.
+    /// Derived fallback facts of selected record graphs that lack them, each in its
+    /// record's metadata graph.
     quads: Vec<QuadIds<GlobalTermId>>,
     _reservation: Option<Reservation>,
 }
@@ -318,7 +315,8 @@ impl<'a> StoredRdfView<'a> {
         Ok(view)
     }
 
-    /// Read both online migration checkpoints from this view's snapshot.
+    /// Read the owner index checkpoint and arm the fallback derivation from this view's
+    /// snapshot.
     fn migration_state(&mut self) -> Result<(), ReadError> {
         let read = |key: &str| {
             self.budget.request(key.len() as u64 + 1024, false)?;
@@ -327,7 +325,6 @@ impl<'a> StoredRdfView<'a> {
                 .map_err(|error| self.budget.fail(error.into()))
         };
         let owner = read(rdf_index::OWNER_GRAPH_UPGRADE)?;
-        let checkpoint = read(super::event_fallback_rdf::CHECKPOINT)?;
         let next = read("rdf:next")?;
         self.owner_pending = rdf_index::owner_graph_progress(|_| Ok(owner))
             .map_err(|error| self.budget.fail(error))?
@@ -335,11 +332,6 @@ impl<'a> StoredRdfView<'a> {
                 None => (rdf_index::graph_key(0, 0), true),
                 Some((graph, owner)) => (rdf_index::graph_key(graph, owner), false),
             });
-        let Some(after) = super::event_fallback_rdf::decode_frontier(checkpoint.as_deref())
-            .map_err(|error| self.budget.fail(error))?
-        else {
-            return Ok(());
-        };
         let mut predicates = [None; 2];
         for (slot, predicate) in predicates
             .iter_mut()
@@ -362,7 +354,6 @@ impl<'a> StoredRdfView<'a> {
                 ))
             })?;
         self.fallback = Some(FallbackPending {
-            after,
             predicates,
             next,
             terms: Vec::new(),
@@ -372,8 +363,8 @@ impl<'a> StoredRdfView<'a> {
         Ok(())
     }
 
-    /// Serve the fallback facts the backfill will add to `record`'s metadata graph, derived
-    /// by the backfill's own law from the record's receipt time.
+    /// Serve the fallback facts `record`'s metadata graph lacks, derived from the record's
+    /// receipt time.
     fn owe_fallback(&mut self, record: &Record) -> Result<(), ReadError> {
         use purrdf::TermFactory;
         let fail = |budget: &Budget, error: Error| budget.fail(error);
@@ -505,18 +496,14 @@ impl<'a> StoredRdfView<'a> {
             .map(|(_, term)| term)
     }
 
-    /// Whether a record's metadata graph still lacks the fallback facts the event fallback
-    /// backfill adds. Graphs at or before its frontier are migrated; one beyond it was
-    /// either published after the fence, with its facts, or still waits for a page.
+    /// Whether a record's metadata graph lacks the fallback facts, so the view derives them.
+    /// A graph an earlier writer or the retired backfill gave the facts keeps them.
     fn fallback_pending(&self, id: &str) -> Result<bool, ReadError> {
         let Some(pending) = &self.fallback else {
             return Ok(false);
         };
-        if pending.after.as_deref().is_some_and(|after| id <= after) {
-            return Ok(false);
-        }
-        // Uncharged to the request budget, as the rest of what the backfill owes: the reads
-        // exist only while it is pending. Decoding is still reserved.
+        // Uncharged to the request budget, as the rest of the derivation. Decoding is still
+        // reserved.
         let key = format!("rdf:graph:{id}");
         let bytes = self
             .snapshot

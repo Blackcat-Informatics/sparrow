@@ -297,7 +297,7 @@ or the free-space floor. The rewrite resumes after a restart, and a running
 job is aborted when the store closes, so shutdown does not wait for it.
 
 The first open of a store written before schema 69 serves at once and runs the
-owner-to-graph index build and the receipt-time fallback backfill in the
+owner-to-graph index build and the other online migrations in the
 background (see "Online store migrations" in the interfaces). `status` reports
 them under `migrations` with `done`, `total`, `watermark` and any `failure`, and
 the journal logs a progress line every 64 pages and a completion line per

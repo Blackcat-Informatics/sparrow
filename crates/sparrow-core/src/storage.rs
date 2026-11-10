@@ -22,8 +22,6 @@ mod tracing_rdf;
 #[cfg(feature = "test-support")]
 pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
 #[cfg(feature = "test-support")]
-pub use event_fallback_rdf::remove_event_fallback_rdf_for_legacy_fixture;
-#[cfg(feature = "test-support")]
 pub use source_summary::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
 #[cfg(feature = "test-support")]
 pub use store_counters::{StoreCounterAudit, remove_store_counters_for_legacy_fixture};

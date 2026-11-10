@@ -854,7 +854,7 @@ struct SparqlCoverage {
   artifactDiagnosticUnknown @11 :UInt64;
   eventTimeKnown @12 :UInt64;
   diagnosticKnown @13 :List(DiagnosticKnownCount);
-  # Schema 69: selected record graphs still awaiting the event fallback migration.
+  # Selected record graphs whose receipt-time fallback facts the reader derives (not stored).
   eventFallbackPending @14 :UInt64;
 }
 struct DiagnosticKnownCount { dimension @0 :DiagnosticDimension; known @1 :UInt64; }

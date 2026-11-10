@@ -459,10 +459,10 @@ mod tests {
         worker.shutdown().await.unwrap();
     }
 
-    /// INVARIANT: a store opened with both schema 69 migrations, the source summary
-    /// migration and a source timeline rebuild pending serves reads while the backfill is part done, and those reads
-    /// report the record graphs still pending; the joined worker's pages then finish every
-    /// migration, after which the same read reports nothing pending and the per-source
+    /// INVARIANT: a store opened with the owner index, the source summary migration and a
+    /// source timeline rebuild pending serves reads mid-migration, and those reads derive and
+    /// count the record graph's receipt-time fallback facts; the joined worker's pages then
+    /// finish every migration, after which the same read answers the same and the per-source
     /// counters equal a full recount.
     #[tokio::test]
     async fn reads_report_pending_mid_migration_and_the_worker_finishes_it() {
@@ -490,16 +490,12 @@ mod tests {
             "{pending:?}"
         );
         // Commit the worker's pages in its run order (the counters, the source summary, the
-        // owner index) through the first backfill page, so the read below lands part-way
-        // through the backfill, not before or after it.
-        while store.migrate_step().unwrap().unwrap().migration != Migration::EventFallbackRdf {}
+        // owner index) through the owner index, so the read below lands before the source
+        // timeline rebuild.
+        while store.migrate_step().unwrap().unwrap().migration != Migration::OwnerGraphIndex {}
         let part = store.migrations().unwrap();
-        let (index, fallback) = (
-            &part[Migration::OwnerGraphIndex.index()],
-            &part[Migration::EventFallbackRdf.index()],
-        );
-        assert!(index.complete() && !fallback.complete(), "{part:?}");
-        assert!(fallback.done > 0, "{part:?}");
+        let index = &part[Migration::OwnerGraphIndex.index()];
+        assert!(index.complete(), "{part:?}");
         use sparrow_core::QueryScope;
         let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1000);
         let read = |store: &sparrow_core::Store| {
@@ -525,8 +521,9 @@ mod tests {
             assert!(result.outcome.is_ok(), "the read is served");
             result.coverage.event_fallback_pending
         };
-        let waiting = read(&store);
-        assert_eq!(waiting, fallback.total.unwrap() - fallback.done, "{part:?}");
+        // The reader derives the fallback facts for each of the 300 record graphs whichever
+        // migration is pending, and counts them.
+        assert_eq!(read(&store), 300, "{part:?}");
         let worker = Worker::start(store.clone(), Duration::from_millis(1));
         tokio::time::timeout(Duration::from_secs(30), async {
             while !store
@@ -547,7 +544,7 @@ mod tests {
                 .all(|m| m.failure.is_none() && m.total == Some(m.done)),
             "{done:?}"
         );
-        assert_eq!(read(&store), 0);
+        assert_eq!(read(&store), 300);
         let (stored, recounted) = store.source_count_audit_for_tests().unwrap();
         assert_eq!(stored, recounted);
         assert_eq!(stored["source"], [300, 1, 0]);
