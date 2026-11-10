@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 175,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/175-user-unit-upgrade-sh-restarts-sparrow",
+  "branch": "paudley/175-user-unit-upgrade-sh-restarts-sparrow",
+  "slug": "user-unit-upgrade-sh-restarts-sparrow",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/175-user-unit-upgrade-sh-restarts-sparrow/.stage/user-unit-upgrade-sh-restarts-sparrow",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "f1219ee5ab748519d679a26d5584dc7a9dc0185f",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/175-user-unit-upgrade-sh-restarts-sparrow",
+    "branch:paudley/175-user-unit-upgrade-sh-restarts-sparrow",
+    "ignored:1 files (1 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/158-serve-every-query-and-status-call caches into /home/paudley/Active/sparrow/.worktrees/175-user-unit-upgrade-sh-restarts-sparrow plus 5 dependency units from 1 other checkouts in 11.2s; 260 unchanged files keep their built mtimes; 30 other files take the seed time and rebuild; 61 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/175-user-unit-upgrade-sh-restarts-sparrow/.stage/user-unit-upgrade-sh-restarts-sparrow",
+    "issue:/home/paudley/Active/sparrow/.worktrees/175-user-unit-upgrade-sh-restarts-sparrow/.stage/user-unit-upgrade-sh-restarts-sparrow/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-09T20:15:56-0600",
+  "seed_error": ""
+}
