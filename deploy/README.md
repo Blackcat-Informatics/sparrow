@@ -31,10 +31,10 @@ lives.
 | `verify-backup.sh` | Verifies an online backup set on a restored scratch copy, and measures the online migration on it (`--measure-migration`), with replayed intake and query traffic under `--with-traffic`. |
 | `reconcile-inflight.sh` | Reconciles consume claims after a rollback restores an older store (`docs/deployment.md`, "Claims after a rollback"). |
 | `lib.sh` | Code shared by the scripts above. |
-| `systemd/` | `sparrow.service`, `sparrow-ship.{service,timer}`, `sparrow-backup.{service,timer}`. |
+| `systemd/` | `sparrow.service`, `sparrow-ship.{service,timer}`, `sparrow-backup.{service,timer}`; under `user/`, the interim user units: the `LimitNOFILE` drop-in and `katamari-journal-spool.service` and `katamari-manager-spool.service`. |
 | `apparmor/sparrow` | The daemon's AppArmor profile, enforce mode. |
 | `config/` | Templates: server, shipper, watch, sysusers and tmpfiles configuration. |
-| `libexec/` | `sparrow-ship` (the shipper), `sparrow-backup` (the online backup client) and `sparrow-measure-load` (the replay and traffic load of `verify-backup.sh --with-traffic`). |
+| `libexec/` | `sparrow-ship` (the shipper), `sparrow-backup` (the online backup client), `katamari-journal-spool` and `katamari-manager-spool` (the Katamari journal forwarders, `docs/deployment.md`, "Katamari's journal in the spool") and `sparrow-measure-load` (the replay and traffic load of `verify-backup.sh --with-traffic`). |
 | `evidence/` | Verification records for this deployment (security exposure, rehearsal, lifecycle, AppArmor, credentials). |
 
 The units are the source of truth. The scripts are thin wrappers over them
@@ -93,6 +93,7 @@ btrfs checksums and compression; its own digests and compression cover both.
 | `/usr/local/libexec/sparrow/sparrow` | link | The matching CLI image; `sparrow.previous` is the rollback. |
 | `/usr/local/bin/sparrow` | link | The CLI on `PATH`, through the link above. |
 | `/usr/local/libexec/sparrow/sparrow-ship`, `sparrow-backup` | root, 0755 | The timers' helpers, from `libexec/`. |
+| `/usr/local/libexec/sparrow/katamari-journal-spool`, `katamari-manager-spool` | root, 0755 | The forwarders' scripts, for the operator to copy to `~/.local/libexec/sparrow/`; their unit files are under `/usr/local/share/sparrow/user-units/`. |
 | `/usr/local/share/sparrow/lexicons-PURRDF_REV/` | root, 0755 | The five native CBOR lexicons; `PURRDF_REV` is the full PurRDF commit the images were built against. |
 | `/usr/local/share/doc/sparrow/deploy/` | root, 0644 | Copies of these documents and of `evidence/`. |
 | `/etc/sparrow/server.toml` | root:sparrow, 0640 | The daemon's configuration. |
