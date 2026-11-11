@@ -11,9 +11,11 @@ pub use sparrow_core::DEFAULT_FLUSH_INTERVAL_MS as STORAGE_FLUSH_INTERVAL_MS;
 /// Native analyzer resolver used by the shared storage fixture macro.
 pub use sparrow_core::resolve_text_analyzer;
 
-/// Baseline native analyzer artifacts for workspace storage fixtures, read from the
-/// sibling PurRDF checkout of the canonical repository root. A linked worktree under
-/// `<root>/.worktrees/` resolves to the same sibling as the main checkout.
+/// Baseline native analyzer artifacts for workspace storage fixtures. The registry crates
+/// exclude the lexicons, so `tools/purrdf-lexicons.sh` archives them from the PurRDF repository
+/// at the `git_revision` `registry/compatibility.toml` pins into `bin/lexicons-<revision>`, the
+/// directory `make install-bin` deploys from; a linked worktree under `<root>/.worktrees/` shares
+/// the main checkout's. They are never read from a PurRDF working tree.
 pub fn text_lexicon_dir() -> &'static std::path::Path {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
@@ -30,7 +32,36 @@ pub fn text_lexicon_dir() -> &'static std::path::Path {
             }
             _ => checkout.to_path_buf(),
         };
-        root.join("../purrdf/crates/text/lexicons/artifacts")
+        let registry = std::fs::read_to_string(checkout.join("registry/compatibility.toml"))
+            .expect("INVARIANT: registry/compatibility.toml pins the PurRDF revision");
+        let supplier = registry
+            .split("[[supplier]]")
+            .nth(1)
+            .expect("INVARIANT: the registry has a purrdf supplier");
+        let field = |key: &str| {
+            supplier
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(key)
+                        .and_then(|rest| rest.trim_start().strip_prefix('='))
+                })
+                .map(|value| value.trim().trim_matches('"').to_owned())
+                .unwrap_or_else(|| panic!("registry purrdf supplier has no `{key}`"))
+        };
+        let (repository, revision) = (field("repository"), field("git_revision"));
+        let dest = root.join(format!("bin/lexicons-{revision}"));
+        let status = std::process::Command::new(checkout.join("tools/purrdf-lexicons.sh"))
+            .arg(root.join(repository))
+            .arg(&revision)
+            .arg(&dest)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("INVARIANT: tools/purrdf-lexicons.sh runs");
+        assert!(
+            status.success(),
+            "lexicons for PurRDF {revision} could not be materialised"
+        );
+        dest.join("artifacts")
     })
 }
 

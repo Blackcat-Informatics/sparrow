@@ -42,25 +42,17 @@ keep target/release/sparrowd "bin/sparrowd-schema$schema-$rev"
 keep target/release/sparrow "bin/sparrow-schema$schema-$rev"
 keep target/release/examples/recovery "bin/sparrow-recovery-schema$schema-$rev"
 
-# The lexicons come from the PurRDF revision Cargo.lock resolves, as cargo checked it out.
-purrdf=$(cargo metadata --format-version 1 --locked | python3 -I -c '
-import json, sys
-from pathlib import Path
-packages = json.load(sys.stdin)["packages"]
-lex = next(p for p in packages if p["name"] == "purrdf-lex")
-print(Path(lex["manifest_path"]).parents[2], lex["source"].rsplit("#", 1)[-1])')
-read -r checkout purrdf_rev <<<"$purrdf"
-lexicons=$checkout/crates/text/lexicons
-[[ -d $lexicons/artifacts ]] || { echo "install-bin: no lexicons at $lexicons" >&2; exit 1; }
-target=bin/lexicons-$purrdf_rev
-if [[ -d $target ]]; then
-    diff -r -q -- "$lexicons" "$target" >/dev/null || { echo "install-bin: $target differs from $lexicons" >&2; exit 1; }
-    echo "install-bin: kept $target"
-else
-    staged=$(mktemp -d bin/.lexicons.XXXXXX)
-    cp -a --reflink=auto -- "$lexicons/." "$staged/"
-    diff -r -q -- "$lexicons" "$staged" >/dev/null || { echo "install-bin: copy of $lexicons differs" >&2; exit 1; }
-    chmod 0755 -- "$staged"
-    mv -T -n -- "$staged" "$target"
-    echo "install-bin: $target"
-fi
+# The registry crates exclude the lexicons, so they come from the PurRDF repository at the
+# `git_revision` registry/compatibility.toml pins (the revision of the locked release), archived
+# by tools/purrdf-lexicons.sh and never read from a working tree.
+read -r purrdf_repository purrdf_rev < <(python3 -I - <<'PY'
+import re
+text = open("registry/compatibility.toml").read()
+block = re.search(r'\[\[supplier\]\]\nname = "purrdf"\n(.*?)(?=\n\[\[|\Z)', text, re.S).group(1)
+print(re.search(r'repository = "([^"]+)"', block).group(1), re.search(r'git_revision = "([0-9a-f]{40})"', block).group(1))
+PY
+)
+# The registry names the repository relative to the canonical checkout, which a linked worktree
+# under .worktrees/ shares with the main one.
+canonical=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
+tools/purrdf-lexicons.sh "$canonical/$purrdf_repository" "$purrdf_rev" "bin/lexicons-$purrdf_rev"
