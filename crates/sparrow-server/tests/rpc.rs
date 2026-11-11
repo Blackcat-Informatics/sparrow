@@ -5260,6 +5260,21 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
         "refused before any scratch directory exists"
     );
 
+    // The margin can only be raised, and only by a plain decimal the arithmetic can hold.
+    for bad in ["39", "0100", "08", "9300000000"] {
+        let (code, stdout, stderr) = verify_backup_measured(
+            &backup,
+            &verify,
+            &live,
+            &args,
+            &[("SPARROW_VERIFY_MARGIN_GB", bad)],
+        );
+        assert_eq!(code, Some(2), "{bad}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("SPARROW_VERIFY_MARGIN_GB may only raise 40"),
+            "{bad}: {stderr}"
+        );
+    }
     // 11 GB of engine files: one restore and the 40 GB margin fit the double's 60 GB, two do not.
     let (live, _, backup, _, _) = traffic_fixture(&dir.path().join("traffic"), true, false, 1000);
     let source = backup.join("SOURCE");

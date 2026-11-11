@@ -149,7 +149,8 @@ VERIFY_ROOT=${SPARROW_VERIFY:-/SPARROW/verify}
 GB=1000000000
 MIN_FREE_GB=${SPARROW_MEASURE_MIN_FREE_GB:-50} ABORT_FREE_GB=${SPARROW_MEASURE_ABORT_FREE_GB:-40}
 RESTORE_MARGIN_GB=${SPARROW_VERIFY_MARGIN_GB:-40}
-if [[ ! $RESTORE_MARGIN_GB =~ ^[0-9]+$ ]] || ((RESTORE_MARGIN_GB < 40)); then
+# Plain decimal of at most nine digits: no octal reading of a leading zero, no arithmetic overflow.
+if [[ ! $RESTORE_MARGIN_GB =~ ^[1-9][0-9]{1,8}$ ]] || ((RESTORE_MARGIN_GB < 40)); then
     printf 'verify-backup.sh: SPARROW_VERIFY_MARGIN_GB may only raise 40 (whole GB)\n' >&2
     exit 2
 fi
