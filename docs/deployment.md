@@ -693,7 +693,7 @@ records and sparql were cut off at 60 s, and katamari publications expired.
 BACKUP` measures the backfill the way the live store runs it. `BACKUP` is an
 online backup set, `BACKUP_ROOT/sets/ID`. The measured copy and the query-only
 prep copy are each restored from it with the image's `--restore-backup`, so
-the scratch filesystem needs twice the set's `engine_bytes` plus 10 GiB. The
+the scratch filesystem must keep `SPARROW_VERIFY_MARGIN_GB` (default and minimum 40 GB) free after both copies of the set's `engine_bytes`. The
 daemon runs under the same user scope, limits and nice level as above.
 
 - The image opens the copy with `sparrowd --private-intake DIR`. That is a
