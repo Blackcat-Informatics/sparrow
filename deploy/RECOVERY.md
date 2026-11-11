@@ -269,8 +269,9 @@ backup itself and never starts a daemon on the live store, socket or intake.
 2. It restores engine backup `ID` into a scratch directory below
    `/SPARROW/verify/` (`SPARROW_VERIFY` overrides it) with the image `SOURCE`
    names, `sparrowd --restore-backup`, which checks every file's checksum as it
-   reads it. The scratch filesystem must have the backup's `engine_bytes` plus
-   10 GiB free. The scratch copy is not a backup: the script removes it however
+   reads it. The scratch filesystem must keep `SPARROW_VERIFY_MARGIN_GB` (default and
+   minimum 40 GB) free after the copy of the backup's `engine_bytes`, because
+   the live store and other writers share it; the run prints the figures. The scratch copy is not a backup: the script removes it however
    the run ends. Before it creates the directory, it refuses any path that
    resolves under the live store, the live socket, the intake
    (`SPARROW_INTAKE`), the backup root, or the `data_dir` and `intake` the

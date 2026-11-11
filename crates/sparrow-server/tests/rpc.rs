@@ -4838,7 +4838,8 @@ fn verify_backup(
     live: &Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    verify_backup_with(backup, verify, live, args, &[])
+    // The df double keeps the restore margin check independent of the host's free space.
+    verify_backup_measured(backup, verify, live, args, &[])
 }
 
 /// Run deploy/verify-backup.sh as [`verify_backup`] does, with extra environment.
@@ -5259,7 +5260,22 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
         "refused before any scratch directory exists"
     );
 
-    // 26 GB of engine files: one restore and 10 GiB fit the double's 60 GB, two do not.
+    // The margin can only be raised, and only by a plain decimal the arithmetic can hold.
+    for bad in ["39", "0100", "08", "9300000000"] {
+        let (code, stdout, stderr) = verify_backup_measured(
+            &backup,
+            &verify,
+            &live,
+            &args,
+            &[("SPARROW_VERIFY_MARGIN_GB", bad)],
+        );
+        assert_eq!(code, Some(2), "{bad}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("SPARROW_VERIFY_MARGIN_GB may only raise 40"),
+            "{bad}: {stderr}"
+        );
+    }
+    // 11 GB of engine files: one restore and the 40 GB margin fit the double's 60 GB, two do not.
     let (live, _, backup, _, _) = traffic_fixture(&dir.path().join("traffic"), true, false, 1000);
     let source = backup.join("SOURCE");
     let resized = std::fs::read_to_string(&source)
@@ -5267,7 +5283,7 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
         .lines()
         .map(|line| {
             if line.starts_with("engine_bytes=") {
-                "engine_bytes=26000000000".to_owned()
+                "engine_bytes=11000000000".to_owned()
             } else {
                 line.to_owned()
             }
@@ -5290,8 +5306,12 @@ fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
     );
     assert_eq!(code, Some(1), "{stdout}{stderr}");
     assert!(
-        stderr.contains("2 time(s) needs 52000000000 bytes plus 10 GiB"),
+        stderr.contains("2 time(s) needs 22000000000 bytes and must leave 40 GB free"),
         "{stderr}"
+    );
+    assert!(
+        stdout.contains("verify-backup: restore margin: 60000000000 bytes free, copy needs 22000000000 bytes, margin 40 GB, 38000000000 bytes would remain"),
+        "the figures used are printed: {stdout}"
     );
     assert!(
         !stdout.contains("PASS restore:"),
