@@ -49,7 +49,8 @@ Usage: deploy/verify-backup.sh [--time-records] [--window FROM BEFORE] [--image 
 BACKUP is a backup set, BACKUP_ROOT/sets/ID. Check every file BACKUP/MANIFEST.b3 lists against
 the NAS, restore engine backup ID into a scratch directory below SPARROW_VERIFY (default
 /SPARROW/verify) with the image BACKUP/SOURCE records, open the copy query-only and check it. The
-scratch filesystem needs the backup's engine_bytes plus 10 GiB free; the copy is removed however
+scratch filesystem must keep SPARROW_VERIFY_MARGIN_GB (default 40, may only be raised) GB free after the
+copy of the backup's engine_bytes, and the run prints the figures; the copy is removed however
 the run ends. A backup counts as verified only once this exits 0. Exit 1 is a failed check; exit
 2 is a usage error. SPARROW_CONFIG (default /etc/sparrow/server.toml) must be readable: its
 data_dir and socket_path are the live paths the copy must never touch.
@@ -147,6 +148,12 @@ VERIFY_ROOT=${SPARROW_VERIFY:-/SPARROW/verify}
 # The migration measurement's disk guard, in GB of 10^9 bytes. An override may only raise them.
 GB=1000000000
 MIN_FREE_GB=${SPARROW_MEASURE_MIN_FREE_GB:-50} ABORT_FREE_GB=${SPARROW_MEASURE_ABORT_FREE_GB:-40}
+RESTORE_MARGIN_GB=${SPARROW_VERIFY_MARGIN_GB:-40}
+# Plain decimal of at most nine digits: no octal reading of a leading zero, no arithmetic overflow.
+if [[ ! $RESTORE_MARGIN_GB =~ ^[1-9][0-9]{1,8}$ ]] || ((RESTORE_MARGIN_GB < 40)); then
+    printf 'verify-backup.sh: SPARROW_VERIFY_MARGIN_GB may only raise 40 (whole GB)\n' >&2
+    exit 2
+fi
 # Seconds between status polls while measuring; progress and free space are logged every minute.
 POLL_SECONDS=15
 # Seconds the migrations' done/total may stay unchanged after the first status before the run
@@ -486,8 +493,14 @@ need=$(source_value engine_bytes)
 copies=1
 ((WITH_TRAFFIC == 0)) || copies=2
 free=$(free_bytes "$SCRATCH") || exit 1
-((free > copies * need + 10 * 1024 ** 3)) || die "only $free bytes free under $VERIFY_ROOT; restoring \
-backup $BACKUP_ID $copies time(s) needs $((copies * need)) bytes plus 10 GiB"
+# The scratch filesystem is shared with the live store and with other writers (2026-11-11: a 38 GB
+# restore on a filesystem with 86 GB free left the live daemon paused for 19.5 minutes at its
+# 4 GiB floor). The restore must leave RESTORE_MARGIN_GB free after the copy, whatever else runs.
+margin=$((RESTORE_MARGIN_GB * GB))
+printf 'verify-backup: restore margin: %s bytes free, copy needs %s bytes, margin %s GB, %s bytes would remain\n' \
+    "$free" "$((copies * need))" "$RESTORE_MARGIN_GB" "$((free - copies * need))"
+((free > copies * need + margin)) || die "only $free bytes free under $VERIFY_ROOT; restoring \
+backup $BACKUP_ID $copies time(s) needs $((copies * need)) bytes and must leave ${RESTORE_MARGIN_GB} GB free for other writers"
 mkdir -- "$DATA"
 switch_off_copy_on_write "$DATA"
 "$daemon" --restore-backup "$BACKUP_ROOT" "$BACKUP_ID" "$DATA" 2>"$SCRATCH/restore.log" \
