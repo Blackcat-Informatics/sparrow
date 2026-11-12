@@ -16,7 +16,8 @@
 //! `rocksdb.background-errors`. The thread samples that count around the compaction, and
 //! the pass keeps a baseline of it (see [`native_errors`]), so only a new error fails a
 //! pass and an old one never holds intake. The thread also times itself and reads each
-//! family's table bytes before and after, so the first real run on a store measures itself.
+//! family's table and blob bytes before and after, so the first real run on a store
+//! measures itself.
 
 use super::{Error, FAMILIES, RetentionWaker};
 use rocksdb::{CompactOptions, DB};
@@ -244,7 +245,7 @@ impl Forced {
 }
 
 impl Forced {
-    /// The compaction, with the native error count and each family's table bytes sampled
+    /// The compaction, with the native error count and each family's table and blob bytes sampled
     /// around it. A higher error count is the failure the binding's `void` call hides.
     fn compact_measured(&self, db: &DB) -> Outcome {
         let mut failures = Vec::new();
