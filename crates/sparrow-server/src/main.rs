@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 
 mod local_endpoint;
 mod maintenance;
+mod pressure_duty;
 mod shutdown;
 
 /// How often the daemon compares filesystem free space with its floor.
@@ -364,13 +365,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 failure = &mut health => return Err(failure),
-                _ = space.tick() => match (store.space_floor().shortfall()?, space_ok) {
+                _ = space.tick() => match (store.space_floor().observe(sparrow_server::now()?)?, space_ok) {
                     (None, false) => {
-                        eprintln!("sparrowd: free space restored; accepting connections and writes");
+                        let floor = store.space_floor().status();
+                        eprintln!("sparrowd: free space restored; accepting connections and writes (pauses={} resumes={} refused_writes={})", floor.pauses, floor.resumes, floor.refused_writes);
                         space_ok = true;
                     }
                     (Some(shortfall), true) => {
-                        eprintln!("sparrowd: pausing connections and writes: {shortfall}");
+                        let floor = store.space_floor().status();
+                        eprintln!("sparrowd: pausing connections and writes (pauses={} resumes={} refused_writes={}): {shortfall}", floor.pauses, floor.resumes, floor.refused_writes);
                         space_ok = false;
                     }
                     _ => {}

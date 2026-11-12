@@ -308,6 +308,24 @@ struct PressureStatus {
   pendingFlushes @5 :UInt64; pendingCompactions @6 :UInt64; snapshots @7 :UInt64;
   lastPass @8 :PressurePass; failure @9 :OptionalText;
   evictedRecordlessArtifacts @10 :UInt64;
+  # #211, additive at schema 71 (SCHEMA_VERSION is unchanged: an older reader ignores these
+  # fields and an older server leaves them zero or absent). Times are Unix milliseconds, 0
+  # when none; the session-local counters restart when the daemon does.
+  observedAt @11 :UInt64;          # the clock of the last pass; every age is measured to it
+  linkedBytes @12 :UInt64;         # linked store bytes the last pass measured
+  episodeSince @13 :UInt64;        # intake has stayed refused since (0 while ready)
+  phaseSince @14 :UInt64;          # the current non-ready phase began
+  waitSince @15 :UInt64;           # the current wait for native reclamation began
+  waitBeforeBytes @16 :UInt64;     # linked bytes when that wait began
+  forcedCompactions @17 :UInt64;   # compactions forced because linked bytes did not fall
+  waitsReleased @18 :UInt64;       # waits ended after a forced compaction left bytes unchanged
+  stalledPasses @19 :UInt64;       # passes that retired nothing and moved nothing on
+  refusedWrites @20 :UInt64;       # data writes answered STORAGE_PRESSURE by physical admission
+  waitingOn @21 :OptionalText;     # why the last pass could do no more
+  floorPausedSince @22 :UInt64;    # the free-space floor paused writes since (0 when not paused)
+  floorPauses @23 :UInt64;         # free-space floor pauses begun
+  floorResumes @24 :UInt64;        # free-space floor pauses ended
+  floorRefusedWrites @25 :UInt64;  # writes refused below the free-space floor
 }
 
 # One-time rewrite of table files written under an older options profile.

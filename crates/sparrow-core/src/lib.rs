@@ -106,7 +106,7 @@ pub use storage::source_read::{
 pub use storage::source_time::{
     EventPlacement, EventTime, EventTimeBasis, SourceTimeProfile, TimeRepresentation,
 };
-pub use storage::space::SpaceFloor;
+pub use storage::space::{FloorStatus, SpaceFloor};
 #[cfg(feature = "test-support")]
 pub use storage::store_event_fallback_rdf_for_legacy_fixture;
 pub use storage::syslog::{

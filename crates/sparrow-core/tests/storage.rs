@@ -5585,14 +5585,30 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
         store.pressure_status().unwrap().phase,
         PressurePhase::AwaitingReclamation
     );
-    for _ in 0..3 {
-        let state = store.pressure_maintain(5, limits).unwrap();
-        assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
-        assert_eq!(state.passes, 0);
-        assert_eq!(store.bytes(&second.id, 0, 7, 5).unwrap(), b"second\n");
-    }
+    store.await_native_quiet().unwrap();
+    // The restored wait still protects the evidence while native work could end it. Nothing
+    // is pending and linked bytes have not fallen, so the first pass forces one compaction
+    // instead of waiting for ever (#211) and retires nothing.
+    let state = store.pressure_maintain(5, limits).unwrap();
+    assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!((state.passes, state.forced_compactions), (0, 1));
+    assert_eq!(store.bytes(&second.id, 0, 7, 5).unwrap(), b"second\n");
+    store.await_native_quiet().unwrap();
+    // The compaction ended: this pass measures, still retiring nothing.
+    let state = store.pressure_maintain(6, limits).unwrap();
+    assert_eq!((state.passes, state.waits_released), (0, 0));
+    assert_eq!(store.bytes(&second.id, 0, 7, 6).unwrap(), b"second\n");
+    // Linked bytes stayed above the wait's start, so the wait is released and the next
+    // evidence goes: the earlier retirement is durable and waiting longer protects nothing.
+    let state = store.pressure_maintain(7, limits).unwrap();
+    assert_eq!((state.passes, state.waits_released), (1, 1));
+    assert_eq!(state.last_pass.unwrap().records, second.record_ids);
     assert_eq!(
-        store.bytes(&first.id, 0, 1, 5).unwrap_err().code,
+        store.bytes(&second.id, 0, 7, 7).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        store.bytes(&first.id, 0, 1, 7).unwrap_err().code,
         "EVIDENCE_UNAVAILABLE"
     );
     std::fs::remove_file(ballast).unwrap();
@@ -5629,6 +5645,138 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
         store.status(6).unwrap()["store_format"].as_str(),
         Some("sparrow.store/307")
     );
+}
+
+// Value: #211 found a wait that could last for ever while every write was refused and
+// nothing reported it. Protects: a wait whose linked bytes do not fall (here the directory
+// holds bytes RocksDB does not own and grows during the wait, the stuck cases A and B)
+// reports its age, start and current linked bytes and the refusals it caused; forces one
+// compaction while nothing native is working; and is then released so the next pass
+// retires more, without ever retiring while native work could still end the wait.
+#[test]
+fn a_wait_that_linked_bytes_never_end_is_reported_forced_and_released() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let first = store
+        .ingest("stuck-first", "source", "log", b"first\n", 1)
+        .unwrap();
+    let second = store
+        .ingest("stuck-second", "source", "log", b"second\n", 2)
+        .unwrap();
+    let third = store
+        .ingest("stuck-third", "source", "log", b"third\n", 3)
+        .unwrap();
+    let ballast = dir.path().join("test-owned-pressure-ballast");
+    let file = std::fs::File::create(&ballast).unwrap();
+    file.set_len(13 * 1024 * 1024).unwrap();
+    let refuse = |request: &str| {
+        assert_eq!(
+            store
+                .ingest(request, "source", "log", b"new\n", 4)
+                .unwrap_err()
+                .code,
+            "STORAGE_PRESSURE"
+        );
+    };
+    refuse("stuck-refused-1");
+    assert_eq!(store.pressure_status().unwrap().refused_writes, 1);
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    // The wait begins at the clock of the pass that retired the first record.
+    let began = store.pressure_maintain(10_000, limits).unwrap();
+    assert_eq!(began.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!(began.last_pass.as_ref().unwrap().records, first.record_ids);
+    assert_eq!(
+        (began.episode_since, began.phase_since, began.wait_since),
+        (10_000, 10_000, 10_000)
+    );
+    assert_eq!(began.wait_before_bytes, began.linked_bytes);
+    assert_eq!(began.wait_age_ms(), 0);
+    // Growth that RocksDB cannot reclaim: linked bytes will not fall below the wait's start.
+    file.set_len(14 * 1024 * 1024).unwrap();
+    store.await_native_quiet().unwrap();
+    refuse("stuck-refused-2");
+    let forced = store.pressure_maintain(70_000, limits).unwrap();
+    assert_eq!(forced.forced_compactions, 1);
+    assert_eq!(forced.passes, 1);
+    assert_eq!(forced.wait_age_ms(), 60_000);
+    assert_eq!(forced.episode_age_ms(), 60_000);
+    assert_eq!(forced.wait_before_bytes, began.wait_before_bytes);
+    assert!(forced.linked_bytes > forced.wait_before_bytes);
+    assert_eq!(forced.refused_writes, 2);
+    assert!(forced.waiting_on.as_deref().unwrap().contains("forced"));
+    assert_eq!(store.bytes(&second.id, 0, 7, 70).unwrap(), b"second\n");
+    store.await_native_quiet().unwrap();
+    let measuring = store.pressure_maintain(80_000, limits).unwrap();
+    assert_eq!((measuring.passes, measuring.waits_released), (1, 0));
+    assert_eq!(store.bytes(&second.id, 0, 7, 80).unwrap(), b"second\n");
+    let released = store.pressure_maintain(90_000, limits).unwrap();
+    assert_eq!((released.passes, released.waits_released), (2, 1));
+    assert_eq!(released.last_pass.unwrap().records, second.record_ids);
+    // The release retired the second record only: the third is still evidence, and the
+    // new retirement starts a new wait with its own start.
+    assert_eq!(store.bytes(&third.id, 0, 6, 90).unwrap(), b"third\n");
+    assert_eq!(released.wait_since, 90_000);
+    assert_eq!(released.episode_since, 10_000);
+    assert_eq!(released.stalled_passes, 2);
+    // Ready again clears every wait measure; the counters stay for the session.
+    drop(file);
+    std::fs::remove_file(&ballast).unwrap();
+    let ready = store.pressure_maintain(95_000, limits).unwrap();
+    assert_eq!(ready.phase, PressurePhase::Ready);
+    assert_eq!(
+        (
+            ready.episode_since,
+            ready.wait_since,
+            ready.wait_before_bytes
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!((ready.forced_compactions, ready.refused_writes), (1, 2));
+}
+
+// Value: with the filesystem nearly full, the old worker skipped the whole pressure duty;
+// the new one runs it, but its writes need the maintenance reserve the budget withholds
+// for them. Protects: below that reserve a pass retires nothing, forces nothing, says
+// why, and counts itself, rather than risk a failed write that latches durability.
+#[test]
+fn pressure_without_the_maintenance_reserve_free_retires_nothing_and_says_why() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    // No filesystem has this much free: the reserve can never be met.
+    settings.maintenance_reserve = 1 << 60;
+    settings.disk_budget = (1 << 60) + 2 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let old = store
+        .ingest("reserve-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("test-owned-ballast"),
+        vec![0_u8; 3 * 1024 * 1024],
+    )
+    .unwrap();
+    let limits = EvictionLimits::default();
+    for now in [10, 20] {
+        let state = store.pressure_maintain(now, limits).unwrap();
+        assert_eq!(state.phase, PressurePhase::Requested);
+        assert_eq!((state.passes, state.forced_compactions), (0, 0));
+        assert!(
+            state
+                .waiting_on
+                .as_deref()
+                .unwrap()
+                .contains("free on the filesystem")
+        );
+    }
+    assert_eq!(store.pressure_status().unwrap().stalled_passes, 2);
+    assert_eq!(store.bytes(&old.id, 0, 4, 20).unwrap(), b"old\n");
 }
 
 #[test]
