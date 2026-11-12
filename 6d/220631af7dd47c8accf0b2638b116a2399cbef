@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 732862d53b418c12ea286eef54468395ec444601
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 208
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/208
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: e3889ec15481f25ce7d99cb9a4caf5b624b32baa
+GhpRsq-Head-Ref: paudley/207-retired-consume-claims-never-lock-a
+GhpRsq-Head-OID: 732862d53b418c12ea286eef54468395ec444601
+GhpRsq-Result-Tree: 46a655f04d870ff8e784c3a87341eeafa2a4af87
+GhpRsq-Result-Commit: 6d220631af7dd47c8accf0b2638b116a2399cbef
+GhpRsq-Parent-Hashes: 732862d53b418c12ea286eef54468395ec444601
+GhpRsq-Squash-Notes-SHA256: fb06a0a34f7ce238ee0b69c47c38c86fe1cf89184e369aa6905a3bb61f84e3a8
+GhpRsq-Stage-Evidence: none
