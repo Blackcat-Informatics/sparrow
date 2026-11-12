@@ -3288,9 +3288,12 @@ or semantic engine. The public surface includes:
   logging path is nonblocking and drops new events when full; it never silently
   allocates an unlimited queue or stalls a production thread on network I/O. A
   briefly held queue lock makes admission wait, never drop. A permanent daemon
-  refusal of a batch (non-retryable `INVALID_ARGUMENT` or `RESOURCE_LIMIT`)
-  quarantines that batch: its events are counted, reported by the next flush as
-  dropped, and later events proceed. A busy (retryable) refusal retries the same
+  refusal of a batch (a non-retryable `INVALID_ARGUMENT`, a batch that can never
+  fit) quarantines that batch: its events are counted (`quarantined_events`, with
+  `last_quarantine` naming the refusal), reported by the next flush as dropped,
+  and later events proceed. A busy or capacity refusal such as the full producer
+  registry (`RESOURCE_LIMIT`) is never quarantined: the client holds the batch,
+  bounded by the queue limits, with overflow counted as `Full`. A busy (retryable) refusal retries the same
   batch on the same connection; only a transport failure reconnects.
 - Explicit buffered/durable delivery selection for direct ingestion and
   `flush(durable)`/shutdown that returns the reached receipt watermark or a typed
@@ -3465,7 +3468,7 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 
 | Code | Meaning |
 | --- | --- |
-| `INVALID_ARGUMENT` | Invalid IDs, ranges, scopes, durations, or names. Also a producer instance the producer registry can never record (its stream-count or byte bound), which is not retryable. |
+| `INVALID_ARGUMENT` | Invalid IDs, ranges, scopes, durations, or names.  |
 | `NOT_FOUND` | Unknown or reclaimed evidence/handle. |
 | `EVIDENCE_UNAVAILABLE` | Known expired, evicted, or incomplete complete-file representation. |
 | `PIN_NOT_ACTIVE` | Expired/released collection cannot be renewed or used as an active scope. |

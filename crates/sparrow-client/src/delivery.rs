@@ -254,9 +254,11 @@ pub struct DeliveryStats {
     pub terminal_failure: Option<Arc<Error>>,
     /// Last transient failure, cleared when a batch is acknowledged.
     pub last_transient_failure: Option<Arc<Error>>,
-    /// Admitted events given up because the daemon permanently refused their batch: an
-    /// answer that retrying the same batch can never change (a cannot-fit refusal, as
-    /// opposed to a busy one). They kept their sequence, so the daemon also sees a gap.
+    /// Admitted events given up because the daemon permanently refused their batch with a
+    /// non-retryable `INVALID_ARGUMENT`: an answer retrying the same batch can never change.
+    /// They kept their sequence; the daemon sees a gap only if it later accepts a higher
+    /// sequence of an instance it already recorded, so this counter and the fence are the
+    /// reliable record.
     pub quarantined_events: u64,
     /// The latest permanent refusal that quarantined a batch.
     pub last_quarantine: Option<Arc<Error>>,
@@ -424,8 +426,8 @@ impl Delivery {
             Ok(bytes) => bytes,
             Err(_) => return shared.reject(DropReason::Invalid, None),
         };
-        // Every holder of this lock does a push- or pop-sized update and never performs I/O
-        // under it, so waiting is brief; refusing the event for a held lock would lose it for
+        // Every holder of this lock does bounded in-memory work (the longest assembles one
+        // batch within the batch limits) and never performs I/O under it, so waiting is brief; refusing the event for a held lock would lose it for
         // no reason and without a sequence for the daemon to see as a gap.
         let Ok(mut state) = shared.state.lock() else {
             return shared.reject(DropReason::Failed, None);
@@ -1014,12 +1016,13 @@ async fn run(shared: &Shared) -> Result<(), Error> {
 }
 
 /// Whether the daemon answered that this batch can never be accepted, as opposed to being
-/// busy. The daemon marks a busy refusal retryable; a permanent bound it reports as the
-/// non-retryable `INVALID_ARGUMENT` (the producer registry cannot record a new instance).
-/// Any other non-retryable refusal (a replaced store, a read-only or unauthorized daemon)
+/// busy. The daemon marks a busy or capacity refusal (`RESOURCE_LIMIT`, including a full
+/// producer registry that a window expiry clears) retryable, and that batch is held. Only a
+/// non-retryable `INVALID_ARGUMENT` is a batch that can never fit. Any other non-retryable
+/// refusal (a replaced store, a read-only or unauthorized daemon)
 /// is not about this batch: it stays a terminal failure with the batch retained.
 fn permanent_refusal(error: &Error) -> bool {
-    matches!(error, Error::Domain { code, retryable: false, .. } if code == "INVALID_ARGUMENT" || code == "RESOURCE_LIMIT")
+    matches!(error, Error::Domain { code, retryable: false, .. } if code == "INVALID_ARGUMENT")
 }
 
 /// Whether reconnecting and retrying the same identity may succeed, including
@@ -1308,6 +1311,20 @@ mod tests {
             delivery.shutdown(Duration::from_millis(50)),
             Err(FlushError::TimedOut(_))
         ));
+        // With nothing queued, a fence over only drops still reports them and certifies nothing.
+        let empty =
+            Delivery::start(DeliveryConfig::new(dir.path().join("missing.sock"), "test")).unwrap();
+        let mut oversized = event();
+        oversized.name = String::with_capacity(MAX_EVENT_BYTES * 2);
+        empty.try_send(oversized);
+        match empty.shutdown(Duration::from_secs(2)).unwrap_err() {
+            FlushError::Dropped(value) => {
+                assert_eq!(value.dropped_before_fence, 1);
+                assert_eq!(value.durable_events, 0);
+                assert!(value.last_receipt.is_none());
+            }
+            error => panic!("unexpected barrier error: {error}"),
+        }
     }
 
     #[test]

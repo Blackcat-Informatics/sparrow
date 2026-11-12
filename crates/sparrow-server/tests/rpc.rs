@@ -8559,8 +8559,8 @@ async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
         .await;
 }
 
-/// INVARIANT: a permanent refusal (non-retryable `INVALID_ARGUMENT`, which is how the daemon
-/// reports that a producer instance can never be recorded) quarantines that batch: it is
+/// INVARIANT: a permanent refusal (a non-retryable `INVALID_ARGUMENT`: a batch that can never
+/// fit) quarantines that batch, while a busy or capacity refusal is never quarantined: it is
 /// counted, reported at the fence as a drop, and not retried; the next event is delivered
 /// instead of queueing forever behind it. Before, the refused batch stayed the immutable
 /// pending batch and blocked every later event until the queue filled.

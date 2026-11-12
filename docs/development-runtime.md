@@ -5084,9 +5084,13 @@ application tracing example below.
 
 `sparrow_client::Delivery` owns one producer thread, a Tokio LocalSet and the
 shared typed client. Producers call `try_send(ProducerEvent)` without waiting for
-socket I/O or a queue lock. The worker assigns increasing sequences under queue
-serialization. Full, contended, invalid, closed and failed admission each have
-visible drop counters. A full-queue refusal can leave an explicit sequence gap;
+socket I/O; admission waits only for the queue lock, whose holders do bounded
+in-memory work and never I/O, so a briefly held lock never drops an event. The
+worker assigns increasing sequences under queue serialization. Full, invalid,
+closed, failed and counter-exhausted admission each have visible drop counters.
+A batch the daemon permanently refuses with a non-retryable `INVALID_ARGUMENT`
+is quarantined: counted, reported as dropped at the next flush, and later events
+proceed. A full-queue refusal can leave an explicit sequence gap;
 refusals before sequence assignment remain visible through counters. Event
 admission also charges unused string/vector capacity, preventing a tiny value
 from retaining an oversized allocation. Caller-owned inputs must already be

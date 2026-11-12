@@ -290,11 +290,9 @@ pub(super) fn prepare(
         }
         None => {
             if streams.len() == MAX_PRODUCER_STREAMS {
-                // Not retryable: the same instance is refused until a window expires, so a
-                // client that retried it would stall every later event behind this batch.
                 return Err(Error::new(
-                    "INVALID_ARGUMENT",
-                    "producer stream registry full; this producer instance cannot be recorded until a finite window expires",
+                    "RESOURCE_LIMIT",
+                    "producer stream registry full; wait for a finite window to expire",
                 ));
             }
             streams.push(ProducerStream {
@@ -341,9 +339,8 @@ pub(super) fn prepare(
         streams.iter().map(Catalog::encode).collect::<Vec<_>>(),
     ));
     if encoded.len() > MAX_PRODUCER_REGISTRY_BYTES {
-        // Not retryable for the same reason as the stream-count bound above.
         return Err(Error::new(
-            "INVALID_ARGUMENT",
+            "RESOURCE_LIMIT",
             "producer registry exceeds persistent byte bound",
         ));
     }
