@@ -159,7 +159,8 @@ pub struct TailGeneration {
     pub complete: bool,
     /// Observer-declared discontinuity; its missing bytes are not reconstructed.
     pub gap: Option<String>,
-    /// Terminal metadata expiry; active generations remain subject to the fixed registry quota.
+    /// Terminal metadata expiry. An active generation has none; a full registry retires a
+    /// complete row for room or holds the new generation in memory (#224).
     pub expires_at: Option<u64>,
     /// Original durable completion intent and terminal publication clock, when declared.
     pub finish: Option<TailFinish>,
@@ -548,7 +549,7 @@ pub(super) fn prepare(
 
 impl Writer {
     /// Stored rows, then the rows held only in memory, and how many are stored.
-    fn tail_rows(&self) -> Result<(Vec<TailGeneration>, usize), Error> {
+    pub(super) fn tail_rows(&self) -> Result<(Vec<TailGeneration>, usize), Error> {
         let mut rows = registry(self)?;
         let stored = rows.len();
         rows.extend(self.unrecorded.borrow().iter().cloned());
@@ -581,10 +582,10 @@ impl Writer {
         self.commit(batch)
     }
 
-    /// The row to retire for room, oldest terminal time first. Never an active row, a row with
-    /// a pending finish, a discontinued row that carries a finish (it blocks re-import of a
-    /// changed finished file), or a complete row a handoff may still read: one finished less
-    /// than `RETRY_WINDOW` ago or bound by an active consumption journal.
+    /// The complete row to retire for room, oldest terminal time first: finished at least
+    /// `RETRY_WINDOW` ago and bound by no active consumption journal. Never an active row, a row
+    /// with a pending finish, or a discontinued row, which is the only durable record of a
+    /// truncation, identity change or read gap.
     fn retirable(&self, rows: &[TailGeneration], now: u64) -> Result<Option<usize>, Error> {
         let bound: BTreeSet<String> = self
             .pending_journals()?
@@ -596,11 +597,9 @@ impl Writer {
             .enumerate()
             .filter_map(|(index, row)| {
                 let terminal = row.expires_at?.saturating_sub(30 * DAY);
-                let free = if row.complete {
-                    terminal.saturating_add(RETRY_WINDOW) <= now && !bound.contains(&row.id)
-                } else {
-                    row.gap.is_some() && row.finish.is_none()
-                };
+                let free = row.complete
+                    && terminal.saturating_add(RETRY_WINDOW) <= now
+                    && !bound.contains(&row.id);
                 free.then_some((terminal, index))
             })
             .min()
@@ -710,8 +709,8 @@ impl Store {
                     .min()
                     .map(|(_, index)| index);
                 if let Some(index) = oldest {
-                    held.remove(index);
-                    self.unlocked.tail_evidence.retired(true);
+                    let gone = held.remove(index);
+                    self.unlocked.tail_evidence.retired(gone.complete);
                 }
             }
         }

@@ -23021,7 +23021,7 @@ fn full_registry_declaration(index: u64) -> sparrow_core::TailStart {
         path: format!("f{index}.log").into_bytes(),
         source: "full".into(),
         format: "log".into(),
-        device: 7,
+        device: 1,
         inode: index + 1,
     }
 }
@@ -23110,20 +23110,18 @@ fn a_full_registry_of_live_generations_still_takes_the_file_and_names_it() {
     assert_eq!(again.offset, 0, "the file is read again from its start");
 }
 
-/// INVARIANT (#224): the registry makes room by retiring the oldest finished row whose file no
+/// INVARIANT (#224): the registry makes room by retiring the oldest complete row whose file no
 /// handoff can still need, counted, and never an active row or a complete row inside the settle
-/// window. When nothing is retirable the file is still taken, unrecorded. Before #224 every case
-/// answered RESOURCE_LIMIT.
+/// window. A retired complete row no longer serves file bytes. When nothing is retirable the file
+/// is still taken, unrecorded. Before #224 every case answered RESOURCE_LIMIT.
 #[test]
-fn a_full_registry_retires_the_oldest_finished_row_and_never_a_live_one() {
+fn a_full_registry_retires_the_oldest_complete_row_and_never_a_live_one() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let ids = fill_tail_registry(&store);
     let settled = 3 * DAY;
-    // Oldest terminal row: complete at 5, settled by `settled`.
     store.tail_append(&ids[0], 0, b"", true, 5).unwrap();
-    // A discontinued row without a finish: terminal at 10, never read for exactly-once.
-    store.tail_discontinue(&ids[1], 0, "truncated", 10).unwrap();
+    store.tail_append(&ids[1], 0, b"", true, 10).unwrap();
     // Complete only just before the declaration: inside the settle window, so it stays.
     store
         .tail_append(&ids[2], 0, b"", true, settled - 1)
@@ -23135,6 +23133,11 @@ fn a_full_registry_retires_the_oldest_finished_row_and_never_a_live_one() {
     assert_eq!(
         store.tail_generation(&ids[0]).unwrap_err().code,
         "NOT_FOUND"
+    );
+    assert_eq!(
+        store.bytes(&ids[0], 0, 0, settled).unwrap_err().code,
+        "NOT_FOUND",
+        "a retired complete row no longer serves file bytes"
     );
     let evidence = store.tail_registry_evidence();
     assert_eq!(
@@ -23153,7 +23156,7 @@ fn a_full_registry_retires_the_oldest_finished_row_and_never_a_live_one() {
     let evidence = store.tail_registry_evidence();
     assert_eq!(
         (evidence.retired_terminal, evidence.retired_duplicate_risk),
-        (2, 1)
+        (2, 2)
     );
 
     // Nothing retirable is left: the settling row and every active row stay.
@@ -23184,4 +23187,132 @@ fn a_full_registry_retires_the_oldest_finished_row_and_never_a_live_one() {
         !stored.contains(&third.id),
         "the unrecorded row is not stored"
     );
+}
+
+/// INVARIANT (#224): a row that is not a settled, unbound complete row is never retired for
+/// room, because dropping it loses evidence or the checkpoint a handoff still reads: a
+/// discontinued row (with or without a finish) is the only durable record of the discontinuity,
+/// a row with a pending finish is still live, and a complete row bound by an active consumption
+/// journal is read by its handoff. The new file is taken unrecorded instead.
+#[test]
+fn a_full_registry_keeps_discontinued_finish_pending_and_journal_bound_rows() {
+    use sparrow_core::{ConsumptionGeneration, ConsumptionHandoff, TailFinishIntent};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.watch_registry_replace(None, b"registered").unwrap();
+    let ids = fill_tail_registry(&store);
+    let observed = |index: u64, byte_length: u64| ConsumptionGeneration {
+        device: 1,
+        inode: index + 1,
+        byte_length,
+        modified: (3, 4),
+        changed: (5, 6),
+    };
+    let finish = |index: u64, byte_length: u64| TailFinishIntent {
+        request_id: format!("keep-finish-{index}"),
+        generation_id: ids[index as usize].clone(),
+        watch_revision: 1,
+        observed: observed(index, byte_length),
+    };
+    // 0: complete and bound by an active handoff journal.
+    store.tail_finish_start(&finish(0, 0), 2).unwrap();
+    store.tail_append(&ids[0], 0, b"", true, 5).unwrap();
+    store
+        .consumption_handoff_reserve(
+            &ConsumptionHandoff {
+                request_id: "keep-handoff".into(),
+                watch: "tail".into(),
+                watch_revision: 1,
+                relative_path: b"f0.log".to_vec(),
+                observed: observed(0, 0),
+                tail_generation_id: Some(ids[0].clone()),
+            },
+            "full",
+            "log",
+            CONSUMPTION_DIRECTORIES,
+            6,
+        )
+        .unwrap();
+    // 1: finish admitted, not complete.
+    store.tail_finish_start(&finish(1, 5), 2).unwrap();
+    // 2: discontinued after a finish was admitted.
+    store.tail_finish_start(&finish(2, 5), 2).unwrap();
+    store
+        .tail_discontinue(&ids[2], 0, "identity_changed", 7)
+        .unwrap();
+    // 3: discontinued without a finish.
+    store.tail_discontinue(&ids[3], 0, "truncated", 8).unwrap();
+
+    let settled = 20 * DAY;
+    // Rows 0 to 3 are all old enough; only the guards keep them.
+    store
+        .tail_start(&full_registry_declaration(100), 3 * DAY)
+        .unwrap();
+    store
+        .tail_start(&full_registry_declaration(101), settled - 1)
+        .unwrap();
+    assert_eq!(store.tail_registry_evidence().retired_terminal, 0);
+    for id in &ids[..4] {
+        store.tail_generation(id).unwrap();
+    }
+    assert_eq!(
+        store.tail_generation(&ids[2]).unwrap().gap.as_deref(),
+        Some("identity_changed")
+    );
+    assert_eq!(
+        store.tail_generation(&ids[3]).unwrap().gap.as_deref(),
+        Some("truncated")
+    );
+    assert_eq!(store.tail_registry_evidence().total_generations, 2);
+}
+
+/// INVARIANT (#224): a generation held only in memory is read like a stored one, including the
+/// whole-file byte read of a completed generation, which reads the same rows as
+/// `tail_generation`. Before the fix the byte read answered NOT_FOUND for it.
+#[test]
+fn a_completed_in_memory_generation_serves_its_file_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    fill_tail_registry(&store);
+    let taken = store.tail_start(&full_registry_declaration(64), 2).unwrap();
+    store
+        .tail_append(&taken.id, 0, b"one\ntwo\n", true, 3)
+        .unwrap();
+    assert!(store.tail_generation(&taken.id).unwrap().complete);
+    assert_eq!(store.bytes(&taken.id, 0, 8, 4).unwrap(), b"one\ntwo\n");
+}
+
+/// INVARIANT (#224): terminal generations held in memory are bounded. Above 64 the oldest is
+/// evicted and counted, so a long-running daemon that keeps finishing unrecorded files does not
+/// grow without bound.
+#[test]
+fn terminal_in_memory_generations_are_evicted_oldest_first_above_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    fill_tail_registry(&store);
+    let ids: Vec<String> = (0..=sparrow_core::MAX_TAIL_GENERATIONS as u64)
+        .map(|index| {
+            let row = store
+                .tail_start(&full_registry_declaration(100 + index), 10 + index)
+                .unwrap();
+            store
+                .tail_append(&row.id, 0, b"", true, 10 + index)
+                .unwrap();
+            row.id
+        })
+        .collect();
+    assert_eq!(store.tail_registry_evidence().retired_terminal, 0);
+    store
+        .tail_start(&full_registry_declaration(500), 1000)
+        .unwrap();
+    let evidence = store.tail_registry_evidence();
+    assert_eq!(
+        (evidence.retired_terminal, evidence.retired_duplicate_risk),
+        (1, 1)
+    );
+    assert_eq!(
+        store.tail_generation(&ids[0]).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    store.tail_generation(&ids[1]).unwrap();
 }
