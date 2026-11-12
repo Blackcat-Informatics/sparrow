@@ -132,8 +132,6 @@ impl DeliveryConfig {
 pub enum DropReason {
     /// Queued and in-flight work exhausted count or byte capacity.
     Full,
-    /// A short queue critical section was already occupied.
-    Contended,
     /// Event shape, relationships, or owned allocations exceeded admission.
     Invalid,
     /// Shutdown or last-owner cancellation closed admission.
@@ -144,7 +142,8 @@ pub enum DropReason {
     CounterExhausted,
 }
 
-/// Admission never waits for a lock or network operation.
+/// Admission never waits for network I/O; it waits only for the queue's push-sized critical
+/// section, so a briefly held lock never discards an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     /// The event is retained under the queue quota, with this assigned sequence.
@@ -172,7 +171,7 @@ pub struct DeliveryWatermark {
     pub durable_sequence: u64,
     /// Count of independently acknowledged events in this instance.
     pub durable_events: u64,
-    /// Dropped offers counted before this fence; these were never certified.
+    /// Dropped offers and quarantined events counted by this fence; these were never certified.
     pub dropped_before_fence: u64,
     /// Last durable batch receipt, absent before any accepted batch.
     pub last_receipt: Option<ArtifactReceipt>,
@@ -230,7 +229,7 @@ pub struct DeliveryStats {
     /// Events acknowledged durably by the daemon.
     pub durable_events: u64,
     /// Refusals indexed by `DropReason`'s discriminant.
-    pub dropped_by_reason: [u64; 6],
+    pub dropped_by_reason: [u64; 5],
     /// Queued plus in-flight observations.
     pub pending_events: usize,
     /// Conservative queued plus in-flight byte charge.
@@ -255,6 +254,14 @@ pub struct DeliveryStats {
     pub terminal_failure: Option<Arc<Error>>,
     /// Last transient failure, cleared when a batch is acknowledged.
     pub last_transient_failure: Option<Arc<Error>>,
+    /// Admitted events given up because the daemon permanently refused their batch with a
+    /// non-retryable `INVALID_ARGUMENT`: an answer retrying the same batch can never change.
+    /// They kept their sequence; the daemon sees a gap only if it later accepts a higher
+    /// sequence of an instance it already recorded, so this counter and the fence are the
+    /// reliable record.
+    pub quarantined_events: u64,
+    /// The latest permanent refusal that quarantined a batch.
+    pub last_quarantine: Option<Arc<Error>>,
 }
 
 struct Queued {
@@ -285,6 +292,10 @@ struct State {
     receipt: Option<ArtifactReceipt>,
     failure: Option<Arc<Error>>,
     transient: Option<Arc<Error>>,
+    quarantined: u64,
+    /// Highest sequence settled by quarantine; a barrier is satisfied by durable or settled.
+    quarantined_sequence: u64,
+    quarantine: Option<Arc<Error>>,
 }
 struct Shared {
     config: DeliveryConfig,
@@ -304,7 +315,7 @@ struct Shared {
     owners: AtomicUsize,
     offered: AtomicU64,
     spans: AtomicU64,
-    drops: [AtomicU64; 6],
+    drops: [AtomicU64; 5],
     exhausted: AtomicBool,
     aborted: AtomicBool,
     stopped: AtomicBool,
@@ -367,6 +378,9 @@ impl Delivery {
                 receipt: None,
                 failure: None,
                 transient: None,
+                quarantined: 0,
+                quarantined_sequence: 0,
+                quarantine: None,
             }),
             control: Mutex::new(()),
             changed: Condvar::new(),
@@ -402,7 +416,7 @@ impl Delivery {
         Ok(Self { shared })
     }
 
-    /// Offer a bounded event, assigning its sequence without waiting for a lock or I/O.
+    /// Offer a bounded event, assigning its sequence without waiting for I/O.
     pub fn try_send(&self, mut event: ProducerEvent) -> Admission {
         let shared = &self.shared;
         if !shared.bump(&shared.offered) {
@@ -412,10 +426,11 @@ impl Delivery {
             Ok(bytes) => bytes,
             Err(_) => return shared.reject(DropReason::Invalid, None),
         };
-        let mut state = match shared.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => return shared.reject(DropReason::Contended, None),
-            Err(TryLockError::Poisoned(_)) => return shared.reject(DropReason::Failed, None),
+        // Every holder of this lock does bounded in-memory work (the longest assembles one
+        // batch within the batch limits) and never performs I/O under it, so waiting is brief; refusing the event for a held lock would lose it for
+        // no reason and without a sequence for the daemon to see as a gap.
+        let Ok(mut state) = shared.state.lock() else {
+            return shared.reject(DropReason::Failed, None);
         };
         if state.failure.is_some() || shared.exhausted.load(Ordering::SeqCst) {
             return shared.reject(DropReason::Failed, None);
@@ -544,7 +559,7 @@ impl Delivery {
             if let Some(error) = &state.failure {
                 return Err(FlushError::Delivery(error.clone()));
             }
-            if state.durable_sequence >= target
+            if state.durable_sequence.max(state.quarantined_sequence) >= target
                 && (!closing || self.shared.stopped.load(Ordering::SeqCst))
             {
                 let watermark = DeliveryWatermark {
@@ -552,10 +567,10 @@ impl Delivery {
                     required_sequence: target,
                     durable_sequence: state.durable_sequence,
                     durable_events: state.durable,
-                    dropped_before_fence: dropped,
+                    dropped_before_fence: dropped.saturating_add(state.quarantined),
                     last_receipt: state.receipt.clone(),
                 };
-                return if dropped == 0 {
+                return if watermark.dropped_before_fence == 0 {
                     Ok(watermark)
                 } else {
                     Err(FlushError::Dropped(Box::new(watermark)))
@@ -650,6 +665,8 @@ impl Shared {
             closing: state.closing,
             terminal_failure: state.failure.clone(),
             last_transient_failure: state.transient.clone(),
+            quarantined_events: state.quarantined,
+            last_quarantine: state.quarantine.clone(),
         }
     }
     fn fail(&self, error: Error) {
@@ -803,6 +820,53 @@ impl Shared {
         self.changed.notify_all();
         Ok(())
     }
+    /// Give up the immutable pending batch after a permanent refusal: its events stay counted
+    /// and visible, their quota is released, and later events proceed instead of queueing
+    /// behind a batch that can never be accepted.
+    fn quarantine(&self, batch: &EventBatch, error: Error) -> Result<(), Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
+        let pending = state
+            .pending
+            .as_ref()
+            .ok_or(Error::Protocol("producer quarantine has no pending batch"))?;
+        if pending.batch.as_ref() != batch {
+            return Err(Error::Protocol(
+                "producer quarantine changed pending identity",
+            ));
+        }
+        let bytes = pending.bytes;
+        let count = batch.events.len();
+        let bytes_left = state
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(Error::Protocol("producer byte ownership underflow"))?;
+        let count_left = state
+            .count
+            .checked_sub(count)
+            .ok_or(Error::Protocol("producer event ownership underflow"))?;
+        let quarantined = state
+            .quarantined
+            .checked_add(count as u64)
+            .ok_or(Error::Protocol("producer quarantine count exhausted"))?;
+        let settled = batch
+            .events
+            .last()
+            .ok_or(Error::Protocol("producer quarantined an empty batch"))?
+            .sequence;
+        state.bytes = bytes_left;
+        state.count = count_left;
+        state.quarantined = quarantined;
+        state.quarantined_sequence = settled;
+        state.quarantine = Some(Arc::new(error));
+        state.transient = None;
+        state.pending = None;
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
     fn retry(&self, error: Error) -> Result<(), Error> {
         let mut state = self
             .state
@@ -918,7 +982,18 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         backoff.reset();
                     }
                     Err(error) => {
-                        connection = None;
+                        // A daemon answer, even a refusal, proves the connection works; only
+                        // a transport, I/O or protocol failure means it may be broken. A
+                        // needless reconnect on every busy retry also feeds the daemon's
+                        // connection ceiling.
+                        if !matches!(error, Error::Domain { .. }) {
+                            connection = None;
+                        }
+                        if permanent_refusal(&error) {
+                            shared.quarantine(&batch, error)?;
+                            backoff.reset();
+                            continue;
+                        }
                         if !retryable(&error) {
                             return Err(error);
                         }
@@ -938,6 +1013,16 @@ async fn run(shared: &Shared) -> Result<(), Error> {
             }
         }
     }
+}
+
+/// Whether the daemon answered that this batch can never be accepted, as opposed to being
+/// busy. The daemon marks a busy or capacity refusal (`RESOURCE_LIMIT`, including a full
+/// producer registry that a window expiry clears) retryable, and that batch is held. Only a
+/// non-retryable `INVALID_ARGUMENT` is a batch that can never fit. Any other non-retryable
+/// refusal (a replaced store, a read-only or unauthorized daemon)
+/// is not about this batch: it stays a terminal failure with the batch retained.
+fn permanent_refusal(error: &Error) -> bool {
+    matches!(error, Error::Domain { code, retryable: false, .. } if code == "INVALID_ARGUMENT")
 }
 
 /// Whether reconnecting and retrying the same identity may succeed, including
@@ -1088,16 +1173,10 @@ mod tests {
         config.retry_max_interval = Duration::from_secs(30);
         let delivery = Delivery::start(config).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while matches!(
+        assert!(matches!(
             delivery.try_send(event()),
-            Admission::Dropped {
-                reason: DropReason::Contended,
-                ..
-            }
-        ) {
-            assert!(Instant::now() < deadline, "admission remained contended");
-            std::thread::yield_now();
-        }
+            Admission::Queued { .. }
+        ));
         while delivery.stats().unwrap().retries < 1 {
             assert!(Instant::now() < deadline, "no retry began");
             std::thread::sleep(Duration::from_millis(1));
@@ -1165,16 +1244,10 @@ mod tests {
         );
         let delivery = Delivery::start(config).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while matches!(
+        assert!(matches!(
             delivery.try_send(event()),
-            Admission::Dropped {
-                reason: DropReason::Contended,
-                ..
-            }
-        ) {
-            assert!(Instant::now() < deadline, "admission remained contended");
-            std::thread::yield_now();
-        }
+            Admission::Queued { .. }
+        ));
         let first = loop {
             if let Some(batch) = delivery.pending_batch().unwrap() {
                 break batch.request_id.clone();
@@ -1193,20 +1266,34 @@ mod tests {
         ));
     }
 
+    /// INVARIANT: an admission offered while another thread briefly holds the queue lock waits
+    /// for it and queues the event; it is never dropped for the lock. The old behavior
+    /// discarded such an event as "contended" before it had a sequence, so the loss was
+    /// invisible to the daemon. An oversized event is still a counted `Invalid` drop, which
+    /// the fence reports.
     #[test]
-    fn contended_and_oversized_allocations_are_drops_and_empty_shutdown_reports_gaps() {
+    fn admission_waits_for_a_held_lock_and_oversized_allocations_are_counted_drops() {
         let dir = tempfile::tempdir().unwrap();
         let delivery =
             Delivery::start(DeliveryConfig::new(dir.path().join("missing.sock"), "test")).unwrap();
         let guard = delivery.shared.state.lock().unwrap();
-        assert_eq!(
-            delivery.try_send(event()),
-            Admission::Dropped {
-                reason: DropReason::Contended,
-                sequence: None
-            }
-        );
+        let (about_to_send, started) = std::sync::mpsc::channel();
+        let sender = {
+            let delivery = delivery.clone();
+            std::thread::spawn(move || {
+                about_to_send.send(()).unwrap();
+                delivery.try_send(event())
+            })
+        };
+        started.recv().unwrap();
+        // Long enough that the pre-fix code, which returned at once, would have dropped it.
+        std::thread::sleep(Duration::from_millis(100));
         drop(guard);
+        assert_eq!(
+            sender.join().unwrap(),
+            Admission::Queued { sequence: 1 },
+            "a briefly held lock must not discard an event"
+        );
         let mut oversized = event();
         oversized.name = String::with_capacity(MAX_EVENT_BYTES * 2);
         assert_eq!(
@@ -1216,15 +1303,28 @@ mod tests {
                 sequence: None
             }
         );
-        match delivery.shutdown(Duration::from_secs(2)).unwrap_err() {
+        assert_eq!(
+            delivery.stats().unwrap().dropped_by_reason[DropReason::Invalid as usize],
+            1
+        );
+        assert!(matches!(
+            delivery.shutdown(Duration::from_millis(50)),
+            Err(FlushError::TimedOut(_))
+        ));
+        // With nothing queued, a fence over only drops still reports them and certifies nothing.
+        let empty =
+            Delivery::start(DeliveryConfig::new(dir.path().join("missing.sock"), "test")).unwrap();
+        let mut oversized = event();
+        oversized.name = String::with_capacity(MAX_EVENT_BYTES * 2);
+        empty.try_send(oversized);
+        match empty.shutdown(Duration::from_secs(2)).unwrap_err() {
             FlushError::Dropped(value) => {
-                assert_eq!(value.dropped_before_fence, 2);
+                assert_eq!(value.dropped_before_fence, 1);
                 assert_eq!(value.durable_events, 0);
                 assert!(value.last_receipt.is_none());
             }
             error => panic!("unexpected barrier error: {error}"),
         }
-        assert!(!delivery.stats().unwrap().running);
     }
 
     #[test]
@@ -1242,19 +1342,10 @@ mod tests {
             config.rpc_timeout = Duration::from_secs(60);
             let delivery = Delivery::start(config).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
-            while matches!(
+            assert!(matches!(
                 delivery.try_send(event()),
-                Admission::Dropped {
-                    reason: DropReason::Contended,
-                    ..
-                }
-            ) {
-                assert!(
-                    Instant::now() < deadline,
-                    "owned worker admission remained contended"
-                );
-                std::thread::yield_now();
-            }
+                Admission::Queued { .. }
+            ));
             while delivery.pending_batch().unwrap().is_none() {
                 assert!(
                     Instant::now() < deadline,
@@ -1288,40 +1379,22 @@ mod tests {
         let mut large = event();
         large.name = "x".repeat(6000);
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match delivery.try_send(large.clone()) {
-                Admission::Queued { .. } => break,
-                Admission::Dropped {
-                    reason: DropReason::Contended,
-                    ..
-                } => {
-                    assert!(Instant::now() < deadline);
-                    std::thread::yield_now();
-                }
-                admission => panic!("unexpected admission: {admission:?}"),
-            }
-        }
+        assert!(matches!(
+            delivery.try_send(large.clone()),
+            Admission::Queued { .. }
+        ));
         while delivery.pending_batch().unwrap().is_none() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(delivery.stats().unwrap().pending_events, 1);
-        loop {
-            match delivery.try_send(large.clone()) {
-                Admission::Dropped {
-                    reason: DropReason::Full,
-                    ..
-                } => break,
-                Admission::Dropped {
-                    reason: DropReason::Contended,
-                    ..
-                } => {
-                    assert!(Instant::now() < deadline);
-                    std::thread::yield_now();
-                }
-                admission => panic!("byte quota did not refuse input: {admission:?}"),
+        assert!(matches!(
+            delivery.try_send(large.clone()),
+            Admission::Dropped {
+                reason: DropReason::Full,
+                ..
             }
-        }
+        ));
         let stats = delivery.stats().unwrap();
         assert_eq!(stats.in_flight_events, 1);
         assert_eq!(stats.pending_events, 1);
