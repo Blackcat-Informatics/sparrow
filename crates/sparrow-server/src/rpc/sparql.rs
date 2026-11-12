@@ -200,8 +200,8 @@ pub(super) fn deliver(
     }
 }
 
-fn dimension(value: ResourceDimension) -> wire::GovernorDimension {
-    match value {
+fn dimension(value: ResourceDimension) -> Result<wire::GovernorDimension, Error> {
+    Ok(match value {
         ResourceDimension::Fuel => wire::GovernorDimension::Fuel,
         ResourceDimension::AnswerRows => wire::GovernorDimension::AnswerRows,
         ResourceDimension::IntermediateCells => wire::GovernorDimension::IntermediateCells,
@@ -210,7 +210,15 @@ fn dimension(value: ResourceDimension) -> wire::GovernorDimension {
         ResourceDimension::UdfDepth => wire::GovernorDimension::UdfDepth,
         ResourceDimension::Pages => wire::GovernorDimension::Pages,
         ResourceDimension::Bytes => wire::GovernorDimension::Bytes,
-    }
+        // The native enum is non-exhaustive: a dimension this schema cannot name is a refusal,
+        // never a silently mislabelled receipt.
+        _ => {
+            return Err(Error::new(
+                "UNSUPPORTED",
+                "native governor dimension lacks a wire variant",
+            ));
+        }
+    })
 }
 
 fn governors(
@@ -222,9 +230,9 @@ fn governors(
     let mut resources = out
         .reborrow()
         .init_resources(ResourceDimension::COUNT as u32);
-    for (index, d) in ResourceDimension::ALL.into_iter().enumerate() {
+    for (index, d) in ResourceDimension::ALL.iter().copied().enumerate() {
         let mut use_ = resources.reborrow().get(index as u32);
-        use_.set_dimension(dimension(d));
+        use_.set_dimension(dimension(d)?);
         use_.set_consumed(value.consumed.get(d));
         use_.set_ceiling(value.limits.get(d));
     }
@@ -237,7 +245,7 @@ fn governors(
             consumed,
         }) => {
             let mut trip = stop.init_budget();
-            trip.set_dimension(dimension(d));
+            trip.set_dimension(dimension(d)?);
             trip.set_limit(limit);
             trip.set_consumed(consumed);
         }
@@ -247,7 +255,7 @@ fn governors(
             estimate,
         }) => {
             let mut trip = stop.init_refused();
-            trip.set_dimension(dimension(d));
+            trip.set_dimension(dimension(d)?);
             trip.set_limit(limit);
             trip.set_estimate(estimate);
         }

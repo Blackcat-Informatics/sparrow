@@ -159,5 +159,5 @@ pub(crate) fn markdown_graph(
         text.push_str(&claim.turtle);
     }
     purrdf::dataset_from_bytes(text.as_bytes(), purrdf::NativeRdfFormat::Turtle)
-        .map_err(|e| Error::new("PROJECTION_FAILURE", e))
+        .map_err(|e| Error::new("PROJECTION_FAILURE", format!("parse error: {e}")))
 }

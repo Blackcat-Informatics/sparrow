@@ -11,9 +11,14 @@ pub use sparrow_core::DEFAULT_FLUSH_INTERVAL_MS as STORAGE_FLUSH_INTERVAL_MS;
 /// Native analyzer resolver used by the shared storage fixture macro.
 pub use sparrow_core::resolve_text_analyzer;
 
-/// Baseline native analyzer artifacts for workspace storage fixtures, read from the
-/// sibling PurRDF checkout of the canonical repository root. A linked worktree under
-/// `<root>/.worktrees/` resolves to the same sibling as the main checkout.
+/// Baseline native analyzer artifacts for workspace storage fixtures. The registry crates
+/// exclude the lexicons, so `tools/purrdf-lexicons.sh` archives them from the PurRDF repository
+/// at the revision that published the locked release (refusing when the registry, `Cargo.lock`
+/// and the crate's `.cargo_vcs_info.json` disagree) into `bin/lexicons-<revision>` of the
+/// canonical checkout root, and prints that directory. A linked worktree under
+/// `<root>/.worktrees/` uses the canonical root's `bin/` here; `make install-bin` instead places
+/// the same bundle in the invoking checkout's own `bin/`, beside the images. They are never read
+/// from a PurRDF working tree.
 pub fn text_lexicon_dir() -> &'static std::path::Path {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
@@ -30,7 +35,20 @@ pub fn text_lexicon_dir() -> &'static std::path::Path {
             }
             _ => checkout.to_path_buf(),
         };
-        root.join("../purrdf/crates/text/lexicons/artifacts")
+        let output = std::process::Command::new(checkout.join("tools/purrdf-lexicons.sh"))
+            .arg(&root)
+            .arg(root.join("bin"))
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .expect("INVARIANT: tools/purrdf-lexicons.sh runs");
+        assert!(
+            output.status.success(),
+            "tools/purrdf-lexicons.sh refused or failed for {}",
+            root.display()
+        );
+        let dest = String::from_utf8(output.stdout)
+            .expect("INVARIANT: the lexicon directory path is UTF-8");
+        std::path::Path::new(dest.trim_end()).join("artifacts")
     })
 }
 

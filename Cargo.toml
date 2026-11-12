@@ -15,11 +15,11 @@ license = "MIT OR Apache-2.0 OR MulanPSL-2.0"
 [workspace.dependencies]
 blake3 = "1"
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
-purrdf = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "c6d670c762842541075bb28c424265ce074d4699" }
-purrdf-hash = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "c6d670c762842541075bb28c424265ce074d4699" }
-purrdf-lex = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "c6d670c762842541075bb28c424265ce074d4699" }
-purrdf-ed25519 = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "c6d670c762842541075bb28c424265ce074d4699" }
-purrdf-core = { git = "https://github.com/Blackcat-Informatics/purrdf", rev = "c6d670c762842541075bb28c424265ce074d4699" }
+purrdf = "=4"
+purrdf-hash = "=4"
+purrdf-lex = "=4"
+purrdf-ed25519 = "=4"
+purrdf-core = "=4"
 getrandom = "0.3"
 rustix = { version = "1.1.5", features = ["fs"] }
 tracing = "0.1.44"

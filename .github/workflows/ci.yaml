@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 120
     steps:
       # The gate expects PurRDF beside the Sparrow checkout at ../purrdf: the
-      # tests read its text lexicons and the census archives its source.
+      # tests archive its text lexicons and the census archives its source.
       - name: Checkout Sparrow
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

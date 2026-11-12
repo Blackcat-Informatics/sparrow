@@ -42,25 +42,12 @@ keep target/release/sparrowd "bin/sparrowd-schema$schema-$rev"
 keep target/release/sparrow "bin/sparrow-schema$schema-$rev"
 keep target/release/examples/recovery "bin/sparrow-recovery-schema$schema-$rev"
 
-# The lexicons come from the PurRDF revision Cargo.lock resolves, as cargo checked it out.
-purrdf=$(cargo metadata --format-version 1 --locked | python3 -I -c '
-import json, sys
-from pathlib import Path
-packages = json.load(sys.stdin)["packages"]
-lex = next(p for p in packages if p["name"] == "purrdf-lex")
-print(Path(lex["manifest_path"]).parents[2], lex["source"].rsplit("#", 1)[-1])')
-read -r checkout purrdf_rev <<<"$purrdf"
-lexicons=$checkout/crates/text/lexicons
-[[ -d $lexicons/artifacts ]] || { echo "install-bin: no lexicons at $lexicons" >&2; exit 1; }
-target=bin/lexicons-$purrdf_rev
-if [[ -d $target ]]; then
-    diff -r -q -- "$lexicons" "$target" >/dev/null || { echo "install-bin: $target differs from $lexicons" >&2; exit 1; }
-    echo "install-bin: kept $target"
-else
-    staged=$(mktemp -d bin/.lexicons.XXXXXX)
-    cp -a --reflink=auto -- "$lexicons/." "$staged/"
-    diff -r -q -- "$lexicons" "$staged" >/dev/null || { echo "install-bin: copy of $lexicons differs" >&2; exit 1; }
-    chmod 0755 -- "$staged"
-    mv -T -n -- "$staged" "$target"
-    echo "install-bin: $target"
-fi
+# The registry crates exclude the lexicons, so tools/purrdf-lexicons.sh archives them from the PurRDF
+# repository at the revision that published the locked release (refusing when the registry, the lock
+# and the crate's .cargo_vcs_info.json disagree) into this checkout's own ./bin, beside the images
+# that deploy/install.sh and deploy/test-instance.sh read. The PurRDF repository itself is found
+# under the canonical checkout root, which a linked worktree under .worktrees/ shares with the main
+# one. They are never read from a working tree.
+canonical=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
+lexicons=$(tools/purrdf-lexicons.sh "$canonical" "$PWD/bin")
+echo "install-bin: $lexicons"
