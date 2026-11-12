@@ -4,15 +4,24 @@
 //! One joined, serial maintenance owner; RPC retains its own request budget.
 
 use sparrow_core::{
-    Error, EvictionLimits, Migration, MigrationPage, RECOMPRESSION_SETTLE_SECONDS, Store,
+    EXPIRY_CEILING_MS, Error, EvictionLimits, ExpiryReport, Migration, MigrationPage,
+    RECOMPRESSION_SETTLE_SECONDS, Store,
 };
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
-/// Pause after each complete expiry traversal. Expiry affects reads immediately,
-/// so this only delays physical retirement. One traversal parses the whole
-/// catalog under the writer lock; restarting it every second starved ingest.
-const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Shortest and longest sleep before the next expiry pass. Expiry affects reads immediately,
+/// so the sleep only delays physical retirement. A pass reads only the due prefix of the
+/// time index, so the worker sleeps until the next deadline the pass reported; the ceiling
+/// protects against a wall clock that stepped forward, since the sleep itself is monotonic,
+/// and paces the request-row scan.
+const EXPIRY_FLOOR: Duration = Duration::from_secs(1);
+const EXPIRY_CEILING: Duration = Duration::from_millis(EXPIRY_CEILING_MS);
+/// Retry interval of an expiry pass that failed or was skipped below the free-space floor.
+const EXPIRY_RETRY: Duration = Duration::from_secs(60);
+/// Interval of the read-lease purge: expired read handles hold snapshots until it runs.
+const LEASE_INTERVAL: Duration = Duration::from_secs(60);
 /// Pause between table rewrite steps. A step only observes progress and turns
 /// native periodic compaction on or off, so it never holds the loop for long.
 const RECOMPRESSION_INTERVAL: Duration = Duration::from_secs(5);
@@ -42,7 +51,9 @@ impl Worker {
             stop,
             task: Some(tokio::spawn(async move {
                 let _alive = alive;
-                run(store, stopped, flush).await
+                let result = run(&store, stopped, flush).await;
+                store.set_retention_waker(None);
+                result
             })),
             ended,
         }
@@ -77,6 +88,7 @@ enum Job {
     Pressure,
     Reclaim,
     Expiry,
+    Leases,
     Recompress,
     /// One migration page. With `defer`, the page first waits inline for writers waiting on
     /// the writer lock: the first page after a retry tick, and a page whose background
@@ -93,15 +105,16 @@ impl Job {
             Self::Pressure => "pressure maintenance",
             Self::Reclaim => "import journal reclamation",
             Self::Expiry => "retention maintenance",
+            Self::Leases => "read lease purge",
             Self::Recompress => "table rewrite",
             Self::Migrate { .. } => "online migration",
         }
     }
 
-    /// Only expiry and online migration change their continuation; a migration reports
+    /// Only expiry and online migration change their schedule; a migration reports
     /// its page. Other duties cannot lose that work.
     fn execute(self, store: &Store) -> Result<Outcome, Error> {
-        let done = Outcome::Continue(None);
+        let done = Outcome::Continue;
         match self {
             Self::Flush => store.flush_buffered().map(|_| done),
             Self::Pressure => store
@@ -109,9 +122,15 @@ impl Job {
                 .map(|_| done),
             // Published journals hold one of 16 import slots until reclaimed.
             Self::Reclaim => store.import_reclaim(sparrow_server::now()?).map(|_| done),
-            Self::Expiry => store
-                .expire_bounded(sparrow_server::now()?, EvictionLimits::default())
-                .map(|report| Outcome::Continue(Some(report.continuation))),
+            Self::Expiry => {
+                let now = sparrow_server::now()?;
+                store
+                    .expire_bounded(now, EvictionLimits::default())
+                    .map(|report| Outcome::Expired(report, now))
+            }
+            Self::Leases => store
+                .purge_read_leases(sparrow_server::now()?)
+                .map(|()| done),
             Self::Recompress => store
                 .recompress_step(sparrow_server::now()?, RECOMPRESSION_SETTLE_SECONDS)
                 .map(|_| done),
@@ -145,7 +164,9 @@ async fn deferred_page(
 }
 
 enum Outcome {
-    Continue(Option<bool>),
+    Continue,
+    /// The pass report and the clock reading it ran at.
+    Expired(ExpiryReport, u64),
     /// The page, and when its job began.
     Migrated(Option<MigrationPage>, std::time::Instant),
 }
@@ -201,22 +222,39 @@ impl MigrationJournal {
     }
 }
 
+/// How long to sleep after an expiry pass that left no due backlog.
+fn expiry_delay(report: &ExpiryReport, now: u64) -> Duration {
+    report
+        .next_due
+        .map_or(EXPIRY_CEILING, |due| {
+            Duration::from_millis(due.saturating_sub(now))
+        })
+        .clamp(EXPIRY_FLOOR, EXPIRY_CEILING)
+}
+
 async fn run(
-    store: Store,
+    store: &Store,
     mut stopped: watch::Receiver<bool>,
     flush_interval: Duration,
 ) -> Result<(), String> {
+    // A pin release or commit and an archive commit change what expiry may retire; the store
+    // notifies this wake without blocking, and a pending wake survives a busy duty.
+    let wake = Arc::new(Notify::new());
+    store.set_retention_waker(Some(Arc::new({
+        let wake = Arc::clone(&wake);
+        move || wake.notify_one()
+    })));
     let mut flush = tokio::time::interval(flush_interval);
     let mut pressure = tokio::time::interval(Duration::from_secs(1));
     let mut reclaim = tokio::time::interval(Duration::from_secs(1));
-    let mut expiry = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
+    let mut leases = tokio::time::interval(LEASE_INTERVAL);
     let mut recompress = tokio::time::interval(RECOMPRESSION_INTERVAL);
     let mut migrate = tokio::time::interval(MIGRATION_RETRY_INTERVAL);
     for interval in [
         &mut flush,
         &mut pressure,
         &mut reclaim,
-        &mut expiry,
+        &mut leases,
         &mut recompress,
         &mut migrate,
     ] {
@@ -225,6 +263,8 @@ async fn run(
     // Buffered synchronization retains its configured initial delay.
     flush.tick().await;
     let mut continuation = false;
+    // The first pass runs at once; each later one at the deadline the previous one reported.
+    let mut expiry_at = tokio::time::Instant::now();
     // Pages continue back to back once the first succeeds, until every migration is
     // complete; a failed page waits for the retry tick, never a busy loop. Immediately
     // before every page the worker waits for writers waiting on the writer lock (#146).
@@ -247,7 +287,9 @@ async fn run(
                     _ = pressure.tick() => Ok(Job::Pressure),
                     _ = reclaim.tick() => Ok(Job::Reclaim),
                     _ = recompress.tick() => Ok(Job::Recompress),
-                    _ = expiry.tick(), if !continuation => Ok(Job::Expiry),
+                    _ = leases.tick() => Ok(Job::Leases),
+                    _ = tokio::time::sleep_until(expiry_at), if !continuation => Ok(Job::Expiry),
+                    _ = wake.notified(), if !continuation => Ok(Job::Expiry),
                     _ = tokio::task::yield_now(), if continuation => Ok(Job::Expiry),
                     _ = migrate.tick(), if !migrating => Ok(Job::Migrate { defer: true }),
                     deferred = deferred_page(&mut deferral), if migrating => {
@@ -270,6 +312,9 @@ async fn run(
             continuation = false;
             migrating = false;
             deferral = None;
+            if matches!(job, Job::Expiry) {
+                expiry_at = tokio::time::Instant::now() + EXPIRY_RETRY;
+            }
             continue;
         }
         let owner = store.clone();
@@ -303,14 +348,24 @@ async fn run(
             stale = true;
         }
         match result {
-            Ok(Outcome::Continue(Some(more))) => {
-                // The pause runs from the end of a traversal, however long it took.
-                if !more {
-                    expiry.reset();
+            Ok(Outcome::Expired(report, now)) => {
+                // Only real due backlog continues without sleeping; otherwise sleep until
+                // the next deadline, however long the pass took.
+                if report.anomalies != 0 {
+                    eprintln!(
+                        "sparrowd: retention saw {} entries whose own deadline differs from receipt plus retention; honoured at their own deadline",
+                        report.anomalies
+                    );
                 }
-                continuation = more;
+                continuation = report.continuation;
+                expiry_at = tokio::time::Instant::now()
+                    + if continuation {
+                        Duration::ZERO
+                    } else {
+                        expiry_delay(&report, now)
+                    };
             }
-            Ok(Outcome::Continue(None)) => {}
+            Ok(Outcome::Continue) => {}
             Ok(Outcome::Migrated(page, began)) => {
                 migrating = page.is_some();
                 if migrating {
@@ -328,7 +383,10 @@ async fn run(
                 eprintln!("sparrowd: {} failed: {error}", job.name());
                 // Retry a refused pass or page on the ordinary tick, never a busy loop.
                 match job {
-                    Job::Expiry => continuation = false,
+                    Job::Expiry => {
+                        continuation = false;
+                        expiry_at = tokio::time::Instant::now() + EXPIRY_RETRY;
+                    }
                     Job::Migrate { .. } => {
                         migrating = false;
                         migrate.reset();
@@ -456,6 +514,48 @@ mod tests {
                 .code,
             "NOT_FOUND"
         );
+        worker.shutdown().await.unwrap();
+    }
+
+    /// INVARIANT (#183): after a pass that leaves nothing due the worker sleeps until the next
+    /// reported deadline, up to an hour, yet a pin release wakes it at once, so evidence a pin
+    /// held retires within seconds of the release and not an hour later.
+    #[tokio::test]
+    async fn a_pin_release_wakes_the_retention_duty_from_its_long_sleep() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let now = sparrow_server::now().unwrap();
+        let old = now - 31 * 86_400_000;
+        let artifact = store
+            .ingest("held-until-release", "source", "log", b"held\n", old)
+            .unwrap();
+        let pin = store
+            .pin(
+                "held-pin",
+                "case",
+                std::slice::from_ref(&artifact.id),
+                40,
+                old,
+            )
+            .unwrap();
+        let worker = Worker::start(store.clone(), Duration::from_millis(1));
+        // Let the first pass finish: it holds the entry and schedules the next pass far away.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(store.artifact(&artifact.id).is_ok(), "a pinned entry stays");
+        store.release(&pin.id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.artifact(&artifact.id).is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
         worker.shutdown().await.unwrap();
     }
 

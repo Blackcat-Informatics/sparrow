@@ -54,7 +54,7 @@ pub use storage::eviction::RetirementBounds;
 pub use storage::eviction::{
     EvictionFrontier, EvictionLimits, EvictionReport, MAX_PINNED_MEMBERS, MAX_PINS,
 };
-pub use storage::expiry::{ExpiryFrontier, ExpiryReport};
+pub use storage::expiry::{EXPIRY_CEILING_MS, ExpiryFrontier, ExpiryReport};
 pub use storage::handoff::ConsumptionHandoff;
 pub use storage::import::{
     IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,
@@ -120,7 +120,7 @@ pub use storage::tail::{
 pub use storage::watch_registry::MAX_WATCH_REGISTRY_BYTES;
 pub use storage::{
     Artifact, Config, Error, INLINE_ARTIFACT_BYTES, OpenPhase, Pin, QUERY_SCOPE_PROFILE,
-    QUERY_SCOPE_WORKSPACE_BYTES, RETENTION_MS, Record, Store,
+    QUERY_SCOPE_WORKSPACE_BYTES, RETENTION_MS, Record, RetentionWaker, Store,
 };
 #[cfg(feature = "test-support")]
 pub use storage::{

@@ -2618,7 +2618,7 @@ names = ['^(serve_test_rpc_connection|serve_daemon_rpc_connection)$']
 
 [[job]]
 id = "bounded-catalog-expiry"
-summary = "Resume finite artifact, record, pin and retry catalog expiry through the shared dependency retirement owner, advancing only after durable publication."
+summary = "Resume finite expiry of records and artifacts from the receipt-ordered time index (retire at the deadline, delete a day later), pins, and hourly retry rows, through the shared dependency retirement owner, advancing only after durable publication; a pass reads the due prefix only."
 home = "sparrow_core::storage::expiry::Writer::expire_bounded"
 entry_points = ["sparrow_core::storage::expiry::Store::expire_bounded", "sparrow_core::storage::expiry::Store::expire"]
 spec = "docs/development-runtime.md: bounded catalog expiry."

@@ -167,11 +167,32 @@ wait for each worker's end signal continue on the serving loop; no worker health
 check runs on a cadence.
 
 Expiry retains its bounded pass limits and resumes an explicit continuation
-after yielding, without waiting one second between every pass. The next
-traversal starts 60 seconds after an exhausted one ends. Each traversal parses
-the whole catalog under the writer lock, and restarting it every second starved
-ingest on a 10 GB store. Expiry already applies to reads, so only physical
-retirement waits.
+after yielding, without waiting one second between every pass, but only while
+due work remains. A pass walks the receipt-ordered `time:` and `empty-time:`
+indexes from two in-memory cursors, one that retires at the deadline
+(`received_at + RETENTION_MS`) and one that deletes a day later, and stops at the
+first key whose deadline has not arrived, so its cost follows the due work and
+never the store size. Scanning the whole catalog under the writer lock made
+reads wait on the same lock for over 30 seconds on a 10 GB store (#183). Entries a
+pin holds are skipped, not retired, and are not read again until a pin ends. A
+restart re-walks at most about a day of retired rows. Expiry already applies to
+reads, so only physical retirement waits.
+
+`ExpiryReport.next_due` is the earliest clock reading at which a pass can find
+work with no external event: the next retirement or deletion deadline or the
+earliest live pin deadline. The worker sleeps until then, never less than one
+second and never more than one hour. The ceiling protects against a wall clock
+that stepped forward, since the sleep itself is monotonic. A pin release, a pin
+commit and an archive commit wake the worker at once. After an error, or a pass
+skipped below the free-space floor, it retries after 60 seconds. Retry rows
+(`request:`) have no time index; one pass scans them once per hour, and their
+logical expiry is exact at read time regardless. The purge of expired read
+leases runs on its own 60-second tick, not inside expiry. Expiry honours each row's
+own `expires_at`: a row whose deadline differs from receipt plus retention is
+counted in `ExpiryReport.anomalies` and retires at its own deadline, never
+stopping the pass; a parent artifact whose own deadline is later keeps its records
+undeleted until then. The count is per pass, and the worker journals it. A
+dangling time-index key is the only data-dependent hard failure.
 Import journal reclamation runs on its own one-second tick, because a published
 journal holds one of the 16 import slots until it is reclaimed. Pressure keeps
 its one-second tick, and buffered synchronization keeps its configured interval.
@@ -253,8 +274,10 @@ store without `[archive]` fails with `INVALID_ARGUMENT`. A fence without its
 watermark, or a watermark without its fence, fails with `STORAGE_FAILURE`.
 Stores without the fence or the table behave exactly as before.
 
-One gate guards every deletion. Expiry leaves entries the watermark does not
-cover and counts them in `ExpiryReport.archive_waiting`. Pressure eviction stops
+One gate guards every deletion. Expiry stops at the first due entry the watermark
+does not cover, with frontier `ArchiveLag` and `ExpiryReport.archive_waiting` of 1,
+because the watermark is a prefix of the receipt order and nothing after that
+entry is covered either. An archive commit wakes expiry. Pressure eviction stops
 at the first unarchived, unprotected entry with frontier `archiveLag`. If that
 pass retired nothing, pressure reports phase `awaitingArchive` rather than
 `blocked`. Ingest above the data allowance still receives `STORAGE_PRESSURE`.
@@ -893,7 +916,7 @@ the build's. Following that cursor waits on the same build again and never
 starts another; a capture's lease starts when its first page is delivered. A
 build's lease runs 60 seconds from the last call that followed its cursor, and
 `resultRelease` with its `snapshot_id` cancels it. An abandoned build is
-dropped when its lease ends, at the latest at the next expiry pass, which
+dropped when its lease ends, at the latest at the next read-lease purge, which
 cancels its thread and drops its snapshot. A finished build stays until the page
 built from it has been delivered, so a call that fails or is cancelled while its
 page waits for the writer is retried on the same cursor. A page with `build` has

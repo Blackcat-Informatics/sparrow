@@ -432,6 +432,7 @@ impl Store {
         };
         // Pressure stopped at the old watermark; let the next pass revisit that entry.
         writer.eviction.borrow_mut().reset();
+        self.wake_retention();
         Ok(())
     }
 }
