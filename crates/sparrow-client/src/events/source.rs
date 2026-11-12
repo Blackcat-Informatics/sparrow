@@ -15,45 +15,8 @@ impl EventBatch {
         let instance = purrdf_hash::hex::encode(&batch.client_instance);
         let mut bytes = String::new();
         for event in &batch.events {
-            let fields = Value::array(event.fields.iter().map(field));
-            let context = Value::array(event.context.iter().map(span));
-            let value = Object::new()
-                .with("profile", "sparrow.events/1")
-                .with("client_instance", instance.clone())
-                .with("sequence", event.sequence)
-                .with("event_time", event.event_time)
-                .with(
-                    "kind",
-                    match event.kind {
-                        EventKind::Log => "log",
-                        EventKind::SpanNew => "span_new",
-                        EventKind::SpanRecord => "span_record",
-                        EventKind::SpanEnter => "span_enter",
-                        EventKind::SpanExit => "span_exit",
-                        EventKind::SpanClose => "span_close",
-                        EventKind::SpanFollowsFrom => "span_follows_from",
-                    },
-                )
-                .with(
-                    "level",
-                    match event.level {
-                        EventLevel::Error => "error",
-                        EventLevel::Warn => "warn",
-                        EventLevel::Info => "info",
-                        EventLevel::Debug => "debug",
-                        EventLevel::Trace => "trace",
-                    },
-                )
-                .with("name", event.name.clone())
-                .with("target", event.target.clone())
-                .with("fields", fields)
-                .with("context", context)
-                .with("span", event.span.map_or(Value::Null, Value::from))
-                .with(
-                    "follows_from",
-                    event.follows_from.map_or(Value::Null, Value::from),
-                );
-            json::write_into(&mut bytes, &value.into(), json::Format::COMPACT);
+            let value = event_value(&instance, event);
+            json::write_into(&mut bytes, &value, json::Format::COMPACT);
             bytes.push('\n');
             if bytes.len() > crate::MAX_EVENT_BATCH_BYTES {
                 return Err(Error::InvalidArgument(
@@ -63,6 +26,64 @@ impl EventBatch {
         }
         Ok(bytes.into_bytes())
     }
+
+    /// The same canonical event lines as [`Self::source_bytes`] without its expansion bound,
+    /// so a quarantined batch is always written whole, whatever refused it.
+    pub(crate) fn quarantine_bytes(&self) -> Vec<u8> {
+        let instance = purrdf_hash::hex::encode(&self.client_instance);
+        let mut bytes = String::new();
+        for event in &self.events {
+            json::write_into(
+                &mut bytes,
+                &event_value(&instance, event),
+                json::Format::COMPACT,
+            );
+            bytes.push('\n');
+        }
+        bytes.into_bytes()
+    }
+}
+
+fn event_value(instance: &str, event: &crate::ProducerEvent) -> Value {
+    let fields = Value::array(event.fields.iter().map(field));
+    let context = Value::array(event.context.iter().map(span));
+    let value = Object::new()
+        .with("profile", "sparrow.events/1")
+        .with("client_instance", instance.to_owned())
+        .with("sequence", event.sequence)
+        .with("event_time", event.event_time)
+        .with(
+            "kind",
+            match event.kind {
+                EventKind::Log => "log",
+                EventKind::SpanNew => "span_new",
+                EventKind::SpanRecord => "span_record",
+                EventKind::SpanEnter => "span_enter",
+                EventKind::SpanExit => "span_exit",
+                EventKind::SpanClose => "span_close",
+                EventKind::SpanFollowsFrom => "span_follows_from",
+            },
+        )
+        .with(
+            "level",
+            match event.level {
+                EventLevel::Error => "error",
+                EventLevel::Warn => "warn",
+                EventLevel::Info => "info",
+                EventLevel::Debug => "debug",
+                EventLevel::Trace => "trace",
+            },
+        )
+        .with("name", event.name.clone())
+        .with("target", event.target.clone())
+        .with("fields", fields)
+        .with("context", context)
+        .with("span", event.span.map_or(Value::Null, Value::from))
+        .with(
+            "follows_from",
+            event.follows_from.map_or(Value::Null, Value::from),
+        );
+    value.into()
 }
 
 fn span(span: &EventSpan) -> Value {

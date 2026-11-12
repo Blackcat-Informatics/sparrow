@@ -58,6 +58,7 @@ pub use events::{
 };
 mod delivery;
 mod logging;
+mod quarantine;
 pub use delivery::{
     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
 };

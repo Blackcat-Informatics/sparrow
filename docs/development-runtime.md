@@ -5090,9 +5090,13 @@ socket I/O; admission waits only for the queue lock, whose holders do bounded
 in-memory work and never I/O, so a briefly held lock never drops an event. The
 worker assigns increasing sequences under queue serialization. Full, invalid,
 closed, failed and counter-exhausted admission each have visible drop counters.
-A batch the daemon permanently refuses with a non-retryable `INVALID_ARGUMENT`
-is quarantined: counted, reported as dropped at the next flush, and later events
-proceed. A full-queue refusal can leave an explicit sequence gap;
+A batch the daemon permanently refuses (a non-retryable `INVALID_ARGUMENT` or
+`CONFLICT`) is written to a quarantine file with its reason and count, then counted,
+reported as not delivered at the next flush, and later events proceed. The client never
+deletes the file; if it cannot be written the batch stays pending. A source whose time
+mapping conflicts refuses every later batch, so each becomes one file (about one per
+flush interval per client) until the operator fixes the source; the disk is the only bound.
+A full-queue refusal can leave an explicit sequence gap;
 refusals before sequence assignment remain visible through counters. Event
 admission also charges unused string/vector capacity, preventing a tiny value
 from retaining an oversized allocation. Caller-owned inputs must already be

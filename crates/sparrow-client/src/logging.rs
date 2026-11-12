@@ -477,10 +477,10 @@ mod tests {
     #[test]
     fn independent_subscribers_share_the_producer_span_identity_allocator() {
         let dir = tempfile::tempdir().unwrap();
-        let delivery = Delivery::start(DeliveryConfig::new(
-            dir.path().join("missing.sock"),
-            "identity",
-        ))
+        let delivery = Delivery::start(
+            DeliveryConfig::new(dir.path().join("missing.sock"), "identity")
+                .with_quarantine_dir(dir.path().join("quarantine")),
+        )
         .unwrap();
         let capture = || {
             let subscriber =
@@ -504,10 +504,10 @@ mod tests {
     #[test]
     fn failed_updates_refuse_stale_context_and_live_span_slots_are_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
-        let delivery = Delivery::start(DeliveryConfig::new(
-            dir.path().join("missing.sock"),
-            "capture",
-        ))
+        let delivery = Delivery::start(
+            DeliveryConfig::new(dir.path().join("missing.sock"), "capture")
+                .with_quarantine_dir(dir.path().join("quarantine")),
+        )
         .unwrap();
         let layer = TracingLayer::new(delivery.clone());
         let slots = layer.slots.clone();

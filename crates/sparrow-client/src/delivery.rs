@@ -42,6 +42,13 @@ pub struct DeliveryConfig {
     pub retry_interval: Duration,
     /// Longest delay between attempts of the same pending batch, at least `retry_interval`.
     pub retry_max_interval: Duration,
+    /// Directory that keeps every batch the daemon permanently refuses, with the reason and
+    /// count, as one file per batch. Created on first use. The client never deletes a file
+    /// here; its size is bounded only by the disk. Default: `sparrow-client/quarantine` under
+    /// an absolute `XDG_STATE_HOME`, else under `$HOME/.local/state`. With neither the default
+    /// is empty and [`Delivery::start`] fails until a directory is set: a refused log is never
+    /// parked in a volatile fallback.
+    pub quarantine_dir: PathBuf,
     /// Shortest accepted `flush_interval` and `retry_interval`. Production configuration
     /// always carries [`MIN_INTERVAL`]; only the test-timing constructor lowers it.
     interval_floor: Duration,
@@ -75,6 +82,7 @@ impl DeliveryConfig {
             rpc_timeout: Duration::from_secs(5),
             retry_interval: Duration::from_secs(1),
             retry_max_interval: Duration::from_secs(30),
+            quarantine_dir: crate::quarantine::default_dir(),
             interval_floor: MIN_INTERVAL,
         }
     }
@@ -98,8 +106,19 @@ impl DeliveryConfig {
         self.retry_max_interval = retry_max_interval;
         self
     }
+    /// Keep quarantined batches in this directory instead of the default.
+    #[must_use]
+    pub fn with_quarantine_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.quarantine_dir = dir.into();
+        self
+    }
     fn validate(&self) -> Result<(), Error> {
         self.endpoint.validate()?;
+        if !self.quarantine_dir.is_absolute() {
+            return Err(Error::InvalidArgument(
+                "quarantine_dir must be an absolute directory: set DeliveryConfig::quarantine_dir, or provide an absolute XDG_STATE_HOME or HOME for the default",
+            ));
+        }
         if self.source.is_empty()
             || self.source.len() > 512
             || !(1..=16_384).contains(&self.max_queued_events)
@@ -173,6 +192,8 @@ pub struct DeliveryWatermark {
     pub durable_events: u64,
     /// Dropped offers and quarantined events counted by this fence; these were never certified.
     pub dropped_before_fence: u64,
+    /// The part of `dropped_before_fence` that is kept in quarantine files, not lost.
+    pub quarantined_before_fence: u64,
     /// Last durable batch receipt, absent before any accepted batch.
     pub last_receipt: Option<ArtifactReceipt>,
 }
@@ -197,8 +218,8 @@ impl std::fmt::Display for FlushError {
             Self::Busy => f.write_str("another delivery barrier owns the control slot"),
             Self::Dropped(value) => write!(
                 f,
-                "durable sequence {}; {} offered events were dropped before the fence",
-                value.durable_sequence, value.dropped_before_fence
+                "durable sequence {}; {} offered events were not delivered before the fence, {} of them kept in quarantine files",
+                value.durable_sequence, value.dropped_before_fence, value.quarantined_before_fence
             ),
             Self::TimedOut(value) => write!(
                 f,
@@ -254,14 +275,25 @@ pub struct DeliveryStats {
     pub terminal_failure: Option<Arc<Error>>,
     /// Last transient failure, cleared when a batch is acknowledged.
     pub last_transient_failure: Option<Arc<Error>>,
-    /// Admitted events given up because the daemon permanently refused their batch with a
-    /// non-retryable `INVALID_ARGUMENT`: an answer retrying the same batch can never change.
-    /// They kept their sequence; the daemon sees a gap only if it later accepts a higher
-    /// sequence of an instance it already recorded, so this counter and the fence are the
-    /// reliable record.
+    /// Admitted events whose batch the daemon permanently refused (a non-retryable
+    /// `INVALID_ARGUMENT` or `CONFLICT`, or a batch the client itself cannot send): an answer
+    /// retrying the same batch can never change. Their bytes are in quarantine files, not
+    /// lost. They kept their sequence; the daemon sees a gap only if it later accepts a
+    /// higher sequence of an instance it already recorded, so this counter and the fence are
+    /// the reliable record.
     pub quarantined_events: u64,
     /// The latest permanent refusal that quarantined a batch.
     pub last_quarantine: Option<Arc<Error>>,
+    /// Directory holding the quarantine files.
+    pub quarantine_dir: PathBuf,
+    /// Quarantine files written by this producer, including those for held events when a
+    /// terminal failure ended delivery.
+    pub quarantine_files: u64,
+    /// The latest quarantine file written.
+    pub last_quarantine_file: Option<PathBuf>,
+    /// Quarantine writes that failed. The batch stays held and the write is retried; that
+    /// batch is not dropped (events offered meanwhile can still be refused as `Full`).
+    pub quarantine_write_failures: u64,
 }
 
 struct Queued {
@@ -296,6 +328,9 @@ struct State {
     /// Highest sequence settled by quarantine; a barrier is satisfied by durable or settled.
     quarantined_sequence: u64,
     quarantine: Option<Arc<Error>>,
+    quarantine_files: u64,
+    quarantine_failures: u64,
+    quarantine_file: Option<PathBuf>,
 }
 struct Shared {
     config: DeliveryConfig,
@@ -381,6 +416,9 @@ impl Delivery {
                 quarantined: 0,
                 quarantined_sequence: 0,
                 quarantine: None,
+                quarantine_files: 0,
+                quarantine_failures: 0,
+                quarantine_file: None,
             }),
             control: Mutex::new(()),
             changed: Condvar::new(),
@@ -406,10 +444,16 @@ impl Delivery {
                 drop(runtime);
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => worker.fail(error),
-                    Err(_) => worker.fail(Error::Protocol(
-                        "producer delivery worker panicked; no remaining delivery certified",
-                    )),
+                    Ok(Err(error)) => {
+                        let error = worker.save_held(error);
+                        worker.fail(error);
+                    }
+                    Err(_) => {
+                        let error = worker.save_held(Error::Protocol(
+                            "producer delivery worker panicked; no remaining delivery certified",
+                        ));
+                        worker.fail(error);
+                    }
                 }
                 worker.finished();
             })?;
@@ -568,6 +612,7 @@ impl Delivery {
                     durable_sequence: state.durable_sequence,
                     durable_events: state.durable,
                     dropped_before_fence: dropped.saturating_add(state.quarantined),
+                    quarantined_before_fence: state.quarantined,
                     last_receipt: state.receipt.clone(),
                 };
                 return if watermark.dropped_before_fence == 0 {
@@ -667,6 +712,10 @@ impl Shared {
             last_transient_failure: state.transient.clone(),
             quarantined_events: state.quarantined,
             last_quarantine: state.quarantine.clone(),
+            quarantine_dir: self.config.quarantine_dir.clone(),
+            quarantine_files: state.quarantine_files,
+            last_quarantine_file: state.quarantine_file.clone(),
+            quarantine_write_failures: state.quarantine_failures,
         }
     }
     fn fail(&self, error: Error) {
@@ -820,9 +869,88 @@ impl Shared {
         self.changed.notify_all();
         Ok(())
     }
-    /// Give up the immutable pending batch after a permanent refusal: its events stay counted
-    /// and visible, their quota is released, and later events proceed instead of queueing
-    /// behind a batch that can never be accepted.
+    /// Write one batch to the quarantine directory, counting the file or the failure. An
+    /// error means the bytes are not preserved and the caller must keep them.
+    fn save(&self, batch: &EventBatch, error: &Error) -> Result<PathBuf, Error> {
+        let (code, reason) = match error {
+            Error::Domain { code, message, .. } => (code.as_str(), message.clone()),
+            other => ("CLIENT_REFUSED", other.to_string()),
+        };
+        let saved = crate::quarantine::save(&self.config.quarantine_dir, batch, code, &reason);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
+        match saved {
+            Ok((path, created)) => {
+                if created {
+                    state.quarantine_files = state.quarantine_files.saturating_add(1);
+                }
+                state.quarantine_file = Some(path.clone());
+                Ok(path)
+            }
+            Err(io) => {
+                state.quarantine_failures = state.quarantine_failures.saturating_add(1);
+                drop(state);
+                self.changed.notify_all();
+                Err(Error::Io(io))
+            }
+        }
+    }
+    /// Before a terminal failure ends delivery, keep what the worker still holds, the pending
+    /// batch and the queued events, in quarantine files: the process may exit and the daemon
+    /// never answers for them. Returns the error to report: unchanged when everything was
+    /// written, else an error that says which held bytes are not preserved (they stay held in
+    /// memory and the failure is counted).
+    fn save_held(&self, error: Error) -> Error {
+        // A panicked worker may have poisoned the state; the held bytes are still readable.
+        let (pending, queued, source) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.pending.as_ref().map(|pending| pending.batch.clone()),
+                state
+                    .queue
+                    .iter()
+                    .map(|queued| queued.event.clone())
+                    .collect::<Vec<_>>(),
+                self.config.source.clone(),
+            )
+        };
+        let mut batches = Vec::new();
+        batches.extend(pending.as_deref().cloned());
+        if let Some(first) = queued.first() {
+            batches.push(EventBatch {
+                request_id: format!(
+                    "events:{}:queued-{:020}",
+                    purrdf_hash::hex::encode(&self.instance),
+                    first.sequence
+                ),
+                source,
+                client_instance: self.instance,
+                events: queued,
+            });
+        }
+        let mut unsaved = Vec::new();
+        for batch in &batches {
+            if let Err(write) = self.save(batch, &error) {
+                unsaved.push(format!("{} ({write})", batch.request_id));
+            }
+        }
+        if unsaved.is_empty() {
+            error
+        } else {
+            Error::Io(std::io::Error::other(format!(
+                "{error}; held events not written to quarantine and kept only in memory: {}",
+                unsaved.join(", ")
+            )))
+        }
+    }
+    /// Give up the immutable pending batch after its bytes reached a quarantine file: its
+    /// events stay counted and visible, their quota is released, and later events proceed
+    /// instead of queueing behind a batch that can never be accepted.
     fn quarantine(&self, batch: &EventBatch, error: Error) -> Result<(), Error> {
         let mut state = self
             .state
@@ -989,14 +1117,24 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         if !matches!(error, Error::Domain { .. }) {
                             connection = None;
                         }
-                        if permanent_refusal(&error) {
-                            shared.quarantine(&batch, error)?;
-                            backoff.reset();
-                            continue;
-                        }
-                        if !retryable(&error) {
+                        // A permanent refusal's bytes must reach a quarantine file before the
+                        // batch is given up. If they cannot, the batch stays pending, the write
+                        // failure is counted and reported as the transient failure whatever its
+                        // kind, and the next attempt tries again: that batch is not dropped.
+                        let error = if permanent_refusal(&error) {
+                            match shared.save(&batch, &error) {
+                                Ok(_) => {
+                                    shared.quarantine(&batch, error)?;
+                                    backoff.reset();
+                                    continue;
+                                }
+                                Err(write) => write,
+                            }
+                        } else if retryable(&error) {
+                            error
+                        } else {
                             return Err(error);
-                        }
+                        };
                         shared.retry(error)?;
                         if wait_out_retry_delay(
                             &shared.abort_wake,
@@ -1015,16 +1153,26 @@ async fn run(shared: &Shared) -> Result<(), Error> {
     }
 }
 
-/// Whether the daemon answered that this batch can never be accepted, as opposed to being
-/// busy. The daemon marks a busy refusal (`RESOURCE_LIMIT`) retryable, and that batch is
-/// held. A full producer registry is no longer a refusal: the daemon stores the batch and
-/// counts the lost gap evidence (#215), so only an older daemon still answers it with
-/// `RESOURCE_LIMIT`, which stays held as before. Only a non-retryable
-/// `INVALID_ARGUMENT` is a batch that can never fit. Any other non-retryable
-/// refusal (a replaced store, a read-only or unauthorized daemon)
-/// is not about this batch: it stays a terminal failure with the batch retained.
+/// Whether this batch can never be accepted, as opposed to the daemon being busy. The
+/// daemon marks a busy refusal (`RESOURCE_LIMIT`) retryable, and that batch is held. A full
+/// producer registry is no longer a refusal: the daemon stores the batch and counts the lost
+/// gap evidence (#215), so only an older daemon still answers it with `RESOURCE_LIMIT`, which
+/// stays held as before. A non-retryable `INVALID_ARGUMENT` or `CONFLICT` (for example
+/// producer sequences that overlap accepted positions, or a source time mapping that differs)
+/// and a batch the client itself cannot encode are about this batch alone: its bytes go to a
+/// quarantine file and later events proceed. Any other non-retryable refusal (a replaced
+/// store, a read-only or unauthorized daemon) is not about this batch: it ends delivery as a
+/// terminal failure, and the held bytes are written to quarantine files first.
 fn permanent_refusal(error: &Error) -> bool {
-    matches!(error, Error::Domain { code, retryable: false, .. } if code == "INVALID_ARGUMENT")
+    match error {
+        Error::Domain {
+            code,
+            retryable: false,
+            ..
+        } => code == "INVALID_ARGUMENT" || code == "CONFLICT",
+        Error::InvalidArgument(_) => true,
+        _ => false,
+    }
 }
 
 /// Whether reconnecting and retrying the same identity may succeed, including
@@ -1071,7 +1219,8 @@ mod tests {
     /// long delay.
     #[test]
     fn retry_backoff_doubles_to_its_maximum_and_restarts_after_acceptance() {
-        let mut config = DeliveryConfig::new("unused.sock", "test");
+        let mut config =
+            DeliveryConfig::new("unused.sock", "test").with_quarantine_dir("/unused-quarantine");
         assert_eq!(config.retry_interval, Duration::from_secs(1));
         config.retry_max_interval = Duration::from_secs(5);
         let mut backoff = Backoff::new(&config);
@@ -1085,7 +1234,8 @@ mod tests {
     /// capping the first retry, and the default maximum is within the shared 60 s bound.
     #[test]
     fn retry_maximum_below_the_first_delay_is_refused() {
-        let mut config = DeliveryConfig::new("unused.sock", "test");
+        let mut config =
+            DeliveryConfig::new("unused.sock", "test").with_quarantine_dir("/unused-quarantine");
         config.validate().unwrap();
         config.retry_max_interval = config.retry_interval - Duration::from_millis(1);
         assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
@@ -1096,7 +1246,8 @@ mod tests {
     /// and only the test-timing constructor can go lower.
     #[test]
     fn sub_second_flush_and_retry_intervals_are_refused() {
-        let base = DeliveryConfig::new("unused.sock", "test");
+        let base =
+            DeliveryConfig::new("unused.sock", "test").with_quarantine_dir("/unused-quarantine");
         base.validate().unwrap();
         let mut at_floor = base.clone();
         at_floor.flush_interval = MIN_INTERVAL;
@@ -1169,7 +1320,8 @@ mod tests {
     #[test]
     fn flush_and_shutdown_during_a_backoff_delay_retry_at_once() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test");
+        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+            .with_quarantine_dir(dir.path().join("quarantine"));
         config.batch_events = 1;
         config.retry_interval = Duration::from_secs(30);
         config.retry_max_interval = Duration::from_secs(30);
@@ -1209,8 +1361,11 @@ mod tests {
     fn flush_and_shutdown_signal_the_retry_wait() {
         use futures::FutureExt;
         let dir = tempfile::tempdir().unwrap();
-        let delivery =
-            Delivery::start(DeliveryConfig::new(dir.path().join("missing.sock"), "test")).unwrap();
+        let delivery = Delivery::start(
+            DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+                .with_quarantine_dir(dir.path().join("quarantine")),
+        )
+        .unwrap();
         delivery.flush(Duration::from_secs(2)).unwrap();
         assert!(
             delivery
@@ -1236,7 +1391,8 @@ mod tests {
     #[test]
     fn retries_keep_the_pending_identity_and_count_each_attempt() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test");
+        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+            .with_quarantine_dir(dir.path().join("quarantine"));
         config.batch_events = 1;
         // Sub-second retry intervals are refused in production; this test needs fast retries.
         config = config.with_test_timing(
@@ -1276,8 +1432,11 @@ mod tests {
     #[test]
     fn admission_waits_for_a_held_lock_and_oversized_allocations_are_counted_drops() {
         let dir = tempfile::tempdir().unwrap();
-        let delivery =
-            Delivery::start(DeliveryConfig::new(dir.path().join("missing.sock"), "test")).unwrap();
+        let delivery = Delivery::start(
+            DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+                .with_quarantine_dir(dir.path().join("quarantine")),
+        )
+        .unwrap();
         let guard = delivery.shared.state.lock().unwrap();
         let (about_to_send, started) = std::sync::mpsc::channel();
         let sender = {
@@ -1314,8 +1473,11 @@ mod tests {
             Err(FlushError::TimedOut(_))
         ));
         // With nothing queued, a fence over only drops still reports them and certifies nothing.
-        let empty =
-            Delivery::start(DeliveryConfig::new(dir.path().join("missing.sock"), "test")).unwrap();
+        let empty = Delivery::start(
+            DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+                .with_quarantine_dir(dir.path().join("quarantine")),
+        )
+        .unwrap();
         let mut oversized = event();
         oversized.name = String::with_capacity(MAX_EVENT_BYTES * 2);
         empty.try_send(oversized);
@@ -1339,7 +1501,8 @@ mod tests {
             crate::Endpoint::Unix(socket),
             crate::Endpoint::Tcp(tcp.local_addr().unwrap()),
         ] {
-            let mut config = DeliveryConfig::for_endpoint(endpoint, "test");
+            let mut config = DeliveryConfig::for_endpoint(endpoint, "test")
+                .with_quarantine_dir(dir.path().join("quarantine"));
             config.batch_events = 1;
             config.rpc_timeout = Duration::from_secs(60);
             let delivery = Delivery::start(config).unwrap();
@@ -1373,7 +1536,8 @@ mod tests {
     #[test]
     fn byte_admission_keeps_failed_in_flight_requests_charged() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test");
+        let mut config = DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+            .with_quarantine_dir(dir.path().join("quarantine"));
         config.max_queued_events = 8;
         config.max_queued_bytes = MAX_EVENT_BYTES;
         config.batch_events = 1;
@@ -1406,5 +1570,62 @@ mod tests {
             delivery.shutdown(Duration::from_millis(20)),
             Err(FlushError::TimedOut(_))
         ));
+    }
+
+    /// INVARIANT (#216): a terminal failure first writes the queued events to a quarantine
+    /// file and returns the error unchanged; if the directory cannot be written the returned
+    /// error says the held events are kept only in memory and the failure is counted. Before,
+    /// nothing was written and the error did not mention the held bytes.
+    #[test]
+    fn terminal_failure_saves_held_events_or_says_they_are_unsaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = |quarantine: &std::path::Path| {
+            let delivery = Delivery::start(
+                DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+                    .with_quarantine_dir(quarantine),
+            )
+            .unwrap();
+            assert!(matches!(
+                delivery.try_send(event()),
+                Admission::Queued { sequence: 1 }
+            ));
+            let error = delivery
+                .shared
+                .save_held(Error::Protocol("terminal for the test"));
+            (delivery, error)
+        };
+        let good = dir.path().join("good");
+        let (delivery, error) = held(&good);
+        assert!(matches!(error, Error::Protocol("terminal for the test")));
+        let stats = delivery.stats().unwrap();
+        assert_eq!(
+            (stats.quarantine_files, stats.quarantine_write_failures),
+            (1, 0)
+        );
+        let text = std::fs::read_to_string(stats.last_quarantine_file.unwrap()).unwrap();
+        assert!(text.contains("\"events\":1") && text.contains("terminal for the test"));
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let (delivery, error) = held(&blocker.join("q"));
+        let Error::Io(error) = error else {
+            panic!("an unsaved queue must change the terminal error: {error:?}");
+        };
+        assert!(error.to_string().contains("kept only in memory"), "{error}");
+        assert_eq!(delivery.stats().unwrap().quarantine_write_failures, 1);
+    }
+
+    /// INVARIANT (#216): with no usable quarantine directory (the empty default of a host
+    /// with no absolute `XDG_STATE_HOME` or `HOME`, or a relative path) delivery refuses to
+    /// start with an actionable error; there is no volatile fallback for the only copy of a
+    /// refused log.
+    #[test]
+    fn unusable_quarantine_directory_fails_start() {
+        for dir in ["", "relative/quarantine"] {
+            let config = DeliveryConfig::new("unused.sock", "test").with_quarantine_dir(dir);
+            let Err(Error::InvalidArgument(message)) = Delivery::start(config) else {
+                panic!("{dir:?} must be refused");
+            };
+            assert!(message.contains("quarantine_dir"), "{message}");
+        }
     }
 }
