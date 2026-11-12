@@ -56,8 +56,8 @@ missing   Run once the restored daemon serves with its watches. The worklist is 
 Exit 0 when done (no watch holds a pending claim this run did not act on, so
 "missing reshipped=0" with exit 0 means nothing was owed), 1 on a refusal or failure, 2 on a
 usage error, 3 when the bytes were re-shipped but the restored image has no "watch
-retire-claim" (schema 69 and older): the claim stays pending until a schema 70 image retires
-it, 4 when a watch still holds a pending claim, with or without a pending reason, that this
+retire-claim" (schema 69 and older) and no other pending claim is unreconciled: the claim
+stays pending until a schema 70 image retires it, 4 when a watch still holds a pending claim, with or without a pending reason, that this
 run did not reconcile (inspect "watch claims"; a claim just attempted needs a rerun).
 USAGE
 }
@@ -86,9 +86,13 @@ store=$(json_field store_id <<<"$restored_status")
 [[ $(json_field store_id <<<"$newer_status") == "$store" ]] \
     || die "the restored and newer daemons serve different stores"
 # One "WATCH<TAB>ROOT" line per consume watch the restored store holds.
-mapfile -t watches < <(python3 -I -c 'import json,sys
+# Each parse is captured before use: a parser failure inside a process substitution would not
+# stop the run, and an empty list would then read as "nothing owed".
+watch_lines=$(python3 -I -c 'import json,sys
 for w in json.load(sys.stdin)["consume_watches"]:
-    print("%s\t%s" % (w["id"], w["root"]))' <<<"$restored_status")
+    print("%s\t%s" % (w["id"], w["root"]))' <<<"$restored_status") || die "the restored status has no readable consume_watches"
+watches=()
+[[ -z $watch_lines ]] || mapfile -t watches <<<"$watch_lines"
 
 # The root a watch consumes: as its status names it, or, with --private-intake, the private
 # root the daemon rebinds it to.
@@ -177,7 +181,7 @@ for row in "${watches[@]}"; do
 done
 if [[ $watch_usage == *"watch claims"* ]]; then
     claims=$("$RESTORED_CLI" "$RESTORED_SOCKET" watch claims) || die "the restored daemon did not answer watch claims"
-    mapfile -t worklist < <(python3 -I -c 'import json,sys
+    work_lines=$(python3 -I -c 'import json,sys
 for c in json.load(sys.stdin)["claims"]:
     if c["state"] != "pending":
         continue
@@ -185,16 +189,18 @@ for c in json.load(sys.stdin)["claims"]:
     # No reason yet: not attempted since the backup (or in flight); it is not done, so it counts.
     kind = "missing" if (reason or "").startswith("unpublished claimed source is missing") else "other"
     reason = reason or "no attempt recorded yet"
-    print("%s\t%s\t%s\t%s" % (kind, c["watch"], c["claim_id"], reason.replace("\t", " ").replace("\n", " ")))' <<<"$claims")
+    print("%s\t%s\t%s\t%s" % (kind, c["watch"], c["claim_id"], reason.replace("\t", " ").replace("\n", " ")))' <<<"$claims") || die "watch claims output is not the expected JSON"
 else
     note "the restored image is older than schema 71 and has no \"watch claims\": reading the volatile watch failure text, and any watch whose pending_claims exceeds what this run reconciled exits 4" >&2
     legacy=1
-    mapfile -t worklist < <(python3 -I -c 'import json,re,sys
+    work_lines=$(python3 -I -c 'import json,re,sys
 for w in json.load(sys.stdin)["consume_watches"]:
     m = re.search(r"claim (import:[0-9a-f]+): unpublished claimed source is missing", w["failure"] or "")
     if m:
-        print("missing\t%s\t%s\t" % (w["id"], m.group(1)))' <<<"$restored_status")
+        print("missing\t%s\t%s\t" % (w["id"], m.group(1)))' <<<"$restored_status") || die "the restored status has no readable consume_watches"
 fi
+worklist=()
+[[ -z $work_lines ]] || mapfile -t worklist <<<"$work_lines"
 for row in "${worklist[@]}"; do
     IFS=$'\t' read -r kind watch claim detail <<<"$row"
     if [[ $kind != missing ]]; then
@@ -247,16 +253,18 @@ done
 if ((legacy)); then
     # The durable count is in every image's status: a watch holding more pending claims than this
     # run reshipped and retired has an unreconciled claim, whatever its failure text shows.
+    count_lines=$(python3 -I -c 'import json,sys
+for w in json.load(sys.stdin)["consume_watches"]:
+    print("%s\t%s" % (w["id"], w["pending_claims"]))' <<<"$restored_status") || die "the restored status has no readable pending_claims"
+    # A claim reshipped but not retired (no "watch retire-claim") is accounted by exit 3.
     while IFS=$'\t' read -r watch pending; do
+        [[ -n $watch ]] || continue
         left=$((pending - ${acted[$watch]:-0}))
-        ((retire == 1)) || left=$pending
         if ((left > 0)); then
             note "$watch holds $left pending claim(s) this run did not reconcile" >&2
             unacted=$((unacted + left))
         fi
-    done < <(python3 -I -c 'import json,sys
-for w in json.load(sys.stdin)["consume_watches"]:
-    print("%s\t%s" % (w["id"], w["pending_claims"]))' <<<"$restored_status")
+    done <<<"$count_lines"
 fi
 note "missing reshipped=$reshipped unretired=$unretired unacted=$unacted"
 ((unacted == 0)) || exit 4

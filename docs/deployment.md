@@ -1041,7 +1041,8 @@ what each claim was. Never delete an entry or a claim's bytes:
    means nothing was owed. An image older than schema 71 has no `watch
    claims`; the script then compares each watch's `pending_claims` with the
    claims it reshipped and retired, and exits 4 for any excess. An image
-   without `watch retire-claim` makes it exit 3 after re-shipping: the claim
+   without `watch retire-claim` makes it exit 3 after re-shipping, when no other
+   pending claim is unreconciled (else 4): the claim
    stays pending until a schema 70 image retires it.
 6. Stop the newer query-only daemon and start `sparrow-ship.timer`. Start
    `sparrow-backup.timer` only after a first online backup of the restored store
