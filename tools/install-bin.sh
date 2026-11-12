@@ -44,8 +44,10 @@ keep target/release/examples/recovery "bin/sparrow-recovery-schema$schema-$rev"
 
 # The registry crates exclude the lexicons, so tools/purrdf-lexicons.sh archives them from the PurRDF
 # repository at the revision that published the locked release (refusing when the registry, the lock
-# and the crate's .cargo_vcs_info.json disagree) into the canonical checkout's bin/, which a linked
-# worktree under .worktrees/ shares with the main one. They are never read from a working tree.
+# and the crate's .cargo_vcs_info.json disagree) into this checkout's own ./bin, beside the images
+# that deploy/install.sh and deploy/test-instance.sh read. The PurRDF repository itself is found
+# under the canonical checkout root, which a linked worktree under .worktrees/ shares with the main
+# one. They are never read from a working tree.
 canonical=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
-lexicons=$(tools/purrdf-lexicons.sh "$canonical")
+lexicons=$(tools/purrdf-lexicons.sh "$canonical" "$PWD/bin")
 echo "install-bin: $lexicons"

@@ -16,8 +16,8 @@ pub use sparrow_core::resolve_text_analyzer;
 /// at the revision that published the locked release (refusing when the registry, `Cargo.lock`
 /// and the crate's `.cargo_vcs_info.json` disagree) into `bin/lexicons-<revision>` of the
 /// canonical checkout root, and prints that directory. A linked worktree under
-/// `<root>/.worktrees/` shares the canonical root's `bin/`, so `make install-bin` run from a
-/// worktree also finds them there rather than in the worktree's own `bin/`. They are never read
+/// `<root>/.worktrees/` uses the canonical root's `bin/` here; `make install-bin` instead places
+/// the same bundle in the invoking checkout's own `bin/`, beside the images. They are never read
 /// from a PurRDF working tree.
 pub fn text_lexicon_dir() -> &'static std::path::Path {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -37,6 +37,7 @@ pub fn text_lexicon_dir() -> &'static std::path::Path {
         };
         let output = std::process::Command::new(checkout.join("tools/purrdf-lexicons.sh"))
             .arg(&root)
+            .arg(root.join("bin"))
             .stderr(std::process::Stdio::inherit())
             .output()
             .expect("INVARIANT: tools/purrdf-lexicons.sh runs");

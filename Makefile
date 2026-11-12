@@ -27,6 +27,7 @@ tools-check:
 	@command -v cargo >/dev/null || { echo "error: cargo is required (Rust 1.98 or newer)"; exit 1; }
 	@command -v git >/dev/null || { echo "error: git is required for the pinned PurRDF scan"; exit 1; }
 	@command -v tar >/dev/null || { echo "error: tar is required for the pinned PurRDF scan"; exit 1; }
+	@command -v python3 >/dev/null && python3 -c 'import tomllib' 2>/dev/null || { echo "error: python3 3.11 or newer (tomllib) is required for tools/purrdf-lexicons.sh"; exit 1; }
 	@command -v capnp >/dev/null || { echo "error: capnp is required to compile the typed RPC schema"; exit 1; }
 
 fmt:

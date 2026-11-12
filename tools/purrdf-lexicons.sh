@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# Materialise the PurRDF text lexicons of the locked release under ROOT/bin/lexicons-<revision> and
+# Materialise the PurRDF text lexicons of the locked release under BINDIR/lexicons-<revision> and
 # print that directory on stdout. The registry crates exclude them (`exclude = ["lexicons/**"]`),
 # so they come from the PurRDF repository, archived with `git archive`, never from a working tree.
 #
@@ -11,15 +11,19 @@
 # `git.sha1` in the locked crate's `.cargo_vcs_info.json`; otherwise the script refuses. An
 # existing destination must hold the same bytes; it is never replaced.
 #
-#   tools/purrdf-lexicons.sh ROOT
+#   tools/purrdf-lexicons.sh ROOT BINDIR
 #
-# ROOT is the canonical checkout root: it holds bin/ and the sibling PurRDF repository the registry
-# names. The registry, Cargo.lock and manifests are read from the checkout this script lives in, so
-# a linked worktree under ROOT/.worktrees/ is judged by its own lock, not the main checkout's.
+# ROOT is the canonical checkout root: it holds the sibling PurRDF repository the registry names.
+# BINDIR is the bin directory that receives the bundle (created when missing): `make install-bin`
+# passes the checkout's own ./bin, beside the images; sparrow-test-support passes the canonical
+# ROOT/bin. The registry, Cargo.lock and manifests are read from the checkout this script lives in,
+# so a linked worktree under ROOT/.worktrees/ is judged by its own lock, not the main checkout's.
 set -euo pipefail
 
-(($# == 1)) || { echo "usage: purrdf-lexicons.sh ROOT" >&2; exit 2; }
+(($# == 2)) || { echo "usage: purrdf-lexicons.sh ROOT BINDIR" >&2; exit 2; }
 root=$(cd -- "$1" && pwd) || { echo "purrdf-lexicons: ROOT $1 is not a directory" >&2; exit 2; }
+mkdir -p -- "$2"
+bindir=$(cd -- "$2" && pwd) || { echo "purrdf-lexicons: BINDIR $2 is not a directory" >&2; exit 2; }
 checkout=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 for needed in registry/compatibility.toml Cargo.lock Cargo.toml; do
     [[ -f $checkout/$needed ]] || { echo "purrdf-lexicons: $checkout/$needed is missing" >&2; exit 2; }
@@ -66,10 +70,9 @@ print(repository, revision)
 
 [[ $revision =~ ^[0-9a-f]{40}$ ]] || { echo "purrdf-lexicons: $revision is not a full 40-digit object name" >&2; exit 2; }
 source_repository=$root/$repository
-dest=$root/bin/lexicons-$revision
+dest=$bindir/lexicons-$revision
 
-mkdir -p -- "$root/bin"
-staged=$(mktemp -d -- "$root/bin/.lexicons.XXXXXX")
+staged=$(mktemp -d -- "$bindir/.lexicons.XXXXXX")
 trap 'rm -rf -- "${staged:?}"' EXIT
 env -u GIT_DIR -u GIT_WORK_TREE git -C "$source_repository" archive --format=tar "$revision" crates/text/lexicons \
     | tar -x --strip-components=3 -C "$staged"
