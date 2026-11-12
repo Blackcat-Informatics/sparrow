@@ -1176,7 +1176,8 @@ Profile identity covers source, whole-record law, pattern, flags, group and
 representation. JSON identities are unchanged. Definitions do not reinterpret
 earlier records or split a staged import's captured interpretation. The existing
 1024-source registry ceiling applies to both selectors. A declaration past it is
-refused with `RESOURCE_LIMIT`; a log never is (see "Source time mapping on the event
+refused with the non-retryable `INVALID_ARGUMENT`, because no mapping is ever removed and
+a retry could never succeed; a log never is (see "Source time mapping on the event
 route"). Returned profiles expose an `extraction` descriptor; the legacy `path` is empty
 for a log capture.
 
@@ -2798,6 +2799,15 @@ twice. A stream without a window has no sequence overlap check, so the exact ret
 (same request ID) is answered from the receipt, while a new request ID that repeats
 sequences of an unrecorded stream is stored again, never dropped. A stream that
 has a window keeps its overlap `CONFLICT` and gap accounting unchanged.
+
+A window created later, after expiry frees a slot, starts at its first
+observed position as every window does. A registry that would pass its byte bound
+sheds that window's oldest exact gap intervals (`gaps_complete=false`, counts exact)
+rather than refusing. A new window that cannot fit is treated as full, and an
+existing window with nothing left to shed takes the batch without a window update
+and counts it as lost; a later batch of that stream may then show those positions
+as a gap. The same holds for receiver windows.
+
 Source time mapping on the event route (#227). The daemon binds each event source's
 `/event_time` (Unix milliseconds) mapping on its first batch. The mapping registry holds at
 most 1024 sources and never shrinks. A batch from a source past that ceiling is never refused:
@@ -2811,21 +2821,23 @@ sources, the rest in `other_*`, and totals over all sources. A retry of an accep
 returns its receipt and is not counted twice. A source that already has a mapping keeps it,
 and a source with a different mapping still gets `CONFLICT`. Explicit
 `define_time_profile`, `define_log_time_profile` and diagnostic profile declarations past the
-ceiling are still refused with `RESOURCE_LIMIT`: they are not logs.
+ceiling are refused, but with the non-retryable `INVALID_ARGUMENT` (#238): they are not logs,
+and nothing ever removes a mapping row, so no slot frees and a retry could never succeed.
+Once the registry is seen full the daemon remembers it for the life of the process, so a
+batch past the ceiling does not walk the mapping rows again.
 
 A batch that no retry can ever accept is not answered with a retryable code (#227). On the
 event route an over-bound batch (more records than `max_records`, inline bytes over 16 MiB, an
 atomic write over 128 MiB or larger than the whole data budget) answers `INVALID_ARGUMENT`,
-which is not retryable, and the client quarantines it. The `ingest` call answers an inline
-payload over 16 MiB with `INVALID_ARGUMENT` too. Other callers keep `RESOURCE_LIMIT`.
+which is not retryable, and the client quarantines it; an operator who raises `max_records`
+can replay the quarantine file. The size of the joined write, which includes source context
+and authority metadata, is judged at write time against the same whole data budget and
+answers the same non-retryable code. The `ingest` call answers an inline payload over 16 MiB
+with `INVALID_ARGUMENT` too. Other callers keep `RESOURCE_LIMIT`. An input-only refusal
+(record count, sequence count) is decided before the source mapping is bound, so a refused
+batch leaves no mapping behind. A batch refused later, at the write-size checks, can still
+leave the mapping of its source, which every later batch of that source needs anyway.
 
-A window created later, after expiry frees a slot, starts at its first
-observed position as every window does. A registry that would pass its byte bound
-sheds that window's oldest exact gap intervals (`gaps_complete=false`, counts exact)
-rather than refusing. A new window that cannot fit is treated as full, and an
-existing window with nothing left to shed takes the batch without a window update
-and counts it as lost; a later batch of that stream may then show those positions
-as a gap. The same holds for receiver windows.
 The existing Rust `events` example accepts an optional sequence after its
 durability argument so separate invocations can demonstrate ordered batches
 using one instance. Its default sequence remains 1; exact retries keep all
@@ -3426,8 +3438,8 @@ or semantic engine. The public surface includes:
   logging path is nonblocking and drops new events when full; it never silently
   allocates an unlimited queue or stalls a production thread on network I/O. A
   briefly held queue lock makes admission wait, never drop. A permanent daemon
-  refusal of a batch (a non-retryable `INVALID_ARGUMENT` or `CONFLICT`, a batch that can
-  never be accepted, or a batch the client cannot encode) is never reduced to a number: the
+  refusal of a batch (a non-retryable `INVALID_ARGUMENT` or `CONFLICT`, or a batch that can
+  never be accepted) is never reduced to a number: the
   client writes the batch's canonical event lines, the refusal code and reason and the event
   count to one file in `quarantine_dir`, and only then settles the batch. The events are
   counted (`quarantined_events`, with `last_quarantine` naming the refusal), reported by the
@@ -3441,9 +3453,12 @@ or semantic engine. The public surface includes:
   directory and the I/O error, and the write is retried, so that batch is not dropped; later
   events wait behind it and are refused as `Full` once the queue is full. Any other
   non-retryable refusal (a replaced store, a read-only daemon) ends delivery as a terminal
-  failure, and the pending batch and queued events are first written to quarantine files. The daemon storing a
-  refused batch as a malformed record with its reason is the preferred form and is not yet
-  implemented (issue 216). A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
+  failure, and the pending batch and queued events are first written to quarantine files.
+  A batch the client itself cannot encode takes this terminal route too: the client validates
+  every batch before it is sent, so the failure ends delivery and the batch is saved by the
+  terminal save under the code `CLIENT_REFUSED`, not by the per-batch route above. The
+  daemon storing a refused batch as a malformed record with its reason is the preferred form
+  and is not yet implemented (issue 216). A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
   the client holds the batch, bounded by the queue limits, with overflow counted
   as `Full`. A full producer registry is not a refusal any more (#215): the daemon
   stores the batch and counts the lost gap evidence, so the client no longer holds
@@ -3570,7 +3585,9 @@ totals and sampled native activity. The last logical pass includes an explicit
 exhausted/record-limit/scan-budget/payload-budget frontier. Retirement counts do
 not assert physical space freed. Writes are retried with their original request
 identity and their own full physical admission check. A batch larger than the
-entire data allowance is a `RESOURCE_LIMIT`, rather than a reclamation request.
+entire data allowance is a `RESOURCE_LIMIT`, rather than a reclamation request (a producer's
+event batch gets the non-retryable `INVALID_ARGUMENT` for it, see "Source time mapping on
+the event route").
 
 Schema 18 extends the last logical pass with `catalogBudget` and `continuation`.
 The session-local traversal resumes after complete scan/catalog prefixes and

@@ -253,6 +253,20 @@ fn batch_bound(origin: ingest::Origin<'_>, message: impl Into<String>) -> Error 
     Error::new(code, message)
 }
 
+/// The most one atomic ingestion write may carry.
+const ATOMIC_BATCH_BYTES: usize = 128 * 1024 * 1024;
+
+/// Refuse an atomic write over [`ATOMIC_BATCH_BYTES`], with the code `batch_bound` picks.
+fn check_atomic_batch(origin: ingest::Origin<'_>, bytes: usize) -> Result<(), Error> {
+    if bytes > ATOMIC_BATCH_BYTES {
+        return Err(batch_bound(
+            origin,
+            "atomic ingestion batch exceeds 128 MiB; split the import into smaller complete artifacts",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_ingest_labels(request_id: &str, source: &str, format: &str) -> Result<(), Error> {
     if request_id.is_empty() || request_id.len() > 128 || source.is_empty() || source.len() > 512 {
         return Err(Error::new(
@@ -637,6 +651,12 @@ struct Writer {
     /// Tail generations taken while the stored registry was full and nothing could be retired.
     /// They are never written to the registry and are lost with the process (#224).
     unrecorded: std::cell::RefCell<Vec<tail::TailGeneration>>,
+    /// Set once the source mapping registry was seen full (1024 rows). Mappings are never
+    /// removed, so it stays set and a batch past the ceiling skips the walk (#238).
+    source_time_full: std::cell::Cell<bool>,
+    /// Dev-only: how many times a registry admission walked its rows.
+    #[cfg(feature = "test-support")]
+    registry_walks: std::cell::Cell<u64>,
 }
 
 /// The refusal every operation reports once a writer panicked while holding the writer lock.
@@ -1727,6 +1747,9 @@ impl Store {
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
                 retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
                 unrecorded: std::cell::RefCell::new(Vec::new()),
+                source_time_full: std::cell::Cell::new(false),
+                #[cfg(feature = "test-support")]
+                registry_walks: std::cell::Cell::new(0),
             })),
             lease_ledgers: Arc::new([
                 pin_reads.ledger(),
@@ -2025,6 +2048,22 @@ impl Store {
         if intake.is_some() {
             intake::fence(&writer)?;
         }
+        // Refusals that depend only on the input come before the mapping bind: a batch that is
+        // refused must not leave a mapping row behind that spends one of the 1024 slots.
+        let record_count = record_ends(format, bytes, true).count();
+        let producer = origin.producer();
+        if producer.is_some_and(|input| input.sequences.len() != record_count) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "producer sequence count differs from normalized record count",
+            ));
+        }
+        if record_count > writer.config.max_records {
+            return Err(batch_bound(
+                origin,
+                "artifact exceeds configured record count",
+            ));
+        }
         let mut source_time_profile = writer.time_profile(source)?;
         let mut source_time_lost = false;
         if origin.maps_event_time() {
@@ -2045,20 +2084,6 @@ impl Store {
                 "acceptance timestamp overflows retention deadline",
             )
         })?;
-        let record_count = record_ends(format, bytes, true).count();
-        let producer = origin.producer();
-        if producer.is_some_and(|input| input.sequences.len() != record_count) {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "producer sequence count differs from normalized record count",
-            ));
-        }
-        if record_count > writer.config.max_records {
-            return Err(batch_bound(
-                origin,
-                "artifact exceeds configured record count",
-            ));
-        }
         // A full registry never refuses a log (#215): the batch is stored without a window
         // position and the lost gap evidence is counted once the batch commits.
         let stream = producer
@@ -2158,29 +2183,23 @@ impl Store {
         if let Some(receiver) = receiver {
             receiver.publish(&mut batch);
         }
-        if batch.size_in_bytes() > 128 * 1024 * 1024 {
-            return Err(batch_bound(
-                origin,
-                "atomic ingestion batch exceeds 128 MiB; split the import into smaller complete artifacts",
-            ));
-        }
-        if origin.producer().is_some() {
-            // The write cannot fit the data budget even in an empty store: no retry helps.
-            pressure::data_write_ceiling(
-                writer.config.disk_budget,
-                writer.config.maintenance_reserve,
-                estimate,
+        check_atomic_batch(origin, batch.size_in_bytes())?;
+        writer
+            .apply(
+                batch,
+                (mode == durability::Durability::Buffered).then_some(artifact.id.as_str()),
+                Some(estimate),
             )
-            .map_err(|error| match error.code {
-                "RESOURCE_LIMIT" => batch_bound(origin, error.message),
-                _ => error,
+            .map_err(|error| {
+                // `apply` admits the larger of this estimate and the joined batch (source
+                // context and authority metadata included). A write over the whole data
+                // allowance can never fit, so a producer is told so and does not retry.
+                if origin.producer().is_some() && pressure::is_write_ceiling_refusal(&error) {
+                    batch_bound(origin, error.message)
+                } else {
+                    error
+                }
             })?;
-        }
-        writer.apply(
-            batch,
-            (mode == durability::Durability::Buffered).then_some(artifact.id.as_str()),
-            Some(estimate),
-        )?;
         if let Some(row) = tail_checkpoint.and_then(|checkpoint| checkpoint.unrecorded) {
             self.unlocked.tail_evidence.published(
                 &row.declaration.watch,
@@ -2229,6 +2248,12 @@ impl Store {
     #[must_use]
     pub fn source_time_evidence_loss(&self) -> stream_evidence::StreamEvidenceLoss {
         self.unlocked.source_time_evidence.report()
+    }
+
+    /// Dev-only: how many times a source registry admission walked its rows this session.
+    #[cfg(feature = "test-support")]
+    pub fn registry_walks(&self) -> Result<u64, Error> {
+        Ok(self.lock()?.registry_walks.get())
     }
 
     /// Files tailed without a stored checkpoint and finished registry rows retired for room
@@ -3225,6 +3250,28 @@ impl Store {
     ) -> Result<(), Error> {
         self.lock()?.page_hold.set(hold);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod atomic_bound_tests {
+    use super::{ATOMIC_BATCH_BYTES, check_atomic_batch, ingest::Origin, producer_stream};
+
+    /// INVARIANT (#227): an atomic write over 128 MiB can never be accepted, so a producer batch
+    /// is told `INVALID_ARGUMENT` (not retryable) and any other caller keeps `RESOURCE_LIMIT`;
+    /// exactly 128 MiB still passes. A producer batch cannot reach this size through the public
+    /// entries (16 MiB inline, 256 records), so the bound is checked at its own function.
+    #[test]
+    fn a_write_over_128_mib_is_permanent_for_a_producer_and_a_limit_for_others() {
+        let batch = producer_stream::ProducerBatch {
+            instance: [1; 16],
+            sequences: vec![1],
+        };
+        check_atomic_batch(Origin::Producer(&batch), ATOMIC_BATCH_BYTES).unwrap();
+        let producer = check_atomic_batch(Origin::Event(&batch), ATOMIC_BATCH_BYTES + 1);
+        assert_eq!(producer.unwrap_err().code, "INVALID_ARGUMENT");
+        let other = check_atomic_batch(Origin::Ordinary, ATOMIC_BATCH_BYTES + 1);
+        assert_eq!(other.unwrap_err().code, "RESOURCE_LIMIT");
     }
 }
 

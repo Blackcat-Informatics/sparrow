@@ -106,6 +106,9 @@ pub(super) struct Forced {
     /// would.
     #[cfg(feature = "test-support")]
     wait_end_refused: std::sync::atomic::AtomicBool,
+    /// While set, the retirement a pass runs fails, as a store that cannot retire would.
+    #[cfg(feature = "test-support")]
+    retirement_refused: std::sync::atomic::AtomicBool,
 }
 
 impl Forced {
@@ -120,6 +123,8 @@ impl Forced {
             fault: Mutex::new(None),
             #[cfg(feature = "test-support")]
             wait_end_refused: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            retirement_refused: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -221,6 +226,20 @@ impl Forced {
     #[cfg(feature = "test-support")]
     pub(super) fn wait_end_refused(&self) -> bool {
         self.wait_end_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make the retirement of every pass fail (or stop failing).
+    #[cfg(feature = "test-support")]
+    pub(super) fn refuse_retirement(&self, refused: bool) {
+        self.retirement_refused
+            .store(refused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a test made the retirement fail.
+    #[cfg(feature = "test-support")]
+    pub(super) fn retirement_refused(&self) -> bool {
+        self.retirement_refused
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 

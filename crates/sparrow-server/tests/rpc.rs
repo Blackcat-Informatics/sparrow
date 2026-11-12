@@ -1185,6 +1185,80 @@ async fn a_full_generation_registry_still_tails_a_file_and_status_names_it() {
         .await;
 }
 
+/// INVARIANT (#227, #238): a daemon whose source mapping registry is full still stores an event
+/// batch from a new source, and status names that source with its counts, over the wire
+/// (`sourceTimeLoss`, kind `source_time`) and rendered. The earlier test only saw the field
+/// empty, so an enum or render mapping error would have passed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_source_mapping_registry_still_takes_a_batch_and_status_names_the_source() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            {
+                let store = sparrow_server::ServerConfig::read(&config)
+                    .unwrap()
+                    .open_store()
+                    .unwrap();
+                for index in 0..1024 {
+                    store
+                        .define_time_profile(
+                            &format!("mapped-{index}"),
+                            "/event_time",
+                            sparrow_core::TimeRepresentation::UnixMillis,
+                        )
+                        .unwrap();
+                }
+            }
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let mut event = delivery_event("past the ceiling");
+            event.sequence = 1;
+            let batch = sparrow_client::EventBatch {
+                request_id: "past-ceiling".into(),
+                source: "unmapped-source".into(),
+                client_instance: [7; 16],
+                events: vec![event],
+            };
+            let stored = client.events(&batch).await.unwrap();
+            assert_eq!(stored.record_ids.len(), 1);
+            let response = client
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let loss = status.get_source_time_loss().unwrap();
+            let named = loss.get_named().unwrap();
+            assert_eq!(named.len(), 1);
+            let row = named.get(0);
+            assert_eq!(row.get_kind().unwrap(), wire::LostStreamKind::SourceTime);
+            assert_eq!(
+                row.get_source().unwrap().to_str().unwrap(),
+                "unmapped-source"
+            );
+            assert_eq!(row.get_instance().unwrap().to_str().unwrap(), "");
+            assert_eq!((row.get_batches(), row.get_events()), (1, 1));
+            assert_eq!((loss.get_total_batches(), loss.get_total_events()), (1, 1));
+            let rendered = cli(&socket, &["status"]);
+            let report = &rendered["source_time_loss"];
+            assert_eq!(report["named"][0]["kind"].as_str(), Some("source_time"));
+            assert_eq!(
+                report["named"][0]["source"].as_str(),
+                Some("unmapped-source")
+            );
+            assert_eq!(report["named"][0]["events"].as_str(), Some("1"));
+            assert_eq!(report["total_events"].as_str(), Some("1"));
+            drop(client);
+            drop(daemon);
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn active_tail_watches_preserve_partial_lines_rotated_descriptors_and_reopened_checkpoints() {
     tokio::task::LocalSet::new()

@@ -6212,8 +6212,8 @@ fn forced_compaction_family_sizes_include_blob_file_bytes() {
         max_records: 1,
         ..EvictionLimits::default()
     };
-    // Random letters in one line: log text the projection accepts, and too dense for blob compression
-    // to shrink the two 64 KiB chunks below the bound asserted.
+    // Random letters in one line: log text the projection accepts, and too dense for blob
+    // compression to shrink the four 64 KiB chunks (the 256 KiB payload) below the bound asserted.
     let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
     let payload: Vec<u8> = (0..256 * 1024)
         .map(|_| {
@@ -6369,7 +6369,8 @@ fn a_store_that_cannot_end_a_wait_says_so_and_keeps_saying_it() {
 // Value: #220 item 5: a RocksDB background error raised with no pressure episode active was
 // only noticed at the next episode's first pass. Protects: the first pass after it counts it
 // and says so in the status while the store stays Ready and keeps taking writes, and the
-// error is counted once: an old error never fails a later pass or an episode's first pass.
+// error is counted once: an old error never fails a later idle pass. (No episode is entered
+// here; the error counted by an episode's own pass is covered by the forced-compaction tests.)
 #[test]
 fn a_native_error_outside_a_pressure_episode_is_surfaced_at_once_and_once() {
     use sparrow_core::{EvictionLimits, PressurePhase};
@@ -6402,6 +6403,69 @@ fn a_native_error_outside_a_pressure_episode_is_surfaced_at_once_and_once() {
         store.pressure_maintain(30, limits).unwrap().native_errors,
         1
     );
+}
+
+// Value: #235 item 2: a forced compaction that raised a native error and is collected by a
+// pass that ends Ready got two identical journal lines, the status text said no pass was
+// waiting (untrue there) and the forced compaction's own reason was gone. Protects: the
+// Ready pass keeps the forced reason in the one status text, names the native error beside
+// it, counts each once, and a forced panic keeps its reason too.
+#[test]
+fn a_forced_failure_collected_by_a_ready_pass_keeps_its_reason() {
+    use sparrow_core::{EvictionLimits, Fault, PressurePhase};
+    for (fault, reason, native) in [
+        (Fault::NativeError, "the forced compaction failed", 1),
+        (Fault::Panic, "panicked", 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = EvictionLimits {
+            max_records: 1,
+            ..EvictionLimits::default()
+        };
+        let store = store_waiting_on_native_reclamation(dir.path(), limits);
+        store.arm_forced_compaction_fault(fault);
+        store.pressure_maintain(20, limits).unwrap();
+        store.await_native_quiet().unwrap();
+        // The ballast goes away, so the pass that collects the failure ends Ready.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("test-owned-pressure-ballast"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let ready = store.pressure_maintain(30, limits).unwrap();
+        assert_eq!(ready.phase, PressurePhase::Ready);
+        assert_eq!((ready.forced_failures, ready.native_errors), (1, native));
+        let text = ready.failure.unwrap();
+        assert!(text.contains(reason), "{text}");
+        assert!(!text.contains("no pressure pass was waiting"), "{text}");
+        if native == 1 {
+            assert!(text.contains("new background errors"), "{text}");
+        }
+    }
+}
+
+// Value: #235 item 4: a later error in the pass that collected a forced failure, other than
+// the wait-ending commit, left the duty to mark the forced failure reported while the error
+// carried no reason. Protects: the pass error names the forced reason.
+#[test]
+fn a_retirement_error_after_a_collected_forced_failure_carries_its_reason() {
+    use sparrow_core::{EvictionLimits, Fault};
+    let dir = tempfile::tempdir().unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let store = store_waiting_on_native_reclamation(dir.path(), limits);
+    store.arm_forced_compaction_fault(Fault::Panic);
+    store.pressure_maintain(20, limits).unwrap();
+    store.await_native_quiet().unwrap();
+    store.refuse_pressure_retirement(true);
+    let error = store.pressure_maintain(30, limits).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("retirement refused"), "{text}");
+    assert!(text.contains("panicked"), "{text}");
+    assert_eq!(store.pressure_status().unwrap().forced_failures, 1);
 }
 
 #[test]
@@ -15595,6 +15659,7 @@ fn legacy_time_absence_is_explicit_and_broken_declared_profiles_refuse_queries()
 
 #[test]
 fn source_time_registry_has_an_exact_admission_ceiling() {
+    use purrdf_lex::json::record::ToJson;
     use sparrow_core::TimeRepresentation;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -15607,13 +15672,13 @@ fn source_time_registry_has_an_exact_admission_ceiling() {
             )
             .unwrap();
     }
-    assert_eq!(
-        store
-            .define_time_profile("overflow", "/t", TimeRepresentation::UnixMillis)
-            .unwrap_err()
-            .code,
-        "RESOURCE_LIMIT"
-    );
+    // #238: nothing ever removes a mapping row, so no slot frees and a retry could never
+    // succeed; the answer must not be a retryable code. The old answer was RESOURCE_LIMIT.
+    let refused = store
+        .define_time_profile("overflow", "/t", TimeRepresentation::UnixMillis)
+        .unwrap_err();
+    assert_eq!(refused.code, "INVALID_ARGUMENT");
+    assert_eq!(refused.to_json()["retryable"].as_bool(), Some(false));
     assert!(store.time_profile("overflow").unwrap().is_none());
     assert!(
         store
@@ -15676,6 +15741,14 @@ fn event_batch_from_a_source_past_the_mapping_ceiling_is_taken_and_counted() {
     assert_eq!((row.batches, row.events), (1, 2));
     assert_eq!(ingest("late", "overflow").unwrap().id, taken.id);
     assert_eq!(store.source_time_evidence_loss().total_events, 2);
+    // #238: the first batch past the ceiling saw the registry full by walking its rows; the
+    // registry never shrinks, so later batches past it must not walk 1024 rows again under the
+    // writer lock. The old code walked once per batch.
+    let walks = store.registry_walks().unwrap();
+    ingest("later", "overflow-two").unwrap();
+    ingest("latest", "overflow-three").unwrap();
+    assert_eq!(store.registry_walks().unwrap(), walks);
+    assert_eq!(store.source_time_evidence_loss().total_events, 6);
     let mapped_batch = ProducerBatch {
         instance: [9; 16],
         sequences: vec![3, 4],
@@ -15695,7 +15768,7 @@ fn event_batch_from_a_source_past_the_mapping_ceiling_is_taken_and_counted() {
         store.record(&mapped.record_ids[0]).unwrap().event_time,
         EventTime::Known { millis: 1000, .. }
     ));
-    assert_eq!(store.source_time_evidence_loss().total_events, 2);
+    assert_eq!(store.source_time_evidence_loss().total_events, 6);
     assert_eq!(store.stream_evidence_loss().total_events, 0);
 }
 
@@ -15724,6 +15797,21 @@ fn producer_batch_over_a_fixed_bound_is_refused_non_retryable() {
         )
         .unwrap_err();
     assert_eq!(count.code, "INVALID_ARGUMENT");
+    // #238: an event-route batch refused for its input alone must not leave a mapping row that
+    // spends one of the 1024 slots. The old code bound the mapping before this refusal.
+    let events = store
+        .ingest_events_with_intake(
+            "many-events",
+            "event-source",
+            b"{}\n{}\n",
+            &batch,
+            None,
+            1,
+            Durability::Durable,
+        )
+        .unwrap_err();
+    assert_eq!(events.code, "INVALID_ARGUMENT");
+    assert!(store.time_profile("event-source").unwrap().is_none());
     let inline = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
     let one = ProducerBatch {
         instance: [3; 16],
@@ -15736,6 +15824,42 @@ fn producer_batch_over_a_fixed_bound_is_refused_non_retryable() {
     assert_eq!(
         store
             .ingest("plain", "source", "log", b"a\nb\n", 1)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert!(store.records(0).unwrap().is_empty());
+}
+
+/// INVARIANT (#227, #238): a producer batch whose write can never fit the whole data budget is
+/// refused with the non-retryable INVALID_ARGUMENT, whichever estimate (the artifact's or the
+/// joined batch's, judged by `apply`) crosses it; the ordinary `ingest` keeps RESOURCE_LIMIT,
+/// which eviction and expiry rely on to shrink their own batches. The old code answered the
+/// joined-estimate case with a retryable RESOURCE_LIMIT.
+#[test]
+fn producer_batch_over_the_whole_data_budget_is_refused_non_retryable() {
+    use sparrow_core::{Durability, ProducerBatch};
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.maintenance_reserve = 1024 * 1024;
+    limits.disk_budget = limits.maintenance_reserve + 4096;
+    let store = Store::open(dir.path(), limits).unwrap();
+    let batch = ProducerBatch {
+        instance: [4; 16],
+        sequences: vec![1],
+    };
+    let refused = store
+        .ingest_producer("budget", "source", b"{}\n", &batch, 1, Durability::Durable)
+        .unwrap_err();
+    assert_eq!(refused.code, "INVALID_ARGUMENT");
+    assert!(
+        refused.message.contains("data budget"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        store
+            .ingest("plain", "source", "log", b"a\n", 1)
             .unwrap_err()
             .code,
         "RESOURCE_LIMIT"
@@ -23566,4 +23690,73 @@ fn terminal_in_memory_generations_are_evicted_oldest_first_above_the_bound() {
         "NOT_FOUND"
     );
     store.tail_generation(&ids[1]).unwrap();
+}
+
+/// INVARIANT (#231): eviction of an in-memory terminal row obeys the journal binding that guards
+/// stored retirement. The oldest row is bound by an active handoff journal, which still reads
+/// it, so the oldest unbound row is evicted instead; evicting the bound one would answer the
+/// handoff NOT_FOUND. Before the guard the bound row was the one evicted.
+#[test]
+fn an_in_memory_terminal_row_bound_by_a_journal_is_not_evicted() {
+    use sparrow_core::{ConsumptionGeneration, ConsumptionHandoff, TailFinishIntent};
+    let observed = ConsumptionGeneration {
+        device: 1,
+        inode: 101,
+        byte_length: 0,
+        modified: (3, 4),
+        changed: (5, 6),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.watch_registry_replace(None, b"registered").unwrap();
+    fill_tail_registry(&store);
+    let ids: Vec<String> = (0..=sparrow_core::MAX_TAIL_GENERATIONS as u64)
+        .map(|index| {
+            let row = store
+                .tail_start(&full_registry_declaration(100 + index), 10 + index)
+                .unwrap();
+            if index == 0 {
+                store
+                    .tail_finish_start(
+                        &TailFinishIntent {
+                            request_id: "keep-in-memory-finish".into(),
+                            generation_id: row.id.clone(),
+                            watch_revision: 1,
+                            observed: observed.clone(),
+                        },
+                        10,
+                    )
+                    .unwrap();
+            }
+            store
+                .tail_append(&row.id, 0, b"", true, 10 + index)
+                .unwrap();
+            row.id
+        })
+        .collect();
+    store
+        .consumption_handoff_reserve(
+            &ConsumptionHandoff {
+                request_id: "keep-in-memory-handoff".into(),
+                watch: "tail".into(),
+                watch_revision: 1,
+                relative_path: b"f100.log".to_vec(),
+                observed,
+                tail_generation_id: Some(ids[0].clone()),
+            },
+            "full",
+            "log",
+            CONSUMPTION_DIRECTORIES,
+            1000,
+        )
+        .unwrap();
+    store
+        .tail_start(&full_registry_declaration(500), 1000)
+        .unwrap();
+    assert_eq!(store.tail_registry_evidence().retired_terminal, 1);
+    store.tail_generation(&ids[0]).unwrap();
+    assert_eq!(
+        store.tail_generation(&ids[1]).unwrap_err().code,
+        "NOT_FOUND"
+    );
 }

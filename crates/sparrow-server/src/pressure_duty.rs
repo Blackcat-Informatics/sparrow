@@ -137,7 +137,8 @@ impl Duty {
         let progress = self.last != Some(signature);
         self.last = Some(signature);
         // A failed forced compaction is journaled the pass it is seen, never rate-limited.
-        if status.forced_failures > self.failures_reported {
+        let forced_failed = status.forced_failures > self.failures_reported;
+        if forced_failed {
             self.failures_reported = status.forced_failures;
             lines.push(format!(
                 "sparrowd: a forced compaction failed after {} ms: {}",
@@ -146,16 +147,20 @@ impl Duty {
             ));
         }
         // A RocksDB error raised while no pressure pass was waiting on native work fails no
-        // pass; it is journaled the pass it is seen, whatever the phase.
+        // pass; it is journaled the pass it is seen, whatever the phase. A forced compaction
+        // collected in this pass that raised the error carries it in its own line above (the
+        // status text names both), so the error is not journaled a second time.
         if status.native_errors > self.native_reported {
             self.native_reported = status.native_errors;
-            lines.push(format!(
-                "sparrowd: {}",
-                status
-                    .failure
-                    .as_deref()
-                    .unwrap_or("RocksDB reported new background errors; no reason recorded")
-            ));
+            if !forced_failed {
+                lines.push(format!(
+                    "sparrowd: {}",
+                    status
+                        .failure
+                        .as_deref()
+                        .unwrap_or("RocksDB reported new background errors; no reason recorded")
+                ));
+            }
         }
         if status.phase != self.phase {
             let from = self.phase;
@@ -454,6 +459,28 @@ mod tests {
         let first = duty.observe(&status);
         assert_eq!(first.lines.len(), 1);
         assert!(first.lines[0].contains("RocksDB reported 1 new background errors"));
+        assert!(duty.observe(&status).lines.is_empty());
+    }
+
+    // Value: #235 item 2: a forced compaction that raised a native error, collected by a pass
+    // that ends Ready, was journaled twice with the same text. Protects: one line, carrying
+    // the forced reason, and neither count is journaled again by a later pass.
+    #[test]
+    fn a_forced_native_failure_in_a_ready_pass_is_journaled_once_with_its_reason() {
+        let mut duty = Duty::default();
+        let status = PressureStatus {
+            native_errors: 1,
+            forced_failures: 1,
+            forced_compaction_ms: 7,
+            failure: Some(
+                "the forced compaction failed: native error; RocksDB reported 1 new background errors (1 this session)"
+                    .into(),
+            ),
+            ..PressureStatus::default()
+        };
+        let first = duty.observe(&status);
+        assert_eq!(first.lines.len(), 1, "{:?}", first.lines);
+        assert!(first.lines[0].contains("the forced compaction failed: native error"));
         assert!(duty.observe(&status).lines.is_empty());
     }
 }

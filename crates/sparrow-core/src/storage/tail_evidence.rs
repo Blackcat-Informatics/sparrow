@@ -55,7 +55,8 @@ pub struct TailRegistryEvidence {
     pub total_records: u64,
     /// Total bytes over every file.
     pub total_bytes: u64,
-    /// Finished rows retired from the stored registry to make room.
+    /// Finished rows retired to make room: stored rows retired from the registry, and
+    /// in-memory terminal rows evicted above the bound.
     pub retired_terminal: u64,
     /// Of those, rows of a complete generation whose file, if it is still present, is read
     /// again from its start.

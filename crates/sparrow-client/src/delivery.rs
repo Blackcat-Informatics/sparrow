@@ -916,9 +916,14 @@ impl Shared {
                 state.quarantine_failures = state.quarantine_failures.saturating_add(1);
                 drop(state);
                 self.changed.notify_all();
+                // The source error rides inside, so its OS error number and cause stay
+                // reachable through the error chain.
                 Err(Error::Io(std::io::Error::new(
                     failure.error.kind(),
-                    format!("{context}: {}", failure.error),
+                    WriteContext {
+                        context: context.to_owned(),
+                        source: failure.error,
+                    },
                 )))
             }
         }
@@ -1091,6 +1096,23 @@ async fn wait_out_retry_delay(
     }
 }
 
+/// A failed quarantine write: what was being saved and why, over the I/O error that stopped it.
+#[derive(Debug)]
+struct WriteContext {
+    context: String,
+    source: std::io::Error,
+}
+impl std::fmt::Display for WriteContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+impl std::error::Error for WriteContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 enum Action {
     Wait(Option<Duration>),
     Send(Arc<EventBatch>),
@@ -1185,12 +1207,17 @@ async fn run(shared: &Shared) -> Result<(), Error> {
 /// gap evidence (#215), and a source past the 1024-mapping ceiling is stored without a time
 /// mapping (#227). An over-bound batch is answered `INVALID_ARGUMENT` and quarantined. Only an
 /// older daemon still answers these with a retryable `RESOURCE_LIMIT`, which stays held as
-/// before: the client cannot tell it from a busy daemon, and held bytes are never lost. A non-retryable `INVALID_ARGUMENT` or `CONFLICT` (for example
-/// producer sequences that overlap accepted positions, or a source time mapping that differs)
-/// and a batch the client itself cannot encode are about this batch alone: its bytes go to a
-/// quarantine file and later events proceed. Any other non-retryable refusal (a replaced
-/// store, a read-only or unauthorized daemon) is not about this batch: it ends delivery as a
-/// terminal failure, and the held bytes are written to quarantine files first.
+/// before: the client cannot tell it from a busy daemon, and held bytes are never lost. A
+/// non-retryable `INVALID_ARGUMENT` or `CONFLICT` (for example producer sequences that overlap
+/// accepted positions, or a source time mapping that differs) is about this batch alone: its
+/// bytes go to a quarantine file and later events proceed. The client's own
+/// `Error::InvalidArgument` is classed the same way, but the worker validates every batch
+/// before it sends one (`Shared::next`), with the checks `Client::events` encodes with, so a
+/// batch the client cannot encode ends delivery as a terminal failure through `run`, and
+/// `save_held` saves its bytes, instead of reaching this per-batch route. Any other
+/// non-retryable refusal (a replaced store, a read-only or unauthorized daemon) is not about
+/// this batch: it ends delivery as a terminal failure, and the held bytes are written to
+/// quarantine files first.
 fn permanent_refusal(error: &Error) -> bool {
     match error {
         Error::Domain {
@@ -1755,12 +1782,21 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle} missing from {text}");
         }
+        // The source I/O error survives inside, with its OS error number: the old rebuild
+        // from kind and text lost both.
+        let source = std::error::Error::source(error.get_ref().unwrap())
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .unwrap();
+        assert_eq!(source.raw_os_error(), io.raw_os_error());
+        assert!(io.raw_os_error().is_some());
         assert_eq!(shared.state.lock().unwrap().quarantine_failures, 1);
     }
 
-    /// INVARIANT: a batch the client itself cannot encode is classed a permanent refusal and
-    /// reaches a quarantine file under the client's own code, with the encoder's reason, so
-    /// those bytes are kept too. No test drove this route before.
+    /// INVARIANT: the client's own refusal is classed permanent and `save` writes it under the
+    /// client's own code with the encoder's reason, so those bytes are kept too. This covers
+    /// the classification and the file only: the worker validates each batch before the send,
+    /// so no deterministic run drives a batch the queue built into that error (it ends
+    /// delivery as a terminal failure, saved by `save_held`, which the held-events test covers).
     #[test]
     fn a_batch_the_client_cannot_encode_is_quarantined_under_a_client_code() {
         let refusal = Error::InvalidArgument("event text exceeds 16 KiB");
