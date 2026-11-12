@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: e099c688519e9012b87fd58bbf269ef6092d55ad
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 217
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/217
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: c82d356321801e2482e501db076a4fe453c17049
+GhpRsq-Head-Ref: paudley/211-storage-pressure-awaitingreclamation
+GhpRsq-Head-OID: e099c688519e9012b87fd58bbf269ef6092d55ad
+GhpRsq-Result-Tree: f926201f0e973c4592e17b32ed078f1658ff225e
+GhpRsq-Result-Commit: 4e5eff83a0fa9fd02a51df053c478110276dc84c
+GhpRsq-Parent-Hashes: e099c688519e9012b87fd58bbf269ef6092d55ad
+GhpRsq-Squash-Notes-SHA256: 8b5f077f04b3a25a9a318f7bec0992e203e74901760c32c8339441a51b694463
+GhpRsq-Stage-Evidence: none
