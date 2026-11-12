@@ -2050,6 +2050,11 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
         let listeners = status.get_syslog_listeners().unwrap();
         assert_eq!(listeners.len(), 4);
+        // #215: status carries the lost-stream-evidence report and its naming bound.
+        let loss = status.get_stream_evidence_loss().unwrap();
+        assert_eq!(loss.get_max_named(), 16);
+        assert_eq!(loss.get_total_events(), 0);
+        assert!(loss.get_named().unwrap().is_empty());
         let tcp = tcp_client(rpc_address).await.unwrap();
         let endpoint = format!("tcp://{rpc_address}");
         let store_id = client.discovery().store_id.clone();

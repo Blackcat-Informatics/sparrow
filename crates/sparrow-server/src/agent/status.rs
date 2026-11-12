@@ -154,6 +154,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("migrations", migrations(value.get_migrations()?)?)
         .with("query_only", value.get_query_only())
         .with("backup", super::backup::render(value.get_backup()?)?)
+        .with(
+            "stream_evidence_loss",
+            stream_evidence_loss(value.get_stream_evidence_loss()?)?,
+        )
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -339,6 +343,37 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             value.get_record_read_lease_ms().to_string(),
         );
     Ok(output.into())
+}
+
+/// Gap evidence lost to a full producer-stream or receiver-window registry (#215).
+fn stream_evidence_loss(value: wire::stream_evidence_loss::Reader<'_>) -> Result<Value> {
+    let mut named = Vec::new();
+    for stream in value.get_named()? {
+        named.push(Value::from(
+            Object::new()
+                .with(
+                    "kind",
+                    match stream.get_kind()? {
+                        wire::LostStreamKind::Producer => "producer",
+                        wire::LostStreamKind::Receiver => "receiver",
+                    },
+                )
+                .with("source", stream.get_source()?.to_str()?)
+                .with("instance", stream.get_instance()?.to_str()?)
+                .with("batches", stream.get_batches().to_string())
+                .with("events", stream.get_events().to_string()),
+        ));
+    }
+    Ok(Object::new()
+        .with("max_named", u64::from(value.get_max_named()))
+        .with("named", Value::from(named))
+        .with("other_streams", value.get_other_streams().to_string())
+        .with("other_batches", value.get_other_batches().to_string())
+        .with("other_events", value.get_other_events().to_string())
+        .with("other_streams_exact", value.get_other_streams_exact())
+        .with("total_batches", value.get_total_batches().to_string())
+        .with("total_events", value.get_total_events().to_string())
+        .into())
 }
 
 fn recompression(value: wire::recompression_status::Reader<'_>) -> Result<Value> {

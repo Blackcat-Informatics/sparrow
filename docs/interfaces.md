@@ -2671,6 +2671,11 @@ typed syslog uploads have no fabricated receiver position.
 Use full typed record/context metadata, including CLI `context STORE_ID
 RECORD_ID --before 0 --after 0`, to resolve a search result's receiver position.
 
+A full receiver-window registry never refuses a packet (#215): the packet is stored
+without a receiver position, a classified discard is not recorded, and either is
+counted per stream in status `stream_evidence_loss` (kind `receiver`, with the source
+and receiver instance) instead of counting a pressure discard.
+
 Known local refused packets publish a classified observation without a packet
 occurrence. A UDP datagram is kept whole. A TCP frame that is oversize, cut by
 end of stream, broken or stalled publishes the bytes read as a packet and also
@@ -2745,7 +2750,23 @@ window ID, including for the same source and instance. Pins on records preserve
 their original positions without extending the stream summary deadline. The
 bounded registry reclaims expired entries on its next atomic replacement.
 Missing or invalid registry state is a hard storage failure, not an empty
-fallback. Full capacity refuses a new window with `RESOURCE_LIMIT`.
+fallback. Full capacity never refuses a log (#215): the batch is stored without
+stream positions (its records carry no `producer` position) and only that stream's
+gap evidence is lost. The loss is counted per stream and shown in status under
+`stream_evidence_loss`: the `max_named` (16) streams with the most lost positions
+are named by kind, source and instance with their `batches` and `events`, every other
+stream folds into `other_streams`, `other_batches` and `other_events`, and
+`total_batches` and `total_events` cover all streams. The daemon tracks at most 1024
+lost streams; `other_streams_exact` is false when more exist, and their positions are
+still in `other_events` and the totals. The counts live in memory for the daemon's
+life, and a retry of a request already accepted is idempotent and is not counted
+twice. A stream without a window has no sequence overlap check, so the exact retry
+(same request ID) is answered from the receipt, while a new request ID that repeats
+sequences of an unrecorded stream is stored again, never dropped. A stream that has a window keeps its overlap `CONFLICT` and gap accounting
+unchanged. A window created later, after expiry frees a slot, starts at its first
+observed position as every window does. A registry that would pass its byte bound
+sheds that window's oldest exact gap intervals (`gaps_complete=false`, counts exact)
+rather than refusing, and a new window that cannot fit is treated as full.
 The existing Rust `events` example accepts an optional sequence after its
 durability argument so separate invocations can demonstrate ordered batches
 using one instance. Its default sequence remains 1; exact retries keep all
@@ -3346,9 +3367,12 @@ or semantic engine. The public surface includes:
   refusal of a batch (a non-retryable `INVALID_ARGUMENT`, a batch that can never
   fit) quarantines that batch: its events are counted (`quarantined_events`, with
   `last_quarantine` naming the refusal), reported by the next flush as dropped,
-  and later events proceed. A busy or capacity refusal such as the full producer
-  registry (`RESOURCE_LIMIT`) is never quarantined: the client holds the batch,
-  bounded by the queue limits, with overflow counted as `Full`. A busy (retryable) refusal retries the same
+  and later events proceed. A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
+  the client holds the batch, bounded by the queue limits, with overflow counted
+  as `Full`. A full producer registry is not a refusal any more (#215): the daemon
+  stores the batch and counts the lost gap evidence, so the client no longer holds
+  a batch for it. An older daemon still answers it with `RESOURCE_LIMIT`, which
+  the client holds as before. A busy (retryable) refusal retries the same
   batch on the same connection; only a transport failure reconnects.
 - Explicit buffered/durable delivery selection for direct ingestion and
   `flush(durable)`/shutdown that returns the reached receipt watermark or a typed

@@ -3,7 +3,7 @@
 
 //! Bounded producer sequence windows committed with their record occurrences.
 
-use super::{Catalog, DAY, Error, Store, Writer, integer, json, random_id, read_field};
+use super::{Catalog, DAY, Error, Store, Writer, integer, random_id, read_field};
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 
@@ -265,16 +265,20 @@ impl PreparedStream {
     }
 }
 
+/// Prepare the stream window for one batch. `None` means the registry cannot hold a new
+/// window (full, or past its byte bound): the batch is still accepted, without positions,
+/// and the caller counts the lost gap evidence (#215).
 pub(super) fn prepare(
     writer: &Writer,
     source: &str,
     input: &ProducerBatch,
     now: u64,
-) -> Result<PreparedStream, Error> {
+) -> Result<Option<PreparedStream>, Error> {
     input.validate()?;
     let mut streams = registry(writer)?;
     streams.retain(|stream| stream.expires_at > now);
     let instance = super::hex::encode(&input.instance);
+    let mut is_new = false;
     let index = match streams
         .iter()
         .position(|stream| stream.source == source && stream.instance == instance)
@@ -290,11 +294,9 @@ pub(super) fn prepare(
         }
         None => {
             if streams.len() == MAX_PRODUCER_STREAMS {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "producer stream registry full; wait for a finite window to expire",
-                ));
+                return Ok(None);
             }
+            is_new = true;
             streams.push(ProducerStream {
                 id: random_id("producer-stream")?,
                 source: source.to_owned(),
@@ -335,16 +337,29 @@ pub(super) fn prepare(
         .checked_add(30 * DAY)
         .ok_or_else(|| Error::new("INVALID_ARGUMENT", "producer metadata deadline overflow"))?;
     let id = state.id.clone();
-    let encoded = json::write_compact(&Value::from(
-        streams.iter().map(Catalog::encode).collect::<Vec<_>>(),
-    ));
-    if encoded.len() > MAX_PRODUCER_REGISTRY_BYTES {
+    let Some(encoded) = super::sequence_window::encode_bounded(
+        &mut streams,
+        index,
+        MAX_PRODUCER_REGISTRY_BYTES,
+        |stream| {
+            // A new window never displaces recorded evidence; an existing one sheds its own.
+            if is_new || stream.gaps.is_empty() {
+                return false;
+            }
+            stream.gaps.remove(0);
+            stream.gaps_complete = false;
+            true
+        },
+    ) else {
+        if is_new {
+            return Ok(None);
+        }
         return Err(Error::new(
             "RESOURCE_LIMIT",
             "producer registry exceeds persistent byte bound",
         ));
-    }
-    Ok(PreparedStream { id, encoded })
+    };
+    Ok(Some(PreparedStream { id, encoded }))
 }
 
 impl super::sequence_window::Window for ProducerStream {

@@ -73,6 +73,7 @@ pub(crate) mod source_read;
 mod source_summary;
 pub(crate) mod source_time;
 mod store_counters;
+pub(crate) mod stream_evidence;
 pub(crate) mod syslog;
 mod table_options;
 pub(crate) mod tail;
@@ -516,6 +517,8 @@ struct Unlocked {
     retention_waker: Arc<Mutex<Option<RetentionWaker>>>,
     /// The one compaction a stalled pressure wait may force.
     forced: Arc<forced_compaction::Forced>,
+    /// Gap evidence lost to a full stream registry, counted per stream (#215).
+    stream_evidence: stream_evidence::Ledger,
 }
 
 /// A non-blocking callback that asks the retention duty to run a pass now.
@@ -1681,6 +1684,7 @@ impl Store {
                 backup: backup::Slot::default(),
                 retention_waker,
                 forced: Arc::clone(&forced),
+                stream_evidence: stream_evidence::Ledger::default(),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -1988,9 +1992,12 @@ impl Store {
                 "artifact exceeds configured record count",
             ));
         }
+        // A full registry never refuses a log (#215): the batch is stored without a window
+        // position and the lost gap evidence is counted once the batch commits.
         let stream = producer
             .map(|input| producer_stream::prepare(&writer, source, input, now))
-            .transpose()?;
+            .transpose()?
+            .flatten();
         let receiver = origin
             .receiver()
             .map(|input| {
@@ -2005,7 +2012,10 @@ impl Store {
                 }
                 receiver_stream::prepare(&writer, source, input, None, now)
             })
-            .transpose()?;
+            .transpose()?
+            .flatten();
+        let stream_lost = producer.is_some() && stream.is_none();
+        let receiver_lost = origin.receiver().is_some() && receiver.is_none();
         let tail_checkpoint = origin
             .tail()
             .map(|input| tail::prepare(&writer, source, format, input, record_count, now))
@@ -2089,7 +2099,30 @@ impl Store {
             (mode == durability::Durability::Buffered).then_some(artifact.id.as_str()),
             Some(estimate),
         )?;
+        if let Some(input) = producer.filter(|_| stream_lost) {
+            self.unlocked.stream_evidence.record(
+                stream_evidence::LostStreamKind::Producer,
+                source,
+                &hex::encode(&input.instance),
+                record_count as u64,
+            );
+        }
+        if let Some(input) = origin.receiver().filter(|_| receiver_lost) {
+            self.unlocked.stream_evidence.record(
+                stream_evidence::LostStreamKind::Receiver,
+                source,
+                input.instance(),
+                1,
+            );
+        }
         writer.receipt(artifact, mode)
+    }
+
+    /// Gap evidence lost to a full producer-stream or receiver-window registry since the
+    /// store opened, per stream and bounded; it takes no writer lock (#215).
+    #[must_use]
+    pub fn stream_evidence_loss(&self) -> stream_evidence::StreamEvidenceLoss {
+        self.unlocked.stream_evidence.report()
     }
 
     /// Read artifact metadata, including known expired or evicted artifacts.

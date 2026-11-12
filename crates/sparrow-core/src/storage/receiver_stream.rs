@@ -3,7 +3,7 @@
 
 //! Finite durable syslog receiver observations, distinct from sender sequences.
 
-use super::{Catalog, DAY, Error, Store, Writer, integer, json, random_id, read_field};
+use super::{Catalog, DAY, Error, Store, Writer, integer, random_id, read_field};
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 
@@ -36,6 +36,11 @@ impl SyslogReceiver {
             instance: random_id("receiver-instance")?,
             transport: transport.into(),
         })
+    }
+    /// The instance identity that names this receiver's window and its lost-evidence count.
+    #[must_use]
+    pub fn instance(&self) -> &str {
+        &self.instance
     }
     pub(super) fn encode(&self) -> Value {
         Object::new()
@@ -284,13 +289,16 @@ impl PreparedReceiver {
         batch.put(KEY, self.encoded);
     }
 }
+/// Prepare the receiver window for one observation. `None` means the registry cannot hold a
+/// new window (full, or past its byte bound): the packet is still accepted, without a
+/// position, and the caller counts the lost gap evidence (#215).
 pub(super) fn prepare(
     writer: &Writer,
     source: &str,
     receiver: &SyslogReceiver,
     discard: Option<ReceiverDiscard>,
     now: u64,
-) -> Result<PreparedReceiver, Error> {
+) -> Result<Option<PreparedReceiver>, Error> {
     if source.is_empty() || source.len() > 512 {
         return Err(Error::new(
             "INVALID_ARGUMENT",
@@ -299,6 +307,7 @@ pub(super) fn prepare(
     }
     let mut windows = registry(writer)?;
     windows.retain(|window| window.expires_at > now);
+    let mut is_new = false;
     let index = match windows
         .iter()
         .position(|window| window.source == source && window.instance == receiver.instance)
@@ -306,11 +315,9 @@ pub(super) fn prepare(
         Some(index) => index,
         None => {
             if windows.len() == MAX_RECEIVER_WINDOWS {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "receiver window registry full; wait for finite metadata expiry",
-                ));
+                return Ok(None);
             }
+            is_new = true;
             windows.push(ReceiverWindow {
                 id: random_id("syslog-receiver")?,
                 source: source.into(),
@@ -374,14 +381,29 @@ pub(super) fn prepare(
         window_id: state.id.clone(),
         sequence: state.observations,
     };
-    let encoded = json::write_compact(&Value::array(windows.iter().map(Catalog::encode)));
-    if encoded.len() > MAX_RECEIVER_REGISTRY_BYTES {
+    let Some(encoded) = super::sequence_window::encode_bounded(
+        &mut windows,
+        index,
+        MAX_RECEIVER_REGISTRY_BYTES,
+        |window| {
+            // A new window never displaces recorded evidence; an existing one sheds its own.
+            if is_new || window.gaps.is_empty() {
+                return false;
+            }
+            window.gaps.remove(0);
+            window.gaps_complete = false;
+            true
+        },
+    ) else {
+        if is_new {
+            return Ok(None);
+        }
         return Err(Error::new(
             "RESOURCE_LIMIT",
             "receiver registry encoded admission exceeded",
         ));
-    }
-    Ok(PreparedReceiver { position, encoded })
+    };
+    Ok(Some(PreparedReceiver { position, encoded }))
 }
 
 impl super::sequence_window::Window for ReceiverWindow {
@@ -403,15 +425,23 @@ impl Store {
         receiver: &SyslogReceiver,
         reason: ReceiverDiscard,
         now: u64,
-    ) -> Result<ReceiverPosition, Error> {
+    ) -> Result<Option<ReceiverPosition>, Error> {
         let writer = self.lock()?;
-        let prepared = prepare(&writer, source, receiver, Some(reason), now)?;
+        let Some(prepared) = prepare(&writer, source, receiver, Some(reason), now)? else {
+            self.unlocked.stream_evidence.record(
+                super::stream_evidence::LostStreamKind::Receiver,
+                source,
+                &receiver.instance,
+                1,
+            );
+            return Ok(None);
+        };
         let position = prepared.position.clone();
         let mut batch = WriteBatch::default();
         prepared.publish(&mut batch);
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
-        Ok(position)
+        Ok(Some(position))
     }
     /// Accept one packet and its receiver observation in the same synchronized batch.
     pub fn ingest_received_syslog(
