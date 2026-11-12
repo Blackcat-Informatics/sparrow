@@ -8,6 +8,11 @@ use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_
 
 const DAY: u64 = 86_400_000;
 
+/// Hang deadline for the two load-sensitive event-driven tests. The slowest measured
+/// run was 44.41 s (sigkill test under load 33-43, .stage/flaky-tests/s1.log), so five
+/// minutes is about seven times that. It fires only on a hang, never on the passing path.
+const HANG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[test]
 fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_history() {
     use sparrow_core::{EventInterval, EventTime, LogTimeCapture, RecordQuery, TimeRepresentation};
@@ -5553,6 +5558,15 @@ fn catalog_frontiers_resume_a_complete_prefix_without_skipping_admission_failure
 
 #[test]
 fn pressure_recovers_real_native_bytes_and_retries_without_ballast_removal() {
+    sparrow_test_support::deadline::run_within(
+        "pressure_recovers_real_native_bytes_and_retries_without_ballast_removal",
+        "native flush, compaction or reclamation to lower physical bytes under pressure",
+        HANG_DEADLINE,
+        pressure_recovers_real_native_bytes_body,
+    );
+}
+
+fn pressure_recovers_real_native_bytes_body() {
     use sparrow_core::{EvictionLimits, PressurePhase};
     use std::io::Read;
     let dir = tempfile::tempdir().unwrap();
@@ -10233,7 +10247,17 @@ fn streaming_journal_recovers_after_owned_writer_sigkill() {
     });
     // Wait on the child itself, not a timer: the reader sends as soon as the ready
     // line arrives, or false when the child's stdout closes because it died.
-    let ready = receiver.recv();
+    let ready = sparrow_test_support::deadline::try_run_within(
+        "streaming_journal_recovers_after_owned_writer_sigkill",
+        "the child writer to print SPARROW_IMPORT_READY after Store::open, import_begin and import_append",
+        HANG_DEADLINE,
+        move || receiver.recv(),
+    )
+    .unwrap_or_else(|hang| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{hang}");
+    });
     // Always terminate/reap only this owned test child, including readiness
     // failure, before assertions. No store destructor runs in the killed writer.
     let killed = child.kill();
