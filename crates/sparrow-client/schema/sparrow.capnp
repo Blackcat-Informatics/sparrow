@@ -260,6 +260,27 @@ struct Status {
   # Schema 71 (additive, #215): gap evidence lost to a full producer-stream or receiver-window
   # registry since the daemon started. The logs were taken; only the stream's window is absent.
   streamEvidenceLoss @56 :StreamEvidenceLoss;
+  # Schema 71 (additive, #224): files tailed without a stored checkpoint because the generation
+  # registry was full and no finished row could be retired, and rows retired for room.
+  tailRegistryEvidence @57 :TailRegistryEvidence;
+}
+# A full tail generation registry never refuses a file. A file tailed without a stored
+# checkpoint is read again from its start after a restart, so its `records` and `bytes` are at
+# risk of duplication. Counts cover the life of the daemon. The files with the most bytes are
+# named, at most `maxNamed`; the rest fold into `other*`. `otherFilesExact` is false when more
+# files exist than the daemon tracks, so `otherFiles` is then a lower bound.
+struct UnrecordedTailFile {
+  watch @0 :Text; path @1 :Text; source @2 :Text;
+  generations @3 :UInt64; records @4 :UInt64; bytes @5 :UInt64;
+}
+struct TailRegistryEvidence {
+  named @0 :List(UnrecordedTailFile); maxNamed @1 :UInt32;
+  otherFiles @2 :UInt64; otherGenerations @3 :UInt64; otherRecords @4 :UInt64;
+  otherBytes @5 :UInt64; otherFilesExact @6 :Bool;
+  totalGenerations @7 :UInt64; totalRecords @8 :UInt64; totalBytes @9 :UInt64;
+  # Finished rows retired from the stored registry to make room, and how many of those were
+  # complete generations, whose file, if still present, is read again from its start.
+  retiredTerminal @10 :UInt64; retiredDuplicateRisk @11 :UInt64;
 }
 # The streams with the most lost positions are named, at most `maxNamed`; every other stream
 # folds into the `other*` totals. `otherStreamsExact` is false when more streams exist than the

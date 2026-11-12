@@ -597,6 +597,36 @@ pub fn validate_consumption_path(watch: &str, path: &[u8]) -> Result<(), Error> 
 }
 
 impl Writer {
+    /// The bounded active recovery set; a removed journal that is still active is corrupt.
+    pub(super) fn pending_journals(&self) -> Result<Vec<ConsumptionJournal>, Error> {
+        let mut journals = Vec::new();
+        for entry in self.db.prefix_iterator("consumption:") {
+            let (name, _) = entry?;
+            let Some(id) = name.strip_prefix(b"consumption:") else {
+                break;
+            };
+            if journals.len() >= MAX_CONSUMPTION_JOURNALS {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "active consumption registry exceeds its admitted bound",
+                ));
+            }
+            let id = std::str::from_utf8(id)
+                .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+            let journal = self
+                .consumption(id)?
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "active consumption entry missing"))?;
+            if journal.removed_at.is_some() {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    "removed consumption journal remains active",
+                ));
+            }
+            journals.push(journal);
+        }
+        Ok(journals)
+    }
+
     pub(super) fn consumption(&self, id: &str) -> Result<Option<ConsumptionJournal>, Error> {
         self.consumption_admitted(id, None)
     }
@@ -898,33 +928,7 @@ impl Store {
     /// Enumerate the bounded active recovery set, including unpublished claims
     /// and published sources whose removal has not been confirmed.
     pub fn consumption_pending(&self) -> Result<Vec<ConsumptionJournal>, Error> {
-        let writer = self.lock()?;
-        let mut journals = Vec::new();
-        for entry in writer.db.prefix_iterator("consumption:") {
-            let (name, _) = entry?;
-            let Some(id) = name.strip_prefix(b"consumption:") else {
-                break;
-            };
-            if journals.len() >= MAX_CONSUMPTION_JOURNALS {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "active consumption registry exceeds its admitted bound",
-                ));
-            }
-            let id = std::str::from_utf8(id)
-                .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-            let journal = writer
-                .consumption(id)?
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "active consumption entry missing"))?;
-            if journal.removed_at.is_some() {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "removed consumption journal remains active",
-                ));
-            }
-            journals.push(journal);
-        }
-        Ok(journals)
+        self.lock()?.pending_journals()
     }
 
     /// Retire a claim that can never complete, as an operator's explicit decision. The

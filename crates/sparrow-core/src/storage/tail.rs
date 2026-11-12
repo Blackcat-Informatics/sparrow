@@ -4,13 +4,16 @@
 //! Durable file-generation checkpoints, published with the shared record pipeline.
 
 use super::{
-    Artifact, Catalog, DAY, Error, Store, Writer, integer, json, parse, random_id, read_field,
+    Artifact, Catalog, DAY, Error, RETRY_WINDOW, Store, Writer, integer, json, parse, random_id,
+    read_field,
 };
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 use std::collections::BTreeSet;
 
-/// Maximum retained active or recent terminal file generations.
+/// Most generations the stored registry holds, active or recent terminal. A full registry never
+/// refuses a file (#224): a finished row is retired, or the file is tailed under a generation
+/// that is held only in memory. Raising this ceiling would change what every reader accepts.
 pub const MAX_TAIL_GENERATIONS: usize = 64;
 /// Hard pre-decode and publication ceiling for checkpoint metadata.
 pub const MAX_TAIL_REGISTRY_BYTES: usize = 512 * 1024;
@@ -445,25 +448,23 @@ fn bytes(generations: &[TailGeneration]) -> Result<Vec<u8>, Error> {
 }
 
 pub(super) struct Prepared {
-    pub encoded: Vec<u8>,
+    /// The stored registry with this publication, absent for a generation held only in memory.
+    pub encoded: Option<Vec<u8>>,
+    /// The advanced row of a generation held only in memory, to keep after the batch commits.
+    pub unrecorded: Option<TailGeneration>,
     pub id: String,
     pub declaration: TailStart,
     pub offset: u64,
 }
 
-pub(super) fn prepare(
-    writer: &Writer,
+fn advance(
+    row: &mut TailGeneration,
     source: &str,
     format: &str,
     input: Append<'_>,
     count: usize,
     now: u64,
-) -> Result<Prepared, Error> {
-    let mut generations = registry(writer)?;
-    let row = generations
-        .iter_mut()
-        .find(|row| row.id == input.id)
-        .ok_or_else(|| Error::new("NOT_FOUND", "file generation absent"))?;
+) -> Result<(), Error> {
     if row.complete
         || row.gap.is_some()
         || row.offset != input.offset
@@ -505,14 +506,106 @@ pub(super) fn prepare(
                 Error::new("INVALID_ARGUMENT", "tail terminal deadline overflow")
             })?);
     }
-    let id = row.id.clone();
-    let declaration = row.declaration.clone();
+    Ok(())
+}
+
+pub(super) fn prepare(
+    writer: &Writer,
+    source: &str,
+    format: &str,
+    input: Append<'_>,
+    count: usize,
+    now: u64,
+) -> Result<Prepared, Error> {
+    let mut generations = registry(writer)?;
+    if let Some(row) = generations.iter_mut().find(|row| row.id == input.id) {
+        advance(row, source, format, input, count, now)?;
+        let (id, declaration) = (row.id.clone(), row.declaration.clone());
+        return Ok(Prepared {
+            encoded: Some(bytes(&generations)?),
+            unrecorded: None,
+            id,
+            declaration,
+            offset: input.offset,
+        });
+    }
+    let mut row = writer
+        .unrecorded
+        .borrow()
+        .iter()
+        .find(|row| row.id == input.id)
+        .cloned()
+        .ok_or_else(|| Error::new("NOT_FOUND", "file generation absent"))?;
+    advance(&mut row, source, format, input, count, now)?;
     Ok(Prepared {
-        encoded: bytes(&generations)?,
-        id,
-        declaration,
+        encoded: None,
+        id: row.id.clone(),
+        declaration: row.declaration.clone(),
+        unrecorded: Some(row),
         offset: input.offset,
     })
+}
+
+impl Writer {
+    /// Stored rows, then the rows held only in memory, and how many are stored.
+    fn tail_rows(&self) -> Result<(Vec<TailGeneration>, usize), Error> {
+        let mut rows = registry(self)?;
+        let stored = rows.len();
+        rows.extend(self.unrecorded.borrow().iter().cloned());
+        Ok((rows, stored))
+    }
+
+    /// Keep the current state of a generation that is held only in memory.
+    pub(super) fn keep_unrecorded(&self, row: TailGeneration) {
+        let mut rows = self.unrecorded.borrow_mut();
+        match rows.iter_mut().find(|held| held.id == row.id) {
+            Some(held) => *held = row,
+            None => rows.push(row),
+        }
+    }
+
+    /// Publish a changed row: into the stored registry when it lives there, else in memory.
+    fn commit_tail_row(
+        &self,
+        rows: &[TailGeneration],
+        stored: usize,
+        row: &TailGeneration,
+    ) -> Result<(), Error> {
+        if !rows[..stored].iter().any(|held| held.id == row.id) {
+            self.keep_unrecorded(row.clone());
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        batch.put(KEY, bytes(&rows[..stored])?);
+        self.admit_import_batch(&batch)?;
+        self.commit(batch)
+    }
+
+    /// The row to retire for room, oldest terminal time first. Never an active row, a row with
+    /// a pending finish, a discontinued row that carries a finish (it blocks re-import of a
+    /// changed finished file), or a complete row a handoff may still read: one finished less
+    /// than `RETRY_WINDOW` ago or bound by an active consumption journal.
+    fn retirable(&self, rows: &[TailGeneration], now: u64) -> Result<Option<usize>, Error> {
+        let bound: BTreeSet<String> = self
+            .pending_journals()?
+            .into_iter()
+            .filter_map(|journal| journal.tail.map(|tail| tail.id))
+            .collect();
+        Ok(rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let terminal = row.expires_at?.saturating_sub(30 * DAY);
+                let free = if row.complete {
+                    terminal.saturating_add(RETRY_WINDOW) <= now && !bound.contains(&row.id)
+                } else {
+                    row.gap.is_some() && row.finish.is_none()
+                };
+                free.then_some((terminal, index))
+            })
+            .min()
+            .map(|(_, index)| index))
+    }
 }
 
 impl Store {
@@ -525,7 +618,9 @@ impl Store {
             ));
         }
         let writer = self.lock()?;
-        Ok(registry(&writer)?
+        Ok(writer
+            .tail_rows()?
+            .0
             .into_iter()
             .filter(|row| row.declaration.watch == watch)
             .collect())
@@ -537,7 +632,7 @@ impl Store {
     ) -> Result<Option<TailGeneration>, Error> {
         intent.validate()?;
         let writer = self.lock()?;
-        Ok(finished_request(&registry(&writer)?, intent)?.cloned())
+        Ok(finished_request(&writer.tail_rows()?.0, intent)?.cloned())
     }
 
     /// Durably bind a validated final observation; the coordinator owns descriptor certification.
@@ -548,7 +643,7 @@ impl Store {
     ) -> Result<TailGeneration, Error> {
         intent.validate()?;
         let writer = self.lock()?;
-        let mut rows = registry(&writer)?;
+        let (mut rows, stored) = writer.tail_rows()?;
         if let Some(original) = finished_request(&rows, intent)? {
             return Ok(original.clone());
         }
@@ -575,20 +670,23 @@ impl Store {
             finished_at: None,
         });
         let result = row.clone();
-        let mut batch = WriteBatch::default();
-        batch.put(KEY, bytes(&rows)?);
-        writer.admit_import_batch(&batch)?;
-        writer.commit(batch)?;
+        writer.commit_tail_row(&rows, stored, &result)?;
         Ok(result)
     }
 
     /// Declare a generation once; exact declaration retries preserve its current checkpoint.
+    ///
+    /// A full registry never refuses the file (#224). The oldest retirable finished row makes
+    /// room and is counted; when none is retirable the generation is held only in memory, its
+    /// file named and counted in [`Store::tail_registry_evidence`], and a restart reads the file
+    /// again from its start.
     pub fn tail_start(&self, declaration: &TailStart, now: u64) -> Result<TailGeneration, Error> {
         declaration.validate()?;
         let writer = self.lock()?;
         let mut generations = registry(&writer)?;
         if let Some(row) = generations
             .iter()
+            .chain(writer.unrecorded.borrow().iter())
             .find(|row| row.declaration.request_id == declaration.request_id)
         {
             if &row.declaration != declaration {
@@ -600,19 +698,34 @@ impl Store {
             return Ok(row.clone());
         }
         generations.retain(|row| row.expires_at.is_none_or(|deadline| deadline > now));
-        if generations.len() >= MAX_TAIL_GENERATIONS {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "file-generation checkpoint registry is full; resolve active generations or await terminal expiry",
-            ));
+        {
+            let mut held = writer.unrecorded.borrow_mut();
+            held.retain(|row| row.expires_at.is_none_or(|deadline| deadline > now));
+            while held.iter().filter(|row| row.expires_at.is_some()).count() > MAX_TAIL_GENERATIONS
+            {
+                let oldest = held
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, row)| row.expires_at.map(|at| (at, index)))
+                    .min()
+                    .map(|(_, index)| index);
+                if let Some(index) = oldest {
+                    held.remove(index);
+                    self.unlocked.tail_evidence.retired(true);
+                }
+            }
         }
-        if generations.iter().any(|row| {
-            !row.complete
-                && row.gap.is_none()
-                && row.declaration.watch == declaration.watch
-                && row.declaration.device == declaration.device
-                && row.declaration.inode == declaration.inode
-        }) {
+        if generations
+            .iter()
+            .chain(writer.unrecorded.borrow().iter())
+            .any(|row| {
+                !row.complete
+                    && row.gap.is_none()
+                    && row.declaration.watch == declaration.watch
+                    && row.declaration.device == declaration.device
+                    && row.declaration.inode == declaration.inode
+            })
+        {
             return Err(Error::new(
                 "CONFLICT",
                 "opened identity already belongs to an active generation; declare its discontinuity before replacing it",
@@ -629,18 +742,36 @@ impl Store {
             expires_at: None,
             finish: None,
         };
+        let mut retired = None;
+        if generations.len() >= MAX_TAIL_GENERATIONS {
+            let Some(index) = writer.retirable(&generations, now)? else {
+                writer.keep_unrecorded(row.clone());
+                self.unlocked.tail_evidence.started(
+                    &declaration.watch,
+                    &declaration.path,
+                    &declaration.source,
+                );
+                return Ok(row);
+            };
+            retired = Some(generations.remove(index));
+        }
         generations.push(row.clone());
         let mut batch = WriteBatch::default();
         batch.put(KEY, bytes(&generations)?);
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
+        if let Some(gone) = retired {
+            self.unlocked.tail_evidence.retired(gone.complete);
+        }
         Ok(row)
     }
 
     /// Read finite checkpoint metadata; it does not retain expired record bytes.
     pub fn tail_generation(&self, id: &str) -> Result<TailGeneration, Error> {
         let writer = self.lock()?;
-        registry(&writer)?
+        writer
+            .tail_rows()?
+            .0
             .into_iter()
             .find(|row| row.id == id)
             .ok_or_else(|| Error::new("NOT_FOUND", "file generation absent"))
@@ -661,7 +792,7 @@ impl Store {
             ));
         }
         let writer = self.lock()?;
-        let mut generations = registry(&writer)?;
+        let (mut generations, stored) = writer.tail_rows()?;
         let row = generations
             .iter_mut()
             .find(|row| row.id == id)
@@ -682,10 +813,7 @@ impl Store {
             })?);
         }
         let result = row.clone();
-        let mut batch = WriteBatch::default();
-        batch.put(KEY, bytes(&generations)?);
-        writer.admit_import_batch(&batch)?;
-        writer.commit(batch)?;
+        writer.commit_tail_row(&generations, stored, &result)?;
         Ok(result)
     }
 
@@ -723,10 +851,16 @@ impl Store {
                     now,
                 )?;
                 if complete {
-                    let mut batch = WriteBatch::default();
-                    batch.put(KEY, encoded.encoded);
-                    writer.admit_import_batch(&batch)?;
-                    writer.commit(batch)?;
+                    match (encoded.encoded, encoded.unrecorded) {
+                        (Some(encoded), _) => {
+                            let mut batch = WriteBatch::default();
+                            batch.put(KEY, encoded);
+                            writer.admit_import_batch(&batch)?;
+                            writer.commit(batch)?;
+                        }
+                        (None, Some(row)) => writer.keep_unrecorded(row),
+                        (None, None) => {}
+                    }
                 }
             }
             None

@@ -158,6 +158,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "stream_evidence_loss",
             stream_evidence_loss(value.get_stream_evidence_loss()?)?,
         )
+        .with(
+            "tail_registry_evidence",
+            tail_registry_evidence(value.get_tail_registry_evidence()?)?,
+        )
         .with("consume_watches", Value::from(watches))
         .with("durability", Value::from(state))
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -373,6 +377,45 @@ fn stream_evidence_loss(value: wire::stream_evidence_loss::Reader<'_>) -> Result
         .with("other_streams_exact", value.get_other_streams_exact())
         .with("total_batches", value.get_total_batches().to_string())
         .with("total_events", value.get_total_events().to_string())
+        .into())
+}
+
+/// Files tailed without a stored checkpoint, and rows retired for room (#224).
+fn tail_registry_evidence(value: wire::tail_registry_evidence::Reader<'_>) -> Result<Value> {
+    let mut named = Vec::new();
+    for file in value.get_named()? {
+        named.push(Value::from(
+            Object::new()
+                .with("watch", file.get_watch()?.to_str()?)
+                .with("path", file.get_path()?.to_str()?)
+                .with("source", file.get_source()?.to_str()?)
+                .with("generations", file.get_generations().to_string())
+                .with("records", file.get_records().to_string())
+                .with("bytes", file.get_bytes().to_string()),
+        ));
+    }
+    Ok(Object::new()
+        .with("max_named", u64::from(value.get_max_named()))
+        .with("named", Value::from(named))
+        .with("other_files", value.get_other_files().to_string())
+        .with(
+            "other_generations",
+            value.get_other_generations().to_string(),
+        )
+        .with("other_records", value.get_other_records().to_string())
+        .with("other_bytes", value.get_other_bytes().to_string())
+        .with("other_files_exact", value.get_other_files_exact())
+        .with(
+            "total_generations",
+            value.get_total_generations().to_string(),
+        )
+        .with("total_records", value.get_total_records().to_string())
+        .with("total_bytes", value.get_total_bytes().to_string())
+        .with("retired_terminal", value.get_retired_terminal().to_string())
+        .with(
+            "retired_duplicate_risk",
+            value.get_retired_duplicate_risk().to_string(),
+        )
         .into())
 }
 

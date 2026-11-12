@@ -9911,6 +9911,15 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         assert_eq!(report["named"][0]["batches"].as_str(), Some("1"));
         assert_eq!(report["named"][0]["events"].as_str(), Some("2"));
         assert_eq!(report["total_events"].as_str(), Some("2"));
+        // #224: the tail registry evidence is on the wire and in the rendered status, empty
+        // while no file was tailed without a stored checkpoint.
+        let tail = status.get_tail_registry_evidence().unwrap();
+        assert_eq!(tail.get_max_named(), sparrow_core::MAX_NAMED_UNRECORDED_TAILS as u32);
+        assert_eq!((tail.get_total_records(), tail.get_retired_terminal()), (0, 0));
+        let tail = &rendered["tail_registry_evidence"];
+        assert_eq!(tail["named"].as_array().map(Vec::len), Some(0));
+        assert_eq!(tail["other_files_exact"].as_bool(), Some(true));
+        assert_eq!(tail["total_bytes"].as_str(), Some("0"));
         drop(producer); drop(daemon);
     }).await;
 }

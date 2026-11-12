@@ -23011,3 +23011,177 @@ fn backup_to_a_local_disk_fails_before_creating_anything_and_ingest_continues() 
         .ingest("after", "local-backup", "log", b"two\n", 3)
         .unwrap();
 }
+
+fn full_registry_declaration(index: u64) -> sparrow_core::TailStart {
+    sparrow_core::TailStart {
+        request_id: format!("full-registry-{index}"),
+        watch: "tail".into(),
+        watch_revision: 1,
+        directories: CONSUMPTION_DIRECTORIES,
+        path: format!("f{index}.log").into_bytes(),
+        source: "full".into(),
+        format: "log".into(),
+        device: 7,
+        inode: index + 1,
+    }
+}
+
+/// Fill the stored registry with active generations and return their ids.
+fn fill_tail_registry(store: &Store) -> Vec<String> {
+    (0..sparrow_core::MAX_TAIL_GENERATIONS as u64)
+        .map(|index| {
+            store
+                .tail_start(&full_registry_declaration(index), 1)
+                .unwrap()
+                .id
+        })
+        .collect()
+}
+
+/// INVARIANT (#224): a full registry of live generations never turns a file away. The file is
+/// tailed under a generation held only in memory: its lines are stored, its file is named and
+/// its stored records and bytes counted as at risk of duplication, and a restart drops the row
+/// so the file is read again from offset 0. Before #224 the 65th declaration answered
+/// RESOURCE_LIMIT and no line of the file was taken.
+#[test]
+fn a_full_registry_of_live_generations_still_takes_the_file_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let live = fill_tail_registry(&store);
+    let overflow = full_registry_declaration(64);
+    let taken = store.tail_start(&overflow, 2).unwrap();
+    assert_eq!(
+        store.tail_start(&overflow, 3).unwrap(),
+        taken,
+        "a declaration retry keeps the unrecorded generation"
+    );
+    let published = store
+        .tail_append(&taken.id, 0, b"one\ntwo\n", false, 4)
+        .unwrap();
+    assert_eq!((published.source_start, published.source_end), (0, 8));
+    let row = store.tail_generation(&taken.id).unwrap();
+    assert_eq!((row.offset, row.records), (8, 2));
+    store
+        .tail_discontinue(&taken.id, 8, "truncated", 5)
+        .unwrap();
+    assert_eq!(
+        store.tail_generation(&taken.id).unwrap().gap.as_deref(),
+        Some("truncated")
+    );
+    let evidence = store.tail_registry_evidence();
+    assert_eq!(evidence.named.len(), 1);
+    let file = &evidence.named[0];
+    assert_eq!(
+        (
+            file.watch.as_str(),
+            file.path.as_str(),
+            file.source.as_str()
+        ),
+        ("tail", "f64.log", "full")
+    );
+    assert_eq!((file.generations, file.records, file.bytes), (1, 2, 8));
+    assert_eq!(
+        (
+            evidence.total_generations,
+            evidence.total_records,
+            evidence.total_bytes
+        ),
+        (1, 2, 8)
+    );
+    assert_eq!(
+        (evidence.retired_terminal, evidence.retired_duplicate_risk),
+        (0, 0)
+    );
+    for id in &live {
+        assert!(!store.tail_generation(id).unwrap().complete);
+    }
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.tail_generations("tail").unwrap().len(), 64);
+    assert_eq!(
+        store.tail_generation(&taken.id).unwrap_err().code,
+        "NOT_FOUND",
+        "the unrecorded generation does not survive a restart"
+    );
+    let mut redeclared = full_registry_declaration(64);
+    redeclared.request_id = "full-registry-restart".into();
+    let again = store.tail_start(&redeclared, 6).unwrap();
+    assert_ne!(again.id, taken.id);
+    assert_eq!(again.offset, 0, "the file is read again from its start");
+}
+
+/// INVARIANT (#224): the registry makes room by retiring the oldest finished row whose file no
+/// handoff can still need, counted, and never an active row or a complete row inside the settle
+/// window. When nothing is retirable the file is still taken, unrecorded. Before #224 every case
+/// answered RESOURCE_LIMIT.
+#[test]
+fn a_full_registry_retires_the_oldest_finished_row_and_never_a_live_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let ids = fill_tail_registry(&store);
+    let settled = 3 * DAY;
+    // Oldest terminal row: complete at 5, settled by `settled`.
+    store.tail_append(&ids[0], 0, b"", true, 5).unwrap();
+    // A discontinued row without a finish: terminal at 10, never read for exactly-once.
+    store.tail_discontinue(&ids[1], 0, "truncated", 10).unwrap();
+    // Complete only just before the declaration: inside the settle window, so it stays.
+    store
+        .tail_append(&ids[2], 0, b"", true, settled - 1)
+        .unwrap();
+
+    let first = store
+        .tail_start(&full_registry_declaration(100), settled)
+        .unwrap();
+    assert_eq!(
+        store.tail_generation(&ids[0]).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    let evidence = store.tail_registry_evidence();
+    assert_eq!(
+        (evidence.retired_terminal, evidence.retired_duplicate_risk),
+        (1, 1)
+    );
+    assert_eq!(evidence.total_generations, 0);
+
+    let second = store
+        .tail_start(&full_registry_declaration(101), settled)
+        .unwrap();
+    assert_eq!(
+        store.tail_generation(&ids[1]).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    let evidence = store.tail_registry_evidence();
+    assert_eq!(
+        (evidence.retired_terminal, evidence.retired_duplicate_risk),
+        (2, 1)
+    );
+
+    // Nothing retirable is left: the settling row and every active row stay.
+    let third = store
+        .tail_start(&full_registry_declaration(102), settled)
+        .unwrap();
+    assert!(store.tail_generation(&ids[2]).unwrap().complete);
+    for id in &ids[3..] {
+        assert!(!store.tail_generation(id).unwrap().complete);
+    }
+    let evidence = store.tail_registry_evidence();
+    assert_eq!(
+        (evidence.retired_terminal, evidence.total_generations),
+        (2, 1)
+    );
+    assert_eq!(evidence.named[0].path, "f102.log");
+    drop(store);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let stored: Vec<String> = store
+        .tail_generations("tail")
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(stored.len(), 64);
+    assert!(stored.contains(&first.id) && stored.contains(&second.id));
+    assert!(
+        !stored.contains(&third.id),
+        "the unrecorded row is not stored"
+    );
+}
