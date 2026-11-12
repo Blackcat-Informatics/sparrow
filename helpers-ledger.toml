@@ -30,6 +30,20 @@ fingerprints = []
 names = ['^(another_watch_reconciliation|infer_readiness_from_missing_events)$']
 
 [[job]]
+id = "event-test-hang-deadline"
+summary = "Tests that wait on native events share one dev-only hang guard: the body runs on a worker thread and a deadline several times the slowest measured run fails the test with its name and wait target. It adds no wait to the passing path."
+home = "sparrow_test_support::deadline::try_run_within"
+entry_points = ["sparrow_test_support::deadline::run_within"]
+spec = "crates/sparrow-test-support/src/deadline.rs module documentation; AGENTS.md: evidence and verification."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(run_with_timeout|test_deadline|spawn_with_deadline)$']
+
+[[job]]
 id = "owned-process-crash-checkpoints"
 summary = "Test-only production checkpoints share one dev-only marker/wait/kill owner. The parent reaps only its owned child and production claim/SDK/storage owners perform recovery; no simulated publication or deletion path."
 home = "sparrow_test_support::crash::checkpoint"

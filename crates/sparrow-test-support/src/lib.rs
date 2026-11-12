@@ -3,6 +3,9 @@
 
 //! Dev-only shared native storage fixtures. Runtime crates must not depend on this crate.
 
+/// Hang guard for event-driven tests under plain `cargo test`.
+pub mod deadline;
+
 /// Process-crash coordination for test-only production checkpoints.
 pub mod crash;
 
