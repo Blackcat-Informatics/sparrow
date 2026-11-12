@@ -41,6 +41,18 @@ status. A caller must not relabel that return as success. This limitation alone
 does not establish that Sparrow needs selected-file compaction, paginated file
 metadata or a new binding. No alternative binding has been selected.
 
+## Forced compaction ends a stalled wait (#211)
+
+Native controls alone left one state with no end: a retirement whose flush is no
+smaller than what it freed queues no native compaction, so linked bytes never fall
+and the wait never ends. The pressure worker now forces one range compaction of each
+family per wait, once nothing native is pending and linked bytes have not fallen. It
+runs on its own thread, outside the writer lock. The binding discards the native
+status, so only the measured linked bytes judge it; if they still have not fallen the
+wait is released and the next pass retires more. The pass needs the maintenance reserve
+free on the filesystem and otherwise does nothing that writes; its retirement and wait-clear commits are admitted against that reserve, not the free-space floor, which ordinary writes keep. The interface
+document has the status fields and the states that cannot end in process.
+
 ## Resource and failure boundary
 
 Application admission accounts for expected write space and a maintenance

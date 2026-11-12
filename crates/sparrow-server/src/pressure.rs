@@ -26,6 +26,26 @@ pub(crate) fn encode(
     out.set_pending_flushes(status.pending_flushes);
     out.set_pending_compactions(status.pending_compactions);
     out.set_snapshots(status.snapshots);
+    out.set_observed_at(status.observed_at);
+    out.set_linked_bytes(status.linked_bytes);
+    out.set_episode_since(status.episode_since);
+    out.set_phase_since(status.phase_since);
+    out.set_wait_since(status.wait_since);
+    out.set_wait_before_bytes(status.wait_before_bytes);
+    out.set_forced_compactions(status.forced_compactions);
+    out.set_waits_released(status.waits_released);
+    out.set_stalled_passes(status.stalled_passes);
+    out.set_refused_writes(status.refused_writes);
+    out.set_floor_paused_since(status.floor.paused_since);
+    out.set_floor_pauses(status.floor.pauses);
+    out.set_floor_resumes(status.floor.resumes);
+    out.set_floor_refused_writes(status.floor.refused_writes);
+    sparrow_client::encode_optional(
+        out.reborrow().init_waiting_on(),
+        status.waiting_on.as_deref(),
+        |mut out, value| out.set_value(value),
+        |mut out| out.set_absent(()),
+    );
     if let Some(report) = &status.last_pass {
         let mut pass = out.reborrow().init_last_pass().init_present();
         pass.set_records(report.records.len() as u32);
@@ -99,6 +119,18 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
         wire::optional_text::Absent(()) => Value::Null,
         wire::optional_text::Value(value) => Value::from(value?.to_str()?),
     };
+    let waiting_on = match value.get_waiting_on()?.which()? {
+        wire::optional_text::Absent(()) => Value::Null,
+        wire::optional_text::Value(value) => Value::from(value?.to_str()?),
+    };
+    // Ages are measured to the last pass's own clock, so they need no clock here.
+    let since = |started: u64| {
+        if started == 0 {
+            0
+        } else {
+            value.get_observed_at().saturating_sub(started)
+        }
+    };
     Ok(Object::new()
         .with("phase", phase)
         .with("requested_bytes", value.get_requested_bytes().to_string())
@@ -118,6 +150,40 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
             value.get_pending_compactions().to_string(),
         )
         .with("snapshots", value.get_snapshots().to_string())
+        .with("linked_bytes", value.get_linked_bytes().to_string())
+        .with("observed_at", value.get_observed_at().to_string())
+        .with("episode_since", value.get_episode_since().to_string())
+        .with(
+            "episode_age_ms",
+            since(value.get_episode_since()).to_string(),
+        )
+        .with("phase_since", value.get_phase_since().to_string())
+        .with("phase_age_ms", since(value.get_phase_since()).to_string())
+        .with("wait_since", value.get_wait_since().to_string())
+        .with("wait_age_ms", since(value.get_wait_since()).to_string())
+        .with(
+            "wait_before_bytes",
+            value.get_wait_before_bytes().to_string(),
+        )
+        .with(
+            "forced_compactions",
+            value.get_forced_compactions().to_string(),
+        )
+        .with("waits_released", value.get_waits_released().to_string())
+        .with("stalled_passes", value.get_stalled_passes().to_string())
+        .with("refused_writes", value.get_refused_writes().to_string())
+        .with("waiting_on", waiting_on)
+        .with(
+            "free_space_floor",
+            Object::new()
+                .with("paused_since", value.get_floor_paused_since().to_string())
+                .with("pauses", value.get_floor_pauses().to_string())
+                .with("resumes", value.get_floor_resumes().to_string())
+                .with(
+                    "refused_writes",
+                    value.get_floor_refused_writes().to_string(),
+                ),
+        )
         .with("last_pass", pass)
         .with("failure", failure)
         .into())
@@ -174,5 +240,64 @@ mod tests {
         let value = decode(message.get_root_as_reader().unwrap()).unwrap();
         assert_eq!(value["phase"].as_str(), Some("awaiting_archive"));
         assert_eq!(value["last_pass"]["frontier"].as_str(), Some("archive_lag"));
+    }
+
+    // Value: #211 adds wait age, byte, refusal and floor measures to the status wire; an
+    // operator reads them through CLI and MCP. Protects: every new measure survives the
+    // wire, ages are measured to the pass's own clock (no clock in the decoder), and a
+    // status with none of them decodes as zeros, as an older server's does.
+    #[test]
+    fn wait_and_floor_measures_survive_the_wire_with_ages_to_the_passes_clock() {
+        let status = PressureStatus {
+            phase: PressurePhase::AwaitingReclamation,
+            observed_at: 100_000,
+            linked_bytes: 700,
+            episode_since: 40_000,
+            phase_since: 90_000,
+            wait_since: 70_000,
+            wait_before_bytes: 650,
+            forced_compactions: 2,
+            waits_released: 1,
+            stalled_passes: 9,
+            refused_writes: 31,
+            waiting_on: Some("a forced compaction is running".into()),
+            floor: sparrow_core::FloorStatus {
+                paused_since: 99_000,
+                pauses: 3,
+                resumes: 2,
+                refused_writes: 5,
+            },
+            ..PressureStatus::default()
+        };
+        let mut message = capnp::message::Builder::new_default();
+        encode(message.init_root(), &status).unwrap();
+        let value = decode(message.get_root_as_reader().unwrap()).unwrap();
+        for (name, expected) in [
+            ("linked_bytes", "700"),
+            ("wait_before_bytes", "650"),
+            ("wait_age_ms", "30000"),
+            ("episode_age_ms", "60000"),
+            ("phase_age_ms", "10000"),
+            ("forced_compactions", "2"),
+            ("waits_released", "1"),
+            ("stalled_passes", "9"),
+            ("refused_writes", "31"),
+        ] {
+            assert_eq!(value[name].as_str(), Some(expected), "{name}");
+        }
+        assert_eq!(
+            value["waiting_on"].as_str(),
+            Some("a forced compaction is running")
+        );
+        let floor = &value["free_space_floor"];
+        assert_eq!(floor["paused_since"].as_str(), Some("99000"));
+        assert_eq!(floor["pauses"].as_str(), Some("3"));
+        assert_eq!(floor["resumes"].as_str(), Some("2"));
+        assert_eq!(floor["refused_writes"].as_str(), Some("5"));
+        let mut message = capnp::message::Builder::new_default();
+        encode(message.init_root(), &PressureStatus::default()).unwrap();
+        let quiet = decode(message.get_root_as_reader().unwrap()).unwrap();
+        assert_eq!(quiet["wait_age_ms"].as_str(), Some("0"));
+        assert!(quiet["waiting_on"].is_null());
     }
 }

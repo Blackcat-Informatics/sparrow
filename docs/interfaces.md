@@ -234,7 +234,54 @@ watch, consumption and handoff updates; clearing a recovered wait retains the
 fence. Older binaries refuse these formats. Existing stores retain their format
 until durable pressure retirement requires the new invariant. Missing space,
 native failures and malformed or oversized recovery markers remain failures;
-logical retirement does not certify forced native physical reclamation.
+logical retirement does not certify native physical reclamation.
+
+#### The wait for reclamation ends (#211)
+
+`awaitingReclamation` used to end only when linked bytes fell below their value at
+the retirement. A retirement whose flush is no smaller than what it freed, bytes in
+the data directory that RocksDB does not own, or growth during the wait left it
+waiting for ever while every data write answered `STORAGE_PRESSURE`, and a restart
+restored the same wait. Now, once a pass finds no native flush, compaction or
+snapshot pending and linked bytes still not below the wait's start, it forces one
+manual compaction of each family. The compaction runs on its own thread, never under
+the writer lock or in the maintenance loop; the native call returns no status, so
+only the measured linked bytes judge it. The next pass after it ends measures. If
+linked bytes are still not below the wait's start, the wait is released
+(`waitsReleased`) and that same pass retires more evidence: the earlier
+retirement is durable, so waiting longer protects nothing. Evidence still
+protected by a pin or the archive watermark is never retired by this, so a store
+whose every remaining unit is protected stays `blocked` or `awaitingArchive`
+and says so (`waitingOn`, `stalledPasses`); a pin release or archive commit wakes the
+pass at once. These cannot end in process by design: the pin and the archive
+gate are protections that outrank intake, and RocksDB's background-error count
+is cumulative since open and cannot be cleared in place, so a store that
+reports one is `blocked` with a restart instruction until the daemon reopens it.
+
+The pressure pass writes a retirement batch, a flush and the forced compaction. All are
+small beside the maintenance reserve the budget withholds for them, so the pass runs
+below the free-space floor, where it is what frees space, but needs the reserve itself
+free on the filesystem; with less it does nothing that writes and reports why. Its two commits, the retirement batch and the clearing of the wait marker (and only those), are admitted against that reserve instead of the floor; every ordinary write keeps the floor. Expiry,
+import reclamation, leases and online migration write more than they free and still wait
+for the floor.
+
+The worker no longer retries every second and discards the result. After a pass that
+made progress it looks again after a second; each pass that made none doubles the delay
+to a ceiling of 30 seconds, and a pin release, an archive commit or the end of a forced
+compaction runs a pass at once. The daemon journals every entry to and exit from a
+non-ready phase, and, at most once a minute, the passes that made no progress.
+
+The status `pressureStatus` extends additively (schema 71, no version change; an older
+reader ignores the fields and an older server leaves them zero): `observedAt` (the last
+pass's clock), `linkedBytes`, `episodeSince` (intake refused since), `phaseSince`,
+`waitSince` and `waitBeforeBytes` (the wait's start and its linked bytes at the start),
+`forcedCompactions`, `waitsReleased`, `stalledPasses`, `refusedWrites` (data writes
+answered `STORAGE_PRESSURE` at physical admission), `waitingOn` (why the last pass could
+do no more), and for the free-space floor `floorPausedSince`, `floorPauses`,
+`floorResumes` and `floorRefusedWrites`. CLI and MCP render ages as `wait_age_ms`,
+`episode_age_ms` and `phase_age_ms`, measured to `observedAt`. Counters are session-local
+and the clocks of an episode or wait restored at open start at the first pass; the
+stored wait marker is unchanged.
 
 ### Archive-before-delete gate (schema 63)
 
@@ -660,8 +707,8 @@ them in a fixed order apart from the run order: `store-counters`,
 `owner-graph-index`, `source-summary`, `source-context`.
 The migration duty is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
-free-space floor it is skipped, as pressure maintenance, import reclamation and
-retention are; buffered synchronization and the table rewrite still run there.
+free-space floor it is skipped, as import reclamation and retention are; buffered
+synchronization, the table rewrite and pressure maintenance still run there.
 Each page commits its rows and its checkpoint in one synchronized batch through
 the ordinary write path, so it is admitted against the data allowance and a
 failed write latches durability uncertainty as any write does; a restart resumes

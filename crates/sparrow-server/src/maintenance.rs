@@ -3,9 +3,10 @@
 
 //! One joined, serial maintenance owner; RPC retains its own request budget.
 
+use crate::pressure_duty;
 use sparrow_core::{
     EXPIRY_CEILING_MS, Error, EvictionLimits, ExpiryReport, Migration, MigrationPage,
-    RECOMPRESSION_SETTLE_SECONDS, Store,
+    PressureStatus, RECOMPRESSION_SETTLE_SECONDS, Store,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,7 +120,7 @@ impl Job {
             Self::Flush => store.flush_buffered().map(|_| done),
             Self::Pressure => store
                 .pressure_maintain(sparrow_server::now()?, EvictionLimits::default())
-                .map(|_| done),
+                .map(|status| Outcome::Pressured(Box::new(status))),
             // Published journals hold one of 16 import slots until reclaimed.
             Self::Reclaim => store.import_reclaim(sparrow_server::now()?).map(|_| done),
             Self::Expiry => {
@@ -149,6 +150,13 @@ impl Job {
     }
 }
 
+/// Duties that still run below the free-space floor. Synchronization accepts nothing new,
+/// the table rewrite step only turns native rewriting off, and pressure maintenance is what
+/// frees space. Every other duty writes more than it frees, so it waits for the floor.
+const fn runs_below_floor(job: Job) -> bool {
+    matches!(job, Job::Flush | Job::Recompress | Job::Pressure)
+}
+
 /// Wait for the deferral before the next page. Polling it is cancel-safe: a duty that wins
 /// the select leaves the deferral running, and the next poll resumes the same wait.
 async fn deferred_page(
@@ -165,6 +173,8 @@ async fn deferred_page(
 
 enum Outcome {
     Continue,
+    /// A pressure pass's status, which sets the next pass and what the daemon journals.
+    Pressured(Box<PressureStatus>),
     /// The pass report and the clock reading it ran at.
     Expired(ExpiryReport, u64),
     /// The page, and when its job began.
@@ -239,20 +249,25 @@ async fn run(
 ) -> Result<(), String> {
     // A pin release or commit and an archive commit change what expiry may retire; the store
     // notifies this wake without blocking, and a pending wake survives a busy duty.
+    // The same events, and the end of a forced compaction, change what a pressure pass can
+    // do, so they wake it too instead of leaving it to its backoff (#211).
     let wake = Arc::new(Notify::new());
+    let pressure_wake = Arc::new(Notify::new());
     store.set_retention_waker(Some(Arc::new({
         let wake = Arc::clone(&wake);
-        move || wake.notify_one()
+        let pressure_wake = Arc::clone(&pressure_wake);
+        move || {
+            wake.notify_one();
+            pressure_wake.notify_one();
+        }
     })));
     let mut flush = tokio::time::interval(flush_interval);
-    let mut pressure = tokio::time::interval(Duration::from_secs(1));
     let mut reclaim = tokio::time::interval(Duration::from_secs(1));
     let mut leases = tokio::time::interval(LEASE_INTERVAL);
     let mut recompress = tokio::time::interval(RECOMPRESSION_INTERVAL);
     let mut migrate = tokio::time::interval(MIGRATION_RETRY_INTERVAL);
     for interval in [
         &mut flush,
-        &mut pressure,
         &mut reclaim,
         &mut leases,
         &mut recompress,
@@ -263,6 +278,8 @@ async fn run(
     // Buffered synchronization retains its configured initial delay.
     flush.tick().await;
     let mut continuation = false;
+    let mut pressure_duty = pressure_duty::Duty::default();
+    let mut pressure_at = tokio::time::Instant::now();
     // The first pass runs at once; each later one at the deadline the previous one reported.
     let mut expiry_at = tokio::time::Instant::now();
     // Pages continue back to back once the first succeeds, until every migration is
@@ -284,7 +301,8 @@ async fn run(
                 // native work. Only stop admission has strict priority.
                 tokio::select! {
                     _ = flush.tick() => Ok(Job::Flush),
-                    _ = pressure.tick() => Ok(Job::Pressure),
+                    _ = tokio::time::sleep_until(pressure_at) => Ok(Job::Pressure),
+                    _ = pressure_wake.notified() => Ok(Job::Pressure),
                     _ = reclaim.tick() => Ok(Job::Reclaim),
                     _ = recompress.tick() => Ok(Job::Recompress),
                     _ = leases.tick() => Ok(Job::Leases),
@@ -299,15 +317,17 @@ async fn run(
             } => job,
         };
         let job = job?;
-        // Below the free-space floor every write is refused. Synchronizing
-        // accepted writes is still allowed and still needed, and the table
-        // rewrite step must run to turn native rewriting off.
-        if !matches!(job, Job::Flush | Job::Recompress)
-            && store
-                .space_floor()
-                .shortfall()
-                .map_err(|error| format!("free-space check failed: {error}"))?
-                .is_some()
+        // Below the free-space floor every write is refused. Synchronizing accepted writes is
+        // still allowed and still needed, and the table rewrite step must run to turn native
+        // rewriting off. Pressure maintenance runs too: it is what frees space, and it keeps
+        // its own check that the maintenance reserve is free (#211). The floor is observed
+        // on every duty so a pause and its end are counted in status.
+        if store
+            .space_floor()
+            .observe(sparrow_server::now().map_err(|error| format!("clock failed: {error}"))?)
+            .map_err(|error| format!("free-space check failed: {error}"))?
+            .is_some()
+            && !runs_below_floor(job)
         {
             continuation = false;
             migrating = false;
@@ -366,6 +386,13 @@ async fn run(
                     };
             }
             Ok(Outcome::Continue) => {}
+            Ok(Outcome::Pressured(status)) => {
+                let verdict = pressure_duty.observe(&status);
+                for line in &verdict.lines {
+                    eprintln!("{line}");
+                }
+                pressure_at = tokio::time::Instant::now() + verdict.delay;
+            }
             Ok(Outcome::Migrated(page, began)) => {
                 migrating = page.is_some();
                 if migrating {
@@ -378,6 +405,18 @@ async fn run(
                 if let Some(page) = &page {
                     journal.page(page, began);
                 }
+            }
+            Err(error) if matches!(job, Job::Pressure) => {
+                // The store latched the failure as `Blocked`; the duty journals it at a
+                // bounded rate and retries on its backoff, never a busy loop.
+                let verdict = pressure_duty.failed(
+                    sparrow_server::now().unwrap_or_default(),
+                    &error.to_string(),
+                );
+                for line in &verdict.lines {
+                    eprintln!("{line}");
+                }
+                pressure_at = tokio::time::Instant::now() + verdict.delay;
             }
             Err(error) => {
                 eprintln!("sparrowd: {} failed: {error}", job.name());
@@ -402,6 +441,27 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Value: below the free-space floor the daemon used to freeze the whole pressure state
+    // machine exactly when the disk was nearly full (#211). Protects: pressure maintenance
+    // is a duty that runs below the floor, beside the two that never add data, while
+    // every duty that writes more than it frees (expiry, import reclamation, leases,
+    // online migration) still waits for the floor.
+    #[test]
+    fn only_duties_that_free_space_or_add_nothing_run_below_the_floor() {
+        assert!(runs_below_floor(Job::Pressure));
+        assert!(runs_below_floor(Job::Flush));
+        assert!(runs_below_floor(Job::Recompress));
+        for job in [
+            Job::Reclaim,
+            Job::Expiry,
+            Job::Leases,
+            Job::Migrate { defer: false },
+            Job::Migrate { defer: true },
+        ] {
+            assert!(!runs_below_floor(job), "{}", job.name());
+        }
+    }
 
     #[tokio::test]
     async fn backlog_drains_between_ticks_with_pins_and_buffered_flushes() {

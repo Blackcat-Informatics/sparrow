@@ -17,6 +17,7 @@ pub(crate) mod archive;
 mod artifact_rdf;
 pub(crate) mod backup;
 mod event_fallback_rdf;
+mod forced_compaction;
 #[cfg(feature = "test-support")]
 pub use event_fallback_rdf::store_event_fallback_rdf_for_legacy_fixture;
 mod provenance_rdf;
@@ -512,7 +513,9 @@ struct Unlocked {
     backup: backup::Slot,
     /// Wakes the maintenance worker's retention duty after an event that changes what
     /// expiry may retire: a pin release or commit and an archive commit.
-    retention_waker: Mutex<Option<RetentionWaker>>,
+    retention_waker: Arc<Mutex<Option<RetentionWaker>>>,
+    /// The one compaction a stalled pressure wait may force.
+    forced: Arc<forced_compaction::Forced>,
 }
 
 /// A non-blocking callback that asks the retention duty to run a pass now.
@@ -591,6 +594,9 @@ struct Writer {
     id: String,
     config: Config,
     space: space::SpaceFloor,
+    forced: Arc<forced_compaction::Forced>,
+    /// Set while a pressure pass commits reclamation, which the floor does not gate.
+    reclaiming: std::cell::Cell<bool>,
     durability: writer_queue::Observed<durability::State>,
     pressure: writer_queue::Observed<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
@@ -1655,6 +1661,8 @@ impl Store {
             record_read::Reads::default(),
             rdf_view::pages::Reads::default(),
         );
+        let retention_waker = Arc::new(Mutex::new(None));
+        let forced = forced_compaction::Forced::new(Arc::clone(&retention_waker));
         let mut store = Self {
             id: Arc::from(id.as_str()),
             open_files,
@@ -1671,13 +1679,16 @@ impl Store {
                 source_builds: Mutex::default(),
                 artifact_builds: Mutex::default(),
                 backup: backup::Slot::default(),
-                retention_waker: Mutex::default(),
+                retention_waker,
+                forced: Arc::clone(&forced),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
                 id,
                 config,
                 space,
+                forced,
+                reclaiming: std::cell::Cell::new(false),
                 durability,
                 pressure,
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
