@@ -2128,17 +2128,17 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
             let response = client.capability().status_request().send().promise.await.unwrap();
             let status = rpc_ok(response.get().unwrap().get_result().unwrap());
             let listeners = status.get_syslog_listeners().unwrap();
-            if listeners.get(0).get_accepted_messages() == 4 && listeners.get(0).get_framing_failures() == 1
-                && listeners.get(1).get_accepted_messages() == 1 && listeners.get(1).get_truncated_datagrams() == 1
+            if listeners.get(0).get_accepted_messages() == 5 && listeners.get(0).get_framing_failures() == 1
+                && listeners.get(1).get_accepted_messages() == 2 && listeners.get(1).get_truncated_datagrams() == 0
                 && listeners.get(2).get_accepted_messages() == 1 && listeners.get(3).get_accepted_messages() == 1 {
-                assert_eq!(listeners.get(0).get_interpretation_failures(), 1);
-                assert_eq!(status.get_live_records(), 7);
+                assert_eq!(listeners.get(0).get_interpretation_failures(), 2);
+                assert_eq!(status.get_live_records(), 9);
                 break;
             }
             assert!(Instant::now() < deadline, "syslog publication did not reach expected counters");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let idle = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut idle = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let response = client.capability().status_request().send().promise.await.unwrap();
@@ -2146,16 +2146,20 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
             if listener.get_active_connections() == 1 { break; }
             assert!(Instant::now() < deadline); tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        // At the ceiling the arrival closes the longest-idle connection and is served, not refused;
+        // idling between frames is no timeout.
         let excess = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut byte = [0_u8];
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), tokio::io::AsyncReadExt::read(&mut idle, &mut byte)).await.unwrap().unwrap(), 0);
         loop {
             let response = client.capability().status_request().send().promise.await.unwrap();
             let listener = rpc_ok(response.get().unwrap().get_result().unwrap()).get_syslog_listeners().unwrap().get(0);
-            if listener.get_rejected_connections() == 1 && listener.get_timed_out_connections() == 1 && listener.get_active_connections() == 0 { break; }
+            if listener.get_active_connections() == 1 { assert_eq!((listener.get_rejected_connections(), listener.get_timed_out_connections()), (0, 0)); break; }
             assert!(Instant::now() < deadline); tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let observed = cli(&endpoint, &["syslog-listener", &store_id, "syslog-octets", "octets"]);
-        assert_eq!(observed["listener"]["accepted_messages"].as_str(), Some("4"));
-        assert_eq!(observed["listener"]["interpretation_failures"].as_str(), Some("1"));
+        assert_eq!(observed["listener"]["accepted_messages"].as_str(), Some("5"));
+        assert_eq!(observed["listener"]["interpretation_failures"].as_str(), Some("2"));
         assert_eq!(observed["listener"]["framing_failures"].as_str(), Some("1"));
         let receiver_sources = cli(&endpoint, &["sources", &store_id]);
         let mut receiver_ids = std::collections::BTreeMap::new();
@@ -2174,15 +2178,15 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
             assert_eq!(history, result["structuredContent"]);
             if source["source_id"].as_str() == Some("syslog-octets") {
                 assert_eq!(history["observations"].as_str(), Some("6"));
-                assert_eq!(history["accepted"].as_str(), Some("4"));
+                assert_eq!(history["accepted"].as_str(), Some("5"));
                 assert_eq!(history["framing_failures"].as_str(), Some("1"));
-                assert_eq!(history["timed_out"].as_str(), Some("1"));
-                assert_eq!(history["gaps"][0]["first"].as_str(), Some("5"));
+                assert_eq!(history["timed_out"].as_str(), Some("0"));
+                assert_eq!(history["gaps"][0]["first"].as_str(), Some("6"));
             }
             if source["source_id"].as_str() == Some("syslog-datagrams") {
                 assert_eq!(history["observations"].as_str(), Some("2"));
-                assert_eq!(history["accepted"].as_str(), Some("1"));
-                assert_eq!(history["truncated"].as_str(), Some("1"));
+                assert_eq!(history["accepted"].as_str(), Some("2"));
+                assert_eq!(history["truncated"].as_str(), Some("0"));
             }
             receiver_ids.insert(source["source_id"].as_str().unwrap().to_owned(), id.to_owned());
         }
@@ -2205,16 +2209,16 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         let store = sparrow_server::ServerConfig::read(&config).unwrap().open_store().unwrap();
         let now = sparrow_server::now().unwrap();
         let rows: Vec<_> = store.records(now).unwrap().into_iter().filter(|row| row.source == "syslog-octets").collect();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         assert_eq!(store.receiver_window(&receiver_ids["syslog-octets"], now).unwrap().observations, 6);
         for record in rows {
             let position = record.receiver.as_ref().unwrap();
             assert_eq!(position.window_id, receiver_ids["syslog-octets"]);
-            assert!((1..=4).contains(&position.sequence));
+            assert!((1..=5).contains(&position.sequence));
             let bytes = store.bytes(&record.artifact_id, record.byte_start, (record.byte_end-record.byte_start) as usize, now).unwrap();
             let snapshot = record.syslog.unwrap();
             if bytes == modern { assert_eq!(snapshot.structured_data[0].parameters.len(), 2); }
-            else if bytes.starts_with(b"<999>") { assert!(snapshot.diagnostic.is_some()); }
+            else if bytes.starts_with(b"<999>") || bytes == b"9 short" { assert!(snapshot.diagnostic.is_some()); }
             else { assert_eq!(bytes, b"<13>Oct  8 06:25:00 host daemon[123]: legacy needle"); }
         }
         for (source, expected) in [("syslog-lf", b"<13>1 - host app - - - lf needle\r".as_slice()), ("syslog-crlf", b"<13>1 - host app - - - crlf\nneedle")] {

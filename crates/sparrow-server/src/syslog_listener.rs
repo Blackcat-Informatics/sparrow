@@ -98,7 +98,6 @@ struct Counts {
     refused: u64,
     truncated: u64,
     framing_failures: u64,
-    rejected_connections: u64,
     timed_out: u64,
 }
 #[derive(Clone)]
@@ -419,10 +418,15 @@ async fn listen(
     match socket {
         Socket::Tcp(listener) => {
             let connections = Arc::new(Semaphore::new(definition.max_connections));
+            let roster = Arc::new(Roster::default());
             let mut tasks = JoinSet::new();
             // Below the free-space floor every write is refused: accept no connections.
             let mut space = tokio::time::interval(std::time::Duration::from_secs(1));
             let mut space_ok = true;
+            // At the ceiling one arrival is held while the longest-idle connection is closed
+            // at a frame boundary for it; it is never refused.
+            let mut pending: Option<tokio::net::TcpStream> = None;
+            let mut evicting = false;
             let serving = async {
             loop {
                 if *stop.borrow() { break; }
@@ -430,18 +434,27 @@ async fn listen(
                     _ = space.tick() => { space_ok = store.space_floor().shortfall().map_err(io::Error::other)?.is_none(); },
                     changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } },
                     result = tasks.join_next(), if !tasks.is_empty() => { if let Some(result) = result { result.map_err(io::Error::other)??; } },
-                    accepted = listener.accept(), if space_ok => {
-                        let (stream, _) = accepted?;
-                        let Ok(permit) = connections.clone().try_acquire_owned() else { metrics.update(|status| increment(&mut status.counts.rejected_connections))?; continue; };
+                    accepted = listener.accept(), if space_ok && pending.is_none() => {
+                        pending = Some(accepted?.0);
+                        evicting = false;
+                    }
+                    _ = roster.idled.notified(), if pending.is_some() && !evicting && connections.available_permits() == 0 => {}
+                    permit = connections.clone().acquire_owned(), if pending.is_some() => {
+                        let permit = permit.map_err(io::Error::other)?;
+                        let Some(stream) = pending.take() else { continue; };
+                        let lease = roster.enroll()?;
                         metrics.update(|status| { status.active_connections += 1; Ok(()) })?;
                         let metrics = metrics.clone(); let store = store.clone(); let operations = operations.clone(); let stop = stop.clone(); let definition = definition.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let result = receive_tcp(BufReader::with_capacity(4096, stream), &definition, &metrics, store, operations, stop).await;
+                            let result = receive_tcp(BufReader::with_capacity(4096, stream), &definition, &metrics, store, operations, stop, lease).await;
                             metrics.update(|status| { status.active_connections = status.active_connections.checked_sub(1).ok_or_else(|| io::Error::other("syslog connection counter underflow"))?; Ok(()) })?;
                             result
                         });
                     }
+                }
+                if pending.is_some() && !evicting && connections.available_permits() == 0 {
+                    evicting = roster.evict_longest_idle()?;
                 }
             }
             Ok(())
@@ -450,22 +463,14 @@ async fn listen(
             finish_tasks(serving, &mut tasks, &shutdown).await
         }
         Socket::Udp(socket) => {
-            let mut buffer = vec![0; definition.max_message_bytes + 1];
+            // A UDP payload never exceeds 65507 bytes, under the store's ceiling, so a whole datagram
+            // always fits and nothing is cut; `max_message_bytes` frames TCP lines only.
+            let mut buffer = vec![0; sparrow_core::SYSLOG_MESSAGE_BYTES];
             loop {
                 if *stop.borrow() {
                     break;
                 }
                 let size = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } continue; }, received = socket.recv_from(&mut buffer) => received?.0 };
-                if size > definition.max_message_bytes {
-                    discard(
-                        &store,
-                        &metrics,
-                        &operations,
-                        sparrow_core::ReceiverDiscard::Truncated,
-                    )
-                    .await?;
-                    continue;
-                }
                 let Ok(permit) = operations.clone().try_acquire_owned() else {
                     discard(
                         &store,
@@ -490,6 +495,146 @@ async fn listen(
     }
 }
 
+/// How the listener tells which connections are idle at a frame boundary, so a new arrival at
+/// the connection ceiling can reclaim the one idle longest instead of being refused.
+#[derive(Default)]
+struct Roster {
+    slots: Mutex<(u64, std::collections::BTreeMap<u64, Slot>)>,
+    /// Signalled whenever a connection reaches a frame boundary.
+    idled: tokio::sync::Notify,
+}
+struct Slot {
+    idle_since: Option<std::time::Instant>,
+    kick: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl Roster {
+    fn enroll(self: &Arc<Self>) -> io::Result<Lease> {
+        let (kick, kicked) = tokio::sync::oneshot::channel();
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| io::Error::other("syslog roster poisoned"))?;
+        slots.0 += 1;
+        let id = slots.0;
+        slots.1.insert(
+            id,
+            Slot {
+                idle_since: None,
+                kick: Some(kick),
+            },
+        );
+        Ok(Lease {
+            roster: self.clone(),
+            id,
+            kicked,
+        })
+    }
+    /// Ask the connection idle longest to close; `false` when none is idle at a boundary.
+    fn evict_longest_idle(&self) -> io::Result<bool> {
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| io::Error::other("syslog roster poisoned"))?;
+        let victim = slots
+            .1
+            .iter()
+            .filter(|(_, slot)| slot.kick.is_some())
+            .filter_map(|(id, slot)| slot.idle_since.map(|since| (since, *id)))
+            .min()
+            .map(|(_, id)| id);
+        let Some(kick) = victim.and_then(|id| slots.1.get_mut(&id)?.kick.take()) else {
+            return Ok(false);
+        };
+        // A closed receiver means the connection is already ending, which frees its slot.
+        let _ = kick.send(());
+        Ok(true)
+    }
+}
+
+/// One connection's place in the roster; dropping it leaves the roster.
+struct Lease {
+    roster: Arc<Roster>,
+    id: u64,
+    kicked: tokio::sync::oneshot::Receiver<()>,
+}
+impl Lease {
+    fn set_idle(&self, idle: bool) -> io::Result<()> {
+        let mut slots = self
+            .roster
+            .slots
+            .lock()
+            .map_err(|_| io::Error::other("syslog roster poisoned"))?;
+        if let Some(slot) = slots.1.get_mut(&self.id) {
+            slot.idle_since = idle.then(std::time::Instant::now);
+        }
+        drop(slots);
+        if idle {
+            self.roster.idled.notify_one();
+        }
+        Ok(())
+    }
+    /// Whether the listener asked this connection to close at its next frame boundary.
+    fn kicked(&mut self) -> bool {
+        self.kicked.try_recv().is_ok()
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.roster.slots.lock() {
+            slots.1.remove(&self.id);
+        }
+    }
+}
+
+/// Bytes of the frame being read. They live outside the read future so a deadline that
+/// cancels it still leaves every byte read so far to be kept. At most the store ceiling is
+/// held per connection; the rest of an oversize frame is counted and dropped as it arrives.
+#[derive(Default)]
+struct Partial {
+    bytes: Vec<u8>,
+    /// Octet-count header length, excluded from a complete frame but kept in a broken one.
+    body_start: usize,
+    /// Bytes beyond what is kept were read and dropped.
+    dropped: bool,
+}
+
+/// How the read of one frame ended; a deadline is the caller's.
+enum End {
+    Complete,
+    /// Bad octet-count start, a frame cut by end of stream, or a read error.
+    Malformed(String),
+}
+
+enum Fault {
+    Framing(String),
+    TimedOut,
+}
+
+/// The packet to publish and what was lost reading it.
+struct Frame {
+    bytes: Vec<u8>,
+    truncated: bool,
+    fault: Option<Fault>,
+}
+
+impl Partial {
+    fn into_frame(mut self, end: Result<End, tokio::time::error::Elapsed>) -> Frame {
+        let fault = match end {
+            Ok(End::Complete) => {
+                self.bytes.drain(..self.body_start);
+                None
+            }
+            Ok(End::Malformed(reason)) => Some(Fault::Framing(reason)),
+            Err(_) => Some(Fault::TimedOut),
+        };
+        Frame {
+            bytes: self.bytes,
+            truncated: self.dropped,
+            fault,
+        }
+    }
+}
+
 async fn receive_tcp<R: AsyncRead + Unpin>(
     mut stream: R,
     definition: &SyslogListener,
@@ -497,22 +642,29 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
     store: sparrow_core::Store,
     operations: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
+    mut lease: Lease,
 ) -> io::Result<()> {
     let framing = definition
         .framing
         .ok_or_else(|| io::Error::other("TCP syslog framing missing"))?;
+    let deadline = Duration::from_millis(u64::from(definition.read_timeout_ms));
     loop {
-        if *stop.borrow() {
+        if *stop.borrow() || lease.kicked() {
             return Ok(());
         }
-        let result = tokio::select! {
-            changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { return Ok(()); } continue; },
-            frame = tokio::time::timeout(Duration::from_millis(u64::from(definition.read_timeout_ms)), read_frame(&mut stream, framing, definition.max_message_bytes)) => frame,
+        // At a frame boundary a quiet sender is idle, not faulty: no deadline runs here.
+        lease.set_idle(true)?;
+        let first = tokio::select! {
+            biased;
+            first = read_first(&mut stream) => first,
+            _ = &mut lease.kicked => return Ok(()),
+            changed = stop.changed() => { changed.map_err(io::Error::other)?; continue; },
         };
-        let bytes = match result {
-            Ok(Ok(Some(bytes))) => bytes,
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Err(error)) => {
+        lease.set_idle(false)?;
+        let first = match first {
+            Ok(Some(first)) => first,
+            Ok(None) => return Ok(()),
+            Err(error) => {
                 discard(
                     &store,
                     metrics,
@@ -526,80 +678,196 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
                 })?;
                 return Ok(());
             }
-            Err(_) => {
-                discard(
-                    &store,
-                    metrics,
-                    &operations,
-                    sparrow_core::ReceiverDiscard::TimedOut,
-                )
-                .await?;
+        };
+        let mut partial = Partial::default();
+        let end = tokio::select! {
+            changed = stop.changed() => {
+                changed.map_err(io::Error::other)?;
+                discard(&store, metrics, &operations, sparrow_core::ReceiverDiscard::Refused).await?;
+                return Ok(());
+            },
+            end = tokio::time::timeout(deadline, read_frame(&mut stream, framing, definition.max_message_bytes, first, &mut partial)) => end,
+        };
+        // A read error ends the stream like a stall: continuity past it is unknown.
+        let (end, closing) = match end {
+            Ok(Ok(end)) => (Ok(end), false),
+            Ok(Err(error)) => (Ok(End::Malformed(error.to_string())), true),
+            Err(elapsed) => (Err(elapsed), true),
+        };
+        let frame = partial.into_frame(end);
+        let permit = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; discard(&store, metrics, &operations, sparrow_core::ReceiverDiscard::Refused).await?; return Ok(()); }, permit = operations.clone().acquire_owned() => permit.map_err(io::Error::other)? };
+        let accepted = publish(
+            store.clone(),
+            definition.source.clone(),
+            frame.bytes,
+            metrics,
+        )
+        .await?;
+        drop(permit);
+        if frame.truncated {
+            discard(
+                &store,
+                metrics,
+                &operations,
+                sparrow_core::ReceiverDiscard::Truncated,
+            )
+            .await?;
+        }
+        let closing = match frame.fault {
+            None => closing,
+            Some(fault) => {
+                let (reason, message) = match fault {
+                    Fault::Framing(message) => {
+                        (sparrow_core::ReceiverDiscard::FramingFailure, message)
+                    }
+                    Fault::TimedOut => (
+                        sparrow_core::ReceiverDiscard::TimedOut,
+                        "TCP frame deadline expired; continuity unknown".into(),
+                    ),
+                };
+                discard(&store, metrics, &operations, reason).await?;
                 metrics.update(|status| {
-                    status.failure = Some("TCP frame deadline expired; continuity unknown".into());
+                    status.failure = Some(message);
                     Ok(())
                 })?;
-                return Ok(());
+                closing
             }
         };
-        let permit = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; discard(&store, metrics, &operations, sparrow_core::ReceiverDiscard::Refused).await?; return Ok(()); }, permit = operations.clone().acquire_owned() => permit.map_err(io::Error::other)? };
-        let accepted = publish(store.clone(), definition.source.clone(), bytes, metrics).await?;
-        drop(permit);
-        if !accepted {
+        if !accepted || closing {
             return Ok(());
         }
     }
 }
 
+async fn read_first<R: AsyncRead + Unpin>(stream: &mut R) -> io::Result<Option<u8>> {
+    let mut byte = [0_u8];
+    Ok((stream.read(&mut byte).await? == 1).then_some(byte[0]))
+}
+
+/// Read the rest of one frame whose first byte is `first`, keeping every byte that fits and
+/// dropping the remainder of an oversize frame as it arrives, in constant memory.
+///
+/// Octet counting reads exactly the announced length (at most 99999): the whole frame is kept up
+/// to the store's syslog ceiling and only the bytes above it are dropped. A line frame keeps
+/// its first `maximum` bytes. A bad octet-count start keeps the line it begins, so the next
+/// frame starts after the newline. Cancel safe: every byte is in `partial` before the next
+/// await.
 async fn read_frame<R: AsyncRead + Unpin>(
     stream: &mut R,
     framing: SyslogFraming,
     maximum: usize,
-) -> io::Result<Option<Vec<u8>>> {
-    let mut byte = [0_u8];
-    if stream.read(&mut byte).await? == 0 {
-        return Ok(None);
+    first: u8,
+    partial: &mut Partial,
+) -> io::Result<End> {
+    if framing != SyslogFraming::OctetCounting {
+        return read_line(
+            stream,
+            partial,
+            maximum,
+            framing == SyslogFraming::CrLf,
+            first,
+        )
+        .await;
     }
-    if framing == SyslogFraming::OctetCounting {
-        if !(b'1'..=b'9').contains(&byte[0]) {
-            return Err(io::Error::other(
-                "octet count requires a nonzero first digit",
-            ));
-        }
-        let mut size = usize::from(byte[0] - b'0');
-        let mut digits = 1;
-        loop {
-            stream.read_exact(&mut byte).await?;
-            if byte[0] == b' ' {
-                break;
-            }
-            if !byte[0].is_ascii_digit() || digits == 5 {
-                return Err(io::Error::other("invalid bounded octet count"));
-            }
-            size = size * 10 + usize::from(byte[0] - b'0');
-            digits += 1;
-        }
-        if size > maximum {
-            return Err(io::Error::other(
-                "syslog frame exceeds configured packet admission",
-            ));
-        }
-        let mut body = vec![0; size];
-        stream.read_exact(&mut body).await?;
-        return Ok(Some(body));
+    partial.bytes.push(first);
+    if !(b'1'..=b'9').contains(&first) {
+        return bad_start(
+            stream,
+            partial,
+            maximum,
+            "octet count requires a nonzero first digit",
+        )
+        .await;
     }
-    let mut body = Vec::with_capacity(maximum.min(4096));
+    let mut size = usize::from(first - b'0');
+    let mut digits = 1;
     loop {
-        body.push(byte[0]);
-        if byte[0] == b'\n' && (framing == SyslogFraming::Lf || body.ends_with(b"\r\n")) {
-            body.truncate(body.len() - if framing == SyslogFraming::Lf { 1 } else { 2 });
-            return Ok(Some(body));
+        let mut byte = [0_u8];
+        if stream.read(&mut byte).await? == 0 {
+            return Ok(End::Malformed("frame cut inside the octet count".into()));
         }
-        if body.len() > maximum + usize::from(framing == SyslogFraming::CrLf) {
-            return Err(io::Error::other(
-                "syslog frame exceeds configured packet admission",
-            ));
+        partial.bytes.push(byte[0]);
+        if byte[0] == b' ' {
+            break;
         }
-        stream.read_exact(&mut byte).await?;
+        if !byte[0].is_ascii_digit() || digits == 5 {
+            return bad_start(stream, partial, maximum, "invalid bounded octet count").await;
+        }
+        size = size * 10 + usize::from(byte[0] - b'0');
+        digits += 1;
+    }
+    let header = partial.bytes.len();
+    partial.body_start = header;
+    let keep = size.min(sparrow_core::SYSLOG_MESSAGE_BYTES);
+    let mut chunk = [0_u8; 4096];
+    while partial.bytes.len() - header < keep {
+        let want = (keep - (partial.bytes.len() - header)).min(chunk.len());
+        let read = stream.read(&mut chunk[..want]).await?;
+        if read == 0 {
+            return Ok(End::Malformed("frame cut by end of stream".into()));
+        }
+        partial.bytes.extend_from_slice(&chunk[..read]);
+    }
+    let mut rest = size - keep;
+    partial.dropped = rest > 0;
+    while rest > 0 {
+        let want = rest.min(chunk.len());
+        let read = stream.read(&mut chunk[..want]).await?;
+        if read == 0 {
+            return Ok(End::Malformed("frame cut by end of stream".into()));
+        }
+        rest -= read;
+    }
+    Ok(End::Complete)
+}
+
+/// A bad octet-count start: keep the bytes read and the rest of the line, then resume at the
+/// next frame after its newline.
+async fn bad_start<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    partial: &mut Partial,
+    maximum: usize,
+    reason: &str,
+) -> io::Result<End> {
+    // The offending byte is already in `partial`; the line reader takes it back.
+    let Some(bad) = partial.bytes.pop() else {
+        return Ok(End::Malformed(reason.into()));
+    };
+    read_line(stream, partial, maximum, false, bad).await?;
+    Ok(End::Malformed(reason.into()))
+}
+
+/// Read to the line terminator (LF, or CRLF when `crlf`), keeping the first `maximum` content
+/// bytes. The terminator is not part of the packet; with LF framing a preceding CR is.
+async fn read_line<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    partial: &mut Partial,
+    maximum: usize,
+    crlf: bool,
+    mut byte: u8,
+) -> io::Result<End> {
+    // CRLF holds one more byte so an exactly full line's trailing CR can be told from content.
+    let cap = maximum + usize::from(crlf);
+    let mut last = 0_u8;
+    loop {
+        if byte == b'\n' && (!crlf || last == b'\r') {
+            if crlf && !partial.dropped {
+                partial.bytes.pop();
+            }
+            partial.bytes.truncate(maximum);
+            return Ok(End::Complete);
+        }
+        if partial.bytes.len() < cap {
+            partial.bytes.push(byte);
+        } else {
+            partial.dropped = true;
+        }
+        last = byte;
+        let mut next = [0_u8];
+        if stream.read(&mut next).await? == 0 {
+            return Ok(End::Malformed("frame cut by end of stream".into()));
+        }
+        byte = next[0];
     }
 }
 
@@ -632,7 +900,8 @@ impl Status {
         out.set_refused_messages(self.counts.refused);
         out.set_truncated_datagrams(self.counts.truncated);
         out.set_framing_failures(self.counts.framing_failures);
-        out.set_rejected_connections(self.counts.rejected_connections);
+        // Arrivals at the ceiling are served by closing the longest-idle connection, never refused.
+        out.set_rejected_connections(0);
         out.set_timed_out_connections(self.counts.timed_out);
         out.set_continuity_unknown(true);
         out.set_kernel_drops_unknown(self.definition.transport == SyslogTransport::Udp);
@@ -840,9 +1109,24 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"admitted publication");
     }
 
+    /// Read the next frame of `input` the way the listener does: first byte, then the rest.
+    async fn next_frame<R: AsyncRead + Unpin>(
+        stream: &mut R,
+        framing: SyslogFraming,
+        maximum: usize,
+    ) -> Option<Frame> {
+        let first = read_first(stream).await.unwrap()?;
+        let mut partial = Partial::default();
+        let end = read_frame(stream, framing, maximum, first, &mut partial)
+            .await
+            .unwrap();
+        Some(partial.into_frame(Ok(end)))
+    }
+
+    /// INVARIANT: a well-formed frame is read byte-exact in every framing, whatever the
+    /// transport's chunking (a two-byte pipe here), with the trailer excluded.
     #[tokio::test]
-    async fn configured_frames_preserve_octets_delimiters_and_reject_partial_or_oversized_messages()
-    {
+    async fn configured_frames_preserve_octets_and_delimiters() {
         for (framing, input, expected) in [
             (
                 SyslogFraming::OctetCounting,
@@ -859,38 +1143,278 @@ mod tests {
                     .await
                     .unwrap();
             });
-            assert_eq!(
-                read_frame(&mut reader, framing, expected.len())
+            for _ in 0..2 {
+                let frame = next_frame(&mut reader, framing, expected.len())
                     .await
-                    .unwrap()
-                    .unwrap(),
-                expected
-            );
-            assert_eq!(
-                read_frame(&mut reader, framing, expected.len())
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                expected
-            );
+                    .unwrap();
+                assert_eq!(frame.bytes, expected);
+                assert!(frame.fault.is_none() && !frame.truncated);
+            }
             assert!(
-                read_frame(&mut reader, framing, expected.len())
+                next_frame(&mut reader, framing, expected.len())
                     .await
-                    .unwrap()
                     .is_none()
             );
             writing.await.unwrap();
         }
-        for (framing, mut input, maximum) in [
-            (SyslogFraming::OctetCounting, b"05 <34>x".as_slice(), 5),
-            (SyslogFraming::OctetCounting, b"6 <34>x", 6),
-            (SyslogFraming::OctetCounting, b"65537 ", 65536),
-            (SyslogFraming::OctetCounting, b"123456 ", 65536),
-            (SyslogFraming::Lf, b"abc\r\n", 3),
-            (SyslogFraming::CrLf, b"abc\n", 10),
-        ] {
-            assert!(read_frame(&mut input, framing, maximum).await.is_err());
+    }
+
+    /// Value: an octet-counted frame above `max_message_bytes` is a log the store can hold,
+    /// so it is kept whole; only bytes above the store's 65536 ceiling are cut, counted, and
+    /// dropped as they arrive, leaving the next frame in sync on the same stream.
+    #[tokio::test]
+    async fn octet_counted_oversize_is_kept_whole_to_the_store_ceiling_then_cut_and_counted() {
+        let ceiling = sparrow_core::SYSLOG_MESSAGE_BYTES;
+        let mut input = Vec::new();
+        for size in [600, ceiling, ceiling + 1, 99_999] {
+            input.extend_from_slice(format!("{size} ").as_bytes());
+            input.extend(std::iter::repeat_n(b'x', size));
         }
+        input.extend_from_slice(b"5 <34>y");
+        let mut input = input.as_slice();
+        for (kept, truncated) in [
+            (600, false),
+            (ceiling, false),
+            (ceiling, true),
+            (ceiling, true),
+        ] {
+            let frame = next_frame(&mut input, SyslogFraming::OctetCounting, 480)
+                .await
+                .unwrap();
+            assert_eq!(frame.bytes.len(), kept);
+            assert!(frame.bytes.iter().all(|byte| *byte == b'x'));
+            assert_eq!((frame.truncated, frame.fault.is_none()), (truncated, true));
+        }
+        let frame = next_frame(&mut input, SyslogFraming::OctetCounting, 480)
+            .await
+            .unwrap();
+        assert_eq!(frame.bytes, b"<34>y");
+    }
+
+    /// Value: a line above `max_message_bytes` keeps its first `max_message_bytes` bytes and
+    /// the next line is intact, in LF and CRLF, whether the overflow is one byte or a megabyte;
+    /// an exactly full line is not cut.
+    #[tokio::test]
+    async fn oversize_lines_keep_the_prefix_and_resume_at_the_newline() {
+        for (framing, terminator) in [
+            (SyslogFraming::Lf, b"\n".as_slice()),
+            (SyslogFraming::CrLf, b"\r\n".as_slice()),
+        ] {
+            let mut input = Vec::new();
+            for length in [480, 481, 1_000_000] {
+                input.extend(std::iter::repeat_n(b'a', length));
+                input.extend_from_slice(terminator);
+            }
+            input.extend_from_slice(b"next");
+            input.extend_from_slice(terminator);
+            let mut input = input.as_slice();
+            for truncated in [false, true, true] {
+                let frame = next_frame(&mut input, framing, 480).await.unwrap();
+                assert_eq!(frame.bytes, vec![b'a'; 480]);
+                assert_eq!((frame.truncated, frame.fault.is_none()), (truncated, true));
+            }
+            let frame = next_frame(&mut input, framing, 480).await.unwrap();
+            assert_eq!(frame.bytes, b"next");
+        }
+    }
+
+    /// Value: a bad octet-count start or a frame cut by end of stream is still evidence. The
+    /// bytes read are kept as a malformed packet with a framing fault, the bad start's line is
+    /// kept whole, and the next frame after its newline is read normally.
+    #[tokio::test]
+    async fn bad_octet_start_and_cut_frames_keep_their_bytes_and_resynchronise() {
+        let framing = SyslogFraming::OctetCounting;
+        let mut input = b"<34>lf sender\n123456 digits\n05 zero\n6 <34>ok9 short".as_slice();
+        for expected in [b"<34>lf sender".as_slice(), b"123456 digits", b"05 zero"] {
+            let frame = next_frame(&mut input, framing, 480).await.unwrap();
+            assert_eq!(frame.bytes, expected);
+            assert!(matches!(frame.fault, Some(Fault::Framing(_))));
+        }
+        let frame = next_frame(&mut input, framing, 480).await.unwrap();
+        assert_eq!(
+            (frame.bytes.as_slice(), frame.fault.is_none()),
+            (&b"<34>ok"[..], true)
+        );
+        let frame = next_frame(&mut input, framing, 480).await.unwrap();
+        assert_eq!(frame.bytes, b"9 short");
+        assert!(matches!(frame.fault, Some(Fault::Framing(_))));
+        assert!(next_frame(&mut input, framing, 480).await.is_none());
+    }
+
+    struct Listener {
+        _dir: tempfile::TempDir,
+        store: sparrow_core::Store,
+        metrics: Metrics,
+    }
+
+    fn listener(transport: SyslogTransport, connections: usize, timeout_ms: u32) -> Listener {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = crate::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let tcp = transport == SyslogTransport::Tcp;
+        let definition = SyslogListener {
+            id: "listener".into(),
+            address: "127.0.0.1:0".parse().unwrap(),
+            source: "source".into(),
+            transport,
+            framing: tcp.then_some(SyslogFraming::OctetCounting),
+            max_message_bytes: 480,
+            max_connections: connections,
+            read_timeout_ms: timeout_ms,
+        };
+        let metrics = Metrics(Arc::new(Mutex::new(Status {
+            receiver: sparrow_core::SyslogReceiver::new(
+                "listener",
+                if tcp { "tcp_octet_counting" } else { "udp" },
+            )
+            .unwrap(),
+            address: definition.address,
+            definition,
+            active_connections: 0,
+            counts: Counts::default(),
+            failure: None,
+        })));
+        Listener {
+            _dir: dir,
+            store,
+            metrics,
+        }
+    }
+
+    async fn until(metrics: &Metrics, done: impl Fn(&Status) -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done(&metrics.snapshot().unwrap()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("listener did not reach the expected counters");
+    }
+
+    async fn serve(
+        socket: Socket,
+        fixture: &Listener,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<io::Result<()>>) {
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(listen(
+            socket,
+            fixture.metrics.clone(),
+            fixture.store.clone(),
+            Arc::new(Semaphore::new(4)),
+            stopped,
+            stop.clone(),
+        ));
+        (stop, task)
+    }
+
+    /// Value: a sender that stalls inside a frame loses nothing already received: the bytes
+    /// read are published as a malformed packet and `timed_out` is counted. Only a stall
+    /// inside a frame is a fault, so the stream is closed after it.
+    #[tokio::test]
+    async fn a_stall_inside_a_frame_publishes_the_bytes_read_and_counts_timed_out() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 50);
+        let definition = fixture.metrics.snapshot().unwrap().definition;
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"20 <34>half")
+            .await
+            .unwrap();
+        let (_stop, stopped) = watch::channel(false);
+        let lease = Arc::new(Roster::default()).enroll().unwrap();
+        receive_tcp(
+            receiver,
+            &definition,
+            &fixture.metrics,
+            fixture.store.clone(),
+            Arc::new(Semaphore::new(4)),
+            stopped,
+            lease,
+        )
+        .await
+        .unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!((counts.accepted, counts.timed_out), (1, 1));
+        assert_eq!(counts.framing_failures + counts.refused, 0);
+    }
+
+    /// Value: a sender quiet between frames is not faulty. The deadline starts at a frame's
+    /// first byte, so a pause far past it at a boundary costs no count and no connection, and
+    /// the next frame is kept.
+    #[tokio::test]
+    async fn an_idle_sender_at_a_frame_boundary_is_not_a_fault() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 50);
+        let definition = fixture.metrics.snapshot().unwrap().definition;
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let lease = Arc::new(Roster::default()).enroll().unwrap();
+        let metrics = fixture.metrics.clone();
+        let store = fixture.store.clone();
+        let reading = tokio::spawn(async move {
+            receive_tcp(
+                receiver,
+                &definition,
+                &metrics,
+                store,
+                Arc::new(Semaphore::new(4)),
+                stopped,
+                lease,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>x")
+            .await
+            .unwrap();
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        assert!(!reading.is_finished());
+        drop(sender);
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!(counts.timed_out + counts.framing_failures, 0);
+    }
+
+    /// Value: at the connection ceiling a new sender is served, not refused: the connection
+    /// idle longest is closed at its frame boundary (the daemon closes it, with nothing
+    /// unread), and the arrival's frame is then kept.
+    #[tokio::test]
+    async fn a_new_connection_at_the_ceiling_closes_the_longest_idle_one() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let (stop, task) = serve(Socket::Tcp(tcp), &fixture).await;
+        let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        until(&fixture.metrics, |status| status.active_connections == 1).await;
+        let mut arrival = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut arrival, b"5 <34>x")
+            .await
+            .unwrap();
+        let mut byte = [0_u8];
+        assert_eq!(idle.read(&mut byte).await.unwrap(), 0);
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.timed_out, 0);
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    /// Value: a UDP datagram above `max_message_bytes` but within the store ceiling is kept
+    /// whole, not discarded as truncated; nothing is cut, so nothing is counted as cut.
+    #[tokio::test]
+    async fn a_udp_datagram_above_the_configured_size_is_kept_whole() {
+        let fixture = listener(SyslogTransport::Udp, 1, 1000);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let (stop, task) = serve(Socket::Udp(socket), &fixture).await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&vec![b'x'; 481], address).await.unwrap();
+        sender.send_to(&vec![b'x'; 65507], address).await.unwrap();
+        until(&fixture.metrics, |status| status.counts.accepted == 2).await;
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.truncated, 0);
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
     }
 
     #[test]

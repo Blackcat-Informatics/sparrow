@@ -54,7 +54,10 @@ fn valid_transport(value: &str) -> bool {
 pub enum ReceiverDiscard {
     /// Complete message refused by local admission/publication.
     Refused,
-    /// Oversized received UDP datagram, never published as a prefix.
+    /// Bytes of a received packet were cut. The kept prefix is published and this counts
+    /// the cut: a TCP line above the listener's `max_message_bytes`, or an octet-counted
+    /// frame above the store's syslog ceiling. Oversize that fits the ceiling is kept whole
+    /// and is not counted.
     Truncated,
     /// TCP framing failed; no complete packet was asserted.
     FramingFailure,

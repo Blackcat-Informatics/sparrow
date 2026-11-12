@@ -2371,7 +2371,31 @@ maximum message bytes (480..65536), maximum connections (TCP 1..16; UDP 1),
 and complete-frame timeout (1..60000 ms). TCP additionally requires a framing
 law: `octet_counting`, `lf`, or `cr_lf`. The framing trailer is excluded from
 the original packet; LF framing preserves a preceding CR. No framing guesses
-or truncated-prefix publications are allowed. At most four listeners exist.
+are made. At most four listeners exist.
+
+A listener keeps every byte it can and counts every byte it cannot, using the
+existing discard reasons, and no framing case closes a TCP stream or discards a
+frame:
+
+- UDP reads a buffer of the store's 65536-byte syslog ceiling, so each datagram
+  is kept whole. `max_message_bytes` frames TCP lines only.
+- Octet counting reads exactly the announced length (at most five digits). A
+  frame above `max_message_bytes` is kept whole up to 65536 bytes. Above that,
+  the first 65536 bytes are kept, the rest is dropped as it arrives and one
+  `truncated` is counted. The stream stays open.
+- An LF or CRLF line above `max_message_bytes` keeps its first
+  `max_message_bytes` bytes, drops the rest up to the newline without holding
+  it, and counts one `truncated`. The stream stays open.
+- A bad octet-count start publishes the bytes read, with the rest of that line,
+  as a malformed packet, counts one `framing_failure`, and resumes after the
+  newline. A frame cut by end of stream publishes the bytes read as a malformed
+  packet and counts `framing_failure`. A frame that stalls past the timeout
+  publishes the bytes read, counts `timed_out`, and closes the stream. The
+  timeout runs from a frame's first byte, so a sender idle between frames is
+  not a fault. Bytes dropped from such a frame also count `truncated`.
+- When a new connection arrives at the connection ceiling, the connection idle
+  longest at a frame boundary is closed for it, losing no data. The arrival
+  waits for that slot and is not refused, so `rejected_connections` stays zero.
 
 Each accepted packet is one exact-byte `syslog` record, including embedded
 newlines. Its immutable profile records parsed RFC 5424 or RFC 3164 headers,
@@ -2568,8 +2592,8 @@ and zero published source leases using the shared dev-only daemon configuration.
 The reply uses the existing typed `SyslogListenerStatus`: configured listener
 ID, exact source, actual binding, transport/framing, payload/connection/time
 bounds, active connections, observed accepted/refused/malformed/truncated counts,
-connection refusals/timeouts and explicit failure. The canonical CLI/MCP listener
-renderer is also used by status. CLI/MCP wrap it with `store_id`, operation
+connection timeouts (arrivals at the ceiling are never refused) and explicit
+failure. The canonical CLI/MCP listener renderer is also used by status. CLI/MCP wrap it with `store_id`, operation
 `syslog_listener_get` and `listener`. This lookup reads current runtime
 observations, not the source capture's historical counters. Counters reset on
 restart; continuity remains unknown, and UDP kernel/network loss remains
