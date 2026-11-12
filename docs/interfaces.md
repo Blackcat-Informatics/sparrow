@@ -261,7 +261,7 @@ reports one is `blocked` with a restart instruction until the daemon reopens it.
 The pressure pass writes a retirement batch, a flush and the forced compaction. All are
 small beside the maintenance reserve the budget withholds for them, so the pass runs
 below the free-space floor, where it is what frees space, but needs the reserve itself
-free on the filesystem; with less it does nothing that writes and reports why. Expiry,
+free on the filesystem; with less it does nothing that writes and reports why. Its two commits, the retirement batch and the clearing of the wait marker (and only those), are admitted against that reserve instead of the floor; every ordinary write keeps the floor. Expiry,
 import reclamation, leases and online migration write more than they free and still wait
 for the floor.
 

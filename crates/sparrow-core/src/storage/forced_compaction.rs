@@ -64,12 +64,13 @@ impl Forced {
         }
     }
 
-    /// Start the compaction unless one is already running or unacknowledged.
-    pub(super) fn start(self: &Arc<Self>, db: Arc<DB>) -> Result<(), Error> {
+    /// Start the compaction unless one is already running or unacknowledged. Returns
+    /// whether a compaction was started, so callers count only real ones.
+    pub(super) fn start(self: &Arc<Self>, db: Arc<DB>) -> Result<bool, Error> {
         {
             let mut slot = self.slot();
             if *slot != Slot::Idle {
-                return Ok(());
+                return Ok(false);
             }
             *slot = Slot::Running;
         }
@@ -91,7 +92,7 @@ impl Forced {
                     waker();
                 }
             })
-            .map(|_| ())
+            .map(|_| true)
             .map_err(|error| {
                 *self.slot() = Slot::Idle;
                 Error::new(
@@ -102,7 +103,7 @@ impl Forced {
     }
 
     /// Block until no compaction is running, for tests that must observe its end.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn wait_finished(&self) {
         let mut slot = self.slot();
         while *slot == Slot::Running {
@@ -124,5 +125,28 @@ fn compact(db: &DB) {
         if let Some(handle) = db.cf_handle(family) {
             db.compact_range_cf_opt::<&[u8], &[u8]>(handle, None, None, &options);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Value: a forced compaction that is counted but not run breaks "one per stuck wait"
+    // (#211 review). Protects: a finished slot refuses a new start until acknowledged, a
+    // refusal reports that nothing started, and acknowledging lets the next wait run one.
+    #[test]
+    fn a_finished_compaction_must_be_acknowledged_before_the_next_wait_may_start_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::open_default(dir.path()).unwrap());
+        let forced = Forced::new(Arc::default());
+        assert!(forced.start(Arc::clone(&db)).unwrap());
+        forced.wait_finished();
+        assert_eq!(forced.poll(), Slot::Finished(None));
+        assert!(!forced.start(Arc::clone(&db)).unwrap());
+        forced.acknowledge();
+        assert_eq!(forced.poll(), Slot::Idle);
+        assert!(forced.start(db).unwrap());
+        forced.wait_finished();
     }
 }

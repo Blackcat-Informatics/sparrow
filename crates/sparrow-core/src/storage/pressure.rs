@@ -315,6 +315,36 @@ impl Writer {
         ))
     }
 
+    /// Run reclamation commits (the retirement batch and the wait clear, nothing else)
+    /// under the maintenance reserve instead of the free-space floor: they are what
+    /// frees space, and ordinary writes keep the floor.
+    fn reclaiming<T>(&self, work: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        struct Reset<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        self.reclaiming.set(true);
+        let _reset = Reset(&self.reclaiming);
+        work()
+    }
+
+    /// The admission check of a commit: the floor for ordinary writes, the maintenance
+    /// reserve for reclamation.
+    pub(super) fn admit_space(&self) -> Result<(), Error> {
+        if !self.reclaiming.get() {
+            return self.space.check();
+        }
+        match self
+            .space
+            .shortfall_below(self.config.maintenance_reserve)?
+        {
+            Some(shortfall) => Err(Error::new("STORAGE_PRESSURE", shortfall)),
+            None => Ok(()),
+        }
+    }
+
     pub(super) fn native_property(&self, family: &str, name: &str) -> Result<u64, Error> {
         let cf = self
             .db
@@ -348,8 +378,10 @@ impl Writer {
             if state.wait.is_some() {
                 let mut batch = rocksdb::WriteBatch::default();
                 batch.delete(WAIT_KEY);
-                self.commit(batch)?;
+                self.reclaiming(|| self.commit(batch))?;
             }
+            // A finished compaction of this wait must not stand in for the next one's.
+            self.forced.acknowledge();
             state.ready();
             self.eviction.borrow_mut().reset();
             return Ok(state.status.clone());
@@ -404,21 +436,26 @@ impl Writer {
         }
         if let Some(wait) = state.wait {
             if linked < wait.before {
+                self.forced.acknowledge();
                 state.end_wait();
             } else {
                 // Linked bytes have not fallen and no native work is pending or running:
                 // nothing is working to end the wait, so force one compaction.
                 match wait.step {
                     Step::Native => {
-                        self.forced.start(std::sync::Arc::clone(&self.db))?;
-                        state.wait = Some(Wait {
-                            step: Step::Forced,
-                            ..wait
-                        });
-                        state.status.forced_compactions =
-                            state.status.forced_compactions.saturating_add(1);
                         state.enter(PressurePhase::AwaitingReclamation, now);
-                        state.stalled("forced a compaction: linked bytes had not fallen");
+                        if self.forced.start(std::sync::Arc::clone(&self.db))? {
+                            state.wait = Some(Wait {
+                                step: Step::Forced,
+                                ..wait
+                            });
+                            state.status.forced_compactions =
+                                state.status.forced_compactions.saturating_add(1);
+                            state.stalled("forced a compaction: linked bytes had not fallen");
+                        } else {
+                            // An earlier compaction is still running: it is native work.
+                            state.stalled("an earlier forced compaction is still running");
+                        }
                         return Ok(state.status.clone());
                     }
                     Step::Forced => {
@@ -452,8 +489,9 @@ impl Writer {
             }
         }
         state.status.passes = state.status.passes.saturating_add(1);
+        let requested = state.status.requested_bytes;
         let report =
-            self.evict_oldest(now, limits, Some((linked, state.status.requested_bytes)))?;
+            self.reclaiming(|| self.evict_oldest(now, limits, Some((linked, requested))))?;
         state.status.evicted_records = state
             .status
             .evicted_records

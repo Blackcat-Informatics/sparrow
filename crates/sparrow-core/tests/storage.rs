@@ -5779,6 +5779,111 @@ fn pressure_without_the_maintenance_reserve_free_retires_nothing_and_says_why() 
     assert_eq!(store.bytes(&old.id, 0, 4, 20).unwrap(), b"old\n");
 }
 
+// Value: review of #211 found that between the maintenance reserve and the free-space
+// floor the pass's own commits were refused by the floor, so nothing was reclaimed exactly
+// when the disk was nearly full. Protects: with the reserve met and the floor unmet, the
+// retirement batch and the wait clear commit, and an ordinary write is still refused.
+#[test]
+fn retirement_and_wait_clear_commit_with_the_floor_unmet() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings.clone()).unwrap();
+    let first = store
+        .ingest("window-first", "source", "log", b"first\n", 1)
+        .unwrap();
+    drop(store);
+    settings.min_free_bytes = u64::MAX / 4;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let ballast = dir.path().join("test-owned-pressure-ballast");
+    std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let state = store.pressure_maintain(10, limits).unwrap();
+    assert!(state.failure.is_none(), "{:?}", state.failure);
+    assert_eq!(state.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!(state.last_pass.unwrap().records, first.record_ids);
+    std::fs::remove_file(&ballast).unwrap();
+    let ready = store.pressure_maintain(20, limits).unwrap();
+    assert_eq!(ready.phase, PressurePhase::Ready);
+    assert!(ready.failure.is_none());
+    drop(store);
+    let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+    assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
+    drop(db);
+    let store = Store::open(dir.path(), {
+        let mut again = config();
+        again.disk_budget = 16 * 1024 * 1024;
+        again.maintenance_reserve = 4 * 1024 * 1024;
+        again.min_free_bytes = u64::MAX / 4;
+        again
+    })
+    .unwrap();
+    assert_eq!(
+        store
+            .ingest("window-new", "source", "log", b"new\n", 30)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
+}
+
+// Value: review of #211 found a forced compaction counted for a later wait while none
+// ran. Protects: a wait that ended by linked bytes falling, after its forced compaction
+// finished, leaves the next stuck wait able to force and count its own compaction.
+#[test]
+fn a_second_stuck_wait_forces_its_own_compaction_after_the_first_ended_by_recovery() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    for (index, at) in [1_u64, 2, 3].into_iter().enumerate() {
+        store
+            .ingest(&format!("two-{index}"), "source", "log", b"x\n", at)
+            .unwrap();
+    }
+    let ballast = dir.path().join("test-owned-pressure-ballast");
+    let file = std::fs::File::create(&ballast).unwrap();
+    file.set_len(13 * 1024 * 1024).unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    store.pressure_maintain(10, limits).unwrap();
+    file.set_len(14 * 1024 * 1024).unwrap();
+    store.await_native_quiet().unwrap();
+    assert_eq!(
+        store
+            .pressure_maintain(20, limits)
+            .unwrap()
+            .forced_compactions,
+        1
+    );
+    store.await_native_quiet().unwrap();
+    // The first wait ends by recovery (still over the allowance), not by release.
+    file.set_len(12 * 1024 * 1024 + 900 * 1024).unwrap();
+    let recovered = store.pressure_maintain(30, limits).unwrap();
+    assert_eq!((recovered.passes, recovered.waits_released), (2, 0));
+    // The second wait is stuck again and must run a compaction of its own.
+    file.set_len(14 * 1024 * 1024).unwrap();
+    store.await_native_quiet().unwrap();
+    let second = store.pressure_maintain(40, limits).unwrap();
+    assert_eq!(second.forced_compactions, 2);
+    assert!(
+        second
+            .waiting_on
+            .as_deref()
+            .unwrap()
+            .contains("forced a compaction")
+    );
+}
+
 #[test]
 fn invalid_pressure_recovery_markers_refuse_open() {
     for bytes in [

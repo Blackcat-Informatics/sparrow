@@ -50,7 +50,7 @@ family per wait, once nothing native is pending and linked bytes have not fallen
 runs on its own thread, outside the writer lock. The binding discards the native
 status, so only the measured linked bytes judge it; if they still have not fallen the
 wait is released and the next pass retires more. The pass needs the maintenance reserve
-free on the filesystem and otherwise does nothing that writes. The interface
+free on the filesystem and otherwise does nothing that writes; its retirement and wait-clear commits are admitted against that reserve, not the free-space floor, which ordinary writes keep. The interface
 document has the status fields and the states that cannot end in process.
 
 ## Resource and failure boundary

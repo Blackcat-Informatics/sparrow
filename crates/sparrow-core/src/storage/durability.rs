@@ -165,7 +165,7 @@ impl Writer {
         }
         // A refused write leaves the session certifiable; a failed one does not.
         self.durability.borrow().check()?;
-        self.space.check()?;
+        self.admit_space()?;
         let mut publication = super::eviction::Publication::default();
         batch.iterate_cf(&mut publication);
         publication.check()?;

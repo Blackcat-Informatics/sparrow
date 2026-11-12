@@ -595,6 +595,8 @@ struct Writer {
     config: Config,
     space: space::SpaceFloor,
     forced: Arc<forced_compaction::Forced>,
+    /// Set while a pressure pass commits reclamation, which the floor does not gate.
+    reclaiming: std::cell::Cell<bool>,
     durability: writer_queue::Observed<durability::State>,
     pressure: writer_queue::Observed<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
@@ -1686,6 +1688,7 @@ impl Store {
                 config,
                 space,
                 forced,
+                reclaiming: std::cell::Cell::new(false),
                 durability,
                 pressure,
                 eviction: std::cell::RefCell::new(eviction::Cursor::default()),
