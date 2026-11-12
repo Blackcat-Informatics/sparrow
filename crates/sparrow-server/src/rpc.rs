@@ -1050,6 +1050,7 @@ fn encode_stream_evidence_loss(
         row.set_kind(match stream.kind {
             sparrow_core::LostStreamKind::Producer => wire::LostStreamKind::Producer,
             sparrow_core::LostStreamKind::Receiver => wire::LostStreamKind::Receiver,
+            sparrow_core::LostStreamKind::SourceTime => wire::LostStreamKind::SourceTime,
         });
         row.set_source(&stream.source);
         row.set_instance(&stream.instance);
@@ -2090,12 +2091,9 @@ impl wire::sparrow::Server for Rpc {
         let intake = self.intake;
         match self
             .work(move |store, now| {
-                store.define_time_profile(
-                    &input.source,
-                    "/event_time",
-                    sparrow_core::TimeRepresentation::UnixMillis,
-                )?;
-                store.ingest_producer_with_intake(
+                // The store binds the source's /event_time mapping; a full source registry
+                // stores the batch with unknown time and counts it (#227).
+                store.ingest_events_with_intake(
                     &input.request_id,
                     &input.source,
                     &bytes,
@@ -3048,6 +3046,10 @@ impl wire::sparrow::Server for Rpc {
                     out.reborrow().init_stream_evidence_loss(),
                     &self.store.stream_evidence_loss(),
                 );
+                encode_stream_evidence_loss(
+                    out.reborrow().init_source_time_loss(),
+                    &self.store.source_time_evidence_loss(),
+                );
                 encode_tail_registry_evidence(
                     out.reborrow().init_tail_registry_evidence(),
                     &self.store.tail_registry_evidence(),
@@ -3130,8 +3132,9 @@ impl wire::sparrow::Server for Rpc {
         if bytes.len() > sparrow_core::INLINE_ARTIFACT_BYTES {
             failure(
                 results.get().init_result(),
+                // No retry shortens the request: not retryable (#227).
                 Error {
-                    code: "RESOURCE_LIMIT",
+                    code: "INVALID_ARGUMENT",
                     message: "inline ingestion carries at most 16 MiB; stage a larger artifact through importBegin".into(),
                 },
             );

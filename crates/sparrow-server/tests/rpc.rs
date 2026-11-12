@@ -6832,10 +6832,13 @@ async fn oversized_single_json_ships_whole_ingests_and_reads_back_exactly() {
                 .unwrap()
             {
                 wire::result::Error(error) => {
+                    // #227: no retry shortens the request, so it is not retryable.
+                    let error = error.unwrap();
                     assert_eq!(
-                        error.unwrap().get_code().unwrap().to_str().unwrap(),
-                        "RESOURCE_LIMIT"
+                        error.get_code().unwrap().to_str().unwrap(),
+                        "INVALID_ARGUMENT"
                     );
+                    assert!(!error.get_retryable());
                 }
                 wire::result::Ok(_) => panic!("an inline message above 16 MiB was accepted"),
             }
@@ -10178,6 +10181,13 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         assert_eq!(tail["named"].as_array().map(Vec::len), Some(0));
         assert_eq!(tail["other_files_exact"].as_bool(), Some(true));
         assert_eq!(tail["total_bytes"].as_str(), Some("0"));
+        // #227: the source-time loss field is on the wire and in the rendered status, empty
+        // while every source got a mapping (the 1024-source ceiling is tested in sparrow-core).
+        let source_time = status.get_source_time_loss().unwrap();
+        assert_eq!((source_time.get_total_batches(), source_time.get_total_events()), (0, 0));
+        assert!(source_time.get_other_streams_exact());
+        assert_eq!(rendered["source_time_loss"]["named"].as_array().map(Vec::len), Some(0));
+        assert_eq!(rendered["source_time_loss"]["total_events"].as_str(), Some("0"));
         drop(producer); drop(daemon);
     }).await;
 }

@@ -1175,8 +1175,10 @@ without compiling; definitions and ingestion perform native admission/matching.
 Profile identity covers source, whole-record law, pattern, flags, group and
 representation. JSON identities are unchanged. Definitions do not reinterpret
 earlier records or split a staged import's captured interpretation. The existing
-1024-source registry ceiling applies to both selectors. Returned profiles expose
-an `extraction` descriptor; the legacy `path` is empty for a log capture.
+1024-source registry ceiling applies to both selectors. A declaration past it is
+refused with `RESOURCE_LIMIT`; a log never is (see "Source time mapping on the event
+route"). Returned profiles expose an `extraction` descriptor; the legacy `path` is empty
+for a log capture.
 
 The first log definition atomically publishes its interpretation marker and
 writer fence 88..98, preserving the corresponding prior authority family 77..87.
@@ -2796,6 +2798,27 @@ twice. A stream without a window has no sequence overlap check, so the exact ret
 (same request ID) is answered from the receipt, while a new request ID that repeats
 sequences of an unrecorded stream is stored again, never dropped. A stream that
 has a window keeps its overlap `CONFLICT` and gap accounting unchanged.
+Source time mapping on the event route (#227). The daemon binds each event source's
+`/event_time` (Unix milliseconds) mapping on its first batch. The mapping registry holds at
+most 1024 sources and never shrinks. A batch from a source past that ceiling is never refused:
+it is stored, its records carry unknown time (`no_profile`, the original `event_time` stays in
+the record bytes), and no mapping row is written, so the stored format is unchanged. The
+loss is counted per source, in memory for the daemon's life, and shown in status under
+`source_time_loss` (schema 71, additive wire field `sourceTimeLoss`): the same bounded
+report as `stream_evidence_loss`, with rows of kind `source_time`, an empty `instance`, the
+`batches` taken and the `events` (records) stored without a mapping, at most 16 named
+sources, the rest in `other_*`, and totals over all sources. A retry of an accepted request
+returns its receipt and is not counted twice. A source that already has a mapping keeps it,
+and a source with a different mapping still gets `CONFLICT`. Explicit
+`define_time_profile`, `define_log_time_profile` and diagnostic profile declarations past the
+ceiling are still refused with `RESOURCE_LIMIT`: they are not logs.
+
+A batch that no retry can ever accept is not answered with a retryable code (#227). On the
+event route an over-bound batch (more records than `max_records`, inline bytes over 16 MiB, an
+atomic write over 128 MiB or larger than the whole data budget) answers `INVALID_ARGUMENT`,
+which is not retryable, and the client quarantines it. The `ingest` call answers an inline
+payload over 16 MiB with `INVALID_ARGUMENT` too. Other callers keep `RESOURCE_LIMIT`.
+
 A window created later, after expiry frees a slot, starts at its first
 observed position as every window does. A registry that would pass its byte bound
 sheds that window's oldest exact gap intervals (`gaps_complete=false`, counts exact)
@@ -3423,8 +3446,12 @@ or semantic engine. The public surface includes:
   the client holds the batch, bounded by the queue limits, with overflow counted
   as `Full`. A full producer registry is not a refusal any more (#215): the daemon
   stores the batch and counts the lost gap evidence, so the client no longer holds
-  a batch for it. An older daemon still answers it with `RESOURCE_LIMIT`, which
-  the client holds as before. A busy (retryable) refusal retries the same
+  a batch for it. A source past the 1024-mapping ceiling and an over-bound
+  batch are no longer retryable refusals either (#227): the daemon takes the
+  first and answers the second `INVALID_ARGUMENT`, which is quarantined. An
+  older daemon still answers these with `RESOURCE_LIMIT`, which the client
+  holds as before: held bytes are never lost, and the client cannot tell the
+  case from a busy daemon. A busy (retryable) refusal retries the same
   batch on the same connection; only a transport failure reconnects.
 - Explicit buffered/durable delivery selection for direct ingestion and
   `flush(durable)`/shutdown that returns the reached receipt watermark or a typed

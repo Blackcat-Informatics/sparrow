@@ -263,6 +263,11 @@ struct Status {
   # Schema 71 (additive, #224): files tailed without a stored checkpoint because the generation
   # registry was full and no finished row could be retired, and rows retired for room.
   tailRegistryEvidence @57 :TailRegistryEvidence;
+  # Schema 71 (additive, #227): records stored with unknown time because the source mapping
+  # registry (1024 sources) was full, per source, since the daemon started. Every row has
+  # kind `sourceTime` and an empty instance; `events` counts the records. A reader that does
+  # not know this field sees no change.
+  sourceTimeLoss @58 :StreamEvidenceLoss;
 }
 # A full tail generation registry never refuses a file. A file tailed without a stored
 # checkpoint is read again from its start after a restart, so its `records` and `bytes` are at
@@ -285,7 +290,7 @@ struct TailRegistryEvidence {
 # The streams with the most lost positions are named, at most `maxNamed`; every other stream
 # folds into the `other*` totals. `otherStreamsExact` is false when more streams exist than the
 # daemon tracks, so `otherStreams` is then a lower bound. The totals cover every stream.
-enum LostStreamKind { producer @0; receiver @1; }
+enum LostStreamKind { producer @0; receiver @1; sourceTime @2; }
 struct LostStream {
   kind @0 :LostStreamKind; source @1 :Text; instance @2 :Text;
   batches @3 :UInt64; events @4 :UInt64;

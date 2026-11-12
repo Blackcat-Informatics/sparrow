@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! Count of gap evidence lost because a stream registry could not hold a window (#215).
+//! Count of evidence lost because a bookkeeping registry could not hold a row (#215, #227).
 //!
 //! A full producer-stream or receiver-window registry never refuses a log: the log is stored
 //! without a window position. What is lost is that stream's gap evidence for those positions.
 //! The loss is counted here, per stream, in memory for the life of the process, and shown in
 //! status. Nothing here is a stored format.
+//!
+//! The same ledger type counts source-time mappings that a full source registry could not
+//! hold (#227); the store keeps that one separate, so status can show it in its own field.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
@@ -23,6 +26,9 @@ pub enum LostStreamKind {
     Producer,
     /// A syslog receiver window, identified by source and receiver instance.
     Receiver,
+    /// A source whose time mapping the full source registry could not hold. The `instance`
+    /// is empty; `events` counts the records stored with unknown time (`no_profile`).
+    SourceTime,
 }
 
 /// One stream whose gap evidence was not recorded.
