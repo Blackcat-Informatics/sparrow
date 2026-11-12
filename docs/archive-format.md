@@ -233,8 +233,10 @@ The store records its progress in two catalog keys, loaded when the store opens:
 
 One gate decides every deletion. A record or artifact may retire only when its
 position is at or before `archive:through`. Expiry checks the gate before it
-retires anything, and counts the entries it leaves waiting in
-`ExpiryReport.archive_waiting`. Ordinary catalog cleanup at `expires_at + 1 day`
+retires anything. It stops at the first due entry the watermark does not cover,
+with the frontier `ArchiveLag` and `ExpiryReport.archive_waiting` of 1, because
+the watermark is a prefix of the receipt order and nothing after that entry is
+covered either. Ordinary catalog cleanup at `expires_at + 1 day`
 follows retirement, so the gate covers it too. Pressure eviction stops at the
 first unarchived, unprotected entry with the frontier `ArchiveLag`, and keeps
 that entry as its inclusive resume position. Retirement asserts the gate

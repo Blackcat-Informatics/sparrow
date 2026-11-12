@@ -3046,7 +3046,7 @@ impl Store {
     }
 
     /// Dev-only: drop every read handle and listing build whose lease ended by `now`, as
-    /// the expiry pass does.
+    /// the maintenance worker's lease duty does.
     #[cfg(feature = "test-support")]
     pub fn purge_read_leases_for_tests(&self, now: u64) -> Result<(), Error> {
         self.purge_read_leases(now)

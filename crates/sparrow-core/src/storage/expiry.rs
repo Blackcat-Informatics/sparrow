@@ -59,6 +59,8 @@ pub(super) struct Cursor {
     delete: Option<Position>,
     /// Smallest key a walk skipped because a pin holds it, since the last rewind.
     held: Option<Vec<u8>>,
+    /// Earliest own deadline of a deferred entry: when it arrives, the walks rewind to it.
+    deferred: Option<u64>,
     /// Protection the last pass saw; a member that disappears releases held rows.
     protected: BTreeSet<String>,
     requests: RequestScan,
@@ -72,6 +74,7 @@ impl Default for Cursor {
             retire: None,
             delete: None,
             held: None,
+            deferred: None,
             protected: BTreeSet::new(),
             requests: RequestScan::Waiting(None),
             reads: 0,
@@ -144,6 +147,9 @@ pub struct ExpiryReport {
     pub deleted: usize,
     /// Due entries, at most one per pass, that stopped it at the archive watermark.
     pub archive_waiting: u64,
+    /// Entries seen whose own `expires_at` differs from receipt plus retention. They are
+    /// honoured at their own deadline, never fatal; a nonzero count needs investigation.
+    pub anomalies: u64,
     /// Explicit bounded frontier.
     pub frontier: ExpiryFrontier,
     /// Due work remains; run another pass without waiting.
@@ -215,6 +221,8 @@ struct Pass<'a> {
     done: BTreeSet<String>,
     deleted_parents: BTreeSet<String>,
     held: Option<Vec<u8>>,
+    /// Earliest own deadline of an entry deferred past its index position.
+    deferred: Option<u64>,
     reads: u64,
 }
 
@@ -341,9 +349,10 @@ impl Pass<'_> {
             Err(error) => return self.refuse(error).map(Step::Stop),
         };
         self.report.visited += 1;
-        if artifact.expires_at != deadline {
-            return Err(contradiction("artifact", &artifact.id));
-        }
+        let Some((delete, deferred)) = self.own_deadline(artifact.expires_at, deadline, delete)
+        else {
+            return Ok(Step::Held);
+        };
         if self.protected.contains(&artifact.id) {
             return Ok(Step::Held);
         }
@@ -364,7 +373,7 @@ impl Pass<'_> {
             manifest_retire::remove(&mut retirement.batch, &artifact.id);
             self.report.deleted += 1;
         }
-        Ok(Step::Next)
+        Ok(if deferred { Step::Held } else { Step::Next })
     }
 
     fn record(
@@ -381,9 +390,10 @@ impl Pass<'_> {
             Err(error) => return self.refuse(error).map(Step::Stop),
         };
         self.report.visited += 1;
-        if record.expires_at != deadline {
-            return Err(contradiction("record", &record.id));
-        }
+        let Some((delete, deferred)) = self.own_deadline(record.expires_at, deadline, delete)
+        else {
+            return Ok(Step::Held);
+        };
         // A pin on the artifact holds all its records; a pin on the record alone holds
         // only the record, and its parent artifact retires and is deleted regardless.
         let held = writer.live_record(&record, self.now, self.protected);
@@ -417,7 +427,14 @@ impl Pass<'_> {
                         format!("record {} outlives its artifact {parent}", record.id),
                     ));
                 }
-                Err(error) => return self.refuse(error).map(Step::Stop),
+                Err(error) => {
+                    // This record is not yet processed: it must not count as progress, so a
+                    // parent that cannot fit a fresh catalog budget fails loudly.
+                    self.report.visited -= 1;
+                    let frontier = self.refuse(error);
+                    self.report.visited += 1;
+                    return frontier.map(Step::Stop);
+                }
             }
         }
         if !held && !record.evicted && !record.retired {
@@ -463,7 +480,45 @@ impl Pass<'_> {
                 self.report.deleted += 1;
             }
         }
-        Ok(if held { Step::Held } else { Step::Next })
+        Ok(if held || deferred {
+            Step::Held
+        } else {
+            Step::Next
+        })
+    }
+
+    /// Honour an entry's own deadline over the one its index position implies. Every
+    /// writer sets `expires_at = received_at + RETENTION_MS`, but a row that differs (an
+    /// older store, an edit) must never stop the pass: an earlier own deadline retires
+    /// when the walk reaches it, and a later one defers the entry, counted in
+    /// `ExpiryReport.anomalies` and scheduled in `next_due`, until its own deadline.
+    /// Returns `None` when the entry is not yet due by its own deadline; else whether its
+    /// deletion is due now, and whether it was deferred to a later pass for deletion.
+    /// Only a dangling or mismatched index key and a record that outlives its artifact
+    /// remain hard failures, because those are broken indexes, not one odd row.
+    fn own_deadline(
+        &mut self,
+        expires_at: u64,
+        position_deadline: u64,
+        delete: bool,
+    ) -> Option<(bool, bool)> {
+        if expires_at != position_deadline {
+            self.report.anomalies += 1;
+        }
+        if expires_at > self.now {
+            self.defer(expires_at);
+            return None;
+        }
+        let deletable = delete && expires_at.saturating_add(DAY) <= self.now;
+        let deferred = delete && !deletable;
+        if deferred {
+            self.defer(expires_at.saturating_add(DAY));
+        }
+        Some((deletable, deferred))
+    }
+
+    fn defer(&mut self, until: u64) {
+        self.deferred = Some(self.deferred.map_or(until, |at| at.min(until)));
     }
 
     /// Retire one parent artifact's graph and manifest slices, once per pass.
@@ -549,15 +604,6 @@ impl Pass<'_> {
     }
 }
 
-fn contradiction(kind: &str, id: &str) -> Error {
-    Error::new(
-        "STORAGE_FAILURE",
-        format!(
-            "{kind} {id} carries a deadline other than its receipt plus retention; the time index cannot order it for expiry"
-        ),
-    )
-}
-
 impl Writer {
     fn expire_bounded(&self, now: u64, limits: EvictionLimits) -> Result<ExpiryReport, Error> {
         let mut pin_catalog = limits.max_pin_catalog_bytes;
@@ -595,6 +641,10 @@ impl Writer {
         }
         let mut saved = self.expiry.borrow_mut();
         let mut local = saved.clone();
+        if local.deferred.is_some_and(|at| at <= now) {
+            local.deferred = None;
+            local.rewind();
+        }
         if local
             .protected
             .iter()
@@ -617,6 +667,7 @@ impl Writer {
             done: BTreeSet::new(),
             deleted_parents: BTreeSet::new(),
             held: local.held.take(),
+            deferred: local.deferred.take(),
             reads: pin_visits as u64,
         };
         let deleted = pass.walk(local.delete.as_ref(), true)?;
@@ -649,6 +700,7 @@ impl Writer {
             retirement,
             mut report,
             held,
+            deferred,
             reads,
             ..
         } = pass;
@@ -671,9 +723,13 @@ impl Writer {
         report.next_due = if report.continuation {
             None
         } else {
-            [due, sweep.next_expiry].into_iter().flatten().min()
+            [due, sweep.next_expiry, deferred]
+                .into_iter()
+                .flatten()
+                .min()
         };
         local.held = held;
+        local.deferred = deferred;
         local.protected = protected;
         local.reads += reads;
         *saved = local;

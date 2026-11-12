@@ -187,7 +187,11 @@ commit and an archive commit wake the worker at once. After an error, or a pass
 skipped below the free-space floor, it retries after 60 seconds. Retry rows
 (`request:`) have no time index; one pass scans them once per hour, and their
 logical expiry is exact at read time regardless. The purge of expired read
-leases runs on its own 60-second tick, not inside expiry.
+leases runs on its own 60-second tick, not inside expiry. Expiry honours each row's
+own `expires_at`: a row whose deadline differs from receipt plus retention is
+counted in `ExpiryReport.anomalies` and retires at its own deadline, never
+stopping the pass. A dangling time-index key and a record that outlives its
+artifact are the only data-dependent hard failures.
 Import journal reclamation runs on its own one-second tick, because a published
 journal holds one of the 16 import slots until it is reclaimed. Pressure keeps
 its one-second tick, and buffered synchronization keeps its configured interval.

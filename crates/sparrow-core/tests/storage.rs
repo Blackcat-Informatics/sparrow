@@ -4547,8 +4547,10 @@ fn expiry_pass_reads_follow_due_work_not_store_size() {
     assert!(small_idle <= 8, "idle pass read {small_idle} rows");
     assert_eq!(small_due, large_due, "due reads follow the store size");
     assert!((DUE..=4 * DUE + 8).contains(&small_due), "{small_due}");
-    // The retry scan is the part that does follow the store.
-    assert!(large_scan > small_scan);
+    // The hourly retry scan is the part that follows the store: about one row read for each
+    // of the one-per-ingest retry rows.
+    assert!((50..=60).contains(&small_scan), "{small_scan}");
+    assert!((500..=510).contains(&large_scan), "{large_scan}");
 }
 
 /// INVARIANT: an entry a pin holds is skipped, not retired, and is not read again on later
@@ -4595,6 +4597,60 @@ fn expiry_skips_held_entries_without_rereading_them_and_deletes_a_day_after_reti
     );
     assert_eq!(store.artifact(&held.id).unwrap_err().code, "NOT_FOUND");
     assert_eq!(store.artifact(&free.id).unwrap_err().code, "NOT_FOUND");
+}
+
+/// INVARIANT (#183): one row whose `expires_at` differs from receipt plus retention never
+/// stops expiry. An earlier own deadline retires when the walk reaches it; a later one is
+/// counted, deferred and neither retired nor deleted early, and retires at its own
+/// deadline. Rows around it retire and delete on schedule, and every pass terminates.
+/// Covers a record and a recordless artifact written through the raw-row seam.
+#[test]
+fn expiry_honours_an_anomalous_own_deadline_without_stopping_the_pass() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let early = store.ingest("early", "source", "log", b"e\n", 0).unwrap();
+    let late = store.ingest("late", "source", "log", b"l\n", 0).unwrap();
+    let empty = store.ingest("empty", "source", "log", b"", 0).unwrap();
+    let normal = store.ingest("normal", "source", "log", b"n\n", 0).unwrap();
+    drop(store);
+    let rewrite = |id: &str, expires_at: u64| {
+        let db = catalog_db(dir.path()).unwrap();
+        let row = String::from_utf8(db.get(id).unwrap().unwrap()).unwrap();
+        let old = format!("\"expires_at\":\"{}\"", 30 * DAY);
+        assert!(row.contains(&old));
+        db.put(
+            id,
+            row.replace(&old, &format!("\"expires_at\":\"{expires_at}\"")),
+        )
+        .unwrap();
+    };
+    rewrite(&early.record_ids[0], 29 * DAY);
+    rewrite(&late.record_ids[0], 40 * DAY);
+    rewrite(&empty.id, 40 * DAY);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let limits = EvictionLimits::default();
+    let first = store.expire_bounded(30 * DAY, limits).unwrap();
+    assert_eq!(first.anomalies, 3);
+    assert_eq!(first.records, 2, "the early and the normal record retire");
+    assert!(first.next_due.is_some_and(|due| due <= 31 * DAY));
+    assert_eq!(store.artifact(&late.id).unwrap().id, late.id);
+    let second = store.expire_bounded(31 * DAY, limits).unwrap();
+    assert_eq!(
+        second.deleted, 4,
+        "the early and normal entries and parents go"
+    );
+    assert_eq!(store.artifact(&normal.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(store.artifact(&early.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(store.artifact(&late.id).unwrap().id, late.id);
+    let third = store.expire_bounded(40 * DAY, limits).unwrap();
+    assert_eq!(
+        third.records, 1,
+        "the late record retires at its own deadline"
+    );
+    store.expire_bounded(41 * DAY, limits).unwrap();
+    assert_eq!(store.artifact(&late.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(store.artifact(&empty.id).unwrap_err().code, "NOT_FOUND");
 }
 
 #[test]
