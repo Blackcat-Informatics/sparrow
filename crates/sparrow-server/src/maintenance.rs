@@ -410,11 +410,12 @@ async fn run(
                 // The store shows `Blocked` until the next pass; the duty journals a new
                 // native error at once and a repeat at a bounded rate, and retries on its
                 // backoff, never a busy loop.
-                let status = store.pressure_status().ok();
+                // A status that cannot be read is journaled and counted by the duty.
+                let status = store.pressure_status().map_err(|error| error.to_string());
                 let verdict = pressure_duty.failed(
                     sparrow_server::now().unwrap_or_default(),
                     &error.to_string(),
-                    status.as_ref(),
+                    status.as_ref().map_err(String::as_str),
                 );
                 for line in &verdict.lines {
                     eprintln!("{line}");

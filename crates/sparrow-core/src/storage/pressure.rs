@@ -99,7 +99,8 @@ pub struct PressureStatus {
     pub floor: FloorStatus,
     /// Wall time of the last finished forced compaction, in milliseconds; zero before one.
     pub forced_compaction_ms: u64,
-    /// Table bytes of each family before and after that compaction; empty before one.
+    /// Table and blob file bytes of each family before and after that compaction; empty
+    /// before one.
     pub forced_compaction_families: Vec<FamilySize>,
     /// Forced compactions that ended in a failure (a panic or a raised native error).
     pub forced_failures: u64,
@@ -426,10 +427,32 @@ impl Writer {
         // Acknowledge first: a failed wait-ending commit below must not leave the outcome
         // in the slot to be counted again by the next pass.
         self.forced.acknowledge();
-        if failure.is_some() && state.wait.is_some() {
-            self.end_wait(state)?;
+        if let Some(forced) = failure.as_deref()
+            && state.wait.is_some()
+        {
+            // The caller's error replaces the status failure and the duty marks the forced
+            // failure reported, so its own reason must ride in the error or it is lost.
+            self.end_wait(state)
+                .map_err(|error| Error::new(error.code, format!("{error}; {forced}")))?;
         }
         Ok(failure)
+    }
+
+    /// Count a RocksDB background error raised while no pass is retiring evidence, and say
+    /// so in the status. The pass does not fail: nothing is waiting on native work, so the
+    /// error holds nothing and the baseline moves at once (an old error never holds intake).
+    fn surface_native_errors(&self, state: &mut State) -> Result<(), Error> {
+        let errors = self.forced.native_errors(&self.db)?;
+        if errors > state.background_errors {
+            let new = errors - state.background_errors;
+            state.background_errors = errors;
+            state.status.native_errors = state.status.native_errors.saturating_add(new);
+            state.status.failure = Some(format!(
+                "RocksDB reported {new} new background errors ({} this session) while no pressure pass was waiting on native work",
+                state.status.native_errors
+            ));
+        }
+        Ok(())
     }
 
     fn maintain_pressure(&self, now: u64, limits: EvictionLimits) -> Result<PressureStatus, Error> {
@@ -440,6 +463,9 @@ impl Writer {
         state.status.observed_at = now;
         state.status.linked_bytes = linked;
         if state.status.requested_bytes == 0 && physical <= limit {
+            // No episode is active, but a RocksDB background error is still news: surface it
+            // now instead of at the next episode's first pass.
+            self.surface_native_errors(&mut state)?;
             return Ok(state.status.clone());
         }
         // A reopened store already above its data allowance needs maintenance too.
@@ -459,11 +485,13 @@ impl Writer {
             self.forced.acknowledge();
             state.ready();
             self.eviction.borrow_mut().reset();
+            self.surface_native_errors(&mut state)?;
             return Ok(state.status.clone());
         }
         if linked.saturating_add(state.status.requested_bytes) <= limit {
             // Temporary query reservations alone are not authority to retire evidence.
             state.stalled("only temporary query reservations hold the data allowance");
+            self.surface_native_errors(&mut state)?;
             return Ok(state.status.clone());
         }
         state.status.pending_flushes = 0;

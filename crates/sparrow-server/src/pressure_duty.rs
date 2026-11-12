@@ -74,6 +74,8 @@ pub(crate) struct Duty {
     failures_reported: u64,
     /// Native background errors already journaled.
     native_reported: u64,
+    /// Failed passes whose status could not be read, this session.
+    unreadable_statuses: u64,
 }
 
 impl Default for Duty {
@@ -87,6 +89,7 @@ impl Default for Duty {
             quiet: 0,
             failures_reported: 0,
             native_reported: 0,
+            unreadable_statuses: 0,
         }
     }
 }
@@ -142,6 +145,18 @@ impl Duty {
                 status.failure.as_deref().unwrap_or("no reason recorded")
             ));
         }
+        // A RocksDB error raised while no pressure pass was waiting on native work fails no
+        // pass; it is journaled the pass it is seen, whatever the phase.
+        if status.native_errors > self.native_reported {
+            self.native_reported = status.native_errors;
+            lines.push(format!(
+                "sparrowd: {}",
+                status
+                    .failure
+                    .as_deref()
+                    .unwrap_or("RocksDB reported new background errors; no reason recorded")
+            ));
+        }
         if status.phase != self.phase {
             let from = self.phase;
             if status.phase == PressurePhase::Ready {
@@ -194,25 +209,38 @@ impl Duty {
     }
 
     /// Account for a pass that failed at `now`. The store shows `Blocked` until the next
-    /// pass, which is retried on the same backoff. A RocksDB error new since the last
-    /// report is journaled at once whatever the rate limit says, and carries its reason;
-    /// the same failure repeated stays rate limited.
+    /// pass, which is retried on the same backoff. A RocksDB error or a forced-compaction
+    /// failure new since the last report is journaled at once whatever the rate limit says,
+    /// and carries its reason; the same failure repeated stays rate limited. `status` is the
+    /// store's status after the failed pass, or why it could not be read: that failure is
+    /// journaled and counted every time, never swallowed.
     pub(crate) fn failed(
         &mut self,
         now: u64,
         error: &str,
-        status: Option<&PressureStatus>,
+        status: Result<&PressureStatus, &str>,
     ) -> Verdict {
         self.last = None;
         self.quiet += 1;
         let mut lines = Vec::new();
-        let new_native = status.is_some_and(|status| status.native_errors > self.native_reported);
-        if let Some(status) = status {
-            self.native_reported = status.native_errors;
-            // The reason rides in `error`, so this failure is not reported a second time.
-            self.failures_reported = self.failures_reported.max(status.forced_failures);
+        let mut new_failure = false;
+        match status {
+            Ok(status) => {
+                new_failure = status.native_errors > self.native_reported
+                    || status.forced_failures > self.failures_reported;
+                self.native_reported = status.native_errors;
+                // The reason rides in `error`, so this failure is not reported a second time.
+                self.failures_reported = self.failures_reported.max(status.forced_failures);
+            }
+            Err(unreadable) => {
+                self.unreadable_statuses += 1;
+                lines.push(format!(
+                    "sparrowd: the pressure status could not be read after a failed pass ({} so far this session): {unreadable}",
+                    self.unreadable_statuses
+                ));
+            }
         }
-        let due = new_native
+        let due = new_failure
             || self
                 .reported_at
                 .is_none_or(|at| now.saturating_sub(at) >= QUIET_REPORT_MS);
@@ -319,16 +347,16 @@ mod tests {
     #[test]
     fn failing_passes_are_journaled_at_a_bounded_rate_and_back_off() {
         let mut duty = Duty::default();
-        let first = duty.failed(0, "background errors", None);
+        let first = duty.failed(0, "background errors", Ok(&PressureStatus::default()));
         assert_eq!(first.lines.len(), 1);
         assert!(first.lines[0].contains("background errors"));
         assert_eq!(first.delay, Duration::from_secs(2));
         assert!(
-            duty.failed(1_000, "background errors", None)
+            duty.failed(1_000, "background errors", Ok(&PressureStatus::default()))
                 .lines
                 .is_empty()
         );
-        let later = duty.failed(60_000, "background errors", None);
+        let later = duty.failed(60_000, "background errors", Ok(&PressureStatus::default()));
         assert!(later.lines[0].contains("2 failures since the last report"));
     }
 
@@ -346,10 +374,10 @@ mod tests {
             ..waiting(1_000, 900)
         };
         let reason = "RocksDB reported 1 new background errors; the forced compaction failed: io";
-        let first = duty.failed(1_000, reason, Some(&status));
+        let first = duty.failed(1_000, reason, Ok(&status));
         assert_eq!(first.lines.len(), 1);
         assert!(first.lines[0].contains("the forced compaction failed: io"));
-        assert!(duty.failed(2_000, reason, Some(&status)).lines.is_empty());
+        assert!(duty.failed(2_000, reason, Ok(&status)).lines.is_empty());
         // The failure was journaled with its reason; no second line follows it.
         assert!(
             !duty
@@ -374,5 +402,58 @@ mod tests {
         };
         let lines = duty.observe(&status).lines;
         assert!(lines[0].contains("after 7 ms: the forced compaction failed: the thread panicked"));
+    }
+
+    // Value: #220 item 3: when the wait-ending commit fails after a forced compaction failure,
+    // the duty marks that forced failure reported, so its own reason was never journaled.
+    // Protects: a failed pass that carries a new forced failure is journaled at once inside
+    // the rate-limit window, with the reason the error carries.
+    #[test]
+    fn a_forced_failure_behind_a_failed_wait_end_is_journaled_at_once() {
+        let mut duty = Duty::default();
+        let quiet = PressureStatus::default();
+        assert_eq!(
+            duty.failed(0, "cannot take a write", Ok(&quiet))
+                .lines
+                .len(),
+            1
+        );
+        let status = PressureStatus {
+            forced_failures: 1,
+            ..waiting(1_000, 900)
+        };
+        let reason = "cannot take a write; the forced compaction failed: the thread panicked";
+        let lines = duty.failed(1_000, reason, Ok(&status)).lines;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("the forced compaction failed: the thread panicked"));
+    }
+
+    // Value: #220 item 4: a failed status read used to fall back to the rate-limited path
+    // without a word. Protects: every unreadable status is journaled with its cause and a
+    // running count, even inside the rate-limit window.
+    #[test]
+    fn an_unreadable_status_after_a_failed_pass_is_journaled_and_counted() {
+        let mut duty = Duty::default();
+        duty.failed(0, "pass failed", Err("store poisoned"));
+        let second = duty.failed(1_000, "pass failed", Err("store poisoned"));
+        assert_eq!(second.lines.len(), 1);
+        assert!(second.lines[0].contains("(2 so far this session): store poisoned"));
+    }
+
+    // Value: #220 item 5: a RocksDB error raised outside a pressure episode fails no pass and
+    // used to reach the journal only at the next episode. Protects: a ready status with a new
+    // native error is journaled at once with its reason, and only once.
+    #[test]
+    fn a_native_error_outside_an_episode_is_journaled_once_at_once() {
+        let mut duty = Duty::default();
+        let status = PressureStatus {
+            native_errors: 1,
+            failure: Some("RocksDB reported 1 new background errors".into()),
+            ..PressureStatus::default()
+        };
+        let first = duty.observe(&status);
+        assert_eq!(first.lines.len(), 1);
+        assert!(first.lines[0].contains("RocksDB reported 1 new background errors"));
+        assert!(duty.observe(&status).lines.is_empty());
     }
 }

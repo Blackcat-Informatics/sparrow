@@ -6174,13 +6174,22 @@ fn store_waiting_on_native_reclamation(
     dir: &std::path::Path,
     limits: sparrow_core::EvictionLimits,
 ) -> Store {
+    store_waiting_on_native_reclamation_with(dir, limits, b"x\n")
+}
+
+/// The same store with `payload` as the content of both records.
+fn store_waiting_on_native_reclamation_with(
+    dir: &std::path::Path,
+    limits: sparrow_core::EvictionLimits,
+    payload: &[u8],
+) -> Store {
     let mut settings = config();
     settings.disk_budget = 16 * 1024 * 1024;
     settings.maintenance_reserve = 4 * 1024 * 1024;
     let store = Store::open(dir, settings).unwrap();
     for (index, at) in [1_u64, 2].into_iter().enumerate() {
         store
-            .ingest(&format!("stale-{index}"), "source", "log", b"x\n", at)
+            .ingest(&format!("stale-{index}"), "source", "log", payload, at)
             .unwrap();
     }
     let file = std::fs::File::create(dir.join("test-owned-pressure-ballast")).unwrap();
@@ -6189,6 +6198,48 @@ fn store_waiting_on_native_reclamation(
     file.set_len(14 * 1024 * 1024).unwrap();
     store.await_native_quiet().unwrap();
     store
+}
+
+// Value: #220 item 1: the payload family keeps its bulk in blob files, and the linked
+// footprint counts them, so the per-family sizes of a forced compaction must too. Protects:
+// a payload family holding only blob-sized chunks reports at least their bytes before and
+// after; a table-only sum would report the few bytes of keys and blob indexes.
+#[test]
+fn forced_compaction_family_sizes_include_blob_file_bytes() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    // Random letters in one line: log text the projection accepts, and too dense for blob compression
+    // to shrink the two 64 KiB chunks below the bound asserted.
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let payload: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            b'a' + ((seed >> 24) % 26) as u8
+        })
+        .collect();
+    let store = store_waiting_on_native_reclamation_with(dir.path(), limits, &payload);
+    store.pressure_maintain(20, limits).unwrap();
+    store.await_native_quiet().unwrap();
+    let families = store
+        .pressure_maintain(30, limits)
+        .unwrap()
+        .forced_compaction_families;
+    let payload_family = families.iter().find(|f| f.family == "payload").unwrap();
+    let blob_floor = 96 * 1024;
+    assert!(
+        payload_family.before_bytes >= blob_floor,
+        "{payload_family:?}"
+    );
+    assert!(
+        payload_family.after_bytes >= blob_floor,
+        "{payload_family:?}"
+    );
 }
 
 // Value: #218: a forced compaction thread that panics must not wedge the wait. Protects:
@@ -6297,6 +6348,14 @@ fn a_store_that_cannot_end_a_wait_says_so_and_keeps_saying_it() {
     for at in [30, 40] {
         let error = store.pressure_maintain(at, limits).unwrap_err();
         assert!(error.to_string().contains("cannot take a write"), "{error}");
+        // The forced failure is counted once, at its first pass, and its own reason rides
+        // in that pass's error for the journal (#220).
+        if at == 30 {
+            assert!(
+                error.to_string().contains("the forced compaction failed"),
+                "{error}"
+            );
+        }
         let status = store.pressure_status().unwrap();
         assert!(status.failure.unwrap().contains("cannot take a write"));
     }
@@ -6305,6 +6364,44 @@ fn a_store_that_cannot_end_a_wait_says_so_and_keeps_saying_it() {
     assert!(error.to_string().contains("new background errors"));
     assert_eq!(store.pressure_status().unwrap().native_errors, 1);
     store.pressure_maintain(60, limits).unwrap();
+}
+
+// Value: #220 item 5: a RocksDB background error raised with no pressure episode active was
+// only noticed at the next episode's first pass. Protects: the first pass after it counts it
+// and says so in the status while the store stays Ready and keeps taking writes, and the
+// error is counted once: an old error never fails a later pass or an episode's first pass.
+#[test]
+fn a_native_error_outside_a_pressure_episode_is_surfaced_at_once_and_once() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let limits = EvictionLimits::default();
+    assert_eq!(
+        store.pressure_maintain(10, limits).unwrap().native_errors,
+        0
+    );
+    store.simulate_native_errors(1);
+    let surfaced = store.pressure_maintain(20, limits).unwrap();
+    assert_eq!(surfaced.native_errors, 1);
+    assert_eq!(surfaced.phase, PressurePhase::Ready);
+    assert!(
+        surfaced
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("new background errors"),
+        "{:?}",
+        surfaced.failure
+    );
+    assert_eq!(store.pressure_status().unwrap().native_errors, 1);
+    // Intake is not held, and the same error is not counted again.
+    store
+        .ingest("after-error", "source", "log", b"x\n", 25)
+        .unwrap();
+    assert_eq!(
+        store.pressure_maintain(30, limits).unwrap().native_errors,
+        1
+    );
 }
 
 #[test]
