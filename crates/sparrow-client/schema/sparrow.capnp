@@ -257,6 +257,23 @@ struct Status {
   countsPending @54 :Bool;
   # Schema 70: the online backup into the configured backup_root (#156).
   backup @55 :BackupStatus;
+  # Schema 71 (additive, #215): gap evidence lost to a full producer-stream or receiver-window
+  # registry since the daemon started. The logs were taken; only the stream's window is absent.
+  streamEvidenceLoss @56 :StreamEvidenceLoss;
+}
+# The streams with the most lost positions are named, at most `maxNamed`; every other stream
+# folds into the `other*` totals. `otherStreamsExact` is false when more streams exist than the
+# daemon tracks, so `otherStreams` is then a lower bound. The totals cover every stream.
+enum LostStreamKind { producer @0; receiver @1; }
+struct LostStream {
+  kind @0 :LostStreamKind; source @1 :Text; instance @2 :Text;
+  batches @3 :UInt64; events @4 :UInt64;
+}
+struct StreamEvidenceLoss {
+  named @0 :List(LostStream); maxNamed @1 :UInt32;
+  otherStreams @2 :UInt64; otherBatches @3 :UInt64; otherEvents @4 :UInt64;
+  otherStreamsExact @5 :Bool;
+  totalBatches @6 :UInt64; totalEvents @7 :UInt64;
 }
 # The online backup (#156). `unconfigured` when the daemon has no backup_root or runs
 # --no-intake or --query-only; otherwise the latest backup since the daemon started. Times are

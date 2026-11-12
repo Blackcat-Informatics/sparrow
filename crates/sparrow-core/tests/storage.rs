@@ -1186,6 +1186,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
     assert_eq!(position.sequence, 1);
     let discard = store
         .discard_syslog("receiver", &receiver, ReceiverDiscard::Truncated, 9)
+        .unwrap()
         .unwrap();
     assert_eq!(discard.window_id, position.window_id);
     assert_eq!(discard.sequence, 2);
@@ -1363,6 +1364,7 @@ fn receiver_concurrent_commits_have_unique_positions_and_finite_discard_history(
     let restarted = SyslogReceiver::new("tcp", "tcp_lf").unwrap();
     let restart = store
         .discard_syslog("concurrent", &restarted, ReceiverDiscard::TimedOut, 22)
+        .unwrap()
         .unwrap();
     assert_ne!(restart.window_id, state.id);
     drop(store);
@@ -1395,7 +1397,8 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
             )
             .unwrap();
     }
-    assert_eq!(
+    // A full registry takes the observation without a window; the loss is counted (#215).
+    assert!(
         store
             .discard_syslog(
                 "only-discards",
@@ -1403,9 +1406,8 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
                 ReceiverDiscard::Refused,
                 2
             )
-            .unwrap_err()
-            .code,
-        "RESOURCE_LIMIT"
+            .unwrap()
+            .is_none()
     );
     assert_eq!(store.status(2).unwrap()["live_records"].as_str(), Some("0"));
     let sources = store
@@ -3122,6 +3124,211 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
         .unwrap();
 }
 
+/// #215: a full receiver-window registry must still take the packet. The packet is stored
+/// with no receiver position, a window that exists keeps its normal positions, and the lost
+/// gap evidence is counted against the named stream. The old behaviour answered
+/// RESOURCE_LIMIT and the listener discarded the packet.
+#[test]
+fn full_receiver_registry_takes_the_packet_and_counts_the_lost_window() {
+    use sparrow_core::{LostStreamKind, MAX_RECEIVER_WINDOWS, ReceiverDiscard, SyslogReceiver};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let packet = b"<13>Nov 12 00:00:00 host app: hello";
+    let held = SyslogReceiver::new("udp", "udp").unwrap();
+    store
+        .ingest_received_syslog("rx", &held, packet, 1)
+        .unwrap();
+    for _ in 1..MAX_RECEIVER_WINDOWS {
+        store
+            .discard_syslog(
+                "rx",
+                &SyslogReceiver::new("udp", "udp").unwrap(),
+                ReceiverDiscard::Refused,
+                1,
+            )
+            .unwrap();
+    }
+    assert_eq!(store.stream_evidence_loss().total_events, 0);
+    let late = SyslogReceiver::new("udp", "udp").unwrap();
+    let artifact = store
+        .ingest_received_syslog("rx", &late, packet, 2)
+        .unwrap();
+    assert!(
+        store
+            .record(&artifact.record_ids[0])
+            .unwrap()
+            .receiver
+            .is_none()
+    );
+    store
+        .ingest_received_syslog("rx", &late, packet, 3)
+        .unwrap();
+    assert!(
+        store
+            .discard_syslog("rx", &late, ReceiverDiscard::Truncated, 4)
+            .unwrap()
+            .is_none()
+    );
+    let loss = store.stream_evidence_loss();
+    assert_eq!(loss.named.len(), 1);
+    let named = &loss.named[0];
+    assert_eq!(
+        (named.kind, named.source.as_str(), named.instance.as_str()),
+        (LostStreamKind::Receiver, "rx", late.instance())
+    );
+    assert_eq!((named.batches, named.events), (3, 3));
+    assert_eq!((loss.total_batches, loss.total_events), (3, 3));
+    // A stream that did get a window is unchanged: it still records its next position.
+    let next = store
+        .ingest_received_syslog("rx", &held, packet, 5)
+        .unwrap();
+    assert_eq!(
+        store
+            .record(&next.record_ids[0])
+            .unwrap()
+            .receiver
+            .unwrap()
+            .sequence,
+        2
+    );
+    assert_eq!(store.stream_evidence_loss().total_events, 3);
+}
+
+fn full_producer_registry(store: &Store) {
+    use sparrow_core::{Durability, MAX_PRODUCER_STREAMS, ProducerBatch};
+    for index in 0..MAX_PRODUCER_STREAMS {
+        store
+            .ingest_producer(
+                &format!("fill-{index}"),
+                "producer",
+                b"{}\n",
+                &ProducerBatch {
+                    instance: [index as u8 + 1; 16],
+                    sequences: vec![1],
+                },
+                1,
+                Durability::Durable,
+            )
+            .unwrap();
+    }
+}
+
+/// #215: a full producer-stream registry must still take the batch. It is stored without
+/// stream positions and the lost gap evidence is counted for the named stream. A retry of the
+/// same request is idempotent (one artifact, loss counted once); a stream with a window keeps
+/// its overlap conflict. The old behaviour answered RESOURCE_LIMIT and the client held the batch.
+#[test]
+fn full_producer_registry_takes_the_batch_counts_the_loss_and_keeps_retries_idempotent() {
+    use sparrow_core::{Durability, LostStreamKind, ProducerBatch};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    full_producer_registry(&store);
+    let overflow = ProducerBatch {
+        instance: [255; 16],
+        sequences: vec![5, 6, 9],
+    };
+    let bytes = b"{}\n".repeat(3);
+    let first = store
+        .ingest_producer(
+            "late",
+            "producer",
+            &bytes,
+            &overflow,
+            2,
+            Durability::Durable,
+        )
+        .unwrap();
+    assert_eq!(first.record_ids.len(), 3);
+    for id in &first.record_ids {
+        assert!(store.record(id).unwrap().producer.is_none());
+    }
+    let retry = store
+        .ingest_producer(
+            "late",
+            "producer",
+            &bytes,
+            &overflow,
+            3,
+            Durability::Durable,
+        )
+        .unwrap();
+    assert_eq!(retry.id, first.id);
+    assert_eq!(
+        store.status(3).unwrap()["live_records"].as_str(),
+        Some("67")
+    );
+    let loss = store.stream_evidence_loss();
+    let named = &loss.named[0];
+    assert_eq!(
+        (named.kind, named.source.as_str(), named.instance.as_str()),
+        (
+            LostStreamKind::Producer,
+            "producer",
+            "ff".repeat(16).as_str()
+        )
+    );
+    assert_eq!((named.batches, named.events), (1, 3));
+    // A stream that has a window still conflicts on overlapping sequences.
+    let held = ProducerBatch {
+        instance: [1; 16],
+        sequences: vec![1],
+    };
+    assert_eq!(
+        store
+            .ingest_producer(
+                "overlap",
+                "producer",
+                b"{}\n",
+                &held,
+                4,
+                Durability::Durable
+            )
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(store.stream_evidence_loss().total_events, 3);
+}
+
+/// #215: status names a bounded number of lost streams and folds the rest into counters, with
+/// every stream still counted in the totals. The most-lost streams are the ones named.
+#[test]
+fn lost_stream_report_names_the_top_streams_and_counts_the_overflow() {
+    use sparrow_core::{Durability, MAX_NAMED_LOST_STREAMS, ProducerBatch};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    full_producer_registry(&store);
+    let extra = 4;
+    let streams = MAX_NAMED_LOST_STREAMS + extra;
+    let mut total = 0_u64;
+    for index in 0..streams {
+        let events = index as u64 + 1;
+        total += events;
+        store
+            .ingest_producer(
+                &format!("lost-{index}"),
+                "producer",
+                &b"{}\n".repeat(events as usize),
+                &ProducerBatch {
+                    instance: [200 + index as u8; 16],
+                    sequences: (1..=events).collect(),
+                },
+                2,
+                Durability::Durable,
+            )
+            .unwrap();
+    }
+    let loss = store.stream_evidence_loss();
+    assert_eq!(loss.named.len(), MAX_NAMED_LOST_STREAMS);
+    assert_eq!(loss.named[0].events, streams as u64);
+    assert_eq!(loss.other_streams, extra as u64);
+    assert_eq!(loss.other_events, (1..=extra as u64).sum::<u64>());
+    assert_eq!(loss.other_batches, extra as u64);
+    assert!(loss.other_streams_exact);
+    assert_eq!(loss.total_events, total);
+    assert_eq!(loss.total_batches, streams as u64);
+}
+
 #[test]
 fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures() {
     use sparrow_core::{Durability, MAX_PRODUCER_GAPS, MAX_PRODUCER_STREAMS, ProducerBatch};
@@ -3170,27 +3377,31 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
             )
             .unwrap();
     }
+    // Full capacity takes the batch without a window (#215); the new tests cover the counts.
     let overflow = ProducerBatch {
         instance: [255; 16],
         sequences: vec![1],
     };
-    assert_eq!(
+    let late = store
+        .ingest_producer(
+            "producer-overflow",
+            "producer",
+            b"{}\n",
+            &overflow,
+            2,
+            Durability::Durable,
+        )
+        .unwrap();
+    assert!(
         store
-            .ingest_producer(
-                "producer-overflow",
-                "producer",
-                b"{}\n",
-                &overflow,
-                2,
-                Durability::Durable
-            )
-            .unwrap_err()
-            .code,
-        "RESOURCE_LIMIT"
+            .record(&late.record_ids[0])
+            .unwrap()
+            .producer
+            .is_none()
     );
     assert_eq!(
         store.status(2).unwrap()["live_records"].as_str(),
-        Some("103")
+        Some("104")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();

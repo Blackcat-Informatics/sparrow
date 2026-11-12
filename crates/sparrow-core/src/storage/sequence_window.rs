@@ -61,6 +61,27 @@ pub(super) fn record_gap(
     Ok(())
 }
 
+/// Encode a registry within `max_bytes`, shedding the oldest exact gap intervals of the
+/// window at `index` (their counts stay exact) until it fits. `None` when it cannot fit.
+pub(super) fn encode_bounded<T: Catalog>(
+    windows: &mut [T],
+    index: usize,
+    max_bytes: usize,
+    mut shed: impl FnMut(&mut T) -> bool,
+) -> Option<String> {
+    loop {
+        let encoded = super::json::write_compact(&super::Value::from(
+            windows.iter().map(Catalog::encode).collect::<Vec<_>>(),
+        ));
+        if encoded.len() <= max_bytes {
+            return Some(encoded);
+        }
+        if !shed(&mut windows[index]) {
+            return None;
+        }
+    }
+}
+
 pub(super) fn registry<T: Catalog, K: Ord>(
     writer: &Writer,
     key: &str,

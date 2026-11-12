@@ -294,6 +294,8 @@ async fn publish(
         let now = crate::now()?;
         let artifact = match store.ingest_received_syslog(&source, &receiver, &bytes, now) {
             Ok(artifact) => artifact,
+            // A full receiver-window registry no longer refuses (#215): the packet is stored
+            // without a window and the store counts the lost evidence.
             Err(error) if matches!(error.code, "RESOURCE_LIMIT" | "STORAGE_PRESSURE") => {
                 return record_discard(
                     &store,

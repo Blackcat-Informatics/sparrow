@@ -3,7 +3,7 @@
 
 //! Bounded producer sequence windows committed with their record occurrences.
 
-use super::{Catalog, DAY, Error, Store, Writer, integer, json, random_id, read_field};
+use super::{Catalog, DAY, Error, Store, Writer, integer, random_id, read_field};
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
 
@@ -265,16 +265,31 @@ impl PreparedStream {
     }
 }
 
+/// Prepare the stream window for one batch. `None` means the registry cannot hold a new
+/// window (full, or past its byte bound): the batch is still accepted, without positions,
+/// and the caller counts the lost gap evidence (#215).
 pub(super) fn prepare(
     writer: &Writer,
     source: &str,
     input: &ProducerBatch,
     now: u64,
-) -> Result<PreparedStream, Error> {
+) -> Result<Option<PreparedStream>, Error> {
+    prepare_within(writer, source, input, now, MAX_PRODUCER_REGISTRY_BYTES)
+}
+
+/// [`prepare`] with an explicit byte bound, so a test can reach the byte-bound corner.
+fn prepare_within(
+    writer: &Writer,
+    source: &str,
+    input: &ProducerBatch,
+    now: u64,
+    max_bytes: usize,
+) -> Result<Option<PreparedStream>, Error> {
     input.validate()?;
     let mut streams = registry(writer)?;
     streams.retain(|stream| stream.expires_at > now);
     let instance = super::hex::encode(&input.instance);
+    let mut is_new = false;
     let index = match streams
         .iter()
         .position(|stream| stream.source == source && stream.instance == instance)
@@ -290,11 +305,9 @@ pub(super) fn prepare(
         }
         None => {
             if streams.len() == MAX_PRODUCER_STREAMS {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "producer stream registry full; wait for a finite window to expire",
-                ));
+                return Ok(None);
             }
+            is_new = true;
             streams.push(ProducerStream {
                 id: random_id("producer-stream")?,
                 source: source.to_owned(),
@@ -335,16 +348,24 @@ pub(super) fn prepare(
         .checked_add(30 * DAY)
         .ok_or_else(|| Error::new("INVALID_ARGUMENT", "producer metadata deadline overflow"))?;
     let id = state.id.clone();
-    let encoded = json::write_compact(&Value::from(
-        streams.iter().map(Catalog::encode).collect::<Vec<_>>(),
-    ));
-    if encoded.len() > MAX_PRODUCER_REGISTRY_BYTES {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
-            "producer registry exceeds persistent byte bound",
-        ));
-    }
-    Ok(PreparedStream { id, encoded })
+    let Some(encoded) =
+        super::sequence_window::encode_bounded(&mut streams, index, max_bytes, |stream| {
+            // A new window never displaces recorded evidence; an existing one sheds its own
+            // oldest intervals first.
+            if is_new || stream.gaps.is_empty() {
+                return false;
+            }
+            stream.gaps.remove(0);
+            stream.gaps_complete = false;
+            true
+        })
+    else {
+        // Nothing left to shed: take the batch without a window update. The caller counts
+        // the lost evidence; a later batch of this stream may then show those positions as
+        // a gap. A log is never refused for bookkeeping (#215).
+        return Ok(None);
+    };
+    Ok(Some(PreparedStream { id, encoded }))
 }
 
 impl super::sequence_window::Window for ProducerStream {
@@ -358,5 +379,53 @@ impl Store {
     /// Read one retained producer window; record positions survive summary expiry.
     pub fn producer_stream(&self, id: &str, now: u64) -> Result<ProducerStream, Error> {
         super::sequence_window::retained::<ProducerStream>(self, id, now, registry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+
+    /// INVARIANT (#215): a registry at its byte bound never refuses a batch. An existing
+    /// window first sheds its own oldest gap intervals; with none left, the batch is taken
+    /// without a window update (`None`, counted by the caller). The old code answered
+    /// RESOURCE_LIMIT in the second case.
+    #[test]
+    fn byte_bound_sheds_the_windows_gaps_then_takes_the_batch_without_a_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
+        let batch = ProducerBatch {
+            instance: [7; 16],
+            sequences: vec![2, 4, 6, 8],
+        };
+        store
+            .ingest_producer(
+                "seed",
+                "source",
+                &b"{}\n".repeat(4),
+                &batch,
+                1,
+                crate::Durability::Durable,
+            )
+            .unwrap();
+        let next = ProducerBatch {
+            instance: [7; 16],
+            sequences: vec![20],
+        };
+        let writer = store.lock().unwrap();
+        let full = prepare_within(&writer, "source", &next, 2, MAX_PRODUCER_REGISTRY_BYTES)
+            .unwrap()
+            .unwrap();
+        let tight = full.encoded.len() - 1;
+        let shed = prepare_within(&writer, "source", &next, 2, tight)
+            .unwrap()
+            .unwrap();
+        assert!(shed.encoded.len() <= tight);
+        assert!(
+            prepare_within(&writer, "source", &next, 2, 10)
+                .unwrap()
+                .is_none()
+        );
     }
 }

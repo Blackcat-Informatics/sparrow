@@ -1033,6 +1033,31 @@ fn import_preparation(
     }
 }
 
+fn encode_stream_evidence_loss(
+    mut out: wire::stream_evidence_loss::Builder<'_>,
+    loss: &sparrow_core::StreamEvidenceLoss,
+) {
+    out.set_max_named(sparrow_core::MAX_NAMED_LOST_STREAMS as u32);
+    out.set_other_streams(loss.other_streams);
+    out.set_other_batches(loss.other_batches);
+    out.set_other_events(loss.other_events);
+    out.set_other_streams_exact(loss.other_streams_exact);
+    out.set_total_batches(loss.total_batches);
+    out.set_total_events(loss.total_events);
+    let mut named = out.init_named(loss.named.len() as u32);
+    for (index, stream) in loss.named.iter().enumerate() {
+        let mut row = named.reborrow().get(index as u32);
+        row.set_kind(match stream.kind {
+            sparrow_core::LostStreamKind::Producer => wire::LostStreamKind::Producer,
+            sparrow_core::LostStreamKind::Receiver => wire::LostStreamKind::Receiver,
+        });
+        row.set_source(&stream.source);
+        row.set_instance(&stream.instance);
+        row.set_batches(stream.batches);
+        row.set_events(stream.events);
+    }
+}
+
 fn producer_limits(
     mut out: wire::producer_limits::Builder<'_>,
     value: &purrdf_lex::json::Value,
@@ -2992,6 +3017,10 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_query_only(self.query_only);
+                encode_stream_evidence_loss(
+                    out.reborrow().init_stream_evidence_loss(),
+                    &self.store.stream_evidence_loss(),
+                );
                 self.backup
                     .encode(out.reborrow().init_backup(), &self.store.backup_status());
                 match &self.ingest_socket {

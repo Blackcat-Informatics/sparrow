@@ -2141,8 +2141,10 @@ a durable counter update. Connections at the ceiling are served by closing the l
 Producer and receiver windows share bounded native registry decoding, inclusive
 gap arithmetic and retained-window lookup. Their semantics remain separate.
 The registry admits 64 receiver windows and 128 KiB, retaining 16 recent discard
-intervals while preserving exact aggregate counts. Summaries expire 30 days
-after their latest observed timestamp; record pins never renew them. Listener
+intervals while preserving exact aggregate counts. A full registry never
+refuses a packet or batch: it is stored without a window and the lost gap
+evidence is counted in status (see `docs/interfaces.md`, #215). Summaries
+expire 30 days after their latest observed timestamp; record pins never renew them. Listener
 restart and post-expiry reuse create new window identities. A first receiver
 publication fences a store at format 40, or 41 with watch state; later writes
 preserve that fence and pressure state. Production has no syslog listeners or
