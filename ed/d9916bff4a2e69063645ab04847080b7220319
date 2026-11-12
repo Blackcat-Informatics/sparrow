@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 5575aeb24f3f1516a78753f4199a6a25e0a07a7b
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 219
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/219
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 4e5eff83a0fa9fd02a51df053c478110276dc84c
+GhpRsq-Head-Ref: paudley/218-pressure-a-failed-native-compaction-can
+GhpRsq-Head-OID: 5575aeb24f3f1516a78753f4199a6a25e0a07a7b
+GhpRsq-Result-Tree: aab31fb045a63723c0d8db39bfb87e618b700ee9
+GhpRsq-Result-Commit: edd9916bff4a2e69063645ab04847080b7220319
+GhpRsq-Parent-Hashes: 5575aeb24f3f1516a78753f4199a6a25e0a07a7b
+GhpRsq-Squash-Notes-SHA256: 80da485c854b4cb29f7353f46f5c9821529ecd8a1a7058e40df0f8c240ede9f6
+GhpRsq-Stage-Evidence: none
