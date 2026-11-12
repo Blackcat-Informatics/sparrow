@@ -255,8 +255,10 @@ whose every remaining unit is protected stays `blocked` or `awaitingArchive`
 and says so (`waitingOn`, `stalledPasses`); a pin release or archive commit wakes the
 pass at once. These cannot end in process by design: the pin and the archive
 gate are protections that outrank intake, and RocksDB's background-error count
-is cumulative since open and cannot be cleared in place, so a store that
-reports one is `blocked` with a restart instruction until the daemon reopens it.
+is cumulative since open and cannot be cleared in place. A background error fails
+only the pass that first sees it (#218): the wait ends, the error is counted in
+`nativeErrors` and journaled, and the next pass goes on, so an error never holds intake
+until a restart.
 
 The pressure pass writes a retirement batch, a flush and the forced compaction. All are
 small beside the maintenance reserve the budget withholds for them, so the pass runs
@@ -278,7 +280,11 @@ pass's clock), `linkedBytes`, `episodeSince` (intake refused since), `phaseSince
 `forcedCompactions`, `waitsReleased`, `stalledPasses`, `refusedWrites` (data writes
 answered `STORAGE_PRESSURE` at physical admission), `waitingOn` (why the last pass could
 do no more), and for the free-space floor `floorPausedSince`, `floorPauses`,
-`floorResumes` and `floorRefusedWrites`. CLI and MCP render ages as `wait_age_ms`,
+`floorResumes` and `floorRefusedWrites`. #218 adds `forcedCompactionMs` (wall time of the
+last forced compaction), `forcedCompactionFamilies` (a list of `family`, `beforeBytes` and
+`afterBytes`, the table bytes of each family around it), `forcedFailures` (forced
+compactions that ended in a panic or a raised native error) and `nativeErrors` (new RocksDB
+background errors the pressure passes saw); again no version change. CLI and MCP render ages as `wait_age_ms`,
 `episode_age_ms` and `phase_age_ms`, measured to `observedAt`. Counters are session-local
 and the clocks of an episode or wait restored at open start at the first pass; the
 stored wait marker is unchanged.

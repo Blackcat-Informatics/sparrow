@@ -53,6 +53,38 @@ wait is released and the next pass retires more. The pass needs the maintenance 
 free on the filesystem and otherwise does nothing that writes; its retirement and wait-clear commits are admitted against that reserve, not the free-space floor, which ordinary writes keep. The interface
 document has the status fields and the states that cannot end in process.
 
+## A failed native compaction does not latch the pressure state (#218)
+
+The binding's compaction call is `void` all the way down: the C function
+`rocksdb_compact_range_cf_opt` drops the status RocksDB returns, and no other binding
+entry point returns it. A failed compaction shows only as a rise in
+`rocksdb.background-errors`, which RocksDB raises for a compaction error through its
+error handler. That count is cumulative since open and cannot be cleared in place. The
+pressure worker used to treat any nonzero count as fatal, so one failed compaction on a
+filling disk failed every later pass, kept the wait marker, and left intake refused
+until a restart.
+
+Now the worker keeps a baseline of the summed count, taken at open, and fails a pass
+only on an error new since the last pass, as the table rewrite already does. That pass
+reports the error once (`failure`, a journal line, the `nativeErrors` counter), ends the
+wait in memory and on disk, and the next pass retires what the archive gate allows. The
+forced thread samples the count around its compaction, so a failed one is told apart from
+a no-op and ends the wait the same way (`forcedFailures`); a panic of the thread does
+too. Policy: intake and its recovery come before an old error. The error stays visible in
+the counters; nothing not yet archived is removed to make room, because the archive
+gate still decides what retirement may take.
+
+Any ended wait now deletes its persisted marker, so a release that retires nothing no
+longer leaves a marker that restores a wait nobody holds at the next open. A pass that
+retires evidence stages a new marker with its own batch. A crash between the two
+reopens above the data allowance, which requests maintenance by itself.
+
+The forced compaction times itself and reads each family's table bytes
+(`rocksdb.total-sst-files-size`) before and after. `pressureStatus` carries
+`forcedCompactionMs` and `forcedCompactionFamilies`, so the first real run on a store
+measures its own duration and per-family effect. These are measurements of that run,
+not estimates.
+
 ## Resource and failure boundary
 
 Application admission accounts for expected write space and a maintenance

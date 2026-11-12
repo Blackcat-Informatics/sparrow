@@ -55,6 +55,9 @@ pub use storage::eviction::{
     EvictionFrontier, EvictionLimits, EvictionReport, MAX_PINNED_MEMBERS, MAX_PINS,
 };
 pub use storage::expiry::{EXPIRY_CEILING_MS, ExpiryFrontier, ExpiryReport};
+pub use storage::forced_compaction::FamilySize;
+#[cfg(feature = "test-support")]
+pub use storage::forced_compaction::Fault;
 pub use storage::handoff::ConsumptionHandoff;
 pub use storage::import::{
     IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,

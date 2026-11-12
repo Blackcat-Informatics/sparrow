@@ -326,7 +326,13 @@ struct PressureStatus {
   floorPauses @23 :UInt64;         # free-space floor pauses begun
   floorResumes @24 :UInt64;        # free-space floor pauses ended
   floorRefusedWrites @25 :UInt64;  # writes refused below the free-space floor
+  # #218, additive again (SCHEMA_VERSION unchanged; an older reader ignores these).
+  forcedCompactionMs @26 :UInt64;  # wall time of the last forced compaction; 0 before one
+  forcedCompactionFamilies @27 :List(CompactionFamily); # table bytes per family around it
+  forcedFailures @28 :UInt64;      # forced compactions that ended in a panic or native error
+  nativeErrors @29 :UInt64;        # new RocksDB background errors the pressure passes saw
 }
+struct CompactionFamily { family @0 :Text; beforeBytes @1 :UInt64; afterBytes @2 :UInt64; }
 
 # One-time rewrite of table files written under an older options profile.
 enum RecompressionPhase { running @0; paused @1; complete @2; }

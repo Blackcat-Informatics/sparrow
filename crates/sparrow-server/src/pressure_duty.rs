@@ -39,6 +39,7 @@ struct Signature {
     linked_bytes: u64,
     passes: u64,
     forced_compactions: u64,
+    forced_failures: u64,
     waits_released: u64,
     pending_flushes: u64,
     pending_compactions: u64,
@@ -51,6 +52,7 @@ impl Signature {
             linked_bytes: status.linked_bytes,
             passes: status.passes,
             forced_compactions: status.forced_compactions,
+            forced_failures: status.forced_failures,
             waits_released: status.waits_released,
             pending_flushes: status.pending_flushes,
             pending_compactions: status.pending_compactions,
@@ -68,6 +70,8 @@ pub(crate) struct Duty {
     reported_at: Option<u64>,
     /// Passes without progress since that line.
     quiet: u64,
+    /// Forced-compaction failures already journaled.
+    failures_reported: u64,
 }
 
 impl Default for Duty {
@@ -79,6 +83,7 @@ impl Default for Duty {
             delay: BASE_DELAY,
             reported_at: None,
             quiet: 0,
+            failures_reported: 0,
         }
     }
 }
@@ -99,7 +104,7 @@ fn seconds(ms: u64) -> String {
 
 fn detail(status: &PressureStatus) -> String {
     format!(
-        "requested_bytes={} linked_bytes={} wait_before_bytes={} wait_age={} episode_age={} passes={} evicted_records={} forced_compactions={} waits_released={} stalled_passes={} refused_writes={} waiting_on={}",
+        "requested_bytes={} linked_bytes={} wait_before_bytes={} wait_age={} episode_age={} passes={} evicted_records={} forced_compactions={} waits_released={} stalled_passes={} refused_writes={} forced_compaction_ms={} forced_failures={} native_errors={} waiting_on={}",
         status.requested_bytes,
         status.linked_bytes,
         status.wait_before_bytes,
@@ -111,6 +116,9 @@ fn detail(status: &PressureStatus) -> String {
         status.waits_released,
         status.stalled_passes,
         status.refused_writes,
+        status.forced_compaction_ms,
+        status.forced_failures,
+        status.native_errors,
         status.waiting_on.as_deref().unwrap_or("nothing"),
     )
 }
@@ -122,6 +130,15 @@ impl Duty {
         let signature = Signature::of(status);
         let progress = self.last != Some(signature);
         self.last = Some(signature);
+        // A failed forced compaction is journaled the pass it is seen, never rate-limited.
+        if status.forced_failures > self.failures_reported {
+            self.failures_reported = status.forced_failures;
+            lines.push(format!(
+                "sparrowd: a forced compaction failed after {} ms: {}",
+                status.forced_compaction_ms,
+                status.failure.as_deref().unwrap_or("no reason recorded")
+            ));
+        }
         if status.phase != self.phase {
             let from = self.phase;
             if status.phase == PressurePhase::Ready {

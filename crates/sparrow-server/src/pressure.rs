@@ -40,6 +40,18 @@ pub(crate) fn encode(
     out.set_floor_pauses(status.floor.pauses);
     out.set_floor_resumes(status.floor.resumes);
     out.set_floor_refused_writes(status.floor.refused_writes);
+    out.set_forced_compaction_ms(status.forced_compaction_ms);
+    out.set_forced_failures(status.forced_failures);
+    out.set_native_errors(status.native_errors);
+    let mut families = out
+        .reborrow()
+        .init_forced_compaction_families(status.forced_compaction_families.len() as u32);
+    for (index, size) in status.forced_compaction_families.iter().enumerate() {
+        let mut family = families.reborrow().get(index as u32);
+        family.set_family(&size.family);
+        family.set_before_bytes(size.before_bytes);
+        family.set_after_bytes(size.after_bytes);
+    }
     sparrow_client::encode_optional(
         out.reborrow().init_waiting_on(),
         status.waiting_on.as_deref(),
@@ -123,6 +135,15 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
         wire::optional_text::Absent(()) => Value::Null,
         wire::optional_text::Value(value) => Value::from(value?.to_str()?),
     };
+    let mut families = Vec::new();
+    for family in value.get_forced_compaction_families()? {
+        families.push(Value::from(
+            Object::new()
+                .with("family", family.get_family()?.to_str()?)
+                .with("before_bytes", family.get_before_bytes().to_string())
+                .with("after_bytes", family.get_after_bytes().to_string()),
+        ));
+    }
     // Ages are measured to the last pass's own clock, so they need no clock here.
     let since = |started: u64| {
         if started == 0 {
@@ -173,6 +194,13 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
         .with("stalled_passes", value.get_stalled_passes().to_string())
         .with("refused_writes", value.get_refused_writes().to_string())
         .with("waiting_on", waiting_on)
+        .with(
+            "forced_compaction_ms",
+            value.get_forced_compaction_ms().to_string(),
+        )
+        .with("forced_failures", value.get_forced_failures().to_string())
+        .with("native_errors", value.get_native_errors().to_string())
+        .with("forced_compaction_families", families)
         .with(
             "free_space_floor",
             Object::new()
@@ -257,6 +285,14 @@ mod tests {
             wait_since: 70_000,
             wait_before_bytes: 650,
             forced_compactions: 2,
+            forced_compaction_ms: 4_200,
+            forced_compaction_families: vec![sparrow_core::FamilySize {
+                family: "payload".into(),
+                before_bytes: 900,
+                after_bytes: 400,
+            }],
+            forced_failures: 1,
+            native_errors: 3,
             waits_released: 1,
             stalled_passes: 9,
             refused_writes: 31,
@@ -282,6 +318,9 @@ mod tests {
             ("waits_released", "1"),
             ("stalled_passes", "9"),
             ("refused_writes", "31"),
+            ("forced_compaction_ms", "4200"),
+            ("forced_failures", "1"),
+            ("native_errors", "3"),
         ] {
             assert_eq!(value[name].as_str(), Some(expected), "{name}");
         }
@@ -289,6 +328,10 @@ mod tests {
             value["waiting_on"].as_str(),
             Some("a forced compaction is running")
         );
+        let family = &value["forced_compaction_families"][0];
+        assert_eq!(family["family"].as_str(), Some("payload"));
+        assert_eq!(family["before_bytes"].as_str(), Some("900"));
+        assert_eq!(family["after_bytes"].as_str(), Some("400"));
         let floor = &value["free_space_floor"];
         assert_eq!(floor["paused_since"].as_str(), Some("99000"));
         assert_eq!(floor["pauses"].as_str(), Some("3"));
