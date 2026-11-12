@@ -443,6 +443,10 @@ impl Writer {
                 // nothing is working to end the wait, so force one compaction.
                 match wait.step {
                     Step::Native => {
+                        // A compaction that ended after its own wait was cleared (the
+                        // Ready branch cannot acknowledge one still running) belongs to
+                        // no wait; only a running one blocks this wait's.
+                        self.forced.acknowledge();
                         state.enter(PressurePhase::AwaitingReclamation, now);
                         if self.forced.start(std::sync::Arc::clone(&self.db))? {
                             state.wait = Some(Wait {
@@ -550,6 +554,12 @@ impl Store {
         let mut status = self.unlocked.pressure.read();
         status.floor = self.space.status();
         Ok(status)
+    }
+
+    /// Dev-only: leave a finished, unacknowledged forced compaction in the slot.
+    #[cfg(feature = "test-support")]
+    pub fn leave_forced_compaction_finished(&self) {
+        self.unlocked.forced.leave_finished();
     }
 
     /// Block until no forced compaction is running and RocksDB has no flush or compaction

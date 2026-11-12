@@ -5830,6 +5830,18 @@ fn retirement_and_wait_clear_commit_with_the_floor_unmet() {
             .code,
         "STORAGE_PRESSURE"
     );
+    // The reclamation flag does not outlive a pass: a write right after one is still
+    // held to the floor.
+    store
+        .pressure_maintain(40, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(
+        store
+            .ingest("window-after", "source", "log", b"new\n", 41)
+            .unwrap_err()
+            .code,
+        "STORAGE_PRESSURE"
+    );
 }
 
 // Value: review of #211 found a forced compaction counted for a later wait while none
@@ -5881,6 +5893,53 @@ fn a_second_stuck_wait_forces_its_own_compaction_after_the_first_ended_by_recove
             .as_deref()
             .unwrap()
             .contains("forced a compaction")
+    );
+}
+
+// Value: review 2 of #211: a compaction still running when its wait was cleared ends
+// later with nothing to acknowledge it, and the next stuck wait then reported "still
+// running" for ever. Protects: a finished slot found at the start of a new wait does not
+// block that wait's own compaction, which is forced, measured and released.
+#[test]
+fn a_finished_slot_left_by_an_earlier_wait_does_not_stop_the_next_wait_forcing() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    for (index, at) in [1_u64, 2].into_iter().enumerate() {
+        store
+            .ingest(&format!("stale-{index}"), "source", "log", b"x\n", at)
+            .unwrap();
+    }
+    let file = std::fs::File::create(dir.path().join("test-owned-pressure-ballast")).unwrap();
+    file.set_len(13 * 1024 * 1024).unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    store.pressure_maintain(10, limits).unwrap();
+    file.set_len(14 * 1024 * 1024).unwrap();
+    store.await_native_quiet().unwrap();
+    store.leave_forced_compaction_finished();
+    let forced = store.pressure_maintain(20, limits).unwrap();
+    assert_eq!(forced.forced_compactions, 1);
+    assert!(
+        !forced
+            .waiting_on
+            .as_deref()
+            .unwrap()
+            .contains("still running")
+    );
+    store.await_native_quiet().unwrap();
+    assert_eq!(
+        store.pressure_maintain(30, limits).unwrap().waits_released,
+        0
+    );
+    assert_eq!(
+        store.pressure_maintain(40, limits).unwrap().waits_released,
+        1
     );
 }
 

@@ -102,6 +102,13 @@ impl Forced {
             })
     }
 
+    /// Leave a finished, unacknowledged compaction in the slot, as one that ended after its
+    /// wait was cleared would.
+    #[cfg(feature = "test-support")]
+    pub(super) fn leave_finished(&self) {
+        *self.slot() = Slot::Finished(None);
+    }
+
     /// Block until no compaction is running, for tests that must observe its end.
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn wait_finished(&self) {
