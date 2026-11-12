@@ -119,7 +119,8 @@ pub struct ReceiverWindow {
     pub discarded: u64,
     /// Refused complete packets.
     pub refused: u64,
-    /// Oversized datagrams.
+    /// Packets cut before publication: TCP lines above the listener's size, and octet-counted
+    /// frames or broken frames above the store's syslog ceiling.
     pub truncated: u64,
     /// TCP framing failures.
     pub framing_failures: u64,

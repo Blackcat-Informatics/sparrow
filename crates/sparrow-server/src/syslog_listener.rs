@@ -35,7 +35,8 @@ pub enum SyslogFraming {
 pub enum SyslogTransport {
     /// Configured RFC 6587 framing and bounded simultaneous connections.
     Tcp,
-    /// One message per datagram, with explicit observed refusals/truncation.
+    /// One message per datagram, kept whole; refusals are counted and there is no delivery
+    /// acknowledgement.
     Udp,
 }
 
@@ -53,7 +54,8 @@ pub struct SyslogListener {
     pub transport: SyslogTransport,
     /// Required for TCP and absent for UDP.
     pub framing: Option<SyslogFraming>,
-    /// Required per-message payload ceiling, 480..65536.
+    /// Required, 480..65536. TCP line framing keeps this many bytes of a line and counts the
+    /// cut; UDP ignores it, since a datagram always fits the store's ceiling.
     pub max_message_bytes: usize,
     /// Required per-listener TCP connection ceiling, 1..16; UDP requires one.
     pub max_connections: usize,
@@ -603,6 +605,10 @@ enum End {
     Complete,
     /// Bad octet-count start, a frame cut by end of stream, or a read error.
     Malformed(String),
+    /// The frame deadline expired inside the frame (decided by the caller).
+    Stalled,
+    /// The daemon began stopping inside the frame (decided by the caller).
+    Stopped,
 }
 
 enum Fault {
@@ -618,15 +624,22 @@ struct Frame {
 }
 
 impl Partial {
-    fn into_frame(mut self, end: Result<End, tokio::time::error::Elapsed>) -> Frame {
+    fn into_frame(mut self, end: End) -> Frame {
         let fault = match end {
-            Ok(End::Complete) => {
+            End::Complete => {
                 self.bytes.drain(..self.body_start);
                 None
             }
-            Ok(End::Malformed(reason)) => Some(Fault::Framing(reason)),
-            Err(_) => Some(Fault::TimedOut),
+            End::Malformed(reason) => Some(Fault::Framing(reason)),
+            End::Stalled => Some(Fault::TimedOut),
+            End::Stopped => Some(Fault::Framing("daemon stopping inside a frame".into())),
         };
+        // A broken frame keeps its header too, so it can pass the store's ceiling: keep what
+        // fits and count the cut.
+        if self.bytes.len() > sparrow_core::SYSLOG_MESSAGE_BYTES {
+            self.bytes.truncate(sparrow_core::SYSLOG_MESSAGE_BYTES);
+            self.dropped = true;
+        }
         Frame {
             bytes: self.bytes,
             truncated: self.dropped,
@@ -681,21 +694,23 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
         };
         let mut partial = Partial::default();
         let end = tokio::select! {
-            changed = stop.changed() => {
-                changed.map_err(io::Error::other)?;
-                discard(&store, metrics, &operations, sparrow_core::ReceiverDiscard::Refused).await?;
-                return Ok(());
-            },
-            end = tokio::time::timeout(deadline, read_frame(&mut stream, framing, definition.max_message_bytes, first, &mut partial)) => end,
+            changed = stop.changed() => { changed.map_err(io::Error::other)?; None },
+            end = tokio::time::timeout(deadline, read_frame(&mut stream, framing, definition.max_message_bytes, first, &mut partial)) => Some(end),
         };
-        // A read error ends the stream like a stall: continuity past it is unknown.
+        // A stop, a stall or a read error ends the stream: continuity past it is unknown. The
+        // bytes read so far are still published, so shutdown loses none it holds.
         let (end, closing) = match end {
-            Ok(Ok(end)) => (Ok(end), false),
-            Ok(Err(error)) => (Ok(End::Malformed(error.to_string())), true),
-            Err(elapsed) => (Err(elapsed), true),
+            Some(Ok(Ok(end))) => (end, false),
+            Some(Ok(Err(error))) => (End::Malformed(error.to_string()), true),
+            Some(Err(_)) => (End::Stalled, true),
+            None => (End::Stopped, true),
         };
         let frame = partial.into_frame(end);
-        let permit = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; discard(&store, metrics, &operations, sparrow_core::ReceiverDiscard::Refused).await?; return Ok(()); }, permit = operations.clone().acquire_owned() => permit.map_err(io::Error::other)? };
+        let permit = operations
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(io::Error::other)?;
         let accepted = publish(
             store.clone(),
             definition.source.clone(),
@@ -1120,7 +1135,7 @@ mod tests {
         let end = read_frame(stream, framing, maximum, first, &mut partial)
             .await
             .unwrap();
-        Some(partial.into_frame(Ok(end)))
+        Some(partial.into_frame(end))
     }
 
     /// INVARIANT: a well-formed frame is read byte-exact in every framing, whatever the
@@ -1239,6 +1254,82 @@ mod tests {
         assert_eq!(frame.bytes, b"9 short");
         assert!(matches!(frame.fault, Some(Fault::Framing(_))));
         assert!(next_frame(&mut input, framing, 480).await.is_none());
+    }
+
+    /// Value: a frame cut near or above the store's 65536-byte ceiling is still kept. Its
+    /// header counts toward the stored packet, so the bytes published are capped at the ceiling
+    /// and the cut is counted; otherwise the store would refuse the whole frame.
+    #[tokio::test]
+    async fn a_cut_frame_at_the_store_ceiling_is_published_capped_and_counted() {
+        let ceiling = sparrow_core::SYSLOG_MESSAGE_BYTES;
+        let mut octets = b"70000 ".to_vec();
+        octets.extend(std::iter::repeat_n(b'x', ceiling));
+        let mut line = vec![b'y'; ceiling + 5];
+        line.push(b'z');
+        for (framing, mut input) in [
+            (SyslogFraming::OctetCounting, octets.as_slice()),
+            (SyslogFraming::CrLf, line.as_slice()),
+        ] {
+            let frame = next_frame(&mut input, framing, ceiling).await.unwrap();
+            assert_eq!(frame.bytes.len(), ceiling);
+            assert!(frame.truncated);
+            assert!(matches!(frame.fault, Some(Fault::Framing(_))));
+        }
+    }
+
+    /// Value: a daemon that stops inside a frame publishes the bytes it already read as a
+    /// malformed packet instead of dropping them, and counts the cut.
+    #[tokio::test]
+    async fn stopping_inside_a_frame_publishes_the_bytes_read() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let definition = fixture.metrics.snapshot().unwrap().definition;
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (stop, stopped) = watch::channel(false);
+        let roster = Arc::new(Roster::default());
+        let lease = roster.enroll().unwrap();
+        let metrics = fixture.metrics.clone();
+        let store = fixture.store.clone();
+        let reading = tokio::spawn(async move {
+            receive_tcp(
+                receiver,
+                &definition,
+                &metrics,
+                store,
+                Arc::new(Semaphore::new(4)),
+                stopped,
+                lease,
+            )
+            .await
+        });
+        // Wait until the connection idles at the boundary, then send the partial frame and wait
+        // until its first byte has put it inside the frame.
+        let idle_is = |idle: bool| {
+            roster
+                .slots
+                .lock()
+                .unwrap()
+                .1
+                .values()
+                .all(|slot| slot.idle_since.is_some() == idle)
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !idle_is(true) {
+                tokio::task::yield_now().await;
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut sender, b"20 <34>half")
+                .await
+                .unwrap();
+            while !idle_is(false) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send_replace(true);
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!((counts.accepted, counts.framing_failures), (1, 1));
+        assert_eq!(counts.refused, 0);
     }
 
     struct Listener {

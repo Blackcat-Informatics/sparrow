@@ -2374,8 +2374,8 @@ the original packet; LF framing preserves a preceding CR. No framing guesses
 are made. At most four listeners exist.
 
 A listener keeps every byte it can and counts every byte it cannot, using the
-existing discard reasons, and no framing case closes a TCP stream or discards a
-frame:
+existing discard reasons. No oversize, bad-start or idle case closes a TCP
+stream or discards a frame:
 
 - UDP reads a buffer of the store's 65536-byte syslog ceiling, so each datagram
   is kept whole. `max_message_bytes` frames TCP lines only.
@@ -2386,6 +2386,8 @@ frame:
 - An LF or CRLF line above `max_message_bytes` keeps its first
   `max_message_bytes` bytes, drops the rest up to the newline without holding
   it, and counts one `truncated`. The stream stays open.
+- A broken frame is published capped at the store's 65536-byte ceiling, header
+  included, with the cut counted `truncated`.
 - A bad octet-count start publishes the bytes read, with the rest of that line,
   as a malformed packet, counts one `framing_failure`, and resumes after the
   newline. A frame cut by end of stream publishes the bytes read as a malformed
@@ -2394,8 +2396,12 @@ frame:
   timeout runs from a frame's first byte, so a sender idle between frames is
   not a fault. Bytes dropped from such a frame also count `truncated`.
 - When a new connection arrives at the connection ceiling, the connection idle
-  longest at a frame boundary is closed for it, losing no data. The arrival
-  waits for that slot and is not refused, so `rejected_connections` stays zero.
+  longest at a frame boundary is closed for it, and nothing the daemon has read
+  is lost. The arrival waits for that slot and is not refused, so
+  `rejected_connections` stays zero. A sender that has not yet noticed the close
+  and writes again has that write reset by the daemon, and no counter sees it.
+  On daemon shutdown a frame in flight is published as a malformed packet and
+  counted `framing_failure`; bytes still unread in the socket cannot be counted.
 
 Each accepted packet is one exact-byte `syslog` record, including embedded
 newlines. Its immutable profile records parsed RFC 5424 or RFC 3164 headers,
@@ -2411,7 +2417,8 @@ diagnostic without claiming successfully parsed header or parameter evidence.
 
 Status exposes configured and actual listener bindings, bounds, active TCP
 connections and observed successful publications, interpretation failures,
-refusals, oversized datagrams, framing failures, connection refusals and timeouts.
+refusals, cut packets (`truncated`), framing failures and timeouts. Connection
+refusals stay zero because an arrival at the ceiling is served.
 Counters are process-lifetime evidence and reset on restart. Successful counts
 follow durable store publication, but syslog provides no typed sender receipt.
 TCP sends therefore do not prove publication; UDP kernel/network loss remains
@@ -2611,15 +2618,17 @@ typed syslog uploads have no fabricated receiver position.
 Use full typed record/context metadata, including CLI `context STORE_ID
 RECORD_ID --before 0 --after 0`, to resolve a search result's receiver position.
 
-Known local refused packets, oversized UDP datagrams, TCP framing failures and
-TCP frame deadlines publish classified observations without a packet occurrence.
+Known local refused packets publish a classified observation without a packet
+occurrence. A UDP datagram is kept whole. A TCP frame that is oversize, cut by
+end of stream, broken or stalled publishes the bytes read as a packet and also
+records its classified observation.
 The listener waits for the same bounded global operation admission before these
 control writes; there is at most one waiter per admitted listener/connection.
 Shutdown joins admitted control writes. Storage admission refusals may be
 classified; an uncertain storage failure stops the intake group without claiming
 a known discarded packet. Failed history publication is a visible intake
-failure, never a successful counter update. Rejected TCP connections are runtime
-counts, since no message observation exists.
+failure, never a successful counter update. A TCP connection at the ceiling is
+not rejected, so no connection count exists.
 
 `ReceiverWindow` exposes exact observations, accepted/discarded totals, counts
 for the four local discard classes, at most 16 recent inclusive discard ordinal
