@@ -72,6 +72,8 @@ pub(crate) struct Duty {
     quiet: u64,
     /// Forced-compaction failures already journaled.
     failures_reported: u64,
+    /// Native background errors already journaled.
+    native_reported: u64,
 }
 
 impl Default for Duty {
@@ -84,6 +86,7 @@ impl Default for Duty {
             reported_at: None,
             quiet: 0,
             failures_reported: 0,
+            native_reported: 0,
         }
     }
 }
@@ -190,15 +193,29 @@ impl Duty {
         }
     }
 
-    /// Account for a pass that failed at `now`; the failure is a latched `Blocked` state
-    /// in the store, and it is retried on the same backoff.
-    pub(crate) fn failed(&mut self, now: u64, error: &str) -> Verdict {
+    /// Account for a pass that failed at `now`. The store shows `Blocked` until the next
+    /// pass, which is retried on the same backoff. A RocksDB error new since the last
+    /// report is journaled at once whatever the rate limit says, and carries its reason;
+    /// the same failure repeated stays rate limited.
+    pub(crate) fn failed(
+        &mut self,
+        now: u64,
+        error: &str,
+        status: Option<&PressureStatus>,
+    ) -> Verdict {
         self.last = None;
         self.quiet += 1;
-        let due = self
-            .reported_at
-            .is_none_or(|at| now.saturating_sub(at) >= QUIET_REPORT_MS);
         let mut lines = Vec::new();
+        let new_native = status.is_some_and(|status| status.native_errors > self.native_reported);
+        if let Some(status) = status {
+            self.native_reported = status.native_errors;
+            // The reason rides in `error`, so this failure is not reported a second time.
+            self.failures_reported = self.failures_reported.max(status.forced_failures);
+        }
+        let due = new_native
+            || self
+                .reported_at
+                .is_none_or(|at| now.saturating_sub(at) >= QUIET_REPORT_MS);
         if due {
             lines.push(format!(
                 "sparrowd: pressure maintenance failed ({} failures since the last report): {error}",
@@ -296,18 +313,66 @@ mod tests {
         assert!(duty.observe(&waiting(61_000, 900)).lines.is_empty());
     }
 
-    // Value: a failing pass (a background error needing a restart) is the one state the
-    // store cannot end; it must stay loud without flooding the journal.
+    // Value: a failing pass (a store fault that persists) must stay loud without flooding
+    // the journal.
     // Protects: failures are journaled at the same bounded rate and back off.
     #[test]
     fn failing_passes_are_journaled_at_a_bounded_rate_and_back_off() {
         let mut duty = Duty::default();
-        let first = duty.failed(0, "background errors");
+        let first = duty.failed(0, "background errors", None);
         assert_eq!(first.lines.len(), 1);
         assert!(first.lines[0].contains("background errors"));
         assert_eq!(first.delay, Duration::from_secs(2));
-        assert!(duty.failed(1_000, "background errors").lines.is_empty());
-        let later = duty.failed(60_000, "background errors");
+        assert!(
+            duty.failed(1_000, "background errors", None)
+                .lines
+                .is_empty()
+        );
+        let later = duty.failed(60_000, "background errors", None);
         assert!(later.lines[0].contains("2 failures since the last report"));
+    }
+
+    // Value: #218 ruling: a new RocksDB error is surfaced at once, and the forced-failure
+    // line names the real reason. Protects: a failed pass that carries a new native error is
+    // journaled inside the rate-limit window with its reason, is not journaled twice, and
+    // an error already reported falls back to the bounded rate.
+    #[test]
+    fn a_new_native_error_is_journaled_at_once_with_its_reason() {
+        let mut duty = Duty::default();
+        assert_eq!(duty.observe(&waiting(0, 900)).lines.len(), 1);
+        let status = PressureStatus {
+            native_errors: 1,
+            forced_failures: 1,
+            ..waiting(1_000, 900)
+        };
+        let reason = "RocksDB reported 1 new background errors; the forced compaction failed: io";
+        let first = duty.failed(1_000, reason, Some(&status));
+        assert_eq!(first.lines.len(), 1);
+        assert!(first.lines[0].contains("the forced compaction failed: io"));
+        assert!(duty.failed(2_000, reason, Some(&status)).lines.is_empty());
+        // The failure was journaled with its reason; no second line follows it.
+        assert!(
+            !duty
+                .observe(&status)
+                .lines
+                .iter()
+                .any(|line| line.contains("forced compaction failed after"))
+        );
+    }
+
+    // Value: a forced compaction that failed without a native error (a panic) is journaled
+    // by the ordinary pass. Protects: the line carries the status failure as its reason, not
+    // a placeholder.
+    #[test]
+    fn a_forced_failure_line_carries_the_real_reason() {
+        let mut duty = Duty::default();
+        let status = PressureStatus {
+            forced_failures: 1,
+            forced_compaction_ms: 7,
+            failure: Some("the forced compaction failed: the thread panicked".into()),
+            ..waiting(0, 900)
+        };
+        let lines = duty.observe(&status).lines;
+        assert!(lines[0].contains("after 7 ms: the forced compaction failed: the thread panicked"));
     }
 }

@@ -70,7 +70,11 @@ reports the error once (`failure`, a journal line, the `nativeErrors` counter), 
 wait in memory and on disk, and the next pass retires what the archive gate allows. The
 forced thread samples the count around its compaction, so a failed one is told apart from
 a no-op and ends the wait the same way (`forcedFailures`); a panic of the thread does
-too. Policy: intake and its recovery come before an old error. The error stays visible in
+too. A store too damaged to take even the small write that ends the wait fails the pass with
+a plain message ("the store cannot take a write, so the pressure wait could not be
+ended"); the error baseline then stays put, so the pass reports it again for as long as it
+lasts. A new RocksDB error is journaled at once, with its reason, not at the bounded rate.
+Policy: intake and its recovery come before an old error. The error stays visible in
 the counters; nothing not yet archived is removed to make room, because the archive
 gate still decides what retirement may take.
 
@@ -79,8 +83,9 @@ longer leaves a marker that restores a wait nobody holds at the next open. A pas
 retires evidence stages a new marker with its own batch. A crash between the two
 reopens above the data allowance, which requests maintenance by itself.
 
-The forced compaction times itself and reads each family's table bytes
-(`rocksdb.total-sst-files-size`) before and after. `pressureStatus` carries
+The forced compaction times itself and reads each family's table and blob file bytes
+(`rocksdb.total-sst-files-size` plus `rocksdb.total-blob-file-size`, the two the linked
+footprint counts) before and after. `pressureStatus` carries
 `forcedCompactionMs` and `forcedCompactionFamilies`, so the first real run on a store
 measures its own duration and per-family effect. These are measurements of that run,
 not estimates.

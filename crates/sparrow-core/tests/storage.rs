@@ -6051,6 +6051,37 @@ fn an_ended_wait_leaves_no_marker_to_restore_at_open() {
     );
 }
 
+// Value: #218 ruling: a store too damaged to take even the small write that ends a wait
+// must say so plainly, and must keep saying it while it lasts. Protects: the failure names
+// the cause in plain words, is re-reported on the next pass (the error baseline does not
+// advance past an unreported error), and once the store takes the write the error fails one
+// pass and the worker proceeds.
+#[test]
+fn a_store_that_cannot_end_a_wait_says_so_and_keeps_saying_it() {
+    use sparrow_core::{EvictionLimits, Fault};
+    let dir = tempfile::tempdir().unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let store = store_waiting_on_native_reclamation(dir.path(), limits);
+    store.arm_forced_compaction_fault(Fault::NativeError);
+    store.pressure_maintain(20, limits).unwrap();
+    store.await_native_quiet().unwrap();
+    store.refuse_pressure_wait_end(true);
+    for at in [30, 40] {
+        let error = store.pressure_maintain(at, limits).unwrap_err();
+        assert!(error.to_string().contains("cannot take a write"), "{error}");
+        let status = store.pressure_status().unwrap();
+        assert!(status.failure.unwrap().contains("cannot take a write"));
+    }
+    store.refuse_pressure_wait_end(false);
+    let error = store.pressure_maintain(50, limits).unwrap_err();
+    assert!(error.to_string().contains("new background errors"));
+    assert_eq!(store.pressure_status().unwrap().native_errors, 1);
+    store.pressure_maintain(60, limits).unwrap();
+}
+
 #[test]
 fn invalid_pressure_recovery_markers_refuse_open() {
     for bytes in [

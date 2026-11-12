@@ -328,7 +328,7 @@ struct PressureStatus {
   floorRefusedWrites @25 :UInt64;  # writes refused below the free-space floor
   # #218, additive again (SCHEMA_VERSION unchanged; an older reader ignores these).
   forcedCompactionMs @26 :UInt64;  # wall time of the last forced compaction; 0 before one
-  forcedCompactionFamilies @27 :List(CompactionFamily); # table bytes per family around it
+  forcedCompactionFamilies @27 :List(CompactionFamily); # table and blob bytes per family around it
   forcedFailures @28 :UInt64;      # forced compactions that ended in a panic or native error
   nativeErrors @29 :UInt64;        # new RocksDB background errors the pressure passes saw
 }

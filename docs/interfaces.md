@@ -282,7 +282,7 @@ answered `STORAGE_PRESSURE` at physical admission), `waitingOn` (why the last pa
 do no more), and for the free-space floor `floorPausedSince`, `floorPauses`,
 `floorResumes` and `floorRefusedWrites`. #218 adds `forcedCompactionMs` (wall time of the
 last forced compaction), `forcedCompactionFamilies` (a list of `family`, `beforeBytes` and
-`afterBytes`, the table bytes of each family around it), `forcedFailures` (forced
+`afterBytes`, the table and blob file bytes of each family around it), `forcedFailures` (forced
 compactions that ended in a panic or a raised native error) and `nativeErrors` (new RocksDB
 background errors the pressure passes saw); again no version change. CLI and MCP render ages as `wait_age_ms`,
 `episode_age_ms` and `phase_age_ms`, measured to `observedAt`. Counters are session-local

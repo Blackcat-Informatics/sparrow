@@ -379,10 +379,30 @@ impl Writer {
     /// next open although nothing is waiting. A pass that retires evidence stages a new one
     /// with that batch; a crash between the two reopens above the allowance, which asks
     /// for maintenance by itself.
+    ///
+    /// A commit that fails means the store cannot take even this small write; the error
+    /// says so plainly, and the caller leaves its baseline alone so the next pass reports
+    /// it again for as long as it lasts.
     fn end_wait(&self, state: &mut State) -> Result<(), Error> {
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete(WAIT_KEY);
-        self.reclaiming(|| self.commit(batch))?;
+        #[cfg(feature = "test-support")]
+        let refused = self.forced.wait_end_refused();
+        #[cfg(not(feature = "test-support"))]
+        let refused = false;
+        let committed = if refused {
+            Err(Error::new("STORAGE_FAILURE", "commit refused by a test"))
+        } else {
+            self.reclaiming(|| self.commit(batch))
+        };
+        committed.map_err(|error| {
+            Error::new(
+                error.code,
+                format!(
+                    "the store cannot take a write, so the pressure wait could not be ended; intake stays refused until it can: {error}"
+                ),
+            )
+        })?;
         state.end_wait();
         Ok(())
     }
@@ -402,11 +422,13 @@ impl Writer {
         if failure.is_some() {
             state.status.forced_failures = state.status.forced_failures.saturating_add(1);
             state.status.failure.clone_from(&failure);
-            if state.wait.is_some() {
-                self.end_wait(state)?;
-            }
         }
+        // Acknowledge first: a failed wait-ending commit below must not leave the outcome
+        // in the slot to be counted again by the next pass.
         self.forced.acknowledge();
+        if failure.is_some() && state.wait.is_some() {
+            self.end_wait(state)?;
+        }
         Ok(failure)
     }
 
@@ -453,14 +475,22 @@ impl Writer {
         let errors = self.forced.native_errors(&self.db)?;
         if errors > state.background_errors {
             let new = errors - state.background_errors;
+            // The wait may already have ended with a failed forced compaction.
+            if state.wait.is_some() {
+                // The baseline moves only once the wait has ended, so a store that cannot
+                // take the write is reported again on every pass.
+                self.end_wait(&mut state)?;
+            }
             state.background_errors = errors;
             state.status.native_errors = state.status.native_errors.saturating_add(new);
-            self.end_wait(&mut state)?;
             self.forced.acknowledge();
+            let forced = forced_failure
+                .map(|failure| format!("; {failure}"))
+                .unwrap_or_default();
             return Err(Error::new(
                 "STORAGE_FAILURE",
                 format!(
-                    "RocksDB reported {new} new background errors ({} this session); the pressure wait ended and the next pass retires more evidence",
+                    "RocksDB reported {new} new background errors ({} this session); the pressure wait ended and the next pass retires more evidence{forced}",
                     state.status.native_errors
                 ),
             ));
@@ -624,6 +654,13 @@ impl Store {
     #[cfg(feature = "test-support")]
     pub fn arm_forced_compaction_fault(&self, fault: super::forced_compaction::Fault) {
         self.unlocked.forced.arm(fault);
+    }
+
+    /// Dev-only: make the commit that ends a pressure wait fail, as a store that cannot
+    /// take a write would.
+    #[cfg(feature = "test-support")]
+    pub fn refuse_pressure_wait_end(&self, refused: bool) {
+        self.unlocked.forced.refuse_wait_end(refused);
     }
 
     /// Dev-only: count native background errors a real failing compaction would raise.

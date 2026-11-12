@@ -23,14 +23,15 @@ use rocksdb::{CompactOptions, DB};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
-/// One family's table bytes either side of the forced compaction.
+/// One family's table and blob bytes either side of the forced compaction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FamilySize {
     /// The column family.
     pub family: String,
-    /// Table bytes before the compaction.
+    /// Table and blob file bytes before the compaction (the same two properties the linked
+    /// footprint counts).
     pub before_bytes: u64,
-    /// Table bytes after it.
+    /// Table and blob file bytes after it.
     pub after_bytes: u64,
 }
 
@@ -41,7 +42,7 @@ pub(super) struct Outcome {
     pub(super) failure: Option<String>,
     /// Wall time the compaction took, in milliseconds.
     pub(super) elapsed_ms: u64,
-    /// Table bytes of every family before and after.
+    /// Table and blob bytes of every family before and after.
     pub(super) families: Vec<FamilySize>,
 }
 
@@ -100,6 +101,10 @@ pub(super) struct Forced {
     /// The fault the next compaction takes.
     #[cfg(feature = "test-support")]
     fault: Mutex<Option<Fault>>,
+    /// While set, the commit that ends a wait fails, as a store that cannot take a write
+    /// would.
+    #[cfg(feature = "test-support")]
+    wait_end_refused: std::sync::atomic::AtomicBool,
 }
 
 impl Forced {
@@ -112,6 +117,8 @@ impl Forced {
             simulated_errors: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             fault: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            wait_end_refused: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -202,6 +209,20 @@ impl Forced {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fault);
     }
 
+    /// Make the commit that ends a wait fail (or succeed again).
+    #[cfg(feature = "test-support")]
+    pub(super) fn refuse_wait_end(&self, refused: bool) {
+        self.wait_end_refused
+            .store(refused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a test made the wait-ending commit fail.
+    #[cfg(feature = "test-support")]
+    pub(super) fn wait_end_refused(&self) -> bool {
+        self.wait_end_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Count `count` more native errors, as a failing compaction would.
     #[cfg(feature = "test-support")]
     pub(super) fn simulate_native_errors(&self, count: u64) {
@@ -231,10 +252,20 @@ impl Forced {
             FAMILIES
                 .iter()
                 .map(|family| {
-                    property(db, family, "rocksdb.total-sst-files-size").unwrap_or_else(|error| {
-                        failures.push(error.to_string());
-                        0
+                    // Blob files hold the payload family's bulk and the linked footprint
+                    // counts them, so the measure must too.
+                    [
+                        "rocksdb.total-sst-files-size",
+                        "rocksdb.total-blob-file-size",
+                    ]
+                    .into_iter()
+                    .map(|name| {
+                        property(db, family, name).unwrap_or_else(|error| {
+                            failures.push(error.to_string());
+                            0
+                        })
                     })
+                    .fold(0_u64, u64::saturating_add)
                 })
                 .collect::<Vec<_>>()
         };

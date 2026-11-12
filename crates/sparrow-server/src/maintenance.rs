@@ -407,11 +407,14 @@ async fn run(
                 }
             }
             Err(error) if matches!(job, Job::Pressure) => {
-                // The store latched the failure as `Blocked`; the duty journals it at a
-                // bounded rate and retries on its backoff, never a busy loop.
+                // The store shows `Blocked` until the next pass; the duty journals a new
+                // native error at once and a repeat at a bounded rate, and retries on its
+                // backoff, never a busy loop.
+                let status = store.pressure_status().ok();
                 let verdict = pressure_duty.failed(
                     sparrow_server::now().unwrap_or_default(),
                     &error.to_string(),
+                    status.as_ref(),
                 );
                 for line in &verdict.lines {
                     eprintln!("{line}");
