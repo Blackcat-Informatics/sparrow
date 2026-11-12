@@ -593,11 +593,12 @@ source is missing", durably across restarts (schema 71 and newer). The watch
 failure text names it too, but another claim's retry can replace that text.
 Once its bytes are confirmed lost, retire it with `sparrow SOCKET watch
 retire-claim WATCH_ID CLAIM_ID REASON` (schema 70 and newer; interfaces,
-"Retiring an unrecoverable claim"). It leaves `pending_claims` and stays listed as `retired-unrecoverable`. If its
-staged import had begun, the next reclaim pass frees that import's staged chunks
-and slot. The watch failure clears only if that claim caused it. A claim whose
-private source still exists or whose publication is recorded is refused;
-reconcile the private entry first, keeping its bytes.
+"Retiring an unrecoverable claim"). It leaves `pending_claims` and stays
+listed as `retired-unrecoverable`. If its staged import had begun, the next
+reclaim pass frees that import's staged chunks and slot. The watch failure
+clears only if that claim caused it. A claim whose private source still exists
+or whose publication is recorded is refused; reconcile the private entry first,
+keeping its bytes.
 
 ### Measure the online migration
 
