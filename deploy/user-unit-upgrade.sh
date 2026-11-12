@@ -117,9 +117,10 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
   pending_claims, status and watch list show it as retired-unrecoverable, and the daemon
   logs one line. It exits 4 while a watch holds a pending claim it did not reconcile:
   inspect watch claims, rerun only for a claim just attempted, and decide on any other
-  kind. A FROM image older than schema 70 cannot retire (exit 3 when nothing else is unreconciled): the bytes are
-  re-shipped and the claim stays pending until a schema 70 image retires it. A claim
-  whose private source exists or whose publication is recorded is refused.
+  kind. A FROM image older than schema 70 cannot retire (exit 3 when nothing else is
+  unreconciled): the bytes are re-shipped and the claim stays pending until a schema 70
+  image retires it. A claim whose private source exists or whose publication is recorded
+  is refused.
 USAGE
 }
 

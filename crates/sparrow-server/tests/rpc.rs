@@ -4254,6 +4254,176 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
         .await;
 }
 
+/// INVARIANT (#222, #214): the running watch loop keeps a claim's failure when a different claim
+/// succeeds. This drives the real success path (the loop's call to `record_claim_success` after
+/// a publication through the daemon's ingest socket), which the worker's unit test of the method
+/// cannot pin: a loop that cleared the failure on any success would pass that test and fail
+/// here. A claim whose private source is gone stays pending and fails; a file that arrives
+/// after its first failed attempt is consumed; at the status that first reports that file's
+/// completion, the stuck claim's failure must still be there. The stuck claim's retry is 5
+/// seconds after its failure and the file completes after its quiet time, so the success is
+/// observed before the retry can set the failure again.
+#[tokio::test(flavor = "current_thread")]
+async fn another_claims_publication_leaves_a_stuck_claims_failure_in_status() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::{ServerConfig, consumption::ClaimRoot};
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_consume_config(&config, &root, 100, 16, 16);
+            let lost = {
+                let store = ServerConfig::read(&config).unwrap().open_store().unwrap();
+                let owner = ClaimRoot::open(store, "completed", &root).unwrap();
+                let path = root.join("lost.jsonl");
+                std::fs::write(&path, b"{\"name\":\"lost\"}\n").unwrap();
+                let identity =
+                    sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap());
+                let journal = owner
+                    .reserve(
+                        Path::new("lost.jsonl"),
+                        identity,
+                        "consume-acceptance",
+                        "jsonl",
+                    )
+                    .unwrap();
+                owner
+                    .recover(&journal.import_id, sparrow_server::now().unwrap())
+                    .unwrap();
+                std::fs::remove_file(root.join(".sparrow-inflight").join(&journal.import_id))
+                    .unwrap();
+                journal.import_id
+            };
+            let _daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(producer.capability(), |watch| {
+                watch.get_pending_claims() == 1
+                    && matches!(
+                        watch.get_failure().unwrap().which().unwrap(),
+                        wire::optional_text::Value(_)
+                    )
+            })
+            .await;
+            std::fs::write(root.join("fresh.jsonl"), b"{\"name\":\"fresh\"}\n").unwrap();
+            let at_completion = std::cell::RefCell::new(None);
+            watch_until(producer.capability(), |watch| {
+                if watch.get_completed_claims() == 0 {
+                    return false;
+                }
+                let failure = match watch.get_failure().unwrap().which().unwrap() {
+                    wire::optional_text::Value(text) => {
+                        Some(text.unwrap().to_str().unwrap().to_owned())
+                    }
+                    wire::optional_text::Absent(()) => None,
+                };
+                *at_completion.borrow_mut() = Some((watch.get_pending_claims(), failure));
+                true
+            })
+            .await;
+            let (pending, failure) = at_completion.into_inner().unwrap();
+            assert_eq!(pending, 1, "the stuck claim is still pending");
+            let failure =
+                failure.expect("the stuck claim's failure vanished with another claim's success");
+            assert!(failure.contains(&lost), "{failure}");
+        })
+        .await;
+}
+
+/// INVARIANT (#222, #214): `deploy/reconcile-inflight.sh missing` never reports done while a
+/// claim is unreconciled. A claim reserved but not yet attempted since the backup has no pending
+/// reason, which is not the missing-source reason, so the script leaves it alone and exits 4 with
+/// nothing re-shipped, not 0. Only a journal made through the claim owner reaches this state (a
+/// running daemon attempts a claim at once and records a reason), so the test builds one that
+/// way and serves it from query-only daemons, which attempt nothing: one on the store as
+/// restored and one on a copy standing in for the newer store. The wrong behaviour this pins
+/// is the first version of the script, which listed only missing-source claims and exited 0
+/// for a claim with no reason.
+#[tokio::test(flavor = "current_thread")]
+async fn reconcile_missing_exits_4_for_a_claim_with_no_attempt_recorded() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::{ServerConfig, consumption::ClaimRoot};
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let data = dir.path().join("restored");
+            let setup = write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+            let claim = {
+                let store = ServerConfig::read(&setup).unwrap().open_store().unwrap();
+                let owner = ClaimRoot::open(store, "completed", &root).unwrap();
+                let path = root.join("waiting.jsonl");
+                std::fs::write(&path, b"{\"name\":\"waiting\"}\n").unwrap();
+                let identity =
+                    sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap());
+                owner
+                    .reserve(
+                        Path::new("waiting.jsonl"),
+                        identity,
+                        "consume-acceptance",
+                        "jsonl",
+                    )
+                    .unwrap()
+                    .import_id
+            };
+            let newer = dir.path().join("newer");
+            let copied = Command::new("cp")
+                .arg("-a")
+                .arg(&data)
+                .arg(&newer)
+                .admitted_output()
+                .unwrap();
+            assert!(copied.status.success());
+            let query_only = |name: &str, store: &Path| {
+                let socket = store.join("rpc.sock");
+                let config = write_server_config(&dir.path().join(name), store, &socket);
+                let text = std::fs::read_to_string(&config).unwrap();
+                std::fs::write(&config, format!("query_only = true\n{text}")).unwrap();
+                (config, socket)
+            };
+            std::fs::create_dir(dir.path().join("r")).unwrap();
+            std::fs::create_dir(dir.path().join("n")).unwrap();
+            let (restored_config, restored_socket) = query_only("r", &data);
+            let (newer_config, newer_socket) = query_only("n", &newer);
+            let _restored = start(&restored_config, &restored_socket).await;
+            let _newer = start(&newer_config, &newer_socket).await;
+            let listed = cli(&restored_socket, &["watch", "claims"]);
+            assert_eq!(
+                listed["claims"][0]["claim_id"].as_str(),
+                Some(claim.as_str())
+            );
+            assert!(
+                listed["claims"][0]["last_pending_reason"].is_null(),
+                "{listed:?}"
+            );
+
+            let cli_path = env!("CARGO_BIN_EXE_sparrow");
+            let output = Command::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../deploy/reconcile-inflight.sh"
+            ))
+            .arg("missing")
+            .args(["--restored", cli_path])
+            .arg(&restored_socket)
+            .args(["--newer", cli_path])
+            .arg(&newer_socket)
+            .stdin(Stdio::null())
+            .admitted_output()
+            .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(4), "{stderr}");
+            assert!(stderr.contains("no attempt recorded yet"), "{stderr}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("missing reshipped=0 unretired=0 unacted=1"),
+                "{stdout}"
+            );
+        })
+        .await;
+}
+
 /// INVARIANT (D118): `watch retire-claim` retires only a claim that can never complete. A
 /// claim whose private source still exists is refused; one whose private source is missing
 /// leaves pending_claims, is listed as retired-unrecoverable in status and the watch listing
