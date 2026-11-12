@@ -4653,6 +4653,49 @@ fn expiry_honours_an_anomalous_own_deadline_without_stopping_the_pass() {
     assert_eq!(store.artifact(&empty.id).unwrap_err().code, "NOT_FOUND");
 }
 
+/// INVARIANT (#183): an anomalous deadline inside a multi-record artifact, and an artifact
+/// whose own deadline is later than its records', never stop expiry. The parent is deleted
+/// with its normal sibling and the late record then finds it gone without failing; the
+/// late-parent artifact and its records stay until the parent's own deadline.
+#[test]
+fn expiry_survives_a_late_record_in_a_shared_artifact_and_honours_a_late_parent() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let shared = store
+        .ingest("shared", "source", "log", b"a\nb\n", 0)
+        .unwrap();
+    let parent = store.ingest("parent", "source", "log", b"p\n", 0).unwrap();
+    drop(store);
+    let rewrite = |id: &str, expires_at: u64| {
+        let db = catalog_db(dir.path()).unwrap();
+        let row = String::from_utf8(db.get(id).unwrap().unwrap()).unwrap();
+        let old = format!("\"expires_at\":\"{}\"", 30 * DAY);
+        assert!(row.contains(&old));
+        db.put(
+            id,
+            row.replace(&old, &format!("\"expires_at\":\"{expires_at}\"")),
+        )
+        .unwrap();
+    };
+    rewrite(&shared.record_ids[1], 40 * DAY);
+    rewrite(&parent.id, 40 * DAY);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let limits = EvictionLimits::default();
+    store.expire_bounded(30 * DAY, limits).unwrap();
+    store.expire_bounded(31 * DAY, limits).unwrap();
+    assert_eq!(store.artifact(&shared.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(store.artifact(&parent.id).unwrap().id, parent.id);
+    store.expire_bounded(40 * DAY, limits).unwrap();
+    store.expire_bounded(41 * DAY, limits).unwrap();
+    assert_eq!(store.artifact(&parent.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(
+        store.expire_bounded(42 * DAY, limits).unwrap().records,
+        0,
+        "nothing is left to retire"
+    );
+}
+
 #[test]
 fn bounded_expiry_drains_manifests_and_preserves_pinned_shared_evidence() {
     use sparrow_core::{EvictionLimits, ExpiryFrontier};

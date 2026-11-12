@@ -149,6 +149,7 @@ pub struct ExpiryReport {
     pub archive_waiting: u64,
     /// Entries seen whose own `expires_at` differs from receipt plus retention. They are
     /// honoured at their own deadline, never fatal; a nonzero count needs investigation.
+    /// A per-pass observation: one entry can be counted again by later passes.
     pub anomalies: u64,
     /// Explicit bounded frontier.
     pub frontier: ExpiryFrontier,
@@ -417,15 +418,13 @@ impl Pass<'_> {
                 Ok(envelope) => {
                     self.parents.insert(parent.clone(), envelope);
                 }
-                // The deletion walk removes the parent with the record's first sibling.
-                Err(error)
-                    if error.code == "NOT_FOUND"
-                        && record.expires_at.saturating_add(DAY) <= self.now => {}
+                // The deletion walk removes the parent with the first due sibling, whose
+                // position deadline a day on is when this one may find it gone. Any other
+                // absence is an anomaly: counted, and the record proceeds without a parent.
                 Err(error) if error.code == "NOT_FOUND" => {
-                    return Err(Error::new(
-                        "STORAGE_FAILURE",
-                        format!("record {} outlives its artifact {parent}", record.id),
-                    ));
+                    if deadline.saturating_add(DAY) > self.now {
+                        self.report.anomalies += 1;
+                    }
                 }
                 Err(error) => {
                     // This record is not yet processed: it must not count as progress, so a
@@ -460,12 +459,17 @@ impl Pass<'_> {
             record.retired = true;
             put(&mut retirement.batch, &record.id, &record);
         }
-        if let Some(stop) = self.parent(&parent)? {
+        // A parent whose own deadline is later than its records' is not touched early.
+        let blocked = self.parent_blocked(&parent, deadline, delete);
+        if !blocked.0
+            && let Some(stop) = self.parent(&parent)?
+        {
             return Ok(Step::Stop(stop));
         }
+        let blocked = blocked.0 || blocked.1;
         if delete {
             let retirement = staged(&mut self.retirement, writer)?;
-            if !held {
+            if !held && !blocked {
                 retirement.batch.delete(&record.id);
                 retirement
                     .batch
@@ -473,6 +477,7 @@ impl Pass<'_> {
                 self.report.deleted += 1;
             }
             if let Some(envelope) = self.parents.get(&parent)
+                && !blocked
                 && self.deleted_parents.insert(parent.clone())
             {
                 retirement.batch.delete(&envelope.id);
@@ -480,7 +485,7 @@ impl Pass<'_> {
                 self.report.deleted += 1;
             }
         }
-        Ok(if held || deferred {
+        Ok(if held || deferred || blocked {
             Step::Held
         } else {
             Step::Next
@@ -494,8 +499,9 @@ impl Pass<'_> {
     /// `ExpiryReport.anomalies` and scheduled in `next_due`, until its own deadline.
     /// Returns `None` when the entry is not yet due by its own deadline; else whether its
     /// deletion is due now, and whether it was deferred to a later pass for deletion.
-    /// Only a dangling or mismatched index key and a record that outlives its artifact
-    /// remain hard failures, because those are broken indexes, not one odd row.
+    /// A parent artifact follows the same rule through `parent_blocked`. The only
+    /// data-dependent hard failure left is a dangling or mismatched time-index key, a
+    /// broken index and not one odd row.
     fn own_deadline(
         &mut self,
         expires_at: u64,
@@ -519,6 +525,27 @@ impl Pass<'_> {
 
     fn defer(&mut self, until: u64) {
         self.deferred = Some(self.deferred.map_or(until, |at| at.min(until)));
+    }
+
+    /// Whether the parent's own deadline keeps it, and with it its records, from retiring
+    /// (first) or from deletion (second) at this record's position. Defers to that deadline.
+    fn parent_blocked(&mut self, id: &str, position_deadline: u64, delete: bool) -> (bool, bool) {
+        let Some(expires_at) = self.parents.get(id).map(|envelope| envelope.expires_at) else {
+            return (false, false);
+        };
+        if expires_at != position_deadline {
+            self.report.anomalies += 1;
+        }
+        if expires_at > self.now {
+            self.defer(expires_at);
+            return (true, false);
+        }
+        let later = expires_at.saturating_add(DAY);
+        if delete && later > self.now {
+            self.defer(later);
+            return (false, true);
+        }
+        (false, false)
     }
 
     /// Retire one parent artifact's graph and manifest slices, once per pass.

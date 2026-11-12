@@ -351,6 +351,12 @@ async fn run(
             Ok(Outcome::Expired(report, now)) => {
                 // Only real due backlog continues without sleeping; otherwise sleep until
                 // the next deadline, however long the pass took.
+                if report.anomalies != 0 {
+                    eprintln!(
+                        "sparrowd: retention saw {} entries whose own deadline differs from receipt plus retention; honoured at their own deadline",
+                        report.anomalies
+                    );
+                }
                 continuation = report.continuation;
                 expiry_at = tokio::time::Instant::now()
                     + if continuation {
