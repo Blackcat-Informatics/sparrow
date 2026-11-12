@@ -582,16 +582,21 @@ impl Writer {
         self.commit(batch)
     }
 
+    /// The generations an active consumption journal binds; their handoff still reads the row.
+    fn journal_bound_generations(&self) -> Result<BTreeSet<String>, Error> {
+        Ok(self
+            .pending_journals()?
+            .into_iter()
+            .filter_map(|journal| journal.tail.map(|tail| tail.id))
+            .collect())
+    }
+
     /// The complete row to retire for room, oldest terminal time first: finished at least
     /// `RETRY_WINDOW` ago and bound by no active consumption journal. Never an active row, a row
     /// with a pending finish, or a discontinued row, which is the only durable record of a
     /// truncation, identity change or read gap.
     fn retirable(&self, rows: &[TailGeneration], now: u64) -> Result<Option<usize>, Error> {
-        let bound: BTreeSet<String> = self
-            .pending_journals()?
-            .into_iter()
-            .filter_map(|journal| journal.tail.map(|tail| tail.id))
-            .collect();
+        let bound = self.journal_bound_generations()?;
         Ok(rows
             .iter()
             .enumerate()
@@ -700,18 +705,39 @@ impl Store {
         {
             let mut held = writer.unrecorded.borrow_mut();
             held.retain(|row| row.expires_at.is_none_or(|deadline| deadline > now));
+        }
+        let terminal_held = |writer: &Writer| {
+            writer
+                .unrecorded
+                .borrow()
+                .iter()
+                .filter(|row| row.expires_at.is_some())
+                .count()
+        };
+        if terminal_held(&writer) > MAX_TAIL_GENERATIONS {
+            // The bound is read before the borrow below: the journal read may look at tail rows.
+            // An active journal binds a row for its handoff, exactly as for stored retirement,
+            // so a bound row is never the one evicted. At most MAX_CONSUMPTION_JOURNALS rows
+            // are bound, so an unbound row exists while the count is above the bound.
+            let bound = writer.journal_bound_generations()?;
+            let mut held = writer.unrecorded.borrow_mut();
             while held.iter().filter(|row| row.expires_at.is_some()).count() > MAX_TAIL_GENERATIONS
             {
                 let oldest = held
                     .iter()
                     .enumerate()
+                    .filter(|(_, row)| !bound.contains(&row.id))
                     .filter_map(|(index, row)| row.expires_at.map(|at| (at, index)))
                     .min()
                     .map(|(_, index)| index);
-                if let Some(index) = oldest {
-                    let gone = held.remove(index);
-                    self.unlocked.tail_evidence.retired(gone.complete);
-                }
+                let Some(index) = oldest else {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "in-memory file generations above their bound are all bound by active consumption journals",
+                    ));
+                };
+                let gone = held.remove(index);
+                self.unlocked.tail_evidence.retired(gone.complete);
             }
         }
         if generations
@@ -858,7 +884,12 @@ impl Store {
                             writer.commit(batch)?;
                         }
                         (None, Some(row)) => writer.keep_unrecorded(row),
-                        (None, None) => {}
+                        (None, None) => {
+                            return Err(Error::new(
+                                "STORAGE_FAILURE",
+                                "prepared tail publication has neither a stored registry nor an in-memory row",
+                            ));
+                        }
                     }
                 }
             }

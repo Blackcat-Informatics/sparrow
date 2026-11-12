@@ -406,17 +406,20 @@ pub(super) fn source_key(source: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Admission {
     Room,
-    /// 1024 mappings exist. Mappings are never removed, so this does not change.
+    /// 1024 mappings exist. Nothing deletes a mapping row (a mapping is immutable and no
+    /// retention path removes one), so this never changes while the store is open.
     Full,
 }
 
 impl Admission {
     /// The refusal an explicit mapping declaration gets when the registry is full. A log
-    /// is never refused for this (#227); only a declaration is.
+    /// is never refused for this (#227); only a declaration is. The cause is permanent, so
+    /// the answer is not retryable (`INVALID_ARGUMENT`): a retryable code would have a client
+    /// retry without end for a slot that nothing ever frees (#238).
     pub(super) fn full_refusal() -> Error {
         Error::new(
-            "RESOURCE_LIMIT",
-            "source profile registry admits at most 1024 immutable mappings",
+            "INVALID_ARGUMENT",
+            "source profile registry admits at most 1024 immutable mappings and none is ever removed; declare the profile on a source that already has one",
         )
     }
 
@@ -435,6 +438,8 @@ impl Writer {
         encoded: &[u8],
         validate: impl Fn(&[u8], &[u8]) -> Result<(), Error>,
     ) -> Result<Admission, Error> {
+        #[cfg(feature = "test-support")]
+        self.registry_walks.set(self.registry_walks.get() + 1);
         for (count, entry) in self.db.prefix_iterator(prefix).enumerate() {
             let (key, bytes) = entry?;
             if !key.starts_with(prefix.as_bytes()) {
@@ -474,6 +479,12 @@ impl Writer {
             }
             return Ok(Some(previous));
         }
+        // INVARIANT: `source_time_full` is set only after a walk counted 1024 mapping rows and
+        // is never cleared: no code path deletes a `source-time:` row while the store is open,
+        // and a restore opens a new writer. So a set flag means the registry is full now.
+        if self.source_time_full.get() {
+            return Ok(None);
+        }
         let mut batch = WriteBatch::default();
         let encoded = json::write_compact(&profile.encode());
         let admission =
@@ -488,6 +499,7 @@ impl Writer {
                 Ok(())
             })?;
         if admission == Admission::Full {
+            self.source_time_full.set(true);
             return Ok(None);
         }
         batch.put(source_key(source), encoded);

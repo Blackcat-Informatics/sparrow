@@ -19,7 +19,8 @@ pub const MAX_NAMED_LOST_STREAMS: usize = 16;
 /// Distinct streams the ledger tracks. Further streams still count, in the overflow totals.
 const MAX_TRACKED_LOST_STREAMS: usize = 1024;
 
-/// Which registry could not hold the stream's window.
+/// Which registry could not hold the stream's window, or, for the source-time kind, the
+/// source's time mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LostStreamKind {
     /// A client producer stream, identified by source and producer instance.
@@ -38,11 +39,13 @@ pub struct LostStream {
     pub kind: LostStreamKind,
     /// Exact source label.
     pub source: String,
-    /// Producer or receiver instance.
+    /// Producer or receiver instance; empty for the source-time kind.
     pub instance: String,
-    /// Accepted batches (or receiver observations) stored without a window position.
+    /// Accepted batches (or receiver observations) stored without a window position, or, for
+    /// the source-time kind, without a time mapping.
     pub batches: u64,
-    /// Positions (producer sequences or receiver observations) with no recorded evidence.
+    /// Positions (producer sequences or receiver observations) with no recorded evidence, or,
+    /// for the source-time kind, records stored with unknown time.
     pub events: u64,
 }
 

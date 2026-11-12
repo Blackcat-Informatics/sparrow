@@ -283,8 +283,9 @@ struct TailRegistryEvidence {
   otherFiles @2 :UInt64; otherGenerations @3 :UInt64; otherRecords @4 :UInt64;
   otherBytes @5 :UInt64; otherFilesExact @6 :Bool;
   totalGenerations @7 :UInt64; totalRecords @8 :UInt64; totalBytes @9 :UInt64;
-  # Finished rows retired from the stored registry to make room, and how many of those were
-  # complete generations, whose file, if still present, is read again from its start.
+  # Finished rows retired to make room (stored rows retired from the registry and in-memory
+  # terminal rows evicted above their bound), and how many of those were complete generations,
+  # whose file, if still present, is read again from its start.
   retiredTerminal @10 :UInt64; retiredDuplicateRisk @11 :UInt64;
 }
 # The streams with the most lost positions are named, at most `maxNamed`; every other stream

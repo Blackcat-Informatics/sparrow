@@ -68,7 +68,9 @@ pub struct PressureStatus {
     pub snapshots: u64,
     /// Last successful bounded retirement report, including its explicit frontier.
     pub last_pass: Option<EvictionReport>,
-    /// Latched actionable maintenance failure; cleared by a successful pass.
+    /// The last actionable maintenance failure. It stays while the phase is Ready (a surfaced
+    /// native-error text or a collected forced-compaction failure) until the next episode ends
+    /// or a retiring pass overwrites it; `native_errors` and `forced_failures` say how many.
     pub failure: Option<String>,
     /// Clock reading (Unix milliseconds) of the last pass. Every age below is measured to it.
     pub observed_at: u64,
@@ -284,6 +286,14 @@ pub(super) fn data_batch_estimate(batch: &rocksdb::WriteBatch) -> u64 {
         .saturating_add(65536)
 }
 
+const WRITE_CEILING_MESSAGE: &str = "estimated atomic write cannot fit the configured data budget; increase the disk budget or reduce the operation";
+
+/// Whether `error` is the refusal of a write whose estimate exceeds the whole data
+/// allowance, independent of what the store holds now: no retry of that write can fit.
+pub(super) fn is_write_ceiling_refusal(error: &Error) -> bool {
+    error.code == "RESOURCE_LIMIT" && error.message == WRITE_CEILING_MESSAGE
+}
+
 /// Largest measured footprint that still leaves the admitted data-write allowance.
 pub(super) fn data_write_ceiling(
     disk_budget: u64,
@@ -302,7 +312,9 @@ pub(super) fn data_write_ceiling(
             "disk budget must exceed maintenance reserve",
         )
     })?;
-    limit.checked_sub(estimate).ok_or_else(||Error::new("RESOURCE_LIMIT","estimated atomic write cannot fit the configured data budget; increase the disk budget or reduce the operation"))
+    limit
+        .checked_sub(estimate)
+        .ok_or_else(|| Error::new("RESOURCE_LIMIT", WRITE_CEILING_MESSAGE))
 }
 
 impl Writer {
@@ -441,16 +453,25 @@ impl Writer {
     /// Count a RocksDB background error raised while no pass is retiring evidence, and say
     /// so in the status. The pass does not fail: nothing is waiting on native work, so the
     /// error holds nothing and the baseline moves at once (an old error never holds intake).
-    fn surface_native_errors(&self, state: &mut State) -> Result<(), Error> {
+    ///
+    /// `forced` is a forced-compaction failure collected in this same pass: its reason leads
+    /// the text, since the error it raised is the one counted here and no wait was involved.
+    fn surface_native_errors(&self, state: &mut State, forced: Option<&str>) -> Result<(), Error> {
         let errors = self.forced.native_errors(&self.db)?;
         if errors > state.background_errors {
             let new = errors - state.background_errors;
             state.background_errors = errors;
             state.status.native_errors = state.status.native_errors.saturating_add(new);
-            state.status.failure = Some(format!(
-                "RocksDB reported {new} new background errors ({} this session) while no pressure pass was waiting on native work",
-                state.status.native_errors
-            ));
+            state.status.failure = Some(match forced {
+                Some(forced) => format!(
+                    "{forced}; RocksDB reported {new} new background errors ({} this session)",
+                    state.status.native_errors
+                ),
+                None => format!(
+                    "RocksDB reported {new} new background errors ({} this session) while no pressure pass was waiting on native work",
+                    state.status.native_errors
+                ),
+            });
         }
         Ok(())
     }
@@ -465,7 +486,7 @@ impl Writer {
         if state.status.requested_bytes == 0 && physical <= limit {
             // No episode is active, but a RocksDB background error is still news: surface it
             // now instead of at the next episode's first pass.
-            self.surface_native_errors(&mut state)?;
+            self.surface_native_errors(&mut state, None)?;
             return Ok(state.status.clone());
         }
         // A reopened store already above its data allowance needs maintenance too.
@@ -475,6 +496,33 @@ impl Writer {
         }
         state.stamp(now);
         let forced_failure = self.collect_forced(&mut state)?;
+        let reason = forced_failure.clone();
+        // The duty treats a failed pass's error as carrying a collected forced failure's
+        // reason, so any later error in this pass must carry it too.
+        self.retire_pass(
+            &mut state,
+            now,
+            limits,
+            (physical, linked, limit),
+            forced_failure,
+        )
+        .map_err(|error| match reason {
+            Some(forced) if !error.message.contains(&forced) => {
+                Error::new(error.code, format!("{error}; {forced}"))
+            }
+            _ => error,
+        })
+    }
+
+    /// The rest of a pressure pass once a finished forced compaction has been collected.
+    fn retire_pass(
+        &self,
+        state: &mut State,
+        now: u64,
+        limits: EvictionLimits,
+        (physical, linked, limit): (u64, u64, u64),
+        forced_failure: Option<String>,
+    ) -> Result<PressureStatus, Error> {
         if physical.saturating_add(state.status.requested_bytes) <= limit {
             if state.wait.is_some() {
                 let mut batch = rocksdb::WriteBatch::default();
@@ -484,14 +532,16 @@ impl Writer {
             // A finished compaction of this wait must not stand in for the next one's.
             self.forced.acknowledge();
             state.ready();
+            // Ready clears the failure text; a collected forced failure keeps its reason.
+            state.status.failure.clone_from(&forced_failure);
             self.eviction.borrow_mut().reset();
-            self.surface_native_errors(&mut state)?;
+            self.surface_native_errors(state, forced_failure.as_deref())?;
             return Ok(state.status.clone());
         }
         if linked.saturating_add(state.status.requested_bytes) <= limit {
             // Temporary query reservations alone are not authority to retire evidence.
             state.stalled("only temporary query reservations hold the data allowance");
-            self.surface_native_errors(&mut state)?;
+            self.surface_native_errors(state, forced_failure.as_deref())?;
             return Ok(state.status.clone());
         }
         state.status.pending_flushes = 0;
@@ -507,7 +557,7 @@ impl Writer {
             if state.wait.is_some() {
                 // The baseline moves only once the wait has ended, so a store that cannot
                 // take the write is reported again on every pass.
-                self.end_wait(&mut state)?;
+                self.end_wait(state)?;
             }
             state.background_errors = errors;
             state.status.native_errors = state.status.native_errors.saturating_add(new);
@@ -561,7 +611,7 @@ impl Writer {
         if let Some(wait) = state.wait {
             if linked < wait.before {
                 self.forced.acknowledge();
-                self.end_wait(&mut state)?;
+                self.end_wait(state)?;
             } else {
                 // Linked bytes have not fallen and no native work is pending or running:
                 // nothing is working to end the wait, so force one compaction.
@@ -607,13 +657,20 @@ impl Writer {
                     Step::Measured => {
                         // The retirement is durable and a compaction left the footprint
                         // where it was, so waiting longer protects nothing: retire more.
-                        self.end_wait(&mut state)?;
+                        self.end_wait(state)?;
                         state.status.waits_released = state.status.waits_released.saturating_add(1);
                     }
                 }
             }
         }
         state.status.passes = state.status.passes.saturating_add(1);
+        #[cfg(feature = "test-support")]
+        if self.forced.retirement_refused() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "retirement refused by a test",
+            ));
+        }
         let requested = state.status.requested_bytes;
         let report =
             self.reclaiming(|| self.evict_oldest(now, limits, Some((linked, requested))))?;
@@ -689,6 +746,12 @@ impl Store {
     #[cfg(feature = "test-support")]
     pub fn refuse_pressure_wait_end(&self, refused: bool) {
         self.unlocked.forced.refuse_wait_end(refused);
+    }
+
+    /// Dev-only: make the retirement of each pass fail, as a store that cannot retire would.
+    #[cfg(feature = "test-support")]
+    pub fn refuse_pressure_retirement(&self, refused: bool) {
+        self.unlocked.forced.refuse_retirement(refused);
     }
 
     /// Dev-only: count native background errors a real failing compaction would raise.
