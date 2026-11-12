@@ -8564,11 +8564,11 @@ async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
         .await;
 }
 
-/// INVARIANT: a permanent refusal (a non-retryable `INVALID_ARGUMENT`: a batch that can never
-/// fit) quarantines that batch, while a busy or capacity refusal is never quarantined: it is
-/// counted, reported at the fence as a drop, and not retried; the next event is delivered
-/// instead of queueing forever behind it. Before, the refused batch stayed the immutable
-/// pending batch and blocked every later event until the queue filled.
+/// INVARIANT (#216): a permanent refusal (a non-retryable `INVALID_ARGUMENT`: a batch that can
+/// never fit) quarantines that batch into a file, with the reason, the count and every event
+/// line, while a busy or capacity refusal is never quarantined. The next event is delivered
+/// instead of queueing forever behind it. Before, the batch was given up as a counted drop and
+/// its bytes were gone; this test fails on that behaviour because no quarantine file exists.
 #[tokio::test(flavor = "current_thread")]
 async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_later_events() {
     tokio::task::LocalSet::new()
@@ -8585,6 +8585,7 @@ async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_late
             state.refusals.borrow_mut().push_back(("INVALID_ARGUMENT", false));
             let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine");
             config.batch_events = 1;
+            config.quarantine_dir = dir.path().join("quarantine");
             let config = config.with_test_timing(
                 Duration::from_secs(2),
                 Duration::from_millis(20),
@@ -8611,8 +8612,70 @@ async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_late
                 Some(sparrow_client::Error::Domain { code, retryable: false, .. }) if code == "INVALID_ARGUMENT"
             ));
             assert_eq!(state.calls.borrow().len(), 2);
+            assert_eq!(stats.quarantine_files, 1);
+            assert_eq!(stats.quarantine_write_failures, 0);
+            assert_eq!(watermark.quarantined_before_fence, 1);
+            let file = stats.last_quarantine_file.clone().unwrap();
+            assert!(file.starts_with(dir.path().join("quarantine")));
+            let kept_text = std::fs::read_to_string(&file).unwrap();
+            let header = kept_text.lines().next().unwrap();
+            assert!(header.contains("\"reason_code\":\"INVALID_ARGUMENT\""), "{header}");
+            assert!(header.contains("\"events\":1"), "{header}");
+            assert!(kept_text.contains("permanently refused"), "{kept_text}");
             let response = backend.client.status_request().send().promise.await.unwrap();
             assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 1);
+            proxy.abort();
+            assert!(proxy.await.unwrap_err().is_cancelled());
+            drop(delivery);
+            drop(backend);
+            drop(daemon);
+        })
+        .await;
+}
+
+/// INVARIANT (#216): a permanently refused batch whose quarantine file cannot be written is
+/// never dropped: the write failure is counted, the batch stays the pending batch and is sent
+/// again, and here the daemon then takes it. Before, the batch was given up as a counted drop
+/// the moment it was refused, so the fence would report a drop and nothing would be stored.
+#[tokio::test(flavor = "current_thread")]
+async fn producer_delivery_keeps_a_refused_batch_when_the_quarantine_cannot_be_written() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let daemon = start(&config, &socket).await;
+            let backend = connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("relay.sock");
+            let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+            state.drop_first.set(false);
+            state
+                .refusals
+                .borrow_mut()
+                .push_back(("INVALID_ARGUMENT", false));
+            // A regular file where the directory should be makes every quarantine write fail.
+            let blocked = dir.path().join("blocked");
+            std::fs::write(&blocked, b"not a directory").unwrap();
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine-held");
+            config.batch_events = 1;
+            config.quarantine_dir = blocked.join("quarantine");
+            let config = config.with_test_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            );
+            let delivery = sparrow_client::Delivery::start(config).unwrap();
+            let sequence = admit(&delivery, delivery_event("refused but never dropped"));
+            let watermark = delivery_barrier(&delivery, true, Duration::from_secs(5))
+                .await
+                .expect("the held batch is delivered once the daemon takes it");
+            assert_eq!(watermark.durable_sequence, sequence);
+            let stats = delivery.stats().unwrap();
+            assert_eq!(stats.quarantine_write_failures, 1);
+            assert_eq!((stats.quarantined_events, stats.quarantine_files), (0, 0));
+            assert_eq!(stats.durable_events, 1);
+            assert_eq!(state.calls.borrow().len(), 2);
             proxy.abort();
             assert!(proxy.await.unwrap_err().is_cancelled());
             drop(delivery);
@@ -8715,6 +8778,7 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
         let (state, proxy) = relay(&proxy_socket, first_backend.client.clone());
         let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery");
         config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150);
+        config.quarantine_dir = dir.path().join("quarantine");
         // Production refuses sub-second intervals; this test needs fast retries.
         let config = config.with_test_timing(Duration::from_secs(2), Duration::from_millis(100), Duration::from_millis(100));
         let delivery = sparrow_client::Delivery::start(config).unwrap();
@@ -8726,6 +8790,12 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
             result => panic!("replacement store must refuse pending delivery: {result:?}") };
         let pending = delivery.pending_batch().unwrap().unwrap(); assert_eq!(pending.as_ref(), &state.calls.borrow()[0]);
         assert_eq!(delivery.stats().unwrap().durable_events, 0);
+        // INVARIANT (#216): a terminal failure ends delivery, but the held batch is first kept
+        // in a quarantine file; before, only the in-memory pending batch remained.
+        let stats = delivery.stats().unwrap();
+        assert_eq!(stats.quarantine_files, 1);
+        let saved = std::fs::read_to_string(stats.last_quarantine_file.unwrap()).unwrap();
+        assert!(saved.contains("STORE_MISMATCH") && saved.contains("unknown accepted delivery"), "{saved}");
         let response = second_backend.client.status_request().send().promise.await.unwrap();
         assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 0);
         let original = state.accepted.borrow().clone().unwrap();

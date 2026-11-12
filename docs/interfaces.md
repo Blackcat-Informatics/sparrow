@@ -3368,10 +3368,21 @@ or semantic engine. The public surface includes:
   logging path is nonblocking and drops new events when full; it never silently
   allocates an unlimited queue or stalls a production thread on network I/O. A
   briefly held queue lock makes admission wait, never drop. A permanent daemon
-  refusal of a batch (a non-retryable `INVALID_ARGUMENT`, a batch that can never
-  fit) quarantines that batch: its events are counted (`quarantined_events`, with
-  `last_quarantine` naming the refusal), reported by the next flush as dropped,
-  and later events proceed. A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
+  refusal of a batch (a non-retryable `INVALID_ARGUMENT` or `CONFLICT`, a batch that can
+  never be accepted, or a batch the client cannot encode) is never reduced to a number: the
+  client writes the batch's canonical event lines, the refusal code and reason and the event
+  count to one file in `quarantine_dir`, and only then settles the batch. The events are
+  counted (`quarantined_events`, with `last_quarantine` naming the refusal), reported by the
+  next flush as not delivered (`FlushError::Dropped`, whose `quarantined_before_fence` counts
+  those kept in files), and later events proceed. Status exposes `quarantine_dir`,
+  `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The client never
+  deletes or rewrites a quarantine file; its size is bounded only by the disk. If the file
+  cannot be written, the batch stays pending, the failure is counted and reported as the
+  transient failure, and the write is retried, so nothing is dropped. Any other non-retryable
+  refusal (a replaced store, a read-only daemon) ends delivery as a terminal failure, and the
+  pending batch and queued events are first written to quarantine files. The daemon storing a
+  refused batch as a malformed record with its reason is the preferred form and is not yet
+  implemented (issue 216). A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
   the client holds the batch, bounded by the queue limits, with overflow counted
   as `Full`. A full producer registry is not a refusal any more (#215): the daemon
   stores the batch and counts the lost gap evidence, so the client no longer holds
