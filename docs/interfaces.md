@@ -3135,8 +3135,9 @@ backups".
 A consume claim whose source moved into the private `.sparrow-inflight/`
 directory and then vanished before publication can never complete: recovery
 needs that exact claimed generation and never republishes a replacement. It
-stays in `pending_claims` and its watch's `failure` names the claim and reads
-"unpublished claimed source is missing". `watchClaimRetire` (CLI `watch retire-claim WATCH_ID
+stays in `pending_claims`; `watchClaims` lists it as pending with the
+reason "unpublished claimed source is missing", and its watch's `failure`
+names the claim with that text until another attempt or retirement replaces it. `watchClaimRetire` (CLI `watch retire-claim WATCH_ID
 CLAIM_ID REASON`, MCP `watch_claim_retire`) lets an administrator retire such a
 claim. It is an admin operation: anonymous TCP and the ingest socket refuse it,
 and a query-only daemon refuses it as a write. The watch's own claim owner
@@ -3150,9 +3151,9 @@ keeps the journal with the time, the caller and the reason. If the claim's
 staged import had begun, the same batch ends its staging lease; the next import
 reclaim pass then frees its staged chunks, private preparation and import slot
 through the ordinary expired-lease removal, so a retired claim never holds one
-of the 16 import slots. Retiring a claim clears the watch failure only when
-that claim's recovery set it; a failure another claim or discovery caused
-stays. The caller is the
+of the 16 import slots. Retiring a claim, or a claim completing, clears the
+watch failure only when that claim's recovery set it; a failure another claim or
+discovery caused stays. The caller is the
 connection's administrator as the daemon identified it: `unix uid=U pid=P` on
 the private socket, `tcp-chap peer=ADDRESS` on a CHAP session. The claim leaves
 `pending_claims`; `status` and `watch list` list it under `retired_claims` with

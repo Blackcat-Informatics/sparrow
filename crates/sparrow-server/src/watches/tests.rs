@@ -407,6 +407,60 @@ fn retiring_a_claim_clears_only_the_failure_that_claim_caused() {
     assert_eq!(detectors[0].failure.as_deref(), Some("discovery refused"));
 }
 
+#[test]
+fn a_claim_that_succeeds_leaves_another_claims_failure_in_place() {
+    // INVARIANT (#214): the watch failure names one claim; only that claim's own success clears
+    // it. Before, any claim's success cleared it, so a claim still unreconciled vanished from
+    // the watch's status between its retries and a deploy step read "nothing owed".
+    let directory = tempfile::tempdir().unwrap();
+    let producer = directory.path().join("producer");
+    std::fs::create_dir(&producer).unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut detector = Detector::open(
+        store,
+        ManagedWatch {
+            definition: ConsumeWatch {
+                id: "success".into(),
+                root: producer,
+                producer_contract: crate::ProducerContract::FinishedFiles,
+                source: "success".into(),
+                format: "opaque".into(),
+                quiet_ms: 30_000,
+                max_directories: 2,
+                max_candidates: 4,
+            },
+            revision: 1,
+            enabled: true,
+        },
+        crate::consumption::RootBinding::Stored,
+    )
+    .unwrap();
+    detector.failure = Some("claim import:aa: unpublished claimed source is missing".into());
+    detector.failed_claim = Some("import:aa".into());
+
+    detector.clear_failure_of("import:bb");
+    assert_eq!(
+        detector.failure.as_deref(),
+        Some("claim import:aa: unpublished claimed source is missing")
+    );
+    assert_eq!(detector.failed_claim.as_deref(), Some("import:aa"));
+
+    detector.clear_failure_of("import:aa");
+    assert_eq!(detector.failure, None);
+    assert_eq!(detector.failed_claim, None);
+
+    // A failure that names no claim (discovery) is cleared by no claim's success.
+    detector.failure = Some("discovery refused".into());
+    detector.clear_failure_of("import:aa");
+    assert_eq!(detector.failure.as_deref(), Some("discovery refused"));
+}
+
 /// INVARIANT: a private root (`sparrowd --private-intake`) never touches the original root's
 /// active tail generations after it opens: reconciliation records no gap for them, and a file
 /// below the private root that reuses a foreign generation's (device, inode) is refused, as the

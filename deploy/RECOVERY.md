@@ -402,8 +402,9 @@ not journal; the daemon then refuses to start with "unrecognized private claim
 entry" (or "private claim directory exceeds its bounded journal registry"). Move
 each such entry out of the intake root, keeping its bytes, never delete it, and
 start again. A claim the restored store journals whose private source is missing
-never completes: `pending_claims` shows it and the watch failure reads
-"unpublished claimed source is missing". Once its bytes are confirmed lost,
+never completes: `pending_claims` shows it and `sparrow SOCKET watch claims`
+lists it as pending with the reason "unpublished claimed source is missing"
+(deploy/reconcile-inflight.sh missing exits 4 while one is unreconciled). Once its bytes are confirmed lost,
 retire it with `sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON"`
 (docs/interfaces.md, "Retiring an unrecoverable claim").
 

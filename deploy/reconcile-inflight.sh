@@ -31,13 +31,19 @@ inflight  Run before the restored daemon starts with its watches; RESTORED is th
           it: a hard link under that name, then the entry is unlinked, so the inode and bytes
           are unchanged and no file is ever overwritten. An entry neither store knows, or
           whose original name is taken, stops the run with nothing more moved.
-missing   Run once the restored daemon serves with its watches. For each watch whose failure
-          names a claim with "unpublished claimed source is missing", NEWER must record that
-          claim as published: its artifact's bytes are read from NEWER, checked against the
-          artifact's payload digest, and placed in the root as NAME.reshipped.EXT (rename
-          from a temporary file beside the root), and the claim is retired with
-          "watch retire-claim". Each failing claim names itself at its next retry (at most
-          15 minutes apart), so run it again until no watch reports that failure.
+missing   Run once the restored daemon serves with its watches. The worklist is the durable
+          pending-claim state, "watch claims": every claim that is pending with a last
+          pending reason starting "unpublished claimed source is missing". (The watch's
+          failure text is volatile: another claim's success or a later retry hides it, so it
+          is read only on an image older than schema 71, which has no "watch claims".) For
+          each such claim NEWER must record it as published: its artifact's bytes are read
+          from NEWER, checked against the artifact's payload digest, and placed in the root
+          as NAME.reshipped.EXT (rename from a temporary file beside the root), and the claim
+          is retired with "watch retire-claim". A restored claim keeps the reason it had at
+          the backup until the restored daemon's first attempt rewrites it, so a claim not
+          yet attempted is not on the worklist; run again once it has been. Any other
+          pending claim that already carries a pending reason is left alone and reported,
+          and the run then exits 4: it is not done, whatever else was reshipped.
 
 --private-intake DIR
                   reconcile the private roots a `sparrowd --private-intake DIR` daemon consumes:
@@ -45,9 +51,12 @@ missing   Run once the restored daemon serves with its watches. For each watch w
                   the daemon rebinds it, and no other root is touched (the measurement's
                   rehearsal uses it on scratch copies)
 
-Exit 0 when done, 1 on a refusal or failure, 2 on a usage error, 3 when the bytes were
-re-shipped but the restored image has no "watch retire-claim" (schema 69 and older): the
-claim stays pending until a schema 70 image retires it.
+Exit 0 when done (no claim left pending with a reason this run did not act on, so
+"missing reshipped=0" with exit 0 means nothing was owed), 1 on a refusal or failure, 2 on a
+usage error, 3 when the bytes were re-shipped but the restored image has no "watch
+retire-claim" (schema 69 and older): the claim stays pending until a schema 70 image retires
+it, 4 when a watch still holds a pending claim that has a pending reason and was not
+reconciled by this run (run it again, or inspect "watch claims").
 USAGE
 }
 
@@ -74,10 +83,10 @@ newer_status=$("$NEWER_CLI" "$NEWER_SOCKET" status) || die "the newer daemon did
 store=$(json_field store_id <<<"$restored_status")
 [[ $(json_field store_id <<<"$newer_status") == "$store" ]] \
     || die "the restored and newer daemons serve different stores"
-# One "WATCH<TAB>ROOT<TAB>FAILURE" line per consume watch the restored store holds.
+# One "WATCH<TAB>ROOT" line per consume watch the restored store holds.
 mapfile -t watches < <(python3 -I -c 'import json,sys
 for w in json.load(sys.stdin)["consume_watches"]:
-    print("%s\t%s\t%s" % (w["id"], w["root"], (w["failure"] or "").replace("\t", " ").replace("\n", " ")))' <<<"$restored_status")
+    print("%s\t%s" % (w["id"], w["root"]))' <<<"$restored_status")
 
 # The root a watch consumes: as its status names it, or, with --private-intake, the private
 # root the daemon rebinds it to.
@@ -154,12 +163,43 @@ fi
 watch_usage=$("$RESTORED_CLI" "$RESTORED_SOCKET" watch 2>&1 >/dev/null || true)
 retire=0
 [[ $watch_usage == *"watch retire-claim"* ]] && retire=1
-reshipped=0 unretired=0
+reshipped=0 unretired=0 unacted=0
+# One "KIND<TAB>WATCH<TAB>CLAIM<TAB>DETAIL" line per claim to act on (KIND "missing") or to
+# report ("other"). The durable pending-claim state is the source; only an image without
+# "watch claims" (schema 70 and older) falls back to the volatile watch failure text.
+declare -A roots=()
 for row in "${watches[@]}"; do
-    IFS=$'\t' read -r watch root failure <<<"$row"
-    [[ $failure =~ claim\ (import:[0-9a-f]+):\ unpublished\ claimed\ source\ is\ missing ]] || continue
-    claim=${BASH_REMATCH[1]}
-    root=$(watch_root "$root")
+    IFS=$'\t' read -r watch root <<<"$row"
+    roots[$watch]=$root
+done
+if [[ $watch_usage == *"watch claims"* ]]; then
+    claims=$("$RESTORED_CLI" "$RESTORED_SOCKET" watch claims) || die "the restored daemon did not answer watch claims"
+    mapfile -t worklist < <(python3 -I -c 'import json,sys
+for c in json.load(sys.stdin)["claims"]:
+    if c["state"] != "pending":
+        continue
+    reason = c["last_pending_reason"]
+    if reason is None:
+        continue
+    kind = "missing" if reason.startswith("unpublished claimed source is missing") else "other"
+    print("%s\t%s\t%s\t%s" % (kind, c["watch"], c["claim_id"], reason.replace("\t", " ").replace("\n", " ")))' <<<"$claims")
+else
+    note "the restored image has no \"watch claims\" (schema 71): reading the volatile watch failure text; run again until it reports nothing" >&2
+    mapfile -t worklist < <(python3 -I -c 'import json,re,sys
+for w in json.load(sys.stdin)["consume_watches"]:
+    m = re.search(r"claim (import:[0-9a-f]+): unpublished claimed source is missing", w["failure"] or "")
+    if m:
+        print("missing\t%s\t%s\t" % (w["id"], m.group(1)))' <<<"$restored_status")
+fi
+for row in "${worklist[@]}"; do
+    IFS=$'\t' read -r kind watch claim detail <<<"$row"
+    if [[ $kind != missing ]]; then
+        note "$watch/$claim is pending and not reconciled by this run: $detail" >&2
+        unacted=$((unacted + 1))
+        continue
+    fi
+    [[ -n ${roots[$watch]+set} ]] || die "$claim names watch $watch, which the restored status does not list"
+    root=$(watch_root "${roots[$watch]}")
     newer=$(ingest_get "$NEWER_CLI" "$NEWER_SOCKET" "$claim")
     [[ -n $newer ]] || die "the newer store does not know $claim; its bytes must be restored from the producer before it is retired"
     read -r artifact payload length < <(python3 -I -c 'import json,sys; v=json.load(sys.stdin)
@@ -199,5 +239,6 @@ print(a["artifact_id"], a["payload_id"], a["byte_length"])' <<<"$newer") \
         || die "retiring $claim failed: $err"
     note "retired $watch/$claim"
 done
-note "missing reshipped=$reshipped unretired=$unretired"
+note "missing reshipped=$reshipped unretired=$unretired unacted=$unacted"
+((unacted == 0)) || exit 4
 ((unretired == 0)) || exit 3

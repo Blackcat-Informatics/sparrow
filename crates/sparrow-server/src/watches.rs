@@ -364,12 +364,23 @@ struct Detector {
     coverage_losses: u64,
     failure: Option<String>,
     /// The claim whose recovery set `failure`, if a claim's recovery did; any other
-    /// failure clears it. Retiring that claim clears the failure, and nothing else does.
+    /// failure clears it. Only that claim's own success or retirement clears the failure
+    /// (`clear_failure_of`); another claim's success leaves it in place.
     failed_claim: Option<String>,
     tail_admission_waiting: bool,
 }
 
 impl Detector {
+    /// Clear the watch failure only when `claim`'s own recovery set it. A failure from another
+    /// claim or from discovery stays until its own cause resolves, so a claim that failed is
+    /// never hidden by an unrelated claim's success.
+    fn clear_failure_of(&mut self, claim: &str) {
+        if self.failed_claim.as_deref() == Some(claim) {
+            self.failure = None;
+            self.failed_claim = None;
+        }
+    }
+
     fn open(store: Store, watch: ManagedWatch, binding: RootBinding) -> Result<Self, Error> {
         let config = watch.definition;
         let owner = match config.producer_contract {
@@ -1192,10 +1203,7 @@ fn retire_claim(
         })?;
     // Clear the watch failure only when it is this claim's recovery refusal; a failure from
     // another claim or from discovery stays until its own cause resolves.
-    if detector.failed_claim.as_deref() == Some(retirement.claim.as_str()) {
-        detector.failure = None;
-        detector.failed_claim = None;
-    }
+    detector.clear_failure_of(&retirement.claim);
     eprintln!(
         "sparrowd: watch={} claim={} retired-unrecoverable caller={:?} reason={:?} path={:?}",
         retirement.watch,
@@ -1744,8 +1752,7 @@ async fn run(
                     client = None;
                 }
             } else {
-                detector.failure = None;
-                detector.failed_claim = None;
+                detector.clear_failure_of(&id);
                 detector.completed = detector.completed.saturating_add(1);
             }
             if let Some(index) = detectors

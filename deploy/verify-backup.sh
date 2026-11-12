@@ -780,15 +780,31 @@ for w in json.load(sys.stdin)["consume_watches"]: print(os.path.basename(w["root
     pid=$STARTED_PID
     await_status "$pid" "$rehearsal/c2.log" "$restored/r.sock" 600 >/dev/null \
         || fail rehearsal "the restored daemon did not start after reconciliation: $(tail -n 3 -- "$rehearsal/c2.log")"
+    # The event is the claim's durable pending record carrying the missing-source reason, which
+    # the restored daemon's first attempt writes over the pre-backup reason; the watch's
+    # failure text is volatile (another claim's success clears it) and is not waited on.
     for ((name = 0; name < 300; name++)); do
-        out=$("$cli" "$restored/r.sock" status) || fail rehearsal "the restored daemon stopped answering"
-        [[ $out == *"claim $claimed: unpublished claimed source is missing"* ]] && break
+        out=$("$cli" "$restored/r.sock" watch claims) || fail rehearsal "the restored daemon stopped answering"
+        python3 -I -c 'import json,sys
+sys.exit(not any(c["claim_id"] == sys.argv[1] and c["state"] == "pending"
+    and (c["last_pending_reason"] or "").startswith("unpublished claimed source is missing")
+    for c in json.load(sys.stdin)["claims"]))' "$claimed" <<<"$out" && break
         sleep 1
     done
-    [[ $out == *"claim $claimed: unpublished claimed source is missing"* ]] \
-        || fail rehearsal "the restored daemon never reported $claimed as missing its source"
+    python3 -I -c 'import json,sys
+sys.exit(not any(c["claim_id"] == sys.argv[1] and c["state"] == "pending"
+    and (c["last_pending_reason"] or "").startswith("unpublished claimed source is missing")
+    for c in json.load(sys.stdin)["claims"]))' "$claimed" <<<"$out" \
+        || fail rehearsal "the restored daemon never recorded $claimed as pending with its source missing"
+    # Exit 4 reports a pending claim that is not this rehearsal's: the traffic phase's "replayed"
+    # watch leaves its own claim pending in the backup. It must not be a claim of the rehearsal
+    # watch, which reconcile has to settle; anything else (exit 1, 3) fails the step.
+    rc=0
     out=$("$RECONCILE" missing --restored "$cli" "$restored/r.sock" --newer "$cli" "$DATA/n.sock" \
-        --private-intake "$intake" 2>&1) || fail rehearsal "reconcile-inflight.sh missing failed: $out"
+        --private-intake "$intake" 2>&1) || rc=$?
+    ((rc == 0 || rc == 4)) || fail rehearsal "reconcile-inflight.sh missing failed: $out"
+    [[ $out != *"measure-rehearsal/import:"*"is pending and not reconciled"* ]] \
+        || fail rehearsal "the rehearsal watch still holds a claim reconcile did not settle: $out"
     printf '%s\n' "$out" | sed 's/^/verify-backup: rehearsal: /'
     [[ $out == *"missing reshipped=1 unretired=0"* ]] || fail rehearsal "$claimed was not re-shipped and retired"
     out=$("$cli" "$restored/r.sock" status) || fail rehearsal "the restored daemon stopped answering"
