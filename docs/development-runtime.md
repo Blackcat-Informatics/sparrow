@@ -2131,11 +2131,12 @@ Full record/context metadata exposes positions; use CLI `context STORE_ID
 RECORD_ID --before 0 --after 0` to resolve a search result's occurrence metadata.
 Positions identify durable observation commit order, never sender or network
 arrival order. Accepted bytes and positions publish in one synchronized WAL
-batch. Known local refusals, UDP truncation, TCP framing failures and frame
-deadlines publish classified observations without raw packet occurrences.
+batch. Known local refusals publish classified observations without raw packet
+occurrences; UDP datagrams are kept whole, and TCP oversize, cut, broken and
+stalled frames publish the bytes read as packets and also classified observations.
 Sender/network/kernel and pre-commit loss remain explicitly unknown. Failed
 history publication stops intake with a visible failure rather than reporting
-a durable counter update. Rejected connections do not invent message positions.
+a durable counter update. Connections at the ceiling are served by closing the longest-idle one, not rejected.
 
 Producer and receiver windows share bounded native registry decoding, inclusive
 gap arithmetic and retained-window lookup. Their semantics remain separate.
