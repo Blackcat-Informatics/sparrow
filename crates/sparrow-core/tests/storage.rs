@@ -10266,32 +10266,41 @@ fn streaming_journal_recovers_after_owned_writer_sigkill() {
     assert!(ready.unwrap());
     killed.unwrap();
     assert!(!exit.success());
-    let store = Store::open(dir.path(), config()).unwrap();
-    let journal = store
-        .import_begin(
-            "crash-copy",
-            "copied-log",
-            "log",
-            input.len() as u64,
-            &digest,
-            1,
-        )
-        .unwrap();
-    assert_eq!(journal.received_bytes, IMPORT_CHUNK_BYTES as u64);
-    assert_eq!(
-        store.import_read_chunk(&journal.id, 0, 1).unwrap(),
-        input[..IMPORT_CHUNK_BYTES]
+    // Recovery is also event-driven (RocksDB open after an unclean kill), so it gets
+    // the same hang deadline; the dropped store and tempdir release inside the worker.
+    sparrow_test_support::deadline::run_within(
+        "streaming_journal_recovers_after_owned_writer_sigkill",
+        "recovery Store::open, import_begin, import_append and import_seal after the writer was killed",
+        HANG_DEADLINE,
+        move || {
+            let store = Store::open(dir.path(), config()).unwrap();
+            let journal = store
+                .import_begin(
+                    "crash-copy",
+                    "copied-log",
+                    "log",
+                    input.len() as u64,
+                    &digest,
+                    1,
+                )
+                .unwrap();
+            assert_eq!(journal.received_bytes, IMPORT_CHUNK_BYTES as u64);
+            assert_eq!(
+                store.import_read_chunk(&journal.id, 0, 1).unwrap(),
+                input[..IMPORT_CHUNK_BYTES]
+            );
+            store
+                .import_append(
+                    &journal.id,
+                    IMPORT_CHUNK_BYTES as u64,
+                    &input[IMPORT_CHUNK_BYTES..],
+                    1,
+                )
+                .unwrap();
+            assert!(store.import_seal(&journal.id, 1).unwrap().sealed);
+            assert_eq!(store.status(1).unwrap()["live_records"].as_str(), Some("0"));
+        },
     );
-    store
-        .import_append(
-            &journal.id,
-            IMPORT_CHUNK_BYTES as u64,
-            &input[IMPORT_CHUNK_BYTES..],
-            1,
-        )
-        .unwrap();
-    assert!(store.import_seal(&journal.id, 1).unwrap().sealed);
-    assert_eq!(store.status(1).unwrap()["live_records"].as_str(), Some("0"));
 }
 
 #[test]

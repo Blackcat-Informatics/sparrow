@@ -70,3 +70,59 @@ pub fn run_within<T: Send + 'static>(
 ) -> T {
     try_run_within(test, waiting_on, limit, body).unwrap_or_else(|hang| panic!("{hang}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    // Invariant: a body that cannot finish yields a Hang naming the test and the wait
+    // target. The body blocks on a channel the test holds, so the deadline fires every
+    // time; the test then releases the body so no worker is left behind.
+    #[test]
+    fn hang_names_the_test_and_wait_target_then_releases_the_worker() {
+        let (release, blocked) = channel::<()>();
+        let result = try_run_within(
+            "sample_test",
+            "the sample event",
+            Duration::from_millis(30),
+            move || blocked.recv().is_ok(),
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("sample_test"), "{message}");
+        assert!(message.contains("the sample event"), "{message}");
+        release.send(()).unwrap();
+    }
+
+    // Invariant: a panic in the body reaches the caller with its original payload, not
+    // the timeout text, so a real assertion failure is never hidden by the guard.
+    #[test]
+    fn body_panic_propagates_with_its_original_payload() {
+        let caught = std::panic::catch_unwind(|| {
+            let _ = try_run_within(
+                "sample_test",
+                "the sample event",
+                Duration::from_secs(60),
+                || panic!("original body failure"),
+            );
+        });
+        let payload = caught.unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("original body failure")
+        );
+    }
+
+    // Invariant: a body that finishes returns its value. A generous limit is used and
+    // elapsed time is not asserted, so the case cannot flake on host load.
+    #[test]
+    fn finished_body_returns_its_value() {
+        let result = try_run_within(
+            "sample_test",
+            "the sample event",
+            Duration::from_secs(60),
+            || 7_u32,
+        );
+        assert_eq!(result.unwrap(), 7);
+    }
+}
