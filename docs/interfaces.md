@@ -3436,11 +3436,12 @@ or semantic engine. The public surface includes:
   `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The client never
   deletes or rewrites a quarantine file; its size is bounded only by the disk (a source whose
   time mapping conflicts refuses every later batch, so each becomes one file until the operator
-  fixes the source). If the file
-  cannot be written, the batch stays pending, the failure is counted and reported as the
-  transient failure, and the write is retried, so that batch is not dropped; later events wait behind it and are refused as `Full` once the queue is full. Any other non-retryable
-  refusal (a replaced store, a read-only daemon) ends delivery as a terminal failure, and the
-  pending batch and queued events are first written to quarantine files. The daemon storing a
+  fixes the source). If the file cannot be written, the batch stays pending, the failure is
+  counted and reported as the transient failure, which names the refusal code and reason, the
+  directory and the I/O error, and the write is retried, so that batch is not dropped; later
+  events wait behind it and are refused as `Full` once the queue is full. Any other
+  non-retryable refusal (a replaced store, a read-only daemon) ends delivery as a terminal
+  failure, and the pending batch and queued events are first written to quarantine files. The daemon storing a
   refused batch as a malformed record with its reason is the preferred form and is not yet
   implemented (issue 216). A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
   the client holds the batch, bounded by the queue limits, with overflow counted

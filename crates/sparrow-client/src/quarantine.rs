@@ -34,20 +34,52 @@ pub(crate) fn default_dir() -> PathBuf {
     })
 }
 
+/// A save that did not complete. `created` names the quarantine file this call had already
+/// linked into place when it failed (its scratch name could not be removed), so the caller
+/// counts that file once even though the save is reported failed and retried.
+#[derive(Debug)]
+pub(crate) struct SaveFailure {
+    pub(crate) error: std::io::Error,
+    pub(crate) created: Option<PathBuf>,
+}
+
+impl From<std::io::Error> for SaveFailure {
+    fn from(error: std::io::Error) -> Self {
+        Self {
+            error,
+            created: None,
+        }
+    }
+}
+
 /// Durably write one batch with its reason; returns the file path and whether this call
 /// created it. The file appears only complete (written and synced under a scratch name, then
-/// linked). A name already taken by this batch's own bytes is reused, so saving one identity
-/// twice writes once; a name taken by different bytes (identities that sanitize to one name)
-/// gets a numeric suffix, so one batch is never reported saved on the strength of another's
-/// file. Any failure is returned: the caller must keep the batch.
+/// linked). A name already taken by this batch's own bytes, compared exactly after the header
+/// line, is reused, so saving one identity twice writes once; a name taken by different bytes
+/// (identities that sanitize to one name) gets a numeric suffix, so one batch is never reported
+/// saved on the strength of another's file. Any failure is returned: the caller must keep the
+/// batch.
 pub(crate) fn save(
     dir: &Path,
     batch: &EventBatch,
     code: &str,
     reason: &str,
-) -> std::io::Result<(PathBuf, bool)> {
+) -> Result<(PathBuf, bool), SaveFailure> {
+    save_with(dir, batch, code, reason, |scratch| {
+        std::fs::remove_file(scratch)
+    })
+}
+
+/// [`save`] with the removal of the scratch name supplied, so a test can fail it.
+fn save_with(
+    dir: &Path,
+    batch: &EventBatch,
+    code: &str,
+    reason: &str,
+    remove_scratch: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(PathBuf, bool), SaveFailure> {
     let (Some(first), Some(last)) = (batch.events.first(), batch.events.last()) else {
-        return Err(std::io::Error::other("quarantine of an empty batch"));
+        return Err(std::io::Error::other("quarantine of an empty batch").into());
     };
     create_dir(dir)?;
     let payload = batch.quarantine_bytes();
@@ -77,16 +109,22 @@ pub(crate) fn save(
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let scratch = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    // A scratch name left by an earlier failed cleanup is a second link to a quarantine file:
+    // opening it for writing would rewrite that file. Drop the name first; the file stays.
+    match std::fs::remove_file(&scratch) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&scratch)?;
     let written = file.write_all(&bytes).and_then(|()| file.sync_all());
     drop(file);
-    let linked = written.and_then(|()| {
-        for attempt in 0_u64.. {
+    let linked = written.map_err(SaveFailure::from).and_then(|()| {
+        for attempt in 0..=u64::MAX {
             let path = if attempt == 0 {
                 dir.join(format!("{name}.quarantine.jsonl"))
             } else {
@@ -95,21 +133,38 @@ pub(crate) fn save(
             match std::fs::hard_link(&scratch, &path) {
                 Ok(()) => return Ok((path, true)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if std::fs::read(&path)?.ends_with(&payload) {
+                    if holds_payload(&std::fs::read(&path)?, &payload) {
                         return Ok((path, false));
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
-        unreachable!("the attempt counter is unbounded")
+        Err(std::io::Error::other("every quarantine file name for this batch is taken").into())
     });
     // The scratch name is this function's own temporary; the quarantine file is never removed.
-    let cleaned = std::fs::remove_file(&scratch);
-    let saved = linked?;
-    cleaned?;
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(saved)
+    let cleaned = remove_scratch(&scratch);
+    let (path, created) = linked?;
+    if let Err(error) = cleaned {
+        return Err(SaveFailure {
+            error,
+            created: created.then_some(path),
+        });
+    }
+    std::fs::File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| SaveFailure {
+            error,
+            created: created.then(|| path.clone()),
+        })?;
+    Ok((path, created))
+}
+
+/// Whether a quarantine file holds exactly this payload after its header line.
+fn holds_payload(file: &[u8], payload: &[u8]) -> bool {
+    file.iter()
+        .position(|byte| *byte == b'\n')
+        .is_some_and(|end| &file[end + 1..] == payload)
 }
 
 /// Create the directory with mode 0700 and make every directory entry this call created
@@ -232,5 +287,47 @@ mod tests {
         save(&leaf, &batch("events:abc:5", &[1]), "CONFLICT", "r").unwrap();
         let mode = std::fs::metadata(&leaf).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// INVARIANT: a name is reused only when the file holds exactly this batch's payload after
+    /// its header line. A batch whose event lines merely equal the tail of another batch's file
+    /// (here the second event of a two-event batch) is a different batch and gets its own file;
+    /// the old tail comparison reported it saved on the strength of the other's file.
+    #[test]
+    fn a_payload_equal_to_the_tail_of_another_file_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (whole, _) =
+            save(dir.path(), &batch("events:abc:6", &[1, 2]), "CONFLICT", "r").unwrap();
+        let (tail, made) = save(dir.path(), &batch("events-abc-6", &[2]), "CONFLICT", "r").unwrap();
+        assert!(made && whole != tail);
+        let kept = std::fs::read_to_string(&tail).unwrap();
+        assert!(kept.contains("event 2") && !kept.contains("event 1"));
+    }
+
+    /// INVARIANT: when the scratch name cannot be removed after the file was linked, the save is
+    /// reported failed (so the batch is retried) but names the file it created, so the caller
+    /// counts it once; the retry reuses the file without rewriting it and clears the scratch
+    /// name. The old code returned a bare error, so the retry saw `created == false` and the
+    /// file was never counted.
+    #[test]
+    fn a_failed_scratch_cleanup_after_the_link_still_names_the_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = batch("events:abc:7", &[1]);
+        let failure = save_with(dir.path(), &batch, "CONFLICT", "first", |_| {
+            Err(std::io::Error::other("scratch removal refused"))
+        })
+        .unwrap_err();
+        let created = failure.created.expect("the linked file is named");
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("scratch removal refused")
+        );
+        let (again, made) = save(dir.path(), &batch, "CONFLICT", "second").unwrap();
+        assert_eq!((again, made), (created.clone(), false));
+        let text = std::fs::read_to_string(&created).unwrap();
+        assert!(text.contains("\"reason\":\"first\""), "{text}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
