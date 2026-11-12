@@ -1058,6 +1058,33 @@ fn encode_stream_evidence_loss(
     }
 }
 
+fn encode_tail_registry_evidence(
+    mut out: wire::tail_registry_evidence::Builder<'_>,
+    evidence: &sparrow_core::TailRegistryEvidence,
+) {
+    out.set_max_named(sparrow_core::MAX_NAMED_UNRECORDED_TAILS as u32);
+    out.set_other_files(evidence.other_files);
+    out.set_other_generations(evidence.other_generations);
+    out.set_other_records(evidence.other_records);
+    out.set_other_bytes(evidence.other_bytes);
+    out.set_other_files_exact(evidence.other_files_exact);
+    out.set_total_generations(evidence.total_generations);
+    out.set_total_records(evidence.total_records);
+    out.set_total_bytes(evidence.total_bytes);
+    out.set_retired_terminal(evidence.retired_terminal);
+    out.set_retired_duplicate_risk(evidence.retired_duplicate_risk);
+    let mut named = out.init_named(evidence.named.len() as u32);
+    for (index, file) in evidence.named.iter().enumerate() {
+        let mut row = named.reborrow().get(index as u32);
+        row.set_watch(&file.watch);
+        row.set_path(&file.path);
+        row.set_source(&file.source);
+        row.set_generations(file.generations);
+        row.set_records(file.records);
+        row.set_bytes(file.bytes);
+    }
+}
+
 fn producer_limits(
     mut out: wire::producer_limits::Builder<'_>,
     value: &purrdf_lex::json::Value,
@@ -3020,6 +3047,10 @@ impl wire::sparrow::Server for Rpc {
                 encode_stream_evidence_loss(
                     out.reborrow().init_stream_evidence_loss(),
                     &self.store.stream_evidence_loss(),
+                );
+                encode_tail_registry_evidence(
+                    out.reborrow().init_tail_registry_evidence(),
+                    &self.store.tail_registry_evidence(),
                 );
                 self.backup
                     .encode(out.reborrow().init_backup(), &self.store.backup_status());

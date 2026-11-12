@@ -3,7 +3,7 @@
 
 //! Ordered membership of retained original bytes in a file generation.
 
-use super::{Catalog, Error, Record, Writer, catalog_upgrade, parse, tail};
+use super::{Catalog, Error, Record, Writer, catalog_upgrade, parse};
 use rocksdb::{DB, WriteBatch};
 
 const PREFIX: &[u8] = b"tail-range:";
@@ -84,7 +84,9 @@ pub(super) fn bytes(
     const VISITS: usize = 100_000;
     const ROW_BYTES: usize = 64 * 1024;
     const CATALOG_BYTES: usize = 64 * 1024 * 1024;
-    let generation = tail::registry(writer)?
+    let generation = writer
+        .tail_rows()?
+        .0
         .into_iter()
         .find(|row| row.id == id)
         .ok_or_else(|| Error::new("NOT_FOUND", "file generation absent"))?;

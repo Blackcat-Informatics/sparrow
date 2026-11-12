@@ -1097,6 +1097,94 @@ async fn tail_capture_refusal_preserves_bytes_and_missing_recovery_reports_a_dur
         .await;
 }
 
+/// INVARIANT (#224): a daemon whose stored generation registry is full still tails a new file,
+/// and status names that file with its counts, over the wire and rendered. Before #224 the
+/// declaration was refused and the file's lines were never taken.
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_generation_registry_still_tails_a_file_and_status_names_it() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("active");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("current.jsonl"), b"{\"n\":1}\n").unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            append_tail_config(&config, &root, "jsonl");
+            {
+                let store = sparrow_server::ServerConfig::read(&config)
+                    .unwrap()
+                    .open_store()
+                    .unwrap();
+                for index in 0..sparrow_core::MAX_TAIL_GENERATIONS as u64 {
+                    store
+                        .tail_start(
+                            &sparrow_core::TailStart {
+                                request_id: format!("filler-{index}"),
+                                watch: "filler".into(),
+                                watch_revision: 1,
+                                directories: sparrow_core::ConsumptionDirectories {
+                                    root_device: 1,
+                                    root_inode: 2,
+                                    parent_device: 3,
+                                    parent_inode: 4,
+                                },
+                                path: format!("filler{index}.log").into_bytes(),
+                                source: "filler".into(),
+                                format: "log".into(),
+                                device: 99,
+                                inode: index + 1,
+                            },
+                            1,
+                        )
+                        .unwrap();
+                }
+            }
+            let daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_tail_checkpoint_records() == 1 && watch.get_tail_descriptors() == 1
+            })
+            .await;
+            let response = client
+                .capability()
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let evidence = status.get_tail_registry_evidence().unwrap();
+            let named = evidence.get_named().unwrap();
+            assert_eq!(named.len(), 1);
+            let file = named.get(0);
+            assert_eq!(file.get_path().unwrap().to_str().unwrap(), "current.jsonl");
+            assert_eq!(
+                (file.get_generations(), file.get_records(), file.get_bytes()),
+                (1, 1, 8)
+            );
+            assert_eq!(
+                (
+                    evidence.get_total_generations(),
+                    evidence.get_total_records(),
+                    evidence.get_total_bytes()
+                ),
+                (1, 1, 8)
+            );
+            let rendered = cli(&socket, &["status"]);
+            let report = &rendered["tail_registry_evidence"];
+            assert_eq!(report["named"][0]["path"].as_str(), Some("current.jsonl"));
+            assert_eq!(report["named"][0]["records"].as_str(), Some("1"));
+            assert_eq!(report["named"][0]["bytes"].as_str(), Some("8"));
+            assert_eq!(report["total_generations"].as_str(), Some("1"));
+            assert_eq!(report["other_files_exact"].as_bool(), Some(true));
+            drop(client);
+            drop(daemon);
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn active_tail_watches_preserve_partial_lines_rotated_descriptors_and_reopened_checkpoints() {
     tokio::task::LocalSet::new()
@@ -9911,6 +9999,15 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         assert_eq!(report["named"][0]["batches"].as_str(), Some("1"));
         assert_eq!(report["named"][0]["events"].as_str(), Some("2"));
         assert_eq!(report["total_events"].as_str(), Some("2"));
+        // #224: the tail registry evidence is on the wire and in the rendered status, empty
+        // while no file was tailed without a stored checkpoint.
+        let tail = status.get_tail_registry_evidence().unwrap();
+        assert_eq!(tail.get_max_named(), sparrow_core::MAX_NAMED_UNRECORDED_TAILS as u32);
+        assert_eq!((tail.get_total_records(), tail.get_retired_terminal()), (0, 0));
+        let tail = &rendered["tail_registry_evidence"];
+        assert_eq!(tail["named"].as_array().map(Vec::len), Some(0));
+        assert_eq!(tail["other_files_exact"].as_bool(), Some(true));
+        assert_eq!(tail["total_bytes"].as_str(), Some("0"));
         drop(producer); drop(daemon);
     }).await;
 }

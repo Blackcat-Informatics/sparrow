@@ -2216,10 +2216,42 @@ watch/revision, original root/parent directory identities, raw relative Unix
 path, source, line format and opened device/inode.
 The observer owns file-descriptor validation; these calls do not probe, rename
 or delete producer files. Reusing a declaration preserves its generation and
-current checkpoint; changing it conflicts. At most 64 generations and 512 KiB
-of encoded checkpoint metadata are retained. Active entries consume this quota;
-terminal summaries become eligible for registry replacement 30 days after
+current checkpoint; changing it conflicts. The stored registry holds at most 64 generations
+and 512 KiB of encoded checkpoint metadata; every shipped reader refuses a longer
+value, so raising either bound is a stored-format change that rides the next one
+(tracked in #230, with the persistence of the counts below).
+Active entries consume this quota; terminal summaries expire 30 days after
 completion/discontinuity.
+
+A full registry never turns a file away (#224). `tail_start` first drops expired
+rows, then retires the one oldest finished row that nothing can still need,
+counted, and stores the new row. Only a complete row is retirable, and only when
+it finished at least two days ago (the retry window) and no active consumption
+journal binds it. Never retired are an active row, a row with a finish that is
+not complete, a complete row inside that window or bound by a journal, and a
+discontinued row, which is the only durable record of a truncation, identity
+change or read gap. A retired complete row answers NOT_FOUND to a file-generation
+byte read (its records stay readable). If no row is retirable the
+file is tailed under a generation held only in memory: it is read, appended,
+finished, discontinued and byte-read like a stored row and its records are stored normally,
+but it is never written to the registry and is lost with the process. After a
+restart the tailer finds no row for the file and reads it again from offset 0
+under a new generation, so the records already stored are stored again. That
+duplicate risk is counted, and it is realised only after a restart, when the counts
+are gone too. Retiring a complete row carries the same risk if its
+file is still present, and is counted too. Status shows both under
+`tail_registry_evidence`: the `max_named` (16) files with the most bytes at risk,
+by `watch`, `path` (non-UTF-8 bytes shown as U+FFFD), `source`, `generations`,
+`records` and `bytes`; the rest in `other_files`, `other_generations`,
+`other_records` and `other_bytes` (`other_files_exact` is false when more than
+1024 files are tracked); `total_generations`, `total_records` and `total_bytes`
+over every file; and `retired_terminal` with the `retired_duplicate_risk` share
+that were complete generations. The counts live in memory for the daemon's life.
+Live in-memory generations are bounded by the per-watch descriptor quota
+(`max_candidates <= 64`, an existing limit this change leaves as it is: a 65th
+simultaneous file in one watch waits unconsumed on disk); terminal ones expire after 30 days and are evicted oldest
+first above 64, counted in `retired_terminal`. Source listings read the stored
+registry and do not list in-memory generations.
 
 Append accepts only the complete prefix found by the existing log/JSONL record
 boundary owner. An unfinished suffix remains at the uncommitted source offset;

@@ -123,6 +123,9 @@ pub use storage::tail::{
     MAX_TAIL_GENERATIONS, MAX_TAIL_REGISTRY_BYTES, TailFinish, TailFinishIntent, TailGeneration,
     TailPosition, TailPublication, TailStart,
 };
+pub use storage::tail_evidence::{
+    MAX_NAMED_UNRECORDED_TAILS, TailRegistryEvidence, UnrecordedTail,
+};
 pub use storage::watch_registry::MAX_WATCH_REGISTRY_BYTES;
 pub use storage::{
     Artifact, Config, Error, INLINE_ARTIFACT_BYTES, OpenPhase, Pin, QUERY_SCOPE_PROFILE,

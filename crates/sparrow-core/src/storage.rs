@@ -77,6 +77,7 @@ pub(crate) mod stream_evidence;
 pub(crate) mod syslog;
 mod table_options;
 pub(crate) mod tail;
+pub(crate) mod tail_evidence;
 mod tail_ranges;
 mod temporal_index;
 mod text_index;
@@ -519,6 +520,8 @@ struct Unlocked {
     forced: Arc<forced_compaction::Forced>,
     /// Gap evidence lost to a full stream registry, counted per stream (#215).
     stream_evidence: stream_evidence::Ledger,
+    /// Files tailed without a stored checkpoint and registry rows retired for room (#224).
+    tail_evidence: tail_evidence::Ledger,
 }
 
 /// A non-blocking callback that asks the retention duty to run a pass now.
@@ -617,6 +620,9 @@ struct Writer {
     /// Retirement share the import bound and pin caps derive from: production
     /// defaults except where the dev-only test hook scales them for one open store.
     retirement: std::cell::Cell<eviction::RetirementShare>,
+    /// Tail generations taken while the stored registry was full and nothing could be retired.
+    /// They are never written to the registry and are lost with the process (#224).
+    unrecorded: std::cell::RefCell<Vec<tail::TailGeneration>>,
 }
 
 /// The refusal every operation reports once a writer panicked while holding the writer lock.
@@ -1685,6 +1691,7 @@ impl Store {
                 retention_waker,
                 forced: Arc::clone(&forced),
                 stream_evidence: stream_evidence::Ledger::default(),
+                tail_evidence: tail_evidence::Ledger::default(),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -1704,6 +1711,7 @@ impl Store {
                 query_staging,
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
                 retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
+                unrecorded: std::cell::RefCell::new(Vec::new()),
             })),
             lease_ledgers: Arc::new([
                 pin_reads.ledger(),
@@ -2016,7 +2024,7 @@ impl Store {
             .flatten();
         let stream_lost = producer.is_some() && stream.is_none();
         let receiver_lost = origin.receiver().is_some() && receiver.is_none();
-        let tail_checkpoint = origin
+        let mut tail_checkpoint = origin
             .tail()
             .map(|input| tail::prepare(&writer, source, format, input, record_count, now))
             .transpose()?;
@@ -2079,8 +2087,11 @@ impl Store {
         put(&mut batch, &artifact.id, &artifact);
         recordless::publish(&mut batch, &artifact)?;
         writer.ingest_receipt(&mut batch, request_id, &artifact, origin, now)?;
-        if let Some(checkpoint) = tail_checkpoint {
-            batch.put(tail::KEY, checkpoint.encoded);
+        if let Some(encoded) = tail_checkpoint
+            .as_mut()
+            .and_then(|checkpoint| checkpoint.encoded.take())
+        {
+            batch.put(tail::KEY, encoded);
         }
         if let Some(stream) = stream {
             stream.publish(&mut batch);
@@ -2099,6 +2110,15 @@ impl Store {
             (mode == durability::Durability::Buffered).then_some(artifact.id.as_str()),
             Some(estimate),
         )?;
+        if let Some(row) = tail_checkpoint.and_then(|checkpoint| checkpoint.unrecorded) {
+            self.unlocked.tail_evidence.published(
+                &row.declaration.watch,
+                &row.declaration.path,
+                record_count as u64,
+                bytes.len() as u64,
+            );
+            writer.keep_unrecorded(row);
+        }
         if let Some(input) = producer.filter(|_| stream_lost) {
             self.unlocked.stream_evidence.record(
                 stream_evidence::LostStreamKind::Producer,
@@ -2123,6 +2143,13 @@ impl Store {
     #[must_use]
     pub fn stream_evidence_loss(&self) -> stream_evidence::StreamEvidenceLoss {
         self.unlocked.stream_evidence.report()
+    }
+
+    /// Files tailed without a stored checkpoint and finished registry rows retired for room
+    /// since the store opened, bounded; it takes no writer lock (#224).
+    #[must_use]
+    pub fn tail_registry_evidence(&self) -> tail_evidence::TailRegistryEvidence {
+        self.unlocked.tail_evidence.report()
     }
 
     /// Read artifact metadata, including known expired or evicted artifacts.
