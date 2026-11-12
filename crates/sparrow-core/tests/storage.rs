@@ -5369,7 +5369,11 @@ fn pressure_recovers_real_native_bytes_and_retries_without_ballast_removal() {
     store
         .ingest("native-shared", "source", "opaque", &input, 2)
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    // Recovery waits on native flush/compaction, whose duration depends on host
+    // load, so no wall-clock deadline applies. A pass that reports no progress
+    // (Blocked, AwaitingArchive or a latched failure), or more passes than the
+    // 130 occurrences ever written (each pass visits at least one), is a stall.
+    const MAX_PASSES: u64 = 130;
     let mut qualified = None;
     for index in 0..128 {
         random.read_exact(&mut input).unwrap();
@@ -5391,7 +5395,11 @@ fn pressure_recovers_real_native_bytes_and_retries_without_ballast_removal() {
                         break state;
                     }
                     assert!(
-                        std::time::Instant::now() < deadline,
+                        !matches!(
+                            state.phase,
+                            PressurePhase::Blocked | PressurePhase::AwaitingArchive
+                        ) && state.failure.is_none()
+                            && state.passes <= MAX_PASSES,
                         "native recovery stalled: {state:?}; before={before}; status={:?}",
                         store.status(3 + index).unwrap()
                     );
@@ -9513,7 +9521,6 @@ fn streaming_journal_recovers_after_owned_writer_sigkill() {
     use sparrow_core::IMPORT_CHUNK_BYTES;
     use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
-    use std::time::Duration;
     let mut input = vec![b'z'; IMPORT_CHUNK_BYTES];
     input.extend_from_slice(b"final\r\n");
     let digest = format!(
@@ -9562,7 +9569,9 @@ fn streaming_journal_recovers_after_owned_writer_sigkill() {
             .any(|line| line.is_ok_and(|line| line == "SPARROW_IMPORT_READY"));
         let _ = sender.send(ready);
     });
-    let ready = receiver.recv_timeout(Duration::from_secs(10));
+    // Wait on the child itself, not a timer: the reader sends as soon as the ready
+    // line arrives, or false when the child's stdout closes because it died.
+    let ready = receiver.recv();
     // Always terminate/reap only this owned test child, including readiness
     // failure, before assertions. No store destructor runs in the killed writer.
     let killed = child.kill();
