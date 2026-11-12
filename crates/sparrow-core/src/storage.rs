@@ -510,7 +510,13 @@ struct Unlocked {
     artifact_builds: Mutex<artifact_read::Builds>,
     /// The one online backup slot (#156); a backup never takes the writer lock.
     backup: backup::Slot,
+    /// Wakes the maintenance worker's retention duty after an event that changes what
+    /// expiry may retire: a pin release or commit and an archive commit.
+    retention_waker: Mutex<Option<RetentionWaker>>,
 }
+
+/// A non-blocking callback that asks the retention duty to run a pass now.
+pub type RetentionWaker = Arc<dyn Fn() + Send + Sync>;
 
 /// One database owner. Clones share a serialized catalog writer.
 #[derive(Clone)]
@@ -1284,7 +1290,7 @@ impl Writer {
     }
 
     /// Capture live pin members, optionally collecting the keys of expired pin rows
-    /// so the caller can delete them.
+    /// and the earliest live deadline so expiry can delete and schedule them.
     fn capture_pins<R>(
         &self,
         now: u64,
@@ -1292,7 +1298,7 @@ impl Writer {
         mut admit: impl FnMut() -> Result<R, Error>,
         maximum: Option<usize>,
         mut remaining: Option<&mut usize>,
-        mut expired: Option<&mut Vec<Box<[u8]>>>,
+        mut sweep: Option<&mut expiry::PinSweep>,
     ) -> Result<BTreeSet<String>, Error> {
         let mut protected = BTreeSet::new();
         for entry in self.db.prefix_iterator("pin:") {
@@ -1314,9 +1320,12 @@ impl Writer {
             }
             let pin: Pin = self.decode_evidence(&key, &bytes)?;
             if pin.expires_at > now {
+                if let Some(sweep) = sweep.as_deref_mut() {
+                    sweep.live(pin.expires_at);
+                }
                 protected.extend(pin.members.into_iter().filter(|member| include(member)));
-            } else if let Some(expired) = expired.as_deref_mut() {
-                expired.push(key);
+            } else if let Some(sweep) = sweep.as_deref_mut() {
+                sweep.expired.push(key);
             }
         }
         Ok(protected)
@@ -1662,6 +1671,7 @@ impl Store {
                 source_builds: Mutex::default(),
                 artifact_builds: Mutex::default(),
                 backup: backup::Slot::default(),
+                retention_waker: Mutex::default(),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -2529,6 +2539,7 @@ impl Store {
         )?;
         pin.extend(deadline)?;
         writer.commit_pin(&retry_key, arguments, &pin, now)?;
+        self.wake_retention();
         Ok(pin)
     }
 
@@ -2608,6 +2619,7 @@ impl Store {
         }
         pin.extend(deadline)?;
         writer.commit_pin(&key, arguments, &pin, now)?;
+        self.wake_retention();
         Ok(pin)
     }
 
@@ -2616,7 +2628,9 @@ impl Store {
         let writer = self.lock()?;
         let mut batch = WriteBatch::default();
         writer.release_batch(id, &mut batch)?;
-        writer.commit(batch)
+        writer.commit(batch)?;
+        self.wake_retention();
+        Ok(())
     }
 
     /// Durably release a pin with a bounded stable retry receipt.
@@ -2658,6 +2672,7 @@ impl Store {
         writer.release_batch(id, &mut batch)?;
         batch.put(key, json::write_compact(&saved));
         writer.commit(batch)?;
+        self.wake_retention();
         Ok(receipt)
     }
 
@@ -2684,8 +2699,29 @@ impl Store {
         .into())
     }
 
-    /// Drop every expired read handle, so an expiry pass frees their snapshots.
-    fn purge_read_leases(&self, now: u64) -> Result<(), Error> {
+    /// Install, or with `None` remove, the callback that wakes the retention duty. The
+    /// callback runs on the thread that released a pin, committed a pin or committed an
+    /// archive segment, so it must not block.
+    pub fn set_retention_waker(&self, waker: Option<RetentionWaker>) {
+        if let Ok(mut slot) = self.unlocked.retention_waker.lock() {
+            *slot = waker;
+        }
+    }
+
+    fn wake_retention(&self) {
+        let waker = self
+            .unlocked
+            .retention_waker
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    /// Drop every expired read handle, so a lease duty frees their snapshots.
+    pub fn purge_read_leases(&self, now: u64) -> Result<(), Error> {
         fn purge<S: catalog_lease::Selector, B: catalog_lease::PageBody>(
             registry: &Mutex<catalog_lease::Reads<S, B>>,
             now: u64,

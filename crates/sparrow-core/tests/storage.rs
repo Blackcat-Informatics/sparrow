@@ -4497,6 +4497,106 @@ fn bounded_expiry_recaptures_pin_release_and_expiry_between_pages() {
     }
 }
 
+/// INVARIANT (#183): an expiry pass costs what is due, never the store size. Expiry once
+/// scanned the whole catalog under the writer lock, so reads waited on that lock for 30
+/// seconds and more. Two stores hold the same unexpired data at different row counts: a pass
+/// with nothing due reads the same small constant number of rows in both, retires and
+/// deletes nothing, reports no continuation and the exact next deadline; a pass after the
+/// deadline reads about the number of due rows, again whatever the store size. The count
+/// comes from expiry's own row-read counter, not from the pass's self-reported `visited`.
+/// The hourly retry-row scan is drained first, since it is the one deliberate full scan.
+#[test]
+fn expiry_pass_reads_follow_due_work_not_store_size() {
+    use sparrow_core::{EvictionLimits, RETENTION_MS};
+    const DUE: u64 = 10;
+    let limits = EvictionLimits {
+        max_records: 64,
+        ..EvictionLimits::default()
+    };
+    let measure = |artifacts: u64| {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        for i in 0..artifacts {
+            store
+                .ingest(&format!("ratio-{i}"), "source", "log", b"line\n", i)
+                .unwrap();
+        }
+        let reads = || store.expiry_reads_for_tests().unwrap();
+        let just_before = RETENTION_MS - 1;
+        while store
+            .expire_bounded(just_before, limits)
+            .unwrap()
+            .continuation
+        {}
+        let scanned = reads();
+        let idle = store.expire_bounded(just_before, limits).unwrap();
+        let idle_reads = reads() - scanned;
+        assert_eq!((idle.records, idle.artifacts, idle.deleted), (0, 0, 0));
+        assert!(!idle.continuation);
+        assert_eq!(idle.next_due, Some(RETENTION_MS));
+        let before = reads();
+        let due = store
+            .expire_bounded(RETENTION_MS + DUE - 1, limits)
+            .unwrap();
+        assert_eq!((due.records, due.artifacts), (DUE, DUE));
+        (scanned, idle_reads, reads() - before)
+    };
+    let (small_scan, small_idle, small_due) = measure(50);
+    let (large_scan, large_idle, large_due) = measure(500);
+    assert_eq!(small_idle, large_idle, "idle reads follow the store size");
+    assert!(small_idle <= 8, "idle pass read {small_idle} rows");
+    assert_eq!(small_due, large_due, "due reads follow the store size");
+    assert!((DUE..=4 * DUE + 8).contains(&small_due), "{small_due}");
+    // The retry scan is the part that does follow the store.
+    assert!(large_scan > small_scan);
+}
+
+/// INVARIANT: an entry a pin holds is skipped, not retired, and is not read again on later
+/// passes; releasing the pin retires it. A retired entry waits a day before deletion, and a
+/// clock that moves backwards neither fails nor undoes anything.
+#[test]
+fn expiry_skips_held_entries_without_rereading_them_and_deletes_a_day_after_retiring() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let held = store.ingest("held", "source", "log", b"a\nb\n", 0).unwrap();
+    let free = store.ingest("free", "source", "log", b"c\n", 0).unwrap();
+    let pin = store
+        .pin("held-pin", "case", std::slice::from_ref(&held.id), 40, 0)
+        .unwrap();
+    let limits = EvictionLimits::default();
+    let reads = || store.expiry_reads_for_tests().unwrap();
+    let deadline = 30 * DAY;
+    let first = store.expire_bounded(deadline, limits).unwrap();
+    assert_eq!((first.records, first.artifacts), (1, 1));
+    let before = reads();
+    let again = store.expire_bounded(deadline, limits).unwrap();
+    assert_eq!((again.records, again.artifacts), (0, 0));
+    assert!(reads() - before <= 8, "a held entry was read again");
+    assert_eq!(store.expire_bounded(1, limits).unwrap().visited, 0);
+    store.release(&pin.id).unwrap();
+    let released = store.expire_bounded(deadline, limits).unwrap();
+    assert_eq!((released.records, released.artifacts), (2, 1));
+    assert_eq!(
+        store
+            .expire_bounded(deadline + DAY - 1, limits)
+            .unwrap()
+            .deleted,
+        0,
+        "a retired entry waits a day"
+    );
+    // Both artifacts and their three records.
+    assert_eq!(
+        store
+            .expire_bounded(deadline + DAY, limits)
+            .unwrap()
+            .deleted,
+        5
+    );
+    assert_eq!(store.artifact(&held.id).unwrap_err().code, "NOT_FOUND");
+    assert_eq!(store.artifact(&free.id).unwrap_err().code, "NOT_FOUND");
+}
+
 #[test]
 fn bounded_expiry_drains_manifests_and_preserves_pinned_shared_evidence() {
     use sparrow_core::{EvictionLimits, ExpiryFrontier};
@@ -18706,7 +18806,9 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
         .expire_bounded(later, EvictionLimits::default())
         .unwrap();
     assert_eq!((waiting.records, waiting.artifacts), (0, 0));
-    assert_eq!(waiting.archive_waiting, 6);
+    // Archiving is a prefix of the receipt order, so the pass stops at the first uncovered
+    // entry and reports that one.
+    assert_eq!(waiting.archive_waiting, 1);
     assert_eq!(owned(&store), before);
 
     // An intent must start at the first unarchived entry and match the catalog.
@@ -18737,7 +18839,7 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
     let pending = store
         .expire_bounded(later, EvictionLimits::default())
         .unwrap();
-    assert_eq!((pending.records, pending.archive_waiting), (0, 6));
+    assert_eq!((pending.records, pending.archive_waiting), (0, 1));
     assert_eq!(store.archive_commit(&[2; 32]).unwrap_err().code, "CONFLICT");
     store.archive_commit(&intent.segment_id).unwrap();
     assert_eq!(
@@ -18748,7 +18850,7 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
         .expire_bounded(later, EvictionLimits::default())
         .unwrap();
     assert_eq!((retired.records, retired.artifacts), (2, 1));
-    assert_eq!(retired.archive_waiting, 3);
+    assert_eq!(retired.archive_waiting, 1);
     assert!(owned(&store) < before);
     assert_eq!(store.bytes(&second.record_ids[0], 0, 2, 3).unwrap(), b"c\n");
 

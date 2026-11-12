@@ -336,6 +336,16 @@ investigation pins. Expiry affects subsequent queries immediately; physical
 reclamation waits for those short-lived leases and native engine maintenance.
 Report reclamation lag separately from logical expiry.
 
+Physical expiry is driven by the receipt-time indexes, not by a catalog scan.
+Records and artifacts share the deadline `received_at + retention`, so the `time:`
+and `empty-time:` order is deadline order. A pass walks it from a retirement
+cursor and a deletion cursor, a day apart, and stops at the first key not yet due.
+Its cost follows the due work, never the store size, so it holds the writer lock
+only briefly and reads are not made to wait on it. The worker sleeps until the
+next reported deadline, bounded between one second and one hour, and a pin
+release, a pin commit or an archive commit wakes it. Retry rows have no time
+index and are scanned once per hour.
+
 Metadata-only record, ranked-text and JSON key/value leases may stage their complete
 immutable native summaries in bounded anonymous disk files under the same store
 admission. These preserve page replay without retaining original payload or RDF

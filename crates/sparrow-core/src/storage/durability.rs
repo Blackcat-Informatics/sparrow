@@ -268,6 +268,7 @@ impl Writer {
         }
         if let Some(earliest) = publication.earliest {
             self.eviction.borrow_mut().published(&earliest);
+            self.expiry.borrow_mut().published(&earliest);
         }
         let sequence = self.db.latest_sequence_number();
         let mut state = self.durability.borrow_mut();
