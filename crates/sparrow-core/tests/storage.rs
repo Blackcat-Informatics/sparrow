@@ -6333,6 +6333,72 @@ fn consumption_retire_moves_only_an_unpublished_claim_out_of_pending() {
     assert_eq!(store.consumption_pending().unwrap().len(), 1);
 }
 
+/// INVARIANT (issue 207): retiring a stuck claim is what frees its journal slot, so the
+/// retired-claim bound must never be reached by routine operation. Past the former 64 rows,
+/// 16 stuck claims retire and 16 new ones reserve again (a stuck claim no longer pins a slot
+/// once retired). The bound is 1024 rows (`MAX_RETIRED_CONSUMPTION_CLAIMS`, 8 MiB at the
+/// 8 KiB row ceiling): at it a retirement is refused with RESOURCE_LIMIT, leaves the claim
+/// pending and recorded, and every earlier row stays listed.
+#[test]
+fn retired_claims_pass_the_old_cap_free_journal_slots_and_stop_only_at_the_bound() {
+    use sparrow_core::{
+        ConsumptionGeneration, MAX_CONSUMPTION_JOURNALS, MAX_RETIRED_CONSUMPTION_CLAIMS,
+    };
+    assert_eq!(MAX_RETIRED_CONSUMPTION_CLAIMS, 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let generation = |inode| ConsumptionGeneration {
+        device: 1,
+        inode,
+        byte_length: 4,
+        modified: (10, 20),
+        changed: (10, 30),
+    };
+    let stick = |index: usize| {
+        let journal = store
+            .consumption_reserve(
+                "watch",
+                format!("stuck-{index}.log").as_bytes(),
+                "source",
+                "log",
+                generation(index as u64 + 2),
+                CONSUMPTION_DIRECTORIES,
+                1_000,
+            )
+            .unwrap();
+        store
+            .consumption_claimed(&journal.import_id, generation(index as u64 + 2))
+            .unwrap();
+        journal.import_id
+    };
+    let retire = |id: &str| store.consumption_retire(id, "watch", "admin", "source lost", DAY);
+    for round in 0..MAX_RETIRED_CONSUMPTION_CLAIMS / MAX_CONSUMPTION_JOURNALS {
+        // Sixteen stuck claims fill every journal slot; a retirement frees each in turn.
+        let ids: Vec<_> = (0..MAX_CONSUMPTION_JOURNALS)
+            .map(|slot| stick(round * MAX_CONSUMPTION_JOURNALS + slot))
+            .collect();
+        assert_eq!(
+            store.consumption_pending().unwrap().len(),
+            MAX_CONSUMPTION_JOURNALS
+        );
+        for id in &ids {
+            retire(id).unwrap();
+        }
+        assert!(store.consumption_pending().unwrap().is_empty());
+    }
+    assert_eq!(
+        store.consumption_retired().unwrap().len(),
+        MAX_RETIRED_CONSUMPTION_CLAIMS
+    );
+    let one_more = stick(MAX_RETIRED_CONSUMPTION_CLAIMS);
+    assert_eq!(retire(&one_more).unwrap_err().code, "RESOURCE_LIMIT");
+    assert_eq!(store.consumption_pending().unwrap().len(), 1);
+    assert_eq!(
+        store.consumption_retired().unwrap().len(),
+        MAX_RETIRED_CONSUMPTION_CLAIMS
+    );
+}
+
 /// INVARIANT (issue 160): the zero-loss check after a write stall reads each claim's final
 /// state, not an inference. A claim's history (first seen, attempts, last attempt, last
 /// pending time and reason) is durable in its journal and follows it into completion and

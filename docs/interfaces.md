@@ -3106,7 +3106,20 @@ the private socket, `tcp-chap peer=ADDRESS` on a CHAP session. The claim leaves
 state `retired-unrecoverable`, and `ingest_get` reports its deletion as
 `retired_unrecoverable`. The daemon logs one line,
 `sparrowd: watch=W claim=ID retired-unrecoverable caller=… reason=… path=…`.
-A store keeps at most 64 retired claims, which are never removed.
+A store keeps at most 1024 retired claims, which are never removed
+(`MAX_RETIRED_CONSUMPTION_CLAIMS`). The retirement itself frees the claim's
+journal slot in the same write batch, so a stuck claim holds one of the 16
+slots only until an operator retires it. The bound exists because every status
+and watch listing reads all retired rows through one iterator and sends them on
+the wire. A row is at most 8 KiB stored, so the bound is 8 MiB of rows. On the
+wire a row is at most about 3.2 KiB (2048 path bytes, 512 caller, 512 reason and
+the claim ID), so 1024 rows are about 3.2 MiB against the 64 MiB message limit,
+and about 5.5 MiB as MCP JSON, where the path is hex. Reaching the bound takes
+1024 operator retirements. A retirement past it is refused with
+`RESOURCE_LIMIT` and leaves the claim pending; no retired row is dropped. The
+count of retired claims is the length of `retired_claims` in `status` and
+`watch list`. Folding the oldest rows into a summary, which would remove the
+refusal, needs a stored-format change and is not part of this bound.
 
 The default scan budget is 10,000 (maximum 100,000) records and pin collections;
 aggregate native catalog construction defaults to and is capped at 32 MiB.
