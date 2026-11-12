@@ -42,17 +42,10 @@ keep target/release/sparrowd "bin/sparrowd-schema$schema-$rev"
 keep target/release/sparrow "bin/sparrow-schema$schema-$rev"
 keep target/release/examples/recovery "bin/sparrow-recovery-schema$schema-$rev"
 
-# The registry crates exclude the lexicons, so they come from the PurRDF repository at the
-# `git_revision` registry/compatibility.toml pins (the revision of the locked release), archived
-# by tools/purrdf-lexicons.sh and never read from a working tree.
-read -r purrdf_repository purrdf_rev < <(python3 -I - <<'PY'
-import re
-text = open("registry/compatibility.toml").read()
-block = re.search(r'\[\[supplier\]\]\nname = "purrdf"\n(.*?)(?=\n\[\[|\Z)', text, re.S).group(1)
-print(re.search(r'repository = "([^"]+)"', block).group(1), re.search(r'git_revision = "([0-9a-f]{40})"', block).group(1))
-PY
-)
-# The registry names the repository relative to the canonical checkout, which a linked worktree
-# under .worktrees/ shares with the main one.
+# The registry crates exclude the lexicons, so tools/purrdf-lexicons.sh archives them from the PurRDF
+# repository at the revision that published the locked release (refusing when the registry, the lock
+# and the crate's .cargo_vcs_info.json disagree) into the canonical checkout's bin/, which a linked
+# worktree under .worktrees/ shares with the main one. They are never read from a working tree.
 canonical=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
-tools/purrdf-lexicons.sh "$canonical/$purrdf_repository" "$purrdf_rev" "bin/lexicons-$purrdf_rev"
+lexicons=$(tools/purrdf-lexicons.sh "$canonical")
+echo "install-bin: $lexicons"
