@@ -6,7 +6,7 @@
 use super::{
     Error, Store, Writer,
     eviction::{EvictionLimits, EvictionReport},
-    forced_compaction::Slot,
+    forced_compaction::{FamilySize, Slot},
     space::FloorStatus,
 };
 use rocksdb::FlushOptions;
@@ -97,6 +97,15 @@ pub struct PressureStatus {
     pub waiting_on: Option<String>,
     /// The free-space floor's pauses and refusals this session.
     pub floor: FloorStatus,
+    /// Wall time of the last finished forced compaction, in milliseconds; zero before one.
+    pub forced_compaction_ms: u64,
+    /// Table bytes of each family before and after that compaction; empty before one.
+    pub forced_compaction_families: Vec<FamilySize>,
+    /// Forced compactions that ended in a failure (a panic or a raised native error).
+    pub forced_failures: u64,
+    /// New RocksDB background errors this session's pressure passes saw. Each is reported
+    /// once as a failed pass and then counted here; none latches the worker.
+    pub native_errors: u64,
 }
 
 impl PressureStatus {
@@ -143,6 +152,9 @@ enum Step {
 pub(super) struct State {
     pub(super) status: PressureStatus,
     wait: Option<Wait>,
+    /// The cumulative native background-error count already reported; only a higher count
+    /// fails a pass (the same baseline as the table rewrite's).
+    background_errors: u64,
     /// The phase `phase_since` was stamped for.
     phase_seen: Option<PressurePhase>,
 }
@@ -156,8 +168,12 @@ impl super::writer_queue::Observe for State {
 
 impl State {
     pub(super) fn load(db: &rocksdb::DB) -> Result<Self, Error> {
+        let background_errors = super::forced_compaction::native_errors(db)?;
         let Some(bytes) = db.get_pinned(WAIT_KEY)? else {
-            return Ok(Self::default());
+            return Ok(Self {
+                background_errors,
+                ..Self::default()
+            });
         };
         if !matches!(
             super::writer_format::read(db)?.as_deref(),
@@ -201,6 +217,7 @@ impl State {
                 before: physical,
                 step: Step::Native,
             }),
+            background_errors,
             phase_seen: None,
         })
     }
@@ -358,6 +375,63 @@ impl Writer {
         })
     }
 
+    /// End the wait in memory and on disk: a marker left behind would restore it at the
+    /// next open although nothing is waiting. A pass that retires evidence stages a new one
+    /// with that batch; a crash between the two reopens above the allowance, which asks
+    /// for maintenance by itself.
+    ///
+    /// A commit that fails means the store cannot take even this small write; the error
+    /// says so plainly, and the caller leaves its baseline alone so the next pass reports
+    /// it again for as long as it lasts.
+    fn end_wait(&self, state: &mut State) -> Result<(), Error> {
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete(WAIT_KEY);
+        #[cfg(feature = "test-support")]
+        let refused = self.forced.wait_end_refused();
+        #[cfg(not(feature = "test-support"))]
+        let refused = false;
+        let committed = if refused {
+            Err(Error::new("STORAGE_FAILURE", "commit refused by a test"))
+        } else {
+            self.reclaiming(|| self.commit(batch))
+        };
+        committed.map_err(|error| {
+            Error::new(
+                error.code,
+                format!(
+                    "the store cannot take a write, so the pressure wait could not be ended; intake stays refused until it can: {error}"
+                ),
+            )
+        })?;
+        state.end_wait();
+        Ok(())
+    }
+
+    /// Take a finished forced compaction's measures into the status. One that failed
+    /// (a panic or a raised native error) is counted and reported, and ends the wait so the
+    /// pass retires more evidence instead of waiting on a compaction that freed nothing.
+    fn collect_forced(&self, state: &mut State) -> Result<Option<String>, Error> {
+        let Slot::Finished(outcome) = self.forced.poll() else {
+            return Ok(None);
+        };
+        state.status.forced_compaction_ms = outcome.elapsed_ms;
+        state.status.forced_compaction_families = outcome.families;
+        let failure = outcome
+            .failure
+            .map(|failure| format!("the forced compaction failed: {failure}"));
+        if failure.is_some() {
+            state.status.forced_failures = state.status.forced_failures.saturating_add(1);
+            state.status.failure.clone_from(&failure);
+        }
+        // Acknowledge first: a failed wait-ending commit below must not leave the outcome
+        // in the slot to be counted again by the next pass.
+        self.forced.acknowledge();
+        if failure.is_some() && state.wait.is_some() {
+            self.end_wait(state)?;
+        }
+        Ok(failure)
+    }
+
     fn maintain_pressure(&self, now: u64, limits: EvictionLimits) -> Result<PressureStatus, Error> {
         let physical = self.physical_bytes()?;
         let linked = self.linked_physical_bytes()?;
@@ -374,6 +448,7 @@ impl Writer {
             state.status.phase = PressurePhase::Requested;
         }
         state.stamp(now);
+        let forced_failure = self.collect_forced(&mut state)?;
         if physical.saturating_add(state.status.requested_bytes) <= limit {
             if state.wait.is_some() {
                 let mut batch = rocksdb::WriteBatch::default();
@@ -393,13 +468,34 @@ impl Writer {
         }
         state.status.pending_flushes = 0;
         state.status.pending_compactions = 0;
-        for family in super::FAMILIES {
-            if self.native_property(family, "rocksdb.background-errors")? != 0 {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "RocksDB reports background errors; restart the daemon to reopen and inspect storage before reclaiming evidence (the native count is cumulative since open and cannot be cleared in place)",
-                ));
+        // Only an error new since the last pass fails this one. The native count is
+        // cumulative since open and cannot be cleared in place, so an old error must never
+        // keep failing every pass: intake would stay refused with nothing working to end it.
+        // The failed wait ends here, so the next pass retires what the archive gate allows.
+        let errors = self.forced.native_errors(&self.db)?;
+        if errors > state.background_errors {
+            let new = errors - state.background_errors;
+            // The wait may already have ended with a failed forced compaction.
+            if state.wait.is_some() {
+                // The baseline moves only once the wait has ended, so a store that cannot
+                // take the write is reported again on every pass.
+                self.end_wait(&mut state)?;
             }
+            state.background_errors = errors;
+            state.status.native_errors = state.status.native_errors.saturating_add(new);
+            self.forced.acknowledge();
+            let forced = forced_failure
+                .map(|failure| format!("; {failure}"))
+                .unwrap_or_default();
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                format!(
+                    "RocksDB reported {new} new background errors ({} this session); the pressure wait ended and the next pass retires more evidence{forced}",
+                    state.status.native_errors
+                ),
+            ));
+        }
+        for family in super::FAMILIES {
             state.status.pending_flushes += self
                 .native_property(family, "rocksdb.mem-table-flush-pending")?
                 + self.native_property(family, "rocksdb.num-running-flushes")?;
@@ -437,7 +533,7 @@ impl Writer {
         if let Some(wait) = state.wait {
             if linked < wait.before {
                 self.forced.acknowledge();
-                state.end_wait();
+                self.end_wait(&mut state)?;
             } else {
                 // Linked bytes have not fallen and no native work is pending or running:
                 // nothing is working to end the wait, so force one compaction.
@@ -468,10 +564,7 @@ impl Writer {
                                 state.stalled("a forced compaction is running");
                                 return Ok(state.status.clone());
                             }
-                            Slot::Finished(Some(failure)) => {
-                                state.status.failure = Some(failure);
-                            }
-                            Slot::Finished(None) | Slot::Idle => {}
+                            Slot::Finished(_) | Slot::Idle => {}
                         }
                         self.forced.acknowledge();
                         state.wait = Some(Wait {
@@ -486,7 +579,7 @@ impl Writer {
                     Step::Measured => {
                         // The retirement is durable and a compaction left the footprint
                         // where it was, so waiting longer protects nothing: retire more.
-                        state.end_wait();
+                        self.end_wait(&mut state)?;
                         state.status.waits_released = state.status.waits_released.saturating_add(1);
                     }
                 }
@@ -514,7 +607,8 @@ impl Writer {
         let archive_lag = report.frontier == super::eviction::EvictionFrontier::ArchiveLag;
         let protected = report.protected;
         state.status.last_pass = Some(report);
-        state.status.failure = None;
+        // A forced compaction's failure stays visible for the pass that ended its wait.
+        state.status.failure = forced_failure;
         if changed {
             state.wait = Some(Wait {
                 before: linked,
@@ -554,6 +648,25 @@ impl Store {
         let mut status = self.unlocked.pressure.read();
         status.floor = self.space.status();
         Ok(status)
+    }
+
+    /// Dev-only: arm a fault for the next forced compaction.
+    #[cfg(feature = "test-support")]
+    pub fn arm_forced_compaction_fault(&self, fault: super::forced_compaction::Fault) {
+        self.unlocked.forced.arm(fault);
+    }
+
+    /// Dev-only: make the commit that ends a pressure wait fail, as a store that cannot
+    /// take a write would.
+    #[cfg(feature = "test-support")]
+    pub fn refuse_pressure_wait_end(&self, refused: bool) {
+        self.unlocked.forced.refuse_wait_end(refused);
+    }
+
+    /// Dev-only: count native background errors a real failing compaction would raise.
+    #[cfg(feature = "test-support")]
+    pub fn simulate_native_errors(&self, count: u64) {
+        self.unlocked.forced.simulate_native_errors(count);
     }
 
     /// Dev-only: leave a finished, unacknowledged forced compaction in the slot.

@@ -5943,6 +5943,145 @@ fn a_finished_slot_left_by_an_earlier_wait_does_not_stop_the_next_wait_forcing()
     );
 }
 
+/// A store with two records, one retired by a first pass, and linked bytes held up by a
+/// ballast file so the next pass forces a compaction.
+fn store_waiting_on_native_reclamation(
+    dir: &std::path::Path,
+    limits: sparrow_core::EvictionLimits,
+) -> Store {
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let store = Store::open(dir, settings).unwrap();
+    for (index, at) in [1_u64, 2].into_iter().enumerate() {
+        store
+            .ingest(&format!("stale-{index}"), "source", "log", b"x\n", at)
+            .unwrap();
+    }
+    let file = std::fs::File::create(dir.join("test-owned-pressure-ballast")).unwrap();
+    file.set_len(13 * 1024 * 1024).unwrap();
+    store.pressure_maintain(10, limits).unwrap();
+    file.set_len(14 * 1024 * 1024).unwrap();
+    store.await_native_quiet().unwrap();
+    store
+}
+
+// Value: #218: a forced compaction thread that panics must not wedge the wait. Protects:
+// the failure is counted and shown, the wait ends in that same pass, and that pass retires
+// the remaining evidence instead of waiting on a compaction that freed nothing.
+#[test]
+fn a_forced_compaction_that_panics_ends_its_wait_and_retires_more() {
+    use sparrow_core::{EvictionLimits, Fault};
+    let dir = tempfile::tempdir().unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let store = store_waiting_on_native_reclamation(dir.path(), limits);
+    store.arm_forced_compaction_fault(Fault::Panic);
+    assert_eq!(
+        store
+            .pressure_maintain(20, limits)
+            .unwrap()
+            .forced_compactions,
+        1
+    );
+    store.await_native_quiet().unwrap();
+    let after = store.pressure_maintain(30, limits).unwrap();
+    assert_eq!(after.forced_failures, 1);
+    assert!(after.failure.as_deref().unwrap().contains("panicked"));
+    assert_eq!((after.waits_released, after.passes), (0, 2));
+    assert_eq!(after.evicted_records, 2);
+}
+
+// Value: #218: a failed native compaction raises a RocksDB background error that is
+// cumulative since open; it used to fail every later pass until a restart while intake stayed
+// refused. Protects: the error fails exactly one pass, is counted, ends the wait on disk as
+// well as in memory (a reopen restores none), and the next pass retires more evidence.
+#[test]
+fn a_failed_native_compaction_fails_one_pass_and_never_latches() {
+    use sparrow_core::{EvictionLimits, Fault, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let store = store_waiting_on_native_reclamation(dir.path(), limits);
+    store.arm_forced_compaction_fault(Fault::NativeError);
+    store.pressure_maintain(20, limits).unwrap();
+    store.await_native_quiet().unwrap();
+    let error = store.pressure_maintain(30, limits).unwrap_err();
+    assert!(error.to_string().contains("new background errors"));
+    let failed = store.pressure_status().unwrap();
+    assert_eq!((failed.native_errors, failed.forced_failures), (1, 1));
+    assert_eq!(
+        (failed.phase, failed.wait_before_bytes),
+        (PressurePhase::Blocked, 0)
+    );
+    assert_eq!(failed.forced_compaction_families.len(), 3);
+    let next = store.pressure_maintain(40, limits).unwrap();
+    assert_eq!((next.passes, next.evicted_records), (2, 2));
+    assert_eq!(next.native_errors, 1);
+    assert_ne!(next.phase, PressurePhase::Blocked);
+}
+
+// Value: #218: the wait marker outlives an ended wait and restores a wait nobody holds
+// at the next open. Protects: ending a wait because of a failed compaction deletes the marker.
+#[test]
+fn an_ended_wait_leaves_no_marker_to_restore_at_open() {
+    use sparrow_core::{EvictionLimits, Fault, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let store = store_waiting_on_native_reclamation(dir.path(), limits);
+    store.arm_forced_compaction_fault(Fault::NativeError);
+    store.pressure_maintain(20, limits).unwrap();
+    store.await_native_quiet().unwrap();
+    store.pressure_maintain(30, limits).unwrap_err();
+    drop(store);
+    let mut settings = config();
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    let reopened = Store::open(dir.path(), settings).unwrap();
+    assert_eq!(
+        reopened.pressure_status().unwrap().phase,
+        PressurePhase::Ready
+    );
+}
+
+// Value: #218 ruling: a store too damaged to take even the small write that ends a wait
+// must say so plainly, and must keep saying it while it lasts. Protects: the failure names
+// the cause in plain words, is re-reported on the next pass (the error baseline does not
+// advance past an unreported error), and once the store takes the write the error fails one
+// pass and the worker proceeds.
+#[test]
+fn a_store_that_cannot_end_a_wait_says_so_and_keeps_saying_it() {
+    use sparrow_core::{EvictionLimits, Fault};
+    let dir = tempfile::tempdir().unwrap();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let store = store_waiting_on_native_reclamation(dir.path(), limits);
+    store.arm_forced_compaction_fault(Fault::NativeError);
+    store.pressure_maintain(20, limits).unwrap();
+    store.await_native_quiet().unwrap();
+    store.refuse_pressure_wait_end(true);
+    for at in [30, 40] {
+        let error = store.pressure_maintain(at, limits).unwrap_err();
+        assert!(error.to_string().contains("cannot take a write"), "{error}");
+        let status = store.pressure_status().unwrap();
+        assert!(status.failure.unwrap().contains("cannot take a write"));
+    }
+    store.refuse_pressure_wait_end(false);
+    let error = store.pressure_maintain(50, limits).unwrap_err();
+    assert!(error.to_string().contains("new background errors"));
+    assert_eq!(store.pressure_status().unwrap().native_errors, 1);
+    store.pressure_maintain(60, limits).unwrap();
+}
+
 #[test]
 fn invalid_pressure_recovery_markers_refuse_open() {
     for bytes in [
