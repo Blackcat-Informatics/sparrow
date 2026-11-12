@@ -3286,7 +3286,12 @@ or semantic engine. The public surface includes:
   lifecycle/context becomes typed relationships with source evidence.
 - Bounded batching/retry queues and visible delivery/drop counters. The default
   logging path is nonblocking and drops new events when full; it never silently
-  allocates an unlimited queue or stalls a production thread on network I/O.
+  allocates an unlimited queue or stalls a production thread on network I/O. A
+  briefly held queue lock makes admission wait, never drop. A permanent daemon
+  refusal of a batch (non-retryable `INVALID_ARGUMENT` or `RESOURCE_LIMIT`)
+  quarantines that batch: its events are counted, reported by the next flush as
+  dropped, and later events proceed. A busy (retryable) refusal retries the same
+  batch on the same connection; only a transport failure reconnects.
 - Explicit buffered/durable delivery selection for direct ingestion and
   `flush(durable)`/shutdown that returns the reached receipt watermark or a typed
   error. Durable flush cannot certify events already dropped before enqueue.
@@ -3460,7 +3465,7 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 
 | Code | Meaning |
 | --- | --- |
-| `INVALID_ARGUMENT` | Invalid IDs, ranges, scopes, durations, or names. |
+| `INVALID_ARGUMENT` | Invalid IDs, ranges, scopes, durations, or names. Also a producer instance the producer registry can never record (its stream-count or byte bound), which is not retryable. |
 | `NOT_FOUND` | Unknown or reclaimed evidence/handle. |
 | `EVIDENCE_UNAVAILABLE` | Known expired, evicted, or incomplete complete-file representation. |
 | `PIN_NOT_ACTIVE` | Expired/released collection cannot be renewed or used as an active scope. |

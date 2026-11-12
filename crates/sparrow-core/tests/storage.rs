@@ -3186,7 +3186,7 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
             )
             .unwrap_err()
             .code,
-        "RESOURCE_LIMIT"
+        "INVALID_ARGUMENT"
     );
     assert_eq!(
         store.status(2).unwrap()["live_records"].as_str(),

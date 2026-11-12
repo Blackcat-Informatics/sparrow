@@ -1439,7 +1439,7 @@ async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_re
             );
             let delivery = sparrow_client::Delivery::start(settings).unwrap();
             assert_eq!(
-                admit(&delivery, delivery_event("queued before TCP listener")).await,
+                admit(&delivery, delivery_event("queued before TCP listener")),
                 1
             );
             assert!(matches!(
@@ -1460,7 +1460,7 @@ async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_re
             drop(client);
             drop(daemon);
             assert_eq!(
-                admit(&delivery, delivery_event("queued during TCP outage")).await,
+                admit(&delivery, delivery_event("queued during TCP outage")),
                 2
             );
             assert!(matches!(
@@ -7580,23 +7580,10 @@ fn delivery_event(text: &str) -> sparrow_client::ProducerEvent {
     }
 }
 
-async fn admit(delivery: &sparrow_client::Delivery, event: sparrow_client::ProducerEvent) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match delivery.try_send(event.clone()) {
-            sparrow_client::Admission::Queued { sequence } => return sequence,
-            sparrow_client::Admission::Dropped {
-                reason: sparrow_client::DropReason::Contended,
-                ..
-            } => {
-                assert!(
-                    Instant::now() < deadline,
-                    "producer admission remained contended"
-                );
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            admission => panic!("unexpected admission: {admission:?}"),
-        }
+fn admit(delivery: &sparrow_client::Delivery, event: sparrow_client::ProducerEvent) -> u64 {
+    match delivery.try_send(event) {
+        sparrow_client::Admission::Queued { sequence } => sequence,
+        admission => panic!("unexpected admission: {admission:?}"),
     }
 }
 
@@ -7640,6 +7627,11 @@ struct EventRelayState {
     drop_first: std::cell::Cell<bool>,
     corrupt_receipt: std::cell::Cell<bool>,
     corrupt_publication: std::cell::Cell<bool>,
+    /// Daemon-style refusals `(code, retryable)` answered, in order, to the next event batches
+    /// instead of forwarding them.
+    refusals: std::cell::RefCell<std::collections::VecDeque<(&'static str, bool)>>,
+    /// Connections accepted by the relay.
+    connections: std::cell::Cell<u32>,
     mutate_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     mutate_published_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     first_accepted: tokio::sync::Notify,
@@ -7719,6 +7711,13 @@ impl wire::sparrow::Server for EventRelay {
             "retry fixture exceeded its request bound"
         );
         self.0.calls.borrow_mut().push(input.clone());
+        if let Some((code, retryable)) = self.0.refusals.borrow_mut().pop_front() {
+            let mut failure = results.get().init_result().init_error();
+            failure.set_code(code);
+            failure.set_message("injected refusal");
+            failure.set_retryable(retryable);
+            return Ok(());
+        }
         let backend = self.0.backend.borrow().clone();
         let mut request = backend.events_ingest_request();
         input
@@ -7924,14 +7923,20 @@ fn relay(
         drop_first: std::cell::Cell::new(true),
         corrupt_receipt: std::cell::Cell::new(false),
         corrupt_publication: std::cell::Cell::new(false),
+        refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        connections: std::cell::Cell::new(0),
         mutate_file: std::cell::RefCell::new(None),
         mutate_published_file: std::cell::RefCell::new(None),
         first_accepted: tokio::sync::Notify::new(),
     });
     let capability: wire::sparrow::Client = capnp_rpc::new_client(EventRelay(state.clone()));
+    let state_for_task = state.clone();
     let task = tokio::task::spawn_local(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            state_for_task
+                .connections
+                .set(state_for_task.connections.get() + 1);
             tokio::task::spawn_local(sparrow_server::serve_connection(stream, capability.clone()));
         }
     });
@@ -8159,7 +8164,7 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
                 retry_max,
             ))
             .unwrap();
-            admit(&delivery, delivery_event("must retain unknown body")).await;
+            admit(&delivery, delivery_event("must retain unknown body"));
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 if delivery.stats().unwrap().terminal_failure.is_some() {
@@ -8435,7 +8440,7 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
                 Duration::from_millis(20),
             );
             let delivery = sparrow_client::Delivery::start(config).unwrap();
-            let sequence = admit(&delivery, delivery_event("lost reply recovery")).await;
+            let sequence = admit(&delivery, delivery_event("lost reply recovery"));
             let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
             let watermark = reached_delivery(result);
             assert_eq!(watermark.required_sequence, sequence);
@@ -8477,7 +8482,7 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
                 Duration::from_secs(30),
             );
             let timed = sparrow_client::Delivery::start(timed_config).unwrap();
-            admit(&timed, delivery_event("lost reply recovery")).await;
+            admit(&timed, delivery_event("lost reply recovery"));
             let deadline = Instant::now() + Duration::from_secs(3);
             while timed.stats().unwrap().durable_events != 1 {
                 assert!(
@@ -8496,6 +8501,115 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
             proxy.abort();
             assert!(proxy.await.unwrap_err().is_cancelled());
             drop(timed);
+            drop(delivery);
+            drop(backend);
+            drop(daemon);
+        })
+        .await;
+}
+
+/// INVARIANT: a daemon answer is not a broken connection. A busy refusal (retryable
+/// `RESOURCE_LIMIT`) keeps retrying the same pending batch, and every retry reuses the one
+/// healthy connection: before, each retry reconnected and so spent a slot of the daemon's
+/// connection ceiling. The batch is delivered once the refusals stop and nothing is quarantined.
+#[tokio::test(flavor = "current_thread")]
+async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let daemon = start(&config, &socket).await;
+            let backend = connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("relay.sock");
+            let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+            state.drop_first.set(false);
+            state
+                .refusals
+                .borrow_mut()
+                .extend([("RESOURCE_LIMIT", true); 3]);
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "busy-retry");
+            config.batch_events = 1;
+            let config = config.with_test_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            );
+            let delivery = sparrow_client::Delivery::start(config).unwrap();
+            admit(&delivery, delivery_event("busy then accepted"));
+            let watermark =
+                reached_delivery(delivery_barrier(&delivery, true, Duration::from_secs(5)).await);
+            assert_eq!(watermark.durable_events, 1);
+            let stats = delivery.stats().unwrap();
+            assert_eq!(stats.retries, 3);
+            assert_eq!(stats.quarantined_events, 0);
+            assert_eq!(state.calls.borrow().len(), 4);
+            assert_eq!(
+                state.connections.get(),
+                1,
+                "a daemon answer must not force a reconnect"
+            );
+            proxy.abort();
+            assert!(proxy.await.unwrap_err().is_cancelled());
+            drop(delivery);
+            drop(backend);
+            drop(daemon);
+        })
+        .await;
+}
+
+/// INVARIANT: a permanent refusal (non-retryable `INVALID_ARGUMENT`, which is how the daemon
+/// reports that a producer instance can never be recorded) quarantines that batch: it is
+/// counted, reported at the fence as a drop, and not retried; the next event is delivered
+/// instead of queueing forever behind it. Before, the refused batch stayed the immutable
+/// pending batch and blocked every later event until the queue filled.
+#[tokio::test(flavor = "current_thread")]
+async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_later_events() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let daemon = start(&config, &socket).await;
+            let backend = connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("relay.sock");
+            let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+            state.drop_first.set(false);
+            state.refusals.borrow_mut().push_back(("INVALID_ARGUMENT", false));
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine");
+            config.batch_events = 1;
+            let config = config.with_test_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            );
+            let delivery = sparrow_client::Delivery::start(config).unwrap();
+            let refused = admit(&delivery, delivery_event("permanently refused"));
+            let kept = admit(&delivery, delivery_event("delivered after the refusal"));
+            let watermark = match delivery_barrier(&delivery, true, Duration::from_secs(5)).await {
+                Err(sparrow_client::FlushError::Dropped(value)) => *value,
+                result => panic!("a quarantined event must be reported at the fence: {result:?}"),
+            };
+            assert_eq!((refused, kept), (1, 2));
+            assert_eq!(watermark.dropped_before_fence, 1);
+            assert_eq!(watermark.durable_events, 1);
+            assert_eq!(watermark.durable_sequence, kept);
+            let stats = delivery.stats().unwrap();
+            assert_eq!(stats.quarantined_events, 1);
+            assert_eq!(stats.retries, 0, "a permanent refusal is not retried");
+            assert!(stats.terminal_failure.is_none());
+            assert_eq!((stats.pending_events, stats.pending_bytes), (0, 0));
+            assert!(matches!(
+                stats.last_quarantine.as_deref(),
+                Some(sparrow_client::Error::Domain { code, retryable: false, .. }) if code == "INVALID_ARGUMENT"
+            ));
+            assert_eq!(state.calls.borrow().len(), 2);
+            let response = backend.client.status_request().send().promise.await.unwrap();
+            assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 1);
+            proxy.abort();
+            assert!(proxy.await.unwrap_err().is_cancelled());
             drop(delivery);
             drop(backend);
             drop(daemon);
@@ -8522,8 +8636,8 @@ async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recover
                 Duration::from_millis(25),
             );
             let delivery = sparrow_client::Delivery::start(delivery_config).unwrap();
-            admit(&delivery, delivery_event("before service start one")).await;
-            admit(&delivery, delivery_event("before service start two")).await;
+            admit(&delivery, delivery_event("before service start one"));
+            admit(&delivery, delivery_event("before service start two"));
             assert!(matches!(
                 delivery.try_send(delivery_event("overflow")),
                 sparrow_client::Admission::Dropped { .. }
@@ -8599,7 +8713,7 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
         // Production refuses sub-second intervals; this test needs fast retries.
         let config = config.with_test_timing(Duration::from_secs(2), Duration::from_millis(100), Duration::from_millis(100));
         let delivery = sparrow_client::Delivery::start(config).unwrap();
-        admit(&delivery, delivery_event("unknown accepted delivery")).await;
+        admit(&delivery, delivery_event("unknown accepted delivery"));
         tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified()).await.unwrap();
         *state.backend.borrow_mut() = second_backend.client.clone();
         let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
