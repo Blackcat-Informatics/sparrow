@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 93f01cd99b18bc9492a5d10f9601479670031aa2
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 210
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/210
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 6d220631af7dd47c8accf0b2638b116a2399cbef
+GhpRsq-Head-Ref: paudley/209-make-the-two-load-sensitive-storage
+GhpRsq-Head-OID: 93f01cd99b18bc9492a5d10f9601479670031aa2
+GhpRsq-Result-Tree: 1a2e15623422635d5534047dc1fd19bdb78bd3bc
+GhpRsq-Result-Commit: edd9cb95a08563e9594842edb5fff10e08928291
+GhpRsq-Parent-Hashes: 93f01cd99b18bc9492a5d10f9601479670031aa2
+GhpRsq-Squash-Notes-SHA256: ddb52f4652e7cb0eae5b632e7d3b5ff7a05f016a4b8262b09befc0524e2f00d0
+GhpRsq-Stage-Evidence: none
