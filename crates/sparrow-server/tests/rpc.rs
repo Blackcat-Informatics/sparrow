@@ -1428,7 +1428,8 @@ async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_re
             let config = write_server_config(dir.path(), &data, &socket);
             let (address, reservation) = configure_tcp_listener(&config);
             drop(reservation);
-            let mut settings = sparrow_client::DeliveryConfig::tcp(address, "tcp-logging");
+            let mut settings = sparrow_client::DeliveryConfig::tcp(address, "tcp-logging")
+                .with_quarantine_dir(dir.path().join("quarantine"));
             settings.batch_events = 1;
             settings.rpc_timeout = Duration::from_millis(100);
             // Production refuses sub-second intervals; this outage test needs fast retries.
@@ -8161,7 +8162,8 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
             *state.mutate_published_file.borrow_mut() = None;
             state.corrupt_receipt.set(true);
             // Production refuses a sub-second flush interval; this test needs a prompt batch.
-            let fast = sparrow_client::DeliveryConfig::new(proxy_socket, "pending-receipt");
+            let fast = sparrow_client::DeliveryConfig::new(proxy_socket, "pending-receipt")
+                .with_quarantine_dir(dir.path().join("quarantine"));
             let (retry, retry_max) = (fast.retry_interval, fast.retry_max_interval);
             let delivery = sparrow_client::Delivery::start(fast.with_test_timing(
                 Duration::from_millis(10),
@@ -8290,7 +8292,8 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
             let proxy_socket = dir.path().join("relay.sock");
             let (state, proxy) = relay(&proxy_socket, backend.client.clone());
             state.drop_first.set(false);
-            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "tracing-layer");
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "tracing-layer")
+                .with_quarantine_dir(dir.path().join("quarantine"));
             config.flush_interval = Duration::from_secs(60);
             let delivery = sparrow_client::Delivery::start(config).unwrap();
             let subscriber = tracing_subscriber::registry()
@@ -8435,7 +8438,8 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
             let proxy_socket = dir.path().join("relay.sock");
             let (state, proxy) = relay(&proxy_socket, backend.client.clone());
             let mut config =
-                sparrow_client::DeliveryConfig::new(&proxy_socket, "delivery-lost-reply");
+                sparrow_client::DeliveryConfig::new(&proxy_socket, "delivery-lost-reply")
+                    .with_quarantine_dir(dir.path().join("quarantine"));
             config.batch_events = 1;
             config.rpc_timeout = Duration::from_millis(150);
             // Production refuses sub-second intervals; this recovery test needs fast retries.
@@ -8478,7 +8482,8 @@ async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
                 rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
                 1
             );
-            let timed_config = sparrow_client::DeliveryConfig::new(&socket, "delivery-lost-reply");
+            let timed_config = sparrow_client::DeliveryConfig::new(&socket, "delivery-lost-reply")
+                .with_quarantine_dir(dir.path().join("quarantine"));
             assert_eq!(timed_config.flush_interval, Duration::from_secs(2));
             // Production refuses a sub-second flush interval; this test needs prompt batching.
             let timed_config = timed_config.with_test_timing(
@@ -8534,7 +8539,8 @@ async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
                 .refusals
                 .borrow_mut()
                 .extend([("RESOURCE_LIMIT", true); 3]);
-            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "busy-retry");
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "busy-retry")
+                .with_quarantine_dir(dir.path().join("quarantine"));
             config.batch_events = 1;
             let config = config.with_test_timing(
                 Duration::from_secs(2),
@@ -8571,6 +8577,13 @@ async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
 /// its bytes were gone; this test fails on that behaviour because no quarantine file exists.
 #[tokio::test(flavor = "current_thread")]
 async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_later_events() {
+    // CONFLICT (overlapping producer sequences, a differing source time mapping) used to end
+    // delivery as a terminal failure and drop every later event; it is quarantined as well.
+    quarantine_permanent_refusal("INVALID_ARGUMENT").await;
+    quarantine_permanent_refusal("CONFLICT").await;
+}
+
+async fn quarantine_permanent_refusal(code: &'static str) {
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
@@ -8582,10 +8595,9 @@ async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_late
             let proxy_socket = dir.path().join("relay.sock");
             let (state, proxy) = relay(&proxy_socket, backend.client.clone());
             state.drop_first.set(false);
-            state.refusals.borrow_mut().push_back(("INVALID_ARGUMENT", false));
-            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine");
+            state.refusals.borrow_mut().push_back((code, false));
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine").with_quarantine_dir(dir.path().join("quarantine"));
             config.batch_events = 1;
-            config.quarantine_dir = dir.path().join("quarantine");
             let config = config.with_test_timing(
                 Duration::from_secs(2),
                 Duration::from_millis(20),
@@ -8609,7 +8621,7 @@ async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_late
             assert_eq!((stats.pending_events, stats.pending_bytes), (0, 0));
             assert!(matches!(
                 stats.last_quarantine.as_deref(),
-                Some(sparrow_client::Error::Domain { code, retryable: false, .. }) if code == "INVALID_ARGUMENT"
+                Some(sparrow_client::Error::Domain { code: refused, retryable: false, .. }) if refused == code
             ));
             assert_eq!(state.calls.borrow().len(), 2);
             assert_eq!(stats.quarantine_files, 1);
@@ -8619,7 +8631,7 @@ async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_late
             assert!(file.starts_with(dir.path().join("quarantine")));
             let kept_text = std::fs::read_to_string(&file).unwrap();
             let header = kept_text.lines().next().unwrap();
-            assert!(header.contains("\"reason_code\":\"INVALID_ARGUMENT\""), "{header}");
+            assert!(header.contains(&format!("\"reason_code\":\"{code}\"")), "{header}");
             assert!(header.contains("\"events\":1"), "{header}");
             assert!(kept_text.contains("permanently refused"), "{kept_text}");
             let response = backend.client.status_request().send().promise.await.unwrap();
@@ -8657,7 +8669,8 @@ async fn producer_delivery_keeps_a_refused_batch_when_the_quarantine_cannot_be_w
             // A regular file where the directory should be makes every quarantine write fail.
             let blocked = dir.path().join("blocked");
             std::fs::write(&blocked, b"not a directory").unwrap();
-            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine-held");
+            let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine-held")
+                .with_quarantine_dir(dir.path().join("quarantine"));
             config.batch_events = 1;
             config.quarantine_dir = blocked.join("quarantine");
             let config = config.with_test_timing(
@@ -8694,7 +8707,8 @@ async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recover
             let socket = store_path.join("rpc.sock");
             let config = write_server_config(dir.path(), &store_path, &socket);
             let mut delivery_config =
-                sparrow_client::DeliveryConfig::new(&socket, "delivery-outage");
+                sparrow_client::DeliveryConfig::new(&socket, "delivery-outage")
+                    .with_quarantine_dir(dir.path().join("quarantine"));
             delivery_config.max_queued_events = 2;
             delivery_config.batch_events = 1;
             // Production refuses sub-second intervals; this outage test needs fast retries.
@@ -8776,13 +8790,13 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
         let first_backend = connect(&first_socket).await.unwrap(); let second_backend = connect(&second_socket).await.unwrap();
         let proxy_socket = dir.path().join("relay.sock");
         let (state, proxy) = relay(&proxy_socket, first_backend.client.clone());
-        let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery");
+        let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery").with_quarantine_dir(dir.path().join("quarantine"));
         config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150);
-        config.quarantine_dir = dir.path().join("quarantine");
         // Production refuses sub-second intervals; this test needs fast retries.
         let config = config.with_test_timing(Duration::from_secs(2), Duration::from_millis(100), Duration::from_millis(100));
         let delivery = sparrow_client::Delivery::start(config).unwrap();
         admit(&delivery, delivery_event("unknown accepted delivery"));
+        admit(&delivery, delivery_event("queued behind the pending batch"));
         tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified()).await.unwrap();
         *state.backend.borrow_mut() = second_backend.client.clone();
         let result = delivery_barrier(&delivery, true, Duration::from_secs(5)).await;
@@ -8793,9 +8807,13 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
         // INVARIANT (#216): a terminal failure ends delivery, but the held batch is first kept
         // in a quarantine file; before, only the in-memory pending batch remained.
         let stats = delivery.stats().unwrap();
-        assert_eq!(stats.quarantine_files, 1);
-        let saved = std::fs::read_to_string(stats.last_quarantine_file.unwrap()).unwrap();
+        assert_eq!(stats.quarantine_files, 2);
+        let mut saved = String::new();
+        for entry in std::fs::read_dir(&stats.quarantine_dir).unwrap() {
+            saved += &std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        }
         assert!(saved.contains("STORE_MISMATCH") && saved.contains("unknown accepted delivery"), "{saved}");
+        assert!(saved.contains("queued behind the pending batch"), "{saved}");
         let response = second_backend.client.status_request().send().promise.await.unwrap();
         assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 0);
         let original = state.accepted.borrow().clone().unwrap();

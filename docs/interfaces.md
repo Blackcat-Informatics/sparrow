@@ -3376,9 +3376,11 @@ or semantic engine. The public surface includes:
   next flush as not delivered (`FlushError::Dropped`, whose `quarantined_before_fence` counts
   those kept in files), and later events proceed. Status exposes `quarantine_dir`,
   `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The client never
-  deletes or rewrites a quarantine file; its size is bounded only by the disk. If the file
+  deletes or rewrites a quarantine file; its size is bounded only by the disk (a source whose
+  time mapping conflicts refuses every later batch, so each becomes one file until the operator
+  fixes the source). If the file
   cannot be written, the batch stays pending, the failure is counted and reported as the
-  transient failure, and the write is retried, so nothing is dropped. Any other non-retryable
+  transient failure, and the write is retried, so that batch is not dropped; later events wait behind it and are refused as `Full` once the queue is full. Any other non-retryable
   refusal (a replaced store, a read-only daemon) ends delivery as a terminal failure, and the
   pending batch and queued events are first written to quarantine files. The daemon storing a
   refused batch as a malformed record with its reason is the preferred form and is not yet

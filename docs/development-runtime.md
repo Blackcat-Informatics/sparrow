@@ -5093,7 +5093,10 @@ closed, failed and counter-exhausted admission each have visible drop counters.
 A batch the daemon permanently refuses (a non-retryable `INVALID_ARGUMENT` or
 `CONFLICT`) is written to a quarantine file with its reason and count, then counted,
 reported as not delivered at the next flush, and later events proceed. The client never
-deletes the file; if it cannot be written the batch stays pending. A full-queue refusal can leave an explicit sequence gap;
+deletes the file; if it cannot be written the batch stays pending. A source whose time
+mapping conflicts refuses every later batch, so each becomes one file (about one per
+flush interval per client) until the operator fixes the source; the disk is the only bound.
+A full-queue refusal can leave an explicit sequence gap;
 refusals before sequence assignment remain visible through counters. Event
 admission also charges unused string/vector capacity, preventing a tiny value
 from retaining an oversized allocation. Caller-owned inputs must already be

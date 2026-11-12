@@ -11,12 +11,14 @@ use crate::EventBatch;
 use purrdf_lex::json::{self, Object};
 use std::{
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
-/// Directory used when the configuration names none: the user's state directory, else the
-/// system temporary directory.
+/// Directory used when the configuration names none: `sparrow-client/quarantine` under an
+/// absolute `XDG_STATE_HOME`, else under `$HOME/.local/state`. Empty when neither is usable:
+/// configuration validation then fails with an actionable error. There is no volatile fallback,
+/// because this directory holds the only copy of a refused log.
 pub(crate) fn default_dir() -> PathBuf {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -26,25 +28,28 @@ pub(crate) fn default_dir() -> PathBuf {
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .map(|home| home.join(".local/state"))
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    state.join("sparrow-client").join("quarantine")
+        });
+    state.map_or_else(PathBuf::new, |state| {
+        state.join("sparrow-client").join("quarantine")
+    })
 }
 
-/// Durably write one batch with its reason; returns the file path. The file appears only
-/// complete (written and synced under a scratch name, then linked), and a batch identity that
-/// was already written is not written twice. Any failure is returned: the caller must keep the
-/// batch.
+/// Durably write one batch with its reason; returns the file path and whether this call
+/// created it. The file appears only complete (written and synced under a scratch name, then
+/// linked). A name already taken by this batch's own bytes is reused, so saving one identity
+/// twice writes once; a name taken by different bytes (identities that sanitize to one name)
+/// gets a numeric suffix, so one batch is never reported saved on the strength of another's
+/// file. Any failure is returned: the caller must keep the batch.
 pub(crate) fn save(
     dir: &Path,
     batch: &EventBatch,
     code: &str,
     reason: &str,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<(PathBuf, bool)> {
     let (Some(first), Some(last)) = (batch.events.first(), batch.events.last()) else {
         return Err(std::io::Error::other("quarantine of an empty batch"));
     };
-    std::fs::create_dir_all(dir)?;
+    create_dir(dir)?;
     let payload = batch.quarantine_bytes();
     let header = Object::new()
         .with("profile", "sparrow.client.quarantine/1")
@@ -71,7 +76,6 @@ pub(crate) fn save(
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let path = dir.join(format!("{name}.quarantine.jsonl"));
     let scratch = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -81,16 +85,48 @@ pub(crate) fn save(
         .open(&scratch)?;
     let written = file.write_all(&bytes).and_then(|()| file.sync_all());
     drop(file);
-    let linked = written.and_then(|()| match std::fs::hard_link(&scratch, &path) {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        other => other,
+    let linked = written.and_then(|()| {
+        for attempt in 0_u64.. {
+            let path = if attempt == 0 {
+                dir.join(format!("{name}.quarantine.jsonl"))
+            } else {
+                dir.join(format!("{name}-{attempt}.quarantine.jsonl"))
+            };
+            match std::fs::hard_link(&scratch, &path) {
+                Ok(()) => return Ok((path, true)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::fs::read(&path)?.ends_with(&payload) {
+                        return Ok((path, false));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the attempt counter is unbounded")
     });
     // The scratch name is this function's own temporary; the quarantine file is never removed.
     let cleaned = std::fs::remove_file(&scratch);
-    linked?;
+    let saved = linked?;
     cleaned?;
     std::fs::File::open(dir)?.sync_all()?;
-    Ok(path)
+    Ok(saved)
+}
+
+/// Create the directory with mode 0700 and make every directory entry this call created
+/// durable, so a crash after the first save cannot lose the directory that holds it.
+fn create_dir(dir: &Path) -> std::io::Result<()> {
+    let created: Vec<&Path> = dir.ancestors().take_while(|path| !path.exists()).collect();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    for path in &created {
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    if let Some(parent) = created.last().and_then(|path| path.parent()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -128,7 +164,8 @@ mod tests {
     fn file_holds_reason_count_and_every_event_line() {
         let dir = tempfile::tempdir().unwrap();
         let batch = batch("events:abc:1", &[3, 4]);
-        let path = save(dir.path(), &batch, "INVALID_ARGUMENT", "too odd").unwrap();
+        let (path, created) = save(dir.path(), &batch, "INVALID_ARGUMENT", "too odd").unwrap();
+        assert!(created);
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines();
         let header = lines.next().unwrap();
@@ -156,9 +193,9 @@ mod tests {
     fn saving_the_same_batch_again_keeps_the_first_file_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let batch = batch("events:abc:2", &[1]);
-        let first = save(dir.path(), &batch, "CONFLICT", "first").unwrap();
-        let second = save(dir.path(), &batch, "CONFLICT", "second").unwrap();
-        assert_eq!(first, second);
+        let (first, made) = save(dir.path(), &batch, "CONFLICT", "first").unwrap();
+        let (second, again) = save(dir.path(), &batch, "CONFLICT", "second").unwrap();
+        assert_eq!((first.clone(), made, again), (second, true, false));
         assert!(std::fs::read_to_string(&first).unwrap().contains("first"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
@@ -171,5 +208,29 @@ mod tests {
         let blocker = dir.path().join("file");
         std::fs::write(&blocker, b"x").unwrap();
         assert!(save(&blocker, &batch("events:abc:3", &[1]), "CONFLICT", "r").is_err());
+    }
+
+    /// INVARIANT: two different batches whose identities sanitize to one file name each get
+    /// their own file; the second is never reported saved on the strength of the first's file.
+    #[test]
+    fn a_name_collision_with_different_bytes_gets_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (one, _) = save(dir.path(), &batch("events:abc:4", &[1]), "CONFLICT", "r").unwrap();
+        let (two, made) = save(dir.path(), &batch("events-abc-4", &[2]), "CONFLICT", "r").unwrap();
+        assert!(made && one != two);
+        assert!(std::fs::read_to_string(&two).unwrap().contains("event 2"));
+        assert!(std::fs::read_to_string(&one).unwrap().contains("event 1"));
+    }
+
+    /// INVARIANT: the quarantine directory is private (0700), created with its missing
+    /// ancestors.
+    #[test]
+    fn directory_is_created_private_with_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("a/b");
+        save(&leaf, &batch("events:abc:5", &[1]), "CONFLICT", "r").unwrap();
+        let mode = std::fs::metadata(&leaf).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 }
