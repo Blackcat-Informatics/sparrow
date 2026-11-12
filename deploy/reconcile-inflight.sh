@@ -45,7 +45,9 @@ missing   Run once the restored daemon serves with its watches. The worklist is 
           Any other pending claim, including one with no reason yet, is left alone and
           reported, and the run then exits 4: it is not done, whatever else was reshipped.
           An image older than schema 71 cannot list claims, so each watch's durable
-          pending_claims count must be covered by claims this run reshipped and retired.
+          pending_claims count must be covered by claims this run reshipped and retired,
+          and the claim its failure text names is acted on only when RESTORED's ingest-get
+          holds it as pending.
 
 --private-intake DIR
                   reconcile the private roots a `sparrowd --private-intake DIR` daemon consumes:
@@ -57,8 +59,9 @@ Exit 0 when done (no watch holds a pending claim this run did not act on, so
 "missing reshipped=0" with exit 0 means nothing was owed), 1 on a refusal or failure, 2 on a
 usage error, 3 when the bytes were re-shipped but the restored image has no "watch
 retire-claim" (schema 69 and older) and no other pending claim is unreconciled: the claim
-stays pending until a schema 70 image retires it, 4 when a watch still holds a pending claim, with or without a pending reason, that this
-run did not reconcile (inspect "watch claims"; a claim just attempted needs a rerun).
+stays pending until a schema 70 image retires it, 4 when a watch still holds a pending claim,
+with or without a pending reason, that this run did not reconcile (inspect "watch claims";
+a claim just attempted needs a rerun).
 USAGE
 }
 
@@ -170,6 +173,9 @@ watch_usage=$("$RESTORED_CLI" "$RESTORED_SOCKET" watch 2>&1 >/dev/null || true)
 retire=0
 [[ $watch_usage == *"watch retire-claim"* ]] && retire=1
 reshipped=0 unretired=0 unacted=0 legacy=0
+# Per watch: claims this run reshipped. On an image older than schema 71 a claim is acted on
+# only after the restored store's own ingest-get reports it pending (reserved or claimed), so
+# the count never rests on the volatile failure text that named it.
 declare -A acted=()
 # One "KIND<TAB>WATCH<TAB>CLAIM<TAB>DETAIL" line per claim to act on (KIND "missing") or to
 # report ("other"). The durable pending-claim state is the source; only an image without
@@ -209,6 +215,17 @@ for row in "${worklist[@]}"; do
         continue
     fi
     [[ -n ${roots[$watch]+set} ]] || die "$claim names watch $watch, which the restored status does not list"
+    if ((legacy)); then
+        # The failure text is volatile and may name a claim that is no longer pending. Only the
+        # restored store's durable record of the claim says whether it is: a claim it does not
+        # hold as reserved or claimed is not reshipped and is not counted as acted on.
+        restored_claim=$(ingest_get "$RESTORED_CLI" "$RESTORED_SOCKET" "$claim")
+        state=$([[ -z $restored_claim ]] || json_field deletion <<<"$restored_claim")
+        if [[ $state != reserved && $state != claimed ]]; then
+            note "$watch/$claim is named by the watch failure but the restored store does not hold it as pending (${state:-unknown}): not acted on" >&2
+            continue
+        fi
+    fi
     root=$(watch_root "${roots[$watch]}")
     newer=$(ingest_get "$NEWER_CLI" "$NEWER_SOCKET" "$claim")
     [[ -n $newer ]] || die "the newer store does not know $claim; its bytes must be restored from the producer before it is retired"

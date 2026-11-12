@@ -590,10 +590,10 @@ journal a claim whose private source is missing. A claim whose private source is
 missing never completes: status shows it in `pending_claims`, and `sparrow
 SOCKET watch claims` lists it as pending with the reason "unpublished claimed
 source is missing", durably across restarts (schema 71 and newer). The watch
-failure text names it too, but another claim's retry can replace that text. Once its bytes are confirmed
-lost, retire it with `sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID
-REASON` (schema 70 and newer; interfaces, "Retiring an unrecoverable claim").
-It leaves `pending_claims` and stays listed as `retired-unrecoverable`. If its
+failure text names it too, but another claim's retry can replace that text.
+Once its bytes are confirmed lost, retire it with `sparrow SOCKET watch
+retire-claim WATCH_ID CLAIM_ID REASON` (schema 70 and newer; interfaces,
+"Retiring an unrecoverable claim"). It leaves `pending_claims` and stays listed as `retired-unrecoverable`. If its
 staged import had begun, the next reclaim pass frees that import's staged chunks
 and slot. The watch failure clears only if that claim caused it. A claim whose
 private source still exists or whose publication is recorded is refused;
@@ -1040,9 +1040,11 @@ what each claim was. Never delete an entry or a claim's bytes:
    no watch held a pending claim this run left alone, so `reshipped=0` then
    means nothing was owed. An image older than schema 71 has no `watch
    claims`; the script then compares each watch's `pending_claims` with the
-   claims it reshipped and retired, and exits 4 for any excess. An image
-   without `watch retire-claim` makes it exit 3 after re-shipping, when no other
-   pending claim is unreconciled (else 4): the claim
+   claims it reshipped and retired, and exits 4 for any excess. The claim a
+   watch's volatile failure text names may no longer be pending, so it is
+   acted on only when the restored store's `ingest-get` reports it reserved
+   or claimed. An image without `watch retire-claim` makes it exit 3 after
+   re-shipping, when no other pending claim is unreconciled (else 4): the claim
    stays pending until a schema 70 image retires it.
 6. Stop the newer query-only daemon and start `sparrow-ship.timer`. Start
    `sparrow-backup.timer` only after a first online backup of the restored store

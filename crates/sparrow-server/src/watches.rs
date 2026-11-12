@@ -281,7 +281,7 @@ impl WatchRegistry {
                     completed: detector.completed,
                     reconciliations: detector.reconciliations,
                     coverage_losses: detector.coverage_losses,
-                    failure: detector.failure.clone(),
+                    failure: detector.status_failure(),
                     tail_generation_ids,
                     tail_read_bytes,
                     tail_descriptors,
@@ -362,23 +362,60 @@ struct Detector {
     completed: u64,
     reconciliations: u64,
     coverage_losses: u64,
+    /// The latest failure that names no claim (discovery, reservation, drain, tail attach).
+    /// Any claim's success clears it (`record_claim_success`).
     failure: Option<String>,
-    /// The claim whose recovery set `failure`, if a claim's recovery did; any other
-    /// failure leaves it `None`. A claim's own success or retirement clears its failure
-    /// (`clear_failure_of`) and another claim's success leaves it in place; a failure that
-    /// names no claim clears on any claim's success (`record_claim_success`).
-    failed_claim: Option<String>,
+    /// The latest failure a claim's own recovery set, kept beside `failure` so neither
+    /// overwrites the other: only that claim's success or retirement clears it
+    /// (`clear_failure_of`), never another claim's success or a claim-less failure.
+    claim_failure: Option<ClaimFailure>,
     tail_admission_waiting: bool,
 }
 
+/// A watch failure caused by one claim's recovery.
+struct ClaimFailure {
+    claim: String,
+    /// The bounded failure text, which starts `claim ID: `.
+    text: String,
+}
+
+/// Longest watch failure text status reports.
+const FAILURE_CHARS: usize = 1024;
+
 impl Detector {
-    /// Clear the watch failure only when `claim`'s own recovery set it. A failure from another
+    /// Record the failure of `claim`'s recovery. A failure that names no claim stays beside it.
+    fn fail_claim(&mut self, claim: &str, text: String) {
+        self.claim_failure = Some(ClaimFailure {
+            claim: claim.to_owned(),
+            text: text.chars().take(FAILURE_CHARS).collect(),
+        });
+    }
+
+    /// The failure status reports: the claim failure first, then a failure that names no
+    /// claim, so a claim that failed is never hidden by a later claim-less failure.
+    fn status_failure(&self) -> Option<String> {
+        match (&self.claim_failure, &self.failure) {
+            (Some(claim), Some(other)) => Some(
+                format!("{}; also: {other}", claim.text)
+                    .chars()
+                    .take(FAILURE_CHARS)
+                    .collect(),
+            ),
+            (Some(claim), None) => Some(claim.text.clone()),
+            (None, other) => other.clone(),
+        }
+    }
+
+    /// Clear the claim failure only when `claim`'s own recovery set it. A failure from another
     /// claim or from discovery stays until its own cause resolves, so a claim that failed is
     /// never hidden by an unrelated claim's success.
     fn clear_failure_of(&mut self, claim: &str) {
-        if self.failed_claim.as_deref() == Some(claim) {
-            self.failure = None;
-            self.failed_claim = None;
+        if self
+            .claim_failure
+            .as_ref()
+            .is_some_and(|failed| failed.claim == claim)
+        {
+            self.claim_failure = None;
         }
     }
 
@@ -386,9 +423,7 @@ impl Detector {
     /// (discovery, reservation, drain, tail attach: the watch demonstrably works again), but
     /// another claim's failure stays until that claim resolves.
     fn record_claim_success(&mut self, claim: &str) {
-        if self.failed_claim.is_none() {
-            self.failure = None;
-        }
+        self.failure = None;
         self.clear_failure_of(claim);
         self.completed = self.completed.saturating_add(1);
     }
@@ -425,7 +460,7 @@ impl Detector {
             reconciliations: 0,
             coverage_losses: 0,
             failure: None,
-            failed_claim: None,
+            claim_failure: None,
             tail_admission_waiting: false,
         };
         detector.reconcile("startup")?;
@@ -532,12 +567,10 @@ impl Detector {
                 }
                 Err(Error::FinishedGeneration(message)) => {
                     self.failure = Some(message.into());
-                    self.failed_claim = None;
                     Ok(())
                 }
                 Err(error) => {
-                    self.failure = Some(error.to_string().chars().take(1024).collect());
-                    self.failed_claim = None;
+                    self.failure = Some(error.to_string().chars().take(FAILURE_CHARS).collect());
                     self.deferred = true;
                     Ok(())
                 }
@@ -1556,8 +1589,8 @@ async fn run(
                         return Err(Error::Storage(error));
                     }
                     Err(error) => {
-                        detector.failure = Some(error.to_string().chars().take(1024).collect());
-                        detector.failed_claim = None;
+                        detector.failure =
+                            Some(error.to_string().chars().take(FAILURE_CHARS).collect());
                     }
                 }
             }
@@ -1622,8 +1655,8 @@ async fn run(
                             work = Some((detector.config.id.clone(), journal.import_id, false));
                         }
                         Err(error) => {
-                            detector.failure = Some(error.to_string().chars().take(1024).collect());
-                            detector.failed_claim = None;
+                            detector.failure =
+                                Some(error.to_string().chars().take(FAILURE_CHARS).collect());
                             eprintln!(
                                 "sparrowd: watch={} reservation refused for {:?}: {error}",
                                 detector.config.id, path
@@ -1733,9 +1766,7 @@ async fn run(
             };
             if let Err(error) = result {
                 // Name the claim, so an operator can act on it (retire-claim takes its ID).
-                detector.failure =
-                    Some(format!("claim {id}: {error}").chars().take(1024).collect());
-                detector.failed_claim = Some(id.clone());
+                detector.fail_claim(&id, format!("claim {id}: {error}"));
                 eprintln!("sparrowd: watch={watch} claim={id} pending: {error}");
                 // The claim's durable history answers `watch claims` after any restart.
                 match store.consumption_attempt_pending(&id, &error.to_string(), crate::now()?) {
@@ -1747,11 +1778,9 @@ async fn run(
                         eprintln!(
                             "sparrowd: watch={watch} claim={id} pending attempt not recorded: {record}"
                         );
-                        detector.failure = Some(
-                            format!("claim {id}: {error}; attempt not recorded: {record}")
-                                .chars()
-                                .take(1024)
-                                .collect(),
+                        detector.fail_claim(
+                            &id,
+                            format!("claim {id}: {error}; attempt not recorded: {record}"),
                         );
                     }
                 }

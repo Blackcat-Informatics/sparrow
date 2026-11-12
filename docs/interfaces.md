@@ -3194,10 +3194,12 @@ directory and then vanished before publication can never complete: recovery
 needs that exact claimed generation and never republishes a replacement. It
 stays in `pending_claims`; `watchClaims` lists it as pending with the reason
 "unpublished claimed source is missing", and its watch's `failure` names the
-claim with that text until a later failure replaces it. `watchClaimRetire` (CLI
-`watch retire-claim WATCH_ID CLAIM_ID REASON`, MCP `watch_claim_retire`) lets an
-administrator retire such a claim. It is an admin operation: anonymous TCP and the ingest socket refuse it,
-and a query-only daemon refuses it as a write. The watch's own claim owner
+claim with that text until a later failure of a claim replaces it. A failure
+that names no claim is kept beside it, and status shows the claim's failure
+first. `watchClaimRetire` (CLI `watch retire-claim WATCH_ID CLAIM_ID REASON`,
+MCP `watch_claim_retire`) lets an administrator retire such a claim. It is an
+admin operation: anonymous TCP and the ingest socket refuse it, and a
+query-only daemon refuses it as a write. The watch's own claim owner
 checks, holding its private claim directory, that the private source is
 missing, and the store refuses unless the claim is active, belongs to that
 watch, was claimed and has no recorded publication. A claim whose private
@@ -3211,12 +3213,13 @@ through the ordinary expired-lease removal, so a retired claim never holds one
 of the 16 import slots. Retiring a claim, or that claim completing, clears the
 watch failure only when that claim's recovery set it; another claim's failure
 stays until that claim resolves. A failure that names no claim (discovery,
-reservation, drain) clears when any claim completes, not when one is retired. The caller is the
-connection's administrator as the daemon identified it: `unix uid=U pid=P` on
-the private socket, `tcp-chap peer=ADDRESS` on a CHAP session. The claim leaves
-`pending_claims`; `status` and `watch list` list it under `retired_claims` with
-state `retired-unrecoverable`, and `ingest_get` reports its deletion as
-`retired_unrecoverable`. The daemon logs one line,
+reservation, drain) is kept apart from a claim's failure, so neither hides the
+other in status, and clears when any claim completes, not when one is retired.
+The caller is the connection's administrator as the daemon identified it:
+`unix uid=U pid=P` on the private socket, `tcp-chap peer=ADDRESS` on a CHAP
+session. The claim leaves `pending_claims`; `status` and `watch list` list it
+under `retired_claims` with state `retired-unrecoverable`, and `ingest_get`
+reports its deletion as `retired_unrecoverable`. The daemon logs one line,
 `sparrowd: watch=W claim=ID retired-unrecoverable caller=… reason=… path=…`.
 A store keeps at most 1024 retired claims, which are never removed
 (`MAX_RETIRED_CONSUMPTION_CLAIMS`). The retirement itself frees the claim's

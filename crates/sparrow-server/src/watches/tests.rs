@@ -387,24 +387,24 @@ fn retiring_a_claim_clears_only_the_failure_that_claim_caused() {
     };
 
     // A failure another claim's recovery set survives retiring this claim.
-    detectors[0].failure = Some(format!("claim {cause}: missing"));
-    detectors[0].failed_claim = Some(cause.clone());
+    detectors[0].fail_claim(&cause, format!("claim {cause}: missing"));
     retire(&mut detectors, &other);
     assert_eq!(
-        detectors[0].failure.as_deref(),
+        detectors[0].status_failure().as_deref(),
         Some(format!("claim {cause}: missing").as_str())
     );
-    assert_eq!(detectors[0].failed_claim.as_deref(), Some(cause.as_str()));
 
     // Retiring the claim that set the failure clears it.
     retire(&mut detectors, &cause);
-    assert_eq!(detectors[0].failure, None);
-    assert_eq!(detectors[0].failed_claim, None);
+    assert_eq!(detectors[0].status_failure(), None);
 
     // A discovery failure names no claim, so no retirement clears it.
     detectors[0].failure = Some("discovery refused".into());
     retire(&mut detectors, &discovered);
-    assert_eq!(detectors[0].failure.as_deref(), Some("discovery refused"));
+    assert_eq!(
+        detectors[0].status_failure().as_deref(),
+        Some("discovery refused")
+    );
 }
 
 #[test]
@@ -441,42 +441,105 @@ fn a_claim_that_succeeds_leaves_another_claims_failure_in_place() {
         crate::consumption::RootBinding::Stored,
     )
     .unwrap();
-    detector.failure = Some("claim import:aa: unpublished claimed source is missing".into());
-    detector.failed_claim = Some("import:aa".into());
+    detector.fail_claim(
+        "import:aa",
+        "claim import:aa: unpublished claimed source is missing".into(),
+    );
 
     detector.clear_failure_of("import:bb");
     assert_eq!(
-        detector.failure.as_deref(),
+        detector.status_failure().as_deref(),
         Some("claim import:aa: unpublished claimed source is missing")
     );
-    assert_eq!(detector.failed_claim.as_deref(), Some("import:aa"));
 
     detector.clear_failure_of("import:aa");
-    assert_eq!(detector.failure, None);
-    assert_eq!(detector.failed_claim, None);
+    assert_eq!(detector.status_failure(), None);
 
     // Retiring a claim never clears a failure that names no claim (discovery).
     detector.failure = Some("discovery refused".into());
     detector.clear_failure_of("import:aa");
-    assert_eq!(detector.failure.as_deref(), Some("discovery refused"));
+    assert_eq!(
+        detector.status_failure().as_deref(),
+        Some("discovery refused")
+    );
 
     // The loop's success path (`record_claim_success`): another claim's success leaves a claim's
     // failure and counts the completion; a failure naming no claim clears on any success, so it
     // does not stay stale for ever once the watch works again.
-    detector.failure = Some("claim import:aa: missing".into());
-    detector.failed_claim = Some("import:aa".into());
+    detector.failure = None;
+    detector.fail_claim("import:aa", "claim import:aa: missing".into());
     detector.record_claim_success("import:bb");
     assert_eq!(
-        detector.failure.as_deref(),
+        detector.status_failure().as_deref(),
         Some("claim import:aa: missing")
     );
     assert_eq!(detector.completed, 1);
     detector.record_claim_success("import:aa");
-    assert_eq!(detector.failure, None);
+    assert_eq!(detector.status_failure(), None);
     detector.failure = Some("discovery refused".into());
     detector.record_claim_success("import:cc");
-    assert_eq!(detector.failure, None);
+    assert_eq!(detector.status_failure(), None);
     assert_eq!(detector.completed, 3);
+}
+
+#[test]
+fn a_claim_failure_survives_a_claimless_failure_and_another_claims_success() {
+    // INVARIANT (#222): the watch keeps a claim's failure and a failure that names no claim
+    // apart. Before, the claim-less failure overwrote the claim's, and another claim's success
+    // then cleared it, so the claim that was still pending showed no failure in status while
+    // its durable pending state stayed. Now status shows the claim failure first and the
+    // claim-less one after it, and only the claim's own success or retirement ends the former.
+    let directory = tempfile::tempdir().unwrap();
+    let producer = directory.path().join("producer");
+    std::fs::create_dir(&producer).unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut detector = Detector::open(
+        store,
+        ManagedWatch {
+            definition: ConsumeWatch {
+                id: "both".into(),
+                root: producer,
+                producer_contract: crate::ProducerContract::FinishedFiles,
+                source: "both".into(),
+                format: "opaque".into(),
+                quiet_ms: 30_000,
+                max_directories: 2,
+                max_candidates: 4,
+            },
+            revision: 1,
+            enabled: true,
+        },
+        crate::consumption::RootBinding::Stored,
+    )
+    .unwrap();
+    detector.fail_claim("import:aa", "claim import:aa: source is missing".into());
+    detector.failure = Some("reservation refused".into());
+    assert_eq!(
+        detector.status_failure().as_deref(),
+        Some("claim import:aa: source is missing; also: reservation refused")
+    );
+
+    // Another claim's success ends the claim-less failure only.
+    detector.record_claim_success("import:bb");
+    assert_eq!(
+        detector.status_failure().as_deref(),
+        Some("claim import:aa: source is missing")
+    );
+
+    // A later claim-less failure does not displace it either.
+    detector.failure = Some("drain refused".into());
+    assert_eq!(
+        detector.status_failure().as_deref(),
+        Some("claim import:aa: source is missing; also: drain refused")
+    );
+    detector.clear_failure_of("import:aa");
+    assert_eq!(detector.status_failure().as_deref(), Some("drain refused"));
 }
 
 /// INVARIANT: a private root (`sparrowd --private-intake`) never touches the original root's
