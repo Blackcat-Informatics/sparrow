@@ -272,7 +272,14 @@ fn key(id: &str) -> String {
 
 /// Most claims a store keeps as retired unrecoverable. Each is an operator's audit record and
 /// is never removed, so the bound is a hard refusal rather than an eviction.
-pub const MAX_RETIRED_CONSUMPTION_CLAIMS: usize = 64;
+///
+/// A retirement is the only way a stuck claim leaves its one of the 16 journal slots, so this
+/// bound must sit far above any count an operator reaches by hand. 1024 rows is 8 MiB at the
+/// 8 KiB row ceiling. Every status and watch listing reads them all through one iterator and
+/// puts them on the wire: at most 1024 x (2048 path + 512 caller + 512 reason + 128 id) bytes,
+/// about 3.2 MiB, against the 64 MiB message traversal limit, and about 5.5 MiB of JSON
+/// for the MCP status (the path is hex). The 64 it replaces was reached after 64 retirements.
+pub const MAX_RETIRED_CONSUMPTION_CLAIMS: usize = 1024;
 const RETIRED_PREFIX: &str = "consumption-retired:";
 const RETIREMENT_TEXT: usize = 512;
 
@@ -983,7 +990,9 @@ impl Store {
         if writer.count_prefix(RETIRED_PREFIX)? >= MAX_RETIRED_CONSUMPTION_CLAIMS as u64 {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
-                "64 retired claims are recorded; no further claim can be retired",
+                format!(
+                    "{MAX_RETIRED_CONSUMPTION_CLAIMS} retired claims are recorded; no further claim can be retired"
+                ),
             ));
         }
         let retired = RetiredConsumption {
