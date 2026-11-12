@@ -1019,7 +1019,8 @@ async fn run(shared: &Shared) -> Result<(), Error> {
 /// busy. The daemon marks a busy refusal (`RESOURCE_LIMIT`) retryable, and that batch is
 /// held. A full producer registry is no longer a refusal: the daemon stores the batch and
 /// counts the lost gap evidence (#215), so only an older daemon still answers it with
-/// `RESOURCE_LIMIT`, which stays held as before. Only a non-retryable `INVALID_ARGUMENT` is a batch that can never fit. Any other non-retryable
+/// `RESOURCE_LIMIT`, which stays held as before. Only a non-retryable
+/// `INVALID_ARGUMENT` is a batch that can never fit. Any other non-retryable
 /// refusal (a replaced store, a read-only or unauthorized daemon)
 /// is not about this batch: it stays a terminal failure with the batch retained.
 fn permanent_refusal(error: &Error) -> bool {

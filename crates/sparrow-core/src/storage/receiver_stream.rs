@@ -299,6 +299,25 @@ pub(super) fn prepare(
     discard: Option<ReceiverDiscard>,
     now: u64,
 ) -> Result<Option<PreparedReceiver>, Error> {
+    prepare_within(
+        writer,
+        source,
+        receiver,
+        discard,
+        now,
+        MAX_RECEIVER_REGISTRY_BYTES,
+    )
+}
+
+/// [`prepare`] with an explicit byte bound, so a test can reach the byte-bound corner.
+fn prepare_within(
+    writer: &Writer,
+    source: &str,
+    receiver: &SyslogReceiver,
+    discard: Option<ReceiverDiscard>,
+    now: u64,
+    max_bytes: usize,
+) -> Result<Option<PreparedReceiver>, Error> {
     if source.is_empty() || source.len() > 512 {
         return Err(Error::new(
             "INVALID_ARGUMENT",
@@ -381,27 +400,21 @@ pub(super) fn prepare(
         window_id: state.id.clone(),
         sequence: state.observations,
     };
-    let Some(encoded) = super::sequence_window::encode_bounded(
-        &mut windows,
-        index,
-        MAX_RECEIVER_REGISTRY_BYTES,
-        |window| {
-            // A new window never displaces recorded evidence; an existing one sheds its own.
+    let Some(encoded) =
+        super::sequence_window::encode_bounded(&mut windows, index, max_bytes, |window| {
+            // A new window never displaces recorded evidence; an existing one sheds its own
+            // oldest intervals first.
             if is_new || window.gaps.is_empty() {
                 return false;
             }
             window.gaps.remove(0);
             window.gaps_complete = false;
             true
-        },
-    ) else {
-        if is_new {
-            return Ok(None);
-        }
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
-            "receiver registry encoded admission exceeded",
-        ));
+        })
+    else {
+        // Nothing left to shed: take the packet without a window update; the caller counts
+        // the lost evidence. A log is never refused for bookkeeping (#215).
+        return Ok(None);
     };
     Ok(Some(PreparedReceiver { position, encoded }))
 }
@@ -461,5 +474,55 @@ impl Store {
             now,
             super::durability::Durability::Durable,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+
+    /// INVARIANT (#215): a registry at its byte bound never refuses an observation. An
+    /// existing window first sheds its own oldest gap intervals; with none left, the
+    /// observation is taken without a window update (`None`, counted by the caller). The old
+    /// code answered RESOURCE_LIMIT in the second case.
+    #[test]
+    fn byte_bound_sheds_the_windows_gaps_then_takes_the_packet_without_a_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
+        let receiver = SyslogReceiver::new("udp", "udp").unwrap();
+        for _ in 0..3 {
+            store
+                .discard_syslog("source", &receiver, ReceiverDiscard::Refused, 1)
+                .unwrap();
+        }
+        let writer = store.lock().unwrap();
+        let full = prepare_within(
+            &writer,
+            "source",
+            &receiver,
+            Some(ReceiverDiscard::Refused),
+            2,
+            MAX_RECEIVER_REGISTRY_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        let tight = full.encoded.len() - 1;
+        let shed = prepare_within(
+            &writer,
+            "source",
+            &receiver,
+            Some(ReceiverDiscard::Refused),
+            2,
+            tight,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(shed.encoded.len() <= tight);
+        assert!(
+            prepare_within(&writer, "source", &receiver, None, 2, 10)
+                .unwrap()
+                .is_none()
+        );
     }
 }

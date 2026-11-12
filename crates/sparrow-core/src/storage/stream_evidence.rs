@@ -127,3 +127,36 @@ impl Ledger {
         report
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// INVARIANT (#215): past the tracked-stream limit a lost stream is still counted, in the
+    /// overflow totals, and the report says `other_streams` is only a lower bound. No lost
+    /// position disappears from the totals.
+    #[test]
+    fn streams_past_the_tracking_limit_still_count_and_mark_the_report_inexact() {
+        let ledger = Ledger::default();
+        for index in 0..MAX_TRACKED_LOST_STREAMS {
+            ledger.record(LostStreamKind::Producer, "s", &index.to_string(), 1);
+        }
+        assert!(ledger.report().other_streams_exact);
+        ledger.record(LostStreamKind::Producer, "s", "beyond", 5);
+        ledger.record(LostStreamKind::Producer, "s", "beyond", 5);
+        ledger.record(LostStreamKind::Producer, "s", "0", 1);
+        let report = ledger.report();
+        assert!(!report.other_streams_exact);
+        assert_eq!(report.named.len(), MAX_NAMED_LOST_STREAMS);
+        assert_eq!(
+            report.other_streams,
+            (MAX_TRACKED_LOST_STREAMS - MAX_NAMED_LOST_STREAMS) as u64
+        );
+        assert_eq!(
+            report.total_events,
+            MAX_TRACKED_LOST_STREAMS as u64 + 10 + 1
+        );
+        assert_eq!(report.total_batches, MAX_TRACKED_LOST_STREAMS as u64 + 3);
+        assert!(report.other_events >= 10);
+    }
+}

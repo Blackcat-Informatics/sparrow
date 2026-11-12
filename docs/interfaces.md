@@ -2762,11 +2762,15 @@ still in `other_events` and the totals. The counts live in memory for the daemon
 life, and a retry of a request already accepted is idempotent and is not counted
 twice. A stream without a window has no sequence overlap check, so the exact retry
 (same request ID) is answered from the receipt, while a new request ID that repeats
-sequences of an unrecorded stream is stored again, never dropped. A stream that has a window keeps its overlap `CONFLICT` and gap accounting
-unchanged. A window created later, after expiry frees a slot, starts at its first
+sequences of an unrecorded stream is stored again, never dropped. A stream that
+has a window keeps its overlap `CONFLICT` and gap accounting unchanged.
+A window created later, after expiry frees a slot, starts at its first
 observed position as every window does. A registry that would pass its byte bound
 sheds that window's oldest exact gap intervals (`gaps_complete=false`, counts exact)
-rather than refusing, and a new window that cannot fit is treated as full.
+rather than refusing. A new window that cannot fit is treated as full, and an
+existing window with nothing left to shed takes the batch without a window update
+and counts it as lost; a later batch of that stream may then show those positions
+as a gap. The same holds for receiver windows.
 The existing Rust `events` example accepts an optional sequence after its
 durability argument so separate invocations can demonstrate ordered batches
 using one instance. Its default sequence remains 1; exact retries keep all

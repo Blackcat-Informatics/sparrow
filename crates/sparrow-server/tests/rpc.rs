@@ -9788,6 +9788,41 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         assert_eq!(producer.artifact(&receipt.id).await.unwrap(), receipt);
         let response = producer.capability().status_request().send().promise.await.unwrap();
         assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 4);
+        // #215: with every producer window taken, a batch from a new instance is still stored and
+        // status names the stream whose gap evidence was lost. The old daemon refused it with
+        // RESOURCE_LIMIT, so this fails there at the overflow send and at the status fields.
+        for index in 0..63_u8 {
+            let mut fill = batch.clone();
+            fill.request_id = format!("fill-{index}"); fill.source = "fill".into();
+            fill.client_instance = [100 + index; 16]; fill.events = vec![batch.events[0].clone()];
+            producer.events(&fill).await.unwrap();
+        }
+        let mut late = batch.clone();
+        late.request_id = "overflow".into(); late.source = "overflow-source".into();
+        late.client_instance = [200; 16];
+        late.events = vec![batch.events[0].clone(), batch.events[2].clone()];
+        let stored = producer.events(&late).await.unwrap();
+        assert_eq!(stored.record_ids.len(), 2);
+        let response = producer.capability().status_request().send().promise.await.unwrap();
+        let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+        let loss = status.get_stream_evidence_loss().unwrap();
+        let named = loss.get_named().unwrap();
+        assert_eq!(named.len(), 1);
+        let row = named.get(0);
+        assert_eq!(row.get_kind().unwrap(), wire::LostStreamKind::Producer);
+        assert_eq!(row.get_source().unwrap().to_str().unwrap(), "overflow-source");
+        assert_eq!(row.get_instance().unwrap().to_str().unwrap(), "c8".repeat(16));
+        assert_eq!((row.get_batches(), row.get_events()), (1, 2));
+        assert_eq!((loss.get_total_batches(), loss.get_total_events()), (1, 2));
+        assert_eq!((loss.get_other_streams(), loss.get_other_events()), (0, 0));
+        let rendered = cli(&socket, &["status"]);
+        let report = &rendered["stream_evidence_loss"];
+        assert_eq!(report["named"][0]["kind"].as_str(), Some("producer"));
+        assert_eq!(report["named"][0]["source"].as_str(), Some("overflow-source"));
+        assert_eq!(report["named"][0]["instance"].as_str(), Some("c8".repeat(16).as_str()));
+        assert_eq!(report["named"][0]["batches"].as_str(), Some("1"));
+        assert_eq!(report["named"][0]["events"].as_str(), Some("2"));
+        assert_eq!(report["total_events"].as_str(), Some("2"));
         drop(producer); drop(daemon);
     }).await;
 }
