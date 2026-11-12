@@ -392,48 +392,7 @@ impl Delivery {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let shared = Arc::new(Shared {
-            config,
-            instance,
-            state: Mutex::new(State {
-                queue: VecDeque::new(),
-                pending: None,
-                bytes: 0,
-                count: 0,
-                sequence: 0,
-                admitted_sequence: 0,
-                admitted: 0,
-                durable_sequence: 0,
-                durable: 0,
-                batch_number: 0,
-                retries: 0,
-                force_through: 0,
-                closing: false,
-                store: None,
-                receipt: None,
-                failure: None,
-                transient: None,
-                quarantined: 0,
-                quarantined_sequence: 0,
-                quarantine: None,
-                quarantine_files: 0,
-                quarantine_failures: 0,
-                quarantine_file: None,
-            }),
-            control: Mutex::new(()),
-            changed: Condvar::new(),
-            wake: tokio::sync::Notify::new(),
-            retry_wake: tokio::sync::Notify::new(),
-            barriers_waiting: AtomicUsize::new(0),
-            abort_wake: tokio::sync::Notify::new(),
-            owners: AtomicUsize::new(1),
-            offered: AtomicU64::new(0),
-            spans: AtomicU64::new(0),
-            drops: std::array::from_fn(|_| AtomicU64::new(0)),
-            exhausted: AtomicBool::new(false),
-            aborted: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-        });
+        let shared = Shared::new(config, instance);
         let worker = shared.clone();
         std::thread::Builder::new()
             .name("sparrow-delivery".into())
@@ -650,6 +609,50 @@ impl Drop for BarrierWaiting<'_> {
 }
 
 impl Shared {
+    fn new(config: DeliveryConfig, instance: [u8; 16]) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            instance,
+            state: Mutex::new(State {
+                queue: VecDeque::new(),
+                pending: None,
+                bytes: 0,
+                count: 0,
+                sequence: 0,
+                admitted_sequence: 0,
+                admitted: 0,
+                durable_sequence: 0,
+                durable: 0,
+                batch_number: 0,
+                retries: 0,
+                force_through: 0,
+                closing: false,
+                store: None,
+                receipt: None,
+                failure: None,
+                transient: None,
+                quarantined: 0,
+                quarantined_sequence: 0,
+                quarantine: None,
+                quarantine_files: 0,
+                quarantine_failures: 0,
+                quarantine_file: None,
+            }),
+            control: Mutex::new(()),
+            changed: Condvar::new(),
+            wake: tokio::sync::Notify::new(),
+            retry_wake: tokio::sync::Notify::new(),
+            barriers_waiting: AtomicUsize::new(0),
+            abort_wake: tokio::sync::Notify::new(),
+            owners: AtomicUsize::new(1),
+            offered: AtomicU64::new(0),
+            spans: AtomicU64::new(0),
+            drops: std::array::from_fn(|_| AtomicU64::new(0)),
+            exhausted: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        })
+    }
     fn finished(&self) {
         // Serialize the completion predicate with barrier waits to prevent a lost notification.
         let guard = self.state.lock();
@@ -870,17 +873,33 @@ impl Shared {
         Ok(())
     }
     /// Write one batch to the quarantine directory, counting the file or the failure. An
-    /// error means the bytes are not preserved and the caller must keep them.
+    /// error means the bytes are not preserved and the caller must keep them; it names the
+    /// refusal code and reason, the directory and the write error, so a persistent write
+    /// failure does not hide what the daemon said.
     fn save(&self, batch: &EventBatch, error: &Error) -> Result<PathBuf, Error> {
         let (code, reason) = match error {
             Error::Domain { code, message, .. } => (code.as_str(), message.clone()),
             other => ("CLIENT_REFUSED", other.to_string()),
         };
         let saved = crate::quarantine::save(&self.config.quarantine_dir, batch, code, &reason);
+        let context = format!(
+            "{code}: {reason}; quarantine write to {} failed",
+            self.config.quarantine_dir.display()
+        );
+        self.record(saved, &context)
+    }
+    /// Count a save's outcome. A poisoned lock still holds consistent counters (every writer
+    /// updates them in one step) and the file is already written, so it is recovered rather
+    /// than reported as an unsaved batch.
+    fn record(
+        &self,
+        saved: Result<(PathBuf, bool), crate::quarantine::SaveFailure>,
+        context: &str,
+    ) -> Result<PathBuf, Error> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match saved {
             Ok((path, created)) => {
                 if created {
@@ -889,11 +908,18 @@ impl Shared {
                 state.quarantine_file = Some(path.clone());
                 Ok(path)
             }
-            Err(io) => {
+            Err(failure) => {
+                if let Some(path) = failure.created {
+                    state.quarantine_files = state.quarantine_files.saturating_add(1);
+                    state.quarantine_file = Some(path);
+                }
                 state.quarantine_failures = state.quarantine_failures.saturating_add(1);
                 drop(state);
                 self.changed.notify_all();
-                Err(Error::Io(io))
+                Err(Error::Io(std::io::Error::new(
+                    failure.error.kind(),
+                    format!("{context}: {}", failure.error),
+                )))
             }
         }
     }
@@ -1629,5 +1655,152 @@ mod tests {
             };
             assert!(message.contains("quarantine_dir"), "{message}");
         }
+    }
+
+    /// A worker-less `Shared` over a quarantine directory, so a test drives `save` and
+    /// `save_held` with no thread racing it.
+    fn shared(quarantine: &std::path::Path) -> Arc<Shared> {
+        Shared::new(
+            DeliveryConfig::new("unused.sock", "test").with_quarantine_dir(quarantine),
+            [9; 16],
+        )
+    }
+
+    fn batch_of(request: &str, sequence: u64) -> EventBatch {
+        EventBatch {
+            request_id: request.into(),
+            source: "test".into(),
+            client_instance: [9; 16],
+            events: vec![ProducerEvent {
+                sequence,
+                ..event()
+            }],
+        }
+    }
+
+    /// INVARIANT: a worker that panicked while holding the state lock poisons it, and the
+    /// bytes it held are still saved and reported saved: `save` writes the file and counts it,
+    /// and `save_held` returns the terminal error unchanged. The old code wrote the file and
+    /// then answered "state poisoned", so a saved batch was reported unsaved.
+    #[test]
+    fn a_poisoned_state_lock_still_saves_and_reports_the_held_bytes_as_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(&dir.path().join("quarantine"));
+        let poisoner = shared.clone();
+        std::thread::spawn(move || {
+            let _held = poisoner.state.lock().unwrap();
+            panic!("poison the state lock on purpose");
+        })
+        .join()
+        .unwrap_err();
+        assert!(shared.state.is_poisoned());
+        let path = shared
+            .save(&batch_of("events:poison:1", 1), &Error::Protocol("refused"))
+            .expect("a saved batch is not reported unsaved");
+        assert!(std::fs::read_to_string(path).unwrap().contains("refused"));
+        shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .push_back(Queued {
+                event: ProducerEvent {
+                    sequence: 2,
+                    ..event()
+                },
+                bytes: 0,
+                at: Instant::now(),
+            });
+        let error = shared.save_held(Error::Protocol("terminal for the test"));
+        assert!(
+            matches!(error, Error::Protocol("terminal for the test")),
+            "{error:?}"
+        );
+        let state = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!((state.quarantine_files, state.quarantine_failures), (2, 0));
+    }
+
+    /// INVARIANT: when the quarantine write fails, the error the worker reports as the
+    /// transient failure still says what the daemon refused (code and reason) and which
+    /// directory could not be written, with the I/O error. The old code replaced the refusal
+    /// with the bare I/O error.
+    #[test]
+    fn a_failed_quarantine_write_keeps_the_refusal_and_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let quarantine = blocker.join("q");
+        let shared = shared(&quarantine);
+        let batch = batch_of("events:blocked:1", 1);
+        let io = crate::quarantine::save(&quarantine, &batch, "c", "r")
+            .unwrap_err()
+            .error;
+        let refusal = Error::Domain {
+            code: "CONFLICT".into(),
+            message: "sequences overlap".into(),
+            retryable: false,
+        };
+        let Err(Error::Io(error)) = shared.save(&batch, &refusal) else {
+            panic!("an unwritable directory must fail the save");
+        };
+        let text = error.to_string();
+        for needle in [
+            "CONFLICT",
+            "sequences overlap",
+            &quarantine.display().to_string(),
+            &io.to_string(),
+        ] {
+            assert!(text.contains(needle), "{needle} missing from {text}");
+        }
+        assert_eq!(shared.state.lock().unwrap().quarantine_failures, 1);
+    }
+
+    /// INVARIANT: a batch the client itself cannot encode is classed a permanent refusal and
+    /// reaches a quarantine file under the client's own code, with the encoder's reason, so
+    /// those bytes are kept too. No test drove this route before.
+    #[test]
+    fn a_batch_the_client_cannot_encode_is_quarantined_under_a_client_code() {
+        let refusal = Error::InvalidArgument("event text exceeds 16 KiB");
+        assert!(permanent_refusal(&refusal));
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(&dir.path().join("quarantine"));
+        let path = shared
+            .save(&batch_of("events:encode:1", 1), &refusal)
+            .unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let header = text.lines().next().unwrap();
+        assert!(
+            header.contains("\"reason_code\":\"CLIENT_REFUSED\""),
+            "{header}"
+        );
+        assert!(header.contains("event text exceeds 16 KiB"), "{header}");
+        assert_eq!(shared.state.lock().unwrap().quarantine_files, 1);
+    }
+
+    /// INVARIANT: a file linked into place is counted once even when the save then fails on
+    /// its scratch cleanup and is retried (the retry reports the file as already existing).
+    /// The old code counted it on neither attempt.
+    #[test]
+    fn a_save_that_failed_after_the_link_counts_its_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let linked = dir.path().join("linked.quarantine.jsonl");
+        let failure = crate::quarantine::SaveFailure {
+            error: std::io::Error::other("scratch removal refused"),
+            created: Some(linked.clone()),
+        };
+        assert!(shared.record(Err(failure), "context").is_err());
+        assert_eq!(
+            shared
+                .record(Ok((linked.clone(), false)), "context")
+                .unwrap(),
+            linked
+        );
+        let state = shared.state.lock().unwrap();
+        assert_eq!((state.quarantine_files, state.quarantine_failures), (1, 1));
+        assert_eq!(state.quarantine_file.as_deref(), Some(linked.as_path()));
     }
 }

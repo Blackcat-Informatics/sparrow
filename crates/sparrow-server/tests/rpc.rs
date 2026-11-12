@@ -8931,9 +8931,8 @@ async fn producer_delivery_keeps_a_refused_batch_when_the_quarantine_cannot_be_w
             let blocked = dir.path().join("blocked");
             std::fs::write(&blocked, b"not a directory").unwrap();
             let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "quarantine-held")
-                .with_quarantine_dir(dir.path().join("quarantine"));
+                .with_quarantine_dir(blocked.join("quarantine"));
             config.batch_events = 1;
-            config.quarantine_dir = blocked.join("quarantine");
             let config = config.with_test_timing(
                 Duration::from_secs(2),
                 Duration::from_millis(20),
