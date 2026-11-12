@@ -364,12 +364,35 @@ struct Detector {
     coverage_losses: u64,
     failure: Option<String>,
     /// The claim whose recovery set `failure`, if a claim's recovery did; any other
-    /// failure clears it. Retiring that claim clears the failure, and nothing else does.
+    /// failure leaves it `None`. A claim's own success or retirement clears its failure
+    /// (`clear_failure_of`) and another claim's success leaves it in place; a failure that
+    /// names no claim clears on any claim's success (`record_claim_success`).
     failed_claim: Option<String>,
     tail_admission_waiting: bool,
 }
 
 impl Detector {
+    /// Clear the watch failure only when `claim`'s own recovery set it. A failure from another
+    /// claim or from discovery stays until its own cause resolves, so a claim that failed is
+    /// never hidden by an unrelated claim's success.
+    fn clear_failure_of(&mut self, claim: &str) {
+        if self.failed_claim.as_deref() == Some(claim) {
+            self.failure = None;
+            self.failed_claim = None;
+        }
+    }
+
+    /// A claim finished. Its own failure clears, and so does a failure that names no claim
+    /// (discovery, reservation, drain, tail attach: the watch demonstrably works again), but
+    /// another claim's failure stays until that claim resolves.
+    fn record_claim_success(&mut self, claim: &str) {
+        if self.failed_claim.is_none() {
+            self.failure = None;
+        }
+        self.clear_failure_of(claim);
+        self.completed = self.completed.saturating_add(1);
+    }
+
     fn open(store: Store, watch: ManagedWatch, binding: RootBinding) -> Result<Self, Error> {
         let config = watch.definition;
         let owner = match config.producer_contract {
@@ -1192,10 +1215,7 @@ fn retire_claim(
         })?;
     // Clear the watch failure only when it is this claim's recovery refusal; a failure from
     // another claim or from discovery stays until its own cause resolves.
-    if detector.failed_claim.as_deref() == Some(retirement.claim.as_str()) {
-        detector.failure = None;
-        detector.failed_claim = None;
-    }
+    detector.clear_failure_of(&retirement.claim);
     eprintln!(
         "sparrowd: watch={} claim={} retired-unrecoverable caller={:?} reason={:?} path={:?}",
         retirement.watch,
@@ -1744,9 +1764,7 @@ async fn run(
                     client = None;
                 }
             } else {
-                detector.failure = None;
-                detector.failed_claim = None;
-                detector.completed = detector.completed.saturating_add(1);
+                detector.record_claim_success(&id);
             }
             if let Some(index) = detectors
                 .iter()
