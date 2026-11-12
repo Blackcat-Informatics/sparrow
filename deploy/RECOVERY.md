@@ -404,9 +404,10 @@ each such entry out of the intake root, keeping its bytes, never delete it, and
 start again. A claim the restored store journals whose private source is missing
 never completes: `pending_claims` shows it and `sparrow SOCKET watch claims`
 lists it as pending with the reason "unpublished claimed source is missing"
-(deploy/reconcile-inflight.sh missing exits 4 while one is unreconciled). Once its bytes are confirmed lost,
-retire it with `sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON"`
-(docs/interfaces.md, "Retiring an unrecoverable claim").
+(`deploy/reconcile-inflight.sh missing` exits 4 while a pending claim is
+unreconciled). Once its bytes are confirmed lost, retire it with `sparrow
+SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON"` (docs/interfaces.md,
+"Retiring an unrecoverable claim").
 
 The shipper then resends every file shipped after the backup whose original
 still exists; records producers sent directly after the backup are lost unless

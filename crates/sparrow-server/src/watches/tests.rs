@@ -455,10 +455,28 @@ fn a_claim_that_succeeds_leaves_another_claims_failure_in_place() {
     assert_eq!(detector.failure, None);
     assert_eq!(detector.failed_claim, None);
 
-    // A failure that names no claim (discovery) is cleared by no claim's success.
+    // Retiring a claim never clears a failure that names no claim (discovery).
     detector.failure = Some("discovery refused".into());
     detector.clear_failure_of("import:aa");
     assert_eq!(detector.failure.as_deref(), Some("discovery refused"));
+
+    // The loop's success path (`record_claim_success`): another claim's success leaves a claim's
+    // failure and counts the completion; a failure naming no claim clears on any success, so it
+    // does not stay stale for ever once the watch works again.
+    detector.failure = Some("claim import:aa: missing".into());
+    detector.failed_claim = Some("import:aa".into());
+    detector.record_claim_success("import:bb");
+    assert_eq!(
+        detector.failure.as_deref(),
+        Some("claim import:aa: missing")
+    );
+    assert_eq!(detector.completed, 1);
+    detector.record_claim_success("import:aa");
+    assert_eq!(detector.failure, None);
+    detector.failure = Some("discovery refused".into());
+    detector.record_claim_success("import:cc");
+    assert_eq!(detector.failure, None);
+    assert_eq!(detector.completed, 3);
 }
 
 /// INVARIANT: a private root (`sparrowd --private-intake`) never touches the original root's

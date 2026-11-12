@@ -41,9 +41,11 @@ missing   Run once the restored daemon serves with its watches. The worklist is 
           as NAME.reshipped.EXT (rename from a temporary file beside the root), and the claim
           is retired with "watch retire-claim". A restored claim keeps the reason it had at
           the backup until the restored daemon's first attempt rewrites it, so a claim not
-          yet attempted is not on the worklist; run again once it has been. Any other
-          pending claim that already carries a pending reason is left alone and reported,
-          and the run then exits 4: it is not done, whatever else was reshipped.
+          yet attempted has no matching reason, so it is not reshipped until it has been.
+          Any other pending claim, including one with no reason yet, is left alone and
+          reported, and the run then exits 4: it is not done, whatever else was reshipped.
+          An image older than schema 71 cannot list claims, so each watch's durable
+          pending_claims count must be covered by claims this run reshipped and retired.
 
 --private-intake DIR
                   reconcile the private roots a `sparrowd --private-intake DIR` daemon consumes:
@@ -51,12 +53,12 @@ missing   Run once the restored daemon serves with its watches. The worklist is 
                   the daemon rebinds it, and no other root is touched (the measurement's
                   rehearsal uses it on scratch copies)
 
-Exit 0 when done (no claim left pending with a reason this run did not act on, so
+Exit 0 when done (no watch holds a pending claim this run did not act on, so
 "missing reshipped=0" with exit 0 means nothing was owed), 1 on a refusal or failure, 2 on a
 usage error, 3 when the bytes were re-shipped but the restored image has no "watch
 retire-claim" (schema 69 and older): the claim stays pending until a schema 70 image retires
-it, 4 when a watch still holds a pending claim that has a pending reason and was not
-reconciled by this run (run it again, or inspect "watch claims").
+it, 4 when a watch still holds a pending claim, with or without a pending reason, that this
+run did not reconcile (inspect "watch claims"; a claim just attempted needs a rerun).
 USAGE
 }
 
@@ -163,7 +165,8 @@ fi
 watch_usage=$("$RESTORED_CLI" "$RESTORED_SOCKET" watch 2>&1 >/dev/null || true)
 retire=0
 [[ $watch_usage == *"watch retire-claim"* ]] && retire=1
-reshipped=0 unretired=0 unacted=0
+reshipped=0 unretired=0 unacted=0 legacy=0
+declare -A acted=()
 # One "KIND<TAB>WATCH<TAB>CLAIM<TAB>DETAIL" line per claim to act on (KIND "missing") or to
 # report ("other"). The durable pending-claim state is the source; only an image without
 # "watch claims" (schema 70 and older) falls back to the volatile watch failure text.
@@ -179,12 +182,13 @@ for c in json.load(sys.stdin)["claims"]:
     if c["state"] != "pending":
         continue
     reason = c["last_pending_reason"]
-    if reason is None:
-        continue
-    kind = "missing" if reason.startswith("unpublished claimed source is missing") else "other"
+    # No reason yet: not attempted since the backup (or in flight); it is not done, so it counts.
+    kind = "missing" if (reason or "").startswith("unpublished claimed source is missing") else "other"
+    reason = reason or "no attempt recorded yet"
     print("%s\t%s\t%s\t%s" % (kind, c["watch"], c["claim_id"], reason.replace("\t", " ").replace("\n", " ")))' <<<"$claims")
 else
-    note "the restored image has no \"watch claims\" (schema 71): reading the volatile watch failure text; run again until it reports nothing" >&2
+    note "the restored image is older than schema 71 and has no \"watch claims\": reading the volatile watch failure text, and any watch whose pending_claims exceeds what this run reconciled exits 4" >&2
+    legacy=1
     mapfile -t worklist < <(python3 -I -c 'import json,re,sys
 for w in json.load(sys.stdin)["consume_watches"]:
     m = re.search(r"claim (import:[0-9a-f]+): unpublished claimed source is missing", w["failure"] or "")
@@ -229,6 +233,7 @@ print(a["artifact_id"], a["payload_id"], a["byte_length"])' <<<"$newer") \
     rmdir -- "$work"
     note "re-shipped $artifact of $watch/$claim ($length bytes, $payload) as $target"
     reshipped=$((reshipped + 1))
+    acted[$watch]=$((${acted[$watch]:-0} + 1))
     reason="published after the restored backup as $artifact by the newer store; its bytes were re-shipped as ${target##*/}"
     if ((retire == 0)); then
         note "$claim stays pending: the restored image has no \"watch retire-claim\" (its watch usage: $watch_usage)" >&2
@@ -239,6 +244,20 @@ print(a["artifact_id"], a["payload_id"], a["byte_length"])' <<<"$newer") \
         || die "retiring $claim failed: $err"
     note "retired $watch/$claim"
 done
+if ((legacy)); then
+    # The durable count is in every image's status: a watch holding more pending claims than this
+    # run reshipped and retired has an unreconciled claim, whatever its failure text shows.
+    while IFS=$'\t' read -r watch pending; do
+        left=$((pending - ${acted[$watch]:-0}))
+        ((retire == 1)) || left=$pending
+        if ((left > 0)); then
+            note "$watch holds $left pending claim(s) this run did not reconcile" >&2
+            unacted=$((unacted + left))
+        fi
+    done < <(python3 -I -c 'import json,sys
+for w in json.load(sys.stdin)["consume_watches"]:
+    print("%s\t%s" % (w["id"], w["pending_claims"]))' <<<"$restored_status")
+fi
 note "missing reshipped=$reshipped unretired=$unretired unacted=$unacted"
 ((unacted == 0)) || exit 4
 ((unretired == 0)) || exit 3

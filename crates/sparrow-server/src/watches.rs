@@ -364,8 +364,9 @@ struct Detector {
     coverage_losses: u64,
     failure: Option<String>,
     /// The claim whose recovery set `failure`, if a claim's recovery did; any other
-    /// failure clears it. Only that claim's own success or retirement clears the failure
-    /// (`clear_failure_of`); another claim's success leaves it in place.
+    /// failure leaves it `None`. A claim's own success or retirement clears its failure
+    /// (`clear_failure_of`) and another claim's success leaves it in place; a failure that
+    /// names no claim clears on any claim's success (`record_claim_success`).
     failed_claim: Option<String>,
     tail_admission_waiting: bool,
 }
@@ -379,6 +380,17 @@ impl Detector {
             self.failure = None;
             self.failed_claim = None;
         }
+    }
+
+    /// A claim finished. Its own failure clears, and so does a failure that names no claim
+    /// (discovery, reservation, drain, tail attach: the watch demonstrably works again), but
+    /// another claim's failure stays until that claim resolves.
+    fn record_claim_success(&mut self, claim: &str) {
+        if self.failed_claim.is_none() {
+            self.failure = None;
+        }
+        self.clear_failure_of(claim);
+        self.completed = self.completed.saturating_add(1);
     }
 
     fn open(store: Store, watch: ManagedWatch, binding: RootBinding) -> Result<Self, Error> {
@@ -1752,8 +1764,7 @@ async fn run(
                     client = None;
                 }
             } else {
-                detector.clear_failure_of(&id);
-                detector.completed = detector.completed.saturating_add(1);
+                detector.record_claim_success(&id);
             }
             if let Some(index) = detectors
                 .iter()

@@ -589,8 +589,8 @@ claim entry the restored store does not journal, and a restored store can
 journal a claim whose private source is missing. A claim whose private source is
 missing never completes: status shows it in `pending_claims`, and `sparrow
 SOCKET watch claims` lists it as pending with the reason "unpublished claimed
-source is missing", durably across restarts (schema 71 and newer; the watch
-failure text shows it only between retries). Once its bytes are confirmed
+source is missing", durably across restarts (schema 71 and newer). The watch
+failure text names it too, but another claim's retry can replace that text. Once its bytes are confirmed
 lost, retire it with `sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID
 REASON` (schema 70 and newer; interfaces, "Retiring an unrecoverable claim").
 It leaves `pending_claims` and stays listed as `retired-unrecoverable`. If its
@@ -1023,22 +1023,26 @@ what each claim was. Never delete an entry or a claim's bytes:
    entry neither store knows or whose original name is taken.
 4. Stop the restored query-only daemon and start `sparrow.service`.
 5. `deploy/reconcile-inflight.sh missing --restored OLD_CLI SOCKET --newer
-   NEW_CLI NEW_SOCKET`. For each claim that `sparrow SOCKET watch claims` lists as pending
-   with the reason "unpublished claimed source is missing", the newer store
-   must record that claim as published. Its artifact's bytes are read back from the newer
-   store and checked against the artifact's payload digest. They are then
-   renamed into the root as `NAME.reshipped.EXT`, a new file the watch
-   ingests, so the records the rollback dropped come back. Last, the claim is
-   retired with `sparrow SOCKET watch retire-claim` (schema 70 and newer). A
-   restored claim keeps the reason it had at the backup until the restored
-   daemon's first attempt rewrites it, so a claim not yet attempted is not
-   listed: the script exits 4 while any watch holds a pending claim that has
-   a reason and was not reconciled, so rerun it until it exits 0. Exit 0
-   with `reshipped=0` means no such claim was left. An image older than
-   schema 71 has no `watch claims`; the script then reads the volatile watch
-   failure text and warns, so check `pending_claims` before trusting it. An old image without the command makes it exit 3
-   after re-shipping: the claim stays pending until a schema 70 image retires
-   it.
+   NEW_CLI NEW_SOCKET`. For each claim that `sparrow SOCKET watch claims`
+   lists as pending with the reason "unpublished claimed source is missing",
+   the newer store must record that claim as published. Its artifact's bytes
+   are read back from the newer store and checked against the artifact's
+   payload digest. They are then renamed into the root as
+   `NAME.reshipped.EXT`, a new file the watch ingests, so the records the
+   rollback dropped come back. Last, the claim is retired with `sparrow
+   SOCKET watch retire-claim` (schema 70 and newer). A restored claim keeps
+   the reason it had at the backup until the restored daemon's first attempt
+   rewrites it, so it is not reshipped before that attempt. The script exits
+   4 while any watch holds a pending claim, with or without a reason, that
+   it did not reconcile. Then inspect `watch claims`: a claim just attempted
+   needs a rerun, and a claim of another kind (for example "watch root was
+   replaced") needs its own decision, so do not rerun for ever. Exit 0 means
+   no watch held a pending claim this run left alone, so `reshipped=0` then
+   means nothing was owed. An image older than schema 71 has no `watch
+   claims`; the script then compares each watch's `pending_claims` with the
+   claims it reshipped and retired, and exits 4 for any excess. An image
+   without `watch retire-claim` makes it exit 3 after re-shipping: the claim
+   stays pending until a schema 70 image retires it.
 6. Stop the newer query-only daemon and start `sparrow-ship.timer`. Start
    `sparrow-backup.timer` only after a first online backup of the restored store
    verifies (`deploy/verify-backup.sh` exits 0).

@@ -110,15 +110,16 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
   deploy/reconcile-inflight.sh missing --restored FROM_CLI SOCKET --newer TO_CLI SOCK2 for
   claims TO published after the backup: the restored store still journals them, each stays
   pending with the reason "unpublished claimed source is missing" in sparrow SOCKET watch
-  claims (schema 71 and newer) until the claim is retired. It reads each one's bytes back from the set-aside store, checks them
-  against their catalog digest, re-ships them into the root as NAME.reshipped.EXT and retires
-  the claim with sparrow SOCKET watch retire-claim WATCH_ID CLAIM_ID "REASON" (schema 70 and newer).
-  A retired claim leaves pending_claims, status and watch list show it as
-  retired-unrecoverable, and the daemon logs one line. It exits 4 while a watch holds a
-  pending claim with a reason that it did not reconcile, so rerun it until it exits 0. A
-  FROM image older than schema 70 cannot retire (exit 3): the bytes are re-shipped
-  and the claim stays pending until a schema 70 image retires it. A claim whose private
-  source exists or whose publication is recorded is refused.
+  claims (schema 71 and newer) until the claim is retired. It reads each one's bytes back
+  from the set-aside store, checks them against their catalog digest, re-ships them into
+  the root as NAME.reshipped.EXT and retires the claim with sparrow SOCKET watch
+  retire-claim WATCH_ID CLAIM_ID "REASON" (schema 70 and newer). A retired claim leaves
+  pending_claims, status and watch list show it as retired-unrecoverable, and the daemon
+  logs one line. It exits 4 while a watch holds a pending claim it did not reconcile:
+  inspect watch claims, rerun only for a claim just attempted, and decide on any other
+  kind. A FROM image older than schema 70 cannot retire (exit 3): the bytes are
+  re-shipped and the claim stays pending until a schema 70 image retires it. A claim
+  whose private source exists or whose publication is recorded is refused.
 USAGE
 }
 

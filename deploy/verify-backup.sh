@@ -796,15 +796,15 @@ sys.exit(not any(c["claim_id"] == sys.argv[1] and c["state"] == "pending"
     and (c["last_pending_reason"] or "").startswith("unpublished claimed source is missing")
     for c in json.load(sys.stdin)["claims"]))' "$claimed" <<<"$out" \
         || fail rehearsal "the restored daemon never recorded $claimed as pending with its source missing"
-    # Exit 4 reports a pending claim that is not this rehearsal's: the traffic phase's "replayed"
-    # watch leaves its own claim pending in the backup. It must not be a claim of the rehearsal
-    # watch, which reconcile has to settle; anything else (exit 1, 3) fails the step.
+    # Exit 4 reports pending claims this run did not reconcile: the traffic phase's "replayed"
+    # watch leaves its own claim pending in the backup, and the rehearsal watch's second claim
+    # (batch-2.jsonl) may be in flight. The claim under test is checked below by reshipped=1,
+    # unretired=0 and its retired-unrecoverable status, so no timing of another claim matters;
+    # exit 1 and 3 fail the step.
     rc=0
     out=$("$RECONCILE" missing --restored "$cli" "$restored/r.sock" --newer "$cli" "$DATA/n.sock" \
         --private-intake "$intake" 2>&1) || rc=$?
     ((rc == 0 || rc == 4)) || fail rehearsal "reconcile-inflight.sh missing failed: $out"
-    [[ $out != *"measure-rehearsal/import:"*"is pending and not reconciled"* ]] \
-        || fail rehearsal "the rehearsal watch still holds a claim reconcile did not settle: $out"
     printf '%s\n' "$out" | sed 's/^/verify-backup: rehearsal: /'
     [[ $out == *"missing reshipped=1 unretired=0"* ]] || fail rehearsal "$claimed was not re-shipped and retired"
     out=$("$cli" "$restored/r.sock" status) || fail rehearsal "the restored daemon stopped answering"
