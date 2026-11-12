@@ -159,6 +159,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             stream_evidence_loss(value.get_stream_evidence_loss()?)?,
         )
         .with(
+            "source_time_loss",
+            stream_evidence_loss(value.get_source_time_loss()?)?,
+        )
+        .with(
             "tail_registry_evidence",
             tail_registry_evidence(value.get_tail_registry_evidence()?)?,
         )
@@ -360,6 +364,7 @@ fn stream_evidence_loss(value: wire::stream_evidence_loss::Reader<'_>) -> Result
                     match stream.get_kind()? {
                         wire::LostStreamKind::Producer => "producer",
                         wire::LostStreamKind::Receiver => "receiver",
+                        wire::LostStreamKind::SourceTime => "source_time",
                     },
                 )
                 .with("source", stream.get_source()?.to_str()?)

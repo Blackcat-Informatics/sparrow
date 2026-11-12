@@ -73,7 +73,11 @@ pub struct SourceTimeProfile {
 }
 
 impl SourceTimeProfile {
-    fn new(source: &str, path: &str, representation: TimeRepresentation) -> Result<Self, Error> {
+    pub(super) fn new(
+        source: &str,
+        path: &str,
+        representation: TimeRepresentation,
+    ) -> Result<Self, Error> {
         if source.is_empty()
             || source.len() > 512
             || path.len() > 4096
@@ -398,13 +402,39 @@ pub(super) fn source_key(source: &str) -> String {
     format!("source-time:{}", super::source_summary::source_hash(source))
 }
 
+/// Whether the immutable source mapping registry has room for one more mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Admission {
+    Room,
+    /// 1024 mappings exist. Mappings are never removed, so this does not change.
+    Full,
+}
+
+impl Admission {
+    /// The refusal an explicit mapping declaration gets when the registry is full. A log
+    /// is never refused for this (#227); only a declaration is.
+    pub(super) fn full_refusal() -> Error {
+        Error::new(
+            "RESOURCE_LIMIT",
+            "source profile registry admits at most 1024 immutable mappings",
+        )
+    }
+
+    pub(super) fn or_refuse(self) -> Result<(), Error> {
+        match self {
+            Self::Room => Ok(()),
+            Self::Full => Err(Self::full_refusal()),
+        }
+    }
+}
+
 impl Writer {
     pub(super) fn admit_source_profile(
         &self,
         prefix: &str,
         encoded: &[u8],
         validate: impl Fn(&[u8], &[u8]) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+    ) -> Result<Admission, Error> {
         for (count, entry) in self.db.prefix_iterator(prefix).enumerate() {
             let (key, bytes) = entry?;
             if !key.starts_with(prefix.as_bytes()) {
@@ -412,10 +442,7 @@ impl Writer {
             }
             validate(&key, &bytes)?;
             if count == 1023 {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "source profile registry admits at most 1024 immutable mappings",
-                ));
+                return Ok(Admission::Full);
             }
         }
         if self
@@ -428,7 +455,55 @@ impl Writer {
                 "source profile exceeds physical control admission budget",
             ));
         }
-        Ok(())
+        Ok(Admission::Room)
+    }
+
+    /// Bind `profile` to its source. `None` means the registry is full: nothing was bound.
+    /// An identical existing mapping is returned; a different one conflicts.
+    pub(super) fn bind_time_profile(
+        &self,
+        profile: SourceTimeProfile,
+    ) -> Result<Option<SourceTimeProfile>, Error> {
+        let source = profile.source.as_str();
+        if let Some(previous) = self.time_profile(source)? {
+            if previous != profile {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "source time mapping is immutable; use a new logical source",
+                ));
+            }
+            return Ok(Some(previous));
+        }
+        let mut batch = WriteBatch::default();
+        let encoded = json::write_compact(&profile.encode());
+        let admission =
+            self.admit_source_profile("source-time:", encoded.as_bytes(), |key, bytes| {
+                let retained = SourceTimeProfile::decode(&parse(bytes)?)?;
+                if key != source_key(&retained.source).as_bytes() {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "source time registry key mismatch",
+                    ));
+                }
+                Ok(())
+            })?;
+        if admission == Admission::Full {
+            return Ok(None);
+        }
+        batch.put(source_key(source), encoded);
+        if profile.log_capture.is_some() {
+            let format = self
+                .db
+                .get("store_format")?
+                .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
+            batch.put(
+                "store_format",
+                super::writer_format::enable_log_time(&format)?,
+            );
+            batch.put(LOG_FENCE, super::log_time::LAW);
+        }
+        self.commit(batch)?;
+        Ok(Some(profile))
     }
 
     pub(super) fn validate_event_record(&self, record: &Record) -> Result<(), Error> {
@@ -520,43 +595,10 @@ impl Store {
     }
 
     fn bind_time_profile(&self, profile: SourceTimeProfile) -> Result<SourceTimeProfile, Error> {
-        let source = profile.source.as_str();
-        let writer = self.lock()?;
-        if let Some(previous) = writer.time_profile(source)? {
-            if previous != profile {
-                return Err(Error::new(
-                    "CONFLICT",
-                    "source time mapping is immutable; use a new logical source",
-                ));
-            }
-            return Ok(previous);
+        match self.lock()?.bind_time_profile(profile)? {
+            Some(bound) => Ok(bound),
+            None => Err(Admission::full_refusal()),
         }
-        let mut batch = WriteBatch::default();
-        let encoded = json::write_compact(&profile.encode());
-        writer.admit_source_profile("source-time:", encoded.as_bytes(), |key, bytes| {
-            let retained = SourceTimeProfile::decode(&parse(bytes)?)?;
-            if key != source_key(&retained.source).as_bytes() {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "source time registry key mismatch",
-                ));
-            }
-            Ok(())
-        })?;
-        batch.put(source_key(source), encoded);
-        if profile.log_capture.is_some() {
-            let format = writer
-                .db
-                .get("store_format")?
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "writer format missing"))?;
-            batch.put(
-                "store_format",
-                super::writer_format::enable_log_time(&format)?,
-            );
-            batch.put(LOG_FENCE, super::log_time::LAW);
-        }
-        writer.commit(batch)?;
-        Ok(profile)
     }
     /// Read a source declared immutable mapping, or explicit absence.
     pub fn time_profile(&self, source: &str) -> Result<Option<SourceTimeProfile>, Error> {

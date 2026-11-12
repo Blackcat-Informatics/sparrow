@@ -15622,6 +15622,127 @@ fn source_time_registry_has_an_exact_admission_ceiling() {
     );
 }
 
+/// INVARIANT (#227): the 1025th distinct source on the event route is taken, never refused.
+/// The old code answered a retryable RESOURCE_LIMIT, which made the client hold the batch and
+/// stall every batch behind it. The records carry unknown time (`no_profile`), the source's
+/// loss is counted by name, a retry of the same request returns the same artifact and counts
+/// nothing more, and a source that already has a mapping keeps it.
+#[test]
+fn event_batch_from_a_source_past_the_mapping_ceiling_is_taken_and_counted() {
+    use sparrow_core::{Durability, EventTime, LostStreamKind, ProducerBatch, TimeRepresentation};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for index in 0..1024 {
+        store
+            .define_time_profile(
+                &format!("source-{index}"),
+                "/event_time",
+                TimeRepresentation::UnixMillis,
+            )
+            .unwrap();
+    }
+    let events = b"{\"event_time\":1000}\n{\"event_time\":1001}\n";
+    let batch = ProducerBatch {
+        instance: [9; 16],
+        sequences: vec![1, 2],
+    };
+    let ingest = |request: &str, source: &str| {
+        store.ingest_events_with_intake(
+            request,
+            source,
+            events,
+            &batch,
+            None,
+            5,
+            Durability::Durable,
+        )
+    };
+    let taken = ingest("late", "overflow").unwrap();
+    assert_eq!(taken.record_ids.len(), 2);
+    for id in &taken.record_ids {
+        assert!(matches!(
+            store.record(id).unwrap().event_time,
+            EventTime::Unknown { ref reason, profile_id: None } if reason == "no_profile"
+        ));
+    }
+    assert!(store.time_profile("overflow").unwrap().is_none());
+    let loss = store.source_time_evidence_loss();
+    assert_eq!(loss.named.len(), 1);
+    let row = &loss.named[0];
+    assert_eq!(
+        (row.kind, row.source.as_str(), row.instance.as_str()),
+        (LostStreamKind::SourceTime, "overflow", "")
+    );
+    assert_eq!((row.batches, row.events), (1, 2));
+    assert_eq!(ingest("late", "overflow").unwrap().id, taken.id);
+    assert_eq!(store.source_time_evidence_loss().total_events, 2);
+    let mapped_batch = ProducerBatch {
+        instance: [9; 16],
+        sequences: vec![3, 4],
+    };
+    let mapped = store
+        .ingest_events_with_intake(
+            "mapped",
+            "source-0",
+            events,
+            &mapped_batch,
+            None,
+            6,
+            Durability::Durable,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.record(&mapped.record_ids[0]).unwrap().event_time,
+        EventTime::Known { millis: 1000, .. }
+    ));
+    assert_eq!(store.source_time_evidence_loss().total_events, 2);
+    assert_eq!(store.stream_evidence_loss().total_events, 0);
+}
+
+/// INVARIANT (#227): a producer batch that can never fit a bound is refused with the
+/// non-retryable INVALID_ARGUMENT, so the client quarantines it instead of holding it forever.
+/// The old code answered a retryable RESOURCE_LIMIT. Other callers keep RESOURCE_LIMIT.
+#[test]
+fn producer_batch_over_a_fixed_bound_is_refused_non_retryable() {
+    use sparrow_core::{Durability, ProducerBatch};
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.max_records = 1;
+    let store = Store::open(dir.path(), limits).unwrap();
+    let batch = ProducerBatch {
+        instance: [3; 16],
+        sequences: vec![1, 2],
+    };
+    let count = store
+        .ingest_producer(
+            "many",
+            "source",
+            b"{}\n{}\n",
+            &batch,
+            1,
+            Durability::Durable,
+        )
+        .unwrap_err();
+    assert_eq!(count.code, "INVALID_ARGUMENT");
+    let inline = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
+    let one = ProducerBatch {
+        instance: [3; 16],
+        sequences: vec![1],
+    };
+    let big = store
+        .ingest_producer("big", "source", &inline, &one, 1, Durability::Durable)
+        .unwrap_err();
+    assert_eq!(big.code, "INVALID_ARGUMENT");
+    assert_eq!(
+        store
+            .ingest("plain", "source", "log", b"a\nb\n", 1)
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert!(store.records(0).unwrap().is_empty());
+}
+
 #[test]
 fn source_time_registry_pressure_is_retryable_without_publishing_a_mapping() {
     use purrdf_lex::json::record::ToJson;

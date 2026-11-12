@@ -666,16 +666,18 @@ impl Store {
             return Ok(old);
         }
         let encoded = json::write_compact(&profile.encode());
-        writer.admit_source_profile("source-diagnostic:", encoded.as_bytes(), |key, bytes| {
-            let retained = DiagnosticProfile::decode(&parse(bytes)?)?;
-            if key != source_key(&retained.source).as_bytes() {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "diagnostic registry key mismatch",
-                ));
-            }
-            Ok(())
-        })?;
+        writer
+            .admit_source_profile("source-diagnostic:", encoded.as_bytes(), |key, bytes| {
+                let retained = DiagnosticProfile::decode(&parse(bytes)?)?;
+                if key != source_key(&retained.source).as_bytes() {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "diagnostic registry key mismatch",
+                    ));
+                }
+                Ok(())
+            })?
+            .or_refuse()?;
         let mut batch = WriteBatch::default();
         batch.put(source_key(source), encoded);
         writer.commit(batch)?;

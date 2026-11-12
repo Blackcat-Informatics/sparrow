@@ -240,6 +240,19 @@ fn read_chunk_range(
     Ok(result)
 }
 
+/// A bound this batch can never meet. An immutable producer batch is held by its client and
+/// retried, so a retryable `RESOURCE_LIMIT` would stall the producer behind it for a cause no
+/// retry changes (#227). It is answered `INVALID_ARGUMENT`, which the client quarantines.
+/// Other callers keep `RESOURCE_LIMIT`: they size their own input and some retry it.
+fn batch_bound(origin: ingest::Origin<'_>, message: impl Into<String>) -> Error {
+    let code = if origin.producer().is_some() {
+        "INVALID_ARGUMENT"
+    } else {
+        "RESOURCE_LIMIT"
+    };
+    Error::new(code, message)
+}
+
 fn validate_ingest_labels(request_id: &str, source: &str, format: &str) -> Result<(), Error> {
     if request_id.is_empty() || request_id.len() > 128 || source.is_empty() || source.len() > 512 {
         return Err(Error::new(
@@ -520,6 +533,7 @@ struct Unlocked {
     forced: Arc<forced_compaction::Forced>,
     /// Gap evidence lost to a full stream registry, counted per stream (#215).
     stream_evidence: stream_evidence::Ledger,
+    source_time_evidence: stream_evidence::Ledger,
     /// Files tailed without a stored checkpoint and registry rows retired for room (#224).
     tail_evidence: tail_evidence::Ledger,
 }
@@ -1691,6 +1705,7 @@ impl Store {
                 retention_waker,
                 forced: Arc::clone(&forced),
                 stream_evidence: stream_evidence::Ledger::default(),
+                source_time_evidence: stream_evidence::Ledger::default(),
                 tail_evidence: tail_evidence::Ledger::default(),
             }),
             inner: Arc::new(Mutex::new(Writer {
@@ -1889,6 +1904,38 @@ impl Store {
         self.ingest_producer_with_intake(request_id, source, bytes, producer, None, now, mode)
     }
 
+    /// Accept a batch on the daemon's event route: [`Store::ingest_producer_with_intake`], with
+    /// the source's `/event_time` (Unix milliseconds) mapping bound on first use. A full source
+    /// registry never refuses the batch (#227): it is stored with unknown time (`no_profile`),
+    /// and the records without a mapping are counted per source in
+    /// [`Store::source_time_evidence_loss`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the event batch, its intake provenance and its WAL boundary"
+    )]
+    pub fn ingest_events_with_intake(
+        &self,
+        request_id: &str,
+        source: &str,
+        bytes: &[u8],
+        producer: &producer_stream::ProducerBatch,
+        intake: Option<intake::Intake>,
+        now: u64,
+        mode: durability::Durability,
+    ) -> Result<Artifact, Error> {
+        producer.validate()?;
+        self.ingest_input(
+            request_id,
+            source,
+            "jsonl",
+            bytes,
+            ingest::Origin::Event(producer),
+            intake,
+            now,
+            mode,
+        )
+    }
+
     /// Accept typed events, recording the endpoint and caller that sent them.
     #[expect(
         clippy::too_many_arguments,
@@ -1941,8 +1988,8 @@ impl Store {
         }
         let writer = self.lock()?;
         if bytes.len() > INLINE_ARTIFACT_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(batch_bound(
+                origin,
                 "inline ingestion carries at most 16 MiB; stage a larger artifact through import_begin",
             ));
         }
@@ -1978,7 +2025,19 @@ impl Store {
         if intake.is_some() {
             intake::fence(&writer)?;
         }
-        let source_time_profile = writer.time_profile(source)?;
+        let mut source_time_profile = writer.time_profile(source)?;
+        let mut source_time_lost = false;
+        if origin.maps_event_time() {
+            // Binds an absent mapping, checks an existing one (a different mapping conflicts).
+            // A full registry never refuses the log (#227): the records carry unknown time.
+            let wanted = source_time::SourceTimeProfile::new(
+                source,
+                "/event_time",
+                source_time::TimeRepresentation::UnixMillis,
+            )?;
+            source_time_profile = writer.bind_time_profile(wanted)?;
+            source_time_lost = source_time_profile.is_none();
+        }
         let diagnostic_profile = writer.diagnostic_profile(source)?;
         let expires_at = now.checked_add(RETENTION_MS).ok_or_else(|| {
             Error::new(
@@ -1995,8 +2054,8 @@ impl Store {
             ));
         }
         if record_count > writer.config.max_records {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(batch_bound(
+                origin,
                 "artifact exceeds configured record count",
             ));
         }
@@ -2100,10 +2159,22 @@ impl Store {
             receiver.publish(&mut batch);
         }
         if batch.size_in_bytes() > 128 * 1024 * 1024 {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(batch_bound(
+                origin,
                 "atomic ingestion batch exceeds 128 MiB; split the import into smaller complete artifacts",
             ));
+        }
+        if origin.producer().is_some() {
+            // The write cannot fit the data budget even in an empty store: no retry helps.
+            pressure::data_write_ceiling(
+                writer.config.disk_budget,
+                writer.config.maintenance_reserve,
+                estimate,
+            )
+            .map_err(|error| match error.code {
+                "RESOURCE_LIMIT" => batch_bound(origin, error.message),
+                _ => error,
+            })?;
         }
         writer.apply(
             batch,
@@ -2127,6 +2198,14 @@ impl Store {
                 record_count as u64,
             );
         }
+        if source_time_lost {
+            self.unlocked.source_time_evidence.record(
+                stream_evidence::LostStreamKind::SourceTime,
+                source,
+                "",
+                record_count as u64,
+            );
+        }
         if let Some(input) = origin.receiver().filter(|_| receiver_lost) {
             self.unlocked.stream_evidence.record(
                 stream_evidence::LostStreamKind::Receiver,
@@ -2143,6 +2222,13 @@ impl Store {
     #[must_use]
     pub fn stream_evidence_loss(&self) -> stream_evidence::StreamEvidenceLoss {
         self.unlocked.stream_evidence.report()
+    }
+
+    /// Records stored with unknown time because the source mapping registry was full, per
+    /// source and bounded, since the store opened; it takes no writer lock (#227).
+    #[must_use]
+    pub fn source_time_evidence_loss(&self) -> stream_evidence::StreamEvidenceLoss {
+        self.unlocked.source_time_evidence.report()
     }
 
     /// Files tailed without a stored checkpoint and finished registry rows retired for room

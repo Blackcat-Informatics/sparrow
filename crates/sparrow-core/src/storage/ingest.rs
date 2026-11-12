@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 pub(super) enum Origin<'a> {
     Ordinary,
     Producer(&'a super::producer_stream::ProducerBatch),
+    /// A producer batch from the daemon's event route: like `Producer`, and the source's
+    /// `/event_time` mapping is bound on first use, or counted lost when the registry is full.
+    Event(&'a super::producer_stream::ProducerBatch),
     Receiver(&'a super::receiver_stream::SyslogReceiver),
     Tail(super::tail::Append<'a>),
 }
@@ -24,9 +27,12 @@ impl<'a> Origin<'a> {
     }
     pub(super) fn producer(self) -> Option<&'a super::producer_stream::ProducerBatch> {
         match self {
-            Self::Producer(value) => Some(value),
+            Self::Producer(value) | Self::Event(value) => Some(value),
             _ => None,
         }
+    }
+    pub(super) fn maps_event_time(self) -> bool {
+        matches!(self, Self::Event(_))
     }
     pub(super) fn tail(self) -> Option<super::tail::Append<'a>> {
         match self {
