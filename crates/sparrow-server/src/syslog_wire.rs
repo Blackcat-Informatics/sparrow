@@ -91,6 +91,19 @@ pub(crate) fn listener(
                 "timed_out_connections",
                 listener.get_timed_out_connections().to_string(),
             )
+            .with("held_frames", u64::from(listener.get_held_frames()))
+            .with(
+                "holds_storage_pressure",
+                listener.get_holds_storage_pressure().to_string(),
+            )
+            .with(
+                "holds_no_permit",
+                listener.get_holds_no_permit().to_string(),
+            )
+            .with(
+                "longest_hold_ms",
+                listener.get_longest_hold_ms().to_string(),
+            )
             .with("continuity_unknown", listener.get_continuity_unknown())
             .with("kernel_drops_unknown", listener.get_kernel_drops_unknown())
             .with("failure", failure),

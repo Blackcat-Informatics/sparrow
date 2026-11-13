@@ -2490,6 +2490,24 @@ stream or discards a frame:
   and writes again has that write reset by the daemon, and no counter sees it.
   On daemon shutdown a frame in flight is published as a malformed packet and
   counted `framing_failure`; bytes still unread in the socket cannot be counted.
+- When the store answers a TCP frame with `STORAGE_PRESSURE`, the frame is held,
+  not discarded, and the connection stays open (#243). The listener retries the
+  same bytes and reads no further frame, so the sender's TCP window closes and
+  the sender holds the rest. Pressure can last as long as reclamation takes. The
+  retry runs on a backoff from 50 ms to 1 s and starts at once when maintenance
+  signals that pressure may have changed: a pressure pass ending, a pin release,
+  an archive commit, a forced compaction ending or the free-space floor ending.
+  A held connection is not idle. The read timeout does not run while it holds,
+  and an arrival at the connection ceiling cannot reclaim it; it is reclaimed
+  only after its frame is stored and it waits at a frame boundary. A frame
+  waiting for an operation permit is held the same way. The daemon holds one
+  frame per connection: at most 65536 bytes plus its 4096-byte read buffer, so
+  at most 16 connections times that per listener. Arrivals the listener does not
+  accept wait in the kernel backlog; the existing pause of accepting below the
+  free-space floor is unchanged. On shutdown a hold ends: the frame gets one last
+  attempt and, if the store still refuses it, is counted `refused` as before.
+  Refusals that no retry can change (`RESOURCE_LIMIT`) and UDP datagrams are
+  not held; they keep their counted discard.
 
 Each accepted packet is one exact-byte `syslog` record, including embedded
 newlines. Its immutable profile records parsed RFC 5424 or RFC 3164 headers,
@@ -2506,7 +2524,13 @@ diagnostic without claiming successfully parsed header or parameter evidence.
 Status exposes configured and actual listener bindings, bounds, active TCP
 connections and observed successful publications, interpretation failures,
 refusals, cut packets (`truncated`), framing failures and timeouts. Connection
-refusals stay zero because an arrival at the ceiling is served.
+refusals stay zero because an arrival at the ceiling is served. Held frames add
+`held_frames` (frames held now), `holds_storage_pressure` and `holds_no_permit`
+(frames held at least once for that reason, each counted once however often it
+is retried) and `longest_hold_ms` (the longest hold, finished or running). They
+are the last four fields of the listener status, added without a schema bump.
+The daemon journals a line when a hold episode begins, at most once a minute,
+and when it ends, with the frames held and the longest wait.
 Counters are process-lifetime evidence and reset on restart. Successful counts
 follow durable store publication, but syslog provides no typed sender receipt.
 TCP sends therefore do not prove publication; UDP kernel/network loss remains

@@ -2421,6 +2421,7 @@ async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_pack
                 &config.syslog,
                 operations.clone(),
                 registry.clone(),
+                Default::default(),
             )
             .await
             .unwrap();
