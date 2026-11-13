@@ -5713,15 +5713,27 @@ fn pressure_admission_drives_bounded_retirement_and_waits_for_physical_capacity(
         )
         .unwrap();
     assert_eq!(store.pressure_status().unwrap().phase, PressurePhase::Ready);
+    // Value (#247): the refusal that requests a pass signals it at once, so the pass does not
+    // wait for its scheduled time; a refusal while the request stands does not signal again.
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    store.set_pressure_request_waker(Some(std::sync::Arc::new({
+        let requests = std::sync::Arc::clone(&requests);
+        move || {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    })));
     let ballast = dir.path().join("test-owned-pressure-ballast");
     std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
-    assert_eq!(
-        store
-            .ingest("pressure-refused", "source", "log", b"later\n", 4)
-            .unwrap_err()
-            .code,
-        "STORAGE_PRESSURE"
-    );
+    for attempt in ["pressure-refused", "pressure-refused-again"] {
+        assert_eq!(
+            store
+                .ingest(attempt, "source", "log", b"later\n", 4)
+                .unwrap_err()
+                .code,
+            "STORAGE_PRESSURE"
+        );
+    }
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     let requested = store.pressure_status().unwrap();
     assert_eq!(requested.phase, PressurePhase::Requested);
     assert!(requested.requested_bytes > 0);

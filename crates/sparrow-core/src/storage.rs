@@ -546,6 +546,8 @@ struct Unlocked {
     /// Told, without blocking, when a reclamation commit deleted an import journal, which is
     /// the moment its slot is free (#246).
     import_slot_waker: Mutex<Option<RetentionWaker>>,
+    /// The writer's pressure-request wake, shared so the owner can install it (#247).
+    pressure_request_waker: Arc<Mutex<Option<RetentionWaker>>>,
     /// The one compaction a stalled pressure wait may force.
     forced: Arc<forced_compaction::Forced>,
     /// Gap evidence lost to a full stream registry, counted per stream (#215).
@@ -632,6 +634,9 @@ struct Writer {
     config: Config,
     space: space::SpaceFloor,
     forced: Arc<forced_compaction::Forced>,
+    /// Told when a refused write moves the pressure state from ready to requested, so the
+    /// pass that starts relief runs at once instead of at its next scheduled time (#247).
+    pressure_request_waker: Arc<Mutex<Option<RetentionWaker>>>,
     /// Set while a pressure pass commits reclamation, which the floor does not gate.
     reclaiming: std::cell::Cell<bool>,
     durability: writer_queue::Observed<durability::State>,
@@ -1709,6 +1714,7 @@ impl Store {
         );
         let retention_waker = Arc::new(Mutex::new(None));
         let forced = forced_compaction::Forced::new(Arc::clone(&retention_waker));
+        let pressure_request_waker = Arc::new(Mutex::new(None));
         let mut store = Self {
             id: Arc::from(id.as_str()),
             open_files,
@@ -1727,6 +1733,7 @@ impl Store {
                 backup: backup::Slot::default(),
                 retention_waker,
                 import_slot_waker: Mutex::new(None),
+                pressure_request_waker: Arc::clone(&pressure_request_waker),
                 forced: Arc::clone(&forced),
                 stream_evidence: stream_evidence::Ledger::default(),
                 source_time_evidence: stream_evidence::Ledger::default(),
@@ -1738,6 +1745,7 @@ impl Store {
                 config,
                 space,
                 forced,
+                pressure_request_waker,
                 reclaiming: std::cell::Cell::new(false),
                 durability,
                 pressure,
@@ -2899,6 +2907,15 @@ impl Store {
     /// must not block.
     pub fn set_import_slot_waker(&self, waker: Option<RetentionWaker>) {
         if let Ok(mut slot) = self.unlocked.import_slot_waker.lock() {
+            *slot = waker;
+        }
+    }
+
+    /// Install, or with `None` remove, the callback run when a refused write requests a
+    /// pressure pass (the state moves from ready to requested). It runs on the writing
+    /// thread under the writer lock, so it must not block.
+    pub fn set_pressure_request_waker(&self, waker: Option<RetentionWaker>) {
+        if let Ok(mut slot) = self.unlocked.pressure_request_waker.lock() {
             *slot = waker;
         }
     }
