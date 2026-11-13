@@ -1,0 +1,18 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 7aa7bab5aa0ace2e09fb4396199c628655f7c0dc
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 261
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/261
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: f0d1d29acb392e051e4e2c44ea93b3177eb7cc8d
+GhpRsq-Head-Ref: paudley/259-agents-md-four-guiding-principles-near
+GhpRsq-Head-OID: 7aa7bab5aa0ace2e09fb4396199c628655f7c0dc
+GhpRsq-Result-Tree: f2027665da9a658c2819e3f7c0301cee3279e9e4
+GhpRsq-Result-Commit: 14d6fb7ddb23ee472677313370748ab563fea654
+GhpRsq-Parent-Hashes: 7aa7bab5aa0ace2e09fb4396199c628655f7c0dc
+GhpRsq-Squash-Notes-SHA256: 5f09dffb59c17af676c28ca5b3d1782549e3022b2434553e90f867820dd78f75
+GhpRsq-Stage-Evidence: none
