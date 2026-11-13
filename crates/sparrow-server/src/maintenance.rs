@@ -323,6 +323,8 @@ mod skips {
         static EXPIRY: Cell<u64> = const { Cell::new(0) };
         static MIGRATE: Cell<u64> = const { Cell::new(0) };
         static EXPIRED: Cell<u64> = const { Cell::new(0) };
+        static RECLAIM_TICKS: Cell<u64> = const { Cell::new(0) };
+        static RECLAIM_WAKES: Cell<u64> = const { Cell::new(0) };
         static RECLAIM: Cell<u64> = const { Cell::new(0) };
         static RECLAIM_OBSERVED: Cell<u64> = const { Cell::new(0) };
     }
@@ -334,6 +336,24 @@ mod skips {
 
     pub(super) fn reclaim_observed() -> u64 {
         RECLAIM_OBSERVED.with(Cell::get)
+    }
+
+    /// A reclaim pass was started by the interval tick (`false`) or by a wake (`true`).
+    pub(super) fn reclaim_started(woken: bool) {
+        let counter = if woken {
+            &RECLAIM_WAKES
+        } else {
+            &RECLAIM_TICKS
+        };
+        counter.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn reclaim_ticks() -> u64 {
+        RECLAIM_TICKS.with(Cell::get)
+    }
+
+    pub(super) fn reclaim_wakes() -> u64 {
+        RECLAIM_WAKES.with(Cell::get)
     }
 
     /// An expiry pass finished and scheduled the next one.
@@ -385,9 +405,10 @@ async fn run(
     // that requests a pressure pass wakes the pass the same way instead of waiting for its
     // next scheduled time.
     let migrate_wake = Arc::new(Notify::new());
-    // An explicit import cancel ends a lease the reclamation duty then deletes; the cancel
-    // wakes it at once. The one-second interval stays as the observer of leases that merely
-    // expire, which have no event (#249).
+    // An explicit import cancel and a publication each make a journal reclaimable; the store
+    // wakes this duty at once (#249). The duty's one-second interval stays only as the
+    // observer of a lease that merely expires, which has no event, and the floor's resume
+    // edge below wakes a pass that was skipped below the floor.
     let reclaim_wake = Arc::new(Notify::new());
     store.set_import_reclaim_waker(Some(Arc::new({
         let reclaim_wake = Arc::clone(&reclaim_wake);
@@ -399,7 +420,9 @@ async fn run(
             let wake = Arc::clone(&wake);
             let pressure_wake = Arc::clone(&pressure_wake);
             let migrate_wake = Arc::clone(&migrate_wake);
+            let reclaim_wake = Arc::clone(&reclaim_wake);
             move || {
+                reclaim_wake.notify_one();
                 wake.notify_one();
                 pressure_wake.notify_one();
                 migrate_wake.notify_one();
@@ -461,8 +484,16 @@ async fn run(
                     _ = flush.tick() => Ok(Job::Flush),
                     _ = tokio::time::sleep_until(pressure_at) => Ok(Job::Pressure),
                     _ = pressure_wake.notified() => Ok(Job::Pressure),
-                    _ = reclaim.tick() => Ok(Job::Reclaim),
-                    _ = reclaim_wake.notified() => Ok(Job::Reclaim),
+                    _ = reclaim.tick() => {
+                        #[cfg(test)]
+                        skips::reclaim_started(false);
+                        Ok(Job::Reclaim)
+                    }
+                    _ = reclaim_wake.notified() => {
+                        #[cfg(test)]
+                        skips::reclaim_started(true);
+                        Ok(Job::Reclaim)
+                    }
                     _ = recompress.tick() => Ok(Job::Recompress),
                     _ = leases.tick() => Ok(Job::Leases),
                     _ = tokio::time::sleep_until(expiry_at), if !continuation => Ok(Job::Expiry),
@@ -677,56 +708,107 @@ mod tests {
         assert_eq!(store.artifact(&artifact.id).unwrap_err().code, "NOT_FOUND");
     }
 
-    /// INVARIANT (#183, #249): a finished import frees its slot within seconds even though
-    /// complete expiry traversals pause for a minute, and an explicit cancel wakes the
-    /// reclamation duty itself instead of waiting for its interval. The test waits on the
-    /// event the daemon's begin-import waiters wait on: the reclamation commit that deleted
-    /// the journal signals the import slot waker. No sleep, no poll.
+    /// INVARIANT (#183, #249): an import's slot is freed by an event, not by the one-second
+    /// interval. Three events make a journal reclaimable and each must reach the worker's
+    /// reclaim arm: an explicit cancel, a publication, and the free-space floor's resume edge
+    /// for a pass the pause skipped. The test waits on the event the daemon's begin-import
+    /// waiters wait on (the reclamation commit signals the import slot waker), and reads which
+    /// source started each reclaim pass: the interval's tick or the wake. A freed slot with no
+    /// wake-started pass means the interval did the work, so removing the worker's wake arm,
+    /// the waker's install, the callback, or the resume edge's notification fails it.
     #[tokio::test]
-    async fn import_journals_are_reclaimed_between_expiry_sweeps() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("store");
-        let path =
-            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
-        let store = sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap();
-        let freed = Arc::new(Notify::new());
-        store.set_import_slot_waker(Some(Arc::new({
-            let freed = Arc::clone(&freed);
-            move || freed.notify_one()
-        })));
-        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
-        let input = b"cancelled import";
-        let payload = format!(
-            "blake3:{}",
-            purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
-        );
-        let now = sparrow_server::now().unwrap();
-        let manifest = store
-            .import_begin(
-                "cancelled",
-                "source",
-                "opaque",
-                input.len() as u64,
-                &payload,
-                now,
-            )
-            .unwrap();
-        store.import_cancel(&manifest.id, now).unwrap();
-        // The bound only reports a slot that was never freed; it ends no wait that succeeds.
-        tokio::time::timeout(Duration::from_secs(30), freed.notified())
-            .await
-            .expect("the cancelled import's slot was never freed");
-        assert_eq!(
-            store
-                .import_get(&manifest.id, sparrow_server::now().unwrap())
-                .unwrap_err()
-                .code,
-            "NOT_FOUND"
-        );
-        worker.shutdown().await.unwrap();
+    async fn an_import_slot_is_freed_by_a_wake_and_not_by_the_interval() {
+        for case in ["cancel", "publish", "resume"] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let path = sparrow_test_support::write_server_config(
+                dir.path(),
+                &data,
+                &data.join("rpc.sock"),
+            );
+            let store = sparrow_server::ServerConfig::read(&path)
+                .unwrap()
+                .open_store()
+                .unwrap();
+            let freed = Arc::new(Notify::new());
+            store.set_import_slot_waker(Some(Arc::new({
+                let freed = Arc::clone(&freed);
+                move || freed.notify_one()
+            })));
+            let input = b"one\n";
+            let digest = format!(
+                "blake3:{}",
+                purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+            );
+            let now = sparrow_server::now().unwrap();
+            let staged = store
+                .import_begin(case, "source", "log", 4, &digest, now)
+                .unwrap();
+            let floor = store.space_floor();
+            if case == "resume" {
+                // Ended before the worker exists, so no wake is sent; the pause then skips the
+                // worker's first reclaim pass.
+                store.import_cancel(&staged.id, now).unwrap();
+                floor.set_free_for_tests(Some(0));
+                assert!(floor.observe(now).unwrap().is_some());
+            }
+            let (ticks, skipped, expired, skipped_expiry) = (
+                skips::reclaim_ticks(),
+                skips::reclaim(),
+                skips::expired(),
+                skips::expiry(),
+            );
+            let worker =
+                Worker::start(store.clone(), Duration::from_secs(3600), Default::default());
+            // The first reclaim tick and the first expiry pass (which also reclaims imports)
+            // are ready at once and have run; after them only an event or the interval, a
+            // second away, can start a reclaim pass. A pass the pause skipped counts too.
+            let first_passes_ran = || {
+                if case == "resume" {
+                    skips::reclaim() > skipped && skips::expiry() > skipped_expiry
+                } else {
+                    skips::reclaim_ticks() > ticks && skips::expired() > expired
+                }
+            };
+            let began = std::time::Instant::now();
+            while !first_passes_ran() {
+                assert!(
+                    began.elapsed() < Duration::from_secs(30),
+                    "{case}: the first passes never ran"
+                );
+                tokio::task::yield_now().await;
+            }
+            let wakes = skips::reclaim_wakes();
+            match case {
+                "cancel" => store.import_cancel(&staged.id, now).unwrap(),
+                "publish" => {
+                    store.import_append(&staged.id, 0, input, now).unwrap();
+                    store.import_seal(&staged.id, now).unwrap();
+                    store.import_prepare_layout(&staged.id, now).unwrap();
+                    store.import_prepare_record(&staged.id, 0, now).unwrap();
+                    store.import_publish(&staged.id, now).unwrap();
+                }
+                _ => {
+                    floor.set_free_for_tests(None);
+                    assert!(floor.observe(now).unwrap().is_none());
+                }
+            }
+            // The bounds only report a slot never freed or a reclaim pass no wake started; they
+            // end no wait that succeeds. On the resume edge the expiry pass is woken beside the
+            // reclaim pass and may free the slot first, so the wake-started pass is awaited too.
+            tokio::time::timeout(Duration::from_secs(30), freed.notified())
+                .await
+                .unwrap_or_else(|_| panic!("{case}: the import slot was never freed"));
+            let began = std::time::Instant::now();
+            while skips::reclaim_wakes() == wakes {
+                assert!(
+                    began.elapsed() < Duration::from_secs(30),
+                    "{case}: no reclaim pass was started by a wake"
+                );
+                tokio::task::yield_now().await;
+            }
+            worker.shutdown().await.unwrap();
+        }
     }
 
     /// INVARIANT (#183): after a pass that leaves nothing due the worker sleeps until the next

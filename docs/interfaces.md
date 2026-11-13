@@ -2470,10 +2470,12 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   free, under one bound of 3 seconds that covers the whole call, including any wait for
   an operation permit (which is capped at the time left); no attempt starts once the
   bound has passed. A slot frees when a reclamation commit deletes a journal (a
-  published, cancelled or expired import). An explicit cancel ends the lease and wakes the
-  maintenance reclamation duty at once, which performs the deletion; a lease that merely
-  expires has no event, so the duty's existing one-second interval is the named observer of
-  lease expiry and nothing else. The deletion commit signals the waiters; a pass
+  published, cancelled or expired import). An explicit cancel and a publication each wake
+  the maintenance reclamation duty at once, which performs the deletion, and the free-space
+  floor's resume edge wakes a pass the pause skipped. A lease that merely expires has no
+  event, so the duty's existing one-second interval is the named observer of lease expiry
+  and nothing else. Each wake also gives held syslog frames one extra evaluation, which is
+  harmless. The deletion commit signals the waiters; a pass
   that deletes nothing signals nobody, and nothing retries on a clock. The wait also
   ends at shutdown, or at the bound, and then answers the same `RESOURCE_LIMIT`. It
   holds no permit while it waits.
@@ -2565,8 +2567,8 @@ stream or discards a frame:
   frame blocks on a wake, the stop and nothing else (#247): it owns no timer and
   never retries on a clock. A frame waiting for an operation permit blocks on the
   permit and on the observer tick below, which only lets the journal announce a wait that
-  outlasts its report interval; the wait keeps its place in the queue. Every ending the daemon can see sends the wake, and one observer
-  covers the two it cannot:
+  outlasts its report interval; the wait keeps its place in the queue. Every ending the
+  daemon can see sends the wake, and one observer covers the two it cannot:
 
   | Ending | Signal | Observer |
   | --- | --- | --- |
@@ -2578,7 +2580,8 @@ stream or discards a frame:
   | Native flush or compaction work completes | none exists; the store has no listener | the same one-second observation |
   | Stop | the stop channel | event |
   | An operation permit frees | the semaphore | event |
-  | An explicit import cancel ends a lease | wake from the store to the reclamation duty, which deletes the journal and signals the import slot | event |
+  | An explicit import cancel, or a publication, makes a journal reclaimable | wake from the store to the reclamation duty, which deletes the journal and signals the import slot | event |
+  | The floor resumes after a reclaim pass was skipped below it | the resume edge wakes the reclamation duty | event |
   | An import lease expires | none exists (time passing is the event) | the reclamation duty's one-second interval, for lease expiry only |
   | A hold's report interval passes (announcing a long hold) | none exists | the same one-second observation, for a permit wait; a pressure hold announces on each wake |
 

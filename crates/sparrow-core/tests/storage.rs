@@ -7602,9 +7602,9 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
 
 /// INVARIANT (#246, #249): the import slot waker runs when a reclamation commit deletes an
 /// import journal, which is when its slot is free, and not for a pass that frees nothing.
-/// The import reclaim waker runs when an explicit cancel has committed (the lease just
-/// ended, so the reclamation duty has work), not for a refused cancel and not for the
-/// reclamation itself. Without it a cancelled import's slot waits for the duty's interval.
+/// The import reclaim waker runs when an explicit cancel or a publication has committed
+/// (the journal is reclaimable, so the reclamation duty has work), not for a refused
+/// cancel, a retried publish, or the reclamation itself. Without it a cancelled import's slot waits for the duty's interval.
 #[test]
 fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7658,6 +7658,25 @@ fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
         1,
         "an empty pass wakes nobody"
     );
+
+    // A publication makes its journal reclaimable too, and wakes reclaim once.
+    let one = b"one\n";
+    let staged = store
+        .import_begin("slot-publish", "source", "log", 4, &digest, DAY)
+        .unwrap();
+    store.import_append(&staged.id, 0, one, DAY).unwrap();
+    store.import_seal(&staged.id, DAY).unwrap();
+    store.import_prepare_layout(&staged.id, DAY).unwrap();
+    store.import_prepare_record(&staged.id, 0, DAY).unwrap();
+    store.import_publish(&staged.id, DAY).unwrap();
+    assert_eq!(
+        cancels.load(Ordering::SeqCst),
+        2,
+        "the publish wakes reclaim"
+    );
+    // A retried publish changes nothing and wakes nobody.
+    store.import_publish(&staged.id, DAY).unwrap();
+    assert_eq!(cancels.load(Ordering::SeqCst), 2);
 }
 
 #[test]
