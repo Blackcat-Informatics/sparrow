@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 .DEFAULT_GOAL := check
-.PHONY: all check tools-check fmt fmt-check lint test census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
+.PHONY: all check tools-check fmt fmt-check lint test check-shipped census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
 
 all: check
-check: tools-check fmt-check lint test census-check
+check: tools-check fmt-check lint check-shipped test census-check
 
 # Select both executable artifacts explicitly after verification hooks. Some
 # managed Cargo targets may republish unselected artifacts from another lease.
@@ -41,6 +41,14 @@ lint:
 
 test:
 	cargo test --locked --release --workspace
+
+# The workspace gates unify features, so sparrow-core's test-support feature is on in them and
+# hides warnings a shipped build hits. Check each shipped crate on its own, one cargo invocation
+# per crate so no other package's features unify in, with warnings denied and no test-support.
+check-shipped:
+	cargo clippy --locked --release -p sparrow-core --lib -- -D warnings
+	cargo clippy --locked --release -p sparrow-client --lib -- -D warnings
+	cargo clippy --locked --release -p sparrow-server --lib --bins -- -D warnings
 
 # The census defaults to the workspace its binary was compiled in. A shared
 # compile cache can reuse a binary built in another checkout, so name this one.

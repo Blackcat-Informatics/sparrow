@@ -72,7 +72,8 @@ rules in this file or a direct word from Patrick.
 - Prefer the smallest coherent design. Add abstractions and dependencies only
   when the concrete problem warrants them.
 - Use focused checks during development and run `make check` before completion.
-  It checks formatting, release-profile Clippy with warnings denied, release
+  It checks formatting, release-profile Clippy with warnings denied, each
+  shipped crate on its own without test-support (`make check-shipped`), release
   tests, seeded census self-tests, and the pinned cross-workspace gate.
   `make all` is the same gate. Repeat checks when relevant changes or unresolved
   failures justify it; there is no fixed review count.
