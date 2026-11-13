@@ -150,6 +150,8 @@ pub(crate) struct Status {
     next_hold: u64,
     episode: Option<Episode>,
     announced_at: Option<tokio::time::Instant>,
+    /// Receive buffer and kernel drop counter; present for a UDP listener started by the worker.
+    kernel: Option<crate::udp_kernel::Kernel>,
 }
 #[derive(Clone)]
 struct Metrics(Arc<Mutex<Status>>);
@@ -167,6 +169,57 @@ impl Metrics {
             .lock()
             .map_err(|_| io::Error::other("syslog status poisoned"))?
             .clone())
+    }
+    /// Read the kernel drop counter now. Called only at events: a status request and the reader
+    /// leaving a wait.
+    ///
+    /// The file read happens on a copy of the kernel evidence, outside the status mutex, so a
+    /// slow read never holds up the counters the intake paths update. A read is one small file
+    /// whose size follows the UDP sockets of the network namespace, taken once per event. It
+    /// stays a plain read on the calling thread because every caller is a synchronous status
+    /// path or the reader itself, which has just left a wait.
+    fn sample_kernel(&self) -> io::Result<()> {
+        let Some(kernel) = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog status poisoned"))?
+            .kernel
+            .clone()
+            .filter(|kernel| !kernel.finished)
+        else {
+            return Ok(());
+        };
+        let counter = kernel.read();
+        self.update(|status| {
+            if let Some(kernel) = status.kernel.as_mut() {
+                kernel.record(counter);
+            }
+            Ok(())
+        })
+    }
+    /// Take the last sample while the socket is open, freeze the count and journal it.
+    fn finish_kernel(&self) -> io::Result<()> {
+        let mut line = None;
+        self.update(|status| {
+            if let Some(kernel) = status.kernel.as_mut() {
+                kernel.finish();
+                line = Some(match &kernel.counter {
+                    crate::udp_kernel::Counter::Available(drops) => format!(
+                        "sparrowd: syslog listener {}: stopped; the kernel dropped {drops} datagram(s) for this socket (final count)",
+                        status.definition.id
+                    ),
+                    crate::udp_kernel::Counter::Unavailable(reason) => format!(
+                        "sparrowd: syslog listener {}: stopped; the kernel drop count is unavailable: {reason}",
+                        status.definition.id
+                    ),
+                });
+            }
+            Ok(())
+        })?;
+        if let Some(line) = line {
+            journal(&line);
+        }
+        Ok(())
     }
 }
 impl Status {
@@ -186,6 +239,7 @@ impl Status {
             next_hold: 0,
             episode: None,
             announced_at: None,
+            kernel: None,
         }
     }
 
@@ -370,17 +424,31 @@ fn increment(counter: &mut u64) -> io::Result<()> {
 #[derive(Clone, Default)]
 pub struct SyslogRegistry(Arc<Mutex<Vec<Metrics>>>);
 impl SyslogRegistry {
+    /// Every listener's status, reading each UDP kernel counter now: this is a status request.
     pub(crate) fn snapshot(&self) -> io::Result<Vec<Status>> {
-        self.0
-            .lock()
-            .map_err(|_| io::Error::other("syslog registry poisoned"))?
+        // The registry mutex is released before any /proc read.
+        self.listeners()?
             .iter()
-            .map(Metrics::snapshot)
+            .map(|metrics| {
+                metrics.sample_kernel()?;
+                metrics.snapshot()
+            })
             .collect()
     }
-    pub(crate) fn sources(&self) -> io::Result<Vec<sparrow_core::SourceSyslogBinding>> {
+    fn listeners(&self) -> io::Result<Vec<Metrics>> {
         Ok(self
-            .snapshot()?
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog registry poisoned"))?
+            .clone())
+    }
+    pub(crate) fn sources(&self) -> io::Result<Vec<sparrow_core::SourceSyslogBinding>> {
+        // Ids only: no kernel counter is read.
+        Ok(self
+            .listeners()?
+            .iter()
+            .map(Metrics::snapshot)
+            .collect::<io::Result<Vec<_>>>()?
             .into_iter()
             .map(|status| sparrow_core::SourceSyslogBinding {
                 source: status.definition.source,
@@ -415,6 +483,7 @@ impl SyslogWorker {
         let mut sockets = Vec::new();
         let mut metrics = Vec::new();
         for definition in definitions {
+            let mut kernel = None;
             let (socket, address) = match definition.transport {
                 SyslogTransport::Tcp => {
                     let socket = TcpListener::bind(definition.address).await?;
@@ -424,10 +493,44 @@ impl SyslogWorker {
                 SyslogTransport::Udp => {
                     let socket = UdpSocket::bind(definition.address).await?;
                     let address = socket.local_addr()?;
+                    let buffer = crate::udp_kernel::request_buffer(
+                        &socket,
+                        crate::udp_kernel::REQUESTED_RCVBUF_BYTES,
+                    )
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("syslog listener {}: {error}", definition.id),
+                        )
+                    })?;
+                    let rmem_max = crate::udp_kernel::rmem_max()
+                        .map_or_else(|| "unreadable".to_owned(), |limit| limit.to_string());
+                    // A refused enlarge does not stop the daemon taking syslog: it keeps the
+                    // default buffer and says so, here and in status.
+                    journal(&match &buffer.enlarge_error {
+                        None => format!(
+                            "sparrowd: syslog listener {}: receive buffer requested {} bytes, kernel granted {} bytes (net.core.rmem_max {rmem_max})",
+                            definition.id, buffer.requested, buffer.granted,
+                        ),
+                        Some(error) => format!(
+                            "sparrowd: syslog listener {}: receive buffer enlarge failed: {error}; keeping the default buffer of {} bytes (requested {} bytes, net.core.rmem_max {rmem_max})",
+                            definition.id, buffer.granted, buffer.requested,
+                        ),
+                    });
+                    kernel = Some(
+                        crate::udp_kernel::Kernel::new(&socket, address, buffer).map_err(
+                            |error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("syslog listener {}: {error}", definition.id),
+                                )
+                            },
+                        )?,
+                    );
                     (Socket::Udp(socket), address)
                 }
             };
-            let metric = Metrics(Arc::new(Mutex::new(Status::new(
+            let mut status = Status::new(
                 sparrow_core::SyslogReceiver::new(
                     &definition.id,
                     match (definition.transport, definition.framing) {
@@ -443,7 +546,9 @@ impl SyslogWorker {
                 .map_err(io::Error::other)?,
                 definition.clone(),
                 address,
-            ))));
+            );
+            status.kernel = kernel;
+            let metric = Metrics(Arc::new(Mutex::new(status)));
             sockets.push((socket, metric.clone()));
             metrics.push(metric);
         }
@@ -797,6 +902,7 @@ async fn listen(
             // A UDP payload never exceeds 65507 bytes, under the store's ceiling, so a whole datagram
             // always fits and nothing is cut; `max_message_bytes` frames TCP lines only.
             let mut buffer = vec![0; sparrow_core::SYSLOG_MESSAGE_BYTES];
+            let serving: io::Result<()> = async {
             loop {
                 if *stop.borrow() {
                     break;
@@ -810,6 +916,8 @@ async fn listen(
                         sparrow_core::ReceiverDiscard::Refused,
                     )
                     .await?;
+                    // The reader has left a wait; datagrams may have been dropped meanwhile.
+                    metrics.sample_kernel()?;
                     continue;
                 };
                 publish(
@@ -823,6 +931,12 @@ async fn listen(
                 drop(permit);
             }
             Ok(())
+            }.await;
+            // The last sample, taken while the socket is open and then frozen, whether the loop
+            // ended by stop or by an error: the socket's row leaves the table when it closes, and
+            // a later status request must still show this count as final.
+            let finished = metrics.finish_kernel();
+            serving.and(finished)
         }
     }
 }
@@ -1254,10 +1368,55 @@ impl Status {
         out.set_rejected_connections(0);
         out.set_timed_out_connections(self.counts.timed_out);
         out.set_continuity_unknown(true);
-        out.set_kernel_drops_unknown(self.definition.transport == SyslogTransport::Udp);
+        self.encode_kernel(out.reborrow());
         match &self.failure {
             Some(value) => out.init_failure().set_value(value),
             None => out.init_failure().set_absent(()),
+        }
+    }
+
+    /// The UDP kernel evidence. A count is written only when it was read; otherwise the count is
+    /// zero, `kernel_drops_unknown` is set and the reason is stated.
+    fn encode_kernel(&self, mut out: crate::sparrow_capnp::syslog_listener_status::Builder<'_>) {
+        use crate::sparrow_capnp::KernelCounterState;
+        use crate::udp_kernel::Counter;
+        if self.definition.transport != SyslogTransport::Udp {
+            out.set_kernel_drops_unknown(false);
+            out.set_kernel_counter_state(KernelCounterState::NotApplicable);
+            out.reborrow().init_kernel_counter_reason().set_absent(());
+            out.init_rcvbuf_enlarge_error().set_absent(());
+            return;
+        }
+        let unattached =
+            Counter::Unavailable("no kernel counter is attached to this listener".into());
+        let counter = self
+            .kernel
+            .as_ref()
+            .map_or(&unattached, |kernel| &kernel.counter);
+        if let Some(kernel) = &self.kernel {
+            out.set_rcvbuf_requested_bytes(kernel.buffer.requested as u64);
+            out.set_rcvbuf_granted_bytes(kernel.buffer.granted as u64);
+            out.set_kernel_counter_final(kernel.finished);
+            match &kernel.buffer.enlarge_error {
+                Some(error) => {
+                    out.set_rcvbuf_enlarge_failures(1);
+                    out.reborrow().init_rcvbuf_enlarge_error().set_value(error);
+                }
+                None => out.reborrow().init_rcvbuf_enlarge_error().set_absent(()),
+            }
+        }
+        match counter {
+            Counter::Available(drops) => {
+                out.set_kernel_drops_unknown(false);
+                out.set_kernel_drops(*drops);
+                out.set_kernel_counter_state(KernelCounterState::Available);
+                out.init_kernel_counter_reason().set_absent(());
+            }
+            Counter::Unavailable(reason) => {
+                out.set_kernel_drops_unknown(true);
+                out.set_kernel_counter_state(KernelCounterState::Unavailable);
+                out.init_kernel_counter_reason().set_value(reason);
+            }
         }
     }
 }
@@ -1976,6 +2135,169 @@ mod tests {
             reader.get_longest_hold_ms(),
             crate::syslog_wire::listener(reader).unwrap(),
         )
+    }
+
+    /// The listener's JSON rendering after the wire encoding, as status shows it.
+    fn status_json(status: &Status) -> purrdf_lex::json::Value {
+        wire_fields(status).2
+    }
+
+    /// Value (#254): status states the receive buffer and the kernel drop count of a UDP
+    /// listener through the wire and its JSON, and a TCP listener states neither applies.
+    #[test]
+    fn udp_status_carries_buffer_sizes_and_the_kernel_drop_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 16 << 20,
+            enlarge_error: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("udp");
+        std::fs::write(
+            &table,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n  1: 0100007F:0202 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 777 2 0000000000000000 42\n",
+        )
+        .unwrap();
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(table, 777, buffer));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["rcvbuf_requested_bytes"].as_str(), Some("8388608"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("16777216"));
+        assert_eq!(json["kernel_drops"].as_str(), Some("42"));
+        assert_eq!(json["kernel_counter_state"].as_str(), Some("available"));
+        assert_eq!(json["kernel_drops_unknown"].as_bool(), Some(false));
+        let tcp = status_json(
+            &listener(SyslogTransport::Tcp, 1, 1000)
+                .metrics
+                .snapshot()
+                .unwrap(),
+        );
+        assert_eq!(tcp["kernel_counter_state"].as_str(), Some("not_applicable"));
+        assert_eq!(tcp["kernel_drops_unknown"].as_bool(), Some(false));
+    }
+
+    /// Value (#254): when the kernel counter cannot be read (a unit hiding /proc/self/net, a
+    /// missing file) status says unavailable with the reason, flags the drops unknown and
+    /// reports no count, so an operator never reads a guessed zero as "no loss".
+    #[test]
+    fn an_unreadable_kernel_counter_is_reported_unavailable_with_no_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 425_984,
+            enlarge_error: None,
+        };
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(
+                    dir.path().join("hidden"),
+                    777,
+                    buffer,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["kernel_counter_state"].as_str(), Some("unavailable"));
+        assert_eq!(json["kernel_drops_unknown"].as_bool(), Some(true));
+        assert_eq!(json["kernel_drops"].as_str(), Some("0"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("425984"));
+        assert!(
+            json["kernel_counter_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("hidden"))
+        );
+    }
+
+    /// Value (#254): the count is read at the events, not at bind. A status request through the
+    /// registry must pick up drops that happened since the last read, and once the listener has
+    /// stopped its final count must survive later status requests even though the closed
+    /// socket's row has left the kernel table. Both would be silently wrong otherwise: a stale
+    /// zero marked available, or a lost count.
+    #[test]
+    fn a_status_request_rereads_the_counter_and_a_stopped_listener_keeps_its_final_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("udp");
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+        let row = |drops: u64| {
+            format!(
+                "  1: 0100007F:0202 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 777 2 0000000000000000 {drops}\n"
+            )
+        };
+        std::fs::write(&table, format!("{header}{}", row(5))).unwrap();
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 16 << 20,
+            enlarge_error: None,
+        };
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(table.clone(), 777, buffer));
+                Ok(())
+            })
+            .unwrap();
+        let registry = SyslogRegistry::default();
+        registry.0.lock().unwrap().push(udp.metrics.clone());
+        let drops = |registry: &SyslogRegistry| {
+            let status = registry.snapshot().unwrap().remove(0);
+            let kernel = status.kernel.clone().unwrap();
+            (kernel.counter, kernel.finished, status_json(&status))
+        };
+        assert_eq!(drops(&registry).0, crate::udp_kernel::Counter::Available(5));
+        std::fs::write(&table, format!("{header}{}", row(9))).unwrap();
+        assert_eq!(drops(&registry).0, crate::udp_kernel::Counter::Available(9));
+        // The reader stops; the socket closes and its row leaves the table.
+        std::fs::write(&table, format!("{header}{}", row(12))).unwrap();
+        udp.metrics.finish_kernel().unwrap();
+        std::fs::write(&table, header).unwrap();
+        let (counter, finished, json) = drops(&registry);
+        assert_eq!(counter, crate::udp_kernel::Counter::Available(12));
+        assert!(finished);
+        assert_eq!(json["kernel_drops"].as_str(), Some("12"));
+        assert_eq!(json["kernel_counter_final"].as_bool(), Some(true));
+        assert!(
+            printed::lines()
+                .iter()
+                .any(|line| line.contains("final count"))
+        );
+    }
+
+    /// Value (#254): a refused enlarge is shown in status as an error text and a count, with the
+    /// size the socket kept, and the listener still reports its drop counter.
+    #[test]
+    fn a_refused_enlarge_shows_in_status_with_its_error_and_the_kept_size() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 212_992,
+            enlarge_error: Some("cannot set SO_RCVBUF: permission denied".into()),
+        };
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(
+                    dir.path().join("udp"),
+                    1,
+                    buffer,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["rcvbuf_enlarge_failures"].as_str(), Some("1"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("212992"));
+        assert!(
+            json["rcvbuf_enlarge_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("permission denied"))
+        );
     }
 
     /// Value (#243): a frame waiting for an operation permit is held and counted as such, not

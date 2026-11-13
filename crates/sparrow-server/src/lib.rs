@@ -27,6 +27,7 @@ mod query_only;
 mod recompression;
 mod tcp_gate;
 mod transport;
+mod udp_kernel;
 mod watch_admin;
 pub mod watches;
 pub use transport::{Access, admit_connection, local_caller, serve_connection};
