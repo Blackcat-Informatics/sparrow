@@ -1,0 +1,18 @@
+ghprsq source head backlink metadata
+
+parent_hashes: bfec528f9e2423106d04e3d7e86f7b14c1bc098b
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 262
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/262
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 14d6fb7ddb23ee472677313370748ab563fea654
+GhpRsq-Head-Ref: paudley/255-udp-syslog-hold-a-reader-that-never
+GhpRsq-Head-OID: bfec528f9e2423106d04e3d7e86f7b14c1bc098b
+GhpRsq-Result-Tree: 138edb321118c45e75d122f860d0e621a0c135c4
+GhpRsq-Result-Commit: 79789e2fbe31278d832dd3fc48ae368797adf55f
+GhpRsq-Parent-Hashes: bfec528f9e2423106d04e3d7e86f7b14c1bc098b
+GhpRsq-Squash-Notes-SHA256: 67fb24d05837f3ff5bfe517a70c6fa63085552b743063472e4174d8df6fcf75e
+GhpRsq-Stage-Evidence: none
