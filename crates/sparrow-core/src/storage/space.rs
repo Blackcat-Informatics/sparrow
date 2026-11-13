@@ -24,6 +24,12 @@ struct Ledger {
     resumes: AtomicU64,
     /// Writes refused by [`SpaceFloor::check`].
     refused: AtomicU64,
+    /// Dev-only: answer every [`SpaceFloor::check`] as below the floor.
+    #[cfg(feature = "test-support")]
+    forced: AtomicBool,
+    /// Dev-only: the error code the next [`SpaceFloor::check`] answers once, then clears.
+    #[cfg(feature = "test-support")]
+    once: std::sync::Mutex<Option<&'static str>>,
 }
 
 /// What the floor has done since the store opened.
@@ -74,6 +80,22 @@ impl SpaceFloor {
 
     /// Refuse while unprivileged free space is below the floor.
     pub fn check(&self) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        if let Some(code) = self
+            .place
+            .ledger
+            .once
+            .lock()
+            .ok()
+            .and_then(|mut once| once.take())
+        {
+            return Err(Error::new(code, "write refused once by a test"));
+        }
+        #[cfg(feature = "test-support")]
+        if self.place.ledger.forced.load(Ordering::Acquire) {
+            self.place.ledger.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::new("STORAGE_PRESSURE", "write refused by a test"));
+        }
         match self.shortfall()? {
             Some(shortfall) => {
                 self.place.ledger.refused.fetch_add(1, Ordering::Relaxed);
@@ -98,6 +120,22 @@ impl SpaceFloor {
             self.place.ledger.resumes.fetch_add(1, Ordering::Relaxed);
         }
         Ok(shortfall)
+    }
+
+    /// Dev-only: refuse (or again admit) every write at the admission check, as a store under
+    /// pressure does, without moving the measured free space the listeners' accept pause reads.
+    #[cfg(feature = "test-support")]
+    pub fn refuse_writes_for_tests(&self, refused: bool) {
+        self.place.ledger.forced.store(refused, Ordering::Release);
+    }
+
+    /// Dev-only: answer the next write admission check with `code` once, as a refusal no
+    /// retry changes would (the one after it is admitted again).
+    #[cfg(feature = "test-support")]
+    pub fn refuse_next_write_for_tests(&self, code: &'static str) {
+        if let Ok(mut once) = self.place.ledger.once.lock() {
+            *once = Some(code);
+        }
     }
 
     /// The pauses and refusals recorded so far.

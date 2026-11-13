@@ -139,6 +139,10 @@ struct SyslogListenerStatus {
   refusedMessages @11 :UInt64; truncatedDatagrams @12 :UInt64; framingFailures @13 :UInt64;
   rejectedConnections @14 :UInt64; timedOutConnections @15 :UInt64;
   continuityUnknown @16 :Bool; kernelDropsUnknown @17 :Bool; failure @18 :OptionalText;
+  # TCP frames held under pressure (#243): the frames held now, frames ever held per reason, and
+  # the longest hold, finished or running, in milliseconds.
+  heldFrames @19 :UInt32; holdsStoragePressure @20 :UInt64; holdsNoPermit @21 :UInt64;
+  longestHoldMs @22 :UInt64;
 }
 struct SyslogListenerQuery { storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :Text; id @3 :Text; }
 struct ProducerPosition { streamId @0 :Text; sequence @1 :UInt64; }

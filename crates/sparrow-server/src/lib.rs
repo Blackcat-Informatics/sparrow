@@ -21,6 +21,7 @@ mod handoff;
 mod ingest_gate;
 pub mod ingest_socket;
 mod pressure;
+pub mod pressure_wake;
 mod query_only;
 mod recompression;
 mod tcp_gate;

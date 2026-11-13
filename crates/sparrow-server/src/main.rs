@@ -278,6 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let connections = Arc::new(Semaphore::new(config.max_rpc_connections));
     let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
+    let pressure_wake = sparrow_server::pressure_wake::PressureWake::default();
     let mut syslog = if config.syslog.is_empty() {
         None
     } else {
@@ -286,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config.syslog,
             operations.clone(),
             syslog_registry.clone(),
+            pressure_wake.clone(),
         )
         .await
         {
@@ -350,7 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
-        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms))));
+        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)), pressure_wake.clone()));
         let serving = async {
         // Pinned once, so its waits and any worker shutdown it starts survive every turn.
         let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());
