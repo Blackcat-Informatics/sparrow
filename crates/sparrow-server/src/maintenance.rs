@@ -285,6 +285,59 @@ fn pressure_failed(
     verdict.delay
 }
 
+/// Observe the free-space floor for `job` and say whether it is paused. The floor's resume
+/// edge wakes held frames itself, in whichever observation consumes it (#247). This is also
+/// the one observer of the two endings that have no event: free space returning because
+/// another process freed it, and native flush or compaction work completing, which the store
+/// has no listener for. Its reclaim tick, one a second, is the cadence the daemon measures
+/// the floor at; while any frame is held it wakes them all to evaluate again, and no frame
+/// owns a timer. It runs before the below-floor skip, because reclamation is skipped exactly
+/// while the floor is paused, which is when held frames need the tick.
+fn observe_floor(
+    store: &Store,
+    job: Job,
+    held: &sparrow_server::pressure_wake::PressureWake,
+) -> Result<bool, String> {
+    let paused = store
+        .space_floor()
+        .observe(sparrow_server::now().map_err(|error| format!("clock failed: {error}"))?)
+        .map_err(|error| format!("free-space check failed: {error}"))?
+        .is_some();
+    if matches!(job, Job::Reclaim) {
+        held.observe_tick();
+    }
+    Ok(paused)
+}
+
+/// Skipped-duty counts of the test running on this thread, so a test waits for the skip it
+/// exercises as an event instead of sleeping.
+#[cfg(test)]
+mod skips {
+    use super::Job;
+    use std::cell::Cell;
+
+    thread_local! {
+        static EXPIRY: Cell<u64> = const { Cell::new(0) };
+        static MIGRATE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note(job: Job) {
+        match job {
+            Job::Expiry => EXPIRY.with(|count| count.set(count.get() + 1)),
+            Job::Migrate { .. } => MIGRATE.with(|count| count.set(count.get() + 1)),
+            _ => {}
+        }
+    }
+
+    pub(super) fn expiry() -> u64 {
+        EXPIRY.with(Cell::get)
+    }
+
+    pub(super) fn migrate() -> u64 {
+        MIGRATE.with(Cell::get)
+    }
+}
+
 async fn run(
     store: &Store,
     mut stopped: watch::Receiver<bool>,
@@ -391,20 +444,7 @@ async fn run(
         // rewriting off. Pressure maintenance runs too: it is what frees space, and it keeps
         // its own check that the maintenance reserve is free (#211). The floor is observed
         // on every duty so a pause and its end are counted in status.
-        let paused = store
-            .space_floor()
-            .observe(sparrow_server::now().map_err(|error| format!("clock failed: {error}"))?)
-            .map_err(|error| format!("free-space check failed: {error}"))?
-            .is_some();
-        // The floor's resume edge wakes held frames itself, in whichever observation consumes
-        // it (#247). This is the one observer of the two endings that have no event: free
-        // space returning because another process freed it, and native flush or compaction
-        // work completing, which the store has no listener for. Its reclaim tick, one a
-        // second, is the cadence the daemon measures the floor at; while any frame is held
-        // it wakes them all to evaluate again, and no frame owns a timer.
-        if matches!(job, Job::Reclaim) {
-            held.observe_tick();
-        }
+        let paused = observe_floor(store, job, &held)?;
         if paused && !runs_below_floor(job) {
             continuation = false;
             migrating = false;
@@ -414,6 +454,8 @@ async fn run(
             if matches!(job, Job::Expiry) {
                 expiry_at = tokio::time::Instant::now() + EXPIRY_CEILING;
             }
+            #[cfg(test)]
+            skips::note(job);
             continue;
         }
         let owner = store.clone();
@@ -852,7 +894,13 @@ mod tests {
         assert!(floor.observe(now).unwrap().is_some());
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
         // The first expiry pass runs at once and is skipped below the floor.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while skips::expiry() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expiry was never skipped below the floor");
         assert!(
             store.artifact(&artifact.id).is_ok(),
             "expiry ran below the floor"
@@ -892,7 +940,13 @@ mod tests {
         );
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
         // The first migration tick runs at once and is skipped below the floor.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while skips::migrate() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("migration was never skipped below the floor");
         assert!(
             store.migrations().unwrap().iter().all(|m| !m.complete()),
             "a migration ran below the floor"
@@ -917,6 +971,36 @@ mod tests {
         .await
         .expect("migration waited out its retry tick after the floor resumed");
         worker.shutdown().await.unwrap();
+    }
+
+    /// Value (#247): the held frames' only wake for endings with no event (free space
+    /// returning, native work completing) is the reclaim observation. Protects, counting the
+    /// observation in isolation from the pressure pass's own wake: a reclaim observation while
+    /// the floor is paused and no event fired wakes a held frame; with none held it sends
+    /// nothing; and no other duty ticks.
+    #[test]
+    fn the_reclaim_observation_wakes_held_frames_below_the_floor_and_only_while_one_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        store.space_floor().set_free_for_tests(Some(0));
+        let held = sparrow_server::pressure_wake::PressureWake::default();
+        assert!(observe_floor(&store, Job::Reclaim, &held).unwrap());
+        assert_eq!(held.sent(), 0, "nothing is held");
+        let waiter = held.subscribe();
+        let frame = waiter.hold();
+        assert!(observe_floor(&store, Job::Flush, &held).unwrap());
+        assert_eq!(held.sent(), 0, "only the reclaim observation ticks");
+        assert!(observe_floor(&store, Job::Reclaim, &held).unwrap());
+        assert_eq!(held.sent(), 1, "the tick wakes a held frame while paused");
+        drop(frame);
+        assert!(observe_floor(&store, Job::Reclaim, &held).unwrap());
+        assert_eq!(held.sent(), 1, "the frame was released");
     }
 
     /// Value (#247): a failed pressure pass is an ending a held syslog frame must evaluate

@@ -183,10 +183,10 @@ work with no external event: the next retirement or deletion deadline or the
 earliest live pin deadline. The worker sleeps until then, never less than one
 second and never more than one hour. The ceiling protects against a wall clock
 that stepped forward, since the sleep itself is monotonic. A pin release, a pin
-commit and an archive commit wake the worker at once. After an error, or a pass
-skipped below the free-space floor, the pass waits for the floor's resume, which wakes
-it at once (#247); only a failed pass retries after 60 seconds, for want of any event
-that says it would now succeed. Retry rows
+commit and an archive commit wake the worker at once. A pass skipped below the
+free-space floor waits for the floor's resume, which wakes it at once (#247); the
+one-hour ceiling is only its backstop. A pass that failed retries after 60 seconds,
+for want of any event that says it would now succeed. Retry rows
 (`request:`) have no time index; one pass scans them once per hour, and their
 logical expiry is exact at read time regardless. The purge of expired read
 leases runs on its own 60-second tick, not inside expiry. Expiry honours each row's

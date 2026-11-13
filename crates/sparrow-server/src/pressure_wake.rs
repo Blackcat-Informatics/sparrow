@@ -77,7 +77,7 @@ impl PressureWake {
     }
 
     /// A subscriber that sees every send after this call.
-    pub(crate) fn subscribe(&self) -> Waiter {
+    pub fn subscribe(&self) -> Waiter {
         Waiter {
             receiver: self.sender.subscribe(),
             // The waiter owns the sender, so its channel never closes under it.
@@ -88,7 +88,7 @@ impl PressureWake {
 }
 
 /// One connection's view of the signal.
-pub(crate) struct Waiter {
+pub struct Waiter {
     receiver: watch::Receiver<u64>,
     _sender: Arc<watch::Sender<u64>>,
     held: Arc<AtomicUsize>,
@@ -97,25 +97,25 @@ pub(crate) struct Waiter {
 impl Waiter {
     /// Mark every send so far as seen. Call it before an attempt: a send that lands during
     /// the attempt then still ends the wait after it.
-    pub(crate) fn mark_seen(&mut self) {
+    pub fn mark_seen(&mut self) {
         self.receiver.borrow_and_update();
     }
 
     /// Resolve at a send after the last [`Waiter::mark_seen`].
-    pub(crate) async fn woken(&mut self) {
+    pub async fn woken(&mut self) {
         // INVARIANT: the waiter owns a sender, so the channel is open.
         let _ = self.receiver.changed().await;
     }
 
     /// Count this frame as held until the returned guard drops.
-    pub(crate) fn hold(&self) -> Held {
+    pub fn hold(&self) -> Held {
         self.held.fetch_add(1, Ordering::AcqRel);
         Held(Arc::clone(&self.held))
     }
 }
 
 /// A frame held for pressure; the observer tick wakes while any exists.
-pub(crate) struct Held(Arc<AtomicUsize>);
+pub struct Held(Arc<AtomicUsize>);
 
 impl Drop for Held {
     fn drop(&mut self) {

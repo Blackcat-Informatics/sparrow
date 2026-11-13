@@ -1882,9 +1882,10 @@ mod tests {
             .await
             .unwrap();
         // No timeout guard here: with a paused clock an idle runtime would fire it early.
-        while !frame_taken(&fixture.metrics.snapshot().unwrap()) {
-            tokio::task::yield_now().await;
-        }
+        yield_until("the frame is held", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
         tokio::time::advance(Duration::from_secs(5)).await;
         let held = fixture.metrics.snapshot().unwrap();
         assert!(held.longest_hold() >= Duration::from_secs(5));
@@ -1897,9 +1898,10 @@ mod tests {
         );
         assert_eq!(wire_fields(&held).0, (1, 1, 0));
         relieve(&fixture);
-        while fixture.metrics.snapshot().unwrap().counts.accepted == 0 {
-            tokio::task::yield_now().await;
-        }
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted != 0
+        })
+        .await;
         let done = fixture.metrics.snapshot().unwrap();
         assert!(done.holding.is_empty());
         assert!(done.counts.longest_hold_ms >= 5000);
@@ -1981,6 +1983,20 @@ mod tests {
         reading.await.unwrap().unwrap();
     }
 
+    /// Yield until `done` holds, failing with `what` after a wall-clock bound instead of
+    /// hanging. Not a timeout future: under a paused clock an idle runtime would fire that
+    /// early, while the blocking store call still runs.
+    async fn yield_until(what: &str, done: impl Fn() -> bool) {
+        let began = std::time::Instant::now();
+        while !done() {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "did not happen within 30 s: {what}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Start a connection whose first frame is held under a pause observed through the
     /// measured free space, the way a nearly full volume pauses the floor. The floor's resume
     /// edge is wired as the daemon wires it. Returns the connection, the sender and the
@@ -2004,17 +2020,19 @@ mod tests {
             .await
             .unwrap();
         // No timeout guard here: with a paused clock an idle runtime would fire it early.
-        while !frame_taken(&fixture.metrics.snapshot().unwrap()) {
-            tokio::task::yield_now().await;
-        }
+        yield_until("the frame is held", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
         (reading, sender, stop, floor.status().refused_writes)
     }
 
     /// Yield until the held frame has been offered to the store `more` times again.
     async fn until_offered_again(fixture: &Listener, refused: u64) {
-        while fixture.store.space_floor().status().refused_writes <= refused {
-            tokio::task::yield_now().await;
-        }
+        yield_until("the held frame is offered again", || {
+            fixture.store.space_floor().status().refused_writes > refused
+        })
+        .await;
     }
 
     /// Value (#247): a held frame owned a 50 ms to 1 s doubling timer, a retry on a clock
@@ -2037,9 +2055,10 @@ mod tests {
         // Free space returned and no observation saw the edge; the next tick ends the hold.
         fixture.store.space_floor().set_free_for_tests(None);
         fixture.wake.observe_tick();
-        while fixture.metrics.snapshot().unwrap().counts.accepted == 0 {
-            tokio::task::yield_now().await;
-        }
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted != 0
+        })
+        .await;
         assert_eq!(stored_lengths(&fixture.store), [5]);
         drop(sender);
         reading.await.unwrap().unwrap();
@@ -2060,9 +2079,10 @@ mod tests {
         // This observer is not maintenance; it consumes the edge.
         assert!(floor.observe(2).unwrap().is_none());
         assert_eq!(floor.status().resumes, 1);
-        while fixture.metrics.snapshot().unwrap().counts.accepted == 0 {
-            tokio::task::yield_now().await;
-        }
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted != 0
+        })
+        .await;
         assert_eq!(stored_lengths(&fixture.store), [5]);
         reading.await.unwrap().unwrap();
         let counts = fixture.metrics.snapshot().unwrap().counts;
@@ -2070,6 +2090,65 @@ mod tests {
             counts.refused + counts.framing_failures + counts.timed_out,
             0
         );
+    }
+
+    /// Value (#243, #247): a long hold is always announced. An episode that starts inside the
+    /// report interval is suppressed at entry and is announced by the frame's next offer once
+    /// the interval has passed; the frame owns no timer now, so only the observer tick can
+    /// make that offer. Protects: with the interval passed and no other event the episode
+    /// stays unannounced until the tick, then is announced.
+    #[tokio::test(start_paused = true)]
+    async fn a_suppressed_hold_is_announced_by_the_observer_tick_after_the_interval() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        let (reading, mut sender, _stop, _) = held_under_observed_pause(&fixture).await;
+        let announced = || {
+            fixture
+                .metrics
+                .snapshot()
+                .unwrap()
+                .episode
+                .as_ref()
+                .map(|episode| episode.announced)
+        };
+        assert_eq!(announced(), Some(true), "the first episode is announced");
+        // End it, then pause again so a second episode starts inside the interval.
+        let floor = fixture.store.space_floor();
+        floor.set_free_for_tests(None);
+        assert!(floor.observe(2).unwrap().is_none());
+        yield_until("the first frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted == 1
+        })
+        .await;
+        floor.set_free_for_tests(Some(0));
+        assert!(floor.observe(3).unwrap().is_some());
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>b")
+            .await
+            .unwrap();
+        yield_until("the second frame is held", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
+        assert_eq!(
+            announced(),
+            Some(false),
+            "inside the interval it is suppressed"
+        );
+        let refused = floor.status().refused_writes;
+        tokio::time::advance(HOLD_REPORT_INTERVAL + Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(announced(), Some(false), "no timer re-offers the frame");
+        assert_eq!(floor.status().refused_writes, refused);
+        fixture.wake.observe_tick();
+        yield_until("the tick announces the episode", || {
+            announced() == Some(true)
+        })
+        .await;
+        drop(sender);
+        floor.set_free_for_tests(None);
+        fixture.wake.wake();
+        reading.await.unwrap().unwrap();
     }
 
     /// Value (#243): a refusal no retry changes (`RESOURCE_LIMIT`) is not held. It keeps its
