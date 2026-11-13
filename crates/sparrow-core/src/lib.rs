@@ -60,8 +60,8 @@ pub use storage::forced_compaction::FamilySize;
 pub use storage::forced_compaction::Fault;
 pub use storage::handoff::ConsumptionHandoff;
 pub use storage::import::{
-    IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage, ImportManifest,
-    ImportRecordSpan, ImportStart, MAX_IMPORT_BYTES, RAW_RECORD_BYTES,
+    IMPORT_CHUNK_BYTES, IMPORT_JOURNALS_OCCUPIED, IMPORT_LAYOUT_PAGE_RECORDS, ImportLayoutPage,
+    ImportManifest, ImportRecordSpan, ImportStart, MAX_IMPORT_BYTES, RAW_RECORD_BYTES,
 };
 pub use storage::ingest_status::{
     IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus,

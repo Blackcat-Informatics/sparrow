@@ -2087,10 +2087,11 @@ async fn ingest_socket_refuses_reads_and_administration() {
         .await;
 }
 
-/// INVARIANT: ingest connections have their own ceiling: over it a producer connection is
-/// dropped and counted, while a private-socket CLI connection still succeeds.
+/// INVARIANT (#246): ingest connections have their own ceiling, and a producer over it is not
+/// reset: it connects, waits in the kernel backlog and is served when a slot frees, while a
+/// private-socket CLI connection is served at once. The wait is counted in status.
 #[tokio::test(flavor = "current_thread")]
-async fn ingest_connections_have_their_own_ceiling() {
+async fn an_ingest_peer_over_the_ceiling_waits_and_is_served_when_a_slot_frees() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
@@ -2100,15 +2101,124 @@ async fn ingest_connections_have_their_own_ceiling() {
             let (ingest, gid) = configure_ingest_socket(dir.path(), &config, 1);
             let daemon = start(&config, &socket).await;
             let held = sparrow_client::Client::connect(&ingest).await.unwrap();
-            assert!(sparrow_client::Client::connect(&ingest).await.is_err());
+            let over = tokio::task::spawn_local({
+                let ingest = ingest.clone();
+                async move { sparrow_client::Client::connect(&ingest).await }
+            });
+            tokio::task::yield_now().await;
             let status = cli(&socket, &["status"]);
             let reported = &status["ingest_socket"];
             assert_eq!(reported["path"].as_str(), ingest.to_str());
             assert_eq!(reported["gid"].as_u64(), Some(u64::from(gid)));
             assert_eq!(reported["max_connections"].as_u64(), Some(1));
             assert_eq!(reported["active_connections"].as_u64(), Some(1));
-            assert_eq!(reported["refused_connections"].as_str(), Some("1"));
+            assert_eq!(reported["refused_connections"].as_str(), Some("0"));
+            assert_eq!(reported["ceiling_wait"]["waits"].as_str(), Some("1"));
+            assert_eq!(reported["ceiling_wait"]["waiting"].as_u64(), Some(1));
+            assert!(!over.is_finished(), "an over-ceiling peer was not held");
             drop(held);
+            let served = over.await.unwrap().expect("the waiting peer was reset");
+            assert_eq!(
+                served.discovery().store_id,
+                status["store_id"].as_str().unwrap()
+            );
+            drop(served);
+            drop(daemon);
+        })
+        .await;
+}
+
+/// Begin one staged import of `name`'s bytes; its import id, or the error code.
+async fn begin_numbered_import(
+    client: &wire::sparrow::Client,
+    name: &str,
+) -> Result<String, String> {
+    let input = name.as_bytes();
+    let payload = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let mut request = client.import_begin_request();
+    let mut begin = request.get().init_request();
+    begin.set_request_id(name);
+    begin.set_source("numbered");
+    begin.set_format(wire::Format::Log);
+    begin.set_byte_length(input.len() as u64);
+    begin.set_payload_id(&payload);
+    let response = request.send().promise.await.unwrap();
+    match response
+        .get()
+        .unwrap()
+        .get_result()
+        .unwrap()
+        .which()
+        .unwrap()
+    {
+        wire::result::Ok(started) => match started.unwrap().which().unwrap() {
+            wire::import_start::Staging(progress) => Ok(progress
+                .unwrap()
+                .get_id()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()),
+            wire::import_start::Accepted(_) => panic!("new input already accepted"),
+        },
+        wire::result::Error(error) => Err(error
+            .unwrap()
+            .get_code()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()),
+    }
+}
+
+/// INVARIANT (#246): a seventeenth concurrent import waits for a journal slot instead of being
+/// refused at once, and is served when a reclamation pass frees one (a cancelled import frees
+/// its slot only when reclaimed); the wait is counted in status.
+#[tokio::test(flavor = "current_thread")]
+async fn a_seventeenth_import_waits_for_a_slot_and_begins_when_one_is_reclaimed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let daemon = start(&config, &socket).await;
+            let connection = connect(&socket).await.unwrap();
+            let client = connection.client.clone();
+            let mut ids = Vec::new();
+            for index in 0..16 {
+                ids.push(
+                    begin_numbered_import(&client, &format!("slot-{index}"))
+                        .await
+                        .unwrap(),
+                );
+            }
+            let seventeenth = tokio::task::spawn_local({
+                let client = client.clone();
+                async move { begin_numbered_import(&client, "slot-16").await }
+            });
+            tokio::task::yield_now().await;
+            let response = client.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let waiting = status
+                .get_admission()
+                .unwrap()
+                .get_import_slot_wait()
+                .unwrap();
+            assert_eq!((waiting.get_waits(), waiting.get_waiting()), (1, 1));
+            assert!(
+                !seventeenth.is_finished(),
+                "the seventeenth import was refused instead of waiting"
+            );
+            let store = status.get_store_id().unwrap().to_str().unwrap().to_owned();
+            let mut request = client.import_cancel_request();
+            upload_ref(request.get().init_import(), &store, &ids[0]);
+            request.send().promise.await.unwrap();
+            assert!(seventeenth.await.unwrap().is_ok());
+            drop(connection);
             drop(daemon);
         })
         .await;
@@ -2587,23 +2697,19 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                 .await
                 .unwrap();
             rpc_ok(response.get().unwrap().get_result().unwrap());
-            // Unix and TCP share six transport leases; neither can over-admit a seventh peer.
-            assert!(sparrow_client::Client::connect(&socket).await.is_err());
-            assert!(tcp_client(address).await.is_err());
+            // Unix and TCP share six transport leases: a seventh peer is not admitted; it waits
+            // in the kernel backlog (#246) and is served when the sixth peer's slot frees.
+            let seventh = tokio::task::spawn_local({
+                let socket = socket.clone();
+                async move { sparrow_client::Client::connect(&socket).await }
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !seventh.is_finished(),
+                "a seventh peer was over-admitted or reset"
+            );
             drop(sixth);
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let recovered = loop {
-                match sparrow_client::Client::connect(&socket).await {
-                    Ok(client) => break client,
-                    Err(error) => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "transport lease not returned: {error}"
-                        );
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            };
+            let recovered = seventh.await.unwrap().expect("the waiting peer was reset");
             let receipt = recovered
                 .ingest(
                     "idle-budget",

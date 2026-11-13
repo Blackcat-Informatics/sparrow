@@ -205,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
+    let admission = sparrow_server::admission::Admission::new(operations.clone());
     let operation_slots = u32::try_from(config.max_concurrent_requests)?;
     // A query-only or no-intake daemon owns no watch root: it reports the stored catalog and
     // claims nothing.
@@ -238,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 &store,
                 &[],
-                &operations,
+                &admission,
                 operation_slots,
             )
             .await;
@@ -264,7 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         &store,
                         &[&endpoint],
-                        &operations,
+                        &admission,
                         operation_slots,
                     )
                     .await;
@@ -276,7 +277,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoints: Vec<&local_endpoint::LocalEndpoint> = std::iter::once(&endpoint)
         .chain(ingest.as_ref().map(|(endpoint, _)| endpoint))
         .collect();
-    let connections = Arc::new(Semaphore::new(config.max_rpc_connections));
+    let connections = sparrow_server::admission::Ceiling::new(
+        "RPC connection ceiling",
+        config.max_rpc_connections,
+    );
     let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
     let pressure_wake = sparrow_server::pressure_wake::PressureWake::default();
     let mut syslog = if config.syslog.is_empty() {
@@ -301,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     &store,
                     &endpoints,
-                    &operations,
+                    &admission,
                     operation_slots,
                 )
                 .await;
@@ -309,6 +313,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut rpc = Rpc::new(store.clone(), operations.clone(), config.max_pin_members)
+        .with_admission(admission.clone())
+        .with_connections(connections.clone())
         .with_watches(watches)
         .with_syslog(syslog_registry);
     if let Some((_, socket)) = &ingest {
@@ -352,7 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
-        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)), pressure_wake.clone()));
+        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)), pressure_wake.clone(), admission.clone()));
         let serving = async {
         // Pinned once, so its waits and any worker shutdown it starts survive every turn.
         let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());
@@ -360,8 +366,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
         // Below the floor every write is refused, so admit no new connections.
         let mut space_ok = true;
+        // A connection slot is taken before its peer is accepted (#246): at the ceiling the accept
+        // loop waits on a slot, and the peer waits in the kernel listen backlog, served when a slot
+        // frees, rather than being accepted and reset. One slot is held ahead for the private socket
+        // and public TCP together, which share a ceiling, and one for the ingest socket.
+        let mut rpc_slot = None;
+        let mut rpc_wait = None;
+        let mut ingest_slot = None;
+        let mut ingest_wait = None;
         loop {
+            if rpc_slot.is_none() && rpc_wait.is_none() {
+                match connections.try_slot() { Ok(slot) => rpc_slot = Some(slot), Err(wait) => rpc_wait = Some(wait) }
+            }
+            if let Some((_, socket)) = ingest.as_ref().filter(|_| ingest_slot.is_none() && ingest_wait.is_none()) {
+                match socket.ceiling().try_slot() { Ok(slot) => ingest_slot = Some(slot), Err(wait) => ingest_wait = Some(wait) }
+            }
             tokio::select! {
+                slot = connections.acquire(), if rpc_slot.is_none() => {
+                    rpc_slot = Some(slot);
+                    rpc_wait = None;
+                }
+                slot = async { ingest.as_ref().expect("enabled ingest branch").1.ceiling().acquire().await }, if ingest.is_some() && ingest_slot.is_none() => {
+                    ingest_slot = Some(slot);
+                    ingest_wait = None;
+                }
                 signal = interrupt.recv() => {
                     signal.ok_or("daemon interrupt subscription terminated unexpectedly")?;
                     break;
@@ -380,30 +408,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     _ => {}
                 },
-                accepted = endpoint.listener.accept(), if space_ok => {
+                accepted = endpoint.listener.accept(), if space_ok && rpc_slot.is_some() => {
                     let (stream, _) = accepted?;
+                    let Some(slot) = rpc_slot.take() else { continue };
                     // A connection whose peer the kernel cannot name is dropped unanswered.
                     match sparrow_server::local_caller(&stream) {
                         Ok(caller) => {
-                            let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::Local(caller));
+                            sparrow_server::admit_connection(stream, rpc.clone(), slot, sparrow_server::Access::Local(caller));
                         }
                         Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
                     }
                 }
-                accepted = async { ingest.as_ref().expect("enabled ingest branch").0.listener.accept().await }, if space_ok && ingest.is_some() => {
+                accepted = async { ingest.as_ref().expect("enabled ingest branch").0.listener.accept().await }, if space_ok && ingest.is_some() && ingest_slot.is_some() => {
                     let (stream, _) = accepted?;
-                    let _ = ingest.as_ref().expect("enabled ingest branch").1.admit(stream, rpc.clone());
+                    let Some(slot) = ingest_slot.take() else { continue };
+                    let _ = ingest.as_ref().expect("enabled ingest branch").1.admit(stream, rpc.clone(), slot);
                 }
-                accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if space_ok && tcp_listener.is_some() => {
+                accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if space_ok && tcp_listener.is_some() && rpc_slot.is_some() => {
                     let (stream, peer) = accepted?;
+                    let Some(slot) = rpc_slot.take() else { continue };
                     stream.set_nodelay(true)?;
                     let secret = tcp_secret.clone().expect("configuration pairs TCP with its secret");
-                    let _ = sparrow_server::admit_connection(stream, rpc.clone(), connections.clone(), sparrow_server::Access::PublicTcp(secret, peer.to_string()));
+                    sparrow_server::admit_connection(stream, rpc.clone(), slot, sparrow_server::Access::PublicTcp(secret, peer.to_string()));
                 }
             }
         }
         Ok::<(), Box<dyn std::error::Error>>(())
         }.await;
-        shutdown::finish(serving, shutdown::Workers { consumer: consumer.take(), syslog: syslog.take(), maintenance: maintenance.take() }, &store, &endpoints, &operations, operation_slots).await
+        shutdown::finish(serving, shutdown::Workers { consumer: consumer.take(), syslog: syslog.take(), maintenance: maintenance.take() }, &store, &endpoints, &admission, operation_slots).await
     }).await
 }

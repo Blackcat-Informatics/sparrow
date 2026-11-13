@@ -14,6 +14,10 @@ use rocksdb::WriteBatch;
 /// Fixed raw staging unit; only the final unit may be shorter.
 pub const IMPORT_CHUNK_BYTES: usize = CHUNK;
 const MAX_IMPORTS: usize = 16;
+/// The `RESOURCE_LIMIT` message of a begin-import that finds every journal slot occupied. The
+/// daemon waits for a slot on exactly this refusal (#246); no other refusal is one.
+pub const IMPORT_JOURNALS_OCCUPIED: &str =
+    "16 import journals are occupied; resume, cancel, or reclaim them";
 const MANIFEST_BYTES: usize = 8192;
 const RECLAIM_CHUNKS: u64 = 128;
 /// Maximum record spans in one immutable layout page.
@@ -1168,10 +1172,7 @@ impl Writer {
             ));
         }
         if writer.imports()?.len() >= MAX_IMPORTS {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "16 import journals are occupied; resume, cancel, or reclaim them",
-            ));
+            return Err(Error::new("RESOURCE_LIMIT", IMPORT_JOURNALS_OCCUPIED));
         }
         let expires_at = now
             .checked_add(RETRY_WINDOW)

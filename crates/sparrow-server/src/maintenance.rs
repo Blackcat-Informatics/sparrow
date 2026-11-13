@@ -49,6 +49,7 @@ impl Worker {
         store: Store,
         flush: Duration,
         held: sparrow_server::pressure_wake::PressureWake,
+        admission: Arc<sparrow_server::admission::Admission>,
     ) -> Self {
         let (stop, stopped) = watch::channel(false);
         let (alive, ended) = tokio::sync::oneshot::channel::<()>();
@@ -56,7 +57,7 @@ impl Worker {
             stop,
             task: Some(tokio::spawn(async move {
                 let _alive = alive;
-                let result = run(&store, stopped, flush, held).await;
+                let result = run(&store, stopped, flush, held, admission).await;
                 store.set_retention_waker(None);
                 result
             })),
@@ -251,6 +252,7 @@ async fn run(
     mut stopped: watch::Receiver<bool>,
     flush_interval: Duration,
     held: sparrow_server::pressure_wake::PressureWake,
+    admission: Arc<sparrow_server::admission::Admission>,
 ) -> Result<(), String> {
     // A pin release or commit and an archive commit change what expiry may retire; the store
     // notifies this wake without blocking, and a pending wake survives a busy duty.
@@ -396,7 +398,13 @@ async fn run(
                         expiry_delay(&report, now)
                     };
             }
-            Ok(Outcome::Continue) => {}
+            Ok(Outcome::Continue) => {
+                // A published or expired import's journal slot frees only when reclaimed, so a
+                // begin-import waiting for one is told when each reclamation pass ends (#246).
+                if matches!(job, Job::Reclaim) {
+                    admission.import_slot_freed();
+                }
+            }
             Ok(Outcome::Pressured(status)) => {
                 held.wake();
                 let verdict = pressure_duty.observe(&status);
@@ -456,6 +464,10 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    fn idle_admission() -> Arc<sparrow_server::admission::Admission> {
+        sparrow_server::admission::Admission::new(Arc::new(tokio::sync::Semaphore::new(1)))
+    }
+
     use super::*;
 
     // Value: below the free-space floor the daemon used to freeze the whole pressure state
@@ -513,7 +525,12 @@ mod tests {
             store.status(now).unwrap()["unique_payload_chunks"].as_str(),
             Some("1025")
         );
-        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        let worker = Worker::start(
+            store.clone(),
+            Duration::from_millis(1),
+            Default::default(),
+            idle_admission(),
+        );
         // Thirty-two default passes would take over thirty seconds under the
         // former once-per-second driver. This allows ample host scheduling slack.
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -551,7 +568,12 @@ mod tests {
             .unwrap()
             .open_store()
             .unwrap();
-        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        let worker = Worker::start(
+            store.clone(),
+            Duration::from_millis(1),
+            Default::default(),
+            idle_admission(),
+        );
         // Let the first traversal finish so the next one is a minute away.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let input = b"cancelled import";
@@ -620,7 +642,12 @@ mod tests {
                 old,
             )
             .unwrap();
-        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        let worker = Worker::start(
+            store.clone(),
+            Duration::from_millis(1),
+            Default::default(),
+            idle_admission(),
+        );
         // Let the first pass finish: it holds the entry and schedules the next pass far away.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(store.artifact(&artifact.id).is_ok(), "a pinned entry stays");
@@ -700,7 +727,12 @@ mod tests {
         // The reader derives the fallback facts for each of the 300 record graphs whichever
         // migration is pending, and counts them.
         assert_eq!(read(&store), 300, "{part:?}");
-        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        let worker = Worker::start(
+            store.clone(),
+            Duration::from_millis(1),
+            Default::default(),
+            idle_admission(),
+        );
         tokio::time::timeout(Duration::from_secs(30), async {
             while !store
                 .migrations()
@@ -740,7 +772,12 @@ mod tests {
             .unwrap()
             .open_store()
             .unwrap();
-        let mut worker = Worker::start(store, Duration::from_millis(1), Default::default());
+        let mut worker = Worker::start(
+            store,
+            Duration::from_millis(1),
+            Default::default(),
+            idle_admission(),
+        );
         let (mut consumer, mut syslog) = (None, None);
         // A running worker: a second passes without a failure.
         assert!(
@@ -783,7 +820,12 @@ mod tests {
                 sparrow_core::Durability::Buffered,
             )
             .unwrap();
-        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        let worker = Worker::start(
+            store.clone(),
+            Duration::from_millis(1),
+            Default::default(),
+            idle_admission(),
+        );
         tokio::time::timeout(Duration::from_secs(2), worker.shutdown())
             .await
             .unwrap()
