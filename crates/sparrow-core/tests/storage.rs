@@ -6456,7 +6456,7 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
         let _page = if release {
             None
         } else {
-            const SLACK: u64 = 16384;
+            const SLACK: u64 = 32768;
             // A live query page holds a staging charge. Size the ballast so the linked
             // footprint fits the allowance beside the request and only the charge crosses it.
             // (`footprint` is the status's physical bytes: no page is live yet, so it is the
@@ -6483,13 +6483,21 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
             let linked = footprint(25);
             let settled = footprint(25);
             // The store directory's bytes other than the ballast, read again just before the
-            // pass to name any growth that crosses the sizing slack.
+            // pass to name any growth that crosses the sizing slack. It only approximates the
+            // production footprint: it sums raw file sizes, where production skips obsolete
+            // write-ahead logs and caps table bytes at what the versions reference. A file
+            // RocksDB deletes between the listing and the inspection counts as zero, as it
+            // does there.
             let files = || -> u64 {
                 std::fs::read_dir(dir.path())
                     .unwrap()
                     .map(|entry| entry.unwrap())
                     .filter(|entry| entry.file_name() != "test-owned-pressure-ballast")
-                    .map(|entry| entry.metadata().unwrap().len())
+                    .map(|entry| match entry.metadata() {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(error) => panic!("{}: {error}", entry.path().display()),
+                    })
                     .sum()
             };
             let page = store
@@ -6509,7 +6517,7 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
                 "the page must stay live (more rows follow)"
             );
             let limit = 12 * 1024 * 1024;
-            // 16 KiB of room is far under the page's staging charge (at least 64 KiB, the
+            // 32 KiB of room stays 32 KiB under the page's staging charge (at least 64 KiB, the
             // builder's reservation), which is what crosses the allowance, and leaves room
             // for small growth of the store's own files.
             ballast.set_len(limit - requested - linked - SLACK).unwrap();
