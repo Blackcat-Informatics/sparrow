@@ -3904,10 +3904,11 @@ scope, shorter pin, altered datatype, or unrelated source generation.
 
 `ARCHIVE_WATERMARK` is a publication at or behind the archive watermark: a clock
 regression, or a datagram stamped with its read instant that waited past the
-watermark. It is not retryable as sent. The UDP syslog publisher offers such a
-datagram once more with the commit instant and counts it `restamped`. Other callers
-see it as a failed write, as they saw `STORAGE_FAILURE` before. `STORAGE_FAILURE` also
-covers retirement reaching unarchived evidence.
+watermark. It is not retryable as sent. It was `STORAGE_FAILURE` before the UDP
+syslog publisher needed to tell it apart, and every other caller treats it exactly
+as it treated `STORAGE_FAILURE`: the watch worker, which stops on a storage
+failure, stops on it too. Only the UDP syslog publisher handles it, as described
+with the UDP hold. `STORAGE_FAILURE` also covers retirement reaching unarchived evidence.
 `INVALID_ARGUMENT` covers opening an archiving store without its `[archive]`
 table.
 

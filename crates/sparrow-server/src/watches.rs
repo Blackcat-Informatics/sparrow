@@ -562,7 +562,7 @@ impl Detector {
         if let Owner::Tail(owner) = &mut self.owner {
             return match owner.attach(&path, &self.config, self.revision) {
                 Ok(()) => Ok(()),
-                Err(Error::Storage(error)) if error.code == "STORAGE_FAILURE" => {
+                Err(Error::Storage(error)) if fatal_storage(error.code) => {
                     Err(Error::Storage(error))
                 }
                 Err(Error::FinishedGeneration(message)) => {
@@ -1205,8 +1205,27 @@ fn admit_handoff(
         })
 }
 
+/// Whether a store error code stops the watch worker and the daemon. A publication at or
+/// behind the archive watermark (a clock regression) was `STORAGE_FAILURE` before it had its own
+/// code for the UDP listener to restamp, and stays fatal here: only that listener handles it.
+fn fatal_storage(code: &str) -> bool {
+    matches!(code, "STORAGE_FAILURE" | sparrow_core::ARCHIVE_WATERMARK)
+}
+
+/// What one tail drain means for the worker: a fatal store error stops it, any other error is
+/// the watch's recorded failure, and success records nothing.
+fn tail_drain_outcome(result: Result<(), Error>) -> Result<Option<String>, Error> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(Error::Storage(error)) if fatal_storage(error.code) => Err(Error::Storage(error)),
+        Err(error) => Ok(Some(
+            error.to_string().chars().take(FAILURE_CHARS).collect(),
+        )),
+    }
+}
+
 fn storage_admission(error: sparrow_core::Error) -> AdminFailure {
-    if error.code == "STORAGE_FAILURE" {
+    if fatal_storage(error.code) {
         AdminFailure::Terminal(Error::Storage(error))
     } else {
         AdminFailure::Refused(error)
@@ -1583,15 +1602,8 @@ async fn run(
                         return Err(Error::State("tail operation budget closed unexpectedly"));
                     }
                 };
-                match owner.drain() {
-                    Ok(()) => {}
-                    Err(Error::Storage(error)) if error.code == "STORAGE_FAILURE" => {
-                        return Err(Error::Storage(error));
-                    }
-                    Err(error) => {
-                        detector.failure =
-                            Some(error.to_string().chars().take(FAILURE_CHARS).collect());
-                    }
+                if let Some(failure) = tail_drain_outcome(owner.drain())? {
+                    detector.failure = Some(failure);
                 }
             }
         }
@@ -1771,7 +1783,7 @@ async fn run(
                 // The claim's durable history answers `watch claims` after any restart.
                 match store.consumption_attempt_pending(&id, &error.to_string(), crate::now()?) {
                     Ok(_) => {}
-                    Err(record) if record.code == "STORAGE_FAILURE" => {
+                    Err(record) if fatal_storage(record.code) => {
                         return Err(Error::Storage(record));
                     }
                     Err(record) => {

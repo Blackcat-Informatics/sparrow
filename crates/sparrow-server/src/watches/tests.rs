@@ -1092,3 +1092,102 @@ async fn the_drain_before_a_wait_reports_and_wakes_for_what_it_found() {
     assert!(detectors[0].due(true).unwrap() <= Instant::now());
     assert!(detectors[0].due(false).unwrap() > Instant::now());
 }
+
+/// A tail detector over a private root holding one file, opened on a fresh store.
+fn tail_detector() -> (tempfile::TempDir, Store, Detector) {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("active.log"), b"first line\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let detector = Detector::open(
+        store.clone(),
+        ManagedWatch {
+            definition: ConsumeWatch {
+                id: "tail-fence".into(),
+                root: private,
+                producer_contract: crate::ProducerContract::ActiveFilesRetain,
+                source: "tail-fence".into(),
+                format: "log".into(),
+                quiet_ms: 30_000,
+                max_directories: 2,
+                max_candidates: 2,
+            },
+            revision: 1,
+            enabled: true,
+        },
+        crate::consumption::RootBinding::Private,
+    )
+    .unwrap();
+    (directory, store, detector)
+}
+
+/// Value (#255): `ARCHIVE_WATERMARK` is a new code for what was `STORAGE_FAILURE`, so that
+/// only the UDP listener restamps. Every watch site that stopped the worker for
+/// `STORAGE_FAILURE` must stop it for the new code too: a clock regression on a tail watch
+/// stops the daemon loudly, as before, and is not recorded as a retryable watch failure.
+/// A code that is not fatal (`RESOURCE_LIMIT`) is the control: it is recorded and the worker
+/// goes on. Covers the tail attach site and the tail drain site.
+#[test]
+fn the_archive_watermark_stops_a_tail_watch_as_a_storage_failure_does() {
+    for code in ["STORAGE_FAILURE", sparrow_core::ARCHIVE_WATERMARK] {
+        // Attach: the first write of the watch is refused.
+        let (_directory, store, mut detector) = tail_detector();
+        store.space_floor().refuse_next_write_for_tests(code);
+        let attach = detector.scan_step().and_then(|()| detector.drain());
+        assert!(
+            matches!(&attach, Err(Error::Storage(error)) if error.code == code),
+            "attach with {code}: {attach:?}"
+        );
+        // Drain: the attach succeeded, and the write that publishes the line is refused.
+        let (_directory, store, mut detector) = tail_detector();
+        detector.scan_step().unwrap();
+        detector.drain().unwrap();
+        let Owner::Tail(owner) = &mut detector.owner else {
+            unreachable!("an ActiveFilesRetain watch has a tail owner");
+        };
+        store.space_floor().refuse_next_write_for_tests(code);
+        let drain = tail_drain_outcome(owner.drain());
+        assert!(
+            matches!(&drain, Err(Error::Storage(error)) if error.code == code),
+            "drain with {code}: {drain:?}"
+        );
+    }
+    let (_directory, store, mut detector) = tail_detector();
+    store
+        .space_floor()
+        .refuse_next_write_for_tests("RESOURCE_LIMIT");
+    detector.scan_step().unwrap();
+    detector.drain().unwrap();
+    assert!(
+        detector.failure.is_some(),
+        "a non-fatal refusal is recorded"
+    );
+    let recorded = tail_drain_outcome(Err(Error::Storage(sparrow_core::Error::new(
+        "RESOURCE_LIMIT",
+        "x",
+    ))));
+    assert!(matches!(recorded, Ok(Some(_))));
+}
+
+/// Value (#255): the admin path classifies store errors the same way: `STORAGE_FAILURE` and
+/// `ARCHIVE_WATERMARK` end the worker (terminal), any other code is a refusal to the caller.
+#[test]
+fn the_archive_watermark_is_terminal_for_an_admin_command_as_a_storage_failure_is() {
+    for code in ["STORAGE_FAILURE", sparrow_core::ARCHIVE_WATERMARK] {
+        assert!(matches!(
+            storage_admission(sparrow_core::Error::new(code, "x")),
+            AdminFailure::Terminal(_)
+        ));
+    }
+    assert!(matches!(
+        storage_admission(sparrow_core::Error::new("RESOURCE_LIMIT", "x")),
+        AdminFailure::Refused(_)
+    ));
+}
