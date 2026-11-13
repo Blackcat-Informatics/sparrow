@@ -138,6 +138,33 @@ pub(crate) fn listener(
                 "rcvbuf_enlarge_failures",
                 listener.get_rcvbuf_enlarge_failures().to_string(),
             )
+            .with(
+                "queued_datagrams",
+                u64::from(listener.get_queued_datagrams()),
+            )
+            .with("queued_bytes", listener.get_queued_bytes().to_string())
+            .with("hold_bytes", listener.get_hold_bytes().to_string())
+            .with(
+                "reader_full_waits",
+                listener.get_reader_full_waits().to_string(),
+            )
+            .with(
+                "reader_full_longest_ms",
+                listener.get_reader_full_longest_ms().to_string(),
+            )
+            .with("restamped", listener.get_restamped().to_string())
+            .with(
+                "restamped_past_watermark",
+                listener.get_restamped_past_watermark().to_string(),
+            )
+            .with(
+                "lost_at_shutdown",
+                listener.get_lost_at_shutdown().to_string(),
+            )
+            .with(
+                "lost_at_shutdown_bytes",
+                listener.get_lost_at_shutdown_bytes().to_string(),
+            )
             .with("failure", failure),
     ))
 }

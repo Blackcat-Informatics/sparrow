@@ -102,6 +102,11 @@ pub struct ArchiveState {
     pub intent: Option<ArchiveIntent>,
 }
 
+/// Error code of a publication at or behind the archive watermark. Typed apart from
+/// `STORAGE_FAILURE` so a caller that stamped the publication with an earlier instant (a UDP
+/// syslog datagram stamped when it was read) can offer it once more with the commit instant.
+pub const ARCHIVE_WATERMARK: &str = "ARCHIVE_WATERMARK";
+
 impl ArchiveState {
     /// The one deletion gate: evidence retires only once a committed segment covers it.
     fn archived(&self, position: &[u8]) -> bool {
@@ -110,17 +115,29 @@ impl ArchiveState {
             .is_some_and(|through| position <= through.as_bytes())
     }
 
-    /// Publication behind the covered or in-flight range would never be archived.
-    fn admit_publication(&self, earliest: &[u8]) -> Result<(), Error> {
-        let fence = self
-            .through
+    /// The greatest position a publication may not take: the watermark or the end of the
+    /// segment in flight.
+    fn fence(&self) -> Option<&str> {
+        self.through
             .as_deref()
             .into_iter()
             .chain(self.intent.as_ref().map(|intent| intent.last.as_str()))
-            .max();
-        match fence {
+            .max()
+    }
+
+    /// The received-at instant of the fence, when there is one. A publication stamped later
+    /// than this instant is admitted whatever its identifier, so a caller that must not refuse
+    /// a log for its stamp can take the instant just past it.
+    #[must_use]
+    pub fn fence_millis(&self) -> Option<u64> {
+        self.fence()?.get(..20)?.parse().ok()
+    }
+
+    /// Publication behind the covered or in-flight range would never be archived.
+    fn admit_publication(&self, earliest: &[u8]) -> Result<(), Error> {
+        match self.fence() {
             Some(fence) if earliest <= fence.as_bytes() => Err(Error::new(
-                "STORAGE_FAILURE",
+                ARCHIVE_WATERMARK,
                 format!(
                     "publication at {} is at or before the archive watermark {fence}; the server clock moved backwards or an import outlived the archive horizon; correct the clock and retry",
                     String::from_utf8_lossy(earliest)

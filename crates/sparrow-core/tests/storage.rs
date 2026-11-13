@@ -6456,6 +6456,7 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
         let _page = if release {
             None
         } else {
+            const SLACK: u64 = 32768;
             // A live query page holds a staging charge. Size the ballast so the linked
             // footprint fits the allowance beside the request and only the charge crosses it.
             // (`footprint` is the status's physical bytes: no page is live yet, so it is the
@@ -6473,7 +6474,32 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
                     .ingest(&format!("extra-{index}"), "source", "log", payload, 24)
                     .unwrap();
             }
+            // The footprint counts every file in the store directory (tables, logs, the
+            // manifest), so any growth between this measurement and the pass breaks the
+            // sizing below (#260). Settle the store first: flush, then wait for native work
+            // to end.
+            store.flush().unwrap();
+            store.await_native_quiet().unwrap();
             let linked = footprint(25);
+            let settled = footprint(25);
+            // The store directory's bytes other than the ballast, read again just before the
+            // pass to name any growth that crosses the sizing slack. It only approximates the
+            // production footprint: it sums raw file sizes, where production skips obsolete
+            // write-ahead logs and caps table bytes at what the versions reference. A file
+            // RocksDB deletes between the listing and the inspection counts as zero, as it
+            // does there.
+            let files = || -> u64 {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .filter(|entry| entry.file_name() != "test-owned-pressure-ballast")
+                    .map(|entry| match entry.metadata() {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(error) => panic!("{}: {error}", entry.path().display()),
+                    })
+                    .sum()
+            };
             let page = store
                 .records_read(
                     &RecordRead {
@@ -6491,9 +6517,20 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
                 "the page must stay live (more rows follow)"
             );
             let limit = 12 * 1024 * 1024;
-            // 4 KiB of room covers the log the pass itself writes; the page's staging charge
-            // (at least 64 KiB, the builder's reservation) is what crosses the allowance.
-            ballast.set_len(limit - requested - linked - 4096).unwrap();
+            // 32 KiB of room stays 32 KiB under the page's staging charge (at least 64 KiB, the
+            // builder's reservation), which is what crosses the allowance, and leaves room
+            // for small growth of the store's own files.
+            ballast.set_len(limit - requested - linked - SLACK).unwrap();
+            let before_pass = files();
+            // The store's own files grow a little after the settle step (up to about 6 KiB in
+            // runs that measured it; what writes them was not identified). The sizing
+            // tolerates SLACK of it; more would send the pass to the retirement branch, so
+            // name it here.
+            assert!(
+                before_pass <= linked + SLACK,
+                "the store files grew by {} bytes ({linked} at sizing, {settled} on a second read, {before_pass} just before the pass), over the {SLACK} byte slack",
+                before_pass.abs_diff(linked)
+            );
             Some(page)
         };
         let status = store.pressure_maintain(30, limits).unwrap();
@@ -20373,13 +20410,14 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
     assert!(owned(&store) < before);
     assert_eq!(store.bytes(&second.record_ids[0], 0, 2, 3).unwrap(), b"c\n");
 
-    // Publication at or behind the watermark or an in-flight segment is a clock regression.
+    // Publication at or behind the watermark or an in-flight segment is a clock regression,
+    // typed apart from a storage failure so a caller that stamped it early can restamp.
     assert_eq!(
         store
             .ingest("archive-regressed", "source", "log", b"late\n", 0)
             .unwrap_err()
             .code,
-        "STORAGE_FAILURE"
+        sparrow_core::ARCHIVE_WATERMARK
     );
     let next = ArchiveIntent {
         segment_id: [3; 32],
@@ -20394,10 +20432,38 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
             .ingest("archive-in-flight", "source", "log", b"late\n", 2)
             .unwrap_err()
             .code,
-        "STORAGE_FAILURE"
+        sparrow_core::ARCHIVE_WATERMARK
     );
     store
         .ingest("archive-current", "source", "log", b"now\n", 4)
+        .unwrap();
+}
+
+/// INVARIANT (#255): the fence names the instant a publication must be stamped after to be
+/// admitted whatever its identifier: one millisecond past it is admitted, and an earlier
+/// instant is refused with the typed code. A store with no fence names none.
+#[test]
+fn the_archive_fence_names_the_instant_a_publication_must_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving_config()).unwrap();
+    assert_eq!(store.archive_state().unwrap().unwrap().fence_millis(), None);
+    let first = store
+        .ingest("fence-first", "source", "log", b"a\n", 5)
+        .unwrap();
+    archive_records(&store, 1, &[archive_position(5, &first.record_ids[0])]);
+    assert_eq!(
+        store.archive_state().unwrap().unwrap().fence_millis(),
+        Some(5)
+    );
+    assert_eq!(
+        store
+            .ingest("fence-before", "source", "log", b"b\n", 4)
+            .unwrap_err()
+            .code,
+        sparrow_core::ARCHIVE_WATERMARK
+    );
+    store
+        .ingest("fence-past", "source", "log", b"c\n", 6)
         .unwrap();
 }
 

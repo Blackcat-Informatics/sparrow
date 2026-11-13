@@ -2589,7 +2589,11 @@ risks were accepted on 2026-10-27.
 
 Explicit `[[syslog]]` entries select TCP or UDP, source, loopback address,
 maximum message bytes (480..65536), maximum connections (TCP 1..16; UDP 1),
-and complete-frame timeout (1..60000 ms). TCP additionally requires a framing
+and complete-frame timeout (1..60000 ms). A UDP entry may also set `hold_bytes`,
+the bound of its queue (1048576..536870912, default 67108864); it is refused on a
+TCP entry. The `hold_bytes` of all UDP entries together may not exceed 536870912, which is
+also the most one entry can have.
+TCP additionally requires a framing
 law: `octet_counting`, `lf`, or `cr_lf`. The framing trailer is excluded from
 the original packet; LF framing preserves a preceding CR. No framing guesses
 are made. At most four listeners exist.
@@ -2670,8 +2674,81 @@ stream or discards a frame:
   counters (the free-space floor's `refused_writes` and the pressure status's
   `refused_writes`) count attempts and rise by one per offer; the listener's
   held counters count frames.
-  Refusals that no retry can change (`RESOURCE_LIMIT`) and UDP datagrams are
-  not held; they keep their counted discard.
+  Refusals that no retry can change (`RESOURCE_LIMIT`) are not held; they keep
+  their counted discard. A full receiver-window registry is not a refusal at all
+  (#215): the packet is stored without a window update and the store counts the lost
+  evidence.
+
+UDP has no sender to hold, so a UDP listener holds differently (#255). It runs a
+reader and a publisher joined by a first-in first-out queue bounded in bytes:
+
+- The reader takes datagrams off the socket as they arrive. It never calls the store
+  and never waits for an operation permit. It stamps each datagram with the instant it
+  was read, which becomes the record's `received_at`; within a listener the stamp never
+  goes backwards, so a clock stepping back stalls the stamp instead of reversing it.
+- Each queue entry holds the datagram's bytes and its read instant, and costs its
+  length plus 128 bytes against `hold_bytes`, so a flood of tiny datagrams is bounded in
+  count as well as in bytes. The memory a listener can use is `hold_bytes` plus the
+  one datagram, at most 65536 bytes, that the reader holds while it waits for room.
+- The publisher offers the head of the queue to the store through the same hold as a
+  TCP frame: a fair wait for an operation permit, and on `STORAGE_PRESSURE` a wait for
+  the wake and the stop and nothing else, governed by the table above. The head stays
+  the head until it is stored, so the order of the store is the order of arrival.
+  For a UDP listener `held_frames`, `holds_storage_pressure`, `holds_no_permit` and
+  `longest_hold_ms` describe the head datagram. A queue behind a healthy store is
+  burst absorption and is not a hold.
+- When the queue is full the reader stops reading, and the kernel socket buffer takes
+  the arrivals. Nothing is dropped in the daemon. When the kernel buffer fills too, the
+  kernel drops the newest datagrams and counts them in `kernel_drops`, so what is
+  stored is an ordered prefix and the loss is counted. The reader's wait ends when the
+  publisher frees room. A stop does not end it: the datagram in hand is published if the
+  store takes it, and counted lost with the rest of the queue if the store is still under
+  pressure at the stop (see the stop below). The wait owns no timer.
+- A datagram waits for the store with its read instant. A client that pages by moving
+  `received_from` past the last record it saw will not see a datagram stored behind that
+  position; a read run again over the range does, and a pin's membership does not change.
+  If the store refuses the read instant as at or behind the archive watermark
+  (`ARCHIVE_WATERMARK`), the publisher offers the datagram once more with the commit
+  instant and counts it `restamped`. If the commit instant is also at or behind the
+  watermark (the clock stepped back), the datagram is still not refused: it is stored with
+  the instant just past the watermark (the fence plus one millisecond), counted
+  `restamped_past_watermark`, and journaled, at most one line a minute. Its `received_at` is
+  then that fence-adjusted time and not the clock; the read instant and the clock appear in
+  the journal line. A log is never refused for its stamp. Any other `STORAGE_FAILURE` is not
+  retried.
+- A store error that is neither pressure nor a counted refusal returns from the
+  listener at once. The reader stops with it, the datagrams still queued are counted in
+  `lost_at_shutdown` (the datagram the reader holds while it waits for room is counted with
+  them, and its wait ends, so `reader_full_longest_ms` stops growing) and named in the error,
+  and the daemon's worker health gate stops the daemon, so a reader never fills a queue that
+  nobody drains. Datagrams still in the kernel buffer at this exit are lost and not counted.
+- A socket or stamping error in the reader closes the queue: the publisher stores what is
+  queued, and then the listener returns the reader's error. A datagram the reader had taken
+  off the socket and not queued when it failed (including one it was holding in a full-queue
+  wait, which ends) is counted in `lost_at_shutdown` and named in the error.
+- On a stop the reader drains the socket, reading up to the queue bound, and the
+  publisher publishes the queue while the store accepts it. A stop that finds the store
+  under pressure gives the head one last attempt. If that is refused, the head and the
+  rest of the queue are counted once, as `lost_at_shutdown` datagrams and
+  `lost_at_shutdown_bytes`, with one journal line and no discard row per datagram.
+
+There is no spool. The loss window is the queue and the kernel buffer on any exit the
+daemon does not get to count: a crash, a kill, an out-of-memory kill and the exit on a
+full disk lose up to `hold_bytes` of queue and the kernel buffer for each UDP listener,
+uncounted, because the process that would count them is gone. A publisher error counts the
+queue and the datagram in the reader's hand, but the kernel buffer at that exit is lost
+uncounted too. A stop inside the unit's
+`TimeoutStopSec` counts the queue's remainder as above; datagrams left in the kernel
+beyond the drain bound are lost uncounted.
+
+The waits a UDP listener adds, with what ends each:
+
+| Wait | Ending | Signal or observer |
+| --- | --- | --- |
+| The publisher holds the head for pressure or a permit | as the table above | as the table above |
+| The reader waits for room in a full queue | the publisher stores or counts a datagram and frees its budget | event (the budget semaphore) |
+| A full-queue episode's report interval passes | none exists | the same one-second observation, since the reader counts as held while it waits |
+| The kernel drop count changes | none exists | read when a status is requested, when the reader leaves a wait and when the queue drains to empty after an episode; no timer |
 
 Each accepted packet is one exact-byte `syslog` record, including embedded
 newlines. Its immutable profile records parsed RFC 5424 or RFC 3164 headers,
@@ -2730,8 +2807,23 @@ says why. A zero count is never reported unless the kernel reported it.
 
 UDP syslog is lossy by its nature; loss is counted where it can be (the kernel's
 drops, a clean shutdown) and stated plainly where it cannot (a crash, an exit on a
-full disk). In this release the shutdown count is the final kernel drop count; datagrams
-a held queue loses at shutdown are counted when that queue exists.
+full disk). The shutdown count is the final kernel drop count and `lost_at_shutdown`.
+
+The UDP queue adds these fields to the listener status, also without a schema bump and
+zero for TCP: `queued_datagrams` and `queued_bytes` (the datagrams in the queue, the head
+included until it is stored, and the budget they use, length plus 128 each), `hold_bytes`
+(the bound), `reader_full_waits` (times the reader stopped on a full queue),
+`reader_full_longest_ms` (the longest such wait, finished or running), `restamped`
+(datagrams published with the commit instant after the archive watermark refused the
+read instant), `restamped_past_watermark` (datagrams that the watermark refused at the commit
+instant too, stored just past it), and `lost_at_shutdown` with `lost_at_shutdown_bytes`. The daemon journals
+an episode of full-queue waits as it does a hold: the entering line gives the queued
+datagrams and bytes against the bound and the kernel drops so far, with at most one a
+minute per listener. An episode the limit suppressed is announced by the next wait or
+observer tick once the minute has passed. The leaving line, printed when the queue next
+drains for an episode that was announced, gives the waits, the longest wait and the
+kernel drops during the episode. A head hold of a UDP listener prints the same hold lines
+as TCP, naming datagrams.
 
 Counters are process-lifetime evidence and reset on restart. Successful counts
 follow durable store publication, but syslog provides no typed sender receipt.
@@ -3884,12 +3976,18 @@ refusal and every refusal of an older daemon.
 | `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. Native certified governor outcomes retain their read receipts. |
 | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
 | `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
+| `ARCHIVE_WATERMARK` | Publication at or behind the archive watermark. Not retryable as sent. |
 | `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface. Raw artifact preservation can still succeed independently of projection support. |
 | `READ_ONLY` | A write sent to a query-only daemon (schema 67). Not retryable against that daemon. |
 | `PERMISSION_DENIED` | A non-producer operation on the ingest socket, or an import continued by an account other than the one that began it (schema 68). Not retryable on that connection. |
 
-`STORAGE_FAILURE` also covers a publication at or behind the archive watermark,
-which signals a clock regression, and retirement reaching unarchived evidence.
+`ARCHIVE_WATERMARK` is a publication at or behind the archive watermark: a clock
+regression, or a datagram stamped with its read instant that waited past the
+watermark. It is not retryable as sent. It was `STORAGE_FAILURE` before the UDP
+syslog publisher needed to tell it apart, and every other caller treats it exactly
+as it treated `STORAGE_FAILURE`: the watch worker, which stops on a storage
+failure, stops on it too. Only the UDP syslog publisher handles it, as described
+with the UDP hold. `STORAGE_FAILURE` also covers retirement reaching unarchived evidence.
 `INVALID_ARGUMENT` covers opening an archiving store without its `[archive]`
 table.
 
