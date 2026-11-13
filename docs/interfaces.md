@@ -2506,6 +2506,12 @@ stream or discards a frame:
   accept wait in the kernel backlog; the existing pause of accepting below the
   free-space floor is unchanged. On shutdown a hold ends: the frame gets one last
   attempt and, if the store still refuses it, is counted `refused` as before.
+  A wait for an operation permit is not cut short by a stop: the frame must
+  still be published, which takes a permit from the budget shutdown waits on
+  anyway. Each retry is a refused write attempt, so the store-wide refusal
+  counters (the free-space floor's `refused_writes` and the pressure status's
+  `refused_writes`) count attempts and rise by one per retry; the listener's
+  held counters count frames.
   Refusals that no retry can change (`RESOURCE_LIMIT`) and UDP datagrams are
   not held; they keep their counted discard.
 
@@ -2529,8 +2535,11 @@ refusals stay zero because an arrival at the ceiling is served. Held frames add
 (frames held at least once for that reason, each counted once however often it
 is retried) and `longest_hold_ms` (the longest hold, finished or running). They
 are the last four fields of the listener status, added without a schema bump.
-The daemon journals a line when a hold episode begins, at most once a minute,
-and when it ends, with the frames held and the longest wait.
+The daemon journals a line when a hold episode begins and, for every episode it
+announced, a line when it ends, with the frames held and the longest wait. Beginning
+lines are limited to one a minute per listener. An episode that starts inside that
+interval is announced by its next retry once the interval has passed, and an
+episode that ends before then leaves counters only.
 Counters are process-lifetime evidence and reset on restart. Successful counts
 follow durable store publication, but syslog provides no typed sender receipt.
 TCP sends therefore do not prove publication; UDP kernel/network loss remains

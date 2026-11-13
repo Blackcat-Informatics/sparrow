@@ -192,6 +192,82 @@ impl Status {
         }
     }
 
+    /// Register or continue one frame's hold at `now`; returns the journal line to print, if
+    /// any. Holds that overlap are one episode. The entering line is limited to one per
+    /// [`HOLD_REPORT_INTERVAL`], but an episode the limit suppressed is announced by its next
+    /// refused attempt once the interval has passed, so no long hold is left unannounced.
+    fn hold(
+        &mut self,
+        id: &mut Option<u64>,
+        seen: &mut [bool; 2],
+        reason: HoldReason,
+        now: tokio::time::Instant,
+    ) -> io::Result<Option<String>> {
+        if id.is_none() {
+            self.next_hold += 1;
+            *id = Some(self.next_hold);
+            self.holding.insert(self.next_hold, now);
+            self.episode
+                .get_or_insert(Episode {
+                    frames: 0,
+                    longest: Duration::ZERO,
+                    announced: false,
+                })
+                .frames += 1;
+        }
+        let slot = usize::from(reason == HoldReason::NoPermit);
+        if !seen[slot] {
+            seen[slot] = true;
+            increment(match reason {
+                HoldReason::StoragePressure => &mut self.counts.holds_storage_pressure,
+                HoldReason::NoPermit => &mut self.counts.holds_no_permit,
+            })?;
+        }
+        let quiet = self
+            .announced_at
+            .is_none_or(|at| now.duration_since(at) >= HOLD_REPORT_INTERVAL);
+        let held = self.holding.len();
+        let Some(episode) = self
+            .episode
+            .as_mut()
+            .filter(|episode| !episode.announced && quiet)
+        else {
+            return Ok(None);
+        };
+        episode.announced = true;
+        self.announced_at = Some(now);
+        Ok(Some(format!(
+            "sparrowd: syslog listener {}: holding {held} frame(s) under {}; each sender's TCP window closes until it clears",
+            self.definition.id,
+            reason.name()
+        )))
+    }
+
+    /// End one frame's hold at `now`; returns the journal line when the episode it belonged
+    /// to was announced and this was its last hold. An episode the limit never announced
+    /// ended within the report interval and shows in the counters only.
+    fn release(&mut self, id: u64, now: tokio::time::Instant) -> Option<String> {
+        let since = self.holding.remove(&id)?;
+        let waited = now.duration_since(since);
+        self.counts.longest_hold_ms = self
+            .counts
+            .longest_hold_ms
+            .max(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+        if let Some(episode) = self.episode.as_mut() {
+            episode.longest = episode.longest.max(waited);
+        }
+        if !self.holding.is_empty() {
+            return None;
+        }
+        let episode = self.episode.take().filter(|episode| episode.announced)?;
+        Some(format!(
+            "sparrowd: syslog listener {}: hold ended; {} frame(s) held, longest wait {} ms",
+            self.definition.id,
+            episode.frames,
+            episode.longest.as_millis()
+        ))
+    }
+
     /// The longest hold, finished or still running.
     fn longest_hold(&self) -> Duration {
         let running = self.holding.values().map(|since| since.elapsed()).max();
@@ -217,48 +293,23 @@ impl<'a> Hold<'a> {
         }
     }
 
-    /// Begin the hold if it has not begun, and count `reason` once for this frame.
+    /// Begin the hold if it has not begun, and count `reason` once for this frame. Called on
+    /// every refused attempt, so a long hold is announced once the report interval allows.
     fn enter(&mut self, reason: HoldReason) -> io::Result<()> {
-        let id = &mut self.id;
-        let seen = &mut self.seen;
+        let mut line = None;
         self.metrics.update(|status| {
-            if id.is_none() {
-                let now = tokio::time::Instant::now();
-                status.next_hold += 1;
-                *id = Some(status.next_hold);
-                status.holding.insert(status.next_hold, now);
-                let episode = status.episode.get_or_insert(Episode {
-                    frames: 0,
-                    longest: Duration::ZERO,
-                    announced: false,
-                });
-                episode.frames += 1;
-                if status.holding.len() == 1
-                    && status
-                        .announced_at
-                        .is_none_or(|at| now.duration_since(at) >= HOLD_REPORT_INTERVAL)
-                {
-                    status.announced_at = Some(now);
-                    if let Some(episode) = status.episode.as_mut() {
-                        episode.announced = true;
-                    }
-                    eprintln!(
-                        "sparrowd: syslog listener {}: holding a frame under {}; the sender's TCP window closes until it clears",
-                        status.definition.id,
-                        reason.name()
-                    );
-                }
-            }
-            let slot = usize::from(reason == HoldReason::NoPermit);
-            if !seen[slot] {
-                seen[slot] = true;
-                increment(match reason {
-                    HoldReason::StoragePressure => &mut status.counts.holds_storage_pressure,
-                    HoldReason::NoPermit => &mut status.counts.holds_no_permit,
-                })?;
-            }
+            line = status.hold(
+                &mut self.id,
+                &mut self.seen,
+                reason,
+                tokio::time::Instant::now(),
+            )?;
             Ok(())
-        })
+        })?;
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
+        Ok(())
     }
 
     /// End the hold, if any, recording how long it lasted.
@@ -266,29 +317,15 @@ impl<'a> Hold<'a> {
         let Some(id) = self.id.take() else {
             return Ok(());
         };
+        let mut line = None;
         self.metrics.update(|status| {
-            let Some(since) = status.holding.remove(&id) else {
-                return Ok(());
-            };
-            let waited = since.elapsed();
-            let millis = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
-            status.counts.longest_hold_ms = status.counts.longest_hold_ms.max(millis);
-            if let Some(episode) = status.episode.as_mut() {
-                episode.longest = episode.longest.max(waited);
-            }
-            if status.holding.is_empty()
-                && let Some(episode) = status.episode.take()
-                && episode.announced
-            {
-                eprintln!(
-                    "sparrowd: syslog listener {}: hold ended; {} frame(s) held, longest wait {} ms",
-                    status.definition.id,
-                    episode.frames,
-                    episode.longest.as_millis()
-                );
-            }
+            line = status.release(id, tokio::time::Instant::now());
             Ok(())
-        })
+        })?;
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
+        Ok(())
     }
 }
 impl Drop for Hold<'_> {
@@ -566,6 +603,8 @@ async fn publish_held(
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
                 hold.enter(HoldReason::NoPermit)?;
+                // A stop does not interrupt this wait: the frame must still be published, and
+                // that takes a permit from the operation budget shutdown waits on anyway.
                 operations
                     .clone()
                     .acquire_owned()
@@ -1598,6 +1637,7 @@ mod tests {
         store: sparrow_core::Store,
         metrics: Metrics,
         wake: PressureWake,
+        operations: Arc<Semaphore>,
     }
 
     fn listener(transport: SyslogTransport, connections: usize, timeout_ms: u32) -> Listener {
@@ -1634,6 +1674,7 @@ mod tests {
             store,
             metrics,
             wake: PressureWake::default(),
+            operations: Arc::new(Semaphore::new(4)),
         }
     }
 
@@ -1656,7 +1697,7 @@ mod tests {
             socket,
             fixture.metrics.clone(),
             fixture.store.clone(),
-            Arc::new(Semaphore::new(4)),
+            fixture.operations.clone(),
             stopped,
             stop.clone(),
             fixture.wake.clone(),
@@ -1775,17 +1816,9 @@ mod tests {
         let store = fixture.store.clone();
         let lease = Arc::new(Roster::default()).enroll().unwrap();
         let wake = fixture.wake.clone();
+        let operations = fixture.operations.clone();
         tokio::spawn(async move {
-            receive_tcp(
-                receiver,
-                &metrics,
-                store,
-                Arc::new(Semaphore::new(4)),
-                stopped,
-                lease,
-                wake,
-            )
-            .await
+            receive_tcp(receiver, &metrics, store, operations, stopped, lease, wake).await
         })
     }
 
@@ -1841,10 +1874,12 @@ mod tests {
     /// Value (#243): a hold is visible while it lasts, which an operator needs to tell a
     /// sender held by the daemon from a silent one. Status carries the frames held now, the
     /// frame counted once for its reason however often it is retried, and the longest wait,
-    /// running or finished. Time is the paused test clock, so no wall time passes.
+    /// running or finished, through the wire encoding and its JSON rendering. The hold
+    /// outlasts the 1 s read timeout and must not trip it. Time is the paused test clock, so
+    /// no wall time passes.
     #[tokio::test(start_paused = true)]
     async fn a_hold_shows_in_status_with_its_reason_and_longest_wait() {
-        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
         fixture.store.space_floor().refuse_writes_for_tests(true);
         let (mut sender, receiver) = tokio::io::duplex(64);
         let (_stop, stopped) = watch::channel(false);
@@ -1866,6 +1901,7 @@ mod tests {
             ),
             (1, 0)
         );
+        assert_eq!(wire_fields(&held).0, (1, 1, 0));
         relieve(&fixture);
         while fixture.metrics.snapshot().unwrap().counts.accepted == 0 {
             tokio::task::yield_now().await;
@@ -1874,8 +1910,180 @@ mod tests {
         assert!(done.holding.is_empty());
         assert!(done.counts.longest_hold_ms >= 5000);
         assert_eq!(done.counts.holds_storage_pressure, 1);
+        assert_eq!(done.counts.timed_out + done.counts.framing_failures, 0);
+        let ((frames, pressure, permit), longest, json) = wire_fields(&done);
+        assert_eq!((frames, pressure, permit), (0, 1, 0));
+        assert!(longest >= 5000);
+        assert_eq!(json["held_frames"].as_u64(), Some(0));
+        assert_eq!(json["holds_storage_pressure"].as_str(), Some("1"));
+        assert_eq!(json["holds_no_permit"].as_str(), Some("0"));
+        assert_eq!(
+            json["longest_hold_ms"].as_str(),
+            Some(longest.to_string().as_str())
+        );
         drop(sender);
         reading.await.unwrap().unwrap();
+    }
+
+    /// The hold fields of a status as the wire carries them: held now, held for pressure, held
+    /// for a permit; the longest hold in milliseconds; and the JSON rendering of the listener.
+    fn wire_fields(status: &Status) -> ((u32, u64, u64), u64, purrdf_lex::json::Value) {
+        let mut message = capnp::message::Builder::new_default();
+        status.encode(message.init_root::<crate::sparrow_capnp::syslog_listener_status::Builder>());
+        let reader = message
+            .get_root_as_reader::<crate::sparrow_capnp::syslog_listener_status::Reader>()
+            .unwrap();
+        (
+            (
+                reader.get_held_frames(),
+                reader.get_holds_storage_pressure(),
+                reader.get_holds_no_permit(),
+            ),
+            reader.get_longest_hold_ms(),
+            crate::syslog_wire::listener(reader).unwrap(),
+        )
+    }
+
+    /// Value (#243): a frame waiting for an operation permit is held and counted as such, not
+    /// as pressure, and is stored once a permit frees. The test holds every permit itself.
+    #[tokio::test]
+    async fn a_frame_waiting_for_an_operation_permit_is_held_and_counted_as_no_permit() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let permits = fixture
+            .operations
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, frame_taken).await;
+        let held = fixture.metrics.snapshot().unwrap();
+        assert_eq!(
+            (
+                held.counts.holds_no_permit,
+                held.counts.holds_storage_pressure
+            ),
+            (1, 0)
+        );
+        assert_eq!(held.counts.accepted, 0);
+        drop(permits);
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        let done = fixture.metrics.snapshot().unwrap();
+        assert!(done.holding.is_empty());
+        assert_eq!(
+            (
+                done.counts.holds_no_permit,
+                done.counts.holds_storage_pressure
+            ),
+            (1, 0)
+        );
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        drop(sender);
+        reading.await.unwrap().unwrap();
+    }
+
+    /// Value (#243): a sender that closes while its frame is held loses nothing. The daemon is
+    /// not reading, so it stores the frame, then sees the close and ends the connection. With
+    /// no wake sent, only the retry backoff can end the hold; the paused clock is advanced
+    /// past the backoff ceiling instead of waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_sender_closing_during_a_hold_is_stored_by_the_backoff_alone() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        drop(sender);
+        while !frame_taken(&fixture.metrics.snapshot().unwrap()) {
+            tokio::task::yield_now().await;
+        }
+        assert!(!reading.is_finished());
+        fixture.store.space_floor().refuse_writes_for_tests(false);
+        while fixture.metrics.snapshot().unwrap().counts.accepted == 0 {
+            tokio::time::advance(HOLD_RETRY_CEILING).await;
+            tokio::task::yield_now().await;
+        }
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!(
+            counts.refused + counts.framing_failures + counts.timed_out,
+            0
+        );
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+    }
+
+    /// Value (#243): a refusal no retry changes (`RESOURCE_LIMIT`) is not held. It keeps its
+    /// counted discard and closes the connection as before, where holding it would stall the
+    /// sender forever.
+    #[tokio::test]
+    async fn a_permanent_refusal_is_counted_not_held() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture
+            .store
+            .space_floor()
+            .refuse_next_write_for_tests("RESOURCE_LIMIT");
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        reading.await.unwrap().unwrap();
+        let status = fixture.metrics.snapshot().unwrap();
+        assert_eq!((status.counts.refused, status.counts.accepted), (1, 0));
+        assert_eq!(
+            (
+                status.counts.holds_storage_pressure,
+                status.counts.holds_no_permit
+            ),
+            (0, 0)
+        );
+        assert!(status.holding.is_empty() && status.counts.longest_hold_ms == 0);
+    }
+
+    /// Value (#243): the journal keeps its promise to an operator. The first episode is
+    /// announced and its end journaled. An episode that starts inside the report interval is
+    /// not announced then, but is once its retries pass the interval, and its end is journaled
+    /// with the count and the longest wait; a short suppressed episode leaves no lines.
+    #[test]
+    fn a_long_hold_is_always_announced_and_its_end_journaled() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        let mut status = fixture.metrics.snapshot().unwrap();
+        let t0 = tokio::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let hold = |status: &mut Status, id: &mut Option<u64>, secs| {
+            status
+                .hold(id, &mut [false; 2], HoldReason::StoragePressure, at(secs))
+                .unwrap()
+        };
+        let mut first = None;
+        assert!(hold(&mut status, &mut first, 0).is_some());
+        assert!(hold(&mut status, &mut first, 1).is_none());
+        let line = status.release(first.unwrap(), at(2)).unwrap();
+        assert!(
+            line.contains("1 frame(s) held, longest wait 2000 ms"),
+            "{line}"
+        );
+        let mut second = None;
+        assert!(hold(&mut status, &mut second, 10).is_none());
+        assert!(hold(&mut status, &mut second, 59).is_none());
+        assert!(hold(&mut status, &mut second, 61).is_some());
+        let line = status.release(second.unwrap(), at(100)).unwrap();
+        assert!(
+            line.contains("1 frame(s) held, longest wait 90000 ms"),
+            "{line}"
+        );
+        let mut third = None;
+        assert!(hold(&mut status, &mut third, 101).is_none());
+        assert!(status.release(third.unwrap(), at(102)).is_none());
     }
 
     /// Value (#243): shutdown interrupts a hold and the frame in hand is still accounted as
