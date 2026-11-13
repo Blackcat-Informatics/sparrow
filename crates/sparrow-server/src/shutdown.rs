@@ -4,8 +4,9 @@
 //! Complete owned teardown, preserving the primary failure and every cleanup failure.
 
 use crate::local_endpoint::LocalEndpoint;
+use sparrow_server::admission::Admission;
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Default)]
 pub(super) struct Workers {
@@ -16,7 +17,11 @@ pub(super) struct Workers {
 
 /// Reserve the complete native admission budget, waiting for every owned worker.
 /// Tokio's fair queue blocks fresh try-acquires while the full reservation waits.
-async fn drain(operations: Arc<Semaphore>, slots: u32) -> Result<OwnedSemaphorePermit, String> {
+async fn drain(admission: &Admission, slots: u32) -> Result<OwnedSemaphorePermit, String> {
+    // Writers waiting for a permit stop waiting now (SHUTTING_DOWN); the drain below takes the
+    // permits they would have used.
+    admission.begin_shutdown();
+    let operations = admission.operations().clone();
     let guard = operations
         .clone()
         .acquire_many_owned(slots)
@@ -31,7 +36,7 @@ pub(super) async fn finish(
     workers: Workers,
     store: &sparrow_core::Store,
     endpoints: &[&LocalEndpoint],
-    operations: &Arc<Semaphore>,
+    admission: &Arc<Admission>,
     slots: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut errors = Vec::with_capacity(6);
@@ -47,7 +52,7 @@ pub(super) async fn finish(
     }
     // Intake workers may need their owned RPC transport to finish an admitted import.
     // Once joined, reserve all slots and retain them through the final WAL fence.
-    let drained = drain(operations.clone(), slots).await;
+    let drained = drain(admission, slots).await;
     if drained.is_ok() {
         let flushed = store.flush();
         let closed = flushed.is_ok();
@@ -102,9 +107,10 @@ mod tests {
 
     #[tokio::test]
     async fn final_drain_waits_for_all_workers_and_closes_fresh_admission() {
-        let operations = Arc::new(Semaphore::new(2));
+        let operations = Arc::new(tokio::sync::Semaphore::new(2));
+        let admission = Admission::new(operations.clone());
         let worker = operations.clone().acquire_owned().await.unwrap();
-        let barrier = drain(operations.clone(), 2);
+        let barrier = drain(&admission, 2);
         tokio::pin!(barrier);
         tokio::select! {
             biased;
@@ -132,7 +138,8 @@ mod tests {
         let config = sparrow_server::ServerConfig::read(&config).unwrap();
         let store = config.open_store().unwrap();
         let identity = store.store_id().unwrap();
-        let operations = Arc::new(Semaphore::new(2));
+        let operations = Arc::new(tokio::sync::Semaphore::new(2));
+        let admission = Admission::new(operations.clone());
         let permit = operations.clone().acquire_owned().await.unwrap();
         let owner = store.clone();
         let (entered, running) = tokio::sync::oneshot::channel();
@@ -162,7 +169,7 @@ mod tests {
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         {
-            let teardown = finish(Ok(()), Workers::default(), &store, &[], &operations, 2);
+            let teardown = finish(Ok(()), Workers::default(), &store, &[], &admission, 2);
             tokio::pin!(teardown);
             tokio::select! {
                 biased;

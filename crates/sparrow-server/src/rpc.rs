@@ -70,6 +70,13 @@ fn encode_durability(
     );
 }
 
+fn refusal(refusal: crate::admission::Refusal) -> Error {
+    Error {
+        code: refusal.code,
+        message: refusal.message.into(),
+    }
+}
+
 /// Read the server's millisecond acceptance clock.
 pub fn now() -> Result<u64, Error> {
     sparrow_client::unix_millis_now().map_err(invalid)
@@ -81,7 +88,9 @@ pub struct Rpc {
     connection: sparrow_core::QueryCancellation,
     syslog: crate::syslog_listener::SyslogRegistry,
     store: Store,
-    requests: Arc<Semaphore>,
+    admission: Arc<crate::admission::Admission>,
+    /// The shared RPC and TCP connection ceiling, reported by `status`.
+    connections: Option<Arc<crate::admission::Ceiling>>,
     max_pin_members: usize,
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
@@ -172,7 +181,8 @@ impl Rpc {
             connection: Default::default(),
             syslog: crate::syslog_listener::SyslogRegistry::default(),
             store,
-            requests,
+            admission: crate::admission::Admission::new(requests),
+            connections: None,
             max_pin_members,
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
@@ -182,6 +192,20 @@ impl Rpc {
             admin: None,
             backup: crate::backup::Backup::Unconfigured,
         }
+    }
+
+    /// Use the daemon's one admission, which shutdown closes to interrupt waiting writers.
+    #[must_use]
+    pub fn with_admission(mut self, admission: Arc<crate::admission::Admission>) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Report the shared RPC and TCP connection ceiling in `status`.
+    #[must_use]
+    pub fn with_connections(mut self, ceiling: Arc<crate::admission::Ceiling>) -> Self {
+        self.connections = Some(ceiling);
+        self
     }
 
     /// Take online backups into `target` (#156).
@@ -344,7 +368,7 @@ impl Rpc {
             self.check_store(&request.store_id)?;
             let intent = crate::tail_wire::intent(&request)?;
             if read_only {
-                self.work(move |store, _| {
+                self.lookup(move |store, _| {
                     store.tail_finish_get(&intent)?.ok_or_else(|| {
                         Error::new("NOT_FOUND", "tail finish request has not been admitted")
                     })
@@ -364,26 +388,53 @@ impl Rpc {
         Ok(())
     }
 
+    /// Run a write on the intake path. It waits for an operation permit, up to the writer wait
+    /// bound, then answers the retryable `RESOURCE_LIMIT`.
     async fn work<T: Send + 'static>(
         &self,
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
+        let permit = self.admission.writer().await.map_err(refusal)?;
+        self.run(permit, operation).await
+    }
+
+    /// As [`Rpc::work`], waiting for a permit no later than `deadline`.
+    async fn work_until<T: Send + 'static>(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
         let permit = self
-            .requests
-            .clone()
-            .try_acquire_owned()
-            .map_err(|error| match error {
-                tokio::sync::TryAcquireError::NoPermits => Error {
-                    code: "RESOURCE_LIMIT",
-                    message: "RPC operation concurrency is at its configured limit".into(),
-                },
-                tokio::sync::TryAcquireError::Closed => Error {
-                    code: "SHUTTING_DOWN",
-                    message:
-                        "RPC storage admission is closed; retry the same intent after reconnecting"
-                            .into(),
-                },
-            })?;
+            .admission
+            .writer_until(deadline)
+            .await
+            .map_err(refusal)?;
+        self.run(permit, operation).await
+    }
+
+    /// Run a `status` read, which takes no operation permit (see `Admission::diagnostic`).
+    async fn diagnostic<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let permit = self.admission.diagnostic().map_err(refusal)?;
+        self.run(permit, operation).await
+    }
+
+    /// Run a read: it takes a reader slot and a permit only if both are free now.
+    async fn lookup<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let permit = self.admission.reader().map_err(refusal)?;
+        self.run(permit, operation).await
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        permit: crate::admission::Admitted,
+        operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -404,7 +455,7 @@ impl Rpc {
     ) -> Result<T, Error> {
         let cancellation = self.connection.child();
         let _caller = CancelQuery(cancellation.clone());
-        self.work(move |store, now| {
+        self.lookup(move |store, now| {
             cancellation.checkpoint()?;
             let reply = operation(store, now, cancellation.clone())?;
             cancellation.checkpoint()?;
@@ -1929,7 +1980,7 @@ impl wire::sparrow::Server for Rpc {
         let result = match self.check_store(store) {
             // The listing decodes up to 2048 journals: run it off the connection's event loop.
             Ok(()) => {
-                self.work(move |store, as_of| {
+                self.lookup(move |store, as_of| {
                     let until = until.unwrap_or(as_of);
                     Ok((as_of, until, store.consumption_claims(since, until)?))
                 })
@@ -2142,15 +2193,26 @@ impl wire::sparrow::Server for Rpc {
         let kind = format(input.get_format()?);
         let length = input.get_byte_length();
         let intake = self.intake;
-        match self
-            .work(move |store, now| {
-                Ok((
-                    store.import_start_with_intake(
-                        &request, &source, kind, length, &payload, intake, now,
-                    )?,
-                    store.store_id()?,
-                ))
-            })
+        let admission = self.admission.clone();
+        match admission
+            .import_slot(
+                |deadline| {
+                    let (request, source, payload) =
+                        (request.clone(), source.clone(), payload.clone());
+                    self.work_until(deadline, move |store, now| {
+                        Ok((
+                            store.import_start_with_intake(
+                                &request, &source, kind, length, &payload, intake, now,
+                            )?,
+                            store.store_id()?,
+                        ))
+                    })
+                },
+                |error: &Error| {
+                    error.code == "RESOURCE_LIMIT"
+                        && error.message == sparrow_core::IMPORT_JOURNALS_OCCUPIED
+                },
+            )
             .await
         {
             Ok((sparrow_core::ImportStart::Staging(value), store)) => import_progress(
@@ -2321,7 +2383,7 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| store.ingest_status(&selector, limits, now))
+            .lookup(move |store, now| store.ingest_status(&selector, limits, now))
             .await
         {
             Ok(status) => ingest_status::encode(results.get().init_result().init_ok(), status)?,
@@ -2505,7 +2567,7 @@ impl wire::sparrow::Server for Rpc {
         );
         let result = match id {
             Ok(id) => {
-                self.work(move |store, now| store.rdf_inspect(&id, now))
+                self.lookup(move |store, now| store.rdf_inspect(&id, now))
                     .await
             }
             Err(error) => Err(error),
@@ -2665,7 +2727,7 @@ impl wire::sparrow::Server for Rpc {
         }
         let source = source.to_str()?.to_owned();
         match self
-            .work(move |store, _| Ok((store.diagnostic_profile(&source)?, store.store_id()?)))
+            .lookup(move |store, _| Ok((store.diagnostic_profile(&source)?, store.store_id()?)))
             .await
         {
             Ok((Some(profile), store)) => crate::diagnostics::profile(
@@ -2770,7 +2832,7 @@ impl wire::sparrow::Server for Rpc {
         }
         let source = input.get_source()?.to_str()?.to_owned();
         match self
-            .work(move |store, _| Ok((store.time_profile(&source)?, store.store_id()?)))
+            .lookup(move |store, _| Ok((store.time_profile(&source)?, store.store_id()?)))
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
@@ -2966,7 +3028,7 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(|store, now| {
+            .diagnostic(|store, now| {
                 let (status, migrations) = store.status_report(now)?;
                 Ok((
                     status,
@@ -3056,6 +3118,8 @@ impl wire::sparrow::Server for Rpc {
                 );
                 self.backup
                     .encode(out.reborrow().init_backup(), &self.store.backup_status());
+                self.admission
+                    .encode(out.reborrow().init_admission(), self.connections.as_deref());
                 match &self.ingest_socket {
                     Some(socket) => socket.encode(out.reborrow().init_ingest_socket().init_value()),
                     None => out.reborrow().init_ingest_socket().set_absent(()),
@@ -3198,7 +3262,7 @@ impl wire::sparrow::Server for Rpc {
             input.get_id()?.to_str()?,
             "artifact:",
         ) {
-            Ok(id) => self.work(move |store, _| store.artifact(&id)).await,
+            Ok(id) => self.lookup(move |store, _| store.artifact(&id)).await,
             Err(e) => Err(e),
         };
         match result {
@@ -3226,7 +3290,7 @@ impl wire::sparrow::Server for Rpc {
             input.get_id()?.to_str()?,
             "record:",
         ) {
-            Ok(id) => self.work(move |store, _| store.record(&id)).await,
+            Ok(id) => self.lookup(move |store, _| store.record(&id)).await,
             Err(e) => Err(e),
         };
         match result {
@@ -3257,7 +3321,7 @@ impl wire::sparrow::Server for Rpc {
         };
         let result = match target {
             Ok(id) => {
-                self.work(move |store, now| store.bytes(&id, offset, length, now))
+                self.lookup(move |store, now| store.bytes(&id, offset, length, now))
                     .await
             }
             Err(e) => Err(e),
@@ -3430,7 +3494,10 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        match self.work(move |store, _| store.tail_generation(&id)).await {
+        match self
+            .lookup(move |store, _| store.tail_generation(&id))
+            .await
+        {
             Err(error) => failure(results.get().init_result(), error),
             Ok(generation) => crate::tail_wire::generation(
                 results.get().init_result().init_ok(),
@@ -3528,7 +3595,7 @@ impl wire::sparrow::Server for Rpc {
         }
         let id = id.to_str()?.to_owned();
         match self
-            .work(move |store, now| store.receiver_window(&id, now))
+            .lookup(move |store, now| store.receiver_window(&id, now))
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
@@ -3615,7 +3682,7 @@ impl wire::sparrow::Server for Rpc {
         }
         let id = id.to_str()?.to_owned();
         match self
-            .work(move |store, now| store.producer_stream(&id, now))
+            .lookup(move |store, now| store.producer_stream(&id, now))
             .await
         {
             Err(error) => failure(results.get().init_result(), error),
@@ -4528,5 +4595,147 @@ mod tests {
         let error = error.unwrap();
         assert_eq!(error.get_code().unwrap().to_str().unwrap(), "SHUTTING_DOWN");
         assert!(error.get_retryable());
+    }
+
+    /// An RPC over a fresh store whose operation budget is `slots` permits.
+    fn admission_fixture(slots: usize) -> (tempfile::TempDir, Arc<Rpc>, Arc<Semaphore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = crate::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let operations = Arc::new(Semaphore::new(slots));
+        let rpc = Arc::new(Rpc::new(store, operations.clone(), 100));
+        (dir, rpc, operations)
+    }
+
+    /// Run a no-op write on its own task and let it reach its wait.
+    async fn spawn_write(rpc: &Arc<Rpc>) -> tokio::task::JoinHandle<Result<u8, Error>> {
+        let rpc = rpc.clone();
+        let task = tokio::spawn(async move { rpc.work(|_, _| Ok(7u8)).await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        task
+    }
+
+    /// INVARIANT (#246): a writer that finds the permit budget exhausted waits for a permit
+    /// and is served when one frees, instead of being refused at once. Waiters are served in
+    /// arrival order, and the wait is counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_waits_for_a_permit_and_is_served_in_arrival_order() {
+        let (_dir, rpc, operations) = admission_fixture(1);
+        let held = operations.clone().acquire_owned().await.unwrap();
+        let first = spawn_write(&rpc).await;
+        let second = spawn_write(&rpc).await;
+        assert!(
+            !first.is_finished(),
+            "a writer was refused instead of waiting"
+        );
+        assert!(!second.is_finished());
+        assert_eq!(rpc.admission.writer_waits().waiting, 2);
+        drop(held);
+        assert_eq!(first.await.unwrap().unwrap(), 7);
+        assert_eq!(second.await.unwrap().unwrap(), 7);
+        let waits = rpc.admission.writer_waits();
+        assert_eq!((waits.waits, waits.waiting, waits.timeouts), (2, 0, 0));
+    }
+
+    /// INVARIANT (#246): a writer that waits the whole bound is answered with the retryable
+    /// `RESOURCE_LIMIT`, after the bound and before the client's own `rpc_timeout`; the timeout
+    /// and the longest wait are counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_that_waits_out_its_bound_gets_the_retryable_resource_limit() {
+        let (_dir, rpc, operations) = admission_fixture(1);
+        let _held = operations.clone().acquire_owned().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let error = spawn_write(&rpc).await.await.unwrap().unwrap_err();
+        assert_eq!(error.code, "RESOURCE_LIMIT");
+        let waited = started.elapsed();
+        assert!(waited >= crate::admission::WRITER_PERMIT_WAIT, "{waited:?}");
+        assert!(
+            waited < sparrow_client::DeliveryConfig::new("rpc.sock", "client").rpc_timeout,
+            "{waited:?}"
+        );
+        let mut message = capnp::message::Builder::new_default();
+        failure(
+            message.init_root::<wire::result::Builder<wire::artifact::Owned>>(),
+            error,
+        );
+        let reply = message
+            .get_root_as_reader::<wire::result::Reader<wire::artifact::Owned>>()
+            .unwrap();
+        let wire::result::Error(error) = reply.which().unwrap() else {
+            panic!("a refusal rendered a successful reply");
+        };
+        assert!(error.unwrap().get_retryable());
+        let waits = rpc.admission.writer_waits();
+        assert_eq!((waits.waits, waits.waiting, waits.timeouts), (1, 0, 1));
+        assert!(waits.longest_ms >= 3000);
+    }
+
+    /// INVARIANT (#246): shutdown interrupts a waiting writer at once with `SHUTTING_DOWN`
+    /// (not after its bound as `RESOURCE_LIMIT`), whether shutdown begins or the budget closes.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_waiting_writers() {
+        let started = tokio::time::Instant::now();
+        // Shutdown beginning interrupts a writer queued behind the drain.
+        let (_dir, rpc, operations) = admission_fixture(1);
+        let _held = operations.clone().acquire_owned().await.unwrap();
+        let waiting = spawn_write(&rpc).await;
+        assert!(!waiting.is_finished());
+        rpc.admission.begin_shutdown();
+        assert_eq!(waiting.await.unwrap().unwrap_err().code, "SHUTTING_DOWN");
+        assert_eq!(rpc.admission.writer_waits().waiting, 0);
+        // So does the budget closing, and a writer that arrives after is told the same.
+        let (_dir, rpc, operations) = admission_fixture(1);
+        let _held = operations.clone().acquire_owned().await.unwrap();
+        let waiting = spawn_write(&rpc).await;
+        assert!(!waiting.is_finished());
+        operations.close();
+        assert_eq!(waiting.await.unwrap().unwrap_err().code, "SHUTTING_DOWN");
+        assert_eq!(
+            spawn_write(&rpc).await.await.unwrap().unwrap_err().code,
+            "SHUTTING_DOWN"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// INVARIANT (#246, #91): readers can hold at most `max - writer_reserve` permits, so a
+    /// query storm leaves the reserved permit to ingest, and a reader beyond its share is
+    /// refused at once and counted rather than queued ahead of a writer.
+    #[tokio::test(start_paused = true)]
+    async fn a_query_storm_cannot_starve_the_writer_sub_pool() {
+        let (_dir, rpc, _operations) = admission_fixture(4);
+        assert_eq!(rpc.admission.writer_reserve(), 1);
+        assert_eq!(rpc.admission.reader_slots(), 3);
+        let storm: Vec<_> = (0..3).map(|_| rpc.admission.reader().unwrap()).collect();
+        let refused = rpc.lookup(|_, _| Ok(1u8)).await.unwrap_err();
+        assert_eq!(refused.code, "RESOURCE_LIMIT");
+        assert_eq!(rpc.admission.reader_refusals(), 1);
+        let started = tokio::time::Instant::now();
+        assert_eq!(rpc.work(|_, _| Ok(7u8)).await.unwrap(), 7);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        drop(storm);
+        assert_eq!(rpc.lookup(|_, _| Ok(1u8)).await.unwrap(), 1);
+    }
+
+    /// INVARIANT (#246): `status` is served while writers hold every operation permit, because
+    /// its handler takes the diagnostic class; a handler that went back to the reader class
+    /// would be refused here with `RESOURCE_LIMIT`, hiding the counters that explain it.
+    #[tokio::test(start_paused = true)]
+    async fn the_status_handler_takes_no_operation_permit() {
+        let (_dir, rpc, operations) = admission_fixture(1);
+        let _writers = operations.clone().acquire_owned().await.unwrap();
+        let client = Rpc::clone(&rpc).into_client();
+        let response = client.status_request().send().promise.await.unwrap();
+        let result = response.get().unwrap().get_result().unwrap();
+        assert!(
+            matches!(result.which().unwrap(), wire::result::Ok(_)),
+            "status was refused while writers held the budget"
+        );
     }
 }

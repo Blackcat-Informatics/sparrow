@@ -56,22 +56,15 @@ pub fn local_caller(stream: &tokio::net::UnixStream) -> std::io::Result<String> 
 /// Every Unix or TCP connection closes this long after admission.
 pub(crate) const CONNECTION_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Apply a connection ceiling and the lease to one accepted stream. Returns false, having
-/// dropped the stream unanswered, when the ceiling is reached.
-pub fn admit_connection<S>(
-    stream: S,
-    rpc: crate::Rpc,
-    connections: std::sync::Arc<tokio::sync::Semaphore>,
-    access: Access,
-) -> bool
+/// Serve one accepted stream under a connection slot taken before it was accepted, and the
+/// lease. The slot frees when the connection ends, which includes the lease expiring.
+pub fn admit_connection<S>(stream: S, rpc: crate::Rpc, slot: crate::admission::Slot, access: Access)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
 {
-    let Ok(permit) = connections.try_acquire_owned() else {
-        return false;
-    };
+    let connection = slot.activate();
     tokio::task::spawn_local(async move {
-        let _permit = permit;
+        let connection = connection;
         let (rpc, _lifetime) = rpc.for_connection();
         let client = match access {
             Access::Local(caller) => rpc.with_admin(caller).into_client(),
@@ -91,8 +84,13 @@ where
         match tokio::time::timeout(CONNECTION_LEASE, serve_connection(stream, client)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => eprintln!("sparrowd: RPC connection failed: {error}"),
-            Err(_) => eprintln!("sparrowd: RPC connection lease expired"),
+            Err(_) => {
+                connection.ceiling().lease_expired();
+                eprintln!(
+                    "sparrowd: {} lease expired; the connection was closed",
+                    connection.ceiling().name()
+                );
+            }
         }
     });
-    true
 }

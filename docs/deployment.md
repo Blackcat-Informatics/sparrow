@@ -80,9 +80,17 @@ because they were sample inputs.
 workers (1..64). `max_rpc_connections` independently admits Unix and TCP RPC
 streams from one shared ceiling (1..256, default 16). An idle agent capability
 holds a transport lease without consuming a storage permit. The existing
-60-second connection lease still applies. Peers beyond the connection ceiling
-are disconnected before capability admission; storage saturation returns the
-existing typed operation refusal. These are separate finite resource budgets.
+60-second connection lease still applies. The daemon takes a connection slot
+before it accepts a peer, so a peer beyond the connection ceiling waits in the
+kernel's listen backlog and is served when a slot frees (a connection ends or
+its lease expires); it is no longer reset. A stalled peer therefore holds its
+slot until the lease expires. An intake operation (ingest, events, imports,
+flush, pins, discovery) that finds every storage permit taken waits for one, in
+arrival order, for at most 3 seconds, then receives the retryable
+`RESOURCE_LIMIT`. About a quarter of the permits (rounded up, none when there is
+only one) are reserved: queries and status reads may hold the rest, so a query
+storm cannot starve ingest, and a read beyond its share is refused at once. These
+are separate finite resource budgets; `status` reports each wait.
 
 Sparrow has no configurable per-artifact byte limit. A large artifact ingests
 through the staged import within `disk_budget` and `min_free_bytes`, up to one
@@ -185,9 +193,10 @@ and the setgid bit, not its membership, gives the socket the group.
 
 `max_ingest_connections` is a ceiling separate from `max_rpc_connections`, so
 producers cannot use up the connections the CLI and MCP need. Over it, a
-producer connection is dropped unanswered. A connection whose credentials the
-kernel cannot report is refused and logged. `status` lists the socket's path,
-group, ceiling, active connections and refused connections. An import is bound
+producer connection waits in the kernel backlog until a slot frees and is not
+reset. A connection whose credentials the kernel cannot report is refused and
+logged. `status` lists the socket's path, group, ceiling, active connections,
+refused connections, ceiling waits and lease expiries. An import is bound
 to the account that began it; another account's attempt to continue it is
 refused with `PERMISSION_DENIED`. A query-only daemon refuses
 `ingest_socket_path`.

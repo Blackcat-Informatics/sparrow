@@ -212,8 +212,8 @@ that reservation; admitted workers retain their slots until they finish, even
 when their caller disappears. Once the reservation completes, admission closes
 and remains reserved through the final store flush and endpoint cleanup.
 Closed storage admission returns retryable `SHUTTING_DOWN`; preserve the same
-immutable intent when reconnecting. While the reservation is pending, ordinary
-capacity refusal remains `RESOURCE_LIMIT`. A failed admission drain is reported
+immutable intent when reconnecting. When the reservation begins, every waiting
+writer and every later one is answered `SHUTTING_DOWN` at once. A failed admission drain is reported
 and withholds the final flush rather than claiming a fence over active workers.
 During intake joins, existing RPC connections remain available for completing
 owned producer work. This establishes ordering, not a worst-case drain deadline.
@@ -2430,7 +2430,68 @@ another uid return `PERMISSION_DENIED`, and an inline retry of a request
 committed by another caller returns `CONFLICT`. Its connections have their own
 ceiling, `max_ingest_connections` (1..256, default 16), and the same 60-second
 lease. The private socket records no caller identity. `status.ingestSocket`
-reports the path, group, ceiling, active connections and refused connections.
+reports the path, group, ceiling, active connections and refused connections,
+which now counts only a peer whose credentials the kernel cannot report; a peer
+over the ceiling waits (see Admission waits).
+
+### Admission waits (#246)
+
+Three limits that used to refuse at once now wait, and every wait is counted.
+
+- Operation permits. `max_concurrent_requests` is the whole budget. A writer (the
+  intake path: ingest, events, imports, flush, discovery, pins and handoffs, and the
+  daemon's own consume and syslog workers) that finds none free waits in arrival
+  order, as Tokio's fair semaphore queue serves, for 3 seconds, which is inside the
+  client's default `rpc_timeout` of 5 seconds, then receives the same retryable
+  `RESOURCE_LIMIT`. A reader (queries, status, gets) takes a permit only if one is
+  free and is first limited to the budget minus the writer reserve, a quarter of it
+  rounded up and never so much that no reader can run, so a query storm cannot take
+  the last permits. A reader never waits, because it would queue ahead of a later
+  writer; beyond its share it is refused at once and counted. `status` is the exception
+  to the permit rule: it takes no operation permit (as many status reads run at once
+  as readers may, one more is refused and counted), so a budget saturated by writers
+  still answers the counters that explain it. It answers `SHUTTING_DOWN` once shutdown
+  begins; a read already running is not drained, because it reads a snapshot and
+  writes nothing. The UDP syslog
+  listener keeps its instant try, which it counts as a refusal, because it must keep
+  reading its socket: a wait there lets the kernel drop datagrams uncounted. The
+  MCP four-call limit is a per-session cap of that adapter, not this budget, and is
+  unchanged. A waiting writer ends its wait on a permit released by finished storage
+  work, on shutdown beginning, or on the budget closing (`SHUTTING_DOWN`, retryable);
+  the only timer is the 3-second bound, which exists because the client stops
+  reading after its own deadline.
+- Import journal slots. A begin-import that finds all 16 occupied waits for a slot to
+  free, under one bound of 3 seconds that covers the whole call, including any wait for
+  an operation permit (which is capped at the time left); no attempt starts once the
+  bound has passed. A slot frees when a reclamation commit deletes a journal (a
+  published, cancelled or expired import; cancelling only ends the lease, and the
+  maintenance reclamation duty, on its existing one-second interval, performs the
+  deletion), and that commit signals the waiters; a pass
+  that deletes nothing signals nobody, and nothing retries on a clock. The wait also
+  ends at shutdown, or at the bound, and then answers the same `RESOURCE_LIMIT`. It
+  holds no permit while it waits.
+- Connection ceilings. The daemon takes a connection slot before it accepts, for the
+  private socket and public TCP (one shared ceiling) and for the ingest socket. A
+  peer over the ceiling waits in the kernel listen backlog and is served when a slot
+  frees; a slot frees when a connection ends, which includes its 60-second lease
+  expiring. The lease is unchanged, so a stalled peer holds its slot until then.
+  Accepting still stops at once on shutdown, and the pause below the free-space
+  floor is unchanged. A syslog TCP listener already holds its arrival and reclaims
+  the longest-idle connection, and is unchanged. The kernel does not report how many
+  peers wait in a backlog or overflow it, so a ceiling wait counts the times the
+  accept loop had to wait for a slot, not peers.
+
+`status.admission` (added after `sourceTimeLoss`, no schema bump) reports
+`writerReserve`, `readerSlots`, `writerWaitLimitMs`, `writerPermitWait`,
+`readerRefusals`, `importSlotWait`, `importSlotWaitLimitMs` and `rpcConnections`
+(the shared ceiling: `maxConnections`, `activeConnections`, `ceilingWait`,
+`leaseExpiries`). Each wait has `waits` (acquisitions that had to wait), `waiting`
+(now), `longestWaitMs` (finished or running) and `timeouts`. `status.ingestSocket`
+gains `ceilingWait` and `leaseExpiries`. The CLI and MCP status show them as
+`admission` and `ingest_socket`. The daemon journals a line when a wait episode
+begins, at most one a minute per kind, and a line when an announced episode (or any
+episode of a minute or more) ends, with the waits, timeouts and longest wait.
+Counters are process-lifetime evidence and reset on restart.
 
 Shared-secret CHAP upgrades a connection. `authChallenge` returns a fresh 32-byte
 nonce. `authenticate(response)` consumes it and checks the BLAKE3 keyed hash of

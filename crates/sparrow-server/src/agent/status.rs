@@ -141,11 +141,14 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
                     "refused_connections",
                     socket.get_refused_connections().to_string(),
                 )
+                .with("ceiling_wait", wait(socket.get_ceiling_wait()?))
+                .with("lease_expiries", socket.get_lease_expiries().to_string())
                 .into()
         }
     };
     let output = Object::new()
         .with("ingest_socket", ingest_socket)
+        .with("admission", admission(value.get_admission()?)?)
         .with(
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,
@@ -464,4 +467,49 @@ fn migrations(
         ));
     }
     Ok(Value::from(rows))
+}
+
+/// One wait counter: waits that blocked, waits in progress, the longest and those that timed out.
+fn wait(status: wire::wait_status::Reader<'_>) -> Value {
+    Object::new()
+        .with("waits", status.get_waits().to_string())
+        .with("waiting", u64::from(status.get_waiting()))
+        .with("longest_wait_ms", status.get_longest_wait_ms().to_string())
+        .with("timeouts", status.get_timeouts().to_string())
+        .into()
+}
+
+/// Permit, import-slot and connection-ceiling waits (#246).
+fn admission(status: wire::admission_status::Reader<'_>) -> capnp::Result<Value> {
+    let connections = match status.get_rpc_connections()?.which()? {
+        wire::optional_connection_ceiling_status::Absent(()) => Value::Null,
+        wire::optional_connection_ceiling_status::Value(ceiling) => {
+            let ceiling = ceiling?;
+            Object::new()
+                .with("max_connections", u64::from(ceiling.get_max_connections()))
+                .with(
+                    "active_connections",
+                    u64::from(ceiling.get_active_connections()),
+                )
+                .with("ceiling_wait", wait(ceiling.get_ceiling_wait()?))
+                .with("lease_expiries", ceiling.get_lease_expiries().to_string())
+                .into()
+        }
+    };
+    Ok(Object::new()
+        .with("writer_reserve", u64::from(status.get_writer_reserve()))
+        .with("reader_slots", u64::from(status.get_reader_slots()))
+        .with(
+            "writer_wait_limit_ms",
+            u64::from(status.get_writer_wait_limit_ms()),
+        )
+        .with("writer_permit_wait", wait(status.get_writer_permit_wait()?))
+        .with("reader_refusals", status.get_reader_refusals().to_string())
+        .with("import_slot_wait", wait(status.get_import_slot_wait()?))
+        .with(
+            "import_slot_wait_limit_ms",
+            u64::from(status.get_import_slot_wait_limit_ms()),
+        )
+        .with("rpc_connections", connections)
+        .into())
 }

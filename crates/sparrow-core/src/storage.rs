@@ -543,6 +543,9 @@ struct Unlocked {
     /// Wakes the maintenance worker's retention duty after an event that changes what
     /// expiry may retire: a pin release or commit and an archive commit.
     retention_waker: Arc<Mutex<Option<RetentionWaker>>>,
+    /// Told, without blocking, when a reclamation commit deleted an import journal, which is
+    /// the moment its slot is free (#246).
+    import_slot_waker: Mutex<Option<RetentionWaker>>,
     /// The one compaction a stalled pressure wait may force.
     forced: Arc<forced_compaction::Forced>,
     /// Gap evidence lost to a full stream registry, counted per stream (#215).
@@ -1723,6 +1726,7 @@ impl Store {
                 artifact_builds: Mutex::default(),
                 backup: backup::Slot::default(),
                 retention_waker,
+                import_slot_waker: Mutex::new(None),
                 forced: Arc::clone(&forced),
                 stream_evidence: stream_evidence::Ledger::default(),
                 source_time_evidence: stream_evidence::Ledger::default(),
@@ -2887,6 +2891,27 @@ impl Store {
     pub fn set_retention_waker(&self, waker: Option<RetentionWaker>) {
         if let Ok(mut slot) = self.unlocked.retention_waker.lock() {
             *slot = waker;
+        }
+    }
+
+    /// Install, or with `None` remove, the callback run when a reclamation commit deletes an
+    /// import journal and so frees one of its slots. It runs on the reclaiming thread, so it
+    /// must not block.
+    pub fn set_import_slot_waker(&self, waker: Option<RetentionWaker>) {
+        if let Ok(mut slot) = self.unlocked.import_slot_waker.lock() {
+            *slot = waker;
+        }
+    }
+
+    fn wake_import_slot(&self) {
+        let waker = self
+            .unlocked
+            .import_slot_waker
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(waker) = waker {
+            waker();
         }
     }
 

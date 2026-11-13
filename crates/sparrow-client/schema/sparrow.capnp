@@ -272,6 +272,30 @@ struct Status {
   # kind `sourceTime` and an empty instance; `events` counts the records. A reader that does
   # not know this field sees no change.
   sourceTimeLoss @58 :StreamEvidenceLoss;
+  # Schema 71 (additive, #246): permit, import-slot and connection-ceiling waits. A reader that
+  # does not know this field sees no change.
+  admission @59 :AdmissionStatus;
+}
+# One kind of wait (#246): acquisitions that found nothing free and waited, waits in progress,
+# the longest wait (finished or running) in milliseconds, and waits that ended at their bound.
+struct WaitStatus { waits @0 :UInt64; waiting @1 :UInt32; longestWaitMs @2 :UInt64; timeouts @3 :UInt64; }
+# A connection ceiling that holds peers in the kernel backlog instead of resetting them. `ceilingWait`
+# counts the times the accept loop found every slot taken and paused for one; `leaseExpiries`
+# counts connections closed by the 60-second lease.
+struct ConnectionCeilingStatus {
+  maxConnections @0 :UInt32; activeConnections @1 :UInt32;
+  ceilingWait @2 :WaitStatus; leaseExpiries @3 :UInt64;
+}
+struct OptionalConnectionCeilingStatus { union { absent @0 :Void; value @1 :ConnectionCeilingStatus; } }
+struct AdmissionStatus {
+  # Operation permits no reader may hold, permits readers may hold, and how long a writer waits.
+  writerReserve @0 :UInt32; readerSlots @1 :UInt32; writerWaitLimitMs @2 :UInt32;
+  writerPermitWait @3 :WaitStatus;
+  # Reads answered RESOURCE_LIMIT at once (a reader never waits).
+  readerRefusals @4 :UInt64;
+  importSlotWait @5 :WaitStatus; importSlotWaitLimitMs @6 :UInt32;
+  # The shared ceiling of the private Unix socket and public TCP, absent in a test harness.
+  rpcConnections @7 :OptionalConnectionCeilingStatus;
 }
 # A full tail generation registry never refuses a file. A file tailed without a stored
 # checkpoint is read again from its start after a restart, so its `records` and `bytes` are at
@@ -329,6 +353,9 @@ struct MigrationStatus {
 struct IngestSocketStatus {
   path @0 :Text; gid @1 :UInt32; maxConnections @2 :UInt32;
   activeConnections @3 :UInt32; refusedConnections @4 :UInt64;
+  # Schema 71 (additive, #246): over-ceiling peers wait in the backlog; `refusedConnections`
+  # now counts only a peer the kernel cannot name.
+  ceilingWait @5 :WaitStatus; leaseExpiries @6 :UInt64;
 }
 struct OptionalIngestSocketStatus { union { absent @0 :Void; value @1 :IngestSocketStatus; } }
 

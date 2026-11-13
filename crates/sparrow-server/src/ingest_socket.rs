@@ -4,6 +4,7 @@
 //! The group-accessible ingest-only Unix socket: its startup directory and socket checks,
 //! the caller credentials read on accept, and its own connection ceiling and counters.
 
+use crate::admission::{Ceiling, Slot};
 use std::{
     io,
     os::unix::fs::{FileTypeExt, MetadataExt},
@@ -13,7 +14,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::Semaphore;
 
 /// The directory must be setgid, so the socket inherits its group, and closed to others.
 const DIRECTORY_MODE: u32 = 0o2750;
@@ -30,8 +30,7 @@ pub struct IngestSocket {
 struct Inner {
     path: PathBuf,
     gid: u32,
-    max_connections: usize,
-    connections: Arc<Semaphore>,
+    ceiling: Arc<Ceiling>,
     refused: AtomicU64,
 }
 
@@ -43,17 +42,23 @@ impl IngestSocket {
             inner: Arc::new(Inner {
                 path,
                 gid,
-                max_connections,
-                connections: Arc::new(Semaphore::new(max_connections)),
+                ceiling: Ceiling::new("ingest socket connection ceiling", max_connections),
                 refused: AtomicU64::new(0),
             }),
         }
     }
 
-    /// Admit one accepted stream with its kernel-reported caller under this socket's own
-    /// ceiling. A stream whose credentials cannot be read, or one over the ceiling, is
-    /// dropped unanswered and counted. Run within a Tokio `LocalSet`.
-    pub fn admit(&self, stream: tokio::net::UnixStream, rpc: crate::Rpc) -> bool {
+    /// The connection ceiling: take a slot before accepting, so a peer over the ceiling waits
+    /// in the kernel backlog and is served when a slot frees, instead of being reset.
+    #[must_use]
+    pub fn ceiling(&self) -> &Arc<Ceiling> {
+        &self.inner.ceiling
+    }
+
+    /// Admit one accepted stream with its kernel-reported caller under the slot taken for it.
+    /// A stream whose credentials cannot be read is dropped unanswered and counted. Run within
+    /// a Tokio `LocalSet`.
+    pub fn admit(&self, stream: tokio::net::UnixStream, rpc: crate::Rpc, slot: Slot) -> bool {
         let credential = match peer_credential(&stream) {
             Ok(credential) => credential,
             Err(error) => {
@@ -64,27 +69,19 @@ impl IngestSocket {
                 return false;
             }
         };
-        let admitted = crate::admit_connection(
-            stream,
-            rpc,
-            self.inner.connections.clone(),
-            crate::Access::IngestSocket(credential),
-        );
-        if !admitted {
-            self.inner.refused.fetch_add(1, Ordering::Relaxed);
-        }
-        admitted
+        crate::admit_connection(stream, rpc, slot, crate::Access::IngestSocket(credential));
+        true
     }
 
     pub(crate) fn encode(&self, mut out: crate::sparrow_capnp::ingest_socket_status::Builder<'_>) {
         let inner = &self.inner;
         out.set_path(inner.path.to_string_lossy().as_ref());
         out.set_gid(inner.gid);
-        let active = inner
-            .max_connections
-            .saturating_sub(inner.connections.available_permits());
-        out.set_max_connections(u32::try_from(inner.max_connections).unwrap_or(u32::MAX));
-        out.set_active_connections(u32::try_from(active).unwrap_or(u32::MAX));
+        let ceiling = inner.ceiling.snapshot();
+        out.set_max_connections(ceiling.max);
+        out.set_active_connections(ceiling.active);
+        out.set_lease_expiries(ceiling.lease_expiries);
+        crate::admission::encode_wait(out.reborrow().init_ceiling_wait(), ceiling.waits);
         out.set_refused_connections(inner.refused.load(Ordering::Relaxed));
     }
 }

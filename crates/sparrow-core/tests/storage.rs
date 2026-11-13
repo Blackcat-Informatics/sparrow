@@ -7531,6 +7531,47 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
         .unwrap();
 }
 
+/// INVARIANT (#246): the import slot waker runs when a reclamation commit deletes an import
+/// journal, which is when its slot is free, and not for a pass that frees nothing.
+#[test]
+fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let wakes = std::sync::Arc::new(AtomicU64::new(0));
+    store.set_import_slot_waker(Some(std::sync::Arc::new({
+        let wakes = wakes.clone();
+        move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+    let input = b"one\n";
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let began = store
+        .import_begin("slot-waker", "source", "log", 4, &digest, DAY)
+        .unwrap();
+    store.import_append(&began.id, 0, input, DAY).unwrap();
+    // A live lease: the pass finds nothing to free and wakes nobody.
+    assert_eq!(store.import_reclaim(DAY).unwrap(), 0);
+    assert_eq!(wakes.load(Ordering::SeqCst), 0);
+    store.import_cancel(&began.id, DAY).unwrap();
+    while store.import_reclaim(DAY).unwrap() != 0 {}
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        1,
+        "one deleted journal, one wake"
+    );
+    assert_eq!(store.import_reclaim(DAY).unwrap(), 0);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        1,
+        "an empty pass wakes nobody"
+    );
+}
+
 #[test]
 fn consumption_recovery_preserves_original_publication_beyond_retry_and_retention() {
     use sparrow_core::{ConsumptionGeneration, ImportStart, IngestDeletion, IngestSelector};
