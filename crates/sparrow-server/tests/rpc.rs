@@ -2748,19 +2748,22 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                 let socket = socket.clone();
                 async move { sparrow_client::Client::connect(&socket).await }
             });
+            // The TCP peer took the freed slot; the Unix peer is held behind it, not admitted.
             status_until(&status_client, |admission| {
                 let wire::optional_connection_ceiling_status::Value(ceiling) =
                     admission.get_rpc_connections().unwrap().which().unwrap()
                 else {
                     panic!("no ceiling reported");
                 };
-                ceiling.unwrap().get_active_connections() == 6
+                let ceiling = ceiling.unwrap();
+                assert!(
+                    ceiling.get_active_connections() <= 6,
+                    "the ceiling was exceeded"
+                );
+                ceiling.get_active_connections() == 6
+                    && ceiling.get_ceiling_wait().unwrap().get_waiting() == 1
             })
             .await;
-            assert!(
-                !unix_seventh.is_finished(),
-                "a seventh peer was over-admitted or reset"
-            );
             drop(tcp_seventh);
             let recovered = unix_seventh
                 .await

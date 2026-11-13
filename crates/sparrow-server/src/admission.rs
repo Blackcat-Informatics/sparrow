@@ -13,7 +13,8 @@
 //!   the semaphore closing at shutdown) and on the shutdown signal;
 //! - the accept loop waits on its connection semaphore (a connection closing, which includes
 //!   its lease expiring);
-//! - the one timer is the bound on a writer's wait, [`WRITER_PERMIT_WAIT`]. It is not a retry
+//! - the timers are the bound on a writer's wait, [`WRITER_PERMIT_WAIT`], and the same-sized
+//!   bound on a begin-import's wait for a journal slot, [`IMPORT_SLOT_WAIT`]. It is not a retry
 //!   interval: nothing is retried on it. It exists because the client gives up after its
 //!   `rpc_timeout`, and an answer that arrives later than that is an answer nobody reads.
 
@@ -241,7 +242,7 @@ pub struct Admitted {
 pub struct Admission {
     operations: Arc<Semaphore>,
     readers: Arc<Semaphore>,
-    /// The one status read at a time that takes no operation permit.
+    /// Status reads in flight at once, as many as readers, none of them taking an operation permit.
     diagnostics: Arc<Semaphore>,
     reader_slots: u32,
     reserve: u32,
@@ -281,7 +282,7 @@ impl Admission {
         Arc::new(Self {
             operations,
             readers: Arc::new(Semaphore::new(reader_slots as usize)),
-            diagnostics: Arc::new(Semaphore::new(1)),
+            diagnostics: Arc::new(Semaphore::new(reader_slots as usize)),
             reader_slots,
             reserve,
             writer_waits: Waits::new("writer operation permit"),
@@ -328,8 +329,9 @@ impl Admission {
         &self.import_waits
     }
 
-    /// Tell begin-imports waiting for a journal slot that one may be free: a reclamation pass
-    /// ended (a published, cancelled or expired import frees its slot only when reclaimed).
+    /// Tell begin-imports waiting for a journal slot that one is free: a reclamation commit
+    /// deleted an import journal (the store calls this through its import slot waker). A
+    /// published, cancelled or expired import frees its slot only when that commit lands.
     pub fn import_slot_freed(&self) {
         self.import_freed.notify_waiters();
     }
@@ -466,11 +468,19 @@ impl Admission {
 impl Admission {
     /// The permit for a `status` read, which takes no operation permit: status carries the
     /// counters that explain a saturated budget, so a budget saturated by writers must not
-    /// refuse it. One status read runs at a time; another at once is refused and counted.
+    /// refuse it. As many status reads run at once as readers may (`reader_slots`), so a
+    /// health check overlapping a CLI or MCP read is served; one more is refused and counted.
+    ///
+    /// Once shutdown has begun it answers `SHUTTING_DOWN` like every other operation. A read
+    /// already running is not drained: it only reads a snapshot and writes nothing, so the
+    /// final flush does not depend on it, and the process outlives it.
     ///
     /// # Errors
     /// The refusal to answer the caller with.
     pub fn diagnostic(&self) -> Result<Admitted, Refusal> {
+        if *self.closing.borrow() {
+            return Err(SHUTTING_DOWN);
+        }
         match self.diagnostics.clone().try_acquire_owned() {
             Ok(slot) => Ok(Admitted {
                 _operation: None,
@@ -480,7 +490,7 @@ impl Admission {
                 self.reader_refusals.fetch_add(1, Ordering::Relaxed);
                 Err(Refusal {
                     code: "RESOURCE_LIMIT",
-                    message: "another status read is in progress",
+                    message: "status reads are at their configured limit",
                 })
             }
         }
@@ -847,21 +857,95 @@ mod tests {
         );
     }
 
-    /// INVARIANT (#246): a status read takes no operation permit, so a budget saturated by
-    /// writers does not refuse it; a second status read at once is refused and counted.
-    #[test]
-    fn status_is_served_while_writers_hold_every_permit() {
-        let operations = Arc::new(Semaphore::new(2));
+    /// INVARIANT (#246): a begin-import that is refused for want of a journal slot and whose
+    /// slot signal arrives late finds the operation budget saturated: its re-run waits for a
+    /// permit only until the original deadline, so the whole call answers at 3 s, not at the
+    /// signal plus a fresh 3 s wait (5.95 s, past the client's `rpc_timeout`).
+    #[tokio::test(start_paused = true)]
+    async fn a_late_slot_signal_does_not_start_a_fresh_permit_wait() {
+        let operations = Arc::new(Semaphore::new(1));
         let admission = Admission::new(operations.clone());
-        let _writers = operations.clone().try_acquire_many_owned(2).unwrap();
+        let attempts = AtomicU32::new(0);
+        let attempt = |deadline| {
+            let admission = admission.clone();
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match admission.writer_until(deadline).await {
+                    Ok(_permit) => Err::<(), _>("full"),
+                    Err(refusal) => Err(refusal.code),
+                }
+            }
+        };
+        let started = Instant::now();
+        let call = admission.import_slot(attempt, |error| *error == "full");
+        tokio::pin!(call);
+        // The first attempt takes the free permit and finds no slot; the permit is released.
+        tokio::select! { biased; _ = &mut call => panic!("answered without waiting"), () = std::future::ready(()) => {} }
+        assert_eq!(admission.import_waits().snapshot().waiting, 1);
+        let held = operations.clone().acquire_owned().await.unwrap();
+        tokio::select! { biased; _ = &mut call => panic!("answered before the bound"), () = tokio::time::sleep(Duration::from_millis(2950)) => {} }
+        admission.import_slot_freed();
+        assert_eq!(call.await, Err("RESOURCE_LIMIT"));
+        assert_eq!(started.elapsed(), IMPORT_SLOT_WAIT);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        drop(held);
+    }
+
+    /// INVARIANT (#246): a slot signal that arrives with the bound already spent is answered
+    /// with the last refusal; no attempt starts after the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_slot_signal_with_the_bound_spent_is_answered_not_retried() {
+        let operations = Arc::new(Semaphore::new(1));
+        let admission = Admission::new(operations.clone());
+        let attempts = AtomicU32::new(0);
+        let attempt = |deadline| {
+            let admission = admission.clone();
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match admission.writer_until(deadline).await {
+                    Ok(_permit) => Err::<(), _>("full"),
+                    Err(refusal) => Err(refusal.code),
+                }
+            }
+        };
+        let started = Instant::now();
+        let call = admission.import_slot(attempt, |error| *error == "full");
+        tokio::pin!(call);
+        tokio::select! { biased; _ = &mut call => panic!("answered without waiting"), () = std::future::ready(()) => {} }
+        let _held = operations.clone().acquire_owned().await.unwrap();
+        tokio::select! { biased; _ = &mut call => panic!("answered before the bound"), () = tokio::time::sleep(IMPORT_SLOT_WAIT - Duration::from_millis(1)) => {} }
+        // The signal and the deadline become ready together; the signal must not start a re-run.
+        admission.import_slot_freed();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(call.await, Err("full"));
+        assert_eq!(started.elapsed(), IMPORT_SLOT_WAIT);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// INVARIANT (#246): a status read takes no operation permit, so a budget saturated by
+    /// writers does not refuse it; as many run at once as readers may, so overlapping health
+    /// checks are served; one more is refused and counted; and once shutdown begins it answers
+    /// `SHUTTING_DOWN` like every other operation.
+    #[test]
+    fn status_is_served_while_writers_hold_every_permit_and_stops_at_shutdown() {
+        let operations = Arc::new(Semaphore::new(4));
+        let admission = Admission::new(operations.clone());
+        let _writers = operations.clone().try_acquire_many_owned(4).unwrap();
         assert!(admission.reader().is_err());
-        let status = admission.diagnostic().unwrap();
+        let overlapping: Vec<_> = (0..admission.reader_slots())
+            .map(|_| admission.diagnostic().unwrap())
+            .collect();
         assert_eq!(
             admission.diagnostic().err().map(|r| r.code),
             Some("RESOURCE_LIMIT")
         );
-        drop(status);
-        assert!(admission.diagnostic().is_ok());
         assert_eq!(admission.reader_refusals(), 2);
+        drop(overlapping);
+        assert!(admission.diagnostic().is_ok());
+        admission.begin_shutdown();
+        assert_eq!(
+            admission.diagnostic().err().map(|r| r.code),
+            Some("SHUTTING_DOWN")
+        );
     }
 }

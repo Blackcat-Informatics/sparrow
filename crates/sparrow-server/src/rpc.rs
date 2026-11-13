@@ -4722,4 +4722,20 @@ mod tests {
         drop(storm);
         assert_eq!(rpc.lookup(|_, _| Ok(1u8)).await.unwrap(), 1);
     }
+
+    /// INVARIANT (#246): `status` is served while writers hold every operation permit, because
+    /// its handler takes the diagnostic class; a handler that went back to the reader class
+    /// would be refused here with `RESOURCE_LIMIT`, hiding the counters that explain it.
+    #[tokio::test(start_paused = true)]
+    async fn the_status_handler_takes_no_operation_permit() {
+        let (_dir, rpc, operations) = admission_fixture(1);
+        let _writers = operations.clone().acquire_owned().await.unwrap();
+        let client = Rpc::clone(&rpc).into_client();
+        let response = client.status_request().send().promise.await.unwrap();
+        let result = response.get().unwrap().get_result().unwrap();
+        assert!(
+            matches!(result.which().unwrap(), wire::result::Ok(_)),
+            "status was refused while writers held the budget"
+        );
+    }
 }
