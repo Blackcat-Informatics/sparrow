@@ -149,6 +149,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
     let output = Object::new()
         .with("ingest_socket", ingest_socket)
         .with("admission", admission(value.get_admission()?)?)
+        .with("floor_pause", floor_pause(value.get_floor_pause()?))
         .with(
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,
@@ -476,6 +477,23 @@ fn wait(status: wire::wait_status::Reader<'_>) -> Value {
         .with("waiting", u64::from(status.get_waiting()))
         .with("longest_wait_ms", status.get_longest_wait_ms().to_string())
         .with("timeouts", status.get_timeouts().to_string())
+        .into()
+}
+
+/// The free-space pause counters (#257); a daemon that predates them reports zeros.
+fn floor_pause(status: wire::floor_pause_status::Reader<'_>) -> Value {
+    Object::new()
+        .with("paused_since", status.get_paused_since().to_string())
+        .with(
+            "connections_accepted",
+            status.get_connections_accepted().to_string(),
+        )
+        .with("writes_refused", status.get_writes_refused().to_string())
+        .with("reads_served", status.get_reads_served().to_string())
+        .with(
+            "read_staging_refused",
+            status.get_read_staging_refused().to_string(),
+        )
         .into()
 }
 

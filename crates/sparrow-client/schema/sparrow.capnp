@@ -3,7 +3,12 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 struct Instant { unixMillis @0 :UInt64; }
-struct Failure { code @0 :Text; message @1 :Text; retryable @2 :Bool; }
+# `class` (additive, #257) says why a retryable refusal was made. `unclassified` is every refusal
+# an older daemon sends. `freeSpaceFloor` is the free-space floor: the code stays
+# STORAGE_PRESSURE and `retryable` stays true, so a client that ignores `class` holds and retries
+# as it always has; one that reads it knows the producer must hold until space returns.
+enum FailureClass { unclassified @0; freeSpaceFloor @1; }
+struct Failure { code @0 :Text; message @1 :Text; retryable @2 :Bool; class @3 :FailureClass; }
 struct Result(T) { union { ok @0 :T; error @1 :Failure; } }
 struct OptionalText { union { absent @0 :Void; value @1 :Text; } }
 struct Evidence { storeId @0 :Text; union { artifact @1 :Text; record @2 :Text; } }
@@ -301,6 +306,16 @@ struct Status {
   # Schema 71 (additive, #246): permit, import-slot and connection-ceiling waits. A reader that
   # does not know this field sees no change.
   admission @59 :AdmissionStatus;
+  # Schema 71 (additive, #257): what the daemon did while the free-space floor paused writes.
+  # A reader that does not know this field sees no change.
+  floorPause @60 :FloorPauseStatus;
+}
+# Connections the daemon kept accepting while paused, writes it answered with the floor label,
+# reads it served while paused and reads refused for staging, since it started. `pausedSince` is the
+# Unix milliseconds the current pause began, 0 when not paused.
+struct FloorPauseStatus {
+  pausedSince @0 :UInt64; connectionsAccepted @1 :UInt64; writesRefused @2 :UInt64;
+  readsServed @3 :UInt64; readStagingRefused @4 :UInt64;
 }
 # One kind of wait (#246): acquisitions that found nothing free and waited, waits in progress,
 # the longest wait (finished or running) in milliseconds, and waits that ended at their bound.

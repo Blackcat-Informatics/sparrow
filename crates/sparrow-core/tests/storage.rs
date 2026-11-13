@@ -14671,6 +14671,44 @@ fn config() -> Config {
     sparrow_test_support::storage_config!(Config)
 }
 
+/// Value (#257, R5): a read under the paused floor must not stage disk that spends the floor's
+/// reserve. Protects: with writes paused a query that needs staging is refused with the floor
+/// label when too little free space is left above half the floor, is served inside the bounded
+/// share otherwise, and is served normally once space returns. Before, a paused read staged up
+/// to 64 MiB regardless of free space.
+#[test]
+fn a_read_stages_within_the_paused_floor_allowance_or_is_refused_with_the_floor_label() {
+    use sparrow_core::{RecordOperation, RecordQuery, RecordRead};
+    let dir = tempfile::tempdir().unwrap();
+    let settings = config();
+    let floor_bytes = settings.min_free_bytes;
+    let store = Store::open(dir.path(), settings).unwrap();
+    store
+        .ingest("floor-read", "source", "log", b"x\n", 10)
+        .unwrap();
+    let read = |now| {
+        store.records_read(
+            &RecordRead {
+                operation: RecordOperation::Records,
+                scope: record_page_scope("source", 1),
+                query: RecordQuery::default(),
+                cursor: None,
+            },
+            now,
+        )
+    };
+    let floor = store.space_floor();
+    // Half the floor must stay free; 88 KiB above it is under the 128 KiB a page needs.
+    floor.set_free_for_tests(Some(floor_bytes / 2 + 88 * 1024));
+    let refused = read(20).unwrap_err();
+    assert!(refused.is_free_space_floor(), "{refused}");
+    // 188 KiB above it fits one page: the read is served from the bounded share.
+    floor.set_free_for_tests(Some(floor_bytes / 2 + 188 * 1024));
+    assert_eq!(read(21).unwrap().total_items, 1);
+    floor.set_free_for_tests(None);
+    assert_eq!(read(22).unwrap().total_items, 1);
+}
+
 #[test]
 fn native_instants_keep_precision_and_reject_invalid_bounds() {
     use sparrow_core::{format_instant, parse_instant};

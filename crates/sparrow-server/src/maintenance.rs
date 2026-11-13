@@ -67,7 +67,6 @@ impl Worker {
                 store.set_retention_waker(None);
                 store.set_pressure_request_waker(None);
                 store.set_import_reclaim_waker(None);
-                store.space_floor().set_resume_waker(None);
                 result
             })),
             ended,
@@ -445,20 +444,19 @@ async fn run(
         let reclaim_wake = Arc::clone(&reclaim_wake);
         move || reclaim_wake.notify_one()
     })));
-    store
-        .space_floor()
-        .set_resume_waker(Some(held.resume_waker({
-            let wake = Arc::clone(&wake);
-            let pressure_wake = Arc::clone(&pressure_wake);
-            let migrate_wake = Arc::clone(&migrate_wake);
-            let reclaim_wake = Arc::clone(&reclaim_wake);
-            move || {
-                reclaim_wake.notify_one();
-                wake.notify_one();
-                pressure_wake.notify_one();
-                migrate_wake.notify_one();
-            }
-        })));
+    // Unsubscribes when this duty loop returns.
+    let _resume = store.space_floor().subscribe_resume(held.resume_waker({
+        let wake = Arc::clone(&wake);
+        let pressure_wake = Arc::clone(&pressure_wake);
+        let migrate_wake = Arc::clone(&migrate_wake);
+        let reclaim_wake = Arc::clone(&reclaim_wake);
+        move || {
+            reclaim_wake.notify_one();
+            wake.notify_one();
+            pressure_wake.notify_one();
+            migrate_wake.notify_one();
+        }
+    }));
     store.set_pressure_request_waker(Some(Arc::new({
         let pressure_wake = Arc::clone(&pressure_wake);
         move || pressure_wake.notify_one()

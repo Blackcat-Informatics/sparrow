@@ -77,7 +77,19 @@ pub(super) struct Finished {
 impl Builder {
     pub(super) fn new(writer: &Writer, grouped: bool, event_order: bool) -> Result<Self, Error> {
         let allowance = writer.config.disk_budget - writer.config.maintenance_reserve;
-        let disk_bytes = DISK_BYTES.min(allowance / catalog_lease::MAX_HANDLES as u64);
+        let wanted = DISK_BYTES.min(allowance / catalog_lease::MAX_HANDLES as u64);
+        // Under the free-space floor a read stages a bounded few bytes, never the reserve (R5).
+        let staged = writer.query_staging.load(Ordering::Relaxed);
+        let disk_bytes = writer.space.read_staging_allowance(wanted, staged)?;
+        if disk_bytes <= FILE_OVERHEAD && wanted > FILE_OVERHEAD {
+            return Err(Error::new(
+                "STORAGE_PRESSURE",
+                format!(
+                    "{}record query staging is limited while writes are paused; retry when free space returns",
+                    super::space::FLOOR_REFUSAL_PREFIX
+                ),
+            ));
+        }
         if disk_bytes <= FILE_OVERHEAD
             || writer.physical_bytes()?.saturating_add(disk_bytes) > allowance
         {

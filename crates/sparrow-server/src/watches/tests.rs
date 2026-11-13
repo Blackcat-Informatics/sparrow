@@ -931,6 +931,48 @@ async fn an_idle_worker_wakes_at_most_once_a_second() {
         .await;
 }
 
+/// INVARIANT (#257): a watch paused below the free-space floor waits for the floor's resume
+/// edge, an event, and owns no recheck timer (the one it had read free space every second).
+/// Protects: the worker records the pause through the floor's ledger, and the observation that
+/// sees the pause end, whichever duty makes it, wakes the worker to run a pass with no clock
+/// passing. Fails when the worker rechecks on a timer instead: the pass then waits for time.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_paused_watch_wakes_on_the_floor_resume_edge_with_no_clock_passing() {
+    let (worker, run) = worker(
+        crate::ProducerContract::FinishedFiles,
+        &[],
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    );
+    let floor = worker.store.space_floor().clone();
+    floor.set_free_for_tests(Some(0));
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let task = tokio::task::spawn_local(run);
+            tokio::time::sleep(SETTLED).await;
+            assert!(
+                floor.paused(),
+                "the watch did not observe the pause through the floor"
+            );
+            let paused = passes();
+            let resumed_at = tokio::time::Instant::now();
+            // Another duty ends the pause: this observation consumes the edge.
+            floor.set_free_for_tests(None);
+            assert!(floor.observe(crate::now().unwrap()).unwrap().is_none());
+            let began = std::time::Instant::now();
+            while passes() == paused {
+                assert!(
+                    began.elapsed() < Duration::from_secs(30),
+                    "the paused watch did not wake on the resume edge"
+                );
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(tokio::time::Instant::now(), resumed_at);
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
 /// INVARIANT (#184): a stop request wakes an idle worker at once; no clock has to pass, as
 /// the 50 ms stop poll needed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1083,6 +1125,7 @@ async fn the_drain_before_a_wait_reports_and_wakes_for_what_it_found() {
         control: &mut control,
         received: &mut None,
         permit: &mut None,
+        resumed: &tokio::sync::Notify::new(),
     };
     pause(waiting, &mut detectors, true, false, true, Wake::default())
         .await

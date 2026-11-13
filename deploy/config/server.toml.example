@@ -15,7 +15,7 @@ rpc_tcp_address = "0.0.0.0:518"
 rpc_tcp_secret_file = "/run/credentials/sparrow.service/tcp.secret"
 
 # The store's own bytes; other programs share the disk, which min_free_bytes guards (default
-# 4 GiB): below it the daemon refuses writes and pauses connections instead of failing a write.
+# 4 GiB): below it the daemon refuses writes (keeping connections and reads) instead of failing a write.
 disk_budget = 53687091200
 maintenance_reserve = 67108864
 min_free_bytes = 4294967296

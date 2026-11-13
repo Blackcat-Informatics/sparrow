@@ -110,7 +110,9 @@ pub use storage::source_read::{
 pub use storage::source_time::{
     EventPlacement, EventTime, EventTimeBasis, SourceTimeProfile, TimeRepresentation,
 };
-pub use storage::space::{FloorStatus, SpaceFloor};
+pub use storage::space::{
+    FLOOR_REFUSAL_PREFIX, FloorStatus, PAUSED_READ_STAGING_BYTES, ResumeSubscription, SpaceFloor,
+};
 #[cfg(feature = "test-support")]
 pub use storage::store_event_fallback_rdf_for_legacy_fixture;
 pub use storage::stream_evidence::{

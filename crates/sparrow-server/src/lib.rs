@@ -9,6 +9,7 @@ mod backup;
 mod config;
 mod correlation_wire;
 mod diagnostics;
+pub mod floor_pause;
 mod source_file;
 pub mod syslog_listener;
 mod syslog_wire;
@@ -35,6 +36,7 @@ pub use watch_admin::WatchController;
 
 mod rdf_wire;
 mod rpc;
+pub mod serving;
 pub use rpc::{Rpc, now};
 mod agent;
 pub use agent::{AgentError, AgentResult, run_cli};

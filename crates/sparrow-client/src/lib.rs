@@ -30,7 +30,7 @@ pub use transport::{Connection, Endpoint, connect, connect_tcp};
 mod tcp_secret;
 pub use tcp_secret::{CHAP_BYTES, TcpSecret};
 mod error;
-pub use error::Error;
+pub use error::{Error, FailureClass};
 mod bytes;
 mod result_release;
 pub use result_release::{ResultReleaseReceipt, release_result};

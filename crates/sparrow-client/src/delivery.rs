@@ -267,6 +267,10 @@ pub struct DeliveryStats {
     pub last_durable_sequence: u64,
     /// Retry attempts following transient failures.
     pub retries: u64,
+    /// Retries caused by the daemon's free-space floor (#257): the daemon answered, the batch
+    /// is held unchanged, and delivery resumes when space returns. Counted within `retries`;
+    /// the latest such answer is `last_transient_failure` until a batch is acknowledged.
+    pub floor_refusals: u64,
     /// Whether the owned worker has not completed shutdown.
     pub running: bool,
     /// Whether explicit shutdown closed producer admission.
@@ -318,6 +322,7 @@ struct State {
     durable: u64,
     batch_number: u64,
     retries: u64,
+    floor_refusals: u64,
     force_through: u64,
     closing: bool,
     store: Option<String>,
@@ -625,6 +630,7 @@ impl Shared {
                 durable: 0,
                 batch_number: 0,
                 retries: 0,
+                floor_refusals: 0,
                 force_through: 0,
                 closing: false,
                 store: None,
@@ -709,6 +715,7 @@ impl Shared {
             last_sequence: state.sequence,
             last_durable_sequence: state.durable_sequence,
             retries: state.retries,
+            floor_refusals: state.floor_refusals,
             running: !self.stopped.load(Ordering::SeqCst),
             closing: state.closing,
             terminal_failure: state.failure.clone(),
@@ -820,6 +827,7 @@ impl Shared {
                 message: "producer socket now identifies a different store; pending batch retained"
                     .into(),
                 retryable: false,
+                class: crate::FailureClass::Unclassified,
             });
         }
         state.store = Some(store.to_owned());
@@ -1035,6 +1043,9 @@ impl Shared {
             .retries
             .checked_add(1)
             .ok_or(Error::Protocol("producer retry count exhausted"))?;
+        if error.is_free_space_floor() {
+            state.floor_refusals = state.floor_refusals.saturating_add(1);
+        }
         state.transient = Some(Arc::new(error));
         drop(state);
         self.changed.notify_all();
@@ -1233,6 +1244,10 @@ fn permanent_refusal(error: &Error) -> bool {
 /// Whether reconnecting and retrying the same identity may succeed, including
 /// a daemon whose socket is briefly absent or refusing while it restarts.
 pub(crate) fn retryable(error: &Error) -> bool {
+    // The floor label always means hold: the batch is never quarantined or dropped for it.
+    if error.is_free_space_floor() {
+        return true;
+    }
     match error {
         Error::Io(error) => matches!(
             error.kind(),
@@ -1769,6 +1784,7 @@ mod tests {
             code: "CONFLICT".into(),
             message: "sequences overlap".into(),
             retryable: false,
+            class: crate::FailureClass::Unclassified,
         };
         let Err(Error::Io(error)) = shared.save(&batch, &refusal) else {
             panic!("an unwritable directory must fail the save");

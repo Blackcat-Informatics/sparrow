@@ -40,7 +40,9 @@ pub struct ServerConfig {
     pub disk_budget: u64,
     /// Reserved maintenance capacity.
     pub maintenance_reserve: u64,
-    /// Filesystem free space below which the daemon pauses connections and writes.
+    /// Filesystem free space below which the daemon refuses writes with the floor-labelled
+    /// `STORAGE_PRESSURE`. It keeps accepting connections and serves reads; consume and tail
+    /// watches and startup wait.
     #[serde(default = "default_min_free")]
     pub min_free_bytes: u64,
     /// Maximum records in a complete publication.

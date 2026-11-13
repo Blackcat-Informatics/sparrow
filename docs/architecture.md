@@ -416,8 +416,8 @@ The watch worker has no tick. A pass runs again at once only while a scan, a cla
 tail backlog is in progress; otherwise it blocks until a stop request, an administrative
 command, a readable inotify descriptor, a freed operation permit it waits for, or its
 earliest deadline (a candidate's quiet interval, the periodic rescan, a claim's retry
-backoff, the one-second connection retry, or a one-second free-space recheck while space
-is below the floor). Each held tail descriptor carries its own inotify watch, so an append
+backoff, or the one-second connection retry; while space is below the floor the worker
+also blocks on the floor's resume edge, with no recheck timer of its own). Each held tail descriptor carries its own inotify watch, so an append
 to a file whose name has left the watched directories still wakes the worker. Before it
 blocks, the worker drains the events its own opens queued, so they cannot wake it again.
 The daemon's serving loop likewise waits for a worker to end rather than sampling it.

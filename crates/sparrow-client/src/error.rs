@@ -1,6 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
+/// The machine-readable reason of a retryable refusal, additive to its code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailureClass {
+    /// No class: every refusal of an older daemon, and any the daemon does not classify.
+    #[default]
+    Unclassified,
+    /// The free-space floor paused writes. The producer holds until space returns; the code is
+    /// still `STORAGE_PRESSURE` and the refusal still retryable.
+    FreeSpaceFloor,
+}
+
 /// An explicit transport, daemon, compatibility, input, or local file failure.
 #[derive(Debug)]
 pub enum Error {
@@ -14,6 +25,8 @@ pub enum Error {
         message: String,
         /// Whether an idempotent retry may succeed.
         retryable: bool,
+        /// Why the daemon refused, when it says (#257). An older daemon sends `Unclassified`.
+        class: FailureClass,
     },
     /// Discovery is incompatible with this client.
     Unsupported(&'static str),
@@ -33,11 +46,29 @@ impl Error {
                 code: value.get_code()?.to_str()?.to_owned(),
                 message: value.get_message()?.to_str()?.to_owned(),
                 retryable: value.get_retryable(),
+                // A class this client does not know reads as none: the code still decides.
+                class: match value.get_class() {
+                    Ok(crate::sparrow_capnp::FailureClass::FreeSpaceFloor) => {
+                        FailureClass::FreeSpaceFloor
+                    }
+                    _ => FailureClass::Unclassified,
+                },
             })
         };
         match decode() {
             Ok(error) | Err(error) => error,
         }
+    }
+
+    /// Whether the daemon refused because the free-space floor paused its writes (#257).
+    pub fn is_free_space_floor(&self) -> bool {
+        matches!(
+            self,
+            Self::Domain {
+                class: FailureClass::FreeSpaceFloor,
+                ..
+            }
+        )
     }
 
     /// Whether retrying the same immutable request identity may succeed.
@@ -61,6 +92,7 @@ impl std::fmt::Display for Error {
                 code,
                 message,
                 retryable,
+                ..
             } => write!(f, "{code}: {message}; retryable={retryable}"),
             Self::Unsupported(message) => write!(f, "unsupported discovery: {message}"),
             Self::Protocol(message) => write!(f, "invalid daemon response: {message}"),

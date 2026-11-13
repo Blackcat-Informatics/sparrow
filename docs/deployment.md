@@ -116,8 +116,14 @@ the disk is full leaves durability uncertain until the store is reopened. To
 avoid that, every write is checked first: below the floor it is refused with a
 retriable `STORAGE_PRESSURE`, and buffered writes that were already accepted
 are still synchronized. The daemon checks free space every second. Below the
-floor it stops accepting Unix and TCP connections, including syslog TCP
-connections. It claims no consumed files and runs only WAL synchronization.
+floor it keeps accepting Unix, ingest and TCP connections, including syslog TCP
+connections (#257): the connection ceiling and the 60-second lease still bound
+them. It answers every write with the retryable `STORAGE_PRESSURE` carrying the
+`freeSpaceFloor` class, so a producer knows the floor is the cause and holds
+(the Rust client keeps its batch and retries), and it serves reads, with the
+disk a query stages limited to 32 MiB in total, within the free space above half the floor.
+It claims no consumed files and runs only WAL synchronization; consume and tail
+watches keep their files. A syslog TCP frame is held and its sender waits.
 Syslog UDP datagrams that still arrive are read and queued by each UDP listener,
 up to its `hold_bytes` (default 64 MiB; the sum over listeners at most 512 MiB), and
 published in order when writes resume. Beyond that the reader stops and the kernel
@@ -125,8 +131,10 @@ buffer takes the arrivals, and the kernel counts the datagrams it drops. A daemo
 that is not a clean stop (a crash, a kill, an out-of-memory kill, or the exit on a full
 disk) loses the queue and the kernel buffer uncounted, so size `hold_bytes` against
 `MemoryHigh` and see `docs/interfaces.md` for what a clean stop counts.
-The daemon logs one
-line when it pauses and one when it resumes. At startup it waits for the floor
+Status reports `floorPause` counters (connections accepted, writes refused, reads
+served while paused). The daemon logs a line when a pause begins, one a minute while
+it lasts and one when it ends. A daemon-side file spool is not built; UDP is held in
+the daemon's memory and then the kernel buffer only. At startup it waits for the floor
 before opening the store, so a restart on a full disk does not use up the
 unit's bounded restarts. If a write
 still fails with durability uncertain, for example because another program

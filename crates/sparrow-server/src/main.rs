@@ -12,8 +12,8 @@ mod maintenance;
 mod pressure_duty;
 mod shutdown;
 
-/// How often the daemon compares filesystem free space with its floor.
-const SPACE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often the daemon compares filesystem free space with its floor while it waits to open.
+const SPACE_CHECK_INTERVAL: std::time::Duration = sparrow_server::serving::SPACE_CHECK_INTERVAL;
 /// Also the contract `deploy/verify-backup.sh` reads to tell an image with query-only mode
 /// and, for its migration measurements, an image with `--no-intake` or `--private-intake`.
 const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only | --no-intake | --private-intake DIR] | sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID] EMPTY_DIR";
@@ -361,85 +361,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
-        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)), pressure_wake.clone()));
-        let serving = async {
-        // Pinned once, so its waits and any worker shutdown it starts survive every turn.
-        let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());
-        tokio::pin!(health);
-        let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
-        // Below the floor every write is refused, so admit no new connections.
-        let mut space_ok = true;
-        // A connection slot is taken before its peer is accepted (#246): at the ceiling the accept
-        // loop waits on a slot, and the peer waits in the kernel listen backlog, served when a slot
-        // frees, rather than being accepted and reset. One slot is held ahead for the private socket
-        // and public TCP together, which share a ceiling, and one for the ingest socket.
-        let mut rpc_slot = None;
-        let mut rpc_wait = None;
-        let mut ingest_slot = None;
-        let mut ingest_wait = None;
-        loop {
-            if rpc_slot.is_none() && rpc_wait.is_none() {
-                match connections.try_slot() { Ok(slot) => rpc_slot = Some(slot), Err(wait) => rpc_wait = Some(wait) }
+    local
+        .run_until(async {
+            // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
+            let mut maintenance = (!config.query_only).then(|| {
+                maintenance::Worker::start(
+                    store.clone(),
+                    std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)),
+                    pressure_wake.clone(),
+                )
+            });
+            let serving = async {
+                // Pinned once, so its waits and any worker shutdown it starts survive every turn.
+                let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());
+                tokio::pin!(health);
+                // The floor never stops the accept loop (#257): below it the store answers writes with the
+                // floor-labelled retryable refusal and reads are served. The loop observes the floor
+                // once a second and journals the episode; connection slots, taken before accept, and
+                // the 60 s lease are unchanged.
+                let sockets = sparrow_server::serving::Sockets {
+                    private: &endpoint.listener,
+                    ingest: ingest
+                        .as_ref()
+                        .map(|(endpoint, socket)| (&endpoint.listener, socket)),
+                    tcp: tcp_listener.as_ref().map(|listener| {
+                        (
+                            listener,
+                            tcp_secret
+                                .clone()
+                                .expect("configuration pairs TCP with its secret"),
+                        )
+                    }),
+                };
+                sparrow_server::serving::serve(
+                    sockets,
+                    &rpc,
+                    &connections,
+                    async {
+                        interrupt.recv().await.map(|_| ()).ok_or_else(
+                            || -> Box<dyn std::error::Error> {
+                                "daemon interrupt subscription terminated unexpectedly".into()
+                            },
+                        )
+                    },
+                    health,
+                    |line| eprintln!("{line}"),
+                )
+                .await
             }
-            if let Some((_, socket)) = ingest.as_ref().filter(|_| ingest_slot.is_none() && ingest_wait.is_none()) {
-                match socket.ceiling().try_slot() { Ok(slot) => ingest_slot = Some(slot), Err(wait) => ingest_wait = Some(wait) }
-            }
-            tokio::select! {
-                slot = connections.acquire(), if rpc_slot.is_none() => {
-                    rpc_slot = Some(slot);
-                    rpc_wait = None;
-                }
-                slot = async { ingest.as_ref().expect("enabled ingest branch").1.ceiling().acquire().await }, if ingest.is_some() && ingest_slot.is_none() => {
-                    ingest_slot = Some(slot);
-                    ingest_wait = None;
-                }
-                signal = interrupt.recv() => {
-                    signal.ok_or("daemon interrupt subscription terminated unexpectedly")?;
-                    break;
-                }
-                failure = &mut health => return Err(failure),
-                _ = space.tick() => match (store.space_floor().observe(sparrow_server::now()?)?, space_ok) {
-                    (None, false) => {
-                        let floor = store.space_floor().status();
-                        eprintln!("sparrowd: free space restored; accepting connections and writes (pauses={} resumes={} refused_writes={})", floor.pauses, floor.resumes, floor.refused_writes);
-                        space_ok = true;
-                    }
-                    (Some(shortfall), true) => {
-                        let floor = store.space_floor().status();
-                        eprintln!("sparrowd: pausing connections and writes (pauses={} resumes={} refused_writes={}): {shortfall}", floor.pauses, floor.resumes, floor.refused_writes);
-                        space_ok = false;
-                    }
-                    _ => {}
+            .await;
+            shutdown::finish(
+                serving,
+                shutdown::Workers {
+                    consumer: consumer.take(),
+                    syslog: syslog.take(),
+                    maintenance: maintenance.take(),
                 },
-                accepted = endpoint.listener.accept(), if space_ok && rpc_slot.is_some() => {
-                    let (stream, _) = accepted?;
-                    let Some(slot) = rpc_slot.take() else { continue };
-                    // A connection whose peer the kernel cannot name is dropped unanswered.
-                    match sparrow_server::local_caller(&stream) {
-                        Ok(caller) => {
-                            sparrow_server::admit_connection(stream, rpc.clone(), slot, sparrow_server::Access::Local(caller));
-                        }
-                        Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
-                    }
-                }
-                accepted = async { ingest.as_ref().expect("enabled ingest branch").0.listener.accept().await }, if space_ok && ingest.is_some() && ingest_slot.is_some() => {
-                    let (stream, _) = accepted?;
-                    let Some(slot) = ingest_slot.take() else { continue };
-                    let _ = ingest.as_ref().expect("enabled ingest branch").1.admit(stream, rpc.clone(), slot);
-                }
-                accepted = async { tcp_listener.as_ref().expect("enabled TCP branch").accept().await }, if space_ok && tcp_listener.is_some() && rpc_slot.is_some() => {
-                    let (stream, peer) = accepted?;
-                    let Some(slot) = rpc_slot.take() else { continue };
-                    stream.set_nodelay(true)?;
-                    let secret = tcp_secret.clone().expect("configuration pairs TCP with its secret");
-                    sparrow_server::admit_connection(stream, rpc.clone(), slot, sparrow_server::Access::PublicTcp(secret, peer.to_string()));
-                }
-            }
-        }
-        Ok::<(), Box<dyn std::error::Error>>(())
-        }.await;
-        shutdown::finish(serving, shutdown::Workers { consumer: consumer.take(), syslog: syslog.take(), maintenance: maintenance.take() }, &store, &endpoints, &admission, operation_slots).await
-    }).await
+                &store,
+                &endpoints,
+                &admission,
+                operation_slots,
+            )
+            .await
+        })
+        .await
 }

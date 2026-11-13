@@ -64,9 +64,11 @@ every watch in `consume_watches` names a root that exists.
   again.
 - Prevention since 600ee97: `min_free_bytes` (default 4 GiB) is a floor on
   free space in the filesystem that holds `data_dir`. Below it the daemon
-  refuses writes with a retriable `STORAGE_PRESSURE`, pauses Unix and TCP
-  connections and claims no consumed files; it logs one line on pausing and one
-  on resuming. A write that still fails with durability uncertain makes the
+  refuses writes with a retriable `STORAGE_PRESSURE` that carries the
+  `freeSpaceFloor` class, keeps accepting Unix, ingest, TCP and syslog TCP
+  connections, serves reads, and claims no consumed files (consume and tail
+  watches keep their files); it logs a line when the pause begins, one a minute
+  while it lasts and one when it ends. A write that still fails with durability uncertain makes the
   daemon exit, and `Restart=on-failure` reopens the store; at startup it waits
   for the floor before opening, so a full disk does not spend the start limit.
 - `/SPARROW` is on the same btrfs device as `/home`, so the move to `/SPARROW`
@@ -87,9 +89,12 @@ every watch in `consume_watches` names a root that exists.
 
 ## Full disk
 
-- Symptom: the journal shows the pause line (writes and connections paused
-  below `min_free_bytes`), clients get `STORAGE_PRESSURE`, `check.sh` cannot
-  connect, or the unit waits at startup with `waiting to open the store`.
+- Symptom: the journal shows `free space is below the floor` (writes paused
+  below `min_free_bytes`; connections are still accepted and reads served),
+  write clients get `STORAGE_PRESSURE` with the floor class and hold, `status`
+  shows a nonzero `floorPause.pausedSince`, or the unit waits at startup with
+  `waiting to open the store` (nothing can answer then, so `check.sh` cannot
+  connect).
 - Diagnose: `df -h /SPARROW /home`, then find what grew:
   `sudo du -xsh /home/* /SPARROW/* | sort -h | tail`.
 - Recover: free space on the filesystem (another program's files, a read-only
