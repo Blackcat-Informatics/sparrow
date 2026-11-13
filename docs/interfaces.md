@@ -2642,6 +2642,29 @@ the latest at the next one-second observation), and a permit wait by that same
 observation, since the wait itself has no retry. An episode that starts inside the
 interval and ends before it has passed prints no line at all, neither beginning nor end:
 a short suppressed episode leaves counters only.
+
+A UDP listener adds kernel evidence, appended to the listener status without a schema
+bump: `rcvbuf_requested_bytes` (always 8 MiB, 8388608), `rcvbuf_granted_bytes`,
+`kernel_drops`, `kernel_counter_state` and `kernel_counter_reason`. A TCP listener
+reports state `not_applicable` and zeros. The daemon asks for the 8 MiB receive buffer
+with SO_RCVBUF when it binds and reads the size back with getsockopt. Linux stores
+twice the clamped request, so the granted size is that stored size; it can be lower
+than twice the request when `net.core.rmem_max` is lower than 8 MiB, which is reported
+and is not an error. The daemon journals the request, the grant and `rmem_max` once per
+listener at start; `rmem_max` reads as unreadable where `/proc/sys` is hidden. A failed
+setsockopt or getsockopt call fails startup with a message naming the listener.
+`kernel_drops` is the `drops` column of the socket's row in `/proc/self/net/udp`
+(`udp6` for an IPv6 address), matched by the socket inode. It counts every datagram
+the kernel dropped for that socket, for any cause, since the socket was bound. It is
+read when a status is requested, when the reader leaves a wait and when the listener
+stops; no timer reads it. `kernel_counter_state` is `available` when the count was
+read. It is `unavailable` when the file cannot be read or has no row for the socket;
+then `kernel_drops` is 0, `kernel_drops_unknown` is true and `kernel_counter_reason`
+says why. A zero count is never reported unless the kernel reported it.
+
+UDP syslog is lossy by its nature; loss is counted where it can be (the kernel's
+drops, a clean shutdown) and stated plainly where it cannot (a crash, an exit on a
+full disk).
 Counters are process-lifetime evidence and reset on restart. Successful counts
 follow durable store publication, but syslog provides no typed sender receipt.
 TCP sends therefore do not prove publication; UDP kernel/network loss remains

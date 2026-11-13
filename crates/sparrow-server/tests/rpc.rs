@@ -2400,7 +2400,19 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         let addresses: Vec<std::net::SocketAddr> = listeners.iter().map(|listener| {
             assert_eq!(listener.get_accepted_messages(), 0);
             assert!(listener.get_continuity_unknown());
-            assert_eq!(listener.get_kernel_drops_unknown(), listener.get_transport().unwrap() == wire::SyslogTransport::Udp);
+            // UDP carries the kernel receive buffer and a drop counter that is either read or stated
+            // unavailable (never a guessed zero); TCP has neither.
+            if listener.get_transport().unwrap() == wire::SyslogTransport::Udp {
+                assert_eq!(listener.get_rcvbuf_requested_bytes(), 8 * 1024 * 1024);
+                assert!(listener.get_rcvbuf_granted_bytes() > 0);
+                let state = listener.get_kernel_counter_state().unwrap();
+                assert_ne!(state, wire::KernelCounterState::NotApplicable);
+                assert_eq!(listener.get_kernel_drops_unknown(), state == wire::KernelCounterState::Unavailable);
+            } else {
+                assert!(!listener.get_kernel_drops_unknown());
+                assert_eq!(listener.get_kernel_counter_state().unwrap(), wire::KernelCounterState::NotApplicable);
+                assert_eq!(listener.get_rcvbuf_granted_bytes(), 0);
+            }
             listener.get_address().unwrap().to_str().unwrap().parse().unwrap()
         }).collect();
         let modern = b"<34>1 2026-10-08T06:25:00.123Z host app 123 ID [id@32473 p=\"x\\]y\" p=\"\\q\"] needle\nnext";

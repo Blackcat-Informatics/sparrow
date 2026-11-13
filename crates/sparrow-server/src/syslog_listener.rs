@@ -150,6 +150,8 @@ pub(crate) struct Status {
     next_hold: u64,
     episode: Option<Episode>,
     announced_at: Option<tokio::time::Instant>,
+    /// Receive buffer and kernel drop counter; present for a UDP listener started by the worker.
+    kernel: Option<crate::udp_kernel::Kernel>,
 }
 #[derive(Clone)]
 struct Metrics(Arc<Mutex<Status>>);
@@ -167,6 +169,16 @@ impl Metrics {
             .lock()
             .map_err(|_| io::Error::other("syslog status poisoned"))?
             .clone())
+    }
+    /// Read the kernel drop counter now. Called only at events: a status request and the reader
+    /// leaving a wait.
+    fn sample_kernel(&self) -> io::Result<()> {
+        self.update(|status| {
+            if let Some(kernel) = status.kernel.as_mut() {
+                kernel.sample();
+            }
+            Ok(())
+        })
     }
 }
 impl Status {
@@ -186,6 +198,7 @@ impl Status {
             next_hold: 0,
             episode: None,
             announced_at: None,
+            kernel: None,
         }
     }
 
@@ -375,7 +388,10 @@ impl SyslogRegistry {
             .lock()
             .map_err(|_| io::Error::other("syslog registry poisoned"))?
             .iter()
-            .map(Metrics::snapshot)
+            .map(|metrics| {
+                metrics.sample_kernel()?;
+                metrics.snapshot()
+            })
             .collect()
     }
     pub(crate) fn sources(&self) -> io::Result<Vec<sparrow_core::SourceSyslogBinding>> {
@@ -415,6 +431,7 @@ impl SyslogWorker {
         let mut sockets = Vec::new();
         let mut metrics = Vec::new();
         for definition in definitions {
+            let mut kernel = None;
             let (socket, address) = match definition.transport {
                 SyslogTransport::Tcp => {
                     let socket = TcpListener::bind(definition.address).await?;
@@ -424,10 +441,29 @@ impl SyslogWorker {
                 SyslogTransport::Udp => {
                     let socket = UdpSocket::bind(definition.address).await?;
                     let address = socket.local_addr()?;
+                    let buffer = crate::udp_kernel::request_buffer(
+                        &socket,
+                        crate::udp_kernel::REQUESTED_RCVBUF_BYTES,
+                    )
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("syslog listener {}: {error}", definition.id),
+                        )
+                    })?;
+                    kernel = Some(crate::udp_kernel::Kernel::new(&socket, address, buffer)?);
+                    journal(&format!(
+                        "sparrowd: syslog listener {}: receive buffer requested {} bytes, kernel granted {} bytes (net.core.rmem_max {})",
+                        definition.id,
+                        buffer.requested,
+                        buffer.granted,
+                        crate::udp_kernel::rmem_max()
+                            .map_or_else(|| "unreadable".to_owned(), |limit| limit.to_string()),
+                    ));
                     (Socket::Udp(socket), address)
                 }
             };
-            let metric = Metrics(Arc::new(Mutex::new(Status::new(
+            let mut status = Status::new(
                 sparrow_core::SyslogReceiver::new(
                     &definition.id,
                     match (definition.transport, definition.framing) {
@@ -443,7 +479,9 @@ impl SyslogWorker {
                 .map_err(io::Error::other)?,
                 definition.clone(),
                 address,
-            ))));
+            );
+            status.kernel = kernel;
+            let metric = Metrics(Arc::new(Mutex::new(status)));
             sockets.push((socket, metric.clone()));
             metrics.push(metric);
         }
@@ -810,6 +848,8 @@ async fn listen(
                         sparrow_core::ReceiverDiscard::Refused,
                     )
                     .await?;
+                    // The reader has left a wait; datagrams may have been dropped meanwhile.
+                    metrics.sample_kernel()?;
                     continue;
                 };
                 publish(
@@ -822,6 +862,8 @@ async fn listen(
                 .await?;
                 drop(permit);
             }
+            // A last sample, so the count survives the socket closing.
+            metrics.sample_kernel()?;
             Ok(())
         }
     }
@@ -1254,10 +1296,46 @@ impl Status {
         out.set_rejected_connections(0);
         out.set_timed_out_connections(self.counts.timed_out);
         out.set_continuity_unknown(true);
-        out.set_kernel_drops_unknown(self.definition.transport == SyslogTransport::Udp);
+        self.encode_kernel(out.reborrow());
         match &self.failure {
             Some(value) => out.init_failure().set_value(value),
             None => out.init_failure().set_absent(()),
+        }
+    }
+
+    /// The UDP kernel evidence. A count is written only when it was read; otherwise the count is
+    /// zero, `kernel_drops_unknown` is set and the reason is stated.
+    fn encode_kernel(&self, mut out: crate::sparrow_capnp::syslog_listener_status::Builder<'_>) {
+        use crate::sparrow_capnp::KernelCounterState;
+        use crate::udp_kernel::Counter;
+        if self.definition.transport != SyslogTransport::Udp {
+            out.set_kernel_drops_unknown(false);
+            out.set_kernel_counter_state(KernelCounterState::NotApplicable);
+            out.init_kernel_counter_reason().set_absent(());
+            return;
+        }
+        let unattached =
+            Counter::Unavailable("no kernel counter is attached to this listener".into());
+        let counter = self
+            .kernel
+            .as_ref()
+            .map_or(&unattached, |kernel| &kernel.counter);
+        if let Some(kernel) = &self.kernel {
+            out.set_rcvbuf_requested_bytes(kernel.buffer.requested as u64);
+            out.set_rcvbuf_granted_bytes(kernel.buffer.granted as u64);
+        }
+        match counter {
+            Counter::Available(drops) => {
+                out.set_kernel_drops_unknown(false);
+                out.set_kernel_drops(*drops);
+                out.set_kernel_counter_state(KernelCounterState::Available);
+                out.init_kernel_counter_reason().set_absent(());
+            }
+            Counter::Unavailable(reason) => {
+                out.set_kernel_drops_unknown(true);
+                out.set_kernel_counter_state(KernelCounterState::Unavailable);
+                out.init_kernel_counter_reason().set_value(reason);
+            }
         }
     }
 }
@@ -1976,6 +2054,82 @@ mod tests {
             reader.get_longest_hold_ms(),
             crate::syslog_wire::listener(reader).unwrap(),
         )
+    }
+
+    /// The listener's JSON rendering after the wire encoding, as status shows it.
+    fn status_json(status: &Status) -> purrdf_lex::json::Value {
+        wire_fields(status).2
+    }
+
+    /// Value (#254): status states the receive buffer and the kernel drop count of a UDP
+    /// listener through the wire and its JSON, and a TCP listener states neither applies.
+    #[test]
+    fn udp_status_carries_buffer_sizes_and_the_kernel_drop_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 16 << 20,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("udp");
+        std::fs::write(
+            &table,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n  1: 0100007F:0202 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 777 2 0000000000000000 42\n",
+        )
+        .unwrap();
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(table, 777, buffer));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["rcvbuf_requested_bytes"].as_str(), Some("8388608"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("16777216"));
+        assert_eq!(json["kernel_drops"].as_str(), Some("42"));
+        assert_eq!(json["kernel_counter_state"].as_str(), Some("available"));
+        assert_eq!(json["kernel_drops_unknown"].as_bool(), Some(false));
+        let tcp = status_json(
+            &listener(SyslogTransport::Tcp, 1, 1000)
+                .metrics
+                .snapshot()
+                .unwrap(),
+        );
+        assert_eq!(tcp["kernel_counter_state"].as_str(), Some("not_applicable"));
+        assert_eq!(tcp["kernel_drops_unknown"].as_bool(), Some(false));
+    }
+
+    /// Value (#254): when the kernel counter cannot be read (a unit hiding /proc/self/net, a
+    /// missing file) status says unavailable with the reason, flags the drops unknown and
+    /// reports no count, so an operator never reads a guessed zero as "no loss".
+    #[test]
+    fn an_unreadable_kernel_counter_is_reported_unavailable_with_no_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 425_984,
+        };
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(
+                    dir.path().join("hidden"),
+                    777,
+                    buffer,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["kernel_counter_state"].as_str(), Some("unavailable"));
+        assert_eq!(json["kernel_drops_unknown"].as_bool(), Some(true));
+        assert_eq!(json["kernel_drops"].as_str(), Some("0"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("425984"));
+        assert!(
+            json["kernel_counter_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("hidden"))
+        );
     }
 
     /// Value (#243): a frame waiting for an operation permit is held and counted as such, not
