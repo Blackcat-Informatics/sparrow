@@ -20335,13 +20335,14 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
     assert!(owned(&store) < before);
     assert_eq!(store.bytes(&second.record_ids[0], 0, 2, 3).unwrap(), b"c\n");
 
-    // Publication at or behind the watermark or an in-flight segment is a clock regression.
+    // Publication at or behind the watermark or an in-flight segment is a clock regression,
+    // typed apart from a storage failure so a caller that stamped it early can restamp.
     assert_eq!(
         store
             .ingest("archive-regressed", "source", "log", b"late\n", 0)
             .unwrap_err()
             .code,
-        "STORAGE_FAILURE"
+        sparrow_core::ARCHIVE_WATERMARK
     );
     let next = ArchiveIntent {
         segment_id: [3; 32],
@@ -20356,7 +20357,7 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
             .ingest("archive-in-flight", "source", "log", b"late\n", 2)
             .unwrap_err()
             .code,
-        "STORAGE_FAILURE"
+        sparrow_core::ARCHIVE_WATERMARK
     );
     store
         .ingest("archive-current", "source", "log", b"now\n", 4)

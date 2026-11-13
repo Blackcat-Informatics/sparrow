@@ -102,6 +102,11 @@ pub struct ArchiveState {
     pub intent: Option<ArchiveIntent>,
 }
 
+/// Error code of a publication at or behind the archive watermark. Typed apart from
+/// `STORAGE_FAILURE` so a caller that stamped the publication with an earlier instant (a UDP
+/// syslog datagram stamped when it was read) can offer it once more with the commit instant.
+pub const ARCHIVE_WATERMARK: &str = "ARCHIVE_WATERMARK";
+
 impl ArchiveState {
     /// The one deletion gate: evidence retires only once a committed segment covers it.
     fn archived(&self, position: &[u8]) -> bool {
@@ -120,7 +125,7 @@ impl ArchiveState {
             .max();
         match fence {
             Some(fence) if earliest <= fence.as_bytes() => Err(Error::new(
-                "STORAGE_FAILURE",
+                ARCHIVE_WATERMARK,
                 format!(
                     "publication at {} is at or before the archive watermark {fence}; the server clock moved backwards or an import outlived the archive horizon; correct the clock and retry",
                     String::from_utf8_lossy(earliest)

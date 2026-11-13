@@ -154,6 +154,16 @@ struct SyslogListenerStatus {
   # The kernel refused the enlarge request: the socket kept the default buffer (granted shows it)
   # and the daemon went on taking syslog. The text is the error; the count is 0 or 1 per listener.
   rcvbufEnlargeError @29 :OptionalText; rcvbufEnlargeFailures @30 :UInt64;
+  # UDP hold (#255): the reader and the publisher are joined by a FIFO bounded in bytes. The
+  # datagrams and bytes queued now (entry cost is length plus a fixed overhead), the configured
+  # bound, the times the reader stopped because the queue was full and the longest such wait
+  # (finished or running) in milliseconds, datagrams published with the commit instant because
+  # the read instant was behind the archive watermark, and datagrams read but not stored when
+  # the listener stopped under pressure. heldFrames, holdsStoragePressure, holdsNoPermit and
+  # longestHoldMs count the datagram at the head of the queue for a UDP listener.
+  queuedDatagrams @31 :UInt32; queuedBytes @32 :UInt64; holdBytes @33 :UInt64;
+  readerFullWaits @34 :UInt64; readerFullLongestMs @35 :UInt64; restamped @36 :UInt64;
+  lostAtShutdown @37 :UInt64; lostAtShutdownBytes @38 :UInt64;
 }
 enum KernelCounterState { notApplicable @0; available @1; unavailable @2; }
 struct SyslogListenerQuery { storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :Text; id @3 :Text; }
