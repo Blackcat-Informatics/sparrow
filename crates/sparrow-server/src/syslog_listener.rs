@@ -65,7 +65,7 @@ pub struct SyslogListener {
     pub max_connections: usize,
     /// Required complete-frame read deadline, 1..60000 milliseconds.
     pub read_timeout_ms: u32,
-    /// UDP only, optional: the bytes the reader may queue for the publisher, 1 MiB to 1 GiB,
+    /// UDP only, optional: the bytes the reader may queue for the publisher, 1 MiB to 512 MiB,
     /// 64 MiB when absent. The sum over all listeners is at most 512 MiB. A queued datagram
     /// costs its length plus [`ENTRY_OVERHEAD`].
     #[serde(default)]

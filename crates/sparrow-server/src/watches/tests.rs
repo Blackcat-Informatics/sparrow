@@ -1176,6 +1176,24 @@ fn the_archive_watermark_stops_a_tail_watch_as_a_storage_failure_does() {
     assert!(matches!(recorded, Ok(Some(_))));
 }
 
+/// Value (#255): recording a claim's pending attempt stops the worker for `STORAGE_FAILURE`
+/// and for `ARCHIVE_WATERMARK` alike, and only reports any other error against the claim. This
+/// is the one site that no other test reaches, so it is pinned alone.
+#[test]
+fn the_archive_watermark_stops_the_worker_when_a_pending_attempt_cannot_be_recorded() {
+    for code in ["STORAGE_FAILURE", sparrow_core::ARCHIVE_WATERMARK] {
+        let outcome = pending_attempt_outcome::<()>(Err(sparrow_core::Error::new(code, "x")));
+        assert!(
+            matches!(&outcome, Err(Error::Storage(error)) if error.code == code),
+            "{code}: {outcome:?}"
+        );
+    }
+    let reported =
+        pending_attempt_outcome::<()>(Err(sparrow_core::Error::new("RESOURCE_LIMIT", "x")));
+    assert!(matches!(reported, Ok(Some(_))));
+    assert!(matches!(pending_attempt_outcome(Ok(())), Ok(None)));
+}
+
 /// Value (#255): the admin path classifies store errors the same way: `STORAGE_FAILURE` and
 /// `ARCHIVE_WATERMARK` end the worker (terminal), any other code is a refusal to the caller.
 #[test]

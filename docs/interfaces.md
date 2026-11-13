@@ -2663,7 +2663,9 @@ reader and a publisher joined by a first-in first-out queue bounded in bytes:
   and the daemon's worker health gate stops the daemon, so a reader never fills a queue that
   nobody drains. Datagrams still in the kernel buffer at this exit are lost and not counted.
 - A socket or stamping error in the reader closes the queue: the publisher stores what is
-  queued, and then the listener returns the reader's error.
+  queued, and then the listener returns the reader's error. A datagram the reader had taken
+  off the socket and not queued when it failed (including one it was holding in a full-queue
+  wait, which ends) is counted in `lost_at_shutdown` and named in the error.
 - On a stop the reader drains the socket, reading up to the queue bound, and the
   publisher publishes the queue while the store accepts it. A stop that finds the store
   under pressure gives the head one last attempt. If that is refused, the head and the

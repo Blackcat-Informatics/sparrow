@@ -100,6 +100,22 @@ impl Metrics {
             Ok(())
         })
     }
+    /// The reader failed holding a datagram it had not queued: count it lost and end its wait.
+    fn lose_unqueued(&self, payload: usize, error: &io::Error) -> io::Result<()> {
+        self.update(|status| {
+            increment(&mut status.counts.lost_at_shutdown)?;
+            status.counts.lost_at_shutdown_bytes = status
+                .counts
+                .lost_at_shutdown_bytes
+                .saturating_add(payload as u64);
+            // A line for an episode that ends here would say the queue drained.
+            let _ = status.end_full_wait(tokio::time::Instant::now());
+            status.failure = Some(format!(
+                "UDP reader failed: {error}; the datagram just read was lost"
+            ));
+            Ok(())
+        })
+    }
     /// The publisher failed: everything still queued, and the datagram the reader holds while it
     /// waits for room, is lost. Counts it, ends the reader's wait (the reader goes with the
     /// publisher, so the wait gauge must stop growing), records the failure and returns the
@@ -371,14 +387,24 @@ impl Reader<'_> {
 
     /// Stamp the datagram in the buffer, take its budget and queue it.
     async fn enqueue(&mut self, size: usize) -> io::Result<()> {
-        let read_at = (self.clock)()?.max(self.last);
+        let read_at = match (self.clock)() {
+            Ok(read_at) => read_at.max(self.last),
+            Err(error) => return self.lose_in_hand(size, error),
+        };
         self.last = read_at;
         let cost = size + ENTRY_OVERHEAD;
         let wanted = u32::try_from(cost).map_err(io::Error::other)?;
         let budget = match self.budget.clone().try_acquire_many_owned(wanted) {
             Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => self.wait_for_room(wanted, size).await?,
-            Err(error @ TryAcquireError::Closed) => return Err(io::Error::other(error)),
+            Err(TryAcquireError::NoPermits) => match self.wait_for_room(wanted, size).await {
+                Ok(permit) => permit,
+                // The wait ends with the error: the datagram in hand is lost and counted, and
+                // the wait gauge stops (a tick, the budget closing).
+                Err(error) => return self.lose_in_hand(size, error),
+            },
+            Err(error @ TryAcquireError::Closed) => {
+                return self.lose_in_hand(size, io::Error::other(error));
+            }
         };
         self.metrics.enqueued(cost)?;
         self.queue
@@ -389,6 +415,17 @@ impl Reader<'_> {
                 _budget: budget,
             })
             .map_err(|_| io::Error::other("the UDP syslog publisher ended"))
+    }
+
+    /// The reader fails with a datagram it has taken off the socket and not queued: count it
+    /// lost, end any wait it was in so the wait gauge stops growing, and return the error naming
+    /// the loss.
+    fn lose_in_hand(&self, size: usize, error: io::Error) -> io::Result<()> {
+        self.metrics.lose_unqueued(size, &error)?;
+        Err(io::Error::new(
+            error.kind(),
+            format!("{error}; the datagram just read ({size} byte(s)) was counted lost"),
+        ))
     }
 
     /// Wait for the publisher to free `wanted` budget bytes with the datagram in hand. The wait
@@ -1117,7 +1154,59 @@ mod tests {
         yield_until("listen returns", || udp.task.is_finished()).await;
         let error = udp.joined().await.unwrap_err();
         assert!(error.to_string().contains("the clock failed"), "{error}");
-        assert_eq!(udp.status().counts.accepted, 2);
+        let status = udp.status();
+        assert_eq!(status.counts.accepted, 2);
+        // The datagram whose stamp failed was taken off the socket: it is counted lost, named.
+        assert_eq!(
+            (
+                status.counts.lost_at_shutdown,
+                status.counts.lost_at_shutdown_bytes
+            ),
+            (1, 103)
+        );
+        assert!(error.to_string().contains("counted lost"), "{error}");
         assert_eq!(stored_lengths(&udp.fixture.store), [101, 102]);
+    }
+
+    /// Value (#255): a reader that fails while it waits for room with a datagram in hand counts
+    /// that datagram lost and ends the wait, so the longest-wait gauge stops growing. The wait
+    /// is made to fail by closing its budget, the one failure a test can reach there. Fails on
+    /// the reader that returned the error and left the wait running.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_error_inside_the_full_wait_counts_the_datagram_and_stops_the_gauge() {
+        let fixture = listener_with(SyslogTransport::Udp, 1, 1000, false);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (queue, _entries) = mpsc::unbounded_channel();
+        let budget = Arc::new(Semaphore::new(1000));
+        let mut reader = Reader {
+            socket: &socket,
+            queue,
+            budget: budget.clone(),
+            metrics: &fixture.metrics,
+            wake: fixture.wake.subscribe(),
+            clock: Arc::new(|| Ok(1)),
+            last: 0,
+            buffer: vec![b'x'; 600],
+        };
+        // The budget has 1000 bytes; the datagram costs 600 + 128: it fits once, not twice.
+        reader.enqueue(600).await.unwrap();
+        let metrics = fixture.metrics.clone();
+        let (outcome, ()) = tokio::join!(reader.enqueue(600), async {
+            yield_until("the reader waits", || {
+                metrics.snapshot().unwrap().waiting_since.is_some()
+            })
+            .await;
+            budget.close();
+        });
+        assert!(outcome.is_err());
+        let status = fixture.metrics.snapshot().unwrap();
+        assert_eq!(
+            (
+                status.counts.lost_at_shutdown,
+                status.counts.lost_at_shutdown_bytes
+            ),
+            (1, 600)
+        );
+        assert!(status.waiting_since.is_none() && status.in_hand.is_none());
     }
 }

@@ -1212,6 +1212,18 @@ fn fatal_storage(code: &str) -> bool {
     matches!(code, "STORAGE_FAILURE" | sparrow_core::ARCHIVE_WATERMARK)
 }
 
+/// What recording a claim's pending attempt means for the worker: a fatal store error stops it,
+/// any other error is reported against the claim, and success reports nothing.
+fn pending_attempt_outcome<T>(
+    result: Result<T, sparrow_core::Error>,
+) -> Result<Option<sparrow_core::Error>, Error> {
+    match result {
+        Ok(_) => Ok(None),
+        Err(record) if fatal_storage(record.code) => Err(Error::Storage(record)),
+        Err(record) => Ok(Some(record)),
+    }
+}
+
 /// What one tail drain means for the worker: a fatal store error stops it, any other error is
 /// the watch's recorded failure, and success records nothing.
 fn tail_drain_outcome(result: Result<(), Error>) -> Result<Option<String>, Error> {
@@ -1781,20 +1793,18 @@ async fn run(
                 detector.fail_claim(&id, format!("claim {id}: {error}"));
                 eprintln!("sparrowd: watch={watch} claim={id} pending: {error}");
                 // The claim's durable history answers `watch claims` after any restart.
-                match store.consumption_attempt_pending(&id, &error.to_string(), crate::now()?) {
-                    Ok(_) => {}
-                    Err(record) if fatal_storage(record.code) => {
-                        return Err(Error::Storage(record));
-                    }
-                    Err(record) => {
-                        eprintln!(
-                            "sparrowd: watch={watch} claim={id} pending attempt not recorded: {record}"
-                        );
-                        detector.fail_claim(
-                            &id,
-                            format!("claim {id}: {error}; attempt not recorded: {record}"),
-                        );
-                    }
+                if let Some(record) = pending_attempt_outcome(store.consumption_attempt_pending(
+                    &id,
+                    &error.to_string(),
+                    crate::now()?,
+                ))? {
+                    eprintln!(
+                        "sparrowd: watch={watch} claim={id} pending attempt not recorded: {record}"
+                    );
+                    detector.fail_claim(
+                        &id,
+                        format!("claim {id}: {error}; attempt not recorded: {record}"),
+                    );
                 }
                 let failures = retry
                     .get(&id)
