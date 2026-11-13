@@ -389,6 +389,7 @@ impl Writer {
 
     pub(super) fn admit_import_batch(&self, batch: &WriteBatch) -> Result<(), Error> {
         self.admit_data_write(super::pressure::data_batch_estimate(batch))
+            .map_err(Error::from)
     }
 
     /// Largest declared input: `MAX_IMPORT_BYTES` under production retirement limits.
@@ -841,7 +842,11 @@ impl Store {
         manifest.expires_at = manifest.expires_at.min(now);
         let mut batch = WriteBatch::default();
         put(&mut batch, id, &manifest);
-        writer.commit(batch)
+        writer.commit(batch)?;
+        drop(writer);
+        // The lease has ended: the journal is reclaimable now, so tell the reclamation duty.
+        self.wake_import_reclaim();
+        Ok(())
     }
 
     /// Durably prepare exact record spans with bounded memory. Repeated or

@@ -2744,11 +2744,18 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                 .unwrap()
                 .expect("the waiting TCP peer was reset");
             // The slot went to the TCP peer; a Unix peer now waits for the shared ceiling too.
+            // Witness that it reached the daemon's listen queue: a raw connect completes only
+            // once the kernel has queued the peer, with no accept, so it is deterministic. Status
+            // cannot witness it: every admission counter belongs to the accept loop, which waits
+            // for a slot whether or not a Unix peer exists. Then a typed client queues behind it.
+            let queued = tokio::net::UnixStream::connect(&socket)
+                .await
+                .expect("the Unix peer did not reach the listen queue");
             let unix_seventh = tokio::task::spawn_local({
                 let socket = socket.clone();
                 async move { sparrow_client::Client::connect(&socket).await }
             });
-            // The TCP peer took the freed slot; the Unix peer is held behind it, not admitted.
+            // The TCP peer took the freed slot; the Unix peers are held behind it, not admitted.
             status_until(&status_client, |admission| {
                 let wire::optional_connection_ceiling_status::Value(ceiling) =
                     admission.get_rpc_connections().unwrap().which().unwrap()
@@ -2764,6 +2771,12 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                     && ceiling.get_ceiling_wait().unwrap().get_waiting() == 1
             })
             .await;
+            assert!(
+                !unix_seventh.is_finished(),
+                "a Unix peer was over-admitted or reset"
+            );
+            // The queued raw peer ends; the daemon serves or drops it and the slot passes on.
+            drop(queued);
             drop(tcp_seventh);
             let recovered = unix_seventh
                 .await

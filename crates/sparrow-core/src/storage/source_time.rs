@@ -419,7 +419,7 @@ impl Admission {
     pub(super) fn full_refusal() -> Error {
         Error::new(
             "INVALID_ARGUMENT",
-            "source profile registry admits at most 1024 immutable mappings and none is ever removed; declare the profile on a source that already has one",
+            "source profile registry is full: it admits at most 1024 immutable mappings and none is ever removed, so no room will free and a retry cannot succeed; this source gets no declared profile, and its records are still accepted",
         )
     }
 

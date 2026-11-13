@@ -154,14 +154,16 @@ impl Writer {
     }
 
     /// Every write uses WAL. Only complete intake batches may request buffered acknowledgment.
+    /// A refusal for the write ceiling stays typed ([`super::pressure::WriteRefusal`]); every
+    /// other caller converts it to [`Error`] through `?`.
     pub(super) fn apply(
         &self,
         mut batch: WriteBatch,
         buffered_id: Option<&str>,
         record_estimate: Option<u64>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), super::pressure::WriteRefusal> {
         if buffered_id.is_none() && batch.is_empty() {
-            return self.synchronize().map(|_| ());
+            return Ok(self.synchronize().map(|_| ())?);
         }
         // A refused write leaves the session certifiable; a failed one does not.
         self.durability.borrow().check()?;
@@ -183,7 +185,8 @@ impl Writer {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
                     "manifest store lost its required receiver registry",
-                ));
+                )
+                .into());
             }
             let receiver = publication.receiver_registry
                 || receiver_present
@@ -247,7 +250,8 @@ impl Writer {
                     return Err(Error::new(
                         "STORAGE_FAILURE",
                         "buffered occurrence identity already occupied",
-                    ));
+                    )
+                    .into());
                 }
                 if state.pending.len() == MAX_BUFFERED_WRITES
                     || bytes > MAX_BUFFERED_BYTES - state.bytes
@@ -255,7 +259,8 @@ impl Writer {
                     return Err(Error::new(
                         "STORAGE_PRESSURE",
                         "buffered durability ledger is full; synchronize before retrying",
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -264,7 +269,7 @@ impl Writer {
         options.set_sync(buffered_id.is_none());
         if let Err(error) = self.db.write_opt(batch, &options) {
             self.durability.borrow_mut().failure = Some(error.to_string());
-            return Err(error.into());
+            return Err(Error::from(error).into());
         }
         if let Some(earliest) = publication.earliest {
             self.eviction.borrow_mut().published(&earliest);

@@ -288,10 +288,35 @@ pub(super) fn data_batch_estimate(batch: &rocksdb::WriteBatch) -> u64 {
 
 const WRITE_CEILING_MESSAGE: &str = "estimated atomic write cannot fit the configured data budget; increase the disk budget or reduce the operation";
 
-/// Whether `error` is the refusal of a write whose estimate exceeds the whole data
-/// allowance, independent of what the store holds now: no retry of that write can fit.
-pub(super) fn is_write_ceiling_refusal(error: &Error) -> bool {
-    error.code == "RESOURCE_LIMIT" && error.message == WRITE_CEILING_MESSAGE
+/// Why admission refused a data write. The one cause a caller acts on is a type, not a
+/// message: a write whose estimate exceeds the whole data allowance can never fit, whatever
+/// the store holds, so no retry of it can succeed. Every other refusal keeps its own error.
+#[derive(Debug)]
+pub(super) enum WriteRefusal {
+    /// The estimate exceeds the whole data allowance (independent of the store's content).
+    Ceiling,
+    Other(Error),
+}
+
+impl From<Error> for WriteRefusal {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<rocksdb::Error> for WriteRefusal {
+    fn from(error: rocksdb::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+
+impl From<WriteRefusal> for Error {
+    fn from(refusal: WriteRefusal) -> Self {
+        match refusal {
+            WriteRefusal::Ceiling => Error::new("RESOURCE_LIMIT", WRITE_CEILING_MESSAGE),
+            WriteRefusal::Other(error) => error,
+        }
+    }
 }
 
 /// Largest measured footprint that still leaves the admitted data-write allowance.
@@ -299,12 +324,13 @@ pub(super) fn data_write_ceiling(
     disk_budget: u64,
     reserve: u64,
     estimate: u64,
-) -> Result<u64, Error> {
+) -> Result<u64, WriteRefusal> {
     if estimate == 0 {
         return Err(Error::new(
             "STORAGE_FAILURE",
             "data write requires a positive capacity estimate",
-        ));
+        )
+        .into());
     }
     let limit = disk_budget.checked_sub(reserve).ok_or_else(|| {
         Error::new(
@@ -312,14 +338,12 @@ pub(super) fn data_write_ceiling(
             "disk budget must exceed maintenance reserve",
         )
     })?;
-    limit
-        .checked_sub(estimate)
-        .ok_or_else(|| Error::new("RESOURCE_LIMIT", WRITE_CEILING_MESSAGE))
+    limit.checked_sub(estimate).ok_or(WriteRefusal::Ceiling)
 }
 
 impl Writer {
     /// Called before publishing a prepared data batch; never mutates its dependencies.
-    pub(super) fn admit_data_write(&self, estimate: u64) -> Result<(), Error> {
+    pub(super) fn admit_data_write(&self, estimate: u64) -> Result<(), WriteRefusal> {
         let ceiling = data_write_ceiling(
             self.config.disk_budget,
             self.config.maintenance_reserve,
@@ -354,7 +378,8 @@ impl Writer {
         Err(Error::new(
             "STORAGE_PRESSURE",
             "write would cross the maintenance reserve; bounded pressure maintenance requested; retry after measured physical recovery",
-        ))
+        )
+        .into())
     }
 
     /// Run reclamation commits (the retirement batch and the wait clear, nothing else)

@@ -546,6 +546,9 @@ struct Unlocked {
     /// Told, without blocking, when a reclamation commit deleted an import journal, which is
     /// the moment its slot is free (#246).
     import_slot_waker: Mutex<Option<RetentionWaker>>,
+    /// Told, without blocking, when an explicit import cancel committed: the lease has ended
+    /// and the reclamation duty may delete the journal now instead of at its next interval.
+    import_reclaim_waker: Mutex<Option<RetentionWaker>>,
     /// The writer's pressure-request wake, shared so the owner can install it (#247).
     pressure_request_waker: Arc<Mutex<Option<RetentionWaker>>>,
     /// The one compaction a stalled pressure wait may force.
@@ -1165,7 +1168,7 @@ impl Writer {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), Error> {
-        self.apply(batch, None, None)
+        self.apply(batch, None, None).map_err(Error::from)
     }
 
     fn get<T: Catalog>(&self, key: &str) -> Result<T, Error> {
@@ -1733,6 +1736,7 @@ impl Store {
                 backup: backup::Slot::default(),
                 retention_waker,
                 import_slot_waker: Mutex::new(None),
+                import_reclaim_waker: Mutex::new(None),
                 pressure_request_waker: Arc::clone(&pressure_request_waker),
                 forced: Arc::clone(&forced),
                 stream_evidence: stream_evidence::Ledger::default(),
@@ -2202,14 +2206,15 @@ impl Store {
                 (mode == durability::Durability::Buffered).then_some(artifact.id.as_str()),
                 Some(estimate),
             )
-            .map_err(|error| {
+            .map_err(|refusal| {
                 // `apply` admits the larger of this estimate and the joined batch (source
                 // context and authority metadata included). A write over the whole data
                 // allowance can never fit, so a producer is told so and does not retry.
-                if origin.producer().is_some() && pressure::is_write_ceiling_refusal(&error) {
-                    batch_bound(origin, error.message)
-                } else {
-                    error
+                match refusal {
+                    pressure::WriteRefusal::Ceiling => {
+                        batch_bound(origin, Error::from(refusal).message)
+                    }
+                    pressure::WriteRefusal::Other(error) => error,
                 }
             })?;
         if let Some(row) = tail_checkpoint.and_then(|checkpoint| checkpoint.unrecorded) {
@@ -2911,12 +2916,34 @@ impl Store {
         }
     }
 
+    /// Install, or with `None` remove, the callback run when an explicit import cancel has
+    /// committed, so the reclamation duty runs at once for the ended lease. It runs on the
+    /// cancelling thread after the writer lock is released, so it must not block. An import
+    /// whose lease merely expires has no event; the duty's interval observes that.
+    pub fn set_import_reclaim_waker(&self, waker: Option<RetentionWaker>) {
+        if let Ok(mut slot) = self.unlocked.import_reclaim_waker.lock() {
+            *slot = waker;
+        }
+    }
+
     /// Install, or with `None` remove, the callback run when a refused write requests a
     /// pressure pass (the state moves from ready to requested). It runs on the writing
     /// thread under the writer lock, so it must not block.
     pub fn set_pressure_request_waker(&self, waker: Option<RetentionWaker>) {
         if let Ok(mut slot) = self.unlocked.pressure_request_waker.lock() {
             *slot = waker;
+        }
+    }
+
+    fn wake_import_reclaim(&self) {
+        let waker = self
+            .unlocked
+            .import_reclaim_waker
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(waker) = waker {
+            waker();
         }
     }
 
