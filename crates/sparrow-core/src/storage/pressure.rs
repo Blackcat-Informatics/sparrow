@@ -385,7 +385,10 @@ impl Writer {
     /// Run reclamation commits (the retirement batch and the wait clear, nothing else)
     /// under the maintenance reserve instead of the free-space floor: they are what
     /// frees space, and ordinary writes keep the floor.
-    fn reclaiming<T>(&self, work: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    pub(super) fn reclaiming<T>(
+        &self,
+        work: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
         struct Reset<'a>(&'a std::cell::Cell<bool>);
         impl Drop for Reset<'_> {
             fn drop(&mut self) {

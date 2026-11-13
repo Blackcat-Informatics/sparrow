@@ -411,6 +411,14 @@ id)` advances the watermark and removes the intent in one synchronized batch.
 is at or before the watermark or the in-flight intent's end is refused with
 `STORAGE_FAILURE`, and the message says to correct the clock.
 
+Both archive commits unlock retirement of archived evidence, so they are
+admitted at the maintenance reserve instead of the free-space floor, as the
+pressure pass's own commits are. Below the floor and above the reserve they
+succeed while ordinary writes are still refused with the floor label. Below the
+reserve they fail with `STORAGE_PRESSURE` and the reserve text, and the
+watermark does not move; the archive worker must hold and retry on the floor
+resume edge.
+
 Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `EvictionFrontier.archiveLag`. CLI and MCP status render them as
 `awaiting_archive` and `archive_lag`. Archive worker status, with its phase,
