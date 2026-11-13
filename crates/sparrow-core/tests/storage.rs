@@ -24134,3 +24134,77 @@ fn an_in_memory_terminal_row_bound_by_a_journal_is_not_evicted() {
         "NOT_FOUND"
     );
 }
+
+/// An archive-configured store whose floor (64 MiB) sits above its maintenance reserve (8 MiB),
+/// holding one record at position 1 that a one-record segment can cover.
+fn archive_store_under_a_high_floor(dir: &std::path::Path) -> (Store, sparrow_core::ArchiveIntent) {
+    let settings = Config {
+        min_free_bytes: 64 * 1024 * 1024,
+        ..archiving_config()
+    };
+    let store = Store::open(dir, settings).unwrap();
+    let artifact = store
+        .ingest("archive-floor", "source", "log", b"a\n", 1)
+        .unwrap();
+    let intent = sparrow_core::ArchiveIntent {
+        segment_id: [7; 32],
+        first: archive_position(1, &artifact.record_ids[0]),
+        last: archive_position(1, &artifact.record_ids[0]),
+        records: 1,
+        artifacts: 0,
+    };
+    (store, intent)
+}
+
+/// Value (#267): the archive advance is what unlocks retirement of archived evidence, so it is
+/// a control write admitted at the maintenance reserve. Protects: with free space between the
+/// reserve and the floor both archive commits succeed while an ordinary ingest keeps the floor
+/// label. Before, both archive calls were refused with the floor label.
+#[test]
+fn archive_advance_commits_with_the_floor_unmet_and_an_ordinary_write_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, intent) = archive_store_under_a_high_floor(dir.path());
+    store
+        .space_floor()
+        .set_free_for_tests(Some(32 * 1024 * 1024));
+    store.archive_intend(&intent).unwrap();
+    store.archive_commit(&intent.segment_id).unwrap();
+    assert_eq!(
+        store.archive_state().unwrap().unwrap().through.as_deref(),
+        Some(intent.last.as_str())
+    );
+    let refused = store
+        .ingest("archive-floor-late", "source", "log", b"b\n", 10)
+        .unwrap_err();
+    assert!(refused.is_free_space_floor(), "{refused}");
+}
+
+/// Value (#267): below the maintenance reserve nothing is admitted. Protects: both archive
+/// calls fail with the reserve text, not the floor label, and the watermark does not move.
+#[test]
+fn archive_advance_below_the_reserve_is_refused_with_the_reserve_text_and_keeps_the_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, intent) = archive_store_under_a_high_floor(dir.path());
+    let floor = store.space_floor();
+    floor.set_free_for_tests(Some(4 * 1024 * 1024));
+    let refused = store.archive_intend(&intent).unwrap_err();
+    assert!(!refused.is_free_space_floor(), "{refused}");
+    assert!(
+        refused.to_string().contains("pressure maintenance resumes"),
+        "{refused}"
+    );
+    assert!(store.archive_state().unwrap().unwrap().intent.is_none());
+
+    floor.set_free_for_tests(Some(32 * 1024 * 1024));
+    store.archive_intend(&intent).unwrap();
+    floor.set_free_for_tests(Some(4 * 1024 * 1024));
+    let refused = store.archive_commit(&intent.segment_id).unwrap_err();
+    assert!(!refused.is_free_space_floor(), "{refused}");
+    assert!(
+        refused.to_string().contains("pressure maintenance resumes"),
+        "{refused}"
+    );
+    let state = store.archive_state().unwrap().unwrap();
+    assert!(state.through.is_none());
+    assert!(state.intent.is_some());
+}

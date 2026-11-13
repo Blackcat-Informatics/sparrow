@@ -420,7 +420,7 @@ impl Store {
         writer.archive_range(intent, current.through.as_deref())?;
         let mut batch = WriteBatch::default();
         batch.put(INTENT_KEY, encode_intent(intent));
-        writer.commit(batch)?;
+        writer.reclaiming(|| writer.commit(batch))?;
         state.borrow_mut().intent = Some(intent.clone());
         Ok(())
     }
@@ -442,7 +442,7 @@ impl Store {
         let mut batch = WriteBatch::default();
         batch.put(THROUGH_KEY, encode_through(Some(&intent.last)));
         batch.delete(INTENT_KEY);
-        writer.commit(batch)?;
+        writer.reclaiming(|| writer.commit(batch))?;
         *state.borrow_mut() = ArchiveState {
             through: Some(intent.last),
             intent: None,
