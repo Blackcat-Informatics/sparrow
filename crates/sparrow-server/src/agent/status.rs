@@ -480,7 +480,6 @@ fn wait(status: wire::wait_status::Reader<'_>) -> Value {
         .into()
 }
 
-/// Permit, import-slot and connection-ceiling waits (#246).
 /// The free-space pause counters (#257); a daemon that predates them reports zeros.
 fn floor_pause(status: wire::floor_pause_status::Reader<'_>) -> Value {
     Object::new()
@@ -498,6 +497,7 @@ fn floor_pause(status: wire::floor_pause_status::Reader<'_>) -> Value {
         .into()
 }
 
+/// Permit, import-slot and connection-ceiling waits (#246).
 fn admission(status: wire::admission_status::Reader<'_>) -> capnp::Result<Value> {
     let connections = match status.get_rpc_connections()?.which()? {
         wire::optional_connection_ceiling_status::Absent(()) => Value::Null,

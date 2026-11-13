@@ -290,7 +290,11 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   own counted refusal. Three things stay paused, because they are the writes
   themselves: configured consume and tail watches (their source files are the spool;
   they observe and claim nothing), the daemon's non-synchronizing maintenance, and
-  opening the store at startup (nothing can answer before the store opens).
+  opening the store at startup (nothing can answer before the store opens). A paused
+  watch worker owns no timer: it observes the floor through the floor's ledger and
+  blocks on the floor's resume edge, which any number of duties subscribe to. The edge
+  is fired by whichever observation sees free space return, including the daemon's
+  one-second floor observation for space freed outside the daemon.
 - Writes. A write is answered with `STORAGE_PRESSURE`, `retryable` true and, new,
   `Failure.class = freeSpaceFloor`. The field is added after `retryable` (no schema
   version change). An older client ignores it and handles the refusal as the retryable
@@ -308,8 +312,9 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   which spends free space outside the store's own accounting. Sized separately (R5):
   above the floor a query stages what it did before (up to 64 MiB, within the store
   allowance). While paused, all reads together stage at most 32 MiB
-  (`PAUSED_READ_STAGING_BYTES`), and a query never stages so much that free space falls
-  below half the floor. A query that cannot fit is refused with the same floor-labelled
+  (`PAUSED_READ_STAGING_BYTES`), and the staging reserved by all reads together never
+  exceeds the free space above half the floor, counting what earlier reads reserved but
+  have not yet written. A query that cannot fit is refused with the same floor-labelled
   `STORAGE_PRESSURE` (retryable; the reader waits for space like a writer) and counted.
   Reads of memory-only or store-resident data need no staging.
 - Counters. `Status.floorPause` (field 60, additive): `pausedSince`,

@@ -25,7 +25,9 @@ struct Ledger {
     /// Writes refused by [`SpaceFloor::check`].
     refused: AtomicU64,
     /// Run, without blocking, by whichever [`SpaceFloor::observe`] sees the pause end (#247).
-    resume_waker: std::sync::Mutex<ResumeWaker>,
+    /// Several duties subscribe (maintenance, the consume and tail watches).
+    resume_wakers: std::sync::Mutex<Resumers>,
+    next_subscription: AtomicU64,
     /// Dev-only: the free bytes every measurement reports, `u64::MAX` for the real volume.
     #[cfg(feature = "test-support")]
     free_override: AtomicU64,
@@ -37,15 +39,30 @@ struct Ledger {
     once: std::sync::Mutex<Option<&'static str>>,
 }
 
-/// The installed resume callback; a closure has no `Debug`, so this reports only presence.
-struct ResumeWaker(Option<RetentionWaker>);
+/// The subscribed resume callbacks; a closure has no `Debug`, so this reports only the count.
+struct Resumers(Vec<(u64, RetentionWaker)>);
 
-impl std::fmt::Debug for ResumeWaker {
+impl std::fmt::Debug for Resumers {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_tuple("ResumeWaker")
-            .field(&self.0.is_some())
+            .debug_tuple("Resumers")
+            .field(&self.0.len())
             .finish()
+    }
+}
+
+/// A subscription to the floor's resume edge; dropping it unsubscribes.
+#[must_use = "dropping the subscription unsubscribes it"]
+pub struct ResumeSubscription {
+    place: Arc<Place>,
+    id: u64,
+}
+
+impl Drop for ResumeSubscription {
+    fn drop(&mut self) {
+        if let Ok(mut resumers) = self.place.ledger.resume_wakers.lock() {
+            resumers.0.retain(|(id, _)| *id != self.id);
+        }
     }
 }
 
@@ -57,7 +74,8 @@ impl Ledger {
             pauses: AtomicU64::new(0),
             resumes: AtomicU64::new(0),
             refused: AtomicU64::new(0),
-            resume_waker: std::sync::Mutex::new(ResumeWaker(None)),
+            resume_wakers: std::sync::Mutex::new(Resumers(Vec::new())),
+            next_subscription: AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             free_override: AtomicU64::new(u64::MAX),
             #[cfg(feature = "test-support")]
@@ -186,7 +204,13 @@ impl SpaceFloor {
         }
         Ok(wanted
             .min(PAUSED_READ_STAGING_BYTES.saturating_sub(staged))
-            .min(free.saturating_sub(self.min_free / 2)))
+            // Reservations other reads hold may not be written yet, so the live free space does
+            // not show them: take them out of the headroom, or concurrent reads would each
+            // see all of it.
+            .min(
+                free.saturating_sub(self.min_free / 2)
+                    .saturating_sub(staged),
+            ))
     }
 
     /// [`SpaceFloor::shortfall`] that also records the start and end of a pause at `now`
@@ -204,25 +228,35 @@ impl SpaceFloor {
             self.place.ledger.resumes.fetch_add(1, Ordering::Relaxed);
             // The edge is signalled here, where it is consumed, so whichever duty or loop
             // observes it first wakes the waiters; none can consume it unseen (#247).
-            let waker = self
+            let wakers: Vec<RetentionWaker> = self
                 .place
                 .ledger
-                .resume_waker
+                .resume_wakers
                 .lock()
-                .ok()
-                .and_then(|slot| slot.0.clone());
-            if let Some(waker) = waker {
+                .map(|resumers| resumers.0.iter().map(|(_, waker)| waker.clone()).collect())
+                .unwrap_or_default();
+            for waker in wakers {
                 waker();
             }
         }
         Ok(shortfall)
     }
 
-    /// Install, or with `None` remove, the callback run by the observation that sees a pause
-    /// end. It runs on the observing thread, so it must not block.
-    pub fn set_resume_waker(&self, waker: Option<RetentionWaker>) {
-        if let Ok(mut slot) = self.place.ledger.resume_waker.lock() {
-            *slot = ResumeWaker(waker);
+    /// Subscribe `waker` to the edge: it runs, once per edge, in the observation that sees a
+    /// pause end. It runs on the observing thread, so it must not block. Any number of duties
+    /// subscribe; the subscription ends when the returned guard drops.
+    pub fn subscribe_resume(&self, waker: RetentionWaker) -> ResumeSubscription {
+        let id = self
+            .place
+            .ledger
+            .next_subscription
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut resumers) = self.place.ledger.resume_wakers.lock() {
+            resumers.0.push((id, waker));
+        }
+        ResumeSubscription {
+            place: Arc::clone(&self.place),
+            id,
         }
     }
 
@@ -237,7 +271,7 @@ impl SpaceFloor {
     }
 
     /// Dev-only: refuse (or again admit) every write at the admission check, as a store under
-    /// pressure does, without moving the measured free space the listeners' accept pause reads.
+    /// pressure does, without moving the measured free space the floor observers read.
     #[cfg(feature = "test-support")]
     pub fn refuse_writes_for_tests(&self, refused: bool) {
         self.place.ledger.forced.store(refused, Ordering::Release);
@@ -397,12 +431,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let low = SpaceFloor::new(dir.path(), u64::MAX / 4);
         let woken = Arc::new(AtomicU64::new(0));
-        low.set_resume_waker(Some(Arc::new({
+        let _first = low.subscribe_resume(Arc::new({
             let woken = Arc::clone(&woken);
             move || {
                 woken.fetch_add(1, Ordering::SeqCst);
             }
-        })));
+        }));
         assert!(low.observe(5_000).unwrap().is_some());
         assert_eq!(woken.load(Ordering::SeqCst), 0);
         let met = SpaceFloor {
@@ -444,6 +478,65 @@ mod tests {
         assert_eq!(floor.read_staging_allowance(64 * MIB, 0).unwrap(), MIB);
         floor.set_free_for_tests(Some(100 * MIB));
         assert_eq!(floor.read_staging_allowance(64 * MIB, 0).unwrap(), 0);
+    }
+
+    // Value (#257): the resume hook had one slot, owned by maintenance, so no other duty could
+    // wait on the edge. Protects: every subscriber runs once per edge, and a dropped
+    // subscription is no longer run.
+    #[test]
+    fn every_resume_subscriber_is_woken_and_a_dropped_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let low = SpaceFloor::new(dir.path(), u64::MAX / 4);
+        let met = SpaceFloor {
+            min_free: 1,
+            ..low.clone()
+        };
+        let counter = || {
+            let count = Arc::new(AtomicU64::new(0));
+            let waker: RetentionWaker = Arc::new({
+                let count = Arc::clone(&count);
+                move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            (count, waker)
+        };
+        let (first, first_waker) = counter();
+        let (second, second_waker) = counter();
+        let _first = low.subscribe_resume(first_waker);
+        let second_subscription = low.subscribe_resume(second_waker);
+        assert!(low.observe(1).unwrap().is_some());
+        assert!(met.observe(2).unwrap().is_none());
+        assert_eq!(
+            (first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)),
+            (1, 1)
+        );
+        drop(second_subscription);
+        assert!(low.observe(3).unwrap().is_some());
+        assert!(met.observe(4).unwrap().is_none());
+        assert_eq!(
+            (first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)),
+            (2, 1)
+        );
+    }
+
+    // Value (#257, review): the live volume does not yet show what earlier reads reserved, so
+    // each concurrent read saw the whole headroom and together they could pass it (10 MiB of
+    // headroom gave 10, 10, 10 and 2 MiB). Protects: reads that reserve in turn, each told the
+    // bytes already reserved, are given no more than the headroom between them.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn concurrent_paused_reads_together_stay_inside_the_headroom() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let floor = SpaceFloor::new(dir.path(), 1024 * MIB);
+        // Nothing reserved has been written, so the volume shows the same headroom to all.
+        floor.set_free_for_tests(Some(512 * MIB + 10 * MIB));
+        let mut reserved = 0;
+        for _ in 0..4 {
+            reserved += floor.read_staging_allowance(64 * MIB, reserved).unwrap();
+        }
+        assert_eq!(reserved, 10 * MIB);
     }
 
     // Value (#257): the daemon must tell a floor refusal from budget pressure without parsing

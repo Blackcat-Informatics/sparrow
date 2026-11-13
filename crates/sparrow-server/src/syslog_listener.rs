@@ -1828,6 +1828,18 @@ mod tests {
         metrics: Metrics,
         wake: PressureWake,
         operations: Arc<Semaphore>,
+        /// Keeps the floor's resume edge wired to `wake`, as the daemon wires it.
+        resumes: std::cell::RefCell<Vec<sparrow_core::ResumeSubscription>>,
+    }
+
+    impl Listener {
+        fn wire_resume(&self) {
+            self.resumes.borrow_mut().push(
+                self.store
+                    .space_floor()
+                    .subscribe_resume(self.wake.resume_waker(|| {})),
+            );
+        }
     }
 
     fn listener(transport: SyslogTransport, connections: usize, timeout_ms: u32) -> Listener {
@@ -1865,6 +1877,7 @@ mod tests {
             metrics,
             wake: PressureWake::default(),
             operations: Arc::new(Semaphore::new(4)),
+            resumes: std::cell::RefCell::default(),
         }
     }
 
@@ -1992,7 +2005,7 @@ mod tests {
         let fixture = listener(SyslogTransport::Tcp, 2, 60_000);
         let floor = fixture.store.space_floor();
         floor.set_free_for_tests(Some(0));
-        floor.set_resume_waker(Some(fixture.wake.resume_waker(|| {})));
+        fixture.wire_resume();
         assert!(floor.observe(1).unwrap().is_some());
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = tcp.local_addr().unwrap();
@@ -2491,7 +2504,7 @@ mod tests {
     ) {
         let floor = fixture.store.space_floor();
         floor.set_free_for_tests(Some(0));
-        floor.set_resume_waker(Some(fixture.wake.resume_waker(|| {})));
+        fixture.wire_resume();
         assert!(floor.observe(1).unwrap().is_some());
         let (mut sender, receiver) = tokio::io::duplex(64);
         let (stop, stopped) = watch::channel(false);

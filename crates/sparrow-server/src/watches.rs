@@ -134,9 +134,6 @@ fn aliased(dir: &[(u64, u64)], private: Option<(u64, u64)>, configured: &[(u64, 
 
 const SCAN_QUANTUM: usize = 64;
 const EVENT_QUANTUM: usize = 4096;
-/// While free space is below the floor the worker rechecks it this often: no event reports
-/// space returning.
-const SPACE_RECHECK: Duration = Duration::from_secs(1);
 /// Interval between consume RPC connection attempts while a claim waits for a connection.
 const CONNECT_RETRY: Duration = Duration::from_secs(1);
 const RETRY_FIRST: Duration = Duration::from_secs(5);
@@ -1030,6 +1027,8 @@ struct Wake {
     at: Option<Instant>,
     /// A tail drain or tail claim waits for a shared operation permit.
     permit: bool,
+    /// The floor is paused: wait for its resume edge.
+    resume: bool,
 }
 
 impl Wake {
@@ -1048,6 +1047,8 @@ struct Waiting<'a> {
     received: &'a mut Option<watch_admin::Command>,
     /// A permit the wait acquired, used by the next pass.
     permit: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Signalled by the floor's resume edge; a signal sent before the wait is kept.
+    resumed: &'a tokio::sync::Notify,
 }
 
 /// End one worker pass. A busy pass yields and runs again at once. An idle one blocks until
@@ -1131,6 +1132,7 @@ async fn pause(
             })?);
         }
         () = deadline => {}
+        () = waiting.resumed.notified(), if wake.resume => {}
     }
     Ok(())
 }
@@ -1451,15 +1453,23 @@ async fn run(
     // A command or a permit the last wait received, for this pass.
     let mut received = None;
     let mut permit = None;
+    // The floor's resume edge wakes a paused worker; unsubscribed when the worker returns.
+    let resumed = Arc::new(tokio::sync::Notify::new());
+    let _resume = store.space_floor().subscribe_resume(Arc::new({
+        let resumed = Arc::clone(&resumed);
+        move || resumed.notify_one()
+    }));
     while !*stop.borrow() {
         #[cfg(test)]
         tests::PASSES.with(|passes| passes.set(passes.get() + 1));
         let mut wake = Wake::default();
         // Below the free-space floor every write is refused: keep observing, write nothing.
-        let space_ok = store.space_floor().shortfall()?.is_none();
-        if !space_ok {
-            wake.by(Instant::now() + SPACE_RECHECK);
-        }
+        // The worker observes through the floor's ledger, so the pause it sees is recorded and
+        // the edge that ends it is signalled to `resumed` by whichever duty sees it end (the
+        // daemon's one-second floor observation catches free space returning from outside).
+        // No timer waits for it.
+        let space_ok = store.space_floor().observe(crate::now()?)?.is_none();
+        wake.resume = !space_ok;
         let pending = store.consumption_pending()?;
         if space_ok && catalog.retire(&pending) {
             catalog.persist(&store)?;
@@ -1605,6 +1615,7 @@ async fn run(
             control: &mut control,
             received: &mut received,
             permit: &mut permit,
+            resumed: &resumed,
         };
         if !space_ok
             || detectors.is_empty()
