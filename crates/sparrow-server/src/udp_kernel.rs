@@ -177,10 +177,18 @@ impl Kernel {
     }
 
     /// Keep a count read by [`Kernel::read`], unless the socket has closed and the count is final.
+    /// Reads taken at different moments can be recorded out of order, and drops only grow while
+    /// the socket lives, so a lower count never replaces a higher one.
     pub(crate) fn record(&mut self, counter: Counter) {
-        if !self.finished {
-            self.counter = counter;
+        if self.finished {
+            return;
         }
+        self.counter = match (&self.counter, counter) {
+            (Counter::Available(held), Counter::Available(read)) => {
+                Counter::Available(read.max(*held))
+            }
+            (_, counter) => counter,
+        };
     }
 
     /// Take the last sample and freeze the counter. Call while the socket is still open.
@@ -301,12 +309,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(buffer.requested, REQUESTED_RCVBUF_BYTES);
-        assert!(buffer.granted >= 4096 && buffer.granted < REQUESTED_RCVBUF_BYTES);
+        // The kernel kept whatever the socket had; the test assumes nothing about rmem_default.
+        assert!(buffer.granted >= 4096, "granted {}", buffer.granted);
         let reason = buffer.enlarge_error.expect("the refusal is reported");
         assert!(
             reason.contains("SO_RCVBUF") && reason.contains("8388608"),
             "{reason}"
         );
+    }
+
+    /// Value (#254): two reads recorded out of order must not lower the shown count.
+    #[test]
+    fn a_later_recorded_lower_count_does_not_replace_a_higher_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = Kernel::at(
+            dir.path().join("absent"),
+            1,
+            Buffer {
+                requested: 1,
+                granted: 1,
+                enlarge_error: None,
+            },
+        );
+        kernel.record(Counter::Available(9));
+        kernel.record(Counter::Available(5));
+        assert_eq!(kernel.counter, Counter::Available(9));
+        kernel.record(Counter::Unavailable("gone".into()));
+        assert_eq!(kernel.counter, Counter::Unavailable("gone".into()));
     }
 
     /// Value (#254): the final count survives the socket closing. After `finish` the row may

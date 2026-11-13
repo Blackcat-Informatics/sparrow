@@ -2655,13 +2655,13 @@ listener at start; `rmem_max` reads as unreadable where `/proc/sys` is hidden. A
 getsockopt read-back, or the socket's own `fstat`, fails startup with a message
 naming the listener. A refused SO_RCVBUF request does not stop the daemon taking
 syslog: the socket keeps the default buffer, `rcvbuf_granted_bytes` shows that size,
-`rcvbuf_enlarge_error` carries the error text, `rcvbuf_enlarge_failures` is 1, and the
+`rcvbuf_enlarge_error` carries the error text, `rcvbuf_enlarge_failures` is 1 (it is 0 or 1 for a listener, since the request is made once), and the
 start-up journal line says the enlarge failed.
 `kernel_drops` is the `drops` column of the socket's row in `/proc/self/net/udp`
 (`udp6` for an IPv6 address), matched by the socket inode. It counts every datagram
 the kernel dropped for that socket, for any cause, since the socket was bound. It is
 read when a status is requested, when the reader leaves a wait and when the listener
-stops; no timer reads it. When the listener stops, its last count is taken, journaled
+stops; no timer reads it. When the listener stops, whether cleanly or on an error, its last count is taken, journaled
 and frozen: `kernel_counter_final` is then true and later status requests keep that
 count, although the closed socket's row has left the kernel table. `kernel_counter_state` is `available` when the count was
 read. It is `unavailable` when the file cannot be read or has no row for the socket;

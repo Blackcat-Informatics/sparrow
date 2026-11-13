@@ -179,7 +179,14 @@ impl Metrics {
     /// stays a plain read on the calling thread because every caller is a synchronous status
     /// path or the reader itself, which has just left a wait.
     fn sample_kernel(&self) -> io::Result<()> {
-        let Some(kernel) = self.snapshot()?.kernel.filter(|kernel| !kernel.finished) else {
+        let Some(kernel) = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog status poisoned"))?
+            .kernel
+            .clone()
+            .filter(|kernel| !kernel.finished)
+        else {
             return Ok(());
         };
         let counter = kernel.read();
@@ -895,6 +902,7 @@ async fn listen(
             // A UDP payload never exceeds 65507 bytes, under the store's ceiling, so a whole datagram
             // always fits and nothing is cut; `max_message_bytes` frames TCP lines only.
             let mut buffer = vec![0; sparrow_core::SYSLOG_MESSAGE_BYTES];
+            let serving: io::Result<()> = async {
             loop {
                 if *stop.borrow() {
                     break;
@@ -922,11 +930,13 @@ async fn listen(
                 .await?;
                 drop(permit);
             }
-            // The last sample, taken while the socket is open and then frozen: the socket's row
-            // leaves the table when it closes, and a later status request must still show this
-            // count as final.
-            metrics.finish_kernel()?;
             Ok(())
+            }.await;
+            // The last sample, taken while the socket is open and then frozen, whether the loop
+            // ended by stop or by an error: the socket's row leaves the table when it closes, and
+            // a later status request must still show this count as final.
+            let finished = metrics.finish_kernel();
+            serving.and(finished)
         }
     }
 }
