@@ -1013,6 +1013,9 @@ impl Store {
         // A begun import of this claim can never publish now; release it to reclamation.
         writer.end_retired_consumption_import(&mut batch, id, now)?;
         writer.commit(batch)?;
+        drop(writer);
+        // The retirement ended a begun import's lease: its journal is reclaimable now.
+        self.wake_import_reclaim();
         Ok(retired)
     }
 

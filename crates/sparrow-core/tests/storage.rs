@@ -7529,6 +7529,14 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
         modified: (10, 20),
         changed: (10, 30),
     };
+    // The reclaim waker counts the wakes the retirement sends the reclamation duty.
+    let reclaim_wakes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    store.set_import_reclaim_waker(Some(std::sync::Arc::new({
+        let reclaim_wakes = reclaim_wakes.clone();
+        move || {
+            reclaim_wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    })));
     let claim = store
         .consumption_reserve(
             "watch",
@@ -7582,9 +7590,16 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
         "RESOURCE_LIMIT"
     );
 
+    assert_eq!(reclaim_wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
     store
         .consumption_retire(&claim.import_id, "watch", "admin", "source deleted", later)
         .unwrap();
+    // Retiring ends the begun import's lease, so reclamation is woken once, by event.
+    assert_eq!(
+        reclaim_wakes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the retirement wakes reclaim"
+    );
     assert_eq!(
         store.import_reclaim(later).unwrap(),
         1,
@@ -7677,6 +7692,59 @@ fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
     // A retried publish changes nothing and wakes nobody.
     store.import_publish(&staged.id, DAY).unwrap();
     assert_eq!(cancels.load(Ordering::SeqCst), 2);
+}
+
+/// INVARIANT (#249): one reclamation pass frees at most 128 chunks, so a large cancelled
+/// import frees over several passes. A pass that spent its whole budget wakes reclaim again
+/// by event, so the next pass does not wait for the duty's interval; a pass that finished
+/// under budget wakes nobody (no spin). The import here has 130 chunks of 64 KiB.
+#[test]
+fn a_large_import_reclaim_asks_for_its_next_pass_until_it_is_done() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let wakes = std::sync::Arc::new(AtomicU64::new(0));
+    store.set_import_reclaim_waker(Some(std::sync::Arc::new({
+        let wakes = wakes.clone();
+        move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+    let input = vec![b'a'; 130 * 64 * 1024];
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
+    );
+    let staged = store
+        .import_begin(
+            "large",
+            "source",
+            "opaque",
+            input.len() as u64,
+            &digest,
+            DAY,
+        )
+        .unwrap();
+    for (index, chunk) in input.chunks(64 * 1024).enumerate() {
+        store
+            .import_append(&staged.id, (index * 64 * 1024) as u64, chunk, DAY)
+            .unwrap();
+    }
+    store.import_cancel(&staged.id, DAY).unwrap();
+    assert_eq!(wakes.load(Ordering::SeqCst), 1, "the cancel");
+    assert_eq!(store.import_reclaim(DAY).unwrap(), 128);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        2,
+        "the full pass asks for another"
+    );
+    assert!(store.import_get(&staged.id, DAY).is_err());
+    assert!(store.import_reclaim(DAY).unwrap() < 128);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        2,
+        "the last pass asks for none"
+    );
 }
 
 #[test]

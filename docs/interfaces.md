@@ -2470,9 +2470,12 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   free, under one bound of 3 seconds that covers the whole call, including any wait for
   an operation permit (which is capped at the time left); no attempt starts once the
   bound has passed. A slot frees when a reclamation commit deletes a journal (a
-  published, cancelled or expired import). An explicit cancel and a publication each wake
-  the maintenance reclamation duty at once, which performs the deletion, and the free-space
-  floor's resume edge wakes a pass the pause skipped. A lease that merely expires has no
+  published, cancelled or expired import). An explicit cancel, a publication and the
+  retirement of a consumption claim whose import had begun each wake the maintenance
+  reclamation duty at once, which performs the deletion. One pass frees at most 128 chunks,
+  so a pass that spent its whole budget wakes the duty again for the next, and a large import
+  frees over a run of passes with no interval between them. The free-space floor's resume
+  edge wakes a pass the pause skipped. A lease that merely expires has no
   event, so the duty's existing one-second interval is the named observer of lease expiry
   and nothing else. Each wake also gives held syslog frames one extra evaluation, which is
   harmless. The deletion commit signals the waiters; a pass
@@ -2580,7 +2583,8 @@ stream or discards a frame:
   | Native flush or compaction work completes | none exists; the store has no listener | the same one-second observation |
   | Stop | the stop channel | event |
   | An operation permit frees | the semaphore | event |
-  | An explicit import cancel, or a publication, makes a journal reclaimable | wake from the store to the reclamation duty, which deletes the journal and signals the import slot | event |
+  | An explicit import cancel, a publication, or the retirement of a claim with a begun import, makes a journal reclaimable | wake from the store to the reclamation duty, which deletes the journal and signals the import slot | event |
+  | A reclamation pass spent its whole budget of 128 chunks | the store wakes the duty again for the rest | event |
   | The floor resumes after a reclaim pass was skipped below it | the resume edge wakes the reclamation duty | event |
   | An import lease expires | none exists (time passing is the event) | the reclamation duty's one-second interval, for lease expiry only |
   | A hold's report interval passes (announcing a long hold) | none exists | the same one-second observation, for a permit wait; a pressure hold announces on each wake |

@@ -1057,6 +1057,11 @@ impl Store {
         if journals_freed != 0 {
             self.wake_import_slot();
         }
+        // A pass that spent its whole budget may have left work: ask for the next pass by
+        // event, not by the duty's interval. A pass that finished under budget asks for none.
+        if removed >= RECLAIM_CHUNKS {
+            self.wake_import_reclaim();
+        }
         Ok(removed)
     }
 }

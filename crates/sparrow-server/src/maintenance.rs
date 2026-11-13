@@ -318,11 +318,14 @@ fn observe_floor(
 mod skips {
     use super::Job;
     use std::cell::Cell;
+    use std::rc::Rc;
+    use tokio::sync::Notify;
 
     thread_local! {
         static EXPIRY: Cell<u64> = const { Cell::new(0) };
         static MIGRATE: Cell<u64> = const { Cell::new(0) };
         static EXPIRED: Cell<u64> = const { Cell::new(0) };
+        static PASS: Rc<Notify> = Rc::new(Notify::new());
         static RECLAIM_TICKS: Cell<u64> = const { Cell::new(0) };
         static RECLAIM_WAKES: Cell<u64> = const { Cell::new(0) };
         static RECLAIM: Cell<u64> = const { Cell::new(0) };
@@ -356,6 +359,16 @@ mod skips {
         RECLAIM_WAKES.with(Cell::get)
     }
 
+    /// The worker's loop finished one turn (a duty ran, or was skipped below the floor). Tests
+    /// that wait for the store to change block on this event instead of polling it.
+    pub(super) fn pass_done() {
+        PASS.with(|pass| pass.notify_one());
+    }
+
+    pub(super) fn passes() -> Rc<Notify> {
+        PASS.with(Rc::clone)
+    }
+
     /// An expiry pass finished and scheduled the next one.
     pub(super) fn expired_pass() {
         EXPIRED.with(|count| count.set(count.get() + 1));
@@ -370,6 +383,7 @@ mod skips {
     }
 
     pub(super) fn note(job: Job) {
+        pass_done();
         match job {
             Job::Reclaim => RECLAIM.with(|count| count.set(count.get() + 1)),
             Job::Expiry => EXPIRY.with(|count| count.set(count.get() + 1)),
@@ -405,10 +419,11 @@ async fn run(
     // that requests a pressure pass wakes the pass the same way instead of waiting for its
     // next scheduled time.
     let migrate_wake = Arc::new(Notify::new());
-    // An explicit import cancel and a publication each make a journal reclaimable; the store
-    // wakes this duty at once (#249). The duty's one-second interval stays only as the
-    // observer of a lease that merely expires, which has no event, and the floor's resume
-    // edge below wakes a pass that was skipped below the floor.
+    // An explicit import cancel, a publication and the retirement of a claim with a begun
+    // import each make a journal reclaimable, and a pass that spent its whole budget asks for
+    // the next one; the store wakes this duty for each (#249). The duty's one-second interval
+    // stays only as the observer of a lease that merely expires, which has no event, and the
+    // floor's resume edge below wakes a pass that was skipped below the floor.
     let reclaim_wake = Arc::new(Notify::new());
     store.set_import_reclaim_waker(Some(Arc::new({
         let reclaim_wake = Arc::clone(&reclaim_wake);
@@ -619,6 +634,8 @@ async fn run(
                 }
             }
         }
+        #[cfg(test)]
+        skips::pass_done();
         tokio::task::yield_now().await;
     }
 }
@@ -626,6 +643,17 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wait until `done` holds, blocking on the worker's pass event (a loop turn ended) and
+    /// re-checking each time. The 30 s bound only reports a worker that stopped making
+    /// turns; it ends no wait that succeeds.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        while !done() {
+            tokio::time::timeout(Duration::from_secs(30), skips::passes().notified())
+                .await
+                .unwrap_or_else(|_| panic!("no worker pass ended while waiting for: {what}"));
+        }
+    }
 
     // Value: below the free-space floor the daemon used to freeze the whole pressure state
     // machine exactly when the disk was nearly full (#211). Protects: pressure maintenance
@@ -685,20 +713,12 @@ mod tests {
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
         // Thirty-two default passes would take over thirty seconds under the
         // former once-per-second driver. This allows ample host scheduling slack.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if store.status(sparrow_server::now().unwrap()).unwrap()["unique_payload_chunks"]
-                    .as_str()
-                    == Some("2")
-                    && store.durability_status().unwrap().pending_writes == 0
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+        until("the backlog to drain", || {
+            store.status(sparrow_server::now().unwrap()).unwrap()["unique_payload_chunks"].as_str()
+                == Some("2")
+                && store.durability_status().unwrap().pending_writes == 0
         })
-        .await
-        .unwrap();
+        .await;
         worker.shutdown().await.unwrap();
         assert_eq!(
             store.bytes(&artifact.record_ids[0], 0, 17, now).unwrap(),
@@ -718,7 +738,7 @@ mod tests {
     /// the waker's install, the callback, or the resume edge's notification fails it.
     #[tokio::test]
     async fn an_import_slot_is_freed_by_a_wake_and_not_by_the_interval() {
-        for case in ["cancel", "publish", "resume"] {
+        for case in ["cancel", "publish", "resume", "large"] {
             let dir = tempfile::tempdir().unwrap();
             let data = dir.path().join("store");
             let path = sparrow_test_support::write_server_config(
@@ -735,14 +755,19 @@ mod tests {
                 let freed = Arc::clone(&freed);
                 move || freed.notify_one()
             })));
-            let input = b"one\n";
+            // The large import has 130 chunks: one reclaim pass frees 128, so it needs a second.
+            let input: Vec<u8> = if case == "large" {
+                vec![b'a'; 130 * 64 * 1024]
+            } else {
+                b"one\n".to_vec()
+            };
             let digest = format!(
                 "blake3:{}",
-                purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+                purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
             );
             let now = sparrow_server::now().unwrap();
             let staged = store
-                .import_begin(case, "source", "log", 4, &digest, now)
+                .import_begin(case, "source", "log", input.len() as u64, &digest, now)
                 .unwrap();
             let floor = store.space_floor();
             if case == "resume" {
@@ -770,19 +795,20 @@ mod tests {
                     skips::reclaim_ticks() > ticks && skips::expired() > expired
                 }
             };
-            let began = std::time::Instant::now();
-            while !first_passes_ran() {
-                assert!(
-                    began.elapsed() < Duration::from_secs(30),
-                    "{case}: the first passes never ran"
-                );
-                tokio::task::yield_now().await;
-            }
+            until("the first passes", first_passes_ran).await;
             let wakes = skips::reclaim_wakes();
             match case {
                 "cancel" => store.import_cancel(&staged.id, now).unwrap(),
+                "large" => {
+                    for (index, chunk) in input.chunks(64 * 1024).enumerate() {
+                        store
+                            .import_append(&staged.id, (index * 64 * 1024) as u64, chunk, now)
+                            .unwrap();
+                    }
+                    store.import_cancel(&staged.id, now).unwrap();
+                }
                 "publish" => {
-                    store.import_append(&staged.id, 0, input, now).unwrap();
+                    store.import_append(&staged.id, 0, &input, now).unwrap();
                     store.import_seal(&staged.id, now).unwrap();
                     store.import_prepare_layout(&staged.id, now).unwrap();
                     store.import_prepare_record(&staged.id, 0, now).unwrap();
@@ -799,13 +825,20 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(30), freed.notified())
                 .await
                 .unwrap_or_else(|_| panic!("{case}: the import slot was never freed"));
-            let began = std::time::Instant::now();
-            while skips::reclaim_wakes() == wakes {
+            if case == "resume" {
+                until("a wake-started reclaim pass", || {
+                    skips::reclaim_wakes() > wakes
+                })
+                .await;
+            } else {
+                // The counter rises when the pass starts, before it frees anything, so it is
+                // already visible here; a regression fails after the interval, not the bound.
+                let expected = wakes + if case == "large" { 2 } else { 1 };
                 assert!(
-                    began.elapsed() < Duration::from_secs(30),
-                    "{case}: no reclaim pass was started by a wake"
+                    skips::reclaim_wakes() >= expected,
+                    "{case}: the slot was freed with {} wake-started passes, expected {expected}",
+                    skips::reclaim_wakes()
                 );
-                tokio::task::yield_now().await;
             }
             worker.shutdown().await.unwrap();
         }
@@ -841,23 +874,13 @@ mod tests {
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
         // Let the first pass finish: it holds the entry and schedules the next pass far away.
         // The finished pass is the event; the bound only reports a pass that never finished.
-        let began = std::time::Instant::now();
-        while skips::expired() == 0 {
-            assert!(
-                began.elapsed() < Duration::from_secs(30),
-                "the first expiry pass never finished"
-            );
-            tokio::task::yield_now().await;
-        }
+        until("the first expiry pass", || skips::expired() > 0).await;
         assert!(store.artifact(&artifact.id).is_ok(), "a pinned entry stays");
         store.release(&pin.id).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while store.artifact(&artifact.id).is_ok() {
-                tokio::task::yield_now().await;
-            }
+        until("the released entry to retire", || {
+            store.artifact(&artifact.id).is_err()
         })
-        .await
-        .unwrap();
+        .await;
         worker.shutdown().await.unwrap();
     }
 
@@ -932,18 +955,14 @@ mod tests {
         // migration is pending, and counts them.
         assert_eq!(read(&store), 300, "{part:?}");
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !store
+        until("the migrations to complete", || {
+            store
                 .migrations()
                 .unwrap()
                 .iter()
                 .all(sparrow_core::MigrationStatus::complete)
-            {
-                tokio::task::yield_now().await;
-            }
         })
-        .await
-        .unwrap();
+        .await;
         worker.shutdown().await.unwrap();
         let done = store.migrations().unwrap();
         assert!(
@@ -1022,13 +1041,10 @@ mod tests {
         assert!(floor.observe(now).unwrap().is_some());
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
         // The first expiry pass runs at once and is skipped below the floor.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while skips::expiry() == 0 {
-                tokio::task::yield_now().await;
-            }
+        until("the first expiry pass to be skipped", || {
+            skips::expiry() > 0
         })
-        .await
-        .expect("expiry was never skipped below the floor");
+        .await;
         assert!(
             store.artifact(&artifact.id).is_ok(),
             "expiry ran below the floor"
@@ -1041,13 +1057,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while store.artifact(&artifact.id).is_ok() {
-                tokio::task::yield_now().await;
-            }
+        until("expiry to run after the floor resumed", || {
+            store.artifact(&artifact.id).is_err()
         })
-        .await
-        .expect("expiry waited out a retry clock after the floor resumed");
+        .await;
         worker.shutdown().await.unwrap();
     }
 
@@ -1068,13 +1081,10 @@ mod tests {
         );
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
         // The first migration tick runs at once and is skipped below the floor.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while skips::migrate() == 0 {
-                tokio::task::yield_now().await;
-            }
+        until("the first migrate pass to be skipped", || {
+            skips::migrate() > 0
         })
-        .await
-        .expect("migration was never skipped below the floor");
+        .await;
         assert!(
             store.migrations().unwrap().iter().all(|m| !m.complete()),
             "a migration ran below the floor"
@@ -1086,18 +1096,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !store
+        until("the migrations to complete after the resume", || {
+            store
                 .migrations()
                 .unwrap()
                 .iter()
                 .all(sparrow_core::MigrationStatus::complete)
-            {
-                tokio::task::yield_now().await;
-            }
         })
-        .await
-        .expect("migration waited out its retry tick after the floor resumed");
+        .await;
         worker.shutdown().await.unwrap();
     }
 
@@ -1153,15 +1159,7 @@ mod tests {
         let frame = waiter.hold();
         // The reclaim interval's first tick is ready at once, so no time needs to pass.
         let worker = Worker::start(store.clone(), Duration::from_secs(3600), held.clone());
-        // No timeout future: the bound only reports a loop that never skipped a reclaim.
-        let began = std::time::Instant::now();
-        while skips::reclaim() == 0 {
-            assert!(
-                began.elapsed() < Duration::from_secs(30),
-                "the loop never skipped a reclaim pass below the floor"
-            );
-            tokio::task::yield_now().await;
-        }
+        until("a skipped reclaim pass", || skips::reclaim() > 0).await;
         assert!(
             skips::reclaim_observed() >= skips::reclaim(),
             "a reclaim pass was skipped below the floor without its observation"
