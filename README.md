@@ -128,7 +128,7 @@ Sparrow builds on Linux with:
 git clone https://github.com/Blackcat-Informatics/purrdf ../purrdf
 git -C ../purrdf checkout "$(sed -n 's/^git_revision = "\(.*\)"/\1/p' registry/compatibility.toml)"
 
-make check          # fmt, release Clippy (warnings denied), release tests, census
+make check          # fmt, release Clippy (warnings denied), shipped crates without test-support, release tests, census
 make build-runtime  # release server and client binaries
 make install-hooks  # run make check before every commit
 ```

@@ -551,7 +551,9 @@ struct Unlocked {
     import_reclaim_waker: Mutex<Option<RetentionWaker>>,
     /// The writer's pressure-request wake, shared so the owner can install it (#247).
     pressure_request_waker: Arc<Mutex<Option<RetentionWaker>>>,
-    /// The one compaction a stalled pressure wait may force.
+    /// The one compaction a stalled pressure wait may force, held here only for the
+    /// test-support handles that arm and release it; the writer owns it in production.
+    #[cfg(feature = "test-support")]
     forced: Arc<forced_compaction::Forced>,
     /// Gap evidence lost to a full stream registry, counted per stream (#215).
     stream_evidence: stream_evidence::Ledger,
@@ -1738,6 +1740,7 @@ impl Store {
                 import_slot_waker: Mutex::new(None),
                 import_reclaim_waker: Mutex::new(None),
                 pressure_request_waker: Arc::clone(&pressure_request_waker),
+                #[cfg(feature = "test-support")]
                 forced: Arc::clone(&forced),
                 stream_evidence: stream_evidence::Ledger::default(),
                 source_time_evidence: stream_evidence::Ledger::default(),

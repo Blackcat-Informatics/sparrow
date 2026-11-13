@@ -120,7 +120,10 @@ impl<T> Worker<T> {
         entries: u64,
         overtaken: impl FnOnce(u64) -> Result<bool, Error>,
     ) -> Result<bool, Error> {
+        #[cfg(feature = "test-support")]
         let read = self.shared.read.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(not(feature = "test-support"))]
+        self.shared.read.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "test-support")]
         if let Some((at, hold)) = &self.shared.hold
             && read == *at
