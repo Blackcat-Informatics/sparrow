@@ -134,7 +134,7 @@ disk) loses the queue and the kernel buffer uncounted, so size `hold_bytes` agai
 Status reports `floorPause` counters (connections accepted, writes refused, reads
 served while paused). The daemon logs a line when a pause begins, one a minute while
 it lasts and one when it ends. A daemon-side file spool is not built; UDP is held in
-memory only. At startup it waits for the floor
+the daemon's memory and then the kernel buffer only. At startup it waits for the floor
 before opening the store, so a restart on a full disk does not use up the
 unit's bounded restarts. If a write
 still fails with durability uncertain, for example because another program

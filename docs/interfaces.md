@@ -286,8 +286,9 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   syslog TCP no longer stop. Connection slots are still taken before accept (the
   ceiling, #246) and the 60-second lease is unchanged, so the floor adds no new
   bound. A syslog TCP frame refused for the floor is held unread past (#243) whether
-  or not its connection was accepted before or during the pause. Syslog UDP keeps its
-  own counted refusal. Three things stay paused, because they are the writes
+  or not its connection was accepted before or during the pause. Syslog UDP is held by
+  its own hold (below): datagrams queue in the daemon up to `hold_bytes`, then in the
+  kernel buffer. Three things stay paused, because they are the writes
   themselves: configured consume and tail watches (their source files are the spool;
   they observe and claim nothing), the daemon's non-synchronizing maintenance, and
   opening the store at startup (nothing can answer before the store opens). A paused
@@ -331,9 +332,9 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   cannot flood the journal, and no long pause is silent.
 - Spool. A daemon-side file spool is not built; coordination accepted that for UDP. A
   spool would append to the filesystem the floor protects, so it would need its own
-  higher floor or a separate filesystem. What remains: Syslog UDP datagrams refused at
-  the floor are counted and lost (the kernel buffer is the only hold, see the intake
-  design); every other source holds at the producer (client queue, ship queue, source
+  higher floor or a separate filesystem. What remains: Syslog UDP datagrams are held in the
+  daemon up to `hold_bytes` and then in the kernel buffer, and are lost only past the
+  kernel buffer or on an unclean daemon exit (see the UDP hold section); every other source holds at the producer (client queue, ship queue, source
   file, sender socket).
 
 The status `pressureStatus` extends additively (schema 71, no version change; an older
