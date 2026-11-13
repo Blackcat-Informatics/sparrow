@@ -102,3 +102,16 @@ authorizes a direct-main exception.
   read-only before proposing recovery.
 
 <!-- END LILLITH BRAINSTEM MANAGED POLICY -->
+
+## Shell commands
+
+- One shell call does one thing. A few related commands may share a call; never a long chain
+  joined by `&&` or `;`. A step that needs a script is written as a file and run.
+- A deletion is never part of a chain. Do not combine `rm -r`, `rm -rf`, `find -delete`,
+  `git clean` or `git worktree remove --force` with other commands. A deletion is its own call,
+  for one exact path inside the repository that an earlier call listed. For worktrees and
+  branches use `stagectl cleanup` or the plain `git worktree remove`.
+- A permission or authorization prompt blocks the whole session, so send nothing that could
+  raise one: no deletion by glob or variable, no path outside the repository, no long compound
+  command. If a call is refused, do not send it again in another form; use the plain small
+  version or report it.

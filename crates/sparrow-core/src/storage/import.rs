@@ -389,6 +389,7 @@ impl Writer {
 
     pub(super) fn admit_import_batch(&self, batch: &WriteBatch) -> Result<(), Error> {
         self.admit_data_write(super::pressure::data_batch_estimate(batch))
+            .map_err(Error::from)
     }
 
     /// Largest declared input: `MAX_IMPORT_BYTES` under production retirement limits.
@@ -841,7 +842,11 @@ impl Store {
         manifest.expires_at = manifest.expires_at.min(now);
         let mut batch = WriteBatch::default();
         put(&mut batch, id, &manifest);
-        writer.commit(batch)
+        writer.commit(batch)?;
+        drop(writer);
+        // The lease has ended: the journal is reclaimable now, so tell the reclamation duty.
+        self.wake_import_reclaim();
+        Ok(())
     }
 
     /// Durably prepare exact record spans with bounded memory. Repeated or
@@ -985,6 +990,8 @@ impl Store {
         let mut batch = WriteBatch::default();
         let mut removed = 0;
         let mut journals_freed = 0u64;
+        // An eligible journal this pass rewrote instead of deleting still has work to free.
+        let mut work_left = false;
         let manifests = writer.imports()?;
         let mut remaining_manifests = manifests.len() as u64;
         for mut manifest in manifests {
@@ -1041,6 +1048,7 @@ impl Store {
                 batch.delete(&manifest.id);
                 journals_freed += 1;
             } else {
+                work_left = true;
                 put(&mut batch, &manifest.id, &manifest);
             }
         }
@@ -1051,6 +1059,14 @@ impl Store {
         // The slot is free only once the commit that deleted its journal has landed.
         if journals_freed != 0 {
             self.wake_import_slot();
+        }
+        // A pass bounds its work (128 chunks, or one private prepared record of an unpublished
+        // import) and rewrites the journal it did not finish: ask for the next pass by event,
+        // not by the duty's interval. Only a pass that freed something asks, so a journal
+        // that can make no progress never spins; a pass that deleted every eligible journal
+        // asks for none.
+        if work_left && removed > 0 {
+            self.wake_import_reclaim();
         }
         Ok(removed)
     }

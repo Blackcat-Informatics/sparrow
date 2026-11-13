@@ -76,7 +76,9 @@ impl PressureWake {
         })
     }
 
-    /// A subscriber that sees every send after this call.
+    /// A subscriber that sees every send after this call. Public only so the daemon binary's
+    /// tests can drive a held frame; hidden from the public documentation.
+    #[doc(hidden)]
     pub fn subscribe(&self) -> Waiter {
         Waiter {
             receiver: self.sender.subscribe(),
@@ -87,7 +89,9 @@ impl PressureWake {
     }
 }
 
-/// One connection's view of the signal.
+/// One connection's view of the signal. Hidden from the public documentation (see
+/// [`PressureWake::subscribe`]).
+#[doc(hidden)]
 pub struct Waiter {
     receiver: watch::Receiver<u64>,
     _sender: Arc<watch::Sender<u64>>,
@@ -114,7 +118,9 @@ impl Waiter {
     }
 }
 
-/// A frame held for pressure; the observer tick wakes while any exists.
+/// A frame held for pressure; the observer tick wakes while any exists. Hidden from the
+/// public documentation (see [`PressureWake::subscribe`]).
+#[doc(hidden)]
 pub struct Held(Arc<AtomicUsize>);
 
 impl Drop for Held {

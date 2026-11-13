@@ -6420,14 +6420,23 @@ fn a_native_error_outside_a_pressure_episode_is_surfaced_at_once_and_once() {
 // Value: #235 item 2: a forced compaction that raised a native error and is collected by a
 // pass that ends Ready got two identical journal lines, the status text said no pass was
 // waiting (untrue there) and the forced compaction's own reason was gone. Protects: the
-// Ready pass keeps the forced reason in the one status text, names the native error beside
+// Ready pass, and the pass that finds only temporary query reservations holding the
+// allowance (#242), keep the forced reason in the one status text, names the native error beside
 // it, counts each once, and a forced panic keeps its reason too.
 #[test]
-fn a_forced_failure_collected_by_a_ready_pass_keeps_its_reason() {
-    use sparrow_core::{EvictionLimits, Fault, PressurePhase};
-    for (fault, reason, native) in [
-        (Fault::NativeError, "the forced compaction failed", 1),
-        (Fault::Panic, "panicked", 0),
+fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_reason() {
+    use sparrow_core::{
+        EvictionLimits, Fault, PressurePhase, RecordOperation, RecordQuery, RecordRead,
+    };
+    // The ballast is a non-linked file in the store directory: removing it ends the episode
+    // (the Ready branch); keeping it leaves the physical footprint over the allowance while
+    // the linked footprint fits, so only temporary query reservations hold it (the
+    // reservations-only branch, #242).
+    for (fault, reason, native, release) in [
+        (Fault::NativeError, "the forced compaction failed", 1, true),
+        (Fault::Panic, "panicked", 0, true),
+        (Fault::NativeError, "the forced compaction failed", 1, false),
+        (Fault::Panic, "panicked", 0, false),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let limits = EvictionLimits {
@@ -6438,17 +6447,65 @@ fn a_forced_failure_collected_by_a_ready_pass_keeps_its_reason() {
         store.arm_forced_compaction_fault(fault);
         store.pressure_maintain(20, limits).unwrap();
         store.await_native_quiet().unwrap();
-        // The ballast goes away, so the pass that collects the failure ends Ready.
-        std::fs::OpenOptions::new()
+        let ballast = std::fs::OpenOptions::new()
             .write(true)
             .open(dir.path().join("test-owned-pressure-ballast"))
-            .unwrap()
-            .set_len(0)
             .unwrap();
-        let ready = store.pressure_maintain(30, limits).unwrap();
-        assert_eq!(ready.phase, PressurePhase::Ready);
-        assert_eq!((ready.forced_failures, ready.native_errors), (1, native));
-        let text = ready.failure.unwrap();
+        // The ballast goes away, so the pass that collects the failure can end Ready.
+        ballast.set_len(0).unwrap();
+        let _page = if release {
+            None
+        } else {
+            // A live query page holds a staging charge. Size the ballast so the linked
+            // footprint fits the allowance beside the request and only the charge crosses it.
+            // (`footprint` is the status's physical bytes: no page is live yet, so it is the
+            // linked footprint.)
+            let footprint = |now| {
+                store.status(now).unwrap()["physical_bytes"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            };
+            // A page with more rows to follow keeps its staging charge until released.
+            for (index, payload) in [b"y\n", b"z\n"].into_iter().enumerate() {
+                store
+                    .ingest(&format!("extra-{index}"), "source", "log", payload, 24)
+                    .unwrap();
+            }
+            let linked = footprint(25);
+            let page = store
+                .records_read(
+                    &RecordRead {
+                        operation: RecordOperation::Records,
+                        scope: record_page_scope("source", 1),
+                        query: RecordQuery::default(),
+                        cursor: None,
+                    },
+                    25,
+                )
+                .unwrap();
+            let requested = store.pressure_status().unwrap().requested_bytes;
+            assert!(
+                page.next_cursor.is_some(),
+                "the page must stay live (more rows follow)"
+            );
+            let limit = 12 * 1024 * 1024;
+            // 4 KiB of room covers the log the pass itself writes; the page's staging charge
+            // (at least 64 KiB, the builder's reservation) is what crosses the allowance.
+            ballast.set_len(limit - requested - linked - 4096).unwrap();
+            Some(page)
+        };
+        let status = store.pressure_maintain(30, limits).unwrap();
+        assert_eq!(status.phase == PressurePhase::Ready, release, "{status:?}");
+        if !release {
+            assert_eq!(
+                status.waiting_on.as_deref(),
+                Some("only temporary query reservations hold the data allowance")
+            );
+        }
+        assert_eq!((status.forced_failures, status.native_errors), (1, native));
+        let text = status.failure.unwrap();
         assert!(text.contains(reason), "{text}");
         assert!(!text.contains("no pressure pass was waiting"), "{text}");
         if native == 1 {
@@ -7472,6 +7529,14 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
         modified: (10, 20),
         changed: (10, 30),
     };
+    // The reclaim waker counts the wakes the retirement sends the reclamation duty.
+    let reclaim_wakes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    store.set_import_reclaim_waker(Some(std::sync::Arc::new({
+        let reclaim_wakes = reclaim_wakes.clone();
+        move || {
+            reclaim_wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    })));
     let claim = store
         .consumption_reserve(
             "watch",
@@ -7525,9 +7590,16 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
         "RESOURCE_LIMIT"
     );
 
+    assert_eq!(reclaim_wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
     store
         .consumption_retire(&claim.import_id, "watch", "admin", "source deleted", later)
         .unwrap();
+    // Retiring ends the begun import's lease, so reclamation is woken once, by event.
+    assert_eq!(
+        reclaim_wakes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the retirement wakes reclaim"
+    );
     assert_eq!(
         store.import_reclaim(later).unwrap(),
         1,
@@ -7543,8 +7615,11 @@ fn retiring_a_claim_with_a_begun_import_frees_its_slot_and_staged_chunks() {
         .unwrap();
 }
 
-/// INVARIANT (#246): the import slot waker runs when a reclamation commit deletes an import
-/// journal, which is when its slot is free, and not for a pass that frees nothing.
+/// INVARIANT (#246, #249): the import slot waker runs when a reclamation commit deletes an
+/// import journal, which is when its slot is free, and not for a pass that frees nothing.
+/// The import reclaim waker runs when an explicit cancel or a publication has committed
+/// (the journal is reclaimable, so the reclamation duty has work), not for a refused
+/// cancel, a retried publish, or the reclamation itself. Without it a cancelled import's slot waits for the duty's interval.
 #[test]
 fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7562,6 +7637,13 @@ fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
         "blake3:{}",
         purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
     );
+    let cancels = std::sync::Arc::new(AtomicU64::new(0));
+    store.set_import_reclaim_waker(Some(std::sync::Arc::new({
+        let cancels = cancels.clone();
+        move || {
+            cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
     let began = store
         .import_begin("slot-waker", "source", "log", 4, &digest, DAY)
         .unwrap();
@@ -7569,19 +7651,144 @@ fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
     // A live lease: the pass finds nothing to free and wakes nobody.
     assert_eq!(store.import_reclaim(DAY).unwrap(), 0);
     assert_eq!(wakes.load(Ordering::SeqCst), 0);
+    // A cancel that is refused ends no lease.
+    assert!(store.import_cancel("no-such-import", DAY).is_err());
+    assert_eq!(cancels.load(Ordering::SeqCst), 0);
     store.import_cancel(&began.id, DAY).unwrap();
+    assert_eq!(
+        cancels.load(Ordering::SeqCst),
+        1,
+        "the cancel wakes reclaim"
+    );
     while store.import_reclaim(DAY).unwrap() != 0 {}
     assert_eq!(
         wakes.load(Ordering::SeqCst),
         1,
         "one deleted journal, one wake"
     );
+    assert_eq!(cancels.load(Ordering::SeqCst), 1, "reclaim is not a cancel");
     assert_eq!(store.import_reclaim(DAY).unwrap(), 0);
     assert_eq!(
         wakes.load(Ordering::SeqCst),
         1,
         "an empty pass wakes nobody"
     );
+
+    // A publication makes its journal reclaimable too, and wakes reclaim once.
+    let one = b"one\n";
+    let staged = store
+        .import_begin("slot-publish", "source", "log", 4, &digest, DAY)
+        .unwrap();
+    store.import_append(&staged.id, 0, one, DAY).unwrap();
+    store.import_seal(&staged.id, DAY).unwrap();
+    store.import_prepare_layout(&staged.id, DAY).unwrap();
+    store.import_prepare_record(&staged.id, 0, DAY).unwrap();
+    store.import_publish(&staged.id, DAY).unwrap();
+    assert_eq!(
+        cancels.load(Ordering::SeqCst),
+        2,
+        "the publish wakes reclaim"
+    );
+    // A retried publish changes nothing and wakes nobody.
+    store.import_publish(&staged.id, DAY).unwrap();
+    assert_eq!(cancels.load(Ordering::SeqCst), 2);
+}
+
+/// INVARIANT (#249): one reclamation pass bounds its work: at most 128 chunks, and for an
+/// unpublished import one private prepared record or raw step. A journal a pass rewrote
+/// instead of deleting still has work, so the pass asks for the next one by event, not by
+/// the duty's interval; the pass that deletes the journal asks for none. Two imports
+/// check both bounds: 130 chunks of 64 KiB (128, then the last 2) and a cancelled import
+/// with prepared records (each pass frees at least one unit).
+#[test]
+fn a_reclaim_pass_that_left_work_asks_for_the_next_pass_until_the_journal_is_gone() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let wakes = std::sync::Arc::new(AtomicU64::new(0));
+    store.set_import_reclaim_waker(Some(std::sync::Arc::new({
+        let wakes = wakes.clone();
+        move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+    let digest = |bytes: &[u8]| {
+        format!(
+            "blake3:{}",
+            purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+        )
+    };
+    // 130 chunks: a pass frees 128, the next frees the last 2 and deletes the journal.
+    let input = vec![b'a'; 130 * 64 * 1024];
+    let staged = store
+        .import_begin(
+            "large",
+            "source",
+            "opaque",
+            input.len() as u64,
+            &digest(&input),
+            DAY,
+        )
+        .unwrap();
+    for (index, chunk) in input.chunks(64 * 1024).enumerate() {
+        store
+            .import_append(&staged.id, (index * 64 * 1024) as u64, chunk, DAY)
+            .unwrap();
+    }
+    store.import_cancel(&staged.id, DAY).unwrap();
+    assert_eq!(wakes.load(Ordering::SeqCst), 1, "the cancel");
+    assert_eq!(store.import_reclaim(DAY).unwrap(), 128);
+    assert_ne!(
+        store.import_get(&staged.id, DAY).unwrap_err().code,
+        "NOT_FOUND",
+        "the journal remains after the first pass"
+    );
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        2,
+        "work remained: another pass"
+    );
+    assert_eq!(store.import_reclaim(DAY).unwrap(), 2);
+    assert_eq!(
+        store.import_get(&staged.id, DAY).unwrap_err().code,
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        2,
+        "the last pass asks for none"
+    );
+    // A cancelled import with prepared records frees one record per pass, far under 128
+    // units, and still asks for its next pass until the journal is gone.
+    let lines = b"a\nb\nc\n";
+    let staged = store
+        .import_begin("prepared", "source", "log", 6, &digest(lines), DAY)
+        .unwrap();
+    store.import_append(&staged.id, 0, lines, DAY).unwrap();
+    store.import_seal(&staged.id, DAY).unwrap();
+    store.import_prepare_layout(&staged.id, DAY).unwrap();
+    store.import_prepare_record(&staged.id, 0, DAY).unwrap();
+    store.import_cancel(&staged.id, DAY).unwrap();
+    let before = wakes.load(Ordering::SeqCst);
+    let mut passes = 0;
+    loop {
+        let freed = store.import_reclaim(DAY).unwrap();
+        passes += 1;
+        assert!(freed >= 1, "every pass frees something: {freed}");
+        let gone = store.import_get(&staged.id, DAY).unwrap_err().code == "NOT_FOUND";
+        let asked = wakes.load(Ordering::SeqCst) - before;
+        // Every pass but the last asks once; the last asks for none.
+        assert_eq!(
+            asked,
+            if gone { passes - 1 } else { passes },
+            "pass {passes}"
+        );
+        if gone {
+            break;
+        }
+        assert!(passes < 100, "the journal never went");
+    }
+    assert!(passes >= 3, "{passes} passes: records go one per pass");
 }
 
 #[test]
@@ -15884,40 +16091,50 @@ fn producer_batch_over_a_fixed_bound_is_refused_non_retryable() {
     assert!(store.records(0).unwrap().is_empty());
 }
 
-/// INVARIANT (#227, #238): a producer batch whose write can never fit the whole data budget is
-/// refused with the non-retryable INVALID_ARGUMENT, whichever estimate (the artifact's or the
-/// joined batch's, judged by `apply`) crosses it; the ordinary `ingest` keeps RESOURCE_LIMIT,
-/// which eviction and expiry rely on to shrink their own batches. The old code answered the
-/// joined-estimate case with a retryable RESOURCE_LIMIT.
+/// INVARIANT (#227, #238, #242): a producer batch whose write can never fit the whole data
+/// budget is refused with the non-retryable INVALID_ARGUMENT, whichever estimate crosses it;
+/// the ordinary `ingest` keeps RESOURCE_LIMIT, which eviction and expiry rely on to shrink
+/// their own batches. Two budgets isolate the two estimates `apply` judges (the larger wins):
+/// 4 KiB of room is under the artifact's own estimate (payload, 2 KiB per record and 4 KiB of
+/// slack), while 32 KiB is above it for this 3-byte record yet under the joined batch's
+/// estimate, which alone carries a 64 KiB constant plus four times the batch (source context
+/// and authority metadata included). The old code answered the joined-estimate case with a
+/// retryable RESOURCE_LIMIT.
 #[test]
 fn producer_batch_over_the_whole_data_budget_is_refused_non_retryable() {
     use sparrow_core::{Durability, ProducerBatch};
-    let dir = tempfile::tempdir().unwrap();
-    let mut limits = config();
-    limits.maintenance_reserve = 1024 * 1024;
-    limits.disk_budget = limits.maintenance_reserve + 4096;
-    let store = Store::open(dir.path(), limits).unwrap();
-    let batch = ProducerBatch {
-        instance: [4; 16],
-        sequences: vec![1],
-    };
-    let refused = store
-        .ingest_producer("budget", "source", b"{}\n", &batch, 1, Durability::Durable)
-        .unwrap_err();
-    assert_eq!(refused.code, "INVALID_ARGUMENT");
-    assert!(
-        refused.message.contains("data budget"),
-        "{}",
-        refused.message
-    );
-    assert_eq!(
-        store
-            .ingest("plain", "source", "log", b"a\n", 1)
-            .unwrap_err()
-            .code,
-        "RESOURCE_LIMIT"
-    );
-    assert!(store.records(0).unwrap().is_empty());
+    for (room, which) in [
+        (4096, "artifact estimate"),
+        (32 * 1024, "joined estimate only"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut limits = config();
+        limits.maintenance_reserve = 1024 * 1024;
+        limits.disk_budget = limits.maintenance_reserve + room;
+        let store = Store::open(dir.path(), limits).unwrap();
+        let batch = ProducerBatch {
+            instance: [4; 16],
+            sequences: vec![1],
+        };
+        let refused = store
+            .ingest_producer("budget", "source", b"{}\n", &batch, 1, Durability::Durable)
+            .unwrap_err();
+        assert_eq!(refused.code, "INVALID_ARGUMENT", "{which}");
+        assert!(
+            refused.message.contains("data budget"),
+            "{which}: {}",
+            refused.message
+        );
+        assert_eq!(
+            store
+                .ingest("plain", "source", "log", b"a\n", 1)
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT",
+            "{which}"
+        );
+        assert!(store.records(0).unwrap().is_empty(), "{which}");
+    }
 }
 
 #[test]

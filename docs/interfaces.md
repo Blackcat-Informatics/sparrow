@@ -2470,9 +2470,16 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   free, under one bound of 3 seconds that covers the whole call, including any wait for
   an operation permit (which is capped at the time left); no attempt starts once the
   bound has passed. A slot frees when a reclamation commit deletes a journal (a
-  published, cancelled or expired import; cancelling only ends the lease, and the
-  maintenance reclamation duty, on its existing one-second interval, performs the
-  deletion), and that commit signals the waiters; a pass
+  published, cancelled or expired import). An explicit cancel, a publication and the
+  retirement of a consumption claim whose import had begun each wake the maintenance
+  reclamation duty at once, which performs the deletion. A pass bounds its work (128 chunks, or one
+  private prepared record or raw step of an unpublished import), so a pass that freed
+  something and rewrote a journal it did not finish wakes the duty again for the next, and
+  such an import frees over a run of passes with no interval between them. The free-space floor's resume
+  edge wakes a pass the pause skipped. A lease that merely expires has no
+  event, so the duty's existing one-second interval is the named observer of lease expiry
+  and nothing else. Each wake also gives held syslog frames one extra evaluation, which is
+  harmless. The deletion commit signals the waiters; a pass
   that deletes nothing signals nobody, and nothing retries on a clock. The wait also
   ends at shutdown, or at the bound, and then answers the same `RESOURCE_LIMIT`. It
   holds no permit while it waits.
@@ -2563,8 +2570,9 @@ stream or discards a frame:
   the sender holds the rest. Pressure can last as long as reclamation takes. A held
   frame blocks on a wake, the stop and nothing else (#247): it owns no timer and
   never retries on a clock. A frame waiting for an operation permit blocks on the
-  permit alone. Every ending the daemon can see sends the wake, and one observer
-  covers the two it cannot:
+  permit and on the observer tick below, which only lets the journal announce a wait that
+  outlasts its report interval; the wait keeps its place in the queue. Every ending the
+  daemon can see sends the wake, and one observer covers the two it cannot:
 
   | Ending | Signal | Observer |
   | --- | --- | --- |
@@ -2576,6 +2584,11 @@ stream or discards a frame:
   | Native flush or compaction work completes | none exists; the store has no listener | the same one-second observation |
   | Stop | the stop channel | event |
   | An operation permit frees | the semaphore | event |
+  | An explicit import cancel, a publication, or the retirement of a claim with a begun import, makes a journal reclaimable | wake from the store to the reclamation duty, which deletes the journal and signals the import slot | event |
+  | A reclamation pass freed something but left a journal unfinished | the store wakes the duty again for the rest | event |
+  | The floor resumes after a reclaim pass was skipped below it | the resume edge wakes the reclamation duty | event |
+  | An import lease expires | none exists (time passing is the event) | the reclamation duty's one-second interval, for lease expiry only |
+  | A hold's report interval passes (announcing a long hold) | none exists | the same one-second observation, for a permit wait; a pressure hold announces on each wake |
 
   The one-second observation is the cadence at which the daemon measures the floor; it
   is one tick for every held frame, never a timer per frame. The same table governs the
@@ -2623,8 +2636,12 @@ are the last four fields of the listener status, added without a schema bump.
 The daemon journals a line when a hold episode begins and, for every episode it
 announced, a line when it ends, with the frames held and the longest wait. Beginning
 lines are limited to one a minute per listener. An episode that starts inside that
-interval is announced by its next retry once the interval has passed, and an
-episode that ends before then leaves counters only.
+interval is announced once the interval has passed, and the trigger depends on the
+reason: a pressure hold is announced by its next offer to the store (every wake, so at
+the latest at the next one-second observation), and a permit wait by that same
+observation, since the wait itself has no retry. An episode that starts inside the
+interval and ends before it has passed prints no line at all, neither beginning nor end:
+a short suppressed episode leaves counters only.
 Counters are process-lifetime evidence and reset on restart. Successful counts
 follow durable store publication, but syslog provides no typed sender receipt.
 TCP sends therefore do not prove publication; UDP kernel/network loss remains
@@ -2953,8 +2970,9 @@ and authority metadata, is judged at write time against the same whole data budg
 answers the same non-retryable code. The `ingest` call answers an inline payload over 16 MiB
 with `INVALID_ARGUMENT` too. Other callers keep `RESOURCE_LIMIT`. An input-only refusal
 (record count, sequence count) is decided before the source mapping is bound, so a refused
-batch leaves no mapping behind. A batch refused later, at the write-size checks, can still
-leave the mapping of its source, which every later batch of that source needs anyway.
+batch leaves no mapping behind. A batch refused after the mapping is bound (at the write-size
+checks, a record-level check, or when the write is applied) can still leave the mapping of its
+source, which every later batch of that source needs anyway.
 
 The existing Rust `events` example accepts an optional sequence after its
 durability argument so separate invocations can demonstrate ordered batches

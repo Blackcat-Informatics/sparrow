@@ -612,6 +612,10 @@ impl Store {
         }
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
+        drop(writer);
+        // The journal of a published import is reclaimable now, so tell the reclamation duty
+        // instead of leaving its slot to the duty's interval.
+        self.wake_import_reclaim();
         Ok(artifact)
     }
 }

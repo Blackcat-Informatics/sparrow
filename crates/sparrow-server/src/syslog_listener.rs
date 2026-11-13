@@ -192,7 +192,8 @@ impl Status {
     /// Register or continue one frame's hold at `now`; returns the journal line to print, if
     /// any. Holds that overlap are one episode. The entering line is limited to one per
     /// [`HOLD_REPORT_INTERVAL`], but an episode the limit suppressed is announced by its next
-    /// refused attempt once the interval has passed, so no long hold is left unannounced.
+    /// call once the interval has passed, so no long hold is left unannounced. A pressure hold
+    /// calls on every offer; a permit wait calls on every observer tick.
     fn hold(
         &mut self,
         id: &mut Option<u64>,
@@ -304,7 +305,7 @@ impl<'a> Hold<'a> {
             Ok(())
         })?;
         if let Some(line) = line {
-            eprintln!("{line}");
+            journal(&line);
         }
         Ok(())
     }
@@ -320,7 +321,7 @@ impl<'a> Hold<'a> {
             Ok(())
         })?;
         if let Some(line) = line {
-            eprintln!("{line}");
+            journal(&line);
         }
         Ok(())
     }
@@ -329,6 +330,32 @@ impl Drop for Hold<'_> {
     fn drop(&mut self) {
         // A poisoned status has nothing left to correct.
         let _ = self.leave();
+    }
+}
+
+/// Print one journal line. Under test the line is also kept per thread, so a test can read
+/// what an operator would have seen.
+fn journal(line: &str) {
+    #[cfg(test)]
+    printed::note(line);
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod printed {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn note(line: &str) {
+        LINES.with(|lines| lines.borrow_mut().push(line.to_owned()));
+    }
+
+    /// Every line printed on this thread so far (each test runs on its own thread).
+    pub(super) fn lines() -> Vec<String> {
+        LINES.with(|lines| lines.borrow().clone())
     }
 }
 
@@ -586,7 +613,9 @@ async fn publish(
 /// wake; it owns no timer. The daemon sends the wake at every ending it can see, and the
 /// maintenance worker's one observation wakes every held frame at its one-second cadence
 /// for the endings it cannot (see `crate::pressure_wake`). A stop ends the hold: the frame
-/// gets one last attempt and, if refused, is counted exactly as before.
+/// gets one last attempt and, if refused, is counted exactly as before. A frame waiting for a
+/// permit blocks on the permit and, so the journal can announce its wait once the report
+/// interval has passed, on the same observer tick; it never retries on a clock.
 async fn publish_held(
     store: &sparrow_core::Store,
     source: &str,
@@ -606,11 +635,20 @@ async fn publish_held(
                 hold.enter(HoldReason::NoPermit)?;
                 // A stop does not interrupt this wait: the frame must still be published, and
                 // that takes a permit from the operation budget shutdown waits on anyway.
-                operations
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(io::Error::other)?
+                // The wait blocks on the permit and, to announce a long wait the report
+                // interval suppressed at entry, on the observer tick (counted as held so the
+                // tick sends it). The one acquire future is kept across ticks: dropping it
+                // would give up the frame's place in the fair queue.
+                let _held = wake.hold();
+                wake.mark_seen();
+                let acquire = operations.clone().acquire_owned();
+                tokio::pin!(acquire);
+                loop {
+                    tokio::select! {
+                        permit = &mut acquire => break permit.map_err(io::Error::other)?,
+                        () = wake.woken() => hold.enter(HoldReason::NoPermit)?,
+                    }
+                }
             }
             Err(error @ TryAcquireError::Closed) => return Err(io::Error::other(error)),
         };
@@ -1983,6 +2021,89 @@ mod tests {
         reading.await.unwrap().unwrap();
     }
 
+    /// Value (#245): `enter(NoPermit)` runs once before the permit wait, so a wait that began
+    /// inside the report interval and outlasted it was never announced. Protects: with a
+    /// recent announcement, a frame waiting for a permit is silent at entry, still silent
+    /// after the interval passes with no event (no timer), and the observer tick announces it
+    /// as a printed `no_permit` line; the wait keeps its place and the frame is then stored.
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_wait_is_announced_by_the_observer_tick_after_the_interval() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        // An announcement a moment ago, as an earlier episode would have left.
+        fixture
+            .metrics
+            .update(|status| {
+                status.announced_at = Some(tokio::time::Instant::now());
+                Ok(())
+            })
+            .unwrap();
+        let permits = fixture
+            .operations
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        yield_until("the frame waits for a permit", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
+        let announced = || {
+            fixture
+                .metrics
+                .snapshot()
+                .unwrap()
+                .episode
+                .as_ref()
+                .map(|episode| episode.announced)
+        };
+        assert_eq!(announced(), Some(false), "suppressed inside the interval");
+        tokio::time::advance(HOLD_REPORT_INTERVAL + Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(announced(), Some(false), "no timer announces the wait");
+        assert!(printed::lines().is_empty());
+        fixture.wake.observe_tick();
+        yield_until("the tick announces the wait", || announced() == Some(true)).await;
+        assert_eq!(
+            printed::lines(),
+            [
+                "sparrowd: syslog listener listener: holding 1 frame(s) under no_permit; each sender's TCP window closes until it clears"
+            ]
+        );
+        drop(permits);
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted == 1
+        })
+        .await;
+        drop(sender);
+        reading.await.unwrap().unwrap();
+    }
+
+    /// Let every task the paused clock has made ready run to its next wait, including the
+    /// blocking store call a re-offered frame would start: yield so the frame reaches it, wait
+    /// for a blocking store call that takes the writer lock after it (a flush), then yield so
+    /// the frame handles its answer. A negative assertion made after this sees a timer's work.
+    async fn settle(fixture: &Listener) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let store = fixture.store.clone();
+        tokio::task::spawn_blocking(move || store.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Yield until `done` holds, failing with `what` after a wall-clock bound instead of
     /// hanging. Not a timeout future: under a paused clock an idle runtime would fire that
     /// early, while the blocking store call still runs.
@@ -2135,16 +2256,22 @@ mod tests {
         );
         let refused = floor.status().refused_writes;
         tokio::time::advance(HOLD_REPORT_INTERVAL + Duration::from_secs(1)).await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        settle(&fixture).await;
         assert_eq!(announced(), Some(false), "no timer re-offers the frame");
         assert_eq!(floor.status().refused_writes, refused);
+        let before = printed::lines().len();
         fixture.wake.observe_tick();
         yield_until("the tick announces the episode", || {
             announced() == Some(true)
         })
         .await;
+        // The chain ends in the printed line an operator reads, not only the flag.
+        let lines = printed::lines();
+        assert_eq!(lines.len(), before + 1, "{lines:?}");
+        assert_eq!(
+            lines.last().unwrap(),
+            "sparrowd: syslog listener listener: holding 1 frame(s) under storage_pressure; each sender's TCP window closes until it clears"
+        );
         drop(sender);
         floor.set_free_for_tests(None);
         fixture.wake.wake();
