@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: ac2477070f16d8922526577bc79e55744b4d533f
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 250
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/250
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 75e136ba9e91aa002f1b400eab2c27aada2dae76
+GhpRsq-Head-Ref: paudley/247-holds-and-waits-block-on-signals-keep
+GhpRsq-Head-OID: ac2477070f16d8922526577bc79e55744b4d533f
+GhpRsq-Result-Tree: 0dfb01e313d477cbf9df0751e3c12a3daf870d8c
+GhpRsq-Result-Commit: 718422ef3352a69205a99ae7d76598f2f2c0311f
+GhpRsq-Parent-Hashes: ac2477070f16d8922526577bc79e55744b4d533f
+GhpRsq-Squash-Notes-SHA256: 99ae7330d2bc408db752cbea16277276d7d0d42e33de6b13af472000ae0e8a2e
+GhpRsq-Stage-Evidence: none
