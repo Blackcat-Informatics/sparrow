@@ -6456,6 +6456,7 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
         let _page = if release {
             None
         } else {
+            const SLACK: u64 = 16384;
             // A live query page holds a staging charge. Size the ballast so the linked
             // footprint fits the allowance beside the request and only the charge crosses it.
             // (`footprint` is the status's physical bytes: no page is live yet, so it is the
@@ -6474,11 +6475,23 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
                     .unwrap();
             }
             // The footprint counts every file in the store directory (tables, logs, the
-            // manifest), so native work still running while it is measured grows it past
-            // the sizing below (#260). Flush and wait for the end of that work first.
+            // manifest), so any growth between this measurement and the pass breaks the
+            // sizing below (#260). Settle the store first: flush, then wait for native work
+            // to end.
             store.flush().unwrap();
             store.await_native_quiet().unwrap();
             let linked = footprint(25);
+            let settled = footprint(25);
+            // The store directory's bytes other than the ballast, read again just before the
+            // pass to name any growth that crosses the sizing slack.
+            let files = || -> u64 {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .filter(|entry| entry.file_name() != "test-owned-pressure-ballast")
+                    .map(|entry| entry.metadata().unwrap().len())
+                    .sum()
+            };
             let page = store
                 .records_read(
                     &RecordRead {
@@ -6496,10 +6509,20 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
                 "the page must stay live (more rows follow)"
             );
             let limit = 12 * 1024 * 1024;
-            // 16 KiB of room covers the info log lines RocksDB still writes; the page's
-            // staging charge (at least 64 KiB, the builder's reservation) is what crosses
-            // the allowance.
-            ballast.set_len(limit - requested - linked - 16384).unwrap();
+            // 16 KiB of room is far under the page's staging charge (at least 64 KiB, the
+            // builder's reservation), which is what crosses the allowance, and leaves room
+            // for small growth of the store's own files.
+            ballast.set_len(limit - requested - linked - SLACK).unwrap();
+            let before_pass = files();
+            // The store's own files grow a little after the settle step (up to about 6 KiB in
+            // runs that measured it; what writes them was not identified). The sizing
+            // tolerates SLACK of it; more would send the pass to the retirement branch, so
+            // name it here.
+            assert!(
+                before_pass <= linked + SLACK,
+                "the store files grew by {} bytes ({linked} at sizing, {settled} on a second read, {before_pass} just before the pass), over the {SLACK} byte slack",
+                before_pass.abs_diff(linked)
+            );
             Some(page)
         };
         let status = store.pressure_maintain(30, limits).unwrap();
