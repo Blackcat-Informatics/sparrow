@@ -2472,9 +2472,10 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   bound has passed. A slot frees when a reclamation commit deletes a journal (a
   published, cancelled or expired import). An explicit cancel, a publication and the
   retirement of a consumption claim whose import had begun each wake the maintenance
-  reclamation duty at once, which performs the deletion. One pass frees at most 128 chunks,
-  so a pass that spent its whole budget wakes the duty again for the next, and a large import
-  frees over a run of passes with no interval between them. The free-space floor's resume
+  reclamation duty at once, which performs the deletion. A pass bounds its work (128 chunks, or one
+  private prepared record or raw step of an unpublished import), so a pass that freed
+  something and rewrote a journal it did not finish wakes the duty again for the next, and
+  such an import frees over a run of passes with no interval between them. The free-space floor's resume
   edge wakes a pass the pause skipped. A lease that merely expires has no
   event, so the duty's existing one-second interval is the named observer of lease expiry
   and nothing else. Each wake also gives held syslog frames one extra evaluation, which is
@@ -2584,7 +2585,7 @@ stream or discards a frame:
   | Stop | the stop channel | event |
   | An operation permit frees | the semaphore | event |
   | An explicit import cancel, a publication, or the retirement of a claim with a begun import, makes a journal reclaimable | wake from the store to the reclamation duty, which deletes the journal and signals the import slot | event |
-  | A reclamation pass spent its whole budget of 128 chunks | the store wakes the duty again for the rest | event |
+  | A reclamation pass freed something but left a journal unfinished | the store wakes the duty again for the rest | event |
   | The floor resumes after a reclaim pass was skipped below it | the resume edge wakes the reclamation duty | event |
   | An import lease expires | none exists (time passing is the event) | the reclamation duty's one-second interval, for lease expiry only |
   | A hold's report interval passes (announcing a long hold) | none exists | the same one-second observation, for a permit wait; a pressure hold announces on each wake |

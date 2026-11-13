@@ -990,6 +990,8 @@ impl Store {
         let mut batch = WriteBatch::default();
         let mut removed = 0;
         let mut journals_freed = 0u64;
+        // An eligible journal this pass rewrote instead of deleting still has work to free.
+        let mut work_left = false;
         let manifests = writer.imports()?;
         let mut remaining_manifests = manifests.len() as u64;
         for mut manifest in manifests {
@@ -1046,6 +1048,7 @@ impl Store {
                 batch.delete(&manifest.id);
                 journals_freed += 1;
             } else {
+                work_left = true;
                 put(&mut batch, &manifest.id, &manifest);
             }
         }
@@ -1057,9 +1060,12 @@ impl Store {
         if journals_freed != 0 {
             self.wake_import_slot();
         }
-        // A pass that spent its whole budget may have left work: ask for the next pass by
-        // event, not by the duty's interval. A pass that finished under budget asks for none.
-        if removed >= RECLAIM_CHUNKS {
+        // A pass bounds its work (128 chunks, or one private prepared record of an unpublished
+        // import) and rewrites the journal it did not finish: ask for the next pass by event,
+        // not by the duty's interval. Only a pass that freed something asks, so a journal
+        // that can make no progress never spins; a pass that deleted every eligible journal
+        // asks for none.
+        if work_left && removed > 0 {
             self.wake_import_reclaim();
         }
         Ok(removed)

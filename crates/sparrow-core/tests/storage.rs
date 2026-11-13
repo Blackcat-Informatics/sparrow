@@ -7694,12 +7694,14 @@ fn the_import_slot_waker_runs_only_when_a_journal_is_deleted() {
     assert_eq!(cancels.load(Ordering::SeqCst), 2);
 }
 
-/// INVARIANT (#249): one reclamation pass frees at most 128 chunks, so a large cancelled
-/// import frees over several passes. A pass that spent its whole budget wakes reclaim again
-/// by event, so the next pass does not wait for the duty's interval; a pass that finished
-/// under budget wakes nobody (no spin). The import here has 130 chunks of 64 KiB.
+/// INVARIANT (#249): one reclamation pass bounds its work: at most 128 chunks, and for an
+/// unpublished import one private prepared record or raw step. A journal a pass rewrote
+/// instead of deleting still has work, so the pass asks for the next one by event, not by
+/// the duty's interval; the pass that deletes the journal asks for none. Two imports
+/// check both bounds: 130 chunks of 64 KiB (128, then the last 2) and a cancelled import
+/// with prepared records (each pass frees at least one unit).
 #[test]
-fn a_large_import_reclaim_asks_for_its_next_pass_until_it_is_done() {
+fn a_reclaim_pass_that_left_work_asks_for_the_next_pass_until_the_journal_is_gone() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -7710,18 +7712,21 @@ fn a_large_import_reclaim_asks_for_its_next_pass_until_it_is_done() {
             wakes.fetch_add(1, Ordering::SeqCst);
         }
     })));
+    let digest = |bytes: &[u8]| {
+        format!(
+            "blake3:{}",
+            purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+        )
+    };
+    // 130 chunks: a pass frees 128, the next frees the last 2 and deletes the journal.
     let input = vec![b'a'; 130 * 64 * 1024];
-    let digest = format!(
-        "blake3:{}",
-        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(&input).as_bytes())
-    );
     let staged = store
         .import_begin(
             "large",
             "source",
             "opaque",
             input.len() as u64,
-            &digest,
+            &digest(&input),
             DAY,
         )
         .unwrap();
@@ -7733,18 +7738,57 @@ fn a_large_import_reclaim_asks_for_its_next_pass_until_it_is_done() {
     store.import_cancel(&staged.id, DAY).unwrap();
     assert_eq!(wakes.load(Ordering::SeqCst), 1, "the cancel");
     assert_eq!(store.import_reclaim(DAY).unwrap(), 128);
+    assert_ne!(
+        store.import_get(&staged.id, DAY).unwrap_err().code,
+        "NOT_FOUND",
+        "the journal remains after the first pass"
+    );
     assert_eq!(
         wakes.load(Ordering::SeqCst),
         2,
-        "the full pass asks for another"
+        "work remained: another pass"
     );
-    assert!(store.import_get(&staged.id, DAY).is_err());
-    assert!(store.import_reclaim(DAY).unwrap() < 128);
+    assert_eq!(store.import_reclaim(DAY).unwrap(), 2);
+    assert_eq!(
+        store.import_get(&staged.id, DAY).unwrap_err().code,
+        "NOT_FOUND"
+    );
     assert_eq!(
         wakes.load(Ordering::SeqCst),
         2,
         "the last pass asks for none"
     );
+    // A cancelled import with prepared records frees one record per pass, far under 128
+    // units, and still asks for its next pass until the journal is gone.
+    let lines = b"a\nb\nc\n";
+    let staged = store
+        .import_begin("prepared", "source", "log", 6, &digest(lines), DAY)
+        .unwrap();
+    store.import_append(&staged.id, 0, lines, DAY).unwrap();
+    store.import_seal(&staged.id, DAY).unwrap();
+    store.import_prepare_layout(&staged.id, DAY).unwrap();
+    store.import_prepare_record(&staged.id, 0, DAY).unwrap();
+    store.import_cancel(&staged.id, DAY).unwrap();
+    let before = wakes.load(Ordering::SeqCst);
+    let mut passes = 0;
+    loop {
+        let freed = store.import_reclaim(DAY).unwrap();
+        passes += 1;
+        assert!(freed >= 1, "every pass frees something: {freed}");
+        let gone = store.import_get(&staged.id, DAY).unwrap_err().code == "NOT_FOUND";
+        let asked = wakes.load(Ordering::SeqCst) - before;
+        // Every pass but the last asks once; the last asks for none.
+        assert_eq!(
+            asked,
+            if gone { passes - 1 } else { passes },
+            "pass {passes}"
+        );
+        if gone {
+            break;
+        }
+        assert!(passes < 100, "the journal never went");
+    }
+    assert!(passes >= 3, "{passes} passes: records go one per pass");
 }
 
 #[test]

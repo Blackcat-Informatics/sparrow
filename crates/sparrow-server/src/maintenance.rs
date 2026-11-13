@@ -326,6 +326,8 @@ mod skips {
         static MIGRATE: Cell<u64> = const { Cell::new(0) };
         static EXPIRED: Cell<u64> = const { Cell::new(0) };
         static PASS: Rc<Notify> = Rc::new(Notify::new());
+        static MIGRATE_TICKS: Cell<u64> = const { Cell::new(0) };
+        static MIGRATE_WAKES: Cell<u64> = const { Cell::new(0) };
         static RECLAIM_TICKS: Cell<u64> = const { Cell::new(0) };
         static RECLAIM_WAKES: Cell<u64> = const { Cell::new(0) };
         static RECLAIM: Cell<u64> = const { Cell::new(0) };
@@ -339,6 +341,20 @@ mod skips {
 
     pub(super) fn reclaim_observed() -> u64 {
         RECLAIM_OBSERVED.with(Cell::get)
+    }
+
+    /// A migration page was started by the retry tick (`false`) or by a wake (`true`).
+    pub(super) fn migrate_started(woken: bool) {
+        let counter = if woken {
+            &MIGRATE_WAKES
+        } else {
+            &MIGRATE_TICKS
+        };
+        counter.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn migrate_wakes() -> u64 {
+        MIGRATE_WAKES.with(Cell::get)
     }
 
     /// A reclaim pass was started by the interval tick (`false`) or by a wake (`true`).
@@ -420,7 +436,7 @@ async fn run(
     // next scheduled time.
     let migrate_wake = Arc::new(Notify::new());
     // An explicit import cancel, a publication and the retirement of a claim with a begun
-    // import each make a journal reclaimable, and a pass that spent its whole budget asks for
+    // import each make a journal reclaimable, and a pass that left a journal unfinished asks for
     // the next one; the store wakes this duty for each (#249). The duty's one-second interval
     // stays only as the observer of a lease that merely expires, which has no event, and the
     // floor's resume edge below wakes a pass that was skipped below the floor.
@@ -514,8 +530,16 @@ async fn run(
                     _ = tokio::time::sleep_until(expiry_at), if !continuation => Ok(Job::Expiry),
                     _ = wake.notified(), if !continuation => Ok(Job::Expiry),
                     _ = tokio::task::yield_now(), if continuation => Ok(Job::Expiry),
-                    _ = migrate.tick(), if !migrating => Ok(Job::Migrate { defer: true }),
-                    _ = migrate_wake.notified(), if !migrating => Ok(Job::Migrate { defer: true }),
+                    _ = migrate.tick(), if !migrating => {
+                        #[cfg(test)]
+                        skips::migrate_started(false);
+                        Ok(Job::Migrate { defer: true })
+                    }
+                    _ = migrate_wake.notified(), if !migrating => {
+                        #[cfg(test)]
+                        skips::migrate_started(true);
+                        Ok(Job::Migrate { defer: true })
+                    }
                     deferred = deferred_page(&mut deferral), if migrating => {
                         deferred.map(|()| Job::Migrate { defer: stale })
                     }
@@ -645,14 +669,17 @@ mod tests {
     use super::*;
 
     /// Wait until `done` holds, blocking on the worker's pass event (a loop turn ended) and
-    /// re-checking each time. The 30 s bound only reports a worker that stopped making
-    /// turns; it ends no wait that succeeds.
+    /// re-checking each time. The 30 s deadline covers the whole wait, not each turn (the
+    /// worker ends a turn at least every second): a condition that never holds fails naming
+    /// `what`. It ends no wait that succeeds.
     async fn until(what: &str, done: impl Fn() -> bool) {
-        while !done() {
-            tokio::time::timeout(Duration::from_secs(30), skips::passes().notified())
-                .await
-                .unwrap_or_else(|_| panic!("no worker pass ended while waiting for: {what}"));
-        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !done() {
+                skips::passes().notified().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("did not happen within 30 s: {what}"));
     }
 
     // Value: below the free-space floor the daemon used to freeze the whole pressure state
@@ -777,6 +804,15 @@ mod tests {
                 floor.set_free_for_tests(Some(0));
                 assert!(floor.observe(now).unwrap().is_some());
             }
+            if case == "large" {
+                // Staged before the worker exists, so the 130 appends cannot delay a turn and
+                // let an overdue interval tick race the cancel wake.
+                for (index, chunk) in input.chunks(64 * 1024).enumerate() {
+                    store
+                        .import_append(&staged.id, (index * 64 * 1024) as u64, chunk, now)
+                        .unwrap();
+                }
+            }
             let (ticks, skipped, expired, skipped_expiry) = (
                 skips::reclaim_ticks(),
                 skips::reclaim(),
@@ -798,15 +834,7 @@ mod tests {
             until("the first passes", first_passes_ran).await;
             let wakes = skips::reclaim_wakes();
             match case {
-                "cancel" => store.import_cancel(&staged.id, now).unwrap(),
-                "large" => {
-                    for (index, chunk) in input.chunks(64 * 1024).enumerate() {
-                        store
-                            .import_append(&staged.id, (index * 64 * 1024) as u64, chunk, now)
-                            .unwrap();
-                    }
-                    store.import_cancel(&staged.id, now).unwrap();
-                }
+                "cancel" | "large" => store.import_cancel(&staged.id, now).unwrap(),
                 "publish" => {
                     store.import_append(&staged.id, 0, &input, now).unwrap();
                     store.import_seal(&staged.id, now).unwrap();
@@ -1089,6 +1117,7 @@ mod tests {
             store.migrations().unwrap().iter().all(|m| !m.complete()),
             "a migration ran below the floor"
         );
+        let wakes = skips::migrate_wakes();
         floor.set_free_for_tests(None);
         assert!(
             floor
@@ -1104,6 +1133,11 @@ mod tests {
                 .all(sparrow_core::MigrationStatus::complete)
         })
         .await;
+        // The resume edge started the first page; the 60 s retry tick did not.
+        assert!(
+            skips::migrate_wakes() > wakes,
+            "no migration page was started by a wake"
+        );
         worker.shutdown().await.unwrap();
     }
 
