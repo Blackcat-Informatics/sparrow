@@ -6473,6 +6473,11 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
                     .ingest(&format!("extra-{index}"), "source", "log", payload, 24)
                     .unwrap();
             }
+            // The footprint counts every file in the store directory (tables, logs, the
+            // manifest), so native work still running while it is measured grows it past
+            // the sizing below (#260). Flush and wait for the end of that work first.
+            store.flush().unwrap();
+            store.await_native_quiet().unwrap();
             let linked = footprint(25);
             let page = store
                 .records_read(
@@ -6491,9 +6496,10 @@ fn a_forced_failure_collected_by_a_ready_or_reservations_only_pass_keeps_its_rea
                 "the page must stay live (more rows follow)"
             );
             let limit = 12 * 1024 * 1024;
-            // 4 KiB of room covers the log the pass itself writes; the page's staging charge
-            // (at least 64 KiB, the builder's reservation) is what crosses the allowance.
-            ballast.set_len(limit - requested - linked - 4096).unwrap();
+            // 16 KiB of room covers the info log lines RocksDB still writes; the page's
+            // staging charge (at least 64 KiB, the builder's reservation) is what crosses
+            // the allowance.
+            ballast.set_len(limit - requested - linked - 16384).unwrap();
             Some(page)
         };
         let status = store.pressure_maintain(30, limits).unwrap();
