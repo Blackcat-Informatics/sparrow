@@ -44,6 +44,10 @@ pub(crate) fn listener(
         wire::optional_text::Absent(()) => Value::Null,
         wire::optional_text::Value(value) => Value::from(value?.to_str()?),
     };
+    let enlarge_error = match listener.get_rcvbuf_enlarge_error()?.which()? {
+        wire::optional_text::Absent(()) => Value::Null,
+        wire::optional_text::Value(value) => Value::from(value?.to_str()?),
+    };
     Ok(Value::from(
         Object::new()
             .with("id", listener.get_id()?.to_str()?)
@@ -128,6 +132,12 @@ pub(crate) fn listener(
                 },
             )
             .with("kernel_counter_reason", counter_reason)
+            .with("kernel_counter_final", listener.get_kernel_counter_final())
+            .with("rcvbuf_enlarge_error", enlarge_error)
+            .with(
+                "rcvbuf_enlarge_failures",
+                listener.get_rcvbuf_enlarge_failures().to_string(),
+            )
             .with("failure", failure),
     ))
 }

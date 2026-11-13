@@ -149,6 +149,11 @@ struct SyslogListenerStatus {
   # kernelCounterState is available; otherwise kernelDrops is zero and kernelCounterReason says why.
   rcvbufRequestedBytes @23 :UInt64; rcvbufGrantedBytes @24 :UInt64; kernelDrops @25 :UInt64;
   kernelCounterState @26 :KernelCounterState; kernelCounterReason @27 :OptionalText;
+  # True once the socket has closed: kernelDrops is then the final count, taken just before.
+  kernelCounterFinal @28 :Bool;
+  # The kernel refused the enlarge request: the socket kept the default buffer (granted shows it)
+  # and the daemon went on taking syslog. The text is the error; the count is 0 or 1 per listener.
+  rcvbufEnlargeError @29 :OptionalText; rcvbufEnlargeFailures @30 :UInt64;
 }
 enum KernelCounterState { notApplicable @0; available @1; unavailable @2; }
 struct SyslogListenerQuery { storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :Text; id @3 :Text; }

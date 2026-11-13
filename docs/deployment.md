@@ -119,7 +119,13 @@ are still synchronized. The daemon checks free space every second. Below the
 floor it stops accepting Unix and TCP connections, including syslog TCP
 connections. It claims no consumed files and runs only WAL synchronization.
 Syslog UDP packets that still arrive are refused and counted in memory, and the
-listener status reports that those counts are not durable. The daemon logs one
+listener status reports that those counts are not durable.
+Each UDP syslog socket asks for an 8 MiB receive buffer. The kernel clamps the
+request to `net.core.rmem_max` (stock 212992) and stores twice the result; the unit
+cannot force more, so raise the sysctl on the host if status shows a small grant.
+The unit sets `ProcSubset=pid`, which hides `/proc/sys`, so the daemon cannot read
+`rmem_max`: status reports the granted size read back from the socket, and the
+daemon reads its kernel drop count from `/proc/self/net/udp`, which stays visible. The daemon logs one
 line when it pauses and one when it resumes. At startup it waits for the floor
 before opening the store, so a restart on a full disk does not use up the
 unit's bounded restarts. If a write

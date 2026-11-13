@@ -23,28 +23,45 @@ const RMEM_MAX: &str = "/proc/sys/net/core/rmem_max";
 /// What was asked of the kernel and what it reports back. Linux stores twice the request (room
 /// for bookkeeping) after clamping the request to `net.core.rmem_max`, so `granted` is that
 /// stored size: it is not the payload capacity, and it may be below `requested`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Buffer {
     pub requested: usize,
     pub granted: usize,
+    /// The error of the enlarge request, when the kernel refused it: the socket then keeps the
+    /// default buffer, `granted` is that default, and the daemon still takes syslog.
+    pub enlarge_error: Option<String>,
 }
 
 /// Ask for a receive buffer of `requested` bytes and read back what the kernel granted. The
-/// kernel clamping the size is normal and only reported; an error from either call is a broken
-/// socket and fails.
+/// kernel clamping the size is normal and only reported. A refused request does not stop the
+/// daemon taking syslog: it is returned in `enlarge_error` for status and the journal. Failing
+/// to read the size back means the socket itself is broken, and fails.
 pub(crate) fn request_buffer(socket: impl AsFd, requested: usize) -> io::Result<Buffer> {
+    request_buffer_with(socket, requested, |socket, size| {
+        rustix::net::sockopt::set_socket_recv_buffer_size(socket, size)
+    })
+}
+
+/// [`request_buffer`] with the setting call supplied, so a test can make the kernel refuse.
+fn request_buffer_with(
+    socket: impl AsFd,
+    requested: usize,
+    set: impl FnOnce(std::os::fd::BorrowedFd<'_>, usize) -> rustix::io::Result<()>,
+) -> io::Result<Buffer> {
     let socket = socket.as_fd();
-    rustix::net::sockopt::set_socket_recv_buffer_size(socket, requested).map_err(|error| {
-        io::Error::other(format!(
-            "cannot set SO_RCVBUF to {requested} bytes on the UDP syslog socket: {error}"
-        ))
-    })?;
+    let enlarge_error = set(socket, requested).err().map(|error| {
+        format!("cannot set SO_RCVBUF to {requested} bytes on the UDP syslog socket: {error}")
+    });
     let granted = rustix::net::sockopt::socket_recv_buffer_size(socket).map_err(|error| {
         io::Error::other(format!(
             "cannot read back SO_RCVBUF of the UDP syslog socket: {error}"
         ))
     })?;
-    Ok(Buffer { requested, granted })
+    Ok(Buffer {
+        requested,
+        granted,
+        enlarge_error,
+    })
 }
 
 /// The sysctl `net.core.rmem_max` when the process can read it. A unit with `ProcSubset=pid`
@@ -117,6 +134,9 @@ pub(crate) enum Counter {
 pub(crate) struct Kernel {
     pub buffer: Buffer,
     pub counter: Counter,
+    /// Set once the socket has closed: the counter then holds its final value and is never read
+    /// again, since the socket's row is gone from the table.
+    pub finished: bool,
     table: PathBuf,
     inode: u64,
 }
@@ -124,7 +144,11 @@ impl Kernel {
     /// Bind the evidence to `socket`, bound at `address`: its inode names its row. The first
     /// sample is taken here.
     pub(crate) fn new(socket: impl AsFd, address: SocketAddr, buffer: Buffer) -> io::Result<Self> {
-        let inode = rustix::fs::fstat(socket.as_fd())?.st_ino;
+        let inode = rustix::fs::fstat(socket.as_fd())
+            .map_err(|error| {
+                io::Error::other(format!("cannot stat the UDP syslog socket: {error}"))
+            })?
+            .st_ino;
         let table = if address.is_ipv6() {
             TABLE_V6
         } else {
@@ -138,6 +162,7 @@ impl Kernel {
         let mut kernel = Self {
             buffer,
             counter: Counter::Unavailable("not sampled".into()),
+            finished: false,
             table,
             inode,
         };
@@ -147,8 +172,28 @@ impl Kernel {
 
     /// Read the table now. A failure replaces any earlier count with its reason.
     pub(crate) fn sample(&mut self) {
+        let counter = self.read();
+        self.record(counter);
+    }
+
+    /// Keep a count read by [`Kernel::read`], unless the socket has closed and the count is final.
+    pub(crate) fn record(&mut self, counter: Counter) {
+        if !self.finished {
+            self.counter = counter;
+        }
+    }
+
+    /// Take the last sample and freeze the counter. Call while the socket is still open.
+    pub(crate) fn finish(&mut self) {
+        self.sample();
+        self.finished = true;
+    }
+
+    /// Read the table, without touching the saved count, so a caller can do the file read
+    /// outside any lock.
+    pub(crate) fn read(&self) -> Counter {
         let table = self.table.display();
-        self.counter = match std::fs::read_to_string(&self.table) {
+        match std::fs::read_to_string(&self.table) {
             Err(error) => Counter::Unavailable(format!("cannot read {table}: {error}")),
             Ok(text) => match parse_drops(&text, self.inode) {
                 Err(error) => Counter::Unavailable(format!("cannot parse {table}: {error}")),
@@ -158,7 +203,7 @@ impl Kernel {
                 )),
                 Ok(Some(drops)) => Counter::Available(drops),
             },
-        };
+        }
     }
 }
 
@@ -171,6 +216,8 @@ mod tests {
   101: 0100007F:0202 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 40001 2 0000000000000000 0
   102: 0100007F:E4A1 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 40002 2 0000000000000000 17
 ";
+    const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+    const ROW_777_5: &str = "  1: 0100007F:0202 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 777 2 0000000000000000 5\n";
     const V6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
   201: 00000000000000000000000001000000:0202 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 50001 2 0000000000000000 9
 ";
@@ -214,6 +261,7 @@ mod tests {
             Buffer {
                 requested: 1,
                 granted: 1,
+                enlarge_error: None,
             },
         );
         let Counter::Unavailable(reason) = &kernel.counter else {
@@ -240,6 +288,46 @@ mod tests {
             let clamped = usize::try_from(limit).unwrap().min(REQUESTED_RCVBUF_BYTES);
             assert_eq!(buffer.granted, 2 * clamped);
         }
+    }
+
+    /// Value (#254): a refused enlarge request must not stop the daemon taking syslog. The
+    /// refusal comes back as text beside the size the socket kept, and a failing read-back
+    /// (a broken socket) is still an error. The kernel refusal is simulated through the seam.
+    #[test]
+    fn a_refused_enlarge_is_reported_and_the_socket_keeps_its_default_buffer() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let buffer = request_buffer_with(&socket, REQUESTED_RCVBUF_BYTES, |_, _| {
+            Err(rustix::io::Errno::PERM)
+        })
+        .unwrap();
+        assert_eq!(buffer.requested, REQUESTED_RCVBUF_BYTES);
+        assert!(buffer.granted >= 4096 && buffer.granted < REQUESTED_RCVBUF_BYTES);
+        let reason = buffer.enlarge_error.expect("the refusal is reported");
+        assert!(
+            reason.contains("SO_RCVBUF") && reason.contains("8388608"),
+            "{reason}"
+        );
+    }
+
+    /// Value (#254): the final count survives the socket closing. After `finish` the row may
+    /// vanish from the table (the socket is closed) and the count must not turn into
+    /// "unavailable".
+    #[test]
+    fn a_finished_counter_keeps_its_final_count_after_its_row_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("udp");
+        std::fs::write(&table, format!("{HEADER}{ROW_777_5}")).unwrap();
+        let buffer = Buffer {
+            requested: 1,
+            granted: 1,
+            enlarge_error: None,
+        };
+        let mut kernel = Kernel::at(table.clone(), 777, buffer);
+        kernel.finish();
+        std::fs::write(&table, HEADER).unwrap();
+        kernel.sample();
+        assert_eq!(kernel.counter, Counter::Available(5));
+        assert!(kernel.finished);
     }
 
     /// Value: the drop count is the kernel's own, for the right socket. A tiny buffer, a burst
@@ -269,6 +357,17 @@ mod tests {
             panic!("the counter was not readable: {:?}", kernel.counter);
         };
         assert!(drops > 0, "a burst into a minimal buffer dropped nothing");
-        assert_eq!(read + drops, SENT);
+        // Delivery and its drop happen inside `send` on stock loopback, so nothing is in flight
+        // and the sum is exact; a host that defers loopback work (RPS, softirq backlog) may still
+        // hold a few datagrams, so the test allows a small bounded number and never more datagrams
+        // than were sent.
+        assert!(
+            read + drops <= SENT,
+            "read {read} + drops {drops} > sent {SENT}"
+        );
+        assert!(
+            SENT - read - drops <= 8,
+            "read {read} + drops {drops} of {SENT} sent"
+        );
     }
 }
