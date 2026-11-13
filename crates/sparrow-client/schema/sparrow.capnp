@@ -164,6 +164,10 @@ struct SyslogListenerStatus {
   queuedDatagrams @31 :UInt32; queuedBytes @32 :UInt64; holdBytes @33 :UInt64;
   readerFullWaits @34 :UInt64; readerFullLongestMs @35 :UInt64; restamped @36 :UInt64;
   lostAtShutdown @37 :UInt64; lostAtShutdownBytes @38 :UInt64;
+  # Datagrams whose read instant and commit instant were both at or behind the archive watermark
+  # (the clock stepped back): stored with the instant just past the watermark, so their
+  # received_at is that fence-adjusted time and not the clock.
+  restampedPastWatermark @39 :UInt64;
 }
 enum KernelCounterState { notApplicable @0; available @1; unavailable @2; }
 struct SyslogListenerQuery { storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :Text; id @3 :Text; }

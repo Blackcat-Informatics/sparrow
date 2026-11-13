@@ -115,15 +115,27 @@ impl ArchiveState {
             .is_some_and(|through| position <= through.as_bytes())
     }
 
-    /// Publication behind the covered or in-flight range would never be archived.
-    fn admit_publication(&self, earliest: &[u8]) -> Result<(), Error> {
-        let fence = self
-            .through
+    /// The greatest position a publication may not take: the watermark or the end of the
+    /// segment in flight.
+    fn fence(&self) -> Option<&str> {
+        self.through
             .as_deref()
             .into_iter()
             .chain(self.intent.as_ref().map(|intent| intent.last.as_str()))
-            .max();
-        match fence {
+            .max()
+    }
+
+    /// The received-at instant of the fence, when there is one. A publication stamped later
+    /// than this instant is admitted whatever its identifier, so a caller that must not refuse
+    /// a log for its stamp can take the instant just past it.
+    #[must_use]
+    pub fn fence_millis(&self) -> Option<u64> {
+        self.fence()?.get(..20)?.parse().ok()
+    }
+
+    /// Publication behind the covered or in-flight range would never be archived.
+    fn admit_publication(&self, earliest: &[u8]) -> Result<(), Error> {
+        match self.fence() {
             Some(fence) if earliest <= fence.as_bytes() => Err(Error::new(
                 ARCHIVE_WATERMARK,
                 format!(

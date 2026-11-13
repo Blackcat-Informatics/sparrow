@@ -20,9 +20,12 @@ pub(super) struct FullEpisode {
 impl Metrics {
     /// The reader stops on a full queue. The kernel count is read first so the episode's
     /// start is a fresh figure.
-    fn full_wait_begin(&self) -> io::Result<()> {
+    fn full_wait_begin(&self, held: usize) -> io::Result<()> {
         self.sample_kernel()?;
-        self.full_wait(|status, now| status.begin_full_wait(now))
+        self.full_wait(|status, now| {
+            status.in_hand = Some(held);
+            status.begin_full_wait(now)
+        })
     }
     /// An observer tick while the reader waits: announce the episode if the interval allows.
     fn full_wait_tick(&self) -> io::Result<()> {
@@ -97,17 +100,25 @@ impl Metrics {
             Ok(())
         })
     }
-    /// The publisher failed: everything still queued is lost. Counts it, records the failure and
-    /// returns the datagrams and bytes lost for the error text.
+    /// The publisher failed: everything still queued, and the datagram the reader holds while it
+    /// waits for room, is lost. Counts it, ends the reader's wait (the reader goes with the
+    /// publisher, so the wait gauge must stop growing), records the failure and returns the
+    /// datagrams and bytes lost for the error text.
     fn abandon_queue(&self, error: &io::Error) -> io::Result<(usize, u64)> {
         let mut lost = (0, 0);
         self.update(|status| {
+            let held = status.in_hand.take();
             lost = (
-                status.queued_datagrams,
+                status.queued_datagrams + usize::from(held.is_some()),
                 status
                     .queued_bytes
-                    .saturating_sub((status.queued_datagrams * ENTRY_OVERHEAD) as u64),
+                    .saturating_sub((status.queued_datagrams * ENTRY_OVERHEAD) as u64)
+                    + held.unwrap_or(0) as u64,
             );
+            // A line for an episode that ends here would say the queue drained.
+            let _ = status.end_full_wait(tokio::time::Instant::now());
+            status.queued_datagrams = 0;
+            status.queued_bytes = 0;
             status.counts.lost_at_shutdown =
                 status.counts.lost_at_shutdown.saturating_add(lost.0 as u64);
             status.counts.lost_at_shutdown_bytes =
@@ -123,6 +134,29 @@ impl Metrics {
 }
 
 impl Status {
+    /// A datagram was stored just past the archive watermark; returns the journal line to print,
+    /// at most one a report interval, since a clock behind the watermark affects every datagram
+    /// until it recovers. The count is in status.
+    pub(super) fn past_watermark_line(
+        &mut self,
+        read_at: u64,
+        commit: u64,
+        stamp: u64,
+        now: tokio::time::Instant,
+    ) -> Option<String> {
+        if self
+            .fenced_announced_at
+            .is_some_and(|at| now.duration_since(at) < HOLD_REPORT_INTERVAL)
+        {
+            return None;
+        }
+        self.fenced_announced_at = Some(now);
+        Some(format!(
+            "sparrowd: syslog listener {}: stored a datagram just past the archive watermark because the clock is behind it ({} so far); read at {read_at} ms, clock {commit} ms, stamped {stamp} ms; its received_at is that fence-adjusted time, not the clock",
+            self.definition.id, self.counts.restamped_past_watermark
+        ))
+    }
+
     /// The reader stops on a full queue at `now`; returns the journal line to print, if any.
     fn begin_full_wait(&mut self, now: tokio::time::Instant) -> io::Result<Option<String>> {
         increment(&mut self.counts.reader_full_waits)?;
@@ -168,6 +202,7 @@ impl Status {
 
     /// The reader has room again at `now`.
     fn end_full_wait(&mut self, now: tokio::time::Instant) -> Option<String> {
+        self.in_hand = None;
         if let Some(since) = self.waiting_since.take() {
             let waited = now.duration_since(since);
             self.counts.reader_full_longest_ms = self
@@ -342,7 +377,7 @@ impl Reader<'_> {
         let wanted = u32::try_from(cost).map_err(io::Error::other)?;
         let budget = match self.budget.clone().try_acquire_many_owned(wanted) {
             Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => self.wait_for_room(wanted).await?,
+            Err(TryAcquireError::NoPermits) => self.wait_for_room(wanted, size).await?,
             Err(error @ TryAcquireError::Closed) => return Err(io::Error::other(error)),
         };
         self.metrics.enqueued(cost)?;
@@ -361,8 +396,12 @@ impl Reader<'_> {
     /// suppressed at entry, on the observer tick (counted as held so the tick sends it); it owns
     /// no timer. The one acquire future is kept across ticks to keep its place in the queue. A
     /// stop does not end it: the datagram in hand is still published.
-    async fn wait_for_room(&mut self, wanted: u32) -> io::Result<OwnedSemaphorePermit> {
-        self.metrics.full_wait_begin()?;
+    async fn wait_for_room(
+        &mut self,
+        wanted: u32,
+        size: usize,
+    ) -> io::Result<OwnedSemaphorePermit> {
+        self.metrics.full_wait_begin(size)?;
         let _held = self.wake.hold();
         self.wake.mark_seen();
         let acquire = self.budget.clone().acquire_many_owned(wanted);
@@ -449,7 +488,7 @@ mod tests {
     use crate::syslog_listener::{
         printed,
         tests::{
-            Listener, frame_taken, listener, relieve, settle, status_json, stored_lengths,
+            Listener, frame_taken, listener_with, relieve, settle, status_json, stored_lengths,
             yield_until,
         },
     };
@@ -466,7 +505,12 @@ mod tests {
     }
 
     async fn udp(hold_bytes: Option<usize>) -> Udp {
-        let fixture = listener(SyslogTransport::Udp, 1, 1000);
+        udp_with(hold_bytes, false, u64::MAX).await
+    }
+
+    /// A UDP listener whose store may archive, and whose clock fails at read number `clock_fails_at`.
+    async fn udp_with(hold_bytes: Option<usize>, archiving: bool, clock_fails_at: u64) -> Udp {
+        let fixture = listener_with(SyslogTransport::Udp, 1, 1000, archiving);
         fixture
             .metrics
             .update(|status| {
@@ -479,7 +523,11 @@ mod tests {
         let base = crate::now().unwrap() - 3_600_000;
         let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let clock: Clock = Arc::new(move || {
-            Ok(base + 1000 * reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read >= clock_fails_at {
+                return Err(io::Error::other("the clock failed"));
+            }
+            Ok(base + 1000 * read)
         });
         let (stop, stopped) = watch::channel(false);
         let task = tokio::spawn(listen_udp(
@@ -810,12 +858,19 @@ mod tests {
         settle(&udp.fixture).await;
         let status = udp.status();
         assert_eq!(
-            status.queued_datagrams, 3,
-            "nothing reads after the failure"
+            status.queued_datagrams, 0,
+            "the failed queue is counted lost"
         );
         assert_eq!(
             (status.counts.lost_at_shutdown, status.counts.accepted),
             (3, 0)
+        );
+        udp.send(105).await;
+        settle(&udp.fixture).await;
+        assert_eq!(
+            udp.status().counts.lost_at_shutdown,
+            3,
+            "nothing reads after the failure"
         );
         assert!(
             status
@@ -824,31 +879,94 @@ mod tests {
         );
     }
 
+    /// Fence the store's archive at `instant`: one record stamped then is archived, so a
+    /// publication stamped at or before that instant is refused as behind the watermark.
+    fn fence_at(store: &sparrow_core::Store, instant: u64) {
+        let seed = store
+            .ingest("fence-seed", "source", "log", b"seed\n", instant)
+            .unwrap();
+        let position = format!("{instant:020}:{}", seed.record_ids[0]);
+        let intent = sparrow_core::ArchiveIntent {
+            segment_id: [1; 32],
+            first: position.clone(),
+            last: position,
+            records: 1,
+            artifacts: 0,
+        };
+        store.archive_intend(&intent).unwrap();
+        store.archive_commit(&intent.segment_id).unwrap();
+    }
+
+    /// The stored UDP records in store order (the fence seed has no receiver position).
+    fn udp_records(store: &sparrow_core::Store) -> Vec<sparrow_core::Record> {
+        let mut records = store.records(crate::now().unwrap()).unwrap();
+        records.retain(|record| record.receiver.is_some());
+        records.sort_by_key(|record| record.receiver.as_ref().map(|position| position.sequence));
+        records
+    }
+
     /// Value (#255): the archive fence refuses a publication behind the watermark with its own
-    /// code. A datagram stamped with its read instant is then offered once more with the commit
-    /// instant and counted restamped, never refused for its stamp, and the next datagram keeps
-    /// its own read instant. The refusal is injected under the code the store gives the fence.
+    /// code. A datagram whose read instant is behind a real fence is offered once more with the
+    /// commit instant and counted restamped, never refused for its stamp. Fails on the old
+    /// code, which answered the fence with `STORAGE_FAILURE` and stopped the listener.
     #[tokio::test(start_paused = true)]
-    async fn a_datagram_behind_the_archive_watermark_is_restamped_once_with_the_commit_instant() {
-        let udp = udp(None).await;
-        udp.fixture
-            .store
-            .space_floor()
-            .refuse_next_write_for_tests(sparrow_core::ARCHIVE_WATERMARK);
+    async fn a_datagram_behind_the_archive_watermark_is_restamped_with_the_commit_instant() {
+        let udp = udp_with(None, true, u64::MAX).await;
+        fence_at(&udp.fixture.store, udp.base + 1_800_000);
         let before = crate::now().unwrap();
         udp.send(101).await;
-        udp.until_stored(1).await;
         udp.send(102).await;
         udp.until_stored(2).await;
         let status = udp.status();
-        assert_eq!((status.counts.restamped, status.counts.refused), (1, 0));
-        let mut records = udp.fixture.store.records(crate::now().unwrap()).unwrap();
-        records.sort_by_key(|record| record.receiver.as_ref().map(|position| position.sequence));
-        assert!(
-            records[0].received_at >= before,
-            "restamped with the commit instant"
+        assert_eq!(
+            (
+                status.counts.restamped,
+                status.counts.restamped_past_watermark,
+                status.counts.refused
+            ),
+            (2, 0, 0)
         );
-        assert_eq!(records[1].received_at, udp.base + 1000);
+        for record in udp_records(&udp.fixture.store) {
+            assert!(
+                record.received_at >= before,
+                "stamped with the commit instant"
+            );
+        }
+        udp.finish().await.unwrap();
+    }
+
+    /// Value (#255, mandate: a log is never refused for stamping): when the clock has stepped
+    /// back behind the archive watermark the commit instant is refused too. The datagram is
+    /// then stored just past the fence, counted `restamped_past_watermark` and journaled once
+    /// (the second datagram is inside the report interval), and the listener goes on. Fails on
+    /// the code that gave up after the second refusal and stopped the daemon.
+    #[tokio::test(start_paused = true)]
+    async fn a_datagram_refused_at_both_instants_is_stored_just_past_the_archive_watermark() {
+        let udp = udp_with(None, true, u64::MAX).await;
+        let fence = crate::now().unwrap() + 600_000;
+        fence_at(&udp.fixture.store, fence);
+        udp.send(101).await;
+        udp.send(102).await;
+        udp.until_stored(2).await;
+        let status = udp.status();
+        assert_eq!(
+            (
+                status.counts.restamped,
+                status.counts.restamped_past_watermark,
+                status.counts.refused
+            ),
+            (0, 2, 0)
+        );
+        assert!(!udp.task.is_finished(), "the listener goes on");
+        for record in udp_records(&udp.fixture.store) {
+            assert_eq!(record.received_at, fence + 1);
+        }
+        let lines: Vec<String> = printed::lines()
+            .into_iter()
+            .filter(|line| line.contains("just past the archive watermark"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("not the clock"), "{lines:?}");
         udp.finish().await.unwrap();
     }
 
@@ -942,5 +1060,64 @@ mod tests {
         assert_eq!(status.queued_datagrams, fits);
         assert_eq!(status.queued_bytes, (fits * (1 + ENTRY_OVERHEAD)) as u64);
         udp.finish().await.unwrap();
+    }
+
+    /// Value (#255): a publisher error with a full queue loses the queue and also the datagram
+    /// the reader holds while it waits for room. Both are counted and named, and the reader's
+    /// wait ends with the listener, so the longest-wait gauge stops growing. Fails on the code
+    /// that counted only the queue and left the wait running.
+    #[tokio::test(start_paused = true)]
+    async fn a_publisher_error_with_a_full_queue_counts_the_datagram_the_reader_holds() {
+        let mut udp = udp(Some(MIN_HOLD_BYTES)).await;
+        udp.pressure().await;
+        let lengths = fill_queue(&udp, 0).await;
+        let floor = udp.fixture.store.space_floor();
+        floor.refuse_writes_for_tests(false);
+        floor.refuse_next_write_for_tests("STORAGE_FAILURE");
+        udp.fixture.wake.wake();
+        yield_until("listen returns without a stop", || udp.task.is_finished()).await;
+        let error = udp.joined().await.unwrap_err();
+        assert!(
+            error.to_string().contains("18 queued datagram(s)"),
+            "{error}"
+        );
+        let status = udp.status();
+        assert_eq!(status.counts.lost_at_shutdown, 18);
+        assert_eq!(
+            status.counts.lost_at_shutdown_bytes,
+            lengths.iter().sum::<u64>()
+        );
+        assert_eq!((status.queued_datagrams, status.in_hand), (0, None));
+        let longest = |status: &Status| status_json(status)["reader_full_longest_ms"].clone();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(
+            longest(&udp.status()),
+            longest(&status),
+            "the wait gauge stopped"
+        );
+    }
+
+    /// Value (#255, the design's reader-error path): a reader error closes the queue; the
+    /// publisher still stores what is queued, and only then does `listen` return the reader's
+    /// error. The clock failing at the third read is the reader's error.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_error_lets_the_publisher_finish_the_queue_then_is_returned() {
+        let mut udp = udp_with(None, false, 2).await;
+        udp.pressure().await;
+        udp.send(101).await;
+        udp.send(102).await;
+        udp.until_queued(2).await;
+        udp.send(103).await;
+        settle(&udp.fixture).await;
+        assert!(
+            !udp.task.is_finished(),
+            "the queue is still to be published"
+        );
+        relieve(&udp.fixture);
+        yield_until("listen returns", || udp.task.is_finished()).await;
+        let error = udp.joined().await.unwrap_err();
+        assert!(error.to_string().contains("the clock failed"), "{error}");
+        assert_eq!(udp.status().counts.accepted, 2);
+        assert_eq!(stored_lengths(&udp.fixture.store), [101, 102]);
     }
 }

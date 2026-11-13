@@ -2531,8 +2531,9 @@ risks were accepted on 2026-10-27.
 Explicit `[[syslog]]` entries select TCP or UDP, source, loopback address,
 maximum message bytes (480..65536), maximum connections (TCP 1..16; UDP 1),
 and complete-frame timeout (1..60000 ms). A UDP entry may also set `hold_bytes`,
-the bound of its queue (1048576..1073741824, default 67108864); it is refused on a
-TCP entry, and the `hold_bytes` of all UDP entries together may not exceed 536870912.
+the bound of its queue (1048576..536870912, default 67108864); it is refused on a
+TCP entry. The `hold_bytes` of all UDP entries together may not exceed 536870912, which is
+also the most one entry can have.
 TCP additionally requires a framing
 law: `octet_counting`, `lf`, or `cr_lf`. The framing trailer is excluded from
 the original packet; LF framing preserves a preceding CR. No framing guesses
@@ -2640,19 +2641,29 @@ reader and a publisher joined by a first-in first-out queue bounded in bytes:
   the arrivals. Nothing is dropped in the daemon. When the kernel buffer fills too, the
   kernel drops the newest datagrams and counts them in `kernel_drops`, so what is
   stored is an ordered prefix and the loss is counted. The reader's wait ends when the
-  publisher frees room. A stop does not end it, because the datagram in hand is still
-  published. The wait owns no timer.
+  publisher frees room. A stop does not end it: the datagram in hand is published if the
+  store takes it, and counted lost with the rest of the queue if the store is still under
+  pressure at the stop (see the stop below). The wait owns no timer.
 - A datagram waits for the store with its read instant. A client that pages by moving
   `received_from` past the last record it saw will not see a datagram stored behind that
   position; a read run again over the range does, and a pin's membership does not change.
   If the store refuses the read instant as at or behind the archive watermark
   (`ARCHIVE_WATERMARK`), the publisher offers the datagram once more with the commit
-  instant and counts it `restamped`: a log is never refused for its stamp. Any other
-  `STORAGE_FAILURE` is not retried.
+  instant and counts it `restamped`. If the commit instant is also at or behind the
+  watermark (the clock stepped back), the datagram is still not refused: it is stored with
+  the instant just past the watermark (the fence plus one millisecond), counted
+  `restamped_past_watermark`, and journaled, at most one line a minute. Its `received_at` is
+  then that fence-adjusted time and not the clock; the read instant and the clock appear in
+  the journal line. A log is never refused for its stamp. Any other `STORAGE_FAILURE` is not
+  retried.
 - A store error that is neither pressure nor a counted refusal returns from the
   listener at once. The reader stops with it, the datagrams still queued are counted in
-  `lost_at_shutdown` and named in the error, and the daemon's worker health gate stops
-  the daemon, so a reader never fills a queue that nobody drains.
+  `lost_at_shutdown` (the datagram the reader holds while it waits for room is counted with
+  them, and its wait ends, so `reader_full_longest_ms` stops growing) and named in the error,
+  and the daemon's worker health gate stops the daemon, so a reader never fills a queue that
+  nobody drains. Datagrams still in the kernel buffer at this exit are lost and not counted.
+- A socket or stamping error in the reader closes the queue: the publisher stores what is
+  queued, and then the listener returns the reader's error.
 - On a stop the reader drains the socket, reading up to the queue bound, and the
   publisher publishes the queue while the store accepts it. A stop that finds the store
   under pressure gives the head one last attempt. If that is refused, the head and the
@@ -2662,7 +2673,9 @@ reader and a publisher joined by a first-in first-out queue bounded in bytes:
 There is no spool. The loss window is the queue and the kernel buffer on any exit the
 daemon does not get to count: a crash, a kill, an out-of-memory kill and the exit on a
 full disk lose up to `hold_bytes` of queue and the kernel buffer for each UDP listener,
-uncounted, because the process that would count them is gone. A stop inside the unit's
+uncounted, because the process that would count them is gone. A publisher error counts the
+queue and the datagram in the reader's hand, but the kernel buffer at that exit is lost
+uncounted too. A stop inside the unit's
 `TimeoutStopSec` counts the queue's remainder as above; datagrams left in the kernel
 beyond the drain bound are lost uncounted.
 
@@ -2740,7 +2753,8 @@ included until it is stored, and the budget they use, length plus 128 each), `ho
 (the bound), `reader_full_waits` (times the reader stopped on a full queue),
 `reader_full_longest_ms` (the longest such wait, finished or running), `restamped`
 (datagrams published with the commit instant after the archive watermark refused the
-read instant), and `lost_at_shutdown` with `lost_at_shutdown_bytes`. The daemon journals
+read instant), `restamped_past_watermark` (datagrams that the watermark refused at the commit
+instant too, stored just past it), and `lost_at_shutdown` with `lost_at_shutdown_bytes`. The daemon journals
 an episode of full-queue waits as it does a hold: the entering line gives the queued
 datagrams and bytes against the bound and the kernel drops so far, with at most one a
 minute per listener. An episode the limit suppressed is announced by the next wait or

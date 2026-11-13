@@ -154,6 +154,10 @@ pub(crate) fn listener(
             )
             .with("restamped", listener.get_restamped().to_string())
             .with(
+                "restamped_past_watermark",
+                listener.get_restamped_past_watermark().to_string(),
+            )
+            .with(
                 "lost_at_shutdown",
                 listener.get_lost_at_shutdown().to_string(),
             )

@@ -74,12 +74,13 @@ pub struct SyslogListener {
 
 /// Bytes the reader may queue by default.
 pub const DEFAULT_HOLD_BYTES: usize = 64 << 20;
-/// Least and greatest `hold_bytes` of one listener.
+/// Least `hold_bytes` of one listener.
 pub const MIN_HOLD_BYTES: usize = 1 << 20;
-/// See [`MIN_HOLD_BYTES`].
-pub const MAX_HOLD_BYTES: usize = 1 << 30;
 /// Greatest sum of the `hold_bytes` of all UDP listeners: a quarter of the unit's `MemoryHigh`.
+/// It is also the greatest for one listener.
 pub const MAX_TOTAL_HOLD_BYTES: usize = 512 << 20;
+/// Greatest `hold_bytes` of one listener: the whole total.
+pub const MAX_HOLD_BYTES: usize = MAX_TOTAL_HOLD_BYTES;
 /// Budget a queued datagram costs beyond its length, so a flood of tiny datagrams is bounded in
 /// count as well as in bytes.
 pub const ENTRY_OVERHEAD: usize = 128;
@@ -122,7 +123,7 @@ pub(crate) fn validate(listeners: &[SyslogListener]) -> io::Result<()> {
                 || !(MIN_HOLD_BYTES..=MAX_HOLD_BYTES).contains(&bytes))
         {
             return Err(io::Error::other(
-                "syslog hold_bytes is for UDP listeners only and must be 1048576..1073741824",
+                "syslog hold_bytes is for UDP listeners only and must be 1048576..536870912",
             ));
         }
     }
@@ -160,6 +161,9 @@ struct Counts {
     /// Datagrams published with the commit instant because their read instant was behind the
     /// archive watermark.
     restamped: u64,
+    /// Datagrams stored just past the archive watermark because the commit instant was behind
+    /// it too (the clock stepped back).
+    restamped_past_watermark: u64,
     /// Datagrams read and not stored when the listener stopped: the queue's remainder under
     /// pressure, or what a failed publisher could not publish. Payload bytes alongside.
     lost_at_shutdown: u64,
@@ -218,6 +222,10 @@ pub(crate) struct Status {
     /// Set when an episode begins, so the next time the queue drains the kernel count is read
     /// again; cleared by that read. Without it every drain to empty would read the file.
     sample_due: bool,
+    /// The payload bytes of the datagram the reader holds while it waits for room.
+    in_hand: Option<usize>,
+    /// When the last past-the-watermark stamp was journaled.
+    fenced_announced_at: Option<tokio::time::Instant>,
 }
 #[derive(Clone)]
 struct Metrics(Arc<Mutex<Status>>);
@@ -312,6 +320,8 @@ impl Status {
             full: None,
             full_announced_at: None,
             sample_due: false,
+            in_hand: None,
+            fenced_announced_at: None,
         }
     }
 
@@ -743,6 +753,21 @@ impl Intake {
     }
 }
 
+/// Which instant a stored packet carries.
+#[derive(Clone, Copy)]
+enum Stamped {
+    /// The instant it was read, or for a TCP frame the commit instant.
+    Read,
+    /// The commit instant, because the archive watermark refused the read instant.
+    Commit,
+    /// The instant just past the archive watermark, because it refused the commit instant too.
+    PastWatermark {
+        read_at: u64,
+        commit: u64,
+        stamp: u64,
+    },
+}
+
 /// A packet in hand and where it came from.
 struct Packet {
     bytes: Arc<[u8]>,
@@ -762,7 +787,7 @@ async fn publish(
     stamp: Option<u64>,
 ) -> io::Result<Published> {
     enum Attempt {
-        Stored { failed: bool, restamped: bool },
+        Stored { failed: bool, stamped: Stamped },
         Refused { durable: bool },
         Pressured,
     }
@@ -770,15 +795,38 @@ async fn publish(
     let result = tokio::task::spawn_blocking(move || {
         let commit = crate::now()?;
         let mut now = stamp.unwrap_or(commit);
-        let mut restamped = false;
+        let mut stamped = Stamped::Read;
         let artifact = match loop {
             match store.ingest_received_syslog(&source, &receiver, &bytes, now) {
-                Err(error) if error.code == sparrow_core::ARCHIVE_WATERMARK && !restamped => {
-                    if stamp.is_none() {
+                // Only a stamped packet is restamped; the commit instant of a TCP frame
+                // behind the watermark is a clock regression and stays an error.
+                Err(error) if error.code == sparrow_core::ARCHIVE_WATERMARK => {
+                    let Some(read_at) = stamp else {
                         break Err(error);
-                    }
-                    restamped = true;
-                    now = crate::now()?;
+                    };
+                    let next = if matches!(stamped, Stamped::Read) {
+                        stamped = Stamped::Commit;
+                        crate::now()?
+                    } else {
+                        // The clock is behind the watermark too: a log is never refused for
+                        // its stamp, so take the instant just past the fence. It always
+                        // advances, so a moving watermark cannot loop this forever.
+                        let fence = store
+                            .archive_state()?
+                            .and_then(|state| state.fence_millis())
+                            .and_then(|fence| fence.checked_add(1))
+                            .filter(|next| *next > now);
+                        let Some(next) = fence else {
+                            break Err(error);
+                        };
+                        stamped = Stamped::PastWatermark {
+                            read_at,
+                            commit,
+                            stamp: next,
+                        };
+                        next
+                    };
+                    now = next;
                 }
                 result => break result,
             }
@@ -815,24 +863,42 @@ async fn publish(
         })?;
         Ok::<_, sparrow_core::Error>(Attempt::Stored {
             failed: snapshot.diagnostic.is_some(),
-            restamped,
+            stamped,
         })
     })
     .await
     .map_err(io::Error::other)?
     .map_err(io::Error::other)?;
     match result {
-        Attempt::Stored { failed, restamped } => {
+        Attempt::Stored { failed, stamped } => {
+            let mut line = None;
             metrics.update(|status| {
                 increment(&mut status.counts.accepted)?;
-                if restamped {
-                    increment(&mut status.counts.restamped)?;
+                match stamped {
+                    Stamped::Read => {}
+                    Stamped::Commit => increment(&mut status.counts.restamped)?,
+                    Stamped::PastWatermark {
+                        read_at,
+                        commit,
+                        stamp,
+                    } => {
+                        increment(&mut status.counts.restamped_past_watermark)?;
+                        line = status.past_watermark_line(
+                            read_at,
+                            commit,
+                            stamp,
+                            tokio::time::Instant::now(),
+                        );
+                    }
                 }
                 if failed {
                     increment(&mut status.counts.interpretation_failures)?;
                 }
                 Ok(())
             })?;
+            if let Some(line) = line {
+                journal(&line);
+            }
             Ok(Published::Stored)
         }
         Attempt::Refused { durable } => {
@@ -1515,6 +1581,7 @@ impl Status {
             .max(Duration::from_millis(self.counts.reader_full_longest_ms));
         out.set_reader_full_longest_ms(u64::try_from(longest.as_millis()).unwrap_or(u64::MAX));
         out.set_restamped(self.counts.restamped);
+        out.set_restamped_past_watermark(self.counts.restamped_past_watermark);
         out.set_lost_at_shutdown(self.counts.lost_at_shutdown);
         out.set_lost_at_shutdown_bytes(self.counts.lost_at_shutdown_bytes);
     }
@@ -1982,10 +2049,28 @@ mod tests {
         connections: usize,
         timeout_ms: u32,
     ) -> Listener {
+        listener_with(transport, connections, timeout_ms, false)
+    }
+
+    /// A listener whose store archives before deleting, so it has an archive fence.
+    pub(super) fn listener_with(
+        transport: SyslogTransport,
+        connections: usize,
+        timeout_ms: u32,
+        archiving: bool,
+    ) -> Listener {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("store");
         let config =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        if archiving {
+            let text = std::fs::read_to_string(&config).unwrap();
+            let table = format!(
+                "\n[archive]\ndir = \"{}\"\n",
+                dir.path().join("nas").display()
+            );
+            std::fs::write(&config, text + &table).unwrap();
+        }
         let store = crate::ServerConfig::read(&config)
             .unwrap()
             .open_store()
@@ -2938,7 +3023,8 @@ mod tests {
             datagram("b", Some(MAX_TOTAL_HOLD_BYTES - MIN_HOLD_BYTES)),
         ])
         .unwrap();
-        assert!(validate(&[datagram("a", Some(MAX_HOLD_BYTES))]).is_err());
+        validate(&[datagram("a", Some(MAX_HOLD_BYTES))]).unwrap();
+        assert_eq!(MAX_HOLD_BYTES, MAX_TOTAL_HOLD_BYTES);
         for bytes in [MIN_HOLD_BYTES - 1, MAX_HOLD_BYTES + 1] {
             assert!(validate(&[datagram("a", Some(bytes))]).is_err());
         }

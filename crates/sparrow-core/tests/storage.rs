@@ -20364,6 +20364,34 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
         .unwrap();
 }
 
+/// INVARIANT (#255): the fence names the instant a publication must be stamped after to be
+/// admitted whatever its identifier: one millisecond past it is admitted, and an earlier
+/// instant is refused with the typed code. A store with no fence names none.
+#[test]
+fn the_archive_fence_names_the_instant_a_publication_must_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving_config()).unwrap();
+    assert_eq!(store.archive_state().unwrap().unwrap().fence_millis(), None);
+    let first = store
+        .ingest("fence-first", "source", "log", b"a\n", 5)
+        .unwrap();
+    archive_records(&store, 1, &[archive_position(5, &first.record_ids[0])]);
+    assert_eq!(
+        store.archive_state().unwrap().unwrap().fence_millis(),
+        Some(5)
+    );
+    assert_eq!(
+        store
+            .ingest("fence-before", "source", "log", b"b\n", 4)
+            .unwrap_err()
+            .code,
+        sparrow_core::ARCHIVE_WATERMARK
+    );
+    store
+        .ingest("fence-past", "source", "log", b"c\n", 6)
+        .unwrap();
+}
+
 /// INVARIANT: pressure retirement stops at the archive watermark, reports that it is
 /// waiting for the archive, and keeps refusing data writes until archiving catches up.
 #[test]
