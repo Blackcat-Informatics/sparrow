@@ -183,8 +183,10 @@ work with no external event: the next retirement or deletion deadline or the
 earliest live pin deadline. The worker sleeps until then, never less than one
 second and never more than one hour. The ceiling protects against a wall clock
 that stepped forward, since the sleep itself is monotonic. A pin release, a pin
-commit and an archive commit wake the worker at once. After an error, or a pass
-skipped below the free-space floor, it retries after 60 seconds. Retry rows
+commit and an archive commit wake the worker at once. A pass skipped below the
+free-space floor waits for the floor's resume, which wakes it at once (#247); the
+one-hour ceiling is only its backstop. A pass that failed retries after 60 seconds,
+for want of any event that says it would now succeed. Retry rows
 (`request:`) have no time index; one pass scans them once per hour, and their
 logical expiry is exact at read time regardless. The purge of expired read
 leases runs on its own 60-second tick, not inside expiry. Expiry honours each row's
@@ -270,7 +272,10 @@ for the floor.
 The worker no longer retries every second and discards the result. After a pass that
 made progress it looks again after a second; each pass that made none doubles the delay
 to a ceiling of 30 seconds, and a pin release, an archive commit or the end of a forced
-compaction runs a pass at once. The daemon journals every entry to and exit from a
+compaction, the floor's resume, and a refused write that requests a pass run a pass at once
+(#247). The delay is the one observer of native RocksDB flush and compaction state: the store
+has no completion hook for it, so the pass reads the pending counts itself, and waiting less
+cannot change what native work does. The daemon journals every entry to and exit from a
 non-ready phase, and, at most once a minute, the passes that made no progress.
 
 The status `pressureStatus` extends additively (schema 71, no version change; an older
@@ -729,7 +734,8 @@ other duties, which keep their own schedule, so it delays only the page. When
 that wait ended while another duty ran, or the page is the first after a retry,
 writers may have arrived since, so the worker waits again immediately before the
 page, inline. A failed page commits nothing, sets that migration's `failure` and
-is retried every 60 seconds until it succeeds. Nothing is skipped. The daemon
+is retried every 60 seconds until it succeeds; a page skipped below the free-space floor
+is not a failure and runs when the floor resumes (#247). Nothing is skipped. The daemon
 logs `sparrowd: migration NAME start pages=1 done=D total=T` at a migration's
 first committed page of the session,
 `sparrowd: migration NAME progress pages=P done=D total=T watermark=W elapsed_seconds=S`
@@ -2552,12 +2558,30 @@ stream or discards a frame:
   On daemon shutdown a frame in flight is published as a malformed packet and
   counted `framing_failure`; bytes still unread in the socket cannot be counted.
 - When the store answers a TCP frame with `STORAGE_PRESSURE`, the frame is held,
-  not discarded, and the connection stays open (#243). The listener retries the
-  same bytes and reads no further frame, so the sender's TCP window closes and
-  the sender holds the rest. Pressure can last as long as reclamation takes. The
-  retry runs on a backoff from 50 ms to 1 s and starts at once when maintenance
-  signals that pressure may have changed: a pressure pass ending, a pin release,
-  an archive commit, a forced compaction ending or the free-space floor ending.
+  not discarded, and the connection stays open (#243). The listener offers the
+  same bytes again and reads no further frame, so the sender's TCP window closes and
+  the sender holds the rest. Pressure can last as long as reclamation takes. A held
+  frame blocks on a wake, the stop and nothing else (#247): it owns no timer and
+  never retries on a clock. A frame waiting for an operation permit blocks on the
+  permit alone. Every ending the daemon can see sends the wake, and one observer
+  covers the two it cannot:
+
+  | Ending | Signal | Observer |
+  | --- | --- | --- |
+  | A pressure pass ends, or fails | wake from the maintenance worker | event |
+  | A pin release or commit, an archive commit, a forced compaction ending | wake from the store's retention callback | event |
+  | The free-space floor resumes | wake sent by the floor itself in the observation that sees the edge, whichever loop that is | event |
+  | A refused write requests a pressure pass | wakes the pass at once; the pass's end wakes the frame | event |
+  | Free space returns because another process freed it | none exists | the maintenance worker's one-second floor observation wakes every held frame while any is held |
+  | Native flush or compaction work completes | none exists; the store has no listener | the same one-second observation |
+  | Stop | the stop channel | event |
+  | An operation permit frees | the semaphore | event |
+
+  The one-second observation is the cadence at which the daemon measures the floor; it
+  is one tick for every held frame, never a timer per frame. The same table governs the
+  other waits: expiry and online migration skipped below the floor wake on its resume;
+  the pressure pass's one-to-30-second delay is the observer of native state above.
+
   A held connection is not idle. The read timeout does not run while it holds,
   and an arrival at the connection ceiling cannot reclaim it; it is reclaimed
   only after its frame is stored and it waits at a frame boundary. A frame
@@ -2569,9 +2593,9 @@ stream or discards a frame:
   attempt and, if the store still refuses it, is counted `refused` as before.
   A wait for an operation permit is not cut short by a stop: the frame must
   still be published, which takes a permit from the budget shutdown waits on
-  anyway. Each retry is a refused write attempt, so the store-wide refusal
+  anyway. Each new offer is a refused write attempt, so the store-wide refusal
   counters (the free-space floor's `refused_writes` and the pressure status's
-  `refused_writes`) count attempts and rise by one per retry; the listener's
+  `refused_writes`) count attempts and rise by one per offer; the listener's
   held counters count frames.
   Refusals that no retry can change (`RESOURCE_LIMIT`) and UDP datagrams are
   not held; they keep their counted discard.

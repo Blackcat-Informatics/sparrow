@@ -335,10 +335,22 @@ impl Writer {
         } else {
             (*requested).min(estimate)
         };
-        if pressure.status.phase == PressurePhase::Ready {
+        let first = pressure.status.phase == PressurePhase::Ready;
+        if first {
             pressure.status.phase = PressurePhase::Requested;
         }
         pressure.status.refused_writes = pressure.status.refused_writes.saturating_add(1);
+        drop(pressure);
+        if first {
+            let waker = self
+                .pressure_request_waker
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(waker) = waker {
+                waker();
+            }
+        }
         Err(Error::new(
             "STORAGE_PRESSURE",
             "write would cross the maintenance reserve; bounded pressure maintenance requested; retry after measured physical recovery",

@@ -19,15 +19,22 @@ use tokio::sync::{Notify, watch};
 /// and paces the request-row scan.
 const EXPIRY_FLOOR: Duration = Duration::from_secs(1);
 const EXPIRY_CEILING: Duration = Duration::from_millis(EXPIRY_CEILING_MS);
-/// Retry interval of an expiry pass that failed or was skipped below the free-space floor.
+/// Retry interval of an expiry pass that failed. The failure's cause has no event: the pass
+/// ran and the native layer refused it, and nothing signals that it would now succeed. Its
+/// observer is this loop's expiry arm; 60 seconds keeps a persistent failure to one journal
+/// line a minute. A pass skipped below the free-space floor does not use it: the floor's
+/// resume edge wakes the pass (#247).
 const EXPIRY_RETRY: Duration = Duration::from_secs(60);
 /// Interval of the read-lease purge: expired read handles hold snapshots until it runs.
 const LEASE_INTERVAL: Duration = Duration::from_secs(60);
 /// Pause between table rewrite steps. A step only observes progress and turns
 /// native periodic compaction on or off, so it never holds the loop for long.
 const RECOMPRESSION_INTERVAL: Duration = Duration::from_secs(5);
-/// Retry interval of an online migration whose last page failed. While pages succeed the
-/// next one is admitted as a continuation, fairly with the other duties.
+/// Retry interval of an online migration whose last page failed, with the same reasoning as
+/// [`EXPIRY_RETRY`]: a failed page has no event, and this loop's migration arm observes it
+/// at this cadence. A page skipped below the free-space floor does not wait for it: the
+/// floor's resume edge wakes the migration (#247). While pages succeed the next one is
+/// admitted as a continuation, fairly with the other duties.
 const MIGRATION_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// Pages between journal progress lines of one online migration.
 const MIGRATION_PROGRESS_PAGES: u64 = 64;
@@ -58,6 +65,8 @@ impl Worker {
                 let _alive = alive;
                 let result = run(&store, stopped, flush, held).await;
                 store.set_retention_waker(None);
+                store.set_pressure_request_waker(None);
+                store.space_floor().set_resume_waker(None);
                 result
             })),
             ended,
@@ -246,6 +255,89 @@ fn expiry_delay(report: &ExpiryReport, now: u64) -> Duration {
         .clamp(EXPIRY_FLOOR, EXPIRY_CEILING)
 }
 
+/// Account for a failed pressure pass and return the delay to the next one. The store shows
+/// `Blocked` until the next pass; the duty journals a new native error at once and a repeat at
+/// a bounded rate, and retries on its backoff, never a busy loop. Held frames are woken: a
+/// failed pass is an ending they evaluate again, as they do after one that succeeded (#247).
+///
+/// The backoff (1 s doubling to 30 s) is this loop's observer of native `RocksDB` flush and
+/// compaction state, which has no completion hook in the store: the pass reads the pending
+/// counts, and waiting less cannot change what native work does. Every event the daemon does
+/// signal (pin release or commit, archive commit, forced compaction end, floor resume, a
+/// refused write requesting a pass) wakes the pass at once instead.
+fn pressure_failed(
+    store: &Store,
+    duty: &mut pressure_duty::Duty,
+    held: &sparrow_server::pressure_wake::PressureWake,
+    error: &Error,
+) -> Duration {
+    held.wake();
+    // A status that cannot be read is journaled and counted by the duty.
+    let status = store.pressure_status().map_err(|error| error.to_string());
+    let verdict = duty.failed(
+        sparrow_server::now().unwrap_or_default(),
+        &error.to_string(),
+        status.as_ref().map_err(String::as_str),
+    );
+    for line in &verdict.lines {
+        eprintln!("{line}");
+    }
+    verdict.delay
+}
+
+/// Observe the free-space floor for `job` and say whether it is paused. The floor's resume
+/// edge wakes held frames itself, in whichever observation consumes it (#247). This is also
+/// the one observer of the two endings that have no event: free space returning because
+/// another process freed it, and native flush or compaction work completing, which the store
+/// has no listener for. Its reclaim tick, one a second, is the cadence the daemon measures
+/// the floor at; while any frame is held it wakes them all to evaluate again, and no frame
+/// owns a timer. It runs before the below-floor skip, because reclamation is skipped exactly
+/// while the floor is paused, which is when held frames need the tick.
+fn observe_floor(
+    store: &Store,
+    job: Job,
+    held: &sparrow_server::pressure_wake::PressureWake,
+) -> Result<bool, String> {
+    let paused = store
+        .space_floor()
+        .observe(sparrow_server::now().map_err(|error| format!("clock failed: {error}"))?)
+        .map_err(|error| format!("free-space check failed: {error}"))?
+        .is_some();
+    if matches!(job, Job::Reclaim) {
+        held.observe_tick();
+    }
+    Ok(paused)
+}
+
+/// Skipped-duty counts of the test running on this thread, so a test waits for the skip it
+/// exercises as an event instead of sleeping.
+#[cfg(test)]
+mod skips {
+    use super::Job;
+    use std::cell::Cell;
+
+    thread_local! {
+        static EXPIRY: Cell<u64> = const { Cell::new(0) };
+        static MIGRATE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note(job: Job) {
+        match job {
+            Job::Expiry => EXPIRY.with(|count| count.set(count.get() + 1)),
+            Job::Migrate { .. } => MIGRATE.with(|count| count.set(count.get() + 1)),
+            _ => {}
+        }
+    }
+
+    pub(super) fn expiry() -> u64 {
+        EXPIRY.with(Cell::get)
+    }
+
+    pub(super) fn migrate() -> u64 {
+        MIGRATE.with(Cell::get)
+    }
+}
+
 async fn run(
     store: &Store,
     mut stopped: watch::Receiver<bool>,
@@ -258,6 +350,28 @@ async fn run(
     // do, so they wake it too instead of leaving it to its backoff (#211).
     let wake = Arc::new(Notify::new());
     let pressure_wake = Arc::new(Notify::new());
+    // The floor's resume edge wakes the duties that skipped below it, so none waits out a
+    // retry clock for it, and the held frames (#247). The edge is signalled by the floor's
+    // own observation, so it reaches this worker whichever loop consumes it. A refused write
+    // that requests a pressure pass wakes the pass the same way instead of waiting for its
+    // next scheduled time.
+    let migrate_wake = Arc::new(Notify::new());
+    store
+        .space_floor()
+        .set_resume_waker(Some(held.resume_waker({
+            let wake = Arc::clone(&wake);
+            let pressure_wake = Arc::clone(&pressure_wake);
+            let migrate_wake = Arc::clone(&migrate_wake);
+            move || {
+                wake.notify_one();
+                pressure_wake.notify_one();
+                migrate_wake.notify_one();
+            }
+        })));
+    store.set_pressure_request_waker(Some(Arc::new({
+        let pressure_wake = Arc::clone(&pressure_wake);
+        move || pressure_wake.notify_one()
+    })));
     store.set_retention_waker(Some(Arc::new({
         let wake = Arc::clone(&wake);
         let pressure_wake = Arc::clone(&pressure_wake);
@@ -317,6 +431,7 @@ async fn run(
                     _ = wake.notified(), if !continuation => Ok(Job::Expiry),
                     _ = tokio::task::yield_now(), if continuation => Ok(Job::Expiry),
                     _ = migrate.tick(), if !migrating => Ok(Job::Migrate { defer: true }),
+                    _ = migrate_wake.notified(), if !migrating => Ok(Job::Migrate { defer: true }),
                     deferred = deferred_page(&mut deferral), if migrating => {
                         deferred.map(|()| Job::Migrate { defer: stale })
                     }
@@ -329,23 +444,18 @@ async fn run(
         // rewriting off. Pressure maintenance runs too: it is what frees space, and it keeps
         // its own check that the maintenance reserve is free (#211). The floor is observed
         // on every duty so a pause and its end are counted in status.
-        let resumes = store.space_floor().status().resumes;
-        let paused = store
-            .space_floor()
-            .observe(sparrow_server::now().map_err(|error| format!("clock failed: {error}"))?)
-            .map_err(|error| format!("free-space check failed: {error}"))?
-            .is_some();
-        // A held syslog frame waits for the floor's end as for a pressure pass's (#243).
-        if store.space_floor().status().resumes != resumes {
-            held.wake();
-        }
+        let paused = observe_floor(store, job, &held)?;
         if paused && !runs_below_floor(job) {
             continuation = false;
             migrating = false;
             deferral = None;
+            // Expiry waits for the floor's resume edge, which wakes it; the ceiling is only the
+            // wall-clock bound every idle expiry sleep already has.
             if matches!(job, Job::Expiry) {
-                expiry_at = tokio::time::Instant::now() + EXPIRY_RETRY;
+                expiry_at = tokio::time::Instant::now() + EXPIRY_CEILING;
             }
+            #[cfg(test)]
+            skips::note(job);
             continue;
         }
         let owner = store.clone();
@@ -419,20 +529,8 @@ async fn run(
                 }
             }
             Err(error) if matches!(job, Job::Pressure) => {
-                // The store shows `Blocked` until the next pass; the duty journals a new
-                // native error at once and a repeat at a bounded rate, and retries on its
-                // backoff, never a busy loop.
-                // A status that cannot be read is journaled and counted by the duty.
-                let status = store.pressure_status().map_err(|error| error.to_string());
-                let verdict = pressure_duty.failed(
-                    sparrow_server::now().unwrap_or_default(),
-                    &error.to_string(),
-                    status.as_ref().map_err(String::as_str),
-                );
-                for line in &verdict.lines {
-                    eprintln!("{line}");
-                }
-                pressure_at = tokio::time::Instant::now() + verdict.delay;
+                pressure_at = tokio::time::Instant::now()
+                    + pressure_failed(store, &mut pressure_duty, &held, &error);
             }
             Err(error) => {
                 eprintln!("sparrowd: {} failed: {error}", job.name());
@@ -635,17 +733,11 @@ mod tests {
         worker.shutdown().await.unwrap();
     }
 
-    /// INVARIANT: a store opened with the owner index, the source summary migration and a
-    /// source timeline rebuild pending serves reads mid-migration, and those reads derive and
-    /// count the record graph's receipt-time fallback facts; the joined worker's pages then
-    /// finish every migration, after which the same read answers the same and the per-source
-    /// counters equal a full recount.
-    #[tokio::test]
-    async fn reads_report_pending_mid_migration_and_the_worker_finishes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("store");
-        let path =
-            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+    /// A store holding 300 records whose owner index, source summary and source timeline
+    /// migrations are pending, reopened so the worker's pages must run them.
+    fn store_with_pending_migrations(dir: &std::path::Path) -> Store {
+        let data = dir.join("store");
+        let path = sparrow_test_support::write_server_config(dir, &data, &data.join("rpc.sock"));
         let config = sparrow_server::ServerConfig::read(&path).unwrap();
         let store = config.open_store().unwrap();
         let now = sparrow_server::now().unwrap();
@@ -659,7 +751,18 @@ mod tests {
         sparrow_test_support::pending_source_summary_migration(&db).unwrap();
         sparrow_test_support::stale_source_context_cache(&db).unwrap();
         drop(db);
-        let store = config.open_store().unwrap();
+        config.open_store().unwrap()
+    }
+
+    /// INVARIANT: a store opened with the owner index, the source summary migration and a
+    /// source timeline rebuild pending serves reads mid-migration, and those reads derive and
+    /// count the record graph's receipt-time fallback facts; the joined worker's pages then
+    /// finish every migration, after which the same read answers the same and the per-source
+    /// counters equal a full recount.
+    #[tokio::test]
+    async fn reads_report_pending_mid_migration_and_the_worker_finishes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_pending_migrations(dir.path());
         let pending = store.migrations().unwrap();
         assert!(
             pending.iter().all(|m| !m.complete() && m.total.is_none()),
@@ -763,6 +866,165 @@ mod tests {
             failure.to_string(),
             "maintenance worker terminated unexpectedly"
         );
+    }
+
+    /// Value (#247): below the free-space floor expiry used to retry on a 60 second clock,
+    /// and the floor's resume was seen only by whichever loop observed it first; the daemon's
+    /// main loop does the same observation every second, so the resume could pass unseen by
+    /// maintenance. Protects: the pause is observed through the real measured free space,
+    /// the edge is consumed by an observer other than the worker (as the main loop does), and
+    /// expiry still runs within seconds of it, from the edge itself.
+    #[tokio::test]
+    async fn the_floor_resume_wakes_expiry_even_when_another_loop_consumes_the_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let now = sparrow_server::now().unwrap();
+        let old = now - 31 * 86_400_000;
+        let artifact = store
+            .ingest("expired-below-floor", "source", "log", b"old\n", old)
+            .unwrap();
+        let floor = store.space_floor();
+        floor.set_free_for_tests(Some(0));
+        assert!(floor.observe(now).unwrap().is_some());
+        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        // The first expiry pass runs at once and is skipped below the floor.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while skips::expiry() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expiry was never skipped below the floor");
+        assert!(
+            store.artifact(&artifact.id).is_ok(),
+            "expiry ran below the floor"
+        );
+        floor.set_free_for_tests(None);
+        // This thread plays the main loop: it consumes the edge before the worker can.
+        assert!(
+            floor
+                .observe(sparrow_server::now().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.artifact(&artifact.id).is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("expiry waited out a retry clock after the floor resumed");
+        worker.shutdown().await.unwrap();
+    }
+
+    /// Value (#247): an online migration page skipped below the floor waited out the 60 second
+    /// retry tick. Protects: the floor's resume edge, consumed by another observer, runs the
+    /// pending migrations to completion within seconds.
+    #[tokio::test]
+    async fn the_floor_resume_wakes_a_migration_skipped_below_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_pending_migrations(dir.path());
+        let floor = store.space_floor();
+        floor.set_free_for_tests(Some(0));
+        assert!(
+            floor
+                .observe(sparrow_server::now().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        // The first migration tick runs at once and is skipped below the floor.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while skips::migrate() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("migration was never skipped below the floor");
+        assert!(
+            store.migrations().unwrap().iter().all(|m| !m.complete()),
+            "a migration ran below the floor"
+        );
+        floor.set_free_for_tests(None);
+        assert!(
+            floor
+                .observe(sparrow_server::now().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !store
+                .migrations()
+                .unwrap()
+                .iter()
+                .all(sparrow_core::MigrationStatus::complete)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("migration waited out its retry tick after the floor resumed");
+        worker.shutdown().await.unwrap();
+    }
+
+    /// Value (#247): the held frames' only wake for endings with no event (free space
+    /// returning, native work completing) is the reclaim observation. Protects, counting the
+    /// observation in isolation from the pressure pass's own wake: a reclaim observation while
+    /// the floor is paused and no event fired wakes a held frame; with none held it sends
+    /// nothing; and no other duty ticks.
+    #[test]
+    fn the_reclaim_observation_wakes_held_frames_below_the_floor_and_only_while_one_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        store.space_floor().set_free_for_tests(Some(0));
+        let held = sparrow_server::pressure_wake::PressureWake::default();
+        assert!(observe_floor(&store, Job::Reclaim, &held).unwrap());
+        assert_eq!(held.sent(), 0, "nothing is held");
+        let waiter = held.subscribe();
+        let frame = waiter.hold();
+        assert!(observe_floor(&store, Job::Flush, &held).unwrap());
+        assert_eq!(held.sent(), 0, "only the reclaim observation ticks");
+        assert!(observe_floor(&store, Job::Reclaim, &held).unwrap());
+        assert_eq!(held.sent(), 1, "the tick wakes a held frame while paused");
+        drop(frame);
+        assert!(observe_floor(&store, Job::Reclaim, &held).unwrap());
+        assert_eq!(held.sent(), 1, "the frame was released");
+    }
+
+    /// Value (#247): a failed pressure pass is an ending a held syslog frame must evaluate
+    /// again; it used to set the backoff only, leaving the frame to its own clock. Protects:
+    /// the failure wakes the held frames and still returns the duty's backoff delay.
+    #[test]
+    fn a_failed_pressure_pass_wakes_the_held_frames_and_backs_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let held = sparrow_server::pressure_wake::PressureWake::default();
+        let delay = pressure_failed(
+            &store,
+            &mut pressure_duty::Duty::default(),
+            &held,
+            &Error::new("STORAGE_FAILURE", "native pass failure"),
+        );
+        assert_eq!(held.sent(), 1);
+        assert!(delay >= pressure_duty::BASE_DELAY && delay <= pressure_duty::BACKOFF_CEILING);
     }
 
     #[tokio::test]

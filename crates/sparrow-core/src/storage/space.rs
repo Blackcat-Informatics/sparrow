@@ -3,7 +3,7 @@
 
 //! One filesystem free-space floor shared by every store write and daemon admission.
 
-use super::Error;
+use super::{Error, RetentionWaker};
 use std::{
     path::Path,
     sync::{
@@ -15,7 +15,7 @@ use std::{
 /// Every pause the free-space floor imposed on this store since it opened, shared by all
 /// clones of its [`SpaceFloor`]. Edges are detected where the floor is observed with a
 /// clock ([`SpaceFloor::observe`]), so a pause is counted once however many duties see it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Ledger {
     paused: AtomicBool,
     /// Unix milliseconds the current pause began; zero while not paused.
@@ -24,12 +24,48 @@ struct Ledger {
     resumes: AtomicU64,
     /// Writes refused by [`SpaceFloor::check`].
     refused: AtomicU64,
+    /// Run, without blocking, by whichever [`SpaceFloor::observe`] sees the pause end (#247).
+    resume_waker: std::sync::Mutex<ResumeWaker>,
+    /// Dev-only: the free bytes every measurement reports, `u64::MAX` for the real volume.
+    #[cfg(feature = "test-support")]
+    free_override: AtomicU64,
     /// Dev-only: answer every [`SpaceFloor::check`] as below the floor.
     #[cfg(feature = "test-support")]
     forced: AtomicBool,
     /// Dev-only: the error code the next [`SpaceFloor::check`] answers once, then clears.
     #[cfg(feature = "test-support")]
     once: std::sync::Mutex<Option<&'static str>>,
+}
+
+/// The installed resume callback; a closure has no `Debug`, so this reports only presence.
+struct ResumeWaker(Option<RetentionWaker>);
+
+impl std::fmt::Debug for ResumeWaker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ResumeWaker")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl Ledger {
+    fn new() -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            since: AtomicU64::new(0),
+            pauses: AtomicU64::new(0),
+            resumes: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            resume_waker: std::sync::Mutex::new(ResumeWaker(None)),
+            #[cfg(feature = "test-support")]
+            free_override: AtomicU64::new(u64::MAX),
+            #[cfg(feature = "test-support")]
+            forced: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            once: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 /// What the floor has done since the store opened.
@@ -72,7 +108,7 @@ impl SpaceFloor {
         Self {
             place: Arc::new(Place {
                 dir: dir.to_path_buf(),
-                ledger: Ledger::default(),
+                ledger: Ledger::new(),
             }),
             min_free,
         }
@@ -118,8 +154,38 @@ impl SpaceFloor {
         } else if !paused && was {
             self.place.ledger.since.store(0, Ordering::Release);
             self.place.ledger.resumes.fetch_add(1, Ordering::Relaxed);
+            // The edge is signalled here, where it is consumed, so whichever duty or loop
+            // observes it first wakes the waiters; none can consume it unseen (#247).
+            let waker = self
+                .place
+                .ledger
+                .resume_waker
+                .lock()
+                .ok()
+                .and_then(|slot| slot.0.clone());
+            if let Some(waker) = waker {
+                waker();
+            }
         }
         Ok(shortfall)
+    }
+
+    /// Install, or with `None` remove, the callback run by the observation that sees a pause
+    /// end. It runs on the observing thread, so it must not block.
+    pub fn set_resume_waker(&self, waker: Option<RetentionWaker>) {
+        if let Ok(mut slot) = self.place.ledger.resume_waker.lock() {
+            *slot = ResumeWaker(waker);
+        }
+    }
+
+    /// Dev-only: report `free` bytes free on every measurement (`None` measures the real
+    /// volume), so a test moves the observed pause and its end the way free space does.
+    #[cfg(feature = "test-support")]
+    pub fn set_free_for_tests(&self, free: Option<u64>) {
+        self.place
+            .ledger
+            .free_override
+            .store(free.unwrap_or(u64::MAX), Ordering::Release);
     }
 
     /// Dev-only: refuse (or again admit) every write at the admission check, as a store under
@@ -194,6 +260,13 @@ impl SpaceFloor {
     /// Measured at the nearest existing ancestor, which shares the filesystem
     /// of a store directory that has not been created yet.
     fn free(&self) -> Result<u64, Error> {
+        #[cfg(feature = "test-support")]
+        {
+            let free = self.place.ledger.free_override.load(Ordering::Acquire);
+            if free != u64::MAX {
+                return Ok(free);
+            }
+        }
         let measured = self
             .place
             .dir
@@ -265,5 +338,34 @@ mod tests {
         );
         assert!(low.observe(10_000).unwrap().is_some());
         assert_eq!(low.status().pauses, 2);
+    }
+
+    // Value (#247): the resume edge was visible only to the observer that compared counters
+    // around its own call, so another loop consuming it left the waiters unwoken. Protects:
+    // the resume waker runs exactly once, in the observation that consumes the edge, whoever
+    // that is, and not on the pause or on later observations.
+    #[test]
+    fn the_resume_waker_runs_once_in_the_observation_that_consumes_the_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let low = SpaceFloor::new(dir.path(), u64::MAX / 4);
+        let woken = Arc::new(AtomicU64::new(0));
+        low.set_resume_waker(Some(Arc::new({
+            let woken = Arc::clone(&woken);
+            move || {
+                woken.fetch_add(1, Ordering::SeqCst);
+            }
+        })));
+        assert!(low.observe(5_000).unwrap().is_some());
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+        let met = SpaceFloor {
+            min_free: 1,
+            ..low.clone()
+        };
+        assert!(met.observe(6_000).unwrap().is_none());
+        assert!(low.observe(7_000).unwrap().is_some());
+        assert!(met.observe(8_000).unwrap().is_none());
+        assert_eq!(woken.load(Ordering::SeqCst), 2, "one per resume edge");
+        assert!(met.observe(9_000).unwrap().is_none());
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
     }
 }

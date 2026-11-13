@@ -11,7 +11,13 @@
 //! The delay is one second while the store is ready or a pass made progress. A pass that
 //! made none doubles it up to [`BACKOFF_CEILING`]: waiting a shorter time cannot change the
 //! outcome of a wait for native work. Events that can change the outcome (a pin released,
-//! an archive commit, a forced compaction ending) wake the worker at once instead.
+//! an archive commit, a forced compaction ending, the free-space floor resuming, a refused
+//! write requesting a pass) wake the worker at once instead.
+//!
+//! The backoff is the named observer of native `RocksDB` flush and compaction state (#247).
+//! The store has no completion listener, so the pass reads the pending counts itself, and the
+//! cadence is the reason: one second while anything moves, doubling to 30 seconds when
+//! nothing does, because a shorter wait cannot change what native work has done.
 
 use sparrow_core::{PressurePhase, PressureStatus};
 use std::time::Duration;
