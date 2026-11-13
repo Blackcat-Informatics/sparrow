@@ -118,8 +118,13 @@ retriable `STORAGE_PRESSURE`, and buffered writes that were already accepted
 are still synchronized. The daemon checks free space every second. Below the
 floor it stops accepting Unix and TCP connections, including syslog TCP
 connections. It claims no consumed files and runs only WAL synchronization.
-Syslog UDP packets that still arrive are refused and counted in memory, and the
-listener status reports that those counts are not durable.
+Syslog UDP datagrams that still arrive are read and queued by each UDP listener,
+up to its `hold_bytes` (default 64 MiB; the sum over listeners at most 512 MiB), and
+published in order when writes resume. Beyond that the reader stops and the kernel
+buffer takes the arrivals, and the kernel counts the datagrams it drops. A daemon exit
+that is not a clean stop (a crash, a kill, an out-of-memory kill, or the exit on a full
+disk) loses the queue and the kernel buffer uncounted, so size `hold_bytes` against
+`MemoryHigh` and see `docs/interfaces.md` for what a clean stop counts.
 The daemon logs one
 line when it pauses and one when it resumes. At startup it waits for the floor
 before opening the store, so a restart on a full disk does not use up the

@@ -20335,13 +20335,14 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
     assert!(owned(&store) < before);
     assert_eq!(store.bytes(&second.record_ids[0], 0, 2, 3).unwrap(), b"c\n");
 
-    // Publication at or behind the watermark or an in-flight segment is a clock regression.
+    // Publication at or behind the watermark or an in-flight segment is a clock regression,
+    // typed apart from a storage failure so a caller that stamped it early can restamp.
     assert_eq!(
         store
             .ingest("archive-regressed", "source", "log", b"late\n", 0)
             .unwrap_err()
             .code,
-        "STORAGE_FAILURE"
+        sparrow_core::ARCHIVE_WATERMARK
     );
     let next = ArchiveIntent {
         segment_id: [3; 32],
@@ -20356,10 +20357,38 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
             .ingest("archive-in-flight", "source", "log", b"late\n", 2)
             .unwrap_err()
             .code,
-        "STORAGE_FAILURE"
+        sparrow_core::ARCHIVE_WATERMARK
     );
     store
         .ingest("archive-current", "source", "log", b"now\n", 4)
+        .unwrap();
+}
+
+/// INVARIANT (#255): the fence names the instant a publication must be stamped after to be
+/// admitted whatever its identifier: one millisecond past it is admitted, and an earlier
+/// instant is refused with the typed code. A store with no fence names none.
+#[test]
+fn the_archive_fence_names_the_instant_a_publication_must_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving_config()).unwrap();
+    assert_eq!(store.archive_state().unwrap().unwrap().fence_millis(), None);
+    let first = store
+        .ingest("fence-first", "source", "log", b"a\n", 5)
+        .unwrap();
+    archive_records(&store, 1, &[archive_position(5, &first.record_ids[0])]);
+    assert_eq!(
+        store.archive_state().unwrap().unwrap().fence_millis(),
+        Some(5)
+    );
+    assert_eq!(
+        store
+            .ingest("fence-before", "source", "log", b"b\n", 4)
+            .unwrap_err()
+            .code,
+        sparrow_core::ARCHIVE_WATERMARK
+    );
+    store
+        .ingest("fence-past", "source", "log", b"c\n", 6)
         .unwrap();
 }
 

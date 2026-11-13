@@ -20,7 +20,8 @@ pub use query::{
 };
 pub use storage::archive::{
     ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_MIN_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES,
-    ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ArchiveIntent, ArchivePolicy, ArchiveState,
+    ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ARCHIVE_WATERMARK, ArchiveIntent,
+    ArchivePolicy, ArchiveState,
 };
 pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,

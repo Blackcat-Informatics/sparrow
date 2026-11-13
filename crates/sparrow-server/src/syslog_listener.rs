@@ -3,6 +3,8 @@
 
 //! Explicit bounded syslog intake, independent of the private typed query transport.
 
+mod udp_hold;
+
 use crate::pressure_wake::{PressureWake, Waiter};
 use serde::Deserialize;
 use std::{
@@ -15,7 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, BufReader},
     net::{TcpListener, UdpSocket},
-    sync::{Semaphore, TryAcquireError, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, watch},
     task::JoinSet,
 };
 
@@ -63,6 +65,31 @@ pub struct SyslogListener {
     pub max_connections: usize,
     /// Required complete-frame read deadline, 1..60000 milliseconds.
     pub read_timeout_ms: u32,
+    /// UDP only, optional: the bytes the reader may queue for the publisher, 1 MiB to 512 MiB,
+    /// 64 MiB when absent. The sum over all listeners is at most 512 MiB. A queued datagram
+    /// costs its length plus [`ENTRY_OVERHEAD`].
+    #[serde(default)]
+    pub hold_bytes: Option<usize>,
+}
+
+/// Bytes the reader may queue by default.
+pub const DEFAULT_HOLD_BYTES: usize = 64 << 20;
+/// Least `hold_bytes` of one listener.
+pub const MIN_HOLD_BYTES: usize = 1 << 20;
+/// Greatest sum of the `hold_bytes` of all UDP listeners: a quarter of the unit's `MemoryHigh`.
+/// It is also the greatest for one listener.
+pub const MAX_TOTAL_HOLD_BYTES: usize = 512 << 20;
+/// Greatest `hold_bytes` of one listener: the whole total.
+pub const MAX_HOLD_BYTES: usize = MAX_TOTAL_HOLD_BYTES;
+/// Budget a queued datagram costs beyond its length, so a flood of tiny datagrams is bounded in
+/// count as well as in bytes.
+pub const ENTRY_OVERHEAD: usize = 128;
+
+impl SyslogListener {
+    /// The queue bound of a UDP listener: the configured value or the default.
+    pub(crate) fn hold_bytes(&self) -> usize {
+        self.hold_bytes.unwrap_or(DEFAULT_HOLD_BYTES)
+    }
 }
 
 pub(crate) fn validate(listeners: &[SyslogListener]) -> io::Result<()> {
@@ -91,6 +118,24 @@ pub(crate) fn validate(listeners: &[SyslogListener]) -> io::Result<()> {
                 "syslog requires unique identities, explicit loopback bindings, source 1..512 bytes, max_message_bytes 480..65536, max_connections 1..16, read_timeout_ms 1..60000, TCP framing, and UDP max_connections=1 with no framing",
             ));
         }
+        if let Some(bytes) = listener.hold_bytes
+            && (listener.transport != SyslogTransport::Udp
+                || !(MIN_HOLD_BYTES..=MAX_HOLD_BYTES).contains(&bytes))
+        {
+            return Err(io::Error::other(
+                "syslog hold_bytes is for UDP listeners only and must be 1048576..536870912",
+            ));
+        }
+    }
+    let total = listeners
+        .iter()
+        .filter(|listener| listener.transport == SyslogTransport::Udp)
+        .map(SyslogListener::hold_bytes)
+        .try_fold(0_usize, usize::checked_add);
+    if total.is_none_or(|total| total > MAX_TOTAL_HOLD_BYTES) {
+        return Err(io::Error::other(
+            "the hold_bytes of all UDP syslog listeners sum to more than 536870912 bytes",
+        ));
     }
     Ok(())
 }
@@ -109,6 +154,20 @@ struct Counts {
     holds_no_permit: u64,
     /// Longest finished hold, in milliseconds.
     longest_hold_ms: u64,
+    /// Times the UDP reader stopped because the queue was full (#255).
+    reader_full_waits: u64,
+    /// Longest finished full-queue wait, in milliseconds.
+    reader_full_longest_ms: u64,
+    /// Datagrams published with the commit instant because their read instant was behind the
+    /// archive watermark.
+    restamped: u64,
+    /// Datagrams stored just past the archive watermark because the commit instant was behind
+    /// it too (the clock stepped back).
+    restamped_past_watermark: u64,
+    /// Datagrams read and not stored when the listener stopped: the queue's remainder under
+    /// pressure, or what a failed publisher could not publish. Payload bytes alongside.
+    lost_at_shutdown: u64,
+    lost_at_shutdown_bytes: u64,
 }
 
 /// Why a frame already read is kept instead of published.
@@ -152,6 +211,21 @@ pub(crate) struct Status {
     announced_at: Option<tokio::time::Instant>,
     /// Receive buffer and kernel drop counter; present for a UDP listener started by the worker.
     kernel: Option<crate::udp_kernel::Kernel>,
+    /// Datagrams in the UDP queue, the one at the head of the publisher included until it is
+    /// stored or counted, and the budget they use (length plus [`ENTRY_OVERHEAD`] each).
+    queued_datagrams: usize,
+    queued_bytes: u64,
+    /// When the reader stopped on a full queue, while it waits.
+    waiting_since: Option<tokio::time::Instant>,
+    full: Option<udp_hold::FullEpisode>,
+    full_announced_at: Option<tokio::time::Instant>,
+    /// Set when an episode begins, so the next time the queue drains the kernel count is read
+    /// again; cleared by that read. Without it every drain to empty would read the file.
+    sample_due: bool,
+    /// The payload bytes of the datagram the reader holds while it waits for room.
+    in_hand: Option<usize>,
+    /// When the last past-the-watermark stamp was journaled.
+    fenced_announced_at: Option<tokio::time::Instant>,
 }
 #[derive(Clone)]
 struct Metrics(Arc<Mutex<Status>>);
@@ -240,6 +314,36 @@ impl Status {
             episode: None,
             announced_at: None,
             kernel: None,
+            queued_datagrams: 0,
+            queued_bytes: 0,
+            waiting_since: None,
+            full: None,
+            full_announced_at: None,
+            sample_due: false,
+            in_hand: None,
+            fenced_announced_at: None,
+        }
+    }
+
+    /// What one held unit is called in the journal, and what holding it does to its sender.
+    fn hold_words(&self) -> (&'static str, &'static str) {
+        match self.definition.transport {
+            SyslogTransport::Tcp => (
+                "frame(s)",
+                "each sender's TCP window closes until it clears",
+            ),
+            SyslogTransport::Udp => (
+                "datagram(s)",
+                "the reader keeps queueing arrivals until the queue is full",
+            ),
+        }
+    }
+
+    /// The kernel drop count at the last sample, when it could be read.
+    fn kernel_drops(&self) -> Option<u64> {
+        match &self.kernel.as_ref()?.counter {
+            crate::udp_kernel::Counter::Available(drops) => Some(*drops),
+            crate::udp_kernel::Counter::Unavailable(_) => None,
         }
     }
 
@@ -257,6 +361,7 @@ impl Status {
     ) -> io::Result<Option<String>> {
         if id.is_none() {
             self.next_hold += 1;
+            self.sample_due = true;
             *id = Some(self.next_hold);
             self.holding.insert(self.next_hold, now);
             self.episode
@@ -279,6 +384,7 @@ impl Status {
             .announced_at
             .is_none_or(|at| now.duration_since(at) >= HOLD_REPORT_INTERVAL);
         let held = self.holding.len();
+        let (unit, effect) = self.hold_words();
         let Some(episode) = self
             .episode
             .as_mut()
@@ -289,7 +395,7 @@ impl Status {
         episode.announced = true;
         self.announced_at = Some(now);
         Ok(Some(format!(
-            "sparrowd: syslog listener {}: holding {held} frame(s) under {}; each sender's TCP window closes until it clears",
+            "sparrowd: syslog listener {}: holding {held} {unit} under {}; {effect}",
             self.definition.id,
             reason.name()
         )))
@@ -311,9 +417,10 @@ impl Status {
         if !self.holding.is_empty() {
             return None;
         }
+        let (unit, _) = self.hold_words();
         let episode = self.episode.take().filter(|episode| episode.announced)?;
         Some(format!(
-            "sparrowd: syslog listener {}: hold ended; {} frame(s) held, longest wait {} ms",
+            "sparrowd: syslog listener {}: hold ended; {} {unit} held, longest wait {} ms",
             self.definition.id,
             episode.frames,
             episode.longest.as_millis()
@@ -629,24 +736,101 @@ enum Published {
     Pressured,
 }
 
+/// Where a packet came from, and so what instant stamps it.
+#[derive(Clone, Copy)]
+enum Intake {
+    /// A TCP frame: stamped when it is committed.
+    Tcp,
+    /// A UDP datagram: stamped with the instant the reader took it off the socket.
+    Udp { read_at: u64 },
+}
+impl Intake {
+    const fn stamp(self) -> Option<u64> {
+        match self {
+            Self::Tcp => None,
+            Self::Udp { read_at } => Some(read_at),
+        }
+    }
+}
+
+/// Which instant a stored packet carries.
+#[derive(Clone, Copy)]
+enum Stamped {
+    /// The instant it was read, or for a TCP frame the commit instant.
+    Read,
+    /// The commit instant, because the archive watermark refused the read instant.
+    Commit,
+    /// The instant just past the archive watermark, because it refused the commit instant too.
+    PastWatermark {
+        read_at: u64,
+        commit: u64,
+        stamp: u64,
+    },
+}
+
+/// A packet in hand and where it came from.
+struct Packet {
+    bytes: Arc<[u8]>,
+    intake: Intake,
+}
+
 /// Offer one packet to the store. With `keep_on_pressure` a `STORAGE_PRESSURE` answer leaves
-/// the packet with the caller instead of being counted as a refused discard.
+/// the packet with the caller instead of being counted as a refused discard. A packet with a
+/// `stamp` that the store refuses as behind the archive watermark is offered once more with the
+/// commit instant and counted restamped: a log is never refused for its stamp.
 async fn publish(
     store: sparrow_core::Store,
     source: String,
     bytes: Arc<[u8]>,
     metrics: &Metrics,
     keep_on_pressure: bool,
+    stamp: Option<u64>,
 ) -> io::Result<Published> {
     enum Attempt {
-        Stored { failed: bool },
+        Stored { failed: bool, stamped: Stamped },
         Refused { durable: bool },
         Pressured,
     }
     let receiver = metrics.snapshot()?.receiver;
     let result = tokio::task::spawn_blocking(move || {
-        let now = crate::now()?;
-        let artifact = match store.ingest_received_syslog(&source, &receiver, &bytes, now) {
+        let commit = crate::now()?;
+        let mut now = stamp.unwrap_or(commit);
+        let mut stamped = Stamped::Read;
+        let artifact = match loop {
+            match store.ingest_received_syslog(&source, &receiver, &bytes, now) {
+                // Only a stamped packet is restamped; the commit instant of a TCP frame
+                // behind the watermark is a clock regression and stays an error.
+                Err(error) if error.code == sparrow_core::ARCHIVE_WATERMARK => {
+                    let Some(read_at) = stamp else {
+                        break Err(error);
+                    };
+                    let next = if matches!(stamped, Stamped::Read) {
+                        stamped = Stamped::Commit;
+                        crate::now()?
+                    } else {
+                        // The clock is behind the watermark too: a log is never refused for
+                        // its stamp, so take the instant just past the fence. It always
+                        // advances, so a moving watermark cannot loop this forever.
+                        let fence = store
+                            .archive_state()?
+                            .and_then(|state| state.fence_millis())
+                            .and_then(|fence| fence.checked_add(1))
+                            .filter(|next| *next > now);
+                        let Some(next) = fence else {
+                            break Err(error);
+                        };
+                        stamped = Stamped::PastWatermark {
+                            read_at,
+                            commit,
+                            stamp: next,
+                        };
+                        next
+                    };
+                    now = next;
+                }
+                result => break result,
+            }
+        } {
             Ok(artifact) => artifact,
             Err(error) if keep_on_pressure && error.code == "STORAGE_PRESSURE" => {
                 return Ok(Attempt::Pressured);
@@ -679,20 +863,42 @@ async fn publish(
         })?;
         Ok::<_, sparrow_core::Error>(Attempt::Stored {
             failed: snapshot.diagnostic.is_some(),
+            stamped,
         })
     })
     .await
     .map_err(io::Error::other)?
     .map_err(io::Error::other)?;
     match result {
-        Attempt::Stored { failed } => {
+        Attempt::Stored { failed, stamped } => {
+            let mut line = None;
             metrics.update(|status| {
                 increment(&mut status.counts.accepted)?;
+                match stamped {
+                    Stamped::Read => {}
+                    Stamped::Commit => increment(&mut status.counts.restamped)?,
+                    Stamped::PastWatermark {
+                        read_at,
+                        commit,
+                        stamp,
+                    } => {
+                        increment(&mut status.counts.restamped_past_watermark)?;
+                        line = status.past_watermark_line(
+                            read_at,
+                            commit,
+                            stamp,
+                            tokio::time::Instant::now(),
+                        );
+                    }
+                }
                 if failed {
                     increment(&mut status.counts.interpretation_failures)?;
                 }
                 Ok(())
             })?;
+            if let Some(line) = line {
+                journal(&line);
+            }
             Ok(Published::Stored)
         }
         Attempt::Refused { durable } => {
@@ -721,15 +927,20 @@ async fn publish(
 /// gets one last attempt and, if refused, is counted exactly as before. A frame waiting for a
 /// permit blocks on the permit and, so the journal can announce its wait once the report
 /// interval has passed, on the same observer tick; it never retries on a clock.
+///
+/// A UDP datagram is stamped with its read instant. On a stop it gets one last attempt as well,
+/// but a refusal is returned as `Pressured` for the caller to count with the rest of its queue
+/// instead of being counted here as one refused discard.
 async fn publish_held(
     store: &sparrow_core::Store,
     source: &str,
-    bytes: Arc<[u8]>,
+    packet: Packet,
     metrics: &Metrics,
     operations: &Arc<Semaphore>,
     stop: &mut watch::Receiver<bool>,
     wake: &mut Waiter,
 ) -> io::Result<Published> {
+    let Packet { bytes, intake } = packet;
     let mut hold = Hold::new(metrics);
     // Counted while the frame is held for pressure, so the observer tick wakes it.
     let mut pressured = None;
@@ -765,11 +976,12 @@ async fn publish_held(
             source.to_owned(),
             bytes.clone(),
             metrics,
-            !stopping,
+            !stopping || matches!(intake, Intake::Udp { .. }),
+            intake.stamp(),
         )
         .await?;
         drop(permit);
-        if published != Published::Pressured {
+        if published != Published::Pressured || (stopping && matches!(intake, Intake::Udp { .. })) {
             hold.leave()?;
             return Ok(published);
         }
@@ -899,44 +1111,16 @@ async fn listen(
             finish_tasks(serving, &mut tasks, &shutdown).await
         }
         Socket::Udp(socket) => {
-            // A UDP payload never exceeds 65507 bytes, under the store's ceiling, so a whole datagram
-            // always fits and nothing is cut; `max_message_bytes` frames TCP lines only.
-            let mut buffer = vec![0; sparrow_core::SYSLOG_MESSAGE_BYTES];
-            let serving: io::Result<()> = async {
-            loop {
-                if *stop.borrow() {
-                    break;
-                }
-                let size = tokio::select! { changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } continue; }, received = socket.recv_from(&mut buffer) => received?.0 };
-                let Ok(permit) = operations.clone().try_acquire_owned() else {
-                    discard(
-                        &store,
-                        &metrics,
-                        &operations,
-                        sparrow_core::ReceiverDiscard::Refused,
-                    )
-                    .await?;
-                    // The reader has left a wait; datagrams may have been dropped meanwhile.
-                    metrics.sample_kernel()?;
-                    continue;
-                };
-                publish(
-                    store.clone(),
-                    definition.source.clone(),
-                    Arc::from(&buffer[..size]),
-                    &metrics,
-                    false,
-                )
-                .await?;
-                drop(permit);
-            }
-            Ok(())
-            }.await;
-            // The last sample, taken while the socket is open and then frozen, whether the loop
-            // ended by stop or by an error: the socket's row leaves the table when it closes, and
-            // a later status request must still show this count as final.
-            let finished = metrics.finish_kernel();
-            serving.and(finished)
+            udp_hold::listen_udp(
+                socket,
+                metrics,
+                store,
+                operations,
+                stop,
+                wake,
+                udp_hold::wall_clock(),
+            )
+            .await
         }
     }
 }
@@ -1156,7 +1340,10 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
         let accepted = publish_held(
             &store,
             &definition.source,
-            Arc::from(frame.bytes),
+            Packet {
+                bytes: Arc::from(frame.bytes),
+                intake: Intake::Tcp,
+            },
             metrics,
             &operations,
             &mut stop,
@@ -1359,6 +1546,7 @@ impl Status {
         out.set_holds_storage_pressure(self.counts.holds_storage_pressure);
         out.set_holds_no_permit(self.counts.holds_no_permit);
         out.set_longest_hold_ms(u64::try_from(self.longest_hold().as_millis()).unwrap_or(u64::MAX));
+        self.encode_queue(out.reborrow());
         out.set_accepted_messages(self.counts.accepted);
         out.set_interpretation_failures(self.counts.interpretation_failures);
         out.set_refused_messages(self.counts.refused);
@@ -1373,6 +1561,29 @@ impl Status {
             Some(value) => out.init_failure().set_value(value),
             None => out.init_failure().set_absent(()),
         }
+    }
+
+    /// The UDP queue: gauges, the reader's full-queue waits, restamped and lost datagrams. A TCP
+    /// listener has no queue and reports zeros.
+    fn encode_queue(&self, mut out: crate::sparrow_capnp::syslog_listener_status::Builder<'_>) {
+        let udp = self.definition.transport == SyslogTransport::Udp;
+        out.set_queued_datagrams(u32::try_from(self.queued_datagrams).unwrap_or(u32::MAX));
+        out.set_queued_bytes(self.queued_bytes);
+        out.set_hold_bytes(if udp {
+            self.definition.hold_bytes() as u64
+        } else {
+            0
+        });
+        out.set_reader_full_waits(self.counts.reader_full_waits);
+        let running = self.waiting_since.map(|since| since.elapsed());
+        let longest = running
+            .unwrap_or_default()
+            .max(Duration::from_millis(self.counts.reader_full_longest_ms));
+        out.set_reader_full_longest_ms(u64::try_from(longest.as_millis()).unwrap_or(u64::MAX));
+        out.set_restamped(self.counts.restamped);
+        out.set_restamped_past_watermark(self.counts.restamped_past_watermark);
+        out.set_lost_at_shutdown(self.counts.lost_at_shutdown);
+        out.set_lost_at_shutdown_bytes(self.counts.lost_at_shutdown_bytes);
     }
 
     /// The UDP kernel evidence. A count is written only when it was read; otherwise the count is
@@ -1536,6 +1747,7 @@ mod tests {
             max_message_bytes: 480,
             max_connections: 1,
             read_timeout_ms: 1000,
+            hold_bytes: None,
         };
         let metrics = Metrics(Arc::new(Mutex::new(Status::new(
             sparrow_core::SyslogReceiver::new("listener", "udp").unwrap(),
@@ -1548,6 +1760,7 @@ mod tests {
             Arc::from(&b"<34>refused"[..]),
             &metrics,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1823,19 +2036,41 @@ mod tests {
         assert_eq!(counts.refused, 0);
     }
 
-    struct Listener {
-        _dir: tempfile::TempDir,
-        store: sparrow_core::Store,
-        metrics: Metrics,
-        wake: PressureWake,
-        operations: Arc<Semaphore>,
+    pub(super) struct Listener {
+        pub(super) _dir: tempfile::TempDir,
+        pub(super) store: sparrow_core::Store,
+        pub(super) metrics: Metrics,
+        pub(super) wake: PressureWake,
+        pub(super) operations: Arc<Semaphore>,
     }
 
-    fn listener(transport: SyslogTransport, connections: usize, timeout_ms: u32) -> Listener {
+    pub(super) fn listener(
+        transport: SyslogTransport,
+        connections: usize,
+        timeout_ms: u32,
+    ) -> Listener {
+        listener_with(transport, connections, timeout_ms, false)
+    }
+
+    /// A listener whose store archives before deleting, so it has an archive fence.
+    pub(super) fn listener_with(
+        transport: SyslogTransport,
+        connections: usize,
+        timeout_ms: u32,
+        archiving: bool,
+    ) -> Listener {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("store");
         let config =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        if archiving {
+            let text = std::fs::read_to_string(&config).unwrap();
+            let table = format!(
+                "\n[archive]\ndir = \"{}\"\n",
+                dir.path().join("nas").display()
+            );
+            std::fs::write(&config, text + &table).unwrap();
+        }
         let store = crate::ServerConfig::read(&config)
             .unwrap()
             .open_store()
@@ -1850,6 +2085,7 @@ mod tests {
             max_message_bytes: 480,
             max_connections: connections,
             read_timeout_ms: timeout_ms,
+            hold_bytes: None,
         };
         let metrics = Metrics(Arc::new(Mutex::new(Status::new(
             sparrow_core::SyslogReceiver::new(
@@ -1983,12 +2219,12 @@ mod tests {
     }
 
     /// One frame is held: taken off the wire and not read again until it is stored.
-    fn frame_taken(status: &Status) -> bool {
+    pub(super) fn frame_taken(status: &Status) -> bool {
         status.holding.len() == 1
     }
 
     /// Lengths of the stored syslog packets in durable observation order.
-    fn stored_lengths(store: &sparrow_core::Store) -> Vec<u64> {
+    pub(super) fn stored_lengths(store: &sparrow_core::Store) -> Vec<u64> {
         let mut records = store.records(crate::now().unwrap()).unwrap();
         records.sort_by_key(|record| record.receiver.as_ref().map(|position| position.sequence));
         records
@@ -2014,7 +2250,7 @@ mod tests {
     }
 
     /// Lift the pressure the tests apply and tell every holder, as the maintenance duty does.
-    fn relieve(fixture: &Listener) {
+    pub(super) fn relieve(fixture: &Listener) {
         fixture.store.space_floor().refuse_writes_for_tests(false);
         fixture.wake.wake();
     }
@@ -2138,7 +2374,7 @@ mod tests {
     }
 
     /// The listener's JSON rendering after the wire encoding, as status shows it.
-    fn status_json(status: &Status) -> purrdf_lex::json::Value {
+    pub(super) fn status_json(status: &Status) -> purrdf_lex::json::Value {
         wire_fields(status).2
     }
 
@@ -2412,7 +2648,7 @@ mod tests {
     /// blocking store call a re-offered frame would start: yield so the frame reaches it, wait
     /// for a blocking store call that takes the writer lock after it (a flush), then yield so
     /// the frame handles its answer. A negative assertion made after this sees a timer's work.
-    async fn settle(fixture: &Listener) {
+    pub(super) async fn settle(fixture: &Listener) {
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
@@ -2429,7 +2665,7 @@ mod tests {
     /// Yield until `done` holds, failing with `what` after a wall-clock bound instead of
     /// hanging. Not a timeout future: under a paused clock an idle runtime would fire that
     /// early, while the blocking store call still runs.
-    async fn yield_until(what: &str, done: impl Fn() -> bool) {
+    pub(super) async fn yield_until(what: &str, done: impl Fn() -> bool) {
         let began = std::time::Instant::now();
         while !done() {
             assert!(
@@ -2754,6 +2990,7 @@ mod tests {
             max_message_bytes: 480,
             max_connections: 1,
             read_timeout_ms: 1000,
+            hold_bytes: None,
         };
         validate(std::slice::from_ref(&valid)).unwrap();
         for (transport, framing, connections, size, address) in [
@@ -2772,6 +3009,32 @@ mod tests {
             invalid.address = address.parse().unwrap();
             assert!(validate(&[invalid]).is_err());
         }
-        assert!(validate(&[valid.clone(), valid]).is_err());
+        assert!(validate(&[valid.clone(), valid.clone()]).is_err());
+        // hold_bytes is a UDP key with a range, and all listeners together have a cap.
+        let datagram = |id: &str, bytes: Option<usize>| SyslogListener {
+            id: id.into(),
+            transport: SyslogTransport::Udp,
+            framing: None,
+            hold_bytes: bytes,
+            ..valid.clone()
+        };
+        validate(&[
+            datagram("a", Some(MIN_HOLD_BYTES)),
+            datagram("b", Some(MAX_TOTAL_HOLD_BYTES - MIN_HOLD_BYTES)),
+        ])
+        .unwrap();
+        validate(&[datagram("a", Some(MAX_HOLD_BYTES))]).unwrap();
+        assert_eq!(MAX_HOLD_BYTES, MAX_TOTAL_HOLD_BYTES);
+        for bytes in [MIN_HOLD_BYTES - 1, MAX_HOLD_BYTES + 1] {
+            assert!(validate(&[datagram("a", Some(bytes))]).is_err());
+        }
+        let mut tcp = valid.clone();
+        tcp.hold_bytes = Some(MIN_HOLD_BYTES);
+        assert!(validate(&[tcp]).is_err());
+        let each = MAX_TOTAL_HOLD_BYTES / 2;
+        validate(&[datagram("a", Some(each)), datagram("b", Some(each))]).unwrap();
+        assert!(validate(&[datagram("a", Some(each)), datagram("b", Some(each + 1))]).is_err());
+        let defaults: Vec<_> = (0..4).map(|n| datagram(&n.to_string(), None)).collect();
+        validate(&defaults).unwrap();
     }
 }
